@@ -1,17 +1,28 @@
 # Benchmark workflow for the posthog/posthog fork.
 #
-# Workload derived from upstream .github/workflows/container-images-cd.yml
-# (production image build of the root Dockerfile), simplified to a single
-# linear amd64 build with push disabled: no registry login, no tag/label
-# metadata, no deploy notifications. See DECISIONS.md #7.
+# Workload: the image build at the heart of upstream
+# .github/workflows/container-images-cd.yml, job "posthog_build" (transcribed
+# from upstream 2026-07-23 -- re-verify against the file at the pinned
+# commit): the same Dockerfile, same context (.), same COMMIT_HASH build-arg.
 #
-# Docker layer caching is where "warm" differs most per environment
-# (DECISIONS.md #4):
-#   - GitHub-hosted: buildx with the GitHub Actions cache backend
-#     (cache-from/to type=gha, mode=max)
-#   - Blacksmith: useblacksmith/build-push-action, which backs the buildx
-#     instance with a sticky disk so layers persist between runs
-#   - cold on both: no-cache build, no cache export
+# This is the one fork where the full upstream job CANNOT run outside the
+# upstream org, because it is a deploy job (DECISIONS.md #7):
+#   - upstream builds on Depot's remote build farm (depot/build-push-action
+#     + paid Depot project) -- using it here would benchmark Depot's
+#     machines, not the runner under test, so the build runs on the runner
+#     via buildx instead
+#   - registry logins + push to DockerHub/ghcr/ECR and the ECR tag
+#     reconciliation need PostHog's secrets and serve deploys, not builds
+#     (push: false here)
+#   - upstream builds linux/arm64 alongside amd64; on x86 runners that arm
+#     half executes under QEMU emulation and would measure QEMU, not the
+#     runner (amd64 only here)
+#   - the sourcemap-upload build secret is satisfied with a placeholder so
+#     the same Dockerfile RUN --mount=type=secret lines execute
+#
+# Docker layer caching is where "warm" differs per environment
+# (DECISIONS.md #4): buildx gha cache backend on GitHub-hosted,
+# useblacksmith/build-push-action (sticky-disk builder) on Blacksmith.
 #
 # See forks/vite/benchmark.yml for the conventions shared by all forks
 # (runs-on mapping, "workload:" step-name prefix, cold/warm semantics).
@@ -28,7 +39,7 @@ on:
         required: true
         options: [github, github-8core, ec2, blacksmith]
       cache_state:
-        description: cold = no caches, warm = environment-native caches
+        description: cold = no caches, warm = environment-native docker layer cache
         type: choice
         required: true
         options: [cold, warm]
@@ -50,7 +61,10 @@ jobs:
     runs-on: ${{ fromJSON('{"github":"ubuntu-latest","github-8core":"benchmark-8core","ec2":"benchmark-ec2","blacksmith":"blacksmith-8vcpu-ubuntu-2404"}')[inputs.environment] }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2 # upstream value
 
       - name: Start telemetry
         uses: ./.github/actions/telemetry/start
@@ -58,59 +72,73 @@ jobs:
         with:
           runner_label: ${{ inputs.environment }}
 
-      - name: Set up buildx (GitHub-hosted)
+      - name: Set up Docker Buildx
         if: inputs.environment != 'blacksmith'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # --- workload: one docker build step per (environment, cache_state) ---
-      # Exactly one of the four steps below runs. All build the same
-      # Dockerfile with push disabled; they differ only in cache transport.
+      # Exactly one of the four steps below runs; all use the same
+      # Dockerfile, context, build-args, and secret mount as upstream's
+      # depot/build-push-action invocation, differing only in cache
+      # transport and push:false.
 
-      - name: "workload: docker build (cold, GitHub-hosted)"
+      - name: "workload: Build container image (cold, GitHub-hosted)"
         if: inputs.cache_state == 'cold' && inputs.environment != 'blacksmith'
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
           push: false
           no-cache: true
           tags: posthog-bench:local
+          platforms: linux/amd64
+          build-args: |
+            COMMIT_HASH=${{ github.sha }}
+          secrets: |
+            posthog_upload_sourcemaps_cli_api_key=benchmark-placeholder
 
-      - name: "workload: docker build (warm, GitHub-hosted)"
+      - name: "workload: Build container image (warm, GitHub-hosted)"
         if: inputs.cache_state == 'warm' && inputs.environment != 'blacksmith'
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
           push: false
           tags: posthog-bench:local
+          platforms: linux/amd64
+          build-args: |
+            COMMIT_HASH=${{ github.sha }}
+          secrets: |
+            posthog_upload_sourcemaps_cli_api_key=benchmark-placeholder
           cache-from: type=gha,scope=benchmark
           cache-to: type=gha,scope=benchmark,mode=max
 
       # useblacksmith/build-push-action provisions a sticky-disk-backed
       # buildx builder; no setup-buildx step is needed on Blacksmith.
-      - name: "workload: docker build (cold, Blacksmith)"
+      - name: "workload: Build container image (cold, Blacksmith)"
         if: inputs.cache_state == 'cold' && inputs.environment == 'blacksmith'
         uses: useblacksmith/build-push-action@v1
         with:
           context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
           push: false
           no-cache: true
           tags: posthog-bench:local
+          platforms: linux/amd64
+          build-args: |
+            COMMIT_HASH=${{ github.sha }}
+          secrets: |
+            posthog_upload_sourcemaps_cli_api_key=benchmark-placeholder
 
-      - name: "workload: docker build (warm, Blacksmith)"
+      - name: "workload: Build container image (warm, Blacksmith)"
         if: inputs.cache_state == 'warm' && inputs.environment == 'blacksmith'
         uses: useblacksmith/build-push-action@v1
         with:
           context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
           push: false
           tags: posthog-bench:local
+          platforms: linux/amd64
+          build-args: |
+            COMMIT_HASH=${{ github.sha }}
+          secrets: |
+            posthog_upload_sourcemaps_cli_api_key=benchmark-placeholder
 
       - name: Stop telemetry
         if: always()
