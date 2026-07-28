@@ -60,8 +60,7 @@ def upsert_session(params: UpsertWizardSessionInput) -> tuple[WizardSessionDTO, 
             "event_plan": event_plan,
             "error": params.error,
         }
-        # `created_by` records the initiator and must not change on later pushes for the same
-        # run, so it lives only in create_defaults (applied on insert, not on update).
+        # created_by only in create_defaults so a later push for the same run can't reattribute it.
         instance, created = WizardSession.objects.update_or_create(
             team_id=params.team_id,
             session_id=params.session_id,
@@ -88,9 +87,7 @@ def _enqueue_event_definition_sync(team_id: int, session_id: str) -> None:
 
 
 def get_session(team_id: int, session_id: str) -> WizardSessionDTO | None:
-    instance = (
-        WizardSession.objects.select_related("created_by").filter(team_id=team_id, session_id=session_id).first()
-    )
+    instance = WizardSession.objects.select_related("created_by").filter(team_id=team_id, session_id=session_id).first()
     return _to_dto(instance) if instance else None
 
 

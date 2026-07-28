@@ -23,8 +23,6 @@ class WizardTaskDTO:
 
 @dataclass(frozen=True)
 class WizardSessionUserDTO:
-    """The person who ran the wizard, for surfaces that attribute a run to its initiator."""
-
     id: int
     first_name: str
     email: str
@@ -72,5 +70,5 @@ class UpsertWizardSessionInput:
     tasks: tuple[WizardTaskDTO, ...]
     event_plan: dict[str, Any] | None
     error: dict[str, Any] | None
-    # The authenticated user who posted the run; set on create only, never overwritten on update.
+    # Set on create only, never overwritten on later pushes for the same run.
     created_by_id: int | None = None

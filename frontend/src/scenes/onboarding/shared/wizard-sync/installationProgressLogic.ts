@@ -19,12 +19,11 @@ import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
 import type { WizardSessionDTOApi } from 'products/wizard/frontend/generated/api.schemas'
 import { wizardSessionStreamLogic } from 'products/wizard/frontend/wizardSessionStreamLogic'
 
-import { startedByFromSession } from './helpers'
-
 import type { WizardConnectionStatus } from '../../../../../../products/wizard/frontend/wizardSessionStreamLogic'
 import { activeCloudRunLogic } from './activeCloudRunLogic'
 import type { CloudRunHandle } from './activeCloudRunLogic'
 import { finishedLocalRunLogic, FinishedLocalRunHandle } from './finishedLocalRunLogic'
+import { startedByFromSession } from './helpers'
 import {
     taskRunPrMerged,
     taskRunPrUrl,
@@ -107,9 +106,7 @@ export interface InstallationProgress {
     /** The bound PR was merged (webhook-recorded on the run's output). */
     prMerged: boolean
     isCurrent: boolean
-    /** Who kicked off the run, so the FAB can name whose run it is instead of always saying "your
-     * machine". Null for runs from before attribution existed. `email` is only for the "is this me?"
-     * check the surface does before deciding whether to show a name. */
+    /** Who started the run (null when unknown). `email` is for the "is this me?" check. */
     startedBy: { name: string; email: string } | null
 }
 
