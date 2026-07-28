@@ -602,7 +602,6 @@ class TaskWriteSerializer(serializers.Serializer):
         reserved_origins = {
             tasks_facade.TaskOriginProduct.IMAGE_BUILDER,
             tasks_facade.TaskOriginProduct.EXPERIMENTS,
-            tasks_facade.TaskOriginProduct.POSTHOG_AI,
             tasks_facade.TaskOriginProduct.SIGNALS_SCOUT,
             tasks_facade.TaskOriginProduct.SUPPORT_REPLY,
             # Routes the run's LLM traffic to the unbilled `onboarding` gateway product, so a
