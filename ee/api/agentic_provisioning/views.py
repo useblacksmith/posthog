@@ -485,6 +485,8 @@ def _handle_new_user(
         team_id=team.id,
     )
 
+    _apply_provisioned_onboarding_flags(user, team)
+
     # Emit the standard signup event so provisioned accounts flow into the shared
     # signup / activation / billing analyses, segmentable by client. Vercel does the
     # same (ee/vercel/integration.py); the agentic path previously skipped it entirely.
