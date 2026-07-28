@@ -19,6 +19,8 @@ import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
 import type { WizardSessionDTOApi } from 'products/wizard/frontend/generated/api.schemas'
 import { wizardSessionStreamLogic } from 'products/wizard/frontend/wizardSessionStreamLogic'
 
+import { startedByFromSession } from './helpers'
+
 import type { WizardConnectionStatus } from '../../../../../../products/wizard/frontend/wizardSessionStreamLogic'
 import { activeCloudRunLogic } from './activeCloudRunLogic'
 import type { CloudRunHandle } from './activeCloudRunLogic'
@@ -105,6 +107,10 @@ export interface InstallationProgress {
     /** The bound PR was merged (webhook-recorded on the run's output). */
     prMerged: boolean
     isCurrent: boolean
+    /** Who kicked off the run, so the FAB can name whose run it is instead of always saying "your
+     * machine". Null for runs from before attribution existed. `email` is only for the "is this me?"
+     * check the surface does before deciding whether to show a name. */
+    startedBy: { name: string; email: string } | null
 }
 
 export interface InstallationProgressLogicProps {
@@ -292,6 +298,7 @@ export function cloudProgress(
         prUrl,
         prMerged,
         isCurrent: phase !== 'idle',
+        startedBy: startedByFromSession(session),
     }
 }
 
@@ -313,6 +320,7 @@ export function localProgress(
             prUrl: null,
             prMerged: false,
             isCurrent: false,
+            startedBy: null,
         }
     }
 
@@ -342,7 +350,15 @@ export function localProgress(
               }
             : null
 
-    return { phase, steps, error, prUrl: null, prMerged: false, isCurrent: sessionIsCurrent && !dismissed }
+    return {
+        phase,
+        steps,
+        error,
+        prUrl: null,
+        prMerged: false,
+        isCurrent: sessionIsCurrent && !dismissed,
+        startedBy: startedByFromSession(latestSession),
+    }
 }
 
 // A finished local run rendered from its persisted snapshot, after the live session stream has
@@ -358,6 +374,7 @@ export function progressFromFinishedLocalRun(handle: FinishedLocalRunHandle): In
         prUrl: null,
         prMerged: false,
         isCurrent: true,
+        startedBy: handle.startedBy ?? null,
     }
 }
 

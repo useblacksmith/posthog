@@ -50,7 +50,16 @@ function cloudSteps(
 }
 
 function progress(overrides: Partial<InstallationProgress>): InstallationProgress {
-    return { phase: 'running', steps: [], error: null, prUrl: null, prMerged: false, isCurrent: true, ...overrides }
+    return {
+        phase: 'running',
+        steps: [],
+        error: null,
+        prUrl: null,
+        prMerged: false,
+        isCurrent: true,
+        startedBy: null,
+        ...overrides,
+    }
 }
 
 export const Connecting: Story = {
@@ -94,6 +103,23 @@ export const LocalRunning: Story = {
                 { id: 'install', label: 'Install PostHog', status: 'in_progress', detail: null },
                 { id: 'capture', label: 'Capture events', status: 'pending', detail: null },
                 { id: 'verify', label: 'Verify it works', status: 'pending', detail: null },
+            ],
+        }),
+    },
+}
+
+// Local run started by a teammate: the mode chip names them so a shared org's run doesn't read as
+// "On your machine".
+export const LocalRunningStartedByTeammate: Story = {
+    args: {
+        mode: 'local',
+        elapsedSeconds: 47,
+        startedByLabel: 'Edwin',
+        progress: progress({
+            steps: [
+                { id: 'plan', label: 'Plan event tracking', status: 'completed', detail: null },
+                { id: 'install', label: 'Install PostHog', status: 'in_progress', detail: null },
+                { id: 'capture', label: 'Capture events', status: 'pending', detail: null },
             ],
         }),
     },
@@ -166,6 +192,7 @@ export const AllStates: Story = {
             { label: 'Cloud, wizard running', args: CloudWizardRunning.args },
             { label: 'Cloud, keeping CI green', args: CloudKeepingCiGreen.args },
             { label: 'Local, running', args: LocalRunning.args },
+            { label: 'Local, started by a teammate', args: LocalRunningStartedByTeammate.args },
             { label: 'Completed', args: Completed.args },
             { label: 'Completed, local (dashboard payoff)', args: CompletedLocal.args },
             { label: 'Stalled', args: Stalled.args },
@@ -181,6 +208,7 @@ export const AllStates: Story = {
                             elapsedSeconds={args!.elapsedSeconds!}
                             mode={args!.mode!}
                             stale={args!.stale}
+                            startedByLabel={args!.startedByLabel}
                             dashboard={args!.dashboard}
                             onExpand={() => {}}
                             onDismiss={() => {}}
