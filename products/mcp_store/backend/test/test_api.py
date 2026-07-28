@@ -415,6 +415,49 @@ class TestMCPGatewayServerAPI(APIBaseTest):
         admin_result = next(result for result in admin_response.json()["results"] if result["id"] == server["id"])
         assert admin_result["is_team_enabled"] is False
 
+    def test_delete_disables_linked_installations_only(self) -> None:
+        self._make_admin()
+        server, own_installation, _tool = self._server_with_personal_tool()
+        other_user = self._create_user("other-delete-member@posthog.com")
+        other_installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=other_user,
+            display_name=server.name,
+            url=server.url,
+            auth_type="api_key",
+            sensitive_configuration={"api_key": "other-secret"},
+            scope="personal",
+            gateway_server=server,
+        )
+        unrelated_server = MCPGatewayServer.objects.for_team(self.team.id).create(
+            team=self.team,
+            name="Unrelated server",
+            url="https://mcp.unrelated-delete-test.example.com/mcp",
+            created_by=self.user,
+        )
+        unrelated_installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            display_name=unrelated_server.name,
+            url=unrelated_server.url,
+            auth_type="api_key",
+            sensitive_configuration={"api_key": "unrelated-secret"},
+            scope="personal",
+            gateway_server=unrelated_server,
+        )
+
+        response = self.client.delete(self._api_url(f"{server.id}/"))
+
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert not MCPGatewayServer.objects.for_team(self.team.id).filter(id=server.id).exists()
+        for installation in (own_installation, other_installation):
+            installation.refresh_from_db()
+            assert installation.is_enabled is False
+            assert installation.gateway_server_id is None
+        unrelated_installation.refresh_from_db()
+        assert unrelated_installation.is_enabled is True
+        assert unrelated_installation.gateway_server_id == unrelated_server.id
+
     @parameterized.expand([("list", False), ("retrieve", True)])
     def test_member_metadata_is_visible_only_to_admins(self, _name: str, retrieve: bool) -> None:
         self._make_admin()

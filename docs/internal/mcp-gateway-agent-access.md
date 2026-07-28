@@ -25,6 +25,7 @@ Member and agent access are independent:
 - Agents never inherit a connection automatically. They receive only the exact credential bound to an explicit grant.
 - Changing the team setting does not revoke existing grants. It only controls who can add, revoke, or tune them.
 - Turning member access off does not revoke an explicit agent grant, and turning an agent grant off does not affect members.
+- Deleting a custom server disables every connected installation before removing it from the gateway.
 
 Inbox reads the Scout agent's configured grants rather than the signed-in member's personal connections.
 Every project member can see credential-safe server names and readiness states there.

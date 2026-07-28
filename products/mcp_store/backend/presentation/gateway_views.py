@@ -12,6 +12,7 @@ from typing import Any, cast
 
 from django.db import transaction
 from django.db.models import Case, Count, IntegerField, Prefetch, Q, QuerySet, When, prefetch_related_objects
+from django.utils import timezone
 
 import structlog
 from drf_spectacular.types import OpenApiTypes
@@ -851,15 +852,20 @@ class MCPGatewayServerViewSet(
 
     def perform_destroy(self, instance: MCPGatewayServer) -> None:
         self._require_project_admin()
+        properties = {"server_name": instance.name, "server_url": instance.url}
+        with transaction.atomic():
+            locked_instance = MCPGatewayServer.objects.for_team(self.team_id).select_for_update().get(pk=instance.pk)
+            MCPServerInstallation.objects.filter(team_id=self.team_id, gateway_server=locked_instance).update(
+                is_enabled=False, updated_at=timezone.now()
+            )
+            locked_instance.delete()
+
         report_user_action(
             cast(User, self.request.user),
             "mcp_gateway server removed",
-            properties={"server_name": instance.name, "server_url": instance.url},
+            properties=properties,
             team=self.team,
         )
-        # Installations survive (FK is SET_NULL): credentials aren't destroyed
-        # by de-registering, they just drop back to pre-gateway behavior.
-        instance.delete()
 
     def _resolve_scope(self, data: dict) -> tuple[str, User | None, MCPServiceAccount | None]:
         scope_type = data.get("scope_type", "team")
