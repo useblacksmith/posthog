@@ -1,4 +1,5 @@
 from posthog.test.base import BaseTest
+from unittest.mock import patch
 
 from parameterized import parameterized
 
@@ -154,6 +155,12 @@ class TestGetActiveInstallations(BaseTest):
 
 
 class TestGetInstallationsForSandbox(BaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = patch("products.mcp_store.backend.facade.api.is_builtin_agent_enforcement_enabled", return_value=True)
+        self.enforcement_enabled_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _create_installation(self, **kwargs) -> MCPServerInstallation:
         defaults: dict = {
             "team": self.team,
@@ -227,6 +234,27 @@ class TestGetInstallationsForSandbox(BaseTest):
         results = get_installations_for_sandbox(self.team.id, user_id=self.user.id)
 
         assert len(results) == 1
+
+    @parameterized.expand([("unstamped", None), ("stamped", "support")])
+    def test_agent_origin_resolves_legacy_until_gateway_flag_rollout(
+        self, _name: str, task_agent_key: str | None
+    ) -> None:
+        self.enforcement_enabled_mock.return_value = False
+        shared = self._create_installation(scope="shared", display_name="Shared")
+        personal = self._create_installation(
+            scope="personal", url="https://personal.example.com/mcp", display_name="Personal"
+        )
+
+        results = get_installations_for_sandbox(
+            self.team.id,
+            user_id=self.user.id,
+            include_personal=True,
+            task_origin="support_reply",
+            task_agent_key=task_agent_key,
+        )
+
+        assert {result.id for result in results} == {str(shared.id), str(personal.id)}
+        assert all(result.proxy_token is None for result in results)
 
     def test_built_in_agent_only_gets_its_explicitly_delegated_credential(self) -> None:
         account = self._enable_support_agent()

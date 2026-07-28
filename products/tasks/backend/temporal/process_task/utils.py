@@ -520,7 +520,9 @@ def get_user_mcp_server_configs(
     Unmapped tasks include shared team installations. Built-in agent tasks only
     include shared installations granted to that agent and never include a
     member's personal installations. A mapped origin without its persisted
-    agent marker gets no Store installations. For unmapped tasks,
+    agent marker gets no Store installations. Built-in agent handling is
+    gated per team on the ``mcp-gateway`` rollout flag; teams without it
+    resolve mapped origins like unmapped tasks. For unmapped tasks,
     ``include_personal`` includes the user's personal installations when a
     ``user_id`` is provided.
 

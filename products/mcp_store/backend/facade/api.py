@@ -16,6 +16,7 @@ from products.mcp_store.backend.agents import (
     create_gateway_agent_token,
     get_agent_product_availability,
     get_built_in_agent,
+    is_builtin_agent_enforcement_enabled,
 )
 from products.mcp_store.backend.facade.contracts import ActiveInstallationInfo
 from products.mcp_store.backend.models import MCPServerInstallation, MCPServiceAccountServerAccess
@@ -141,7 +142,9 @@ def get_installations_for_sandbox(
     delegated through its service-account grants, and only while the gateway
     server stays enabled for the team. Origin alone is not trusted:
     the persisted task agent key must match the origin mapping. A mapped origin
-    without that marker gets no MCP Store installations. Unmapped origins
+    without that marker gets no MCP Store installations. Built-in agent
+    handling is gated per team on the `mcp-gateway` rollout flag; teams
+    without it resolve mapped origins like unmapped tasks. Unmapped origins
     retain the legacy member behavior and optionally include the user's
     personal installations when ``include_personal`` is True and a ``user_id``
     is provided. When the user has a ready personal installation for the same
@@ -154,6 +157,10 @@ def get_installations_for_sandbox(
         )
 
         mapped_agent_key = built_in_agent_key_for_task_origin(task_origin or "")
+        if mapped_agent_key is not None and not is_builtin_agent_enforcement_enabled(team_id):
+            # Rollout gate: until the gateway ships for this team, built-in
+            # agent origins keep the legacy member resolution below.
+            mapped_agent_key = None
         if mapped_agent_key is not None and task_agent_key != mapped_agent_key:
             logger.warning(
                 "Refusing MCP installations for an unstamped built-in agent task",

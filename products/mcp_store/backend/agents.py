@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from django.conf import settings
 from django.core import signing
 from django.utils import timezone
 
 import structlog
+import posthoganalytics
 
 from posthog.models import Team
 from posthog.models.utils import hash_key_value
@@ -77,6 +79,41 @@ def built_in_agent_handles() -> tuple[str, ...]:
 
 def built_in_agent_key_for_task_origin(origin_product: str) -> BuiltInAgentKey | None:
     return _TASK_ORIGIN_TO_AGENT.get(origin_product)
+
+
+MCP_GATEWAY_FEATURE_FLAG = "mcp-gateway"
+
+
+def is_builtin_agent_enforcement_enabled(team_id: int) -> bool:
+    """Per-team rollout gate for built-in agent MCP enforcement.
+
+    Until `mcp-gateway` is enabled for the team's organization, built-in agent
+    tasks keep the legacy member resolution (team-shared installations and a
+    member-capable sandbox token). The Store facade and the sandbox token
+    minter both key off this check — they must agree, or a legacy-resolved
+    task gets a token the member proxy rejects. Fails closed to legacy so a
+    flag-evaluation hiccup behaves like a not-yet-rolled-out team.
+
+    DEBUG bypasses the flag: the analytics SDK is disabled in local dev, where
+    gateway work needs enforcement on to be exercisable at all.
+    """
+    if settings.DEBUG:
+        return True
+    try:
+        team = Team.objects.only("uuid", "organization_id").get(id=team_id)
+        return bool(
+            posthoganalytics.feature_enabled(
+                MCP_GATEWAY_FEATURE_FLAG,
+                str(team.uuid),
+                groups={"organization": str(team.organization_id)},
+                group_properties={"organization": {"id": str(team.organization_id)}},
+                only_evaluate_locally=False,
+                send_feature_flag_events=False,
+            )
+        )
+    except Exception:
+        logger.exception("mcp_gateway_enforcement_flag_check_failed", team_id=team_id)
+        return False
 
 
 def get_built_in_agent_spec(account: MCPServiceAccount) -> BuiltInAgentSpec | None:

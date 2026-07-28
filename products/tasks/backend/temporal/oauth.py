@@ -15,6 +15,7 @@ from posthog.temporal.oauth import (
     resolve_scopes,
 )
 
+from products.mcp_store.backend.facade.api import is_builtin_agent_enforcement_enabled
 from products.tasks.backend.exceptions import OAuthTokenError, TaskInvalidStateError
 from products.tasks.backend.logic.services.run_actor import (
     get_task_run_credential_user,
@@ -84,10 +85,13 @@ def create_oauth_access_token(
         Task.OriginProduct.POSTHOG_AI,
         Task.OriginProduct.SIGNALS_SCOUT,
         Task.OriginProduct.SUPPORT_REPLY,
-    }:
+    } and is_builtin_agent_enforcement_enabled(task.team_id):
         # This scope only removes access to the human MCP Store surface. Add it
         # even when a legacy task lacks trusted provenance so an old spoofed
         # origin fails closed instead of inheriting its creator's connections.
+        # Keyed to the same rollout flag as the Store facade: a legacy-resolved
+        # task needs a member-capable token, or every member-proxy call it was
+        # just granted would 403.
         token_options["include_mcp_builtin_agent_scope"] = True
     return create_oauth_access_token_for_user(actor, task.team_id, **token_options)
 
