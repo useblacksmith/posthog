@@ -14,15 +14,17 @@ import { SceneContent } from '~/layout/scenes/components/SceneContent'
 import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
 import { ProductKey } from '~/queries/schema/schema-general'
 
+import { FunctionTemplateEditor } from './FunctionTemplateEditor'
 import { messageTemplateLogic } from './messageTemplateLogic'
 import { MessageTemplateSceneLogicProps, messageTemplateSceneLogic } from './messageTemplateSceneLogic'
 
 export const scene: SceneExport<MessageTemplateSceneLogicProps> = {
     component: MessageTemplate,
     logic: messageTemplateSceneLogic,
-    paramsToProps: ({ params: { id }, searchParams: { messageId } }) => ({
+    paramsToProps: ({ params: { id }, searchParams: { messageId, type } }) => ({
         id: id || 'new',
         messageId,
+        type: type === 'function' ? 'function' : undefined,
     }),
     productKey: ProductKey.WORKFLOWS,
 }
@@ -119,28 +121,47 @@ export function MessageTemplate(props: MessageTemplateSceneLogicProps): JSX.Elem
                     </div>
 
                     <div className="p-3 space-y-2 rounded border flex-2 min-w-100 bg-surface-primary">
-                        <div className="flex justify-between items-center">
-                            <h3>Email template</h3>
-                            <Tooltip
-                                title="You can use Liquid templating in any email text field."
-                                docLink="https://liquidjs.com/filters/overview.html"
-                            >
-                                <span>
-                                    <IconCode fontSize={24} />
-                                </span>
-                            </Tooltip>
-                        </div>
-                        {messageLoading ? (
-                            <Spinner className="text-lg" />
+                        {template.type === 'function' ? (
+                            <>
+                                <div className="flex justify-between items-center">
+                                    <h3>Webhook or destination</h3>
+                                    <Tooltip
+                                        title="You can use Liquid templating in any text field."
+                                        docLink="https://liquidjs.com/filters/overview.html"
+                                    >
+                                        <span>
+                                            <IconCode fontSize={24} />
+                                        </span>
+                                    </Tooltip>
+                                </div>
+                                <FunctionTemplateEditor />
+                            </>
                         ) : (
-                            <EmailTemplater
-                                value={template?.content.email}
-                                onChange={(value) => setTemplateValue('content.email', value)}
-                                onChangeTemplating={(templating) =>
-                                    setTemplateValue('content.email.templating', templating)
-                                }
-                                type="native_email_template"
-                            />
+                            <>
+                                <div className="flex justify-between items-center">
+                                    <h3>Email template</h3>
+                                    <Tooltip
+                                        title="You can use Liquid templating in any email text field."
+                                        docLink="https://liquidjs.com/filters/overview.html"
+                                    >
+                                        <span>
+                                            <IconCode fontSize={24} />
+                                        </span>
+                                    </Tooltip>
+                                </div>
+                                {messageLoading ? (
+                                    <Spinner className="text-lg" />
+                                ) : (
+                                    <EmailTemplater
+                                        value={template?.content.email ?? null}
+                                        onChange={(value) => setTemplateValue('content.email', value)}
+                                        onChangeTemplating={(templating) =>
+                                            setTemplateValue('content.email.templating', templating)
+                                        }
+                                        type="native_email_template"
+                                    />
+                                )}
+                            </>
                         )}
                     </div>
                 </div>

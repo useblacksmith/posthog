@@ -6611,8 +6611,11 @@ const api = {
         },
     },
     messaging: {
-        async getTemplates(): Promise<PaginatedResponse<MessageTemplate>> {
-            return await new ApiRequest().messagingTemplates().get()
+        async getTemplates(params?: { type?: MessageTemplate['type'] }): Promise<PaginatedResponse<MessageTemplate>> {
+            return await new ApiRequest()
+                .messagingTemplates()
+                .withQueryString(toParams(params || {}))
+                .get()
         },
         async getTemplate(templateId: MessageTemplate['id']): Promise<MessageTemplate> {
             return await new ApiRequest().messagingTemplate(templateId).get()

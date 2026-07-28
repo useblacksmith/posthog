@@ -640,7 +640,7 @@ function NativeEmailTemplaterForm({
                         >
                             <div className="h-[80vh] overflow-auto">
                                 <iframe
-                                    srcDoc={previewTemplate?.content.email.html}
+                                    srcDoc={previewTemplate?.content.email?.html}
                                     sandbox=""
                                     title="Email template preview"
                                     className="w-full h-full border-0"
