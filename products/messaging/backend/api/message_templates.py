@@ -16,7 +16,7 @@ from posthog.api.routing import TeamAndOrgViewSetMixin
 from posthog.api.scoped_related_fields import TeamScopedPrimaryKeyRelatedField
 from posthog.api.shared import UserBasicSerializer
 
-from products.cdp.backend.models.hog_function_template import HogFunctionTemplate
+from products.cdp.backend.facade.models import HogFunctionTemplate
 from products.messaging.backend.api.design_operations import apply_design_operations
 from products.messaging.backend.api.design_validation import validate_design
 from products.messaging.backend.models.message_category import MessageCategory
@@ -226,6 +226,23 @@ class MessageTemplateSerializer(serializers.ModelSerializer):
         if isinstance(inputs, dict):
             for key in secret_keys:
                 inputs.pop(key, None)
+
+        # Mappings carry their own inputs and inputs_schema, so strip each one by its own schema.
+        mappings = function.get("mappings")
+        if isinstance(mappings, list):
+            for mapping in mappings:
+                if not isinstance(mapping, dict):
+                    continue
+                mapping_schemas = mapping.get("inputs_schema")
+                mapping_secret_keys = {
+                    schema["key"]
+                    for schema in (mapping_schemas if isinstance(mapping_schemas, list) else [])
+                    if isinstance(schema, dict) and schema.get("secret")
+                }
+                mapping_inputs = mapping.get("inputs")
+                if isinstance(mapping_inputs, dict):
+                    for key in mapping_secret_keys:
+                        mapping_inputs.pop(key, None)
 
     def create(self, validated_data: Any) -> Any:
         request = self.context["request"]
