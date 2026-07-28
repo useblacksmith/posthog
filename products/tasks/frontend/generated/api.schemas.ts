@@ -1503,7 +1503,7 @@ export interface TaskCreateApi {
     title_manually_set?: boolean
     /** Free-form description of the work to be done. Used as the prompt passed to the agent. */
     description?: string
-    /** PostHog product or surface that created this task (e.g. error_tracking, slack, user_created).
+    /** PostHog product or surface that created this task (e.g. error_tracking, slack, user_created). Origins reserved for server-created agents cannot be set through this API.
      *
      * * `onboarding` - Onboarding
      * * `error_tracking` - Error Tracking
@@ -1640,7 +1640,7 @@ export interface TaskWriteApi {
     title_manually_set?: boolean
     /** Free-form description of the work to be done. Used as the prompt passed to the agent. */
     description?: string
-    /** PostHog product or surface that created this task (e.g. error_tracking, slack, user_created).
+    /** PostHog product or surface that created this task (e.g. error_tracking, slack, user_created). Origins reserved for server-created agents cannot be set through this API.
      *
      * * `onboarding` - Onboarding
      * * `error_tracking` - Error Tracking
@@ -1762,7 +1762,7 @@ export interface PatchedTaskWriteApi {
     title_manually_set?: boolean
     /** Free-form description of the work to be done. Used as the prompt passed to the agent. */
     description?: string
-    /** PostHog product or surface that created this task (e.g. error_tracking, slack, user_created).
+    /** PostHog product or surface that created this task (e.g. error_tracking, slack, user_created). Origins reserved for server-created agents cannot be set through this API.
      *
      * * `onboarding` - Onboarding
      * * `error_tracking` - Error Tracking
