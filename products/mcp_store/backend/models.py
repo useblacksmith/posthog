@@ -36,13 +36,6 @@ SCOPE_CHOICES = [
     ("shared", "Shared"),
 ]
 
-# How a gateway server authenticates its callers: everyone rides one shared
-# credential, or each member connects their own account.
-GATEWAY_AUTH_MODE_CHOICES = [
-    ("individual", "Individual accounts"),
-    ("shared", "Shared credential"),
-]
-
 SERVICE_ACCOUNT_STATUS_CHOICES = [
     ("active", "Active"),
     ("paused", "Paused"),
@@ -289,14 +282,10 @@ class MCPGatewayServer(TeamScopedRootMixin, UUIDModel):
     url = models.URLField(max_length=2048)
     description = models.TextField(blank=True, default="")
     category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default="dev")
-    auth_mode = models.CharField(max_length=20, choices=GATEWAY_AUTH_MODE_CHOICES, default="individual")
     # Team-wide kill switch: when off, neither members nor agents can call the
     # server. Agent access additionally requires an explicit
     # MCPServiceAccountServerAccess grant.
     is_team_enabled = models.BooleanField(default=True)
-    # Only meaningful for shared-credential servers: whether members may also
-    # connect their own account on top of the shared one.
-    allow_personal_connections = models.BooleanField(default=True)
     template = models.ForeignKey(
         MCPServerTemplate, on_delete=models.SET_NULL, related_name="gateway_servers", null=True, blank=True
     )

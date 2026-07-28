@@ -1104,7 +1104,6 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         )
         assert access.installation == installation
         assert access.installation.scope == "personal"
-        assert server.auth_mode == "individual"
         assert (
             MCPToolPolicy.objects.for_team(self.team.id)
             .get(

@@ -93,10 +93,10 @@ function GatewayServerCard({ server }: { server: MCPGatewayServerApi }): JSX.Ele
     const { isAdmin, connectingServerId, canAddServers } = useValues(mcpGatewayLogic)
     const { connectServer } = useActions(mcpGatewayLogic)
 
-    const connected = Boolean(server.your_connection) || (server.auth_mode === 'shared' && !isAdmin)
+    const connected = Boolean(server.your_connection)
     const connecting = connectingServerId === server.id
     const disabled = !server.is_team_enabled
-    const canConnectIndividual = server.auth_mode === 'individual' && !connected
+    const canConnectIndividual = !connected
     const customConnectionDisabledReason =
         !server.template_id && !canAddServers
             ? 'Only project admins can connect custom servers for this team.'
@@ -120,7 +120,6 @@ function GatewayServerCard({ server }: { server: MCPGatewayServerApi }): JSX.Ele
                         {server.name}
                     </button>
                     {connected && <LemonTag type="success">Connected</LemonTag>}
-                    {isAdmin && server.auth_mode === 'shared' && <LemonTag type="muted">🔑 Shared</LemonTag>}
                     {isAdmin && disabled && <LemonTag type="muted">Off</LemonTag>}
                 </div>
                 <div className="text-sm text-secondary truncate">{server.description || server.url}</div>
@@ -296,17 +295,6 @@ function GatewayConnectionModal(): JSX.Element | null {
 function PeopleRow({ server }: { server: MCPGatewayServerApi }): JSX.Element {
     if (!server.is_team_enabled) {
         return <div className="text-xs text-secondary mt-1">Disabled — enable it in Team settings</div>
-    }
-    if (server.auth_mode === 'shared') {
-        return (
-            <div className="flex items-center gap-1 text-xs text-secondary mt-1">
-                {server.shared_credential?.managed_by && (
-                    <ProfilePicture user={toProfileUser(server.shared_credential.managed_by)} size="xs" />
-                )}
-                <span className="font-mono">{server.shared_credential?.managed_by?.email ?? 'shared credential'}</span>
-                <span>· everyone on the team</span>
-            </div>
-        )
     }
     const connections = server.connections ?? []
     const agentCount = (server.agents ?? []).length

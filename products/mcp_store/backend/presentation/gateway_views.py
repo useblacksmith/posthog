@@ -195,27 +195,11 @@ class GatewayYourConnectionSerializer(serializers.Serializer):
     """The requesting user's own connection to a gateway server."""
 
     installation_id = serializers.UUIDField(help_text="The caller's installation row for this server.")
-    scope = serializers.ChoiceField(
-        choices=["personal", "shared"], help_text="Whether the caller connects personally or via the shared credential."
-    )
     is_enabled = serializers.BooleanField(help_text="Per-connection switch — false when self-disabled.")
     pending_oauth = serializers.BooleanField(help_text="True when the OAuth round-trip has not completed yet.")
     needs_reauth = serializers.BooleanField(help_text="True when the stored token was invalidated and needs reauth.")
     last_used_at = serializers.DateTimeField(
         allow_null=True, help_text="When the caller last proxied a call through this connection."
-    )
-
-
-class GatewaySharedCredentialSerializer(serializers.Serializer):
-    """The admin-managed shared credential of a shared-auth server."""
-
-    installation_id = serializers.UUIDField(help_text="Shared installation row holding the credential.")
-    managed_by = UserBasicSerializer(allow_null=True, help_text="Admin who connected the shared credential.")
-    is_enabled = serializers.BooleanField(help_text="Whether the shared credential is enabled.")
-    pending_oauth = serializers.BooleanField(help_text="True when the shared credential has not finished OAuth.")
-    needs_reauth = serializers.BooleanField(help_text="True when the shared credential needs re-authentication.")
-    last_used_at = serializers.DateTimeField(
-        allow_null=True, help_text="When the shared credential last proxied a call."
     )
 
 
@@ -286,13 +270,10 @@ class MCPGatewayServerSerializer(serializers.ModelSerializer):
     created_by = UserBasicSerializer(read_only=True, help_text="Who registered the server.")
     tool_count = serializers.SerializerMethodField(help_text="Number of live tools known for this server.")
     connections = serializers.SerializerMethodField(
-        help_text="Members with a personal connection to this server. Only project admins receive this list."
+        help_text="Members with a connection to this server. Only project admins receive this list."
     )
     your_connection = serializers.SerializerMethodField(
         help_text="The requesting user's own connection, or null when not connected."
-    )
-    shared_credential = serializers.SerializerMethodField(
-        help_text="Shared credential details when auth_mode is shared, else null."
     )
     agents = serializers.SerializerMethodField(help_text="Agents this server is shared with.")
     revoked_user_ids = serializers.SerializerMethodField(
@@ -310,10 +291,8 @@ class MCPGatewayServerSerializer(serializers.ModelSerializer):
             "url",
             "description",
             "category",
-            "auth_mode",
             "template_auth_type",
             "is_team_enabled",
-            "allow_personal_connections",
             "icon_key",
             "icon_domain",
             "docs_url",
@@ -321,7 +300,6 @@ class MCPGatewayServerSerializer(serializers.ModelSerializer):
             "tool_count",
             "connections",
             "your_connection",
-            "shared_credential",
             "agents",
             "revoked_user_ids",
             "is_revoked_for_you",
@@ -335,9 +313,7 @@ class MCPGatewayServerSerializer(serializers.ModelSerializer):
             "url",
             "description",
             "category",
-            "auth_mode",
             "is_team_enabled",
-            "allow_personal_connections",
             "created_at",
             "updated_at",
         ]
@@ -358,11 +334,7 @@ class MCPGatewayServerSerializer(serializers.ModelSerializer):
     def get_connections(self, obj: MCPGatewayServer) -> list[dict[str, Any]]:
         if not self.context.get("is_admin"):
             return []
-        return [
-            _connection_payload(installation)
-            for installation in obj.installations.all()
-            if installation.scope == "personal"
-        ]
+        return [_connection_payload(installation) for installation in obj.installations.all()]
 
     @extend_schema_field(GatewayYourConnectionSerializer(allow_null=True))
     def get_your_connection(self, obj: MCPGatewayServer) -> dict[str, Any] | None:
@@ -370,31 +342,13 @@ class MCPGatewayServerSerializer(serializers.ModelSerializer):
         if request is None:
             return None
         own = [installation for installation in obj.installations.all() if installation.user_id == request.user.id]
-        # A personal connection wins over owning the shared credential.
+        # A personal row wins over a legacy team-shared row the user owns.
         own.sort(key=lambda installation: installation.scope != "personal")
         if not own:
             return None
         installation = own[0]
         return {
             "installation_id": installation.id,
-            "scope": installation.scope,
-            "is_enabled": installation.is_enabled,
-            "pending_oauth": _installation_pending_oauth(installation),
-            "needs_reauth": _installation_needs_reauth(installation),
-            "last_used_at": installation.last_used_at,
-        }
-
-    @extend_schema_field(GatewaySharedCredentialSerializer(allow_null=True))
-    def get_shared_credential(self, obj: MCPGatewayServer) -> dict[str, Any] | None:
-        if obj.auth_mode != "shared":
-            return None
-        shared = [installation for installation in obj.installations.all() if installation.scope == "shared"]
-        if not shared:
-            return None
-        installation = shared[0]
-        return {
-            "installation_id": installation.id,
-            "managed_by": UserBasicSerializer(installation.user).data if installation.user else None,
             "is_enabled": installation.is_enabled,
             "pending_oauth": _installation_pending_oauth(installation),
             "needs_reauth": _installation_needs_reauth(installation),
@@ -432,7 +386,7 @@ class MCPGatewayServerSerializer(serializers.ModelSerializer):
 class MCPGatewayServerUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = MCPGatewayServer
-        fields = ["name", "description", "category", "is_team_enabled", "allow_personal_connections"]
+        fields = ["name", "description", "category", "is_team_enabled"]
         extra_kwargs = {
             "name": {"required": False, "help_text": "Display name shown across the gateway."},
             "description": {"required": False, "help_text": "Short description shown on server cards."},
@@ -440,10 +394,6 @@ class MCPGatewayServerUpdateSerializer(serializers.ModelSerializer):
             "is_team_enabled": {
                 "required": False,
                 "help_text": "Whether the team can see and call the server. Turning it off also blocks agent access.",
-            },
-            "allow_personal_connections": {
-                "required": False,
-                "help_text": "For shared-credential servers: whether members may also connect their own account.",
             },
         }
 
@@ -895,7 +845,6 @@ class MCPGatewayServerViewSet(
             properties={
                 "server_name": server.name,
                 "is_team_enabled": server.is_team_enabled,
-                "allow_personal_connections": server.allow_personal_connections,
             },
             team=self.team,
         )

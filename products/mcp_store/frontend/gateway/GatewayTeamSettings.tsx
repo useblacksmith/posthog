@@ -163,11 +163,9 @@ export function GatewayTeamSettings(): JSX.Element {
                     {filteredServers.map((server) => (
                         <div key={server.id} className="flex items-center gap-3 p-2">
                             <ServerIcon iconDomain={server.icon_domain} serverUrl={server.url} size={28} />
-                            <div className="flex-1">
+                            <div className="flex-1 min-w-0">
                                 <div className="font-semibold">{server.name}</div>
-                                <div className="text-xs text-secondary">
-                                    {server.auth_mode === 'shared' ? 'Shared credential' : 'Individual accounts'}
-                                </div>
+                                <div className="text-xs text-secondary truncate">{server.url}</div>
                             </div>
                             <LemonSwitch
                                 checked={server.is_team_enabled}

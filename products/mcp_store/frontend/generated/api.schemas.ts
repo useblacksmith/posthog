@@ -362,17 +362,6 @@ export const MCPServerCategoryEnumApi = {
 } as const
 
 /**
- * * `individual` - Individual accounts
- * * `shared` - Shared credential
- */
-export type AuthModeEnumApi = (typeof AuthModeEnumApi)[keyof typeof AuthModeEnumApi]
-
-export const AuthModeEnumApi = {
-    Individual: 'individual',
-    Shared: 'shared',
-} as const
-
-/**
  * * `api_key` - API Key
  * * `oauth` - OAuth
  */
@@ -403,27 +392,11 @@ export interface GatewayConnectionApi {
 }
 
 /**
- * * `personal` - personal
- * * `shared` - shared
- */
-export type MCPInstallationScopeEnumApi = (typeof MCPInstallationScopeEnumApi)[keyof typeof MCPInstallationScopeEnumApi]
-
-export const MCPInstallationScopeEnumApi = {
-    Personal: 'personal',
-    Shared: 'shared',
-} as const
-
-/**
  * The requesting user's own connection to a gateway server.
  */
 export interface GatewayYourConnectionApi {
     /** The caller's installation row for this server. */
     installation_id: string
-    /** Whether the caller connects personally or via the shared credential.
-     *
-     * * `personal` - personal
-     * * `shared` - shared */
-    scope: MCPInstallationScopeEnumApi
     /** Per-connection switch — false when self-disabled. */
     is_enabled: boolean
     /** True when the OAuth round-trip has not completed yet. */
@@ -432,27 +405,6 @@ export interface GatewayYourConnectionApi {
     needs_reauth: boolean
     /**
      * When the caller last proxied a call through this connection.
-     * @nullable
-     */
-    last_used_at: string | null
-}
-
-/**
- * The admin-managed shared credential of a shared-auth server.
- */
-export interface GatewaySharedCredentialApi {
-    /** Shared installation row holding the credential. */
-    installation_id: string
-    /** Admin who connected the shared credential. */
-    managed_by: UserBasicApi | null
-    /** Whether the shared credential is enabled. */
-    is_enabled: boolean
-    /** True when the shared credential has not finished OAuth. */
-    pending_oauth: boolean
-    /** True when the shared credential needs re-authentication. */
-    needs_reauth: boolean
-    /**
-     * When the shared credential last proxied a call.
      * @nullable
      */
     last_used_at: string | null
@@ -503,14 +455,12 @@ export interface MCPGatewayServerApi {
     readonly url: string
     readonly description: string
     readonly category: MCPServerCategoryEnumApi
-    readonly auth_mode: AuthModeEnumApi
     /** Fixed authentication type for catalog templates. Null for custom servers, where members choose.
      *
      * * `api_key` - API Key
      * * `oauth` - OAuth */
     readonly template_auth_type: MCPAuthTypeEnumApi | null
     readonly is_team_enabled: boolean
-    readonly allow_personal_connections: boolean
     /** Deprecated brand icon key from the linked template. Empty for custom servers. */
     readonly icon_key: string
     /** Brand domain from the linked template. Empty for custom servers. */
@@ -524,12 +474,10 @@ export interface MCPGatewayServerApi {
     readonly template_id: string | null
     /** Number of live tools known for this server. */
     readonly tool_count: number
-    /** Members with a personal connection to this server. Only project admins receive this list. */
+    /** Members with a connection to this server. Only project admins receive this list. */
     readonly connections: readonly GatewayConnectionApi[]
     /** The requesting user's own connection, or null when not connected. */
     readonly your_connection: GatewayYourConnectionApi | null
-    /** Shared credential details when auth_mode is shared, else null. */
-    readonly shared_credential: GatewaySharedCredentialApi | null
     /** Agents this server is shared with. */
     readonly agents: readonly GatewayAgentAccessApi[]
     /** Ids of members whose access an admin has turned off. Only project admins receive this list. */
@@ -568,10 +516,8 @@ export interface MCPGatewayServerUpdateApi {
      * * `infra` - Infrastructure
      * * `productivity` - Productivity & Collaboration */
     category?: MCPServerCategoryEnumApi
-    /** Whether project members can see and call the server. Agent access is granted separately. */
+    /** Whether the team can see and call the server. Turning it off also blocks agent access. */
     is_team_enabled?: boolean
-    /** For shared-credential servers: whether members may also connect their own account. */
-    allow_personal_connections?: boolean
 }
 
 export interface PatchedMCPGatewayServerUpdateApi {
@@ -591,10 +537,8 @@ export interface PatchedMCPGatewayServerUpdateApi {
      * * `infra` - Infrastructure
      * * `productivity` - Productivity & Collaboration */
     category?: MCPServerCategoryEnumApi
-    /** Whether project members can see and call the server. Agent access is granted separately. */
+    /** Whether the team can see and call the server. Turning it off also blocks agent access. */
     is_team_enabled?: boolean
-    /** For shared-credential servers: whether members may also connect their own account. */
-    allow_personal_connections?: boolean
 }
 
 /**
@@ -966,6 +910,17 @@ export const InstallSourceEnumApi = {
     PosthogCode: 'posthog-code',
 } as const
 
+/**
+ * * `personal` - personal
+ * * `shared` - shared
+ */
+export type MCPInstallationScopeEnumApi = (typeof MCPInstallationScopeEnumApi)[keyof typeof MCPInstallationScopeEnumApi]
+
+export const MCPInstallationScopeEnumApi = {
+    Personal: 'personal',
+    Shared: 'shared',
+} as const
+
 export interface InstallCustomApi {
     /** @maxLength 200 */
     name: string
@@ -985,8 +940,6 @@ export interface InstallCustomApi {
     scope?: MCPInstallationScopeEnumApi
     /** Whether the server starts enabled for the whole team. Non-default values are admin-only. */
     team_enabled?: boolean
-    /** For shared-credential servers: whether members may also connect personal accounts. Admin-only. */
-    allow_personal?: boolean
     /** Service accounts to share the server with at install time. Available to members when team settings allow member-managed agent access. */
     agent_ids?: string[]
     /** In-app path to land back on after the OAuth round-trip. Must be a same-app relative path. */
@@ -1009,8 +962,6 @@ export interface InstallTemplateApi {
     scope?: MCPInstallationScopeEnumApi
     /** Whether the server starts enabled for the whole team. Non-default values are admin-only. */
     team_enabled?: boolean
-    /** For shared-credential servers: whether members may also connect personal accounts. Admin-only. */
-    allow_personal?: boolean
     /** Service accounts to share the server with at install time. Available to members when team settings allow member-managed agent access. */
     agent_ids?: string[]
     /** In-app path to land back on after the OAuth round-trip. Must be a same-app relative path. */

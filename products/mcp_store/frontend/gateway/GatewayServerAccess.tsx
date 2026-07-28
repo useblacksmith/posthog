@@ -15,12 +15,11 @@ export function GatewayAccessSection(): JSX.Element | null {
         allServersEnabledLoading,
         canManageAgentAccess,
         isAdmin,
-        personalConnectionsLoadingIds,
         serverEnabledLoadingIds,
         serviceAccounts,
         serviceAccountsLoading,
     } = useValues(mcpGatewayLogic)
-    const { toggleServerEnabled, toggleAllowPersonal, setAgentServerAccess } = useActions(mcpGatewayLogic)
+    const { toggleServerEnabled, setAgentServerAccess } = useActions(mcpGatewayLogic)
 
     if (!server || !canManageAgentAccess) {
         return null
@@ -39,9 +38,7 @@ export function GatewayAccessSection(): JSX.Element | null {
                             <div className="font-semibold">Available to the team</div>
                             <div className="text-sm text-secondary">
                                 {server.is_team_enabled
-                                    ? server.auth_mode === 'shared'
-                                        ? `Members use ${server.name} through the shared credential — nothing for them to set up.`
-                                        : `Members can connect their own ${server.name} account.`
+                                    ? `Members can connect their own ${server.name} account.`
                                     : `Turned off. Members and agents can't see or call ${server.name}.`}
                             </div>
                         </div>
@@ -53,47 +50,13 @@ export function GatewayAccessSection(): JSX.Element | null {
                         />
                     </div>
 
-                    {server.auth_mode === 'shared' && (
-                        <>
-                            <div className="border rounded p-3 flex items-center justify-between gap-3">
-                                <div>
-                                    <div className="font-mono text-sm">
-                                        {server.shared_credential?.managed_by?.email ?? 'shared credential'}
-                                    </div>
-                                    <div className="text-sm text-secondary">
-                                        Shared credential — managed by{' '}
-                                        {server.shared_credential?.managed_by?.first_name ?? 'an admin'}. Everyone on
-                                        the team calls {server.name} through this account.
-                                    </div>
-                                </div>
-                            </div>
-                            <div className="border rounded p-3 flex items-center justify-between gap-3">
-                                <div>
-                                    <div className="font-semibold">Personal connections</div>
-                                    <div className="text-sm text-secondary">
-                                        Let members authenticate their own {server.name} account on top of the shared
-                                        credential.
-                                    </div>
-                                </div>
-                                <LemonSwitch
-                                    checked={server.allow_personal_connections}
-                                    loading={personalConnectionsLoadingIds.has(server.id)}
-                                    aria-label={`${server.allow_personal_connections ? 'Disable' : 'Enable'} personal ${server.name} connections`}
-                                    onChange={(checked) => toggleAllowPersonal(server.id, checked)}
-                                />
-                            </div>
-                        </>
-                    )}
-
                     <div>
                         <div className="text-xs uppercase text-secondary font-semibold mb-1">
                             People connected · {connections.length}
                         </div>
                         {connections.length === 0 ? (
                             <div className="border border-dashed rounded p-3 text-sm text-secondary">
-                                {server.auth_mode === 'shared'
-                                    ? 'No one has connected a personal account — everyone uses the shared credential.'
-                                    : 'No one has connected yet.'}
+                                No one has connected yet.
                             </div>
                         ) : (
                             <div className="border rounded divide-y">
@@ -137,8 +100,7 @@ export function GatewayAccessSection(): JSX.Element | null {
                     <div className="border rounded divide-y">
                         {serviceAccounts.map((account) => {
                             const shared = account.server_ids.includes(server.id)
-                            const needsConnection =
-                                !shared && server.your_connection === null && server.shared_credential === null
+                            const needsConnection = !shared && server.your_connection === null
                             return (
                                 <div key={account.id} className="flex items-center gap-2 p-2">
                                     <div className="flex-1 min-w-0">

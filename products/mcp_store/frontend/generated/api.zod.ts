@@ -208,11 +208,7 @@ export const McpGatewayServersUpdateBody = /* @__PURE__ */ zod.object({
     is_team_enabled: zod
         .boolean()
         .optional()
-        .describe('Whether project members can see and call the server. Agent access is granted separately.'),
-    allow_personal_connections: zod
-        .boolean()
-        .optional()
-        .describe('For shared-credential servers: whether members may also connect their own account.'),
+        .describe('Whether the team can see and call the server. Turning it off also blocks agent access.'),
 })
 
 /**
@@ -240,11 +236,7 @@ export const McpGatewayServersPartialUpdateBody = /* @__PURE__ */ zod.object({
     is_team_enabled: zod
         .boolean()
         .optional()
-        .describe('Whether project members can see and call the server. Agent access is granted separately.'),
-    allow_personal_connections: zod
-        .boolean()
-        .optional()
-        .describe('For shared-credential servers: whether members may also connect their own account.'),
+        .describe('Whether the team can see and call the server. Turning it off also blocks agent access.'),
 })
 
 /**
@@ -413,7 +405,6 @@ export const mcpServerInstallationsInstallCustomCreateBodyInstallSourceDefault =
 export const mcpServerInstallationsInstallCustomCreateBodyPosthogCodeCallbackUrlDefault = ``
 export const mcpServerInstallationsInstallCustomCreateBodyScopeDefault = `personal`
 export const mcpServerInstallationsInstallCustomCreateBodyTeamEnabledDefault = true
-export const mcpServerInstallationsInstallCustomCreateBodyAllowPersonalDefault = true
 export const mcpServerInstallationsInstallCustomCreateBodyReturnPathDefault = ``
 
 export const McpServerInstallationsInstallCustomCreateBody = /* @__PURE__ */ zod.object({
@@ -442,10 +433,6 @@ export const McpServerInstallationsInstallCustomCreateBody = /* @__PURE__ */ zod
         .boolean()
         .default(mcpServerInstallationsInstallCustomCreateBodyTeamEnabledDefault)
         .describe('Whether the server starts enabled for the whole team. Non-default values are admin-only.'),
-    allow_personal: zod
-        .boolean()
-        .default(mcpServerInstallationsInstallCustomCreateBodyAllowPersonalDefault)
-        .describe('For shared-credential servers: whether members may also connect personal accounts. Admin-only.'),
     agent_ids: zod
         .array(zod.uuid())
         .optional()
@@ -463,7 +450,6 @@ export const mcpServerInstallationsInstallTemplateCreateBodyInstallSourceDefault
 export const mcpServerInstallationsInstallTemplateCreateBodyPosthogCodeCallbackUrlDefault = ``
 export const mcpServerInstallationsInstallTemplateCreateBodyScopeDefault = `personal`
 export const mcpServerInstallationsInstallTemplateCreateBodyTeamEnabledDefault = true
-export const mcpServerInstallationsInstallTemplateCreateBodyAllowPersonalDefault = true
 export const mcpServerInstallationsInstallTemplateCreateBodyReturnPathDefault = ``
 
 export const McpServerInstallationsInstallTemplateCreateBody = /* @__PURE__ */ zod.object({
@@ -487,10 +473,6 @@ export const McpServerInstallationsInstallTemplateCreateBody = /* @__PURE__ */ z
         .boolean()
         .default(mcpServerInstallationsInstallTemplateCreateBodyTeamEnabledDefault)
         .describe('Whether the server starts enabled for the whole team. Non-default values are admin-only.'),
-    allow_personal: zod
-        .boolean()
-        .default(mcpServerInstallationsInstallTemplateCreateBodyAllowPersonalDefault)
-        .describe('For shared-credential servers: whether members may also connect personal accounts. Admin-only.'),
     agent_ids: zod
         .array(zod.uuid())
         .optional()

@@ -83,17 +83,11 @@ def link_installation_to_gateway(installation: MCPServerInstallation, created_by
             "description": installation.description,
             "template": template,
             "category": template.category if template else "dev",
-            "auth_mode": "individual",
             "created_by": created_by,
         },
     )
 
     update_fields: list[str] = []
-    # A shared credential turns the whole registration into shared-auth mode;
-    # the reverse transition is explicit (see set_gateway_auth_mode).
-    if installation.scope == "shared" and server.auth_mode != "shared":
-        server.auth_mode = "shared"
-        update_fields.append("auth_mode")
     if template is not None and server.template_id is None:
         server.template = template
         update_fields.append("template")
@@ -107,42 +101,19 @@ def link_installation_to_gateway(installation: MCPServerInstallation, created_by
     return server
 
 
-def set_gateway_auth_mode(installation: MCPServerInstallation, mode: str) -> None:
-    """Flip the registration's auth mode (e.g. back to individual on unshare)."""
-    server = installation.gateway_server
-    if server is None:
-        return
-    if server.auth_mode != mode:
-        server.auth_mode = mode
-        server.save(update_fields=["auth_mode", "updated_at"])
-
-
 def installation_for_agent_grant(
     team_id: int, gateway_server: MCPGatewayServer, user_id: int
 ) -> MCPServerInstallation | None:
-    """Choose the credential delegated by an agent-access action.
-
-    A requesting user's personal connection is the natural meaning of "share
-    access". If they do not have one, an existing team-shared credential is a
-    valid fallback.
+    """Choose the credential delegated by an agent-access action: the
+    requesting user's own connection to the server. An agent never rides a
+    credential its granter didn't connect themselves.
     """
-    personal = (
+    return (
         MCPServerInstallation.objects.filter(
             team_id=team_id,
             gateway_server=gateway_server,
             user_id=user_id,
             scope="personal",
-        )
-        .order_by("created_at")
-        .first()
-    )
-    if personal is not None:
-        return personal
-    return (
-        MCPServerInstallation.objects.filter(
-            team_id=team_id,
-            gateway_server=gateway_server,
-            scope="shared",
         )
         .order_by("created_at")
         .first()

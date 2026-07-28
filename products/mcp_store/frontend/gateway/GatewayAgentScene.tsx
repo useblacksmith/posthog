@@ -102,8 +102,7 @@ export function GatewayAgentScene(): JSX.Element {
                     ) : (
                         allServers.map((server) => {
                             const shared = sharedServerIds.has(server.id)
-                            const needsConnection =
-                                !shared && server.your_connection === null && server.shared_credential === null
+                            const needsConnection = !shared && server.your_connection === null
                             return (
                                 <div key={server.id} className="flex items-center gap-3 p-2">
                                     <ServerIcon iconDomain={server.icon_domain} serverUrl={server.url} size={28} />

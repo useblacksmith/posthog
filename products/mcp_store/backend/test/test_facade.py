@@ -172,7 +172,6 @@ class TestGetInstallationsForSandbox(BaseTest):
             team_id=self.team.id,
             name=name,
             url=url,
-            auth_mode="shared",
             is_team_enabled=is_team_enabled,
         )
 

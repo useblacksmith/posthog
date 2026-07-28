@@ -80,11 +80,9 @@ export function GatewayMemberScene(): JSX.Element {
                                 <div className="text-xs text-secondary">
                                     {isRevoked
                                         ? `Access turned off for ${member.user.first_name}`
-                                        : server.auth_mode === 'shared'
-                                          ? 'Shared credential — pre-authorized'
-                                          : isConnected
-                                            ? 'Connected'
-                                            : 'Not connected yet'}
+                                        : isConnected
+                                          ? 'Connected'
+                                          : 'Not connected yet'}
                                 </div>
                             </div>
                             {isConnected && (

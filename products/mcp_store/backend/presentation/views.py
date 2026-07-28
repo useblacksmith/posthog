@@ -43,7 +43,7 @@ from posthog.rate_limit import (
 from posthog.security.url_validation import is_url_allowed
 
 from ..agents import sync_built_in_agents
-from ..gateway import link_installation_to_gateway, members_can_manage_agent_access, set_gateway_auth_mode
+from ..gateway import link_installation_to_gateway, members_can_manage_agent_access
 from ..models import (
     APPROVAL_STATES,
     MCPMemberServerRevocation,
@@ -372,11 +372,6 @@ class InstallCustomSerializer(serializers.Serializer):
         default=True,
         help_text="Whether the server starts enabled for the whole team. Non-default values are admin-only.",
     )
-    allow_personal = serializers.BooleanField(
-        required=False,
-        default=True,
-        help_text="For shared-credential servers: whether members may also connect personal accounts. Admin-only.",
-    )
     agent_ids = serializers.ListField(
         child=serializers.UUIDField(),
         required=False,
@@ -422,11 +417,6 @@ class InstallTemplateSerializer(serializers.Serializer):
         required=False,
         default=True,
         help_text="Whether the server starts enabled for the whole team. Non-default values are admin-only.",
-    )
-    allow_personal = serializers.BooleanField(
-        required=False,
-        default=True,
-        help_text="For shared-credential servers: whether members may also connect personal accounts. Admin-only.",
     )
     agent_ids = serializers.ListField(
         child=serializers.UUIDField(),
@@ -522,8 +512,6 @@ class MCPServerInstallationToolSerializer(serializers.ModelSerializer):
         context = cast(PolicyContext | None, self.context.get("policy_context"))
         if context is None:
             return None
-        if self.context.get("policy_scope_type") == "team":
-            return context.resolve_team(obj.tool_name, obj.description or "")
         return context.resolve(obj.tool_name, obj.description or "")
 
     @extend_schema_field(serializers.ChoiceField(choices=APPROVAL_STATES))
@@ -541,9 +529,7 @@ class MCPServerInstallationToolSerializer(serializers.ModelSerializer):
         resolved = self._resolved_policy(obj)
         if resolved is None:
             return False
-        return resolved.locked or (
-            self.context.get("policy_scope_type") != "team" and resolved.team_state == "do_not_use"
-        )
+        return resolved.locked or resolved.team_state == "do_not_use"
 
     @extend_schema_field(serializers.CharField())
     def get_decided_by(self, obj: MCPServerInstallationTool) -> str:
@@ -624,10 +610,7 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
             gateway_server=gateway_server,
             installation=installation,
         )
-        return {
-            "policy_context": policy_context,
-            "policy_scope_type": "team" if installation.scope == "shared" else "member",
-        }
+        return {"policy_context": policy_context}
 
     def check_object_permissions(self, request: Request, obj: Any) -> None:
         # Enforce owner-only mutation of shared rows centrally so every action in
@@ -698,7 +681,7 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
 
     @staticmethod
     def _wants_team_gateway_options(data: dict) -> bool:
-        return not data.get("team_enabled", True) or not data.get("allow_personal", True)
+        return not data.get("team_enabled", True)
 
     def _validate_gateway_options(self, data: dict) -> None:
         """Validate team-level options and agent grants before creating rows."""
@@ -735,16 +718,9 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
 
         if self._wants_team_gateway_options(data):
             team_enabled = data.get("team_enabled", True)
-            allow_personal = data.get("allow_personal", True)
-            update_fields: list[str] = []
             if server.is_team_enabled != team_enabled:
                 server.is_team_enabled = team_enabled
-                update_fields.append("is_team_enabled")
-            if server.allow_personal_connections != allow_personal:
-                server.allow_personal_connections = allow_personal
-                update_fields.append("allow_personal_connections")
-            if update_fields:
-                server.save(update_fields=[*update_fields, "updated_at"])
+                server.save(update_fields=["is_team_enabled", "updated_at"])
 
         for account in accounts_by_id.values():
             MCPServiceAccountServerAccess.objects.for_team(self.team_id).update_or_create(
@@ -947,8 +923,6 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
                 {"detail": "The owner already has a personal installation for this server."},
                 status=status.HTTP_409_CONFLICT,
             )
-
-        set_gateway_auth_mode(installation, "individual")
 
         report_user_action(
             request.user,
@@ -1725,7 +1699,7 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
             return Response({"detail": "Tool not found"}, status=status.HTTP_404_NOT_FOUND)
 
         new_state = request.validated_data["approval_state"]
-        if installation.scope != "shared" and installation.gateway_server_id:
+        if installation.gateway_server_id:
             policy_context = PolicyContext(
                 team_id=self.team_id,
                 caller=GatewayCaller(kind="member", user_id=cast(User, request.user).id),
@@ -1769,20 +1743,17 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
         self, installation: MCPServerInstallation, tool_name: str, new_state: str
     ) -> None:
         """Keep the gateway policy row in sync with the legacy per-installation
-        approval toggle: a shared installation's states are the team default, a
-        personal installation's states are the owner's member scope."""
+        approval toggle: an installation's states are the owner's member scope."""
         if not installation.gateway_server_id:
             return
-        if installation.scope == "shared":
-            scope_kwargs: dict[str, Any] = {"scope_type": "team", "scope_user": None, "scope_service_account": None}
-        else:
-            scope_kwargs = {"scope_type": "member", "scope_user": installation.user, "scope_service_account": None}
         policy_team_id = resolve_effective_team_id(installation.team_id)
         MCPToolPolicy.objects.for_team(policy_team_id, canonical=True).update_or_create(
             team_id=policy_team_id,
             gateway_server_id=installation.gateway_server_id,
             tool_name=tool_name,
-            **scope_kwargs,
+            scope_type="member",
+            scope_user=installation.user,
+            scope_service_account=None,
             defaults={"state": new_state},
         )
 

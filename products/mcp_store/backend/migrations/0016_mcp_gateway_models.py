@@ -55,19 +55,7 @@ class Migration(migrations.Migration):
                         max_length=20,
                     ),
                 ),
-                (
-                    "auth_mode",
-                    models.CharField(
-                        choices=[
-                            ("individual", "Individual accounts"),
-                            ("shared", "Shared credential"),
-                        ],
-                        default="individual",
-                        max_length=20,
-                    ),
-                ),
                 ("is_team_enabled", models.BooleanField(default=True)),
-                ("allow_personal_connections", models.BooleanField(default=True)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
                 (

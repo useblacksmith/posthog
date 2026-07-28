@@ -39,14 +39,10 @@ def backfill_gateway_servers(apps, schema_editor):
                     "description": installation.description,
                     "template": installation.template,
                     "category": installation.template.category if installation.template else "dev",
-                    "auth_mode": "individual",
                     "created_by": installation.user,
                 },
             )
             servers_by_key[key] = server
-        if installation.scope == "shared" and server.auth_mode != "shared":
-            server.auth_mode = "shared"
-            server.save(update_fields=["auth_mode"])
         installation.gateway_server = server
         pending_links.append(installation)
         if len(pending_links) >= 500:

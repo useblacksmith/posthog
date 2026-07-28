@@ -104,7 +104,6 @@ export interface mcpGatewayLogicValues {
     members: GatewayMemberSummaryApi[]
     membersLoading: boolean
     membersOffset: number
-    personalConnectionsLoadingIds: Set<string>
     ruleEnabledLoadingIds: Set<string>
     rules: MCPOrgRuleApi[]
     rulesLoading: boolean
@@ -338,16 +337,6 @@ export interface mcpGatewayLogicActions {
     toggleAccountStatusComplete: (accountId: string) => {
         accountId: string
     }
-    toggleAllowPersonal: (
-        serverId: string,
-        allowed: boolean
-    ) => {
-        allowed: boolean
-        serverId: string
-    }
-    toggleAllowPersonalComplete: (serverId: string) => {
-        serverId: string
-    }
     toggleRuleEnabled: (
         ruleId: string,
         enabled: boolean
@@ -419,8 +408,6 @@ export const mcpGatewayLogic = kea<mcpGatewayLogicType>([
         setCategoryFilter: (category: string | null) => ({ category }),
         toggleServerEnabled: (serverId: string, enabled: boolean) => ({ serverId, enabled }),
         toggleServerEnabledComplete: (serverId: string) => ({ serverId }),
-        toggleAllowPersonal: (serverId: string, allowed: boolean) => ({ serverId, allowed }),
-        toggleAllowPersonalComplete: (serverId: string) => ({ serverId }),
         removeServer: (serverId: string) => ({ serverId }),
         connectServer: (serverId: string) => ({ serverId }),
         openConnectionModal: (serverId: string, authType: InstallCustomAuthTypeEnumApi) => ({
@@ -621,17 +608,6 @@ export const mcpGatewayLogic = kea<mcpGatewayLogicType>([
                 },
             },
         ],
-        personalConnectionsLoadingIds: [
-            new Set<string>(),
-            {
-                toggleAllowPersonal: (state, { serverId }) => new Set(state).add(serverId),
-                toggleAllowPersonalComplete: (state, { serverId }) => {
-                    const next = new Set(state)
-                    next.delete(serverId)
-                    return next
-                },
-            },
-        ],
         memberServerAccessLoadingKeys: [
             new Set<string>(),
             {
@@ -781,31 +757,6 @@ export const mcpGatewayLogic = kea<mcpGatewayLogicType>([
                 )
             } finally {
                 actions.toggleServerEnabledComplete(serverId)
-            }
-        },
-        toggleAllowPersonal: async ({ serverId, allowed }) => {
-            const server = values.servers.find((candidate) => candidate.id === serverId)
-            try {
-                await mcpGatewayServersPartialUpdate(currentProjectId(), serverId, {
-                    allow_personal_connections: allowed,
-                })
-                actions.loadServersSuccess(
-                    values.servers.map((candidate) =>
-                        candidate.id === serverId ? { ...candidate, allow_personal_connections: allowed } : candidate
-                    )
-                )
-                actions.loadServers()
-                lemonToast[allowed ? 'success' : 'info'](
-                    allowed
-                        ? `Members can now connect personal ${server?.name ?? ''} accounts`
-                        : `Personal connections turned off for ${server?.name ?? 'this server'}`
-                )
-            } catch (error: unknown) {
-                lemonToast.error(
-                    errorDetail(error) ?? `Could not update personal connections for ${server?.name ?? 'this server'}`
-                )
-            } finally {
-                actions.toggleAllowPersonalComplete(serverId)
             }
         },
         setAllServersEnabled: async ({ enabled }) => {
