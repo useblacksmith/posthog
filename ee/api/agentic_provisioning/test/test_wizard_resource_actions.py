@@ -11,7 +11,6 @@ from parameterized import parameterized
 
 from posthog.models.integration import GitHubInstallationAccess, GitHubIntegration, GitHubUserAuthorization, Integration
 from posthog.models.team.team import Team
-from posthog.models.user import OnboardingSkippedReason
 from posthog.models.user_integration import UserIntegration
 
 from ee.api.agentic_provisioning import GITHUB_GRANT_CACHE_PREFIX, github_grants
@@ -89,24 +88,10 @@ class TestWizardResourceActions(ProvisioningTestBase):
 
         self.user.refresh_from_db()
         self.team.refresh_from_db()
-        assert self.user.onboarding_skipped_reason == OnboardingSkippedReason.PROVISIONED
-        assert self.user.onboarding_skipped_at is not None
-        assert self.user.onboarding_skipped_organization_id == self.team.organization_id
-        assert self.team.completed_snippet_onboarding is True
-
-    def test_github_integration_does_not_touch_onboarding_for_claimed_user(self):
-        grant = self._grant()
-        with (
-            patch.object(GitHubIntegration, "verify_user_installation_access", return_value=True),
-            patch.object(GitHubIntegration, "fetch_installation_access", return_value=_installation_access()),
-        ):
-            response = self._post_github_integration(
-                self.team.id, {"grant_id": grant.grant_id, "installation_id": INSTALLATION_ID}
-            )
-        assert response.status_code == 200
-        self.user.refresh_from_db()
         assert self.user.onboarding_skipped_reason is None
         assert self.user.onboarding_skipped_at is None
+        assert self.user.onboarding_skipped_organization_id is None
+        assert self.team.completed_snippet_onboarding is False
 
     def test_github_integration_unknown_grant_returns_404(self):
         response = self._post_github_integration(
@@ -130,11 +115,9 @@ class TestWizardResourceActions(ProvisioningTestBase):
         assert response.status_code == 200
         assert response.json()["github_integration"]["already_linked"] is True
 
-        # Onboarding flags are re-applied on the already-linked retry so a crash between
-        # grant consumption and the flag write doesn't leave the account routed into onboarding.
         self.user.refresh_from_db()
-        assert self.user.onboarding_skipped_reason == OnboardingSkippedReason.PROVISIONED
-        assert self.user.onboarding_skipped_at is not None
+        assert self.user.onboarding_skipped_reason is None
+        assert self.user.onboarding_skipped_at is None
 
     @parameterized.expand(
         [
