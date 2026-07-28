@@ -585,7 +585,7 @@ class MCPServiceAccountSerializer(serializers.ModelSerializer):
             "last_active_at": {"help_text": "When the agent last made a call through the gateway."},
         }
 
-    @extend_schema_field(serializers.ChoiceField(choices=["support", "scout", "posthog_ai"]))
+    @extend_schema_field(serializers.ChoiceField(choices=["support", "scout"]))
     def get_agent_key(self, obj: MCPServiceAccount) -> str:
         spec = get_built_in_agent_spec(obj)
         return spec.key if spec is not None else ""

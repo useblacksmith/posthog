@@ -12,7 +12,6 @@ from products.tasks.backend.temporal.oauth import create_oauth_access_token, cre
 @pytest.mark.parametrize(
     ("origin_product", "application"),
     [
-        (Task.OriginProduct.POSTHOG_AI, "posthog_ai"),
         (Task.OriginProduct.SIGNALS_SCOUT, "array"),
         (Task.OriginProduct.SUPPORT_REPLY, "array"),
     ],
@@ -40,6 +39,29 @@ def test_built_in_agent_origins_use_restricted_oauth_scope(
         scopes="read_only",
         application=application,
         include_mcp_builtin_agent_scope=True,
+    )
+
+
+@patch("products.tasks.backend.temporal.oauth.is_builtin_agent_enforcement_enabled", return_value=True)
+@patch("products.tasks.backend.temporal.oauth._create_oauth_access_token_for_user", return_value="token")
+def test_posthog_ai_task_keeps_member_token_and_posthog_ai_oauth_application(
+    mock_create: MagicMock,
+    mock_enforcement: MagicMock,
+) -> None:
+    task = MagicMock(
+        id="task-id",
+        created_by=MagicMock(),
+        team_id=123,
+        origin_product=Task.OriginProduct.POSTHOG_AI,
+    )
+
+    assert create_oauth_access_token(task) == "token"
+
+    mock_create.assert_called_once_with(
+        task.created_by,
+        123,
+        scopes="read_only",
+        application="posthog_ai",
     )
 
 
@@ -101,7 +123,6 @@ def test_oauth_token_can_disable_task_creator_fallback() -> None:
 @pytest.mark.parametrize(
     ("origin_product", "agent_key"),
     [
-        (Task.OriginProduct.POSTHOG_AI, "posthog_ai"),
         (Task.OriginProduct.SIGNALS_SCOUT, "scout"),
         (Task.OriginProduct.SUPPORT_REPLY, "support"),
     ],

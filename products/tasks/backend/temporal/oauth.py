@@ -82,7 +82,6 @@ def create_oauth_access_token(
         "application": _oauth_application_for_task(task),
     }
     if task.origin_product in {
-        Task.OriginProduct.POSTHOG_AI,
         Task.OriginProduct.SIGNALS_SCOUT,
         Task.OriginProduct.SUPPORT_REPLY,
     } and is_builtin_agent_enforcement_enabled(task.team_id):

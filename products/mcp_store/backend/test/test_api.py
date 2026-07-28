@@ -950,10 +950,10 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         membership.level = OrganizationMembership.Level.MEMBER
         membership.save()
 
-    def _active_posthog_ai_account(self) -> MCPServiceAccount:
+    def _active_scout_account(self) -> MCPServiceAccount:
         self.organization.is_ai_data_processing_approved = True
         self.organization.save(update_fields=["is_ai_data_processing_approved"])
-        return next(agent for agent in sync_built_in_agents(self.team) if agent.handle == "posthog-ai")
+        return next(agent for agent in sync_built_in_agents(self.team) if agent.handle == "posthog-scout")
 
     @staticmethod
     def _agent_client(account: MCPServiceAccount, token: str | None = None) -> APIClient:
@@ -995,11 +995,11 @@ class TestMCPServiceAccountAPI(APIBaseTest):
 
         assert response.status_code == status.HTTP_200_OK
         results = response.json()["results"]
-        assert [agent["agent_key"] for agent in results] == ["support", "scout", "posthog_ai"]
-        assert [agent["handle"] for agent in results] == ["posthog-support", "posthog-scout", "posthog-ai"]
+        assert [agent["agent_key"] for agent in results] == ["support", "scout"]
+        assert [agent["handle"] for agent in results] == ["posthog-support", "posthog-scout"]
         assert all(agent["product_enabled"] is False for agent in results)
         assert all(agent["status"] == "active" for agent in results)
-        assert MCPServiceAccount.objects.for_team(self.team.id).count() == 3
+        assert MCPServiceAccount.objects.for_team(self.team.id).count() == 2
 
     def test_list_reconciles_legacy_built_in_agent_handles(self) -> None:
         self._make_admin()
@@ -1366,7 +1366,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     def test_product_availability_does_not_mutate_manual_pause_state(self, _mock_is_limited) -> None:
         self._make_admin()
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         assert account.status == "active"
 
         self.organization.is_ai_data_processing_approved = False
@@ -1399,7 +1399,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         self.organization.is_ai_data_processing_approved = True
         self.organization.save(update_fields=["is_ai_data_processing_approved"])
         mock_is_limited.return_value = False
-        account = next(agent for agent in sync_built_in_agents(self.team) if agent.handle == "posthog-ai")
+        account = next(agent for agent in sync_built_in_agents(self.team) if agent.handle == "posthog-scout")
         token = create_gateway_agent_token(account)
         assert resolve_gateway_agent_token(token) == account
 
@@ -1413,7 +1413,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
 
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     def test_agent_endpoint_rejects_tampered_signed_token(self, _mock_is_limited) -> None:
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         token = create_gateway_agent_token(account)
         tampered_token = f"{token[:-1]}{'a' if token[-1] != 'a' else 'b'}"
 
@@ -1423,7 +1423,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
 
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     def test_agent_endpoint_rejects_expired_signed_token(self, _mock_is_limited) -> None:
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         client = self._agent_client(account)
 
         with patch(
@@ -1436,7 +1436,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
 
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     def test_agent_endpoint_throttles_last_active_updates(self, _mock_is_limited) -> None:
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         client = self._agent_client(account)
         recent_active_at = timezone.now()
         MCPServiceAccount.objects.for_team(self.team.id).filter(pk=account.pk).update(last_active_at=recent_active_at)
@@ -1460,7 +1460,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
 
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     def test_agent_endpoint_rechecks_pause_and_product_availability_after_mint(self, _mock_is_limited) -> None:
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         token = create_gateway_agent_token(account)
         client = self._agent_client(account, token)
 
@@ -1491,9 +1491,12 @@ class TestMCPServiceAccountAPI(APIBaseTest):
     ) -> None:
         self.organization.is_ai_data_processing_approved = True
         self.organization.save(update_fields=["is_ai_data_processing_approved"])
+        self.team.conversations_enabled = True
+        self.team.conversations_settings = {"ai_suggestions_enabled": True}
+        self.team.save(update_fields=["conversations_enabled", "conversations_settings"])
         accounts = sync_built_in_agents(self.team)
-        primary_account = next(account for account in accounts if account.handle == "posthog-ai")
-        secondary_account = next(account for account in accounts if account.handle == "posthog-scout")
+        primary_account = next(account for account in accounts if account.handle == "posthog-scout")
+        secondary_account = next(account for account in accounts if account.handle == "posthog-support")
         primary_client = self._agent_client(primary_account)
         secondary_client = self._agent_client(secondary_account)
         cache.clear()
@@ -1527,7 +1530,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     @patch("products.mcp_store.backend.presentation.agent_views.proxy_mcp_request")
     def test_agent_proxy_hides_servers_outside_its_grant_set(self, scenario: str, mock_proxy, _mock_is_limited) -> None:
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         server_team = self.team
         if scenario == "cross_team":
             server_team = self.organization.teams.create(name="Other gateway team")
@@ -1557,7 +1560,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     @patch("products.mcp_store.backend.presentation.agent_views.proxy_mcp_request")
     def test_agent_proxy_rejects_server_disabled_for_team(self, mock_proxy, _mock_is_limited) -> None:
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         server = MCPGatewayServer.objects.for_team(self.team.id).create(
             team=self.team,
             name="Killed",
@@ -1597,7 +1600,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
     def test_agent_grant_enforces_agent_scope_policy(
         self, mock_http_client, _mock_is_url_allowed, _mock_is_limited
     ) -> None:
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         server = MCPGatewayServer.objects.for_team(self.team.id).create(
             team=self.team,
             name="Agent policy",
@@ -1654,7 +1657,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         self.organization.is_ai_data_processing_approved = True
         self.organization.save(update_fields=["is_ai_data_processing_approved"])
         catalog_response = self.client.get(self._api_url())
-        posthog_ai = next(agent for agent in catalog_response.json()["results"] if agent["agent_key"] == "posthog_ai")
+        scout = next(agent for agent in catalog_response.json()["results"] if agent["agent_key"] == "scout")
         granted_server = MCPGatewayServer.objects.for_team(self.team.id).create(
             team=self.team,
             name="Agent only",
@@ -1696,13 +1699,13 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         )
 
         grant_response = self.client.post(
-            self._api_url(f"{posthog_ai['id']}/access/"),
+            self._api_url(f"{scout['id']}/access/"),
             data={"gateway_server_id": str(granted_server.id), "enabled": True},
             format="json",
         )
         assert grant_response.status_code == status.HTTP_200_OK
         access = MCPServiceAccountServerAccess.objects.for_team(self.team.id).get(
-            service_account_id=posthog_ai["id"],
+            service_account_id=scout["id"],
             gateway_server=granted_server,
         )
         assert access.installation == personal_installation
@@ -1717,7 +1720,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
             }
         ]
 
-        account = MCPServiceAccount.objects.for_team(self.team.id).get(id=posthog_ai["id"])
+        account = MCPServiceAccount.objects.for_team(self.team.id).get(id=scout["id"])
         agent_client = APIClient()
         agent_client.credentials(HTTP_AUTHORIZATION=f"Bearer {create_gateway_agent_token(account)}")
         dormant_response = agent_client.get("/api/mcp_store/gateway/servers/")
@@ -1734,7 +1737,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         assert [tool["name"] for tool in response.json()["results"][0]["tools"]] == ["personal_tool"]
 
         revoke_response = self.client.post(
-            self._api_url(f"{posthog_ai['id']}/access/"),
+            self._api_url(f"{scout['id']}/access/"),
             data={"gateway_server_id": str(granted_server.id), "enabled": False},
             format="json",
         )
@@ -1747,7 +1750,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
 
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     def test_agent_catalog_query_count_does_not_grow_with_accessible_servers(self, _mock_is_limited) -> None:
-        account = self._active_posthog_ai_account()
+        account = self._active_scout_account()
         client = self._agent_client(account)
 
         def grant_server(index: int) -> MCPGatewayServer:
@@ -1820,7 +1823,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         self.organization.is_ai_data_processing_approved = True
         self.organization.save(update_fields=["is_ai_data_processing_approved"])
         catalog = self.client.get(self._api_url()).json()["results"]
-        account = next(agent for agent in catalog if agent["agent_key"] == "posthog_ai")
+        account = next(agent for agent in catalog if agent["agent_key"] == "scout")
         server = MCPGatewayServer.objects.for_team(self.team.id).create(
             team=self.team,
             name="Restricted",

@@ -19,7 +19,7 @@ from .models import MCPServiceAccount
 
 logger = structlog.get_logger(__name__)
 
-BuiltInAgentKey = Literal["support", "scout", "posthog_ai"]
+BuiltInAgentKey = Literal["support", "scout"]
 
 GATEWAY_AGENT_TOKEN_PREFIX = "mcp_gw_"
 GATEWAY_AGENT_TOKEN_SALT = "mcp_store.gateway_agent"
@@ -53,12 +53,6 @@ BUILT_IN_AGENTS: tuple[BuiltInAgentSpec, ...] = (
         description="Proactively investigates your product and reports useful findings.",
         handle="posthog-scout",
     ),
-    BuiltInAgentSpec(
-        key="posthog_ai",
-        name="PostHog AI",
-        description="Helps your team analyze data and make changes across PostHog.",
-        handle="posthog-ai",
-    ),
 )
 
 _SPEC_BY_KEY = {spec.key: spec for spec in BUILT_IN_AGENTS}
@@ -67,7 +61,6 @@ _SPEC_BY_HANDLE = {spec.handle: spec for spec in BUILT_IN_AGENTS}
 _TASK_ORIGIN_TO_AGENT: dict[str, BuiltInAgentKey] = {
     "support_reply": "support",
     "signals_scout": "scout",
-    "posthog_ai": "posthog_ai",
 }
 # Signal report tasks may be created through the public Tasks API, so they
 # remain member-scoped instead of inheriting Scout's MCP grants.
@@ -141,7 +134,6 @@ def get_agent_product_availability(team: Team, agent_key: BuiltInAgentKey) -> Ag
 
     quota_resource = {
         "scout": QuotaResource.SIGNALS_CREDITS,
-        "posthog_ai": QuotaResource.AI_CREDITS,
     }.get(agent_key)
     quota_limited = False
     if quota_resource is not None:
@@ -159,10 +151,9 @@ def get_agent_product_availability(team: Team, agent_key: BuiltInAgentKey) -> Ag
                 exc_info=True,
             )
     if quota_limited:
-        product_name = "Signals" if agent_key == "scout" else "PostHog AI"
         return AgentProductAvailability(
             enabled=False,
-            disabled_reason=f"Increase your {product_name} credits limit in Billing to use this agent.",
+            disabled_reason="Increase your Signals credits limit in Billing to use this agent.",
         )
 
     return AgentProductAvailability(enabled=True, disabled_reason="")

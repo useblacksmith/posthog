@@ -8810,7 +8810,6 @@ export namespace Schemas {
     export const AgentKeyEnum = {
       Support: 'support',
       Scout: 'scout',
-      PosthogAi: 'posthog_ai',
     } as const;
 
     export interface AgentListenResponse {
