@@ -97,9 +97,11 @@ class MCPGatewayAgentViewSet(viewsets.ViewSet):
     throttle_classes = [MCPGatewayAgentBurstThrottle, MCPGatewayAgentSustainedThrottle]
 
     def _accessible_server_access(self, account: MCPServiceAccount) -> list[MCPServiceAccountServerAccess]:
+        # The admin kill switch overrides grants: a server turned off for the
+        # team disappears from the agent catalog like it does for members.
         return list(
             MCPServiceAccountServerAccess.objects.for_team(account.team_id)
-            .filter(service_account=account)
+            .filter(service_account=account, gateway_server__is_team_enabled=True)
             .select_related("gateway_server__template", "installation")
             .order_by("gateway_server__name")
         )
@@ -195,6 +197,12 @@ class MCPGatewayAgentViewSet(viewsets.ViewSet):
                 status=404,
             )
         server = access.gateway_server
+        if not server.is_team_enabled:
+            return HttpResponse(
+                '{"error": "Server is disabled for this team"}',
+                content_type="application/json",
+                status=403,
+            )
         installation = installation_for_agent_access(access)
         if installation is None:
             return HttpResponse(

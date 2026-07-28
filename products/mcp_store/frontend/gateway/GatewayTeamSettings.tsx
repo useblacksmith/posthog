@@ -156,8 +156,8 @@ export function GatewayTeamSettings(): JSX.Element {
                     </div>
                 </div>
                 <div className="text-sm text-secondary">
-                    Every server is available to team members by default. Agent access is managed separately. Disable
-                    everything to curate up from zero, or switch off individual servers.
+                    Every server is available to the team by default. Switching a server off blocks members and agents
+                    alike. Disable everything to curate up from zero, or switch off individual servers.
                 </div>
                 <div className="border rounded divide-y">
                     {filteredServers.map((server) => (
@@ -172,7 +172,7 @@ export function GatewayTeamSettings(): JSX.Element {
                             <LemonSwitch
                                 checked={server.is_team_enabled}
                                 loading={allServersEnabledLoading || serverEnabledLoadingIds.has(server.id)}
-                                aria-label={`${server.is_team_enabled ? 'Turn off' : 'Turn on'} ${server.name} for team members`}
+                                aria-label={`${server.is_team_enabled ? 'Turn off' : 'Turn on'} ${server.name} for the team`}
                                 onChange={(checked) => toggleServerEnabled(server.id, checked)}
                             />
                         </div>

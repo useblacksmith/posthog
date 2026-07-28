@@ -36,19 +36,19 @@ export function GatewayAccessSection(): JSX.Element | null {
                 <>
                     <div className="border rounded p-3 flex items-center justify-between gap-3">
                         <div>
-                            <div className="font-semibold">Available to team members</div>
+                            <div className="font-semibold">Available to the team</div>
                             <div className="text-sm text-secondary">
                                 {server.is_team_enabled
                                     ? server.auth_mode === 'shared'
                                         ? `Members use ${server.name} through the shared credential — nothing for them to set up.`
                                         : `Members can connect their own ${server.name} account.`
-                                    : `Turned off — members can't see or call ${server.name}.`}
+                                    : `Turned off. Members and agents can't see or call ${server.name}.`}
                             </div>
                         </div>
                         <LemonSwitch
                             checked={server.is_team_enabled}
                             loading={allServersEnabledLoading || serverEnabledLoadingIds.has(server.id)}
-                            aria-label={`${server.is_team_enabled ? 'Turn off' : 'Turn on'} ${server.name} for team members`}
+                            aria-label={`${server.is_team_enabled ? 'Turn off' : 'Turn on'} ${server.name} for the team`}
                             onChange={(checked) => toggleServerEnabled(server.id, checked)}
                         />
                     </div>

@@ -1513,9 +1513,46 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         mock_proxy.assert_not_called()
 
     @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
+    @patch("products.mcp_store.backend.presentation.agent_views.proxy_mcp_request")
+    def test_agent_proxy_rejects_server_disabled_for_team(self, mock_proxy, _mock_is_limited) -> None:
+        account = self._active_posthog_ai_account()
+        server = MCPGatewayServer.objects.for_team(self.team.id).create(
+            team=self.team,
+            name="Killed",
+            url="https://mcp.killed.example.com/mcp",
+            is_team_enabled=False,
+        )
+        installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            display_name="Shared agent credential",
+            url=server.url,
+            auth_type="api_key",
+            sensitive_configuration={"api_key": "secret"},
+            scope="shared",
+            gateway_server=server,
+        )
+        MCPServiceAccountServerAccess.objects.for_team(self.team.id).create(
+            team=self.team,
+            service_account=account,
+            gateway_server=server,
+            installation=installation,
+            granted_by=self.user,
+        )
+
+        response = self._agent_client(account).post(
+            f"/api/mcp_store/gateway/servers/{server.id}/proxy/",
+            data={"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        mock_proxy.assert_not_called()
+
+    @patch("products.mcp_store.backend.agents.is_team_limited", return_value=False)
     @patch("products.mcp_store.backend.proxy.is_url_allowed", return_value=(True, None))
     @patch("products.mcp_store.backend.proxy.httpx.Client")
-    def test_agent_grant_works_with_member_access_off_and_still_enforces_policy(
+    def test_agent_grant_enforces_agent_scope_policy(
         self, mock_http_client, _mock_is_url_allowed, _mock_is_limited
     ) -> None:
         account = self._active_posthog_ai_account()
@@ -1523,7 +1560,6 @@ class TestMCPServiceAccountAPI(APIBaseTest):
             team=self.team,
             name="Agent policy",
             url="https://mcp.agent-policy.example.com/mcp",
-            is_team_enabled=False,
         )
         installation = MCPServerInstallation.objects.create(
             team=self.team,
@@ -1571,7 +1607,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         assert response.json()["error"]["code"] == -32002
         mock_http_client.assert_not_called()
 
-    def test_explicit_agent_grant_is_independent_of_team_member_access(self) -> None:
+    def test_agent_grant_on_disabled_server_stays_dormant_until_team_enabled(self) -> None:
         self._make_admin()
         self.organization.is_ai_data_processing_approved = True
         self.organization.save(update_fields=["is_ai_data_processing_approved"])
@@ -1642,6 +1678,13 @@ class TestMCPServiceAccountAPI(APIBaseTest):
         account = MCPServiceAccount.objects.for_team(self.team.id).get(id=posthog_ai["id"])
         agent_client = APIClient()
         agent_client.credentials(HTTP_AUTHORIZATION=f"Bearer {create_gateway_agent_token(account)}")
+        dormant_response = agent_client.get("/api/mcp_store/gateway/servers/")
+
+        assert dormant_response.status_code == status.HTTP_200_OK
+        assert dormant_response.json()["results"] == []
+
+        granted_server.is_team_enabled = True
+        granted_server.save(update_fields=["is_team_enabled"])
         response = agent_client.get("/api/mcp_store/gateway/servers/")
 
         assert response.status_code == status.HTTP_200_OK

@@ -138,7 +138,8 @@ def get_installations_for_sandbox(
 
     Generic tasks retain the legacy team-shared installation behavior. A
     server-stamped built-in agent task gets only the credentials explicitly
-    delegated through its service-account grants. Origin alone is not trusted:
+    delegated through its service-account grants, and only while the gateway
+    server stays enabled for the team. Origin alone is not trusted:
     the persisted task agent key must match the origin mapping. A mapped origin
     without that marker gets no MCP Store installations. Unmapped origins
     retain the legacy member behavior and optionally include the user's
@@ -187,7 +188,9 @@ def get_installations_for_sandbox(
                     for installation_id, gateway_server_id in access_rows
                     if installation_id is not None
                 }
-                candidates = list(base_queryset.filter(id__in=bound_servers))
+                # The admin kill switch overrides grants: a server turned off
+                # for the team is withheld from agents too.
+                candidates = list(base_queryset.filter(id__in=bound_servers, gateway_server__is_team_enabled=True))
                 installations = [
                     installation
                     for installation in candidates

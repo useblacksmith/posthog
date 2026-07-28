@@ -290,8 +290,9 @@ class MCPGatewayServer(TeamScopedRootMixin, UUIDModel):
     description = models.TextField(blank=True, default="")
     category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default="dev")
     auth_mode = models.CharField(max_length=20, choices=GATEWAY_AUTH_MODE_CHOICES, default="individual")
-    # Team-member availability. Agent access is controlled independently by
-    # explicit MCPServiceAccountServerAccess grants.
+    # Team-wide kill switch: when off, neither members nor agents can call the
+    # server. Agent access additionally requires an explicit
+    # MCPServiceAccountServerAccess grant.
     is_team_enabled = models.BooleanField(default=True)
     # Only meaningful for shared-credential servers: whether members may also
     # connect their own account on top of the shared one.

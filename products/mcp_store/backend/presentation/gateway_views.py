@@ -439,7 +439,7 @@ class MCPGatewayServerUpdateSerializer(serializers.ModelSerializer):
             "category": {"required": False, "help_text": "Catalog category used for filter chips."},
             "is_team_enabled": {
                 "required": False,
-                "help_text": "Whether project members can see and call the server. Agent access is granted separately.",
+                "help_text": "Whether the team can see and call the server. Turning it off also blocks agent access.",
             },
             "allow_personal_connections": {
                 "required": False,

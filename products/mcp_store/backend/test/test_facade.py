@@ -11,6 +11,7 @@ from products.mcp_store.backend.models import (
     MCPGatewayServer,
     MCPServerInstallation,
     MCPServerTemplate,
+    MCPServiceAccount,
     MCPServiceAccountServerAccess,
 )
 
@@ -175,6 +176,16 @@ class TestGetInstallationsForSandbox(BaseTest):
             is_team_enabled=is_team_enabled,
         )
 
+    def _enable_support_agent(self) -> MCPServiceAccount:
+        self.organization.is_ai_data_processing_approved = True
+        self.organization.save(update_fields=["is_ai_data_processing_approved"])
+        self.team.conversations_enabled = True
+        self.team.conversations_settings = {"ai_suggestions_enabled": True}
+        self.team.save(update_fields=["conversations_enabled", "conversations_settings"])
+        account = get_built_in_agent(self.team.id, "support")
+        assert account is not None
+        return account
+
     def test_shared_always_returned(self) -> None:
         shared = self._create_installation(scope="shared", display_name="Shared Server")
 
@@ -219,15 +230,10 @@ class TestGetInstallationsForSandbox(BaseTest):
         assert len(results) == 1
 
     def test_built_in_agent_only_gets_its_explicitly_delegated_credential(self) -> None:
-        self.organization.is_ai_data_processing_approved = True
-        self.organization.save(update_fields=["is_ai_data_processing_approved"])
-        self.team.conversations_enabled = True
-        self.team.conversations_settings = {"ai_suggestions_enabled": True}
-        self.team.save(update_fields=["conversations_enabled", "conversations_settings"])
+        account = self._enable_support_agent()
         granted_server = self._create_gateway_server(
             name="Granted",
             url="https://granted.example.com/mcp",
-            is_team_enabled=False,
         )
         ungranted_server = self._create_gateway_server(
             name="Ungranted",
@@ -251,8 +257,6 @@ class TestGetInstallationsForSandbox(BaseTest):
             url=ungranted_server.url,
             display_name="Ungranted",
         )
-        account = get_built_in_agent(self.team.id, "support")
-        assert account is not None
         MCPServiceAccountServerAccess.objects.for_team(self.team.id).create(
             team_id=self.team.id,
             service_account=account,
@@ -316,11 +320,7 @@ class TestGetInstallationsForSandbox(BaseTest):
         assert mismatched_results == []
 
     def test_built_in_agent_does_not_fall_back_after_delegated_credential_is_deleted(self) -> None:
-        self.organization.is_ai_data_processing_approved = True
-        self.organization.save(update_fields=["is_ai_data_processing_approved"])
-        self.team.conversations_enabled = True
-        self.team.conversations_settings = {"ai_suggestions_enabled": True}
-        self.team.save(update_fields=["conversations_enabled", "conversations_settings"])
+        account = self._enable_support_agent()
         server = self._create_gateway_server(
             name="Delegated",
             url="https://delegated.example.com/mcp",
@@ -337,8 +337,6 @@ class TestGetInstallationsForSandbox(BaseTest):
             url=server.url,
             display_name="Delegated",
         )
-        account = get_built_in_agent(self.team.id, "support")
-        assert account is not None
         access = MCPServiceAccountServerAccess.objects.for_team(self.team.id).create(
             team_id=self.team.id,
             service_account=account,
@@ -351,6 +349,37 @@ class TestGetInstallationsForSandbox(BaseTest):
 
         access.refresh_from_db()
         assert access.installation_id is None
+        assert (
+            get_installations_for_sandbox(
+                self.team.id,
+                task_origin="support_reply",
+                task_agent_key="support",
+            )
+            == []
+        )
+
+    def test_built_in_agent_blocked_when_admin_disables_server_for_team(self) -> None:
+        account = self._enable_support_agent()
+        server = self._create_gateway_server(name="Granted", url="https://granted.example.com/mcp")
+        delegated = self._create_installation(scope="personal", gateway_server=server, url=server.url)
+        MCPServiceAccountServerAccess.objects.for_team(self.team.id).create(
+            team_id=self.team.id,
+            service_account=account,
+            gateway_server=server,
+            installation=delegated,
+            granted_by=self.user,
+        )
+
+        results = get_installations_for_sandbox(
+            self.team.id,
+            task_origin="support_reply",
+            task_agent_key="support",
+        )
+        assert [result.id for result in results] == [str(delegated.id)]
+
+        server.is_team_enabled = False
+        server.save(update_fields=["is_team_enabled"])
+
         assert (
             get_installations_for_sandbox(
                 self.team.id,
