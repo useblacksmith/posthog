@@ -76,7 +76,7 @@ export interface gatewayServerLogicActions {
         payload?: any
         serviceAccounts: MCPServiceAccountApi[]
     } // mcpGatewayLogic
-    loadToolPolicies: () => any
+    loadToolPolicies: (_: void) => void
     loadToolPoliciesFailure: (
         error: string,
         errorObject?: any
@@ -86,10 +86,10 @@ export interface gatewayServerLogicActions {
     }
     loadToolPoliciesSuccess: (
         toolPolicies: ResolvedToolPolicyApi[],
-        payload?: any
+        payload?: void
     ) => {
         toolPolicies: ResolvedToolPolicyApi[]
-        payload?: any
+        payload?: void
     }
     setAllTools: ({ state }: { state: MCPToolApprovalStateEnumApi }) => {
         state: MCPToolApprovalStateEnumApi
@@ -199,13 +199,14 @@ export const gatewayServerLogic = kea<gatewayServerLogicType>([
         toolPolicies: [
             [] as ResolvedToolPolicyApi[],
             {
-                loadToolPolicies: async () => {
+                loadToolPolicies: async (_: void, breakpoint) => {
                     const scope = values.scope
                     const response = await mcpGatewayServersToolsRetrieve(currentProjectId(), props.id, {
                         scope_type: scope.scopeType,
                         scope_user_id: scope.scopeUserId,
                         scope_service_account_id: scope.scopeServiceAccountId,
                     })
+                    breakpoint()
                     return response.results
                 },
                 setToolPolicy: async ({

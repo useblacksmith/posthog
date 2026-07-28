@@ -181,27 +181,36 @@ class PolicyContext:
         *,
         team_id: int,
         caller: GatewayCaller,
-        gateway_server: MCPGatewayServer,
+        gateway_server: MCPGatewayServer | None = None,
+        gateway_server_id: UUID | None = None,
         installation: MCPServerInstallation | None = None,
+        legacy_rows: dict[str, str] | None = None,
         _preloaded: _PolicyInputs | None = None,
     ) -> None:
+        if gateway_server is not None:
+            gateway_server_id = gateway_server.id
+        if gateway_server_id is None:
+            raise ValueError("PolicyContext requires a gateway server or gateway server ID")
+
         self.team_id = team_id
         self.caller = caller
         self.gateway_server = gateway_server
+        self.gateway_server_id = gateway_server_id
 
         audience = "members" if caller.kind == "member" else "agents"
         # for_team: policy resolution also runs outside request scope (Max,
         # the agent proxy), where the fail-closed manager has no context.
-        self._rules = (
-            tuple(
-                MCPOrgRule.objects.for_team(team_id).filter(
+        if _preloaded is None:
+            canonical_team_id = resolve_effective_team_id(team_id)
+            self._rules = tuple(
+                MCPOrgRule.objects.for_team(canonical_team_id, canonical=True).filter(
                     enabled=True,
                     applies_to__in=("everyone", audience),
                 )
             )
-            if _preloaded is None
-            else _preloaded.rules
-        )
+        else:
+            canonical_team_id = team_id
+            self._rules = _preloaded.rules
 
         policy_scope = Q(scope_type="team")
         if caller.kind == "member" and caller.user_id is not None:
@@ -209,7 +218,9 @@ class PolicyContext:
         elif caller.kind == "agent" and caller.service_account_id is not None:
             policy_scope |= Q(scope_type="agent", scope_service_account_id=caller.service_account_id)
         policies: Iterable[MCPToolPolicy] = (
-            MCPToolPolicy.objects.for_team(team_id).filter(policy_scope, gateway_server=gateway_server)
+            MCPToolPolicy.objects.for_team(canonical_team_id, canonical=True).filter(
+                policy_scope, gateway_server_id=gateway_server_id
+            )
             if _preloaded is None
             else _preloaded.policies
         )
@@ -236,14 +247,14 @@ class PolicyContext:
         if _preloaded is not None:
             self.preset = _preloaded.preset
         else:
-            config = TeamMCPGatewayConfig.objects.for_team(team_id).first()
+            config = TeamMCPGatewayConfig.objects.for_team(canonical_team_id, canonical=True).first()
             if config is None:
                 self.preset = ""
             else:
                 self.preset = config.member_default_preset if caller.kind == "member" else config.agent_default_preset
 
-        self._legacy_rows: dict[str, str] = {}
-        if installation is not None and caller.kind == "member":
+        self._legacy_rows = dict(legacy_rows or {}) if caller.kind == "member" else {}
+        if legacy_rows is None and installation is not None and caller.kind == "member":
             for row in installation.tools.filter(removed_at__isnull=True).values("tool_name", "approval_state"):
                 self._legacy_rows[row["tool_name"]] = row["approval_state"]
 

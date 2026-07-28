@@ -374,18 +374,22 @@ def _write_audit_events(
 ) -> None:
     """Best-effort audit trail — a failed insert must never break the proxy."""
     try:
-        for tool_name, decision in entries:
-            MCPAuditEvent(
-                team_id=installation.team_id,
-                gateway_server=gateway_server,
-                installation=installation,
-                actor_user_id=caller.user_id,
-                actor_service_account_id=caller.service_account_id,
-                actor_label=actor_label,
-                server_name=gateway_server.name,
-                tool_name=tool_name,
-                decision=decision,
-            ).save()
+        MCPAuditEvent.objects.for_team(gateway_server.team_id, canonical=True).bulk_create(
+            [
+                MCPAuditEvent(
+                    team_id=gateway_server.team_id,
+                    gateway_server=gateway_server,
+                    installation=installation,
+                    actor_user_id=caller.user_id,
+                    actor_service_account_id=caller.service_account_id,
+                    actor_label=actor_label,
+                    server_name=gateway_server.name,
+                    tool_name=tool_name,
+                    decision=decision,
+                )
+                for tool_name, decision in entries
+            ]
+        )
         if any(decision in ("auto", "approved") for _, decision in entries):
             MCPServerInstallation.objects.filter(pk=installation.pk).update(last_used_at=timezone.now())
     except Exception:

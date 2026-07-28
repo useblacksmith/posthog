@@ -1,5 +1,7 @@
 import { MakeLogicType, actions, connect, kea, path, reducers, selectors } from 'kea'
-import { actionToUrl, urlToAction } from 'kea-router'
+import { actionToUrl, router, urlToAction } from 'kea-router'
+
+import { lemonToast } from '@posthog/lemon-ui'
 
 import { urls } from 'scenes/urls'
 
@@ -59,17 +61,31 @@ export const mcpGatewaySceneLogic = kea<mcpGatewaySceneLogicType>([
     actionToUrl(({ values }) => ({
         setTab: () => (values.activeTab === 'servers' ? urls.mcpGateway() : urls.mcpGatewayTab(values.activeTab)),
     })),
-    urlToAction(({ actions, values }) => ({
-        [urls.mcpGateway()]: () => {
-            if (values.activeTab !== 'servers') {
-                actions._setTab('servers')
+    urlToAction(({ actions, values }) => {
+        const handleOAuthCallback = (searchParams: Record<string, unknown>): void => {
+            if (searchParams.oauth_complete === 'true') {
+                lemonToast.success('Server connected')
+                router.actions.replace(router.values.location.pathname)
+            } else if (searchParams.oauth_error) {
+                lemonToast.error('OAuth authorization failed')
+                router.actions.replace(router.values.location.pathname)
             }
-        },
-        [urls.mcpGatewayTab(':tab')]: ({ tab }) => {
-            const next = (ADMIN_TABS.includes(tab as GatewayTab) ? tab : 'servers') as GatewayTab
-            if (next !== values.activeTab) {
-                actions._setTab(next)
-            }
-        },
-    })),
+        }
+
+        return {
+            [urls.mcpGateway()]: (_, searchParams) => {
+                handleOAuthCallback(searchParams ?? {})
+                if (values.activeTab !== 'servers') {
+                    actions._setTab('servers')
+                }
+            },
+            [urls.mcpGatewayTab(':tab')]: ({ tab }, searchParams) => {
+                handleOAuthCallback(searchParams ?? {})
+                const next = (ADMIN_TABS.includes(tab as GatewayTab) ? tab : 'servers') as GatewayTab
+                if (next !== values.activeTab) {
+                    actions._setTab(next)
+                }
+            },
+        }
+    }),
 ])

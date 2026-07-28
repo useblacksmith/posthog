@@ -986,7 +986,7 @@ class TestMCPServiceAccountAPI(APIBaseTest):
     @ALLOW_URL
     def test_member_can_delegate_a_personal_credential_during_install(self, _mock_is_url_allowed) -> None:
         self._make_member()
-        account = sync_built_in_agents(self.team)[0]
+        accounts = sync_built_in_agents(self.team)
         install_url = "https://mcp.personal-agent-grant.example.com/mcp"
 
         response = self.client.post(
@@ -997,19 +997,20 @@ class TestMCPServiceAccountAPI(APIBaseTest):
                 "auth_type": "api_key",
                 "api_key": "secret",
                 "scope": "personal",
-                "agent_ids": [str(account.id)],
+                "agent_ids": [str(account.id) for account in accounts],
             },
             format="json",
         )
 
         assert response.status_code == status.HTTP_201_CREATED
         installation = MCPServerInstallation.objects.get(team=self.team, url=install_url)
-        access = MCPServiceAccountServerAccess.objects.for_team(self.team.id).get(
-            service_account=account,
+        accesses = MCPServiceAccountServerAccess.objects.for_team(self.team.id).filter(
+            service_account__in=accounts,
             gateway_server=installation.gateway_server,
         )
+        access_rows = set(accesses.values_list("service_account_id", "installation_id"))
         assert installation.scope == "personal"
-        assert access.installation == installation
+        assert access_rows == {(account.id, installation.id) for account in accounts}
 
     @ALLOW_URL
     def test_install_rejects_member_agent_grant_when_team_setting_is_off(self, _mock_is_url_allowed) -> None:

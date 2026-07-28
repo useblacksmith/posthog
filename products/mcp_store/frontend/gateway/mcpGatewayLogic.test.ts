@@ -1,13 +1,17 @@
 import { MOCK_DEFAULT_BASIC_USER, MOCK_DEFAULT_TEAM } from '~/lib/api.mock'
 
+import { lemonToast } from '@posthog/lemon-ui'
+
 import { initKeaTests } from '~/test/init'
 import { expectLogic } from '~/test/keaTestUtils'
 
 import {
+    mcpGatewayConfigApplyPresetCreate,
     mcpGatewayConfigList,
     mcpGatewayMembersList,
     mcpGatewayRulesList,
     mcpGatewayServersList,
+    mcpGatewayServersPartialUpdate,
     mcpGatewayServiceAccountsList,
     mcpServerInstallationsInstallCustomCreate,
     mcpServerInstallationsInstallTemplateCreate,
@@ -16,19 +20,27 @@ import type { GatewayMemberSummaryApi, MCPGatewayServerApi } from '../generated/
 import { GATEWAY_MEMBERS_PAGE_SIZE, mcpGatewayLogic } from './mcpGatewayLogic'
 
 jest.mock('../generated/api', () => ({
+    mcpGatewayConfigApplyPresetCreate: jest.fn(),
     mcpGatewayConfigList: jest.fn(),
     mcpGatewayMembersList: jest.fn(),
     mcpGatewayRulesList: jest.fn(),
     mcpGatewayServersList: jest.fn(),
+    mcpGatewayServersPartialUpdate: jest.fn(),
     mcpGatewayServiceAccountsList: jest.fn(),
     mcpServerInstallationsInstallCustomCreate: jest.fn(),
     mcpServerInstallationsInstallTemplateCreate: jest.fn(),
 }))
 
+const mockApplyPreset = mcpGatewayConfigApplyPresetCreate as jest.MockedFunction<
+    typeof mcpGatewayConfigApplyPresetCreate
+>
 const mockConfigList = mcpGatewayConfigList as jest.MockedFunction<typeof mcpGatewayConfigList>
 const mockMembersList = mcpGatewayMembersList as jest.MockedFunction<typeof mcpGatewayMembersList>
 const mockRulesList = mcpGatewayRulesList as jest.MockedFunction<typeof mcpGatewayRulesList>
 const mockServersList = mcpGatewayServersList as jest.MockedFunction<typeof mcpGatewayServersList>
+const mockServersPartialUpdate = mcpGatewayServersPartialUpdate as jest.MockedFunction<
+    typeof mcpGatewayServersPartialUpdate
+>
 const mockServiceAccountsList = mcpGatewayServiceAccountsList as jest.MockedFunction<
     typeof mcpGatewayServiceAccountsList
 >
@@ -45,6 +57,10 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
         resolve = resolvePromise
     })
     return { promise, resolve }
+}
+
+function apiError(detail: string): Error & { detail: string } {
+    return Object.assign(new Error(detail), { detail })
 }
 
 function gatewayServer(overrides: Partial<MCPGatewayServerApi>): MCPGatewayServerApi {
@@ -120,6 +136,7 @@ describe('mcpGatewayLogic', () => {
 
     afterEach(() => {
         logic.unmount()
+        jest.restoreAllMocks()
     })
 
     it('connects a custom API-key server with the selected auth type and credential', async () => {
@@ -198,6 +215,74 @@ describe('mcpGatewayLogic', () => {
 
         pendingInstall.resolve({ redirect_url: '' })
         await expectLogic(logic).toFinishAllListeners()
+    })
+
+    it('surfaces access update failures and clears the loading state', async () => {
+        const server = gatewayServer({ is_team_enabled: true })
+        const toast = jest.spyOn(lemonToast, 'error')
+        mockServersPartialUpdate.mockRejectedValue(apiError('You cannot update this server.'))
+        logic.actions.loadServersSuccess([server])
+
+        await expectLogic(logic, () => {
+            logic.actions.toggleServerEnabled(server.id, false)
+        }).toFinishAllListeners()
+
+        expect(toast).toHaveBeenCalledWith('You cannot update this server.')
+        expect(logic.values.serverEnabledLoadingIds).toEqual(new Set())
+        expect(logic.values.servers[0].is_team_enabled).toBe(true)
+    })
+
+    it('reloads servers after a bulk update partially fails', async () => {
+        const updatedServer = gatewayServer({ id: 'updated-server', is_team_enabled: true })
+        const failedServer = gatewayServer({ id: 'failed-server', is_team_enabled: true })
+        const slowUpdate = deferred<Awaited<ReturnType<typeof mcpGatewayServersPartialUpdate>>>()
+        mockServersPartialUpdate.mockImplementation((_projectId, serverId) => {
+            if (serverId === failedServer.id) {
+                return Promise.reject(apiError('Could not update every server.'))
+            }
+            return slowUpdate.promise
+        })
+        mockServersList.mockClear()
+        mockServersList.mockResolvedValue({
+            count: 2,
+            results: [{ ...updatedServer, is_team_enabled: false }, failedServer],
+        })
+        logic.actions.loadServersSuccess([updatedServer, failedServer])
+
+        logic.actions.setAllServersEnabled(false)
+        await Promise.resolve()
+
+        expect(mockServersPartialUpdate).toHaveBeenCalledTimes(2)
+        expect(mockServersList).not.toHaveBeenCalled()
+        expect(logic.values.allServersEnabledLoading).toBe(true)
+        slowUpdate.resolve({ ...updatedServer, is_team_enabled: false })
+        await expectLogic(logic).toFinishAllListeners()
+        expect(mockServersList).toHaveBeenCalledTimes(1)
+        expect(logic.values.allServersEnabledLoading).toBe(false)
+        expect(logic.values.servers).toEqual([{ ...updatedServer, is_team_enabled: false }, failedServer])
+    })
+
+    it('tracks preset updates by audience and uses the mutation response', async () => {
+        const pendingPreset = deferred<Awaited<ReturnType<typeof mcpGatewayConfigApplyPresetCreate>>>()
+        const updatedConfig = {
+            ...logic.values.config!,
+            member_default_preset: 'block' as const,
+        }
+        mockApplyPreset.mockReturnValue(pendingPreset.promise)
+        const configLoadCalls = mockConfigList.mock.calls.length
+
+        logic.actions.applyPreset('members', 'block')
+        logic.actions.applyPreset('agents', 'allow')
+
+        expect(logic.values.applyingPresetByAudience).toEqual({ members: 'block' })
+        expect(mockApplyPreset).toHaveBeenCalledTimes(1)
+
+        pendingPreset.resolve(updatedConfig)
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.applyingPresetByAudience).toEqual({})
+        expect(logic.values.config).toEqual(updatedConfig)
+        expect(mockConfigList).toHaveBeenCalledTimes(configLoadCalls)
     })
 
     it('loads members one server-controlled page at a time', async () => {

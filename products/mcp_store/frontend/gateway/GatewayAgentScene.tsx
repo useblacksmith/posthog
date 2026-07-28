@@ -2,7 +2,7 @@ import { useActions, useValues } from 'kea'
 import { router } from 'kea-router'
 
 import { IconSparkles } from '@posthog/icons'
-import { LemonBanner, LemonButton, LemonDivider, LemonSwitch, LemonTable, LemonTag } from '@posthog/lemon-ui'
+import { LemonBanner, LemonButton, LemonDivider, LemonSwitch, LemonTable, LemonTag, Spinner } from '@posthog/lemon-ui'
 
 import { TZLabel } from 'lib/components/TZLabel'
 import { SceneExport } from 'scenes/sceneTypes'
@@ -28,8 +28,10 @@ export function GatewayAgentScene(): JSX.Element {
         accountStatusLoadingIds,
         agentServerAccessLoadingKeys,
         allServers,
+        allServersLoading,
         sharedServerIds,
         recentCalls,
+        recentCallsLoading,
     } = useValues(gatewayAgentLogic)
     const { setAgentServerAccess, toggleAccountStatus } = useActions(gatewayAgentLogic)
 
@@ -90,47 +92,53 @@ export function GatewayAgentScene(): JSX.Element {
 
             <div className="flex flex-col gap-2">
                 <h3 className="mb-0">
-                    Shared servers · {sharedServerIds.size} of {allServers.length}
+                    Shared servers{!allServersLoading && ` · ${sharedServerIds.size} of ${allServers.length}`}
                 </h3>
                 <div className="border rounded divide-y">
-                    {allServers.map((server) => {
-                        const shared = sharedServerIds.has(server.id)
-                        const needsConnection =
-                            !shared && server.your_connection === null && server.shared_credential === null
-                        return (
-                            <div key={server.id} className="flex items-center gap-3 p-2">
-                                <ServerIcon iconDomain={server.icon_domain} serverUrl={server.url} size={28} />
-                                <div className="flex-1 min-w-0">
-                                    <div className="font-semibold">{server.name}</div>
-                                    <div className="text-xs text-secondary">
-                                        {shared ? `${server.tool_count} tools` : 'Not shared'}
+                    {allServersLoading && allServers.length === 0 ? (
+                        <div className="flex items-center gap-2 p-3 text-sm text-secondary">
+                            <Spinner /> Loading shared servers…
+                        </div>
+                    ) : (
+                        allServers.map((server) => {
+                            const shared = sharedServerIds.has(server.id)
+                            const needsConnection =
+                                !shared && server.your_connection === null && server.shared_credential === null
+                            return (
+                                <div key={server.id} className="flex items-center gap-3 p-2">
+                                    <ServerIcon iconDomain={server.icon_domain} serverUrl={server.url} size={28} />
+                                    <div className="flex-1 min-w-0">
+                                        <div className="font-semibold">{server.name}</div>
+                                        <div className="text-xs text-secondary">
+                                            {shared ? `${server.tool_count} tools` : 'Not shared'}
+                                        </div>
                                     </div>
-                                </div>
-                                {shared && (
-                                    <LemonButton
-                                        size="xsmall"
-                                        type="secondary"
-                                        to={urls.mcpGatewayServer(server.id, `agent:${account.id}`)}
-                                    >
-                                        Tool policies
-                                    </LemonButton>
-                                )}
-                                <LemonSwitch
-                                    checked={shared}
-                                    loading={agentServerAccessLoadingKeys.has(
-                                        agentServerAccessKey(account.id, server.id)
+                                    {shared && (
+                                        <LemonButton
+                                            size="xsmall"
+                                            type="secondary"
+                                            to={urls.mcpGatewayServer(server.id, `agent:${account.id}`)}
+                                        >
+                                            Tool policies
+                                        </LemonButton>
                                     )}
-                                    disabledReason={
-                                        needsConnection
-                                            ? 'Connect this server before sharing it with an agent.'
-                                            : undefined
-                                    }
-                                    aria-label={`${shared ? 'Revoke' : 'Grant'} ${account.name} access to ${server.name}`}
-                                    onChange={(checked) => setAgentServerAccess(account.id, server.id, checked)}
-                                />
-                            </div>
-                        )
-                    })}
+                                    <LemonSwitch
+                                        checked={shared}
+                                        loading={agentServerAccessLoadingKeys.has(
+                                            agentServerAccessKey(account.id, server.id)
+                                        )}
+                                        disabledReason={
+                                            needsConnection
+                                                ? 'Connect this server before sharing it with an agent.'
+                                                : undefined
+                                        }
+                                        aria-label={`${shared ? 'Revoke' : 'Grant'} ${account.name} access to ${server.name}`}
+                                        onChange={(checked) => setAgentServerAccess(account.id, server.id, checked)}
+                                    />
+                                </div>
+                            )
+                        })
+                    )}
                 </div>
             </div>
 
@@ -138,6 +146,7 @@ export function GatewayAgentScene(): JSX.Element {
                 <h3 className="mb-0">Recent tool calls</h3>
                 <LemonTable
                     dataSource={recentCalls}
+                    loading={recentCallsLoading}
                     emptyState="No tool calls from this agent yet."
                     columns={[
                         {

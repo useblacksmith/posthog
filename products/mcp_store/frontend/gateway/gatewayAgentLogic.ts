@@ -6,7 +6,7 @@ import { urls } from 'scenes/urls'
 
 import { Breadcrumb } from '~/types'
 
-import { mcpGatewayAuditList, mcpGatewayServersList } from '../generated/api'
+import { mcpGatewayAuditList } from '../generated/api'
 import { MCPAuditEventApi, MCPGatewayServerApi, MCPServiceAccountApi } from '../generated/api.schemas'
 import { mcpGatewayLogic } from './mcpGatewayLogic'
 
@@ -23,10 +23,10 @@ export interface gatewayAgentLogicValues {
     accountLoading: boolean // mcpGatewayLogic
     accountStatusLoadingIds: Set<string> // mcpGatewayLogic
     agentServerAccessLoadingKeys: Set<string> // mcpGatewayLogic
+    allServers: MCPGatewayServerApi[] // mcpGatewayLogic
+    allServersLoading: boolean // mcpGatewayLogic
     serviceAccounts: MCPServiceAccountApi[] // mcpGatewayLogic
     account: MCPServiceAccountApi | null
-    allServers: MCPGatewayServerApi[]
-    allServersLoading: boolean
     breadcrumbs: Breadcrumb[]
     recentCalls: MCPAuditEventApi[]
     recentCallsLoading: boolean
@@ -51,21 +51,6 @@ export interface gatewayAgentLogicActions {
         accountId: string
         paused: boolean
     } // mcpGatewayLogic
-    loadAllServers: () => any
-    loadAllServersFailure: (
-        error: string,
-        errorObject?: any
-    ) => {
-        error: string
-        errorObject?: any
-    }
-    loadAllServersSuccess: (
-        allServers: MCPGatewayServerApi[],
-        payload?: any
-    ) => {
-        allServers: MCPGatewayServerApi[]
-        payload?: any
-    }
     loadRecentCalls: () => any
     loadRecentCallsFailure: (
         error: string,
@@ -111,6 +96,8 @@ export const gatewayAgentLogic = kea<gatewayAgentLogicType>([
             [
                 'accountStatusLoadingIds',
                 'agentServerAccessLoadingKeys',
+                'servers as allServers',
+                'serversLoading as allServersLoading',
                 'serviceAccounts',
                 'serviceAccountsLoading as accountLoading',
             ],
@@ -119,15 +106,6 @@ export const gatewayAgentLogic = kea<gatewayAgentLogicType>([
     })),
 
     loaders(({ props }) => ({
-        allServers: [
-            [] as MCPGatewayServerApi[],
-            {
-                loadAllServers: async () => {
-                    const response = await mcpGatewayServersList(currentProjectId(), { limit: 500 })
-                    return response.results
-                },
-            },
-        ],
         recentCalls: [
             [] as MCPAuditEventApi[],
             {
@@ -162,7 +140,6 @@ export const gatewayAgentLogic = kea<gatewayAgentLogicType>([
     }),
 
     afterMount(({ actions }) => {
-        actions.loadAllServers()
         actions.loadRecentCalls()
     }),
 ])

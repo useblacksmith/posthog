@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from django.db.models import Q
 
 from posthog.models import Team, User
@@ -42,6 +44,7 @@ def _get_installations(team: Team, user: User) -> list[dict]:
             "auth_type",
             "sensitive_configuration",
             "scope",
+            "gateway_server_id",
         )
     ]
     ready_shared_by_url = {row["url"]: row for row in rows if row["scope"] == "shared" and _is_row_ready(row)}
@@ -77,7 +80,12 @@ def _get_cached_tools(installation_id: str) -> list[dict]:
     ]
 
 
-def _get_tool_approval_states(installation_id: str, user: User | None = None) -> dict[str, str]:
+def _get_tool_approval_states(
+    installation_id: str,
+    team_id: int,
+    gateway_server_id: UUID | None,
+    user: User | None = None,
+) -> dict[str, str]:
     """Return a {tool_name: effective_state} map for an installation.
 
     States resolve through the gateway policy engine when the installation is
@@ -93,16 +101,14 @@ def _get_tool_approval_states(installation_id: str, user: User | None = None) ->
     )
     legacy = {row["tool_name"]: ("do_not_use" if row["removed_at"] else row["approval_state"]) for row in rows}
 
-    installation = MCPServerInstallation.objects.filter(id=installation_id).select_related("gateway_server").first()
-    gateway_server = installation.gateway_server if installation else None
-    if installation is None or gateway_server is None or user is None:
+    if gateway_server_id is None or user is None:
         return legacy
 
     context = PolicyContext(
-        team_id=installation.team_id,
+        team_id=team_id,
         caller=GatewayCaller(kind="member", user_id=user.id),
-        gateway_server=gateway_server,
-        installation=installation,
+        gateway_server_id=gateway_server_id,
+        legacy_rows={row["tool_name"]: row["approval_state"] for row in rows if row["removed_at"] is None},
     )
     resolved: dict[str, str] = {}
     for row in rows:

@@ -349,7 +349,8 @@ class TestGetToolApprovalStates(BaseTest):
             member_default_preset="block",
         )
 
-        states = _get_tool_approval_states(str(installation.id), self.user)
+        with self.assertNumQueries(5):
+            states = _get_tool_approval_states(str(installation.id), self.team.id, server.id, self.user)
 
         assert states == {"manage_issue": "do_not_use"}
 

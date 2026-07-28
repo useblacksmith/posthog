@@ -22,6 +22,7 @@ export function GatewayTeamSettings(): JSX.Element {
         allowCustomServersLoading,
         allowMemberAgentAccess,
         allowMemberAgentAccessLoading,
+        applyingPresetByAudience,
         config,
         enabledServerCount,
         serverEnabledLoadingIds,
@@ -34,6 +35,7 @@ export function GatewayTeamSettings(): JSX.Element {
     const filteredServers = servers.filter((server) =>
         server.name.toLowerCase().includes(serverSearch.trim().toLowerCase())
     )
+    const presetUpdateInProgress = Object.keys(applyingPresetByAudience).length > 0
 
     return (
         <div className="flex flex-col gap-6">
@@ -80,6 +82,7 @@ export function GatewayTeamSettings(): JSX.Element {
                 {(['members', 'agents'] as AudienceEnumApi[]).map((audience) => {
                     const current =
                         audience === 'members' ? config?.member_default_preset : config?.agent_default_preset
+                    const applyingPreset = applyingPresetByAudience[audience]
                     return (
                         <div key={audience} className="border rounded p-3 flex flex-col gap-2">
                             <div className="font-semibold capitalize">{audience}</div>
@@ -90,6 +93,12 @@ export function GatewayTeamSettings(): JSX.Element {
                                         size="small"
                                         type={current === preset.value ? 'primary' : 'secondary'}
                                         tooltip={preset.description}
+                                        loading={applyingPreset === preset.value}
+                                        disabledReason={
+                                            presetUpdateInProgress
+                                                ? 'Wait for the baseline update to finish'
+                                                : undefined
+                                        }
                                         onClick={() => applyPreset(audience, preset.value)}
                                     >
                                         {preset.label}
@@ -128,7 +137,7 @@ export function GatewayTeamSettings(): JSX.Element {
                             }
                             onClick={() => setAllServersEnabled(true)}
                         >
-                            Enable all
+                            Enable all servers
                         </LemonButton>
                         <LemonButton
                             size="small"
@@ -142,7 +151,7 @@ export function GatewayTeamSettings(): JSX.Element {
                             }
                             onClick={() => setAllServersEnabled(false)}
                         >
-                            Disable all
+                            Disable all servers
                         </LemonButton>
                     </div>
                 </div>
@@ -169,7 +178,11 @@ export function GatewayTeamSettings(): JSX.Element {
                         </div>
                     ))}
                     {filteredServers.length === 0 && (
-                        <div className="p-3 text-sm text-secondary">No servers match “{serverSearch}”.</div>
+                        <div className="p-3 text-sm text-secondary">
+                            {servers.length === 0
+                                ? 'No servers configured for this team yet.'
+                                : `No servers match “${serverSearch.trim()}”.`}
+                        </div>
                     )}
                 </div>
             </div>

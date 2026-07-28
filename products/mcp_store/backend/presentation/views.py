@@ -607,7 +607,7 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
                 team_id=self.team_id,
             )
             .filter(Q(scope="shared") | Q(user=self.request.user))
-            .select_related("template")
+            .select_related("template", "gateway_server")
             .annotate(tool_count_annotated=Count("tools", filter=Q(tools__removed_at__isnull=True)))
             .order_by("-created_at")
         )
@@ -722,6 +722,15 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
         Called only once the install is persisted for good; `_validate_gateway_options`
         has already gated team options and agent grants.
         """
+        agent_ids = set(data.get("agent_ids") or [])
+        accounts_by_id = {
+            account.id: account for account in MCPServiceAccount.objects.for_team(self.team_id).filter(id__in=agent_ids)
+        }
+        if agent_ids != set(accounts_by_id):
+            raise serializers.ValidationError(
+                {"agent_ids": "One or more selected PostHog agents are no longer available. Refresh and try again."}
+            )
+
         server = link_installation_to_gateway(installation, created_by=cast(User, self.request.user))
 
         if self._wants_team_gateway_options(data):
@@ -737,8 +746,7 @@ class MCPServerInstallationViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet
             if update_fields:
                 server.save(update_fields=[*update_fields, "updated_at"])
 
-        for agent_id in data.get("agent_ids") or []:
-            account = MCPServiceAccount.objects.for_team(self.team_id).get(id=agent_id)
+        for account in accounts_by_id.values():
             MCPServiceAccountServerAccess.objects.for_team(self.team_id).update_or_create(
                 service_account=account,
                 gateway_server=server,

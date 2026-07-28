@@ -4,7 +4,9 @@ import uuid
 from posthog.test.base import APIBaseTest, ClickhouseTestMixin, QueryMatchingTest
 from unittest.mock import MagicMock, patch
 
+from django.db import connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 import httpx
@@ -717,6 +719,53 @@ class TestMCPProxyToolApproval(ClickhouseTestMixin, APIBaseTest, QueryMatchingTe
         assert isinstance(body, list)
         assert [entry["error"]["code"] for entry in body] == [-32001, -32002]
         mock_client_cls.assert_not_called()
+
+    def test_gateway_audit_query_count_does_not_grow_with_batch_size(self) -> None:
+        server = MCPGatewayServer.objects.for_team(self.team.id).create(
+            team=self.team,
+            name="Audited tools",
+            url="https://mcp.audited-tools.example.com/mcp",
+        )
+        installation = self._installation()
+        installation.gateway_server = server
+        installation.save(update_fields=["gateway_server", "updated_at"])
+        for index in range(5):
+            self._tool(installation, f"pending-{index}", "needs_approval")
+
+        single_call = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "pending-0"},
+        }
+        assert self.client.post(self._proxy_url(installation.id), data=single_call, format="json").status_code == 200
+        MCPAuditEvent.objects.for_team(self.team.id).all().delete()
+
+        with CaptureQueriesContext(connection) as single_call_queries:
+            single_response = self.client.post(
+                self._proxy_url(installation.id),
+                data=single_call,
+                format="json",
+            )
+        with CaptureQueriesContext(connection) as batch_call_queries:
+            batch_response = self.client.post(
+                self._proxy_url(installation.id),
+                data=[
+                    {
+                        "jsonrpc": "2.0",
+                        "id": index,
+                        "method": "tools/call",
+                        "params": {"name": f"pending-{index}"},
+                    }
+                    for index in range(5)
+                ],
+                format="json",
+            )
+
+        assert single_response.status_code == 200
+        assert batch_response.status_code == 200
+        assert len(batch_call_queries.captured_queries) == len(single_call_queries.captured_queries)
+        assert MCPAuditEvent.objects.for_team(self.team.id).count() == 6
 
     @patch("products.mcp_store.backend.proxy.httpx.Client")
     def test_mixed_batch_rejects_whole_request_with_batch_code(self, mock_client_cls):

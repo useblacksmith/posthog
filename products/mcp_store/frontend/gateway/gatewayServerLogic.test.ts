@@ -146,6 +146,27 @@ describe('gatewayServerLogic', () => {
         expect(mockToolsRetrieve).toHaveBeenCalledTimes(1)
     })
 
+    it('discards a stale policy response after the scope changes', async () => {
+        const staleResponse = deferred<Awaited<ReturnType<typeof mcpGatewayServersToolsRetrieve>>>()
+        const latestResponse = deferred<Awaited<ReturnType<typeof mcpGatewayServersToolsRetrieve>>>()
+        const stalePolicy = toolPolicy('create_issue', { policy_state: 'approved' })
+        const latestPolicy = toolPolicy('create_issue', { policy_state: 'needs_approval' })
+        mockToolsRetrieve.mockReset()
+        mockToolsRetrieve.mockReturnValueOnce(staleResponse.promise).mockReturnValueOnce(latestResponse.promise)
+
+        logic.actions.setScope({ scopeType: 'team', label: 'Team default' })
+        logic.actions.setScope({ scopeType: 'member', label: 'You' })
+
+        expect(mockToolsRetrieve).toHaveBeenCalledTimes(2)
+
+        latestResponse.resolve({ count: 1, results: [latestPolicy] })
+        staleResponse.resolve({ count: 1, results: [stalePolicy] })
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.scope.scopeType).toBe('member')
+        expect(logic.values.toolPolicies).toEqual([latestPolicy])
+    })
+
     it('reports the number of tools changed by a bulk update', async () => {
         const editablePolicy = toolPolicy('create_issue')
         const lockedPolicy = toolPolicy('delete_issue', { locked: true, policy_state: 'do_not_use' })
