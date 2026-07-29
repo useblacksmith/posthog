@@ -12,6 +12,7 @@ from django.conf import settings
 
 import psycopg
 import pyarrow as pa
+import aioboto3
 import botocore.exceptions
 from psycopg import sql
 from structlog.contextvars import bind_contextvars
@@ -19,7 +20,14 @@ from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 
 from posthog.models import Team
-from posthog.models.integration import TLS, Authority, Credentials
+from posthog.models.integration import (
+    TLS,
+    Authority,
+    Credentials,
+    Integration,
+    RedshiftIntegration,
+    RedshiftIntegrationError,
+)
 from posthog.temporal.common.base import PostHogWorkflow
 from posthog.temporal.common.heartbeat import Heartbeater
 from posthog.temporal.common.logger import get_logger, get_write_only_logger
@@ -112,6 +120,10 @@ NON_RETRYABLE_ERROR_TYPES = (
     # Redshift failed to COPY the staged files from S3 (IAM role auth, cause not locally confirmable).
     # These (read access, region, manifest) don't self-heal, so retrying is pointless.
     "RedshiftS3CopyError",
+    # The linked Integration was deleted or doesn't belong to the team.
+    "RedshiftIntegrationNotFoundError",
+    # The linked Integration is malformed or the inline legacy connection is incomplete.
+    "RedshiftIntegrationError",
 )
 
 
@@ -643,25 +655,132 @@ class CopyParameters:
 
 @dataclasses.dataclass
 class ConnectionParameters:
-    user: str
-    password: str
-    host: str
-    port: int
     database: str
+    user: str | None = None
+    password: str | None = None
+    host: str | None = None
+    port: int = 5439
+    integration_id: int | None = None
     has_self_signed_cert: bool = False
 
     def credentials(self) -> Credentials:
+        if self.user is None or self.password is None:
+            raise RedshiftIntegrationError("Redshift connection is missing user or password")
         user = self.user
         password = self.password
         return Credentials(user, password)
 
     def authority(self) -> Authority:
+        if self.host is None:
+            raise RedshiftIntegrationError("Redshift connection is missing host")
         host = self.host
         port = self.port
         return Authority(host, port)
 
     def tls(self) -> TLS:
         return TLS(ssl_mode="prefer" if settings.TEST else "require")
+
+
+class RedshiftIntegrationNotFoundError(Exception):
+    def __init__(self, integration_id: int, team_id: int):
+        super().__init__(f"Redshift integration with ID '{integration_id}' not found for team '{team_id}'")
+
+
+async def _get_redshift_integration(integration_id: int, team_id: int) -> RedshiftIntegration:
+    try:
+        integration = await Integration.objects.aget(
+            id=integration_id, team_id=team_id, kind=Integration.IntegrationKind.REDSHIFT
+        )
+    except Integration.DoesNotExist:
+        raise RedshiftIntegrationNotFoundError(integration_id, team_id)
+    return RedshiftIntegration(integration)
+
+
+@contextlib.asynccontextmanager
+async def _redshift_serverless_client(
+    credentials: AWSCredentials, region: str
+) -> collections.abc.AsyncIterator[typing.Any]:
+    session = aioboto3.Session(
+        aws_access_key_id=credentials.aws_access_key_id,
+        aws_secret_access_key=credentials.aws_secret_access_key,
+        aws_session_token=credentials.aws_session_token,
+    )
+    async with session.client("redshift-serverless", region_name=region) as client:
+        yield client
+
+
+async def _get_redshift_serverless_connection_parameters(
+    *,
+    credentials: AWSCredentials,
+    region: str,
+    workgroup_name: str,
+    database: str,
+) -> ConnectionParameters:
+    async with _redshift_serverless_client(credentials, region) as client:
+        credentials_response = await client.get_credentials(
+            workgroupName=workgroup_name,
+            dbName=database,
+            durationSeconds=3600,
+        )
+        workgroup_response = await client.get_workgroup(workgroupName=workgroup_name)
+
+    endpoint = workgroup_response["workgroup"]["endpoint"]
+    return ConnectionParameters(
+        user=credentials_response["dbUser"],
+        password=credentials_response["dbPassword"],
+        host=endpoint["address"],
+        port=int(endpoint.get("port", 5439)),
+        database=database,
+    )
+
+
+async def _resolve_redshift_connection_parameters(
+    connection: ConnectionParameters,
+    *,
+    team_id: int,
+    batch_export_id: str | None,
+) -> ConnectionParameters:
+    if connection.integration_id is None:
+        if not (connection.user and connection.password and connection.host):
+            raise RedshiftIntegrationError("Redshift connection is missing host, user, or password")
+        return connection
+
+    integration = await _get_redshift_integration(connection.integration_id, team_id)
+    if integration.authentication_type == "password":
+        if not (integration.host and integration.user and integration.password):
+            raise RedshiftIntegrationError("Redshift integration is missing host, user, or password")
+        return ConnectionParameters(
+            user=integration.user,
+            password=integration.password,
+            host=integration.host,
+            port=integration.port,
+            database=connection.database,
+            integration_id=connection.integration_id,
+        )
+
+    if not (integration.region and integration.workgroup_name and integration.aws_role_arn):
+        raise RedshiftIntegrationError("Redshift integration is missing region, workgroup name, or IAM role ARN")
+
+    team = await Team.objects.aget(id=team_id)
+    external_id = f"posthog-{team.organization_id}"
+    credentials = await get_credentials_using_user_aws_role(
+        integration.aws_role_arn,
+        external_id,
+        session_name=f"PostHog-redshift-batch-export-{batch_export_id or 'unknown'}",
+        policy_statements=[
+            PolicyStatement(
+                Effect="Allow",
+                Action=["redshift-serverless:GetCredentials", "redshift-serverless:GetWorkgroup"],
+                Resource="*",
+            )
+        ],
+    )
+    return await _get_redshift_serverless_connection_parameters(
+        credentials=credentials,
+        region=integration.region,
+        workgroup_name=integration.workgroup_name,
+        database=connection.database,
+    )
 
 
 @dataclasses.dataclass
@@ -963,8 +1082,14 @@ async def insert_into_redshift_activity_from_stage(inputs: RedshiftInsertInputs)
             else inputs.table.name
         )
 
+        connection_parameters = await _resolve_redshift_connection_parameters(
+            inputs.connection,
+            team_id=inputs.batch_export.team_id,
+            batch_export_id=inputs.batch_export.batch_export_id,
+        )
+
         async with RedshiftClient.from_inputs(
-            inputs.connection, database=inputs.connection.database
+            connection_parameters, database=connection_parameters.database
         ).connect() as redshift_client:
             remove_duplicates = True
             # filter out fields that are not in the destination table
@@ -1423,8 +1548,14 @@ async def copy_into_redshift_activity_from_stage(inputs: RedshiftCopyActivityInp
         if result.error is not None:
             return result
 
+        connection_parameters = await _resolve_redshift_connection_parameters(
+            inputs.connection,
+            team_id=inputs.batch_export.team_id,
+            batch_export_id=inputs.batch_export.batch_export_id,
+        )
+
         async with RedshiftClient.from_inputs(
-            inputs.connection, database=inputs.connection.database
+            connection_parameters, database=connection_parameters.database
         ).connect() as redshift_client:
             remove_duplicates = True
 
@@ -1599,11 +1730,12 @@ class RedshiftBatchExportWorkflow(PostHogWorkflow):
             destination_default_fields=redshift_default_fields(),
         )
         connection_parameters = ConnectionParameters(
+            database=inputs.database,
             user=inputs.user,
             password=inputs.password,
             host=inputs.host,
             port=inputs.port,
-            database=inputs.database,
+            integration_id=inputs.integration_id,
         )
         table_parameters = TableParameters(
             schema_name=inputs.schema,
