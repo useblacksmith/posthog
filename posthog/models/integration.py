@@ -393,6 +393,7 @@ class Integration(models.Model):
         PINTEREST_ADS = "pinterest-ads"
         POSTGRESQL = "postgresql"
         REDDIT_ADS = "reddit-ads"
+        REDSHIFT = "redshift"
         RESEND = "resend"
         S3_COMPATIBLE = "s3-compatible"
         SALESFORCE = "salesforce"
@@ -482,6 +483,10 @@ class Integration(models.Model):
             auth_type = self.config.get("authentication_type", "password")
             account = self.config.get("account")
             return f"{name} (account: {account}, {auth_type} auth)"
+        if self.kind == Integration.IntegrationKind.REDSHIFT:
+            name = self.integration_id or "unknown ID"
+            auth_type = self.config.get("authentication_type", "password")
+            return f"{name} ({auth_type} auth)"
         if self.kind == "gitlab":
             return self.integration_id or "unknown ID"
         if self.kind == "email":
@@ -4507,6 +4512,130 @@ class PostgreSQLIntegration:
         else:
             # Preserve the default ssl_root_cert if one was not provided
             return TLS(ssl_mode=self.integration.config["ssl_mode"])
+
+
+class RedshiftIntegrationError(Exception):
+    """Error raised when a Redshift integration is not valid."""
+
+    pass
+
+
+_AWS_IAM_ROLE_ARN_RE = re.compile(r"^arn:aws:iam::\d{12}:role\/.+$")
+
+
+class RedshiftIntegration:
+    integration: Integration
+    authentication_type: Literal["password", "iam_role"]
+
+    def __init__(self, integration: Integration) -> None:
+        if integration.kind != Integration.IntegrationKind.REDSHIFT:
+            raise RedshiftIntegrationError(
+                f"Integration provided is not a Redshift integration (got kind='{integration.kind}')"
+            )
+
+        self.integration = integration
+        try:
+            self.authentication_type = integration.config["authentication_type"]
+        except KeyError as e:
+            raise RedshiftIntegrationError(f"Redshift integration is not valid: {str(e)} missing")
+
+        if self.authentication_type not in ("password", "iam_role"):
+            raise RedshiftIntegrationError(f"Invalid authentication type: {self.authentication_type}")
+
+    @property
+    def host(self) -> str | None:
+        return self.integration.config.get("host")
+
+    @property
+    def port(self) -> int:
+        return int(self.integration.config.get("port", 5439))
+
+    @property
+    def user(self) -> str | None:
+        return self.integration.config.get("user")
+
+    @property
+    def password(self) -> str | None:
+        return self.integration.sensitive_config.get("password")
+
+    @property
+    def region(self) -> str | None:
+        return self.integration.config.get("region")
+
+    @property
+    def workgroup_name(self) -> str | None:
+        return self.integration.config.get("workgroup_name")
+
+    @property
+    def aws_role_arn(self) -> str | None:
+        return self.integration.config.get("aws_role_arn")
+
+    @classmethod
+    def integration_from_config(
+        cls,
+        team_id: int,
+        name: str | None,
+        authentication_type: str | None,
+        host: str | None = None,
+        port: int | None = None,
+        user: str | None = None,
+        password: str | None = None,
+        region: str | None = None,
+        workgroup_name: str | None = None,
+        aws_role_arn: str | None = None,
+        created_by: User | None = None,
+    ) -> Integration:
+        if not name or not authentication_type:
+            raise RedshiftIntegrationError("Name and authentication type must be provided")
+        if not isinstance(name, str) or not isinstance(authentication_type, str):
+            raise RedshiftIntegrationError("Name and authentication type must be strings")
+
+        config: dict[str, str | int] = {
+            "name": name,
+            "authentication_type": authentication_type,
+        }
+        sensitive_config: dict[str, str] = {}
+
+        if authentication_type == "password":
+            if not (host and port and user and password):
+                raise RedshiftIntegrationError("Host, port, user, and password must be provided")
+            if not isinstance(host, str) or not isinstance(user, str) or not isinstance(password, str):
+                raise RedshiftIntegrationError("Host, user, and password must be strings")
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                raise RedshiftIntegrationError("Port must be an integer")
+            if port < 0 or port > 65535:
+                raise RedshiftIntegrationError("Port must be between 0 and 65535")
+
+            config.update({"host": host, "port": port, "user": user})
+            sensitive_config["password"] = password
+        elif authentication_type == "iam_role":
+            if not (region and workgroup_name and aws_role_arn):
+                raise RedshiftIntegrationError("Region, workgroup name, and IAM role ARN must be provided")
+            if not all(isinstance(value, str) for value in (region, workgroup_name, aws_role_arn)):
+                raise RedshiftIntegrationError("Region, workgroup name, and IAM role ARN must be strings")
+            if not _AWS_IAM_ROLE_ARN_RE.fullmatch(aws_role_arn):
+                raise RedshiftIntegrationError(
+                    "Enter a valid IAM role ARN, e.g. arn:aws:iam::123456789012:role/my-role"
+                )
+
+            config.update({"region": region, "workgroup_name": workgroup_name, "aws_role_arn": aws_role_arn})
+        else:
+            raise RedshiftIntegrationError(f"Invalid authentication type: {authentication_type}")
+
+        try:
+            with transaction.atomic():
+                return Integration.objects.create(
+                    team_id=team_id,
+                    kind=Integration.IntegrationKind.REDSHIFT,
+                    integration_id=name,
+                    config=config,
+                    sensitive_config=sensitive_config,
+                    created_by=created_by,
+                )
+        except IntegrityError:
+            raise RedshiftIntegrationError(f"An integration named '{name}' already exists")
 
 
 @receiver(models.signals.post_delete, sender=Integration)
