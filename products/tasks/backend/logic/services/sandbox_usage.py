@@ -60,13 +60,18 @@ def open_sandbox_session(
     ``sandbox_id`` so activity retries stay idempotent, and never regresses
     ``user_attributed_at`` on an existing row.
     """
-    run = TaskRun.objects.select_related("task").only("id", "team_id", "state", "task__origin_product").get(id=run_id)
+    run = (
+        TaskRun.objects.select_related("task")
+        .only("id", "team_id", "state", "created_via_code", "task__origin_product")
+        .get(id=run_id)
+    )
     state = run.state or {}
     created_at = sandbox_created_at or timezone.now()
     shape = {
         "team_id": run.team_id,
         "task_run_id": run.id,
         "origin_product": run.task.origin_product,
+        "created_via_code": run.created_via_code,
         "prewarmed": bool(state.get("prewarmed")),
         "vm_runtime": config.is_vm,
         "cpu_cores": config.cpu_cores,
@@ -99,7 +104,7 @@ def close_sandbox_session(sandbox_id: str, *, reason: str) -> None:
 
 
 @_best_effort
-def record_task_run_user_activity(run_id: str | UUID, team_id: int) -> None:
+def record_task_run_user_activity(run_id: str | UUID, team_id: int, *, created_via_code: bool = False) -> None:
     """Stamp a user message against the run's open sandbox sessions.
 
     Sets ``last_user_activity_at`` on every message and ``user_attributed_at``
@@ -109,7 +114,11 @@ def record_task_run_user_activity(run_id: str | UUID, team_id: int) -> None:
     """
     now = timezone.now()
     run_uuid = run_id if isinstance(run_id, UUID) else UUID(run_id)
+    if created_via_code:
+        TaskRun.objects.filter(id=run_uuid, team_id=team_id).update(created_via_code=True)
     open_sessions = SandboxSession.objects.for_team(team_id).filter(task_run_id=run_uuid, ended_at__isnull=True)
+    if created_via_code:
+        open_sessions.update(created_via_code=True)
     open_sessions.update(last_user_activity_at=now)
     open_sessions.filter(user_attributed_at__isnull=True).update(user_attributed_at=now)
 
