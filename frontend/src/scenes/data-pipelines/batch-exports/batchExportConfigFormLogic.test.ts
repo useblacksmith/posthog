@@ -441,7 +441,7 @@ describe('batchExportConfigFormLogic', () => {
             },
             {
                 service: 'Redshift' as const,
-                fields: ['user', 'password', 'host', 'port', 'database', 'schema', 'table_name'],
+                fields: ['integration_id', 'database', 'schema', 'table_name'],
             },
             {
                 // New Snowflake exports authenticate via an integration, not inline credentials.
@@ -754,7 +754,7 @@ describe('batchExportConfigFormLogic', () => {
                     destination: 'Redshift',
                     mode: 'COPY',
                     authorization_mode: 'IAMRole',
-                    properties_data_type: 'SUPER',
+                    properties_data_type: 'super',
                     paused: true,
                     model: 'events',
                 },
@@ -912,10 +912,7 @@ describe('batchExportConfigFormLogic', () => {
                 name: 'Redshift (default COPY + IAM)',
                 service: 'Redshift' as const,
                 requiredValues: {
-                    user: 'rs-user',
-                    password: 'rs-pass',
-                    host: 'rs-host',
-                    port: 5439,
+                    integration_id: 41,
                     database: 'rs-db',
                     schema: 'public',
                     table_name: 'events',
@@ -926,15 +923,12 @@ describe('batchExportConfigFormLogic', () => {
                 },
                 expectedDestination: {
                     type: 'Redshift',
+                    integration: 41,
                     config: {
-                        user: 'rs-user',
-                        password: 'rs-pass',
-                        host: 'rs-host',
-                        port: 5439,
                         database: 'rs-db',
                         schema: 'public',
                         table_name: 'events',
-                        properties_data_type: 'SUPER',
+                        properties_data_type: 'super',
                         mode: 'COPY',
                         copy_inputs: {
                             s3_bucket: 'rs-staging',
