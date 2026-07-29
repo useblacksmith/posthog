@@ -9849,7 +9849,7 @@
                     "type": "boolean"
                 },
                 "hasValue": {
-                    "description": "Whether the goal is revenue-bearing — gates the value columns.",
+                    "description": "Whether the goal is revenue-bearing, which gates the value columns.",
                     "type": "boolean"
                 },
                 "hogql": {
@@ -30867,7 +30867,7 @@
                     "type": ["number", "null"]
                 },
                 "conversions": {
-                    "description": "Fractional for multi-touch models — each conversion's credit is split across its touchpoints.",
+                    "description": "Fractional for multi-touch models: each conversion's credit is split across its touchpoints.",
                     "type": "number"
                 },
                 "model": {
@@ -31007,7 +31007,7 @@
                     "type": "boolean"
                 },
                 "hasValue": {
-                    "description": "Whether the goal is revenue-bearing — gates the value columns.",
+                    "description": "Whether the goal is revenue-bearing, which gates the value columns.",
                     "type": "boolean"
                 },
                 "hogql": {
@@ -31105,7 +31105,7 @@
                 },
                 "influencedConversions": {
                     "$ref": "#/definitions/integer",
-                    "description": "Conversions with at least one touchpoint on this dimension. Counted once per conversion, so a conversion influenced by several dimensions is counted in each of their rows — these deliberately sum to more than the total, unlike the per-model columns."
+                    "description": "Conversions with at least one touchpoint on this dimension. Counted once per conversion, so a conversion influenced by several dimensions is counted in each of their rows. These deliberately sum to more than the total, unlike the per-model columns."
                 },
                 "influencedValue": {
                     "type": ["number", "null"]
@@ -38037,7 +38037,7 @@
                             "type": "boolean"
                         },
                         "hasValue": {
-                            "description": "Whether the goal is revenue-bearing — gates the value columns.",
+                            "description": "Whether the goal is revenue-bearing, which gates the value columns.",
                             "type": "boolean"
                         },
                         "hogql": {
