@@ -22,6 +22,7 @@ from ..facade.enums import CheckRunStatus, CheckSeverity, SubjectStatus
 from ..models import DataQualityCheck, DataQualityCheckRun, DataQualitySuiteRun
 from .compiler import compile_check, related_subject_ref
 from .contracts import CompiledCheck, Evaluation
+from .notifications import notify_check_started_failing
 from .subjects import resolve_subject
 
 QUERY_TYPE = "data_quality_check"
@@ -64,6 +65,8 @@ def run_check(check: DataQualityCheck, suite_run: DataQualitySuiteRun, team: Tea
         and previous_status != CheckRunStatus.FAILED
         and check.severity == CheckSeverity.ERROR
     )
+    if became_failing:
+        notify_check_started_failing(check, outcome.failed_row_count)
     return replace(outcome, became_failing=became_failing)
 
 

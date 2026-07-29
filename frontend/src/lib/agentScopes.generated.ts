@@ -28,6 +28,8 @@ export const AGENT_USE_CASE_SCOPES = [
     'data_catalog:read',
     'data_catalog:write',
     'data_catalog_approval:write',
+    'data_quality:read',
+    'data_quality:write',
     'dashboard:read',
     'dashboard:write',
     'dashboard_template:read',

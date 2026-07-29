@@ -2109,6 +2109,156 @@
         },
         "feature_flag": "product-data-catalog"
     },
+    "data-quality-check-create": {
+        "description": "Add a dbt-test-style assertion to a warehouse table or view. A check passes when it finds zero failing rows.\n\nQuery `system.information_schema.data_quality_checks` first — re-creating an identical check is a no-op,\nbut a near-duplicate with different config is noise for whoever reviews the results.\n\nPrefer a generic type over custom_sql. Config per type:\n  - not_null, unique: no config; set column_name.\n  - accepted_values: {\"values\": [\"paid\", \"refunded\"]}; set column_name.\n  - relationships: {\"to_subject_type\": \"table\", \"to_subject_uuid\": \"<uuid>\", \"to_column\": \"id\"}; set\n    column_name.\n  - row_count: {\"min\": 1} and/or {\"max\": 1000000}; no column_name.\n  - freshness: {\"max_age_minutes\": 60}; set column_name to a timestamp column.\n  - custom_sql: {\"query\": \"select 1 from orders where total < 0\"}; every row it returns is a failure.\n\nUse severity 'error' when bad data should block trusting the model, 'warn' when it is worth surfacing but\nnot acting on. Leave run_on_materialization on for views; set schedule_interval_minutes for source tables\nand freshness checks, which nothing else triggers.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Create a data quality check",
+        "title": "Create a data quality check",
+        "required_scopes": ["data_quality:write", "query:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": false
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-check-delete": {
+        "description": "Delete a check. The API soft-deletes it, so its run history stays queryable in system.information_schema.data_quality_check_runs and past failures can still be dated.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Delete a data quality check",
+        "title": "Delete a data quality check",
+        "required_scopes": ["data_quality:write"],
+        "annotations": {
+            "destructiveHint": true,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": false
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-check-results": {
+        "description": "Recent executions of one check, newest first. observed_value is recorded on passes too, so the history reads as a time series.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Read a check's run history",
+        "title": "Read a check's run history",
+        "required_scopes": ["data_quality:read", "query:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": true
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-check-run": {
+        "description": "Run one check now. Returns a suite run to poll with data-quality-suite-run; read the per-check outcomes with data-quality-suite-run-results. Run a check once after creating it to confirm it does what you meant.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Run a data quality check",
+        "title": "Run a data quality check",
+        "required_scopes": ["data_quality:write", "query:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": false
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-check-types": {
+        "description": "The check types this project supports, each with the JSON schema its config must match. Call this before authoring an unfamiliar check type rather than guessing at config keys.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "List data quality check types",
+        "title": "List data quality check types",
+        "required_scopes": ["data_quality:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": true
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-check-update": {
+        "description": "Change a check's severity, schedule, tags, owner, or enabled flag. The assertion itself (subject, type, column, config) is immutable — create a new check and delete this one instead.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Update a data quality check",
+        "title": "Update a data quality check",
+        "required_scopes": ["data_quality:write", "query:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": false
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-checks-run-for-subject": {
+        "description": "Run all enabled checks on one table or view. Returns a suite run to poll. Use this to re-validate a model after changing it.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Run every check on a table or view",
+        "title": "Run every check on a table or view",
+        "required_scopes": ["data_quality:write", "query:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": false
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-health": {
+        "description": "One verdict for a table or view: 'failing' (an error-severity check found bad data), 'erroring' (a check could not run), 'warn' (only warn-severity failures), 'healthy', or 'unknown' (nothing has run yet). Check this before trusting a source in an analysis.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Get data quality health for a table or view",
+        "title": "Get data quality health for a table or view",
+        "required_scopes": ["data_quality:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": true
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-suite-run": {
+        "description": "Status and pass/fail/error counts for a suite run. Status is 'running' until the checks finish, then 'completed', or 'empty' when the trigger matched no checks.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Poll a check suite run",
+        "title": "Poll a check suite run",
+        "required_scopes": ["data_quality:read", "query:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": true
+        },
+        "feature_flag": "data-quality-checks"
+    },
+    "data-quality-suite-run-results": {
+        "description": "Every check execution in one suite run. Poll this after data-quality-check-run to see what each check found. failed_row_count is how many rows broke the assertion; re-run compiled_query with SQL to see them.",
+        "category": "Data quality",
+        "feature": "data_quality",
+        "summary": "Read a check suite report",
+        "title": "Read a check suite report",
+        "required_scopes": ["data_quality:read", "query:read"],
+        "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true,
+            "readOnlyHint": true
+        },
+        "feature_flag": "data-quality-checks"
+    },
     "data-warehouse-source-connect-link": {
         "description": "Return a secure browser link to connect a data warehouse source WITHOUT the user pasting secrets into the chat. The link opens a minimal page rendering the source's full connection form — the user authorizes via OAuth or enters credentials there, whichever the source offers — and the page stores the connection details encrypted and temporarily; it does NOT create the source. This is the preferred, secure way to collect credentials: share the returned connect_url with the user, wait for them to confirm they're done, then find the stored credential via 'data-warehouse-stored-credentials-list' (filter by source_type, newest first) and call 'data-warehouse-source-setup' with {'credential_id': '<uuid>'} in the payload. Stored credentials are single-use, expire after 24 hours, and are only visible to the PostHog user who entered them — the page must be filled by the same user this session authenticates as. Never ask the user to paste raw database passwords, API keys, or OAuth tokens into the chat.",
         "category": "Warehouse sources",

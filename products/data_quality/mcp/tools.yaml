@@ -1,0 +1,188 @@
+# MCP tool definition — tool entries are scaffolded from the OpenAPI schema.
+# The tool list and operation IDs are kept in sync automatically:
+#   pnpm --filter=@posthog/mcp run scaffold-yaml -- --sync-all
+#
+# To enable a tool, set enabled: true and add required scopes + annotations.
+# All other fields (title, description, enrich_url, etc.) are yours to configure.
+category: Data quality
+feature: data_quality
+url_prefix: /
+ui_apps: {}
+tools:
+    data-quality-check-create:
+        operation: data_quality_checks_create
+        enabled: true
+        scopes:
+            - data_quality:write
+            - query:read
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Create a data quality check
+        description: |
+            Add a dbt-test-style assertion to a warehouse table or view. A check passes when it finds zero failing rows.
+
+            Query `system.information_schema.data_quality_checks` first — re-creating an identical check is a no-op,
+            but a near-duplicate with different config is noise for whoever reviews the results.
+
+            Prefer a generic type over custom_sql. Config per type:
+              - not_null, unique: no config; set column_name.
+              - accepted_values: {"values": ["paid", "refunded"]}; set column_name.
+              - relationships: {"to_subject_type": "table", "to_subject_uuid": "<uuid>", "to_column": "id"}; set
+                column_name.
+              - row_count: {"min": 1} and/or {"max": 1000000}; no column_name.
+              - freshness: {"max_age_minutes": 60}; set column_name to a timestamp column.
+              - custom_sql: {"query": "select 1 from orders where total < 0"}; every row it returns is a failure.
+
+            Use severity 'error' when bad data should block trusting the model, 'warn' when it is worth surfacing but
+            not acting on. Leave run_on_materialization on for views; set schedule_interval_minutes for source tables
+            and freshness checks, which nothing else triggers.
+        inject_body:
+            created_source: ai_generated
+        feature_flag: data-quality-checks
+    data-quality-check-delete:
+        operation: data_quality_checks_destroy
+        enabled: true
+        scopes:
+            - data_quality:write
+        annotations:
+            readOnly: false
+            destructive: true
+            idempotent: true
+        title: Delete a data quality check
+        description: >
+            Delete a check. The API soft-deletes it, so its run history stays queryable in
+            system.information_schema.data_quality_check_runs and past failures can still be dated.
+        feature_flag: data-quality-checks
+    data-quality-check-get:
+        operation: data_quality_checks_retrieve
+        enabled: false
+    data-quality-check-replace:
+        operation: data_quality_checks_update
+        enabled: false
+    data-quality-check-results:
+        operation: data_quality_checks_runs_list
+        enabled: true
+        scopes:
+            - data_quality:read
+            - query:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Read a check's run history
+        description: >
+            Recent executions of one check, newest first. observed_value is recorded on passes too, so the history reads
+            as a time series.
+        feature_flag: data-quality-checks
+    data-quality-check-run:
+        operation: data_quality_checks_run_create
+        enabled: true
+        scopes:
+            - data_quality:write
+            - query:read
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Run a data quality check
+        description: >
+            Run one check now. Returns a suite run to poll with data-quality-suite-run; read the per-check outcomes with
+            data-quality-suite-run-results. Run a check once after creating it to confirm it does what you meant.
+        feature_flag: data-quality-checks
+    data-quality-check-types:
+        operation: data_quality_checks_check_types_list
+        enabled: true
+        scopes:
+            - data_quality:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: List data quality check types
+        description: >
+            The check types this project supports, each with the JSON schema its config must match. Call this before
+            authoring an unfamiliar check type rather than guessing at config keys.
+        feature_flag: data-quality-checks
+    data-quality-check-update:
+        operation: data_quality_checks_partial_update
+        enabled: true
+        scopes:
+            - data_quality:write
+            - query:read
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Update a data quality check
+        description: >
+            Change a check's severity, schedule, tags, owner, or enabled flag. The assertion itself (subject, type,
+            column, config) is immutable — create a new check and delete this one instead.
+        feature_flag: data-quality-checks
+    data-quality-checks-list:
+        operation: data_quality_checks_list
+        enabled: false
+    data-quality-checks-run-for-subject:
+        operation: data_quality_checks_run_for_subject_create
+        enabled: true
+        scopes:
+            - data_quality:write
+            - query:read
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Run every check on a table or view
+        description: >
+            Run all enabled checks on one table or view. Returns a suite run to poll. Use this to re-validate a model
+            after changing it.
+        feature_flag: data-quality-checks
+    data-quality-health:
+        operation: data_quality_checks_health_retrieve
+        enabled: true
+        scopes:
+            - data_quality:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get data quality health for a table or view
+        description: >
+            One verdict for a table or view: 'failing' (an error-severity check found bad data), 'erroring' (a check
+            could not run), 'warn' (only warn-severity failures), 'healthy', or 'unknown' (nothing has run yet). Check
+            this before trusting a source in an analysis.
+        feature_flag: data-quality-checks
+    data-quality-suite-run:
+        operation: data_quality_check_suite_runs_retrieve
+        enabled: true
+        scopes:
+            - data_quality:read
+            - query:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Poll a check suite run
+        description: >
+            Status and pass/fail/error counts for a suite run. Status is 'running' until the checks finish, then
+            'completed', or 'empty' when the trigger matched no checks.
+        feature_flag: data-quality-checks
+    data-quality-suite-run-results:
+        operation: data_quality_check_suite_runs_check_runs_list
+        enabled: true
+        scopes:
+            - data_quality:read
+            - query:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Read a check suite report
+        description: >
+            Every check execution in one suite run. Poll this after data-quality-check-run to see what each check found.
+            failed_row_count is how many rows broke the assertion; re-run compiled_query with SQL to see them.
+        feature_flag: data-quality-checks
+    data-quality-suite-runs-list:
+        operation: data_quality_check_suite_runs_list
+        enabled: false
