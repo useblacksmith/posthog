@@ -37,7 +37,7 @@ on:
         description: Runner environment under test
         type: choice
         required: true
-        options: [github, github-8core, ec2, blacksmith]
+        options: [github, github-8core, ec2, blacksmith, blacksmith-4vcpu]
       cache_state:
         description: cold = no caches, warm = environment-native docker layer cache
         type: choice
@@ -58,7 +58,7 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: ${{ fromJSON('{"github":"ubuntu-latest","github-8core":"benchmark-8core","ec2":"benchmark-ec2","blacksmith":"blacksmith-8vcpu-ubuntu-2404"}')[inputs.environment] }}
+    runs-on: ${{ fromJSON('{"github":"ubuntu-latest","github-8core":"benchmark-8core","ec2":"benchmark-ec2","blacksmith":"blacksmith-8vcpu-ubuntu-2404","blacksmith-4vcpu":"blacksmith-4vcpu-ubuntu-2404"}')[inputs.environment] }}
     timeout-minutes: 120
     steps:
       - name: Check out
@@ -73,7 +73,7 @@ jobs:
           runner_label: ${{ inputs.environment }}
 
       - name: Set up Docker Buildx
-        if: inputs.environment != 'blacksmith'
+        if: ${{ !startsWith(inputs.environment, 'blacksmith') }}
         uses: docker/setup-buildx-action@v4
 
       # --- workload: one docker build step per (environment, cache_state) ---
@@ -83,7 +83,7 @@ jobs:
       # transport and push:false.
 
       - name: "workload: Build container image (cold, GitHub-hosted)"
-        if: inputs.cache_state == 'cold' && inputs.environment != 'blacksmith'
+        if: inputs.cache_state == 'cold' && !startsWith(inputs.environment, 'blacksmith')
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -97,7 +97,7 @@ jobs:
             posthog_upload_sourcemaps_cli_api_key=benchmark-placeholder
 
       - name: "workload: Build container image (warm, GitHub-hosted)"
-        if: inputs.cache_state == 'warm' && inputs.environment != 'blacksmith'
+        if: inputs.cache_state == 'warm' && !startsWith(inputs.environment, 'blacksmith')
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -114,7 +114,7 @@ jobs:
       # useblacksmith/build-push-action provisions a sticky-disk-backed
       # buildx builder; no setup-buildx step is needed on Blacksmith.
       - name: "workload: Build container image (cold, Blacksmith)"
-        if: inputs.cache_state == 'cold' && inputs.environment == 'blacksmith'
+        if: inputs.cache_state == 'cold' && startsWith(inputs.environment, 'blacksmith')
         uses: useblacksmith/build-push-action@v1
         with:
           context: .
@@ -128,7 +128,7 @@ jobs:
             posthog_upload_sourcemaps_cli_api_key=benchmark-placeholder
 
       - name: "workload: Build container image (warm, Blacksmith)"
-        if: inputs.cache_state == 'warm' && inputs.environment == 'blacksmith'
+        if: inputs.cache_state == 'warm' && startsWith(inputs.environment, 'blacksmith')
         uses: useblacksmith/build-push-action@v1
         with:
           context: .
