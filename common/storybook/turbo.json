@@ -1,0 +1,16 @@
+{
+    "$schema": "https://turbo.build/schema.json",
+    "extends": ["//"],
+    "tasks": {
+        "build": {
+            "dependsOn": ["@posthog/frontend#prepare"]
+        },
+        "prepare": {
+            "dependsOn": ["@posthog/frontend#prepare"]
+        },
+        "start": {
+            "dependsOn": ["@posthog/frontend#prepare"],
+            "passThroughEnv": ["$TURBO_EXTENDS$", "STORYBOOK_STORIES"]
+        }
+    }
+}

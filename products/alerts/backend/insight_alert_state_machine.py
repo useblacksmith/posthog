@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+from posthog.schema_enums import AlertState as InsightAlertState
+
+from products.alerts.backend.llm_detector_limits import is_llm_detector_config
+from products.alerts_platform.backend.facade.lifecycle import (
+    AlertCheckOutcome,
+    AlertPolicy,
+    AlertSnapshot,
+    AlertState,
+    CheckInput,
+    ControlPlaneOutcome,
+    NotificationAction,
+    Outcome,
+    apply_disable as shared_apply_disable,
+    apply_enable as shared_apply_enable,
+    apply_snooze as shared_apply_snooze,
+    apply_threshold_change as shared_apply_threshold_change,
+    apply_unsnooze as shared_apply_unsnooze,
+    evaluate_alert_check as shared_evaluate_alert_check,
+)
+
+if TYPE_CHECKING:
+    from products.alerts.backend.models.alert import AlertConfiguration
+
+
+INSIGHT_ALERT_POLICY = AlertPolicy(
+    max_consecutive_failures=None,
+    notify_error_on_every_failure=False,
+    renotify_while_firing=True,
+    notify_resolve=False,
+    errors_set_errored_state=True,
+)
+
+# The AI detector flags the same bad state on check after check, so renotifying sends one message per check.
+AI_DETECTOR_ALERT_POLICY = replace(INSIGHT_ALERT_POLICY, renotify_while_firing=False)
+
+# Tells the investigation safety net and the cutover that an unsent firing check owes no notification.
+FIRING_NOT_RENOTIFIED_KEY = "firing_not_renotified"
+
+
+def insight_alert_policy(detector_config: Any) -> AlertPolicy:
+    """The policy both stacks run for an insight alert with this detector."""
+    return AI_DETECTOR_ALERT_POLICY if is_llm_detector_config(detector_config) else INSIGHT_ALERT_POLICY
+
+
+def insight_snapshot(
+    state: AlertState,
+    *,
+    last_notified_at: datetime | None,
+    snooze_until: datetime | None = None,
+    firing_started_at: datetime | None = None,
+) -> AlertSnapshot:
+    """The machine's view of an insight alert. The model keeps no failure counter, so an ERRORED
+    state reads as one failure. The platform's parallel run builds its view here too, so both
+    stacks announce an error on the same check."""
+    return AlertSnapshot(
+        state=state,
+        cooldown=timedelta(0),
+        last_notified_at=last_notified_at,
+        snooze_until=snooze_until,
+        consecutive_failures=1 if state == AlertState.ERRORED else 0,
+        firing_started_at=firing_started_at,
+    )
+
+
+def platform_state_of(insight_state: str) -> AlertState:
+    """Insight stores the `schema_enums` spelling ("Firing"). The machine spells it "firing"."""
+    return AlertState[InsightAlertState(insight_state).name]
+
+
+def snapshot_from_alert(alert: AlertConfiguration) -> AlertSnapshot:
+    return insight_snapshot(
+        platform_state_of(alert.state),
+        last_notified_at=alert.last_notified_at,
+        snooze_until=alert.snoozed_until,
+    )
+
+
+def evaluate_alert_check(
+    alert: AlertConfiguration,
+    *,
+    threshold_breached: bool,
+    error_message: str | None,
+    now: datetime,
+) -> AlertCheckOutcome:
+    return shared_evaluate_alert_check(
+        snapshot_from_alert(alert),
+        CheckInput(threshold_breached=threshold_breached, error_message=error_message),
+        now,
+        policy=insight_alert_policy(alert.detector_config),
+    )
+
+
+def apply_outcome(alert: AlertConfiguration, outcome: Outcome) -> list[str]:
+    alert.state = InsightAlertState[outcome.new_state.name]
+    return ["state"]
+
+
+def apply_enable(alert: AlertConfiguration) -> list[str]:
+    alert.enabled = True
+    return ["enabled", *apply_outcome(alert, shared_apply_enable(snapshot_from_alert(alert)))]
+
+
+def apply_disable(alert: AlertConfiguration) -> list[str]:
+    alert.enabled = False
+    return ["enabled", *apply_outcome(alert, shared_apply_disable(snapshot_from_alert(alert)))]
+
+
+def apply_snooze(alert: AlertConfiguration) -> list[str]:
+    return apply_outcome(alert, shared_apply_snooze(snapshot_from_alert(alert)))
+
+
+def apply_unsnooze(alert: AlertConfiguration) -> list[str]:
+    return apply_outcome(alert, shared_apply_unsnooze(snapshot_from_alert(alert)))
+
+
+def apply_threshold_change(alert: AlertConfiguration) -> list[str]:
+    return apply_outcome(
+        alert,
+        shared_apply_threshold_change(snapshot_from_alert(alert), preserve_snoozed_state=False),
+    )
+
+
+def apply_invalid_configuration(alert: AlertConfiguration) -> list[str]:
+    alert.enabled = False
+    return [
+        "enabled",
+        *apply_outcome(alert, ControlPlaneOutcome(new_state=AlertState.ERRORED, consecutive_failures=0)),
+    ]
+
+
+def apply_platform_state(alert: AlertConfiguration, state: InsightAlertState) -> list[str]:
+    """Takes a state the platform holds for the alert, such as the one it hands back with ownership."""
+    return apply_outcome(alert, ControlPlaneOutcome(new_state=platform_state_of(state), consecutive_failures=0))
+
+
+def should_notify(outcome: AlertCheckOutcome) -> bool:
+    return outcome.notification != NotificationAction.NONE
+
+
+def is_firing_not_renotified(outcome: AlertCheckOutcome) -> bool:
+    return outcome.new_state == AlertState.FIRING and outcome.error_message is None and not should_notify(outcome)

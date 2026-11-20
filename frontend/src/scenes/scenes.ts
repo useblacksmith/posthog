@@ -1,0 +1,990 @@
+import { combineUrl } from 'kea-router'
+
+import { dayjs } from 'lib/dayjs'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { tryDecodeURIComponent } from 'lib/utils/url'
+import { getEventLookupQuery } from 'scenes/activity/explore/defaults'
+import { Params, Scene, SceneConfig, SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { Error404 as Error404Component } from '~/layout/Error404'
+import { ErrorAccessDenied as ErrorAccessDeniedComponent } from '~/layout/ErrorAccessDenied'
+import { ErrorNetwork as ErrorNetworkComponent } from '~/layout/ErrorNetwork'
+import { ErrorProjectAccessDenied as ErrorProjectAccessDeniedComponent } from '~/layout/ErrorProjectAccessDenied'
+import { ErrorProjectUnavailable as ErrorProjectUnavailableComponent } from '~/layout/ErrorProjectUnavailable'
+import { SceneLoadError as SceneLoadErrorComponent } from '~/layout/SceneLoadError'
+import { productConfiguration, productRedirects, productRoutes } from '~/products'
+import { EventsQuery } from '~/queries/schema/schema-general'
+import { ActivityScope, ActivityTab, InsightShortId, ReplayTabs } from '~/types'
+
+import { BillingSectionId } from './billing/types'
+import { SettingSectionId } from './settings/types'
+
+export const emptySceneParams = { params: {}, searchParams: {}, hashParams: {} }
+
+export const preloadedScenes: Record<string, SceneExport> = {
+    [Scene.Error404]: {
+        component: Error404Component,
+    },
+    [Scene.ErrorAccessDenied]: {
+        component: ErrorAccessDeniedComponent,
+    },
+    [Scene.ErrorNetwork]: {
+        component: ErrorNetworkComponent,
+    },
+    [Scene.ErrorProjectAccessDenied]: {
+        component: ErrorProjectAccessDeniedComponent,
+    },
+    [Scene.ErrorProjectUnavailable]: {
+        component: ErrorProjectUnavailableComponent,
+    },
+    [Scene.ErrorSceneLoad]: {
+        component: SceneLoadErrorComponent,
+    },
+}
+
+export const sceneConfigurations: Record<Scene | string, SceneConfig> = {
+    [Scene.AdvancedActivityLogs]: {
+        projectBased: true,
+        organizationBased: false,
+        name: 'Activity logs',
+        description:
+            'Track all changes and activities in your organization with detailed filtering and export capabilities.',
+    },
+    [Scene.AgenticAuthorize]: {
+        name: 'Authorize Stripe',
+        layout: 'plain',
+        projectBased: false,
+        organizationBased: false,
+        allowUnauthenticated: true,
+    },
+    [Scene.AsyncMigrations]: { instanceLevel: true },
+    [Scene.MaterializedColumns]: {
+        projectBased: true,
+        name: 'Materialized columns',
+        description: 'Manage materialized column slot assignments for your team.',
+    },
+    [Scene.Approval]: {
+        projectBased: true,
+        name: 'Approval',
+        description: 'Review and approve a change request',
+    },
+    [Scene.WebScripts]: {
+        projectBased: true,
+        name: 'Web scripts',
+        description: 'Web scripts allow you to add custom tags and functionality to your website using PostHog.',
+        activityScope: ActivityScope.HOG_FUNCTION,
+        iconType: 'data_pipeline',
+        docsHref: 'https://posthog.com/docs/js-snippets',
+    },
+    [Scene.BatchExport]: {
+        projectBased: true,
+        name: 'Batch export',
+        activityScope: ActivityScope.BATCH_EXPORT,
+        iconType: 'data_pipeline',
+    },
+    [Scene.BatchExportNew]: {
+        projectBased: true,
+        name: 'New batch export',
+        iconType: 'data_pipeline',
+    },
+    [Scene.BillingAuthorizationStatus]: {
+        organizationBased: true,
+    },
+    [Scene.Billing]: { organizationBased: true },
+    [Scene.BillingSection]: { name: 'Billing', organizationBased: true },
+    [Scene.RealTimeUsage]: { name: 'Real-time usage', organizationBased: true },
+    [Scene.Canvas]: {
+        projectBased: true,
+        name: 'Canvas',
+        description: 'You can change anything you like and it is persisted to the URL for easy sharing.',
+        layout: 'app-full-scene-height',
+        hideProjectNotice: true,
+    },
+    [Scene.WorkloadTrustPolicyRequest]: {
+        projectBased: true,
+        layout: 'plain',
+        name: 'Trusted workload request',
+        description: 'Review a request to trust a workload',
+    },
+    [Scene.CLIAuthorize]: {
+        name: 'Authorize CLI',
+        projectBased: false,
+        organizationBased: false,
+        layout: 'plain',
+    },
+    [Scene.OAuthDeviceAuthorize]: {
+        name: 'Approve a login',
+        projectBased: false,
+        organizationBased: false,
+        layout: 'plain',
+        allowUnauthenticated: true,
+    },
+    [Scene.CLILive]: {
+        name: 'Authorize Live',
+        projectBased: false,
+        organizationBased: false,
+        layout: 'plain',
+    },
+    [Scene.Cohort]: { projectBased: true, name: 'Cohort' },
+    [Scene.CohortCalculationHistory]: { projectBased: true, name: 'Cohort Calculation History' },
+    [Scene.Cohorts]: {
+        projectBased: true,
+        name: 'Cohorts',
+        description: 'A catalog of identified persons and your created cohorts.',
+        iconType: 'cohort',
+    },
+    [Scene.CustomerAnalytics]: { projectBased: true, name: 'Customer analytics' },
+    [Scene.Dashboard]: {
+        projectBased: true,
+        deferSceneMeasurementsDuringResize: true,
+        activityScope: ActivityScope.DASHBOARD,
+        iconType: 'dashboard',
+    },
+    [Scene.Dashboards]: {
+        projectBased: true,
+        name: 'Dashboards',
+        activityScope: ActivityScope.DASHBOARD,
+        description: 'Create and manage your dashboards',
+        iconType: 'dashboard',
+        docsHref: 'https://posthog.com/docs/product-analytics/dashboards',
+    },
+    [Scene.DataManagement]: {
+        projectBased: true,
+        name: 'Data management',
+    },
+    [Scene.DataPipelinesNew]: {
+        projectBased: true,
+        name: 'New data pipeline',
+        activityScope: ActivityScope.HOG_FUNCTION,
+    },
+    [Scene.DeadLetterQueue]: { instanceLevel: true },
+    [Scene.Destinations]: {
+        projectBased: true,
+        name: 'Destinations',
+        description:
+            'Destinations allow you to send your data to external systems either in real time or in scheduled batches.',
+        activityScope: ActivityScope.HOG_FUNCTION,
+        iconType: 'data_pipeline',
+    },
+    [Scene.DebugHog]: { projectBased: true, name: 'Hog Repl' },
+    [Scene.ProjectFiles]: { projectBased: true, name: 'Files', layout: 'app-full-scene-height' },
+    [Scene.DebugQuery]: { projectBased: true },
+    [Scene.Terminal]: { projectBased: true, name: 'Terminal', layout: 'app-full-scene-height' },
+
+    [Scene.Error404]: { name: 'Not found', projectBased: true },
+    [Scene.ErrorAccessDenied]: { name: 'Access denied', hideProjectNotice: true },
+    [Scene.ErrorNetwork]: { name: 'Network error' },
+    [Scene.ErrorProjectAccessDenied]: { name: 'Project access denied', hideProjectNotice: true },
+    [Scene.ErrorProjectUnavailable]: { name: 'Project unavailable', hideProjectNotice: true },
+    // Any scene can fail to mount, including a logged-out one (login, signup, invite, password reset),
+    // so this generic error scene must render for both logged-out and logged-in visitors.
+    [Scene.ErrorSceneLoad]: { name: 'Page could not load', allowUnauthenticated: true },
+    [Scene.EventDefinitionEdit]: {
+        projectBased: true,
+        name: 'Data management',
+        activityScope: ActivityScope.EVENT_DEFINITION,
+    },
+    [Scene.EventDefinitions]: {
+        projectBased: true,
+        name: 'Event definitions',
+        activityScope: ActivityScope.EVENT_DEFINITION,
+        description: 'Event definitions are a way to define events that can be used in your app or website.',
+    },
+    [Scene.EventDefinition]: {
+        projectBased: true,
+        name: 'Event definitions',
+        activityScope: ActivityScope.EVENT_DEFINITION,
+        iconType: 'event_definition',
+    },
+    [Scene.Experiment]: {
+        projectBased: true,
+        name: 'Experiment',
+        activityScope: ActivityScope.EXPERIMENT,
+        iconType: 'experiment',
+    },
+    [Scene.ExperimentsSharedMetric]: {
+        projectBased: true,
+        name: '',
+        activityScope: ActivityScope.EXPERIMENT,
+    },
+    [Scene.ExperimentsSharedMetrics]: {
+        projectBased: true,
+        name: 'Shared metrics',
+        activityScope: ActivityScope.EXPERIMENT,
+    },
+    [Scene.Experiments]: {
+        projectBased: true,
+        name: 'Experiments',
+        activityScope: ActivityScope.EXPERIMENT,
+        description:
+            'Experiments help you test changes to your product to see which changes will lead to optimal results. Automatic statistical calculations let you see if the results are valid or due to chance.',
+        iconType: 'experiment',
+    },
+    [Scene.Activity]: {
+        projectBased: true,
+        name: 'Activity',
+        description: 'Explore your events or see real-time events from your app or website.',
+        iconType: 'activity',
+    },
+    [Scene.ExploreEvents]: {
+        projectBased: true,
+        name: 'Explore events',
+        description: 'A catalog of all user interactions with your app or website.',
+        iconType: 'activity',
+    },
+    [Scene.ExploreSessions]: {
+        projectBased: true,
+        name: 'Explore sessions',
+        description: 'A catalog of all user sessions with your app or website.',
+        iconType: 'session_replay',
+    },
+    [Scene.ExploreFlagCalls]: {
+        projectBased: true,
+        name: 'Flag calls',
+        description: 'Feature flag calls from your app or website, across all flags.',
+        iconType: 'feature_flag',
+    },
+    [Scene.FeatureFlag]: {
+        projectBased: true,
+        activityScope: ActivityScope.FEATURE_FLAG,
+    },
+    [Scene.FeatureFlags]: {
+        projectBased: true,
+        name: 'Feature flags',
+        description:
+            'Use feature flags to safely deploy and roll back new features in an easy-to-manage way. Roll variants out to certain groups, a percentage of users, or everyone all at once.',
+        activityScope: ActivityScope.FEATURE_FLAG,
+        docsHref: 'https://posthog.com/docs/feature-flags',
+    },
+    [Scene.Game368]: { name: '368 Hedgehogs', projectBased: true },
+    [Scene.HogFunction]: { projectBased: true, name: 'Hog function', activityScope: ActivityScope.HOG_FUNCTION },
+    [Scene.Insight]: {
+        projectBased: true,
+        name: 'Insights',
+        activityScope: ActivityScope.INSIGHT,
+    },
+    [Scene.InsightQuickStart]: {
+        projectBased: true,
+        name: 'Quick start',
+        description: 'Choose the type of insight you want to create',
+    },
+    [Scene.IntegrationsRedirect]: { name: 'Integrations redirect' },
+    [Scene.IntegrationsLanding]: { name: 'Integration', layout: 'plain' },
+    [Scene.StripeConfirmInstall]: { name: 'Confirm Stripe install', projectBased: true },
+    [Scene.IngestionWarnings]: {
+        projectBased: true,
+        name: 'Event ingestion warnings',
+        iconType: 'ingestion_warning',
+        description: 'Data ingestion related warnings from past 30 days.',
+    },
+    [Scene.InviteSignup]: { allowUnauthenticated: true, layout: 'plain' },
+    [Scene.LegacyPlugin]: { projectBased: true, name: 'Legacy plugin' },
+    [Scene.Coupons]: { name: 'Coupons', organizationBased: true, layout: 'app-container' },
+    [Scene.LiveEvents]: {
+        projectBased: true,
+        name: 'Live events',
+        description: 'Real-time events from your app or website.',
+        iconType: 'live',
+    },
+    [Scene.Login2FA]: { onlyUnauthenticated: true, name: 'Login 2FA', layout: 'plain' },
+    [Scene.Login]: { onlyUnauthenticated: true, name: 'Log in', layout: 'plain' },
+    [Scene.Max]: { projectBased: true, name: 'Max', layout: 'app-raw-no-header', hideProjectNotice: true },
+    [Scene.MoveToPostHogCloud]: { name: 'Move to PostHog Cloud', hideProjectNotice: true },
+    [Scene.NewTab]: {
+        projectBased: true,
+        name: 'Search',
+        iconType: 'search',
+        hideProjectNotice: true,
+        layout: 'app-raw-no-header',
+    },
+    [Scene.Notebook]: {
+        projectBased: true,
+        name: 'Notebook',
+        activityScope: ActivityScope.NOTEBOOK,
+        canvasBackground: true,
+    },
+    [Scene.Notebooks]: {
+        projectBased: true,
+        name: 'Notebooks',
+        description: 'Notebooks are a way to organize your work and share it with others.',
+        activityScope: ActivityScope.NOTEBOOK,
+        docsHref: 'https://posthog.com/docs/notebooks',
+        iconType: 'notebook',
+    },
+    [Scene.OAuthAuthorize]: {
+        name: 'Authorize',
+        layout: 'plain',
+        projectBased: false,
+        organizationBased: false,
+        allowUnauthenticated: true,
+    },
+    [Scene.Onboarding]: { projectBased: true, name: 'Onboarding', layout: 'plain' },
+    [Scene.OnboardingCoupon]: { projectBased: true, name: 'Claim coupon', layout: 'plain' },
+    [Scene.OnboardingWelcome]: { projectBased: true, name: 'Welcome' },
+    [Scene.OrganizationCreateFirst]: {
+        name: 'Organization creation',
+    },
+    [Scene.OrganizationCreationConfirm]: {
+        name: 'Confirm organization creation',
+        onlyUnauthenticated: true,
+        layout: 'plain',
+    },
+    [Scene.PasswordResetComplete]: { allowUnauthenticated: true, layout: 'plain' },
+    [Scene.PasswordReset]: { onlyUnauthenticated: true, layout: 'plain' },
+    [Scene.TwoFactorReset]: { allowUnauthenticated: true, layout: 'plain' },
+    [Scene.VercelConnect]: { allowUnauthenticated: true, layout: 'plain', name: 'Connect to Vercel' },
+    [Scene.VercelLinkError]: { layout: 'plain', name: 'Vercel account mismatch' },
+    [Scene.AgenticAccountMismatch]: { layout: 'plain', name: 'Account mismatch', allowUnauthenticated: true },
+    [Scene.AccountConnected]: {
+        name: 'Account connected',
+        layout: 'plain',
+        projectBased: false,
+        organizationBased: false,
+    },
+    [Scene.CredentialReview]: {
+        name: 'Review API keys',
+        layout: 'plain',
+        projectBased: false,
+        organizationBased: false,
+    },
+    [Scene.PreflightCheck]: { onlyUnauthenticated: true, layout: 'plain' },
+    [Scene.ProjectCreateFirst]: {
+        name: 'Project creation',
+        organizationBased: true,
+    },
+    [Scene.ProjectHomepage]: {
+        projectBased: true,
+        name: 'Homepage',
+        layout: 'app-raw-no-header',
+    },
+    [Scene.Library]: {
+        projectBased: true,
+        name: 'Library',
+    },
+    [Scene.AnalyticsList]: {
+        projectBased: true,
+        name: 'Analytics',
+    },
+    [Scene.AnalyticsSpaces]: {
+        projectBased: true,
+        name: 'Collections',
+    },
+    [Scene.Tools]: {
+        projectBased: true,
+        name: 'Tools',
+    },
+    [Scene.PropertyDefinitionEdit]: {
+        projectBased: true,
+        name: 'Data management',
+        activityScope: ActivityScope.PROPERTY_DEFINITION,
+    },
+    [Scene.SqlVariableEdit]: {
+        projectBased: true,
+        name: 'SQL variable',
+    },
+    [Scene.PropertyDefinitions]: {
+        projectBased: true,
+        name: 'Property definitions',
+        activityScope: ActivityScope.PROPERTY_DEFINITION,
+        iconType: 'property_definition',
+        description: 'Properties are additional fields you can configure to be sent along with an event capture.',
+    },
+    [Scene.PropertyDefinition]: {
+        projectBased: true,
+        name: 'Property definitions',
+        activityScope: ActivityScope.PROPERTY_DEFINITION,
+        iconType: 'property_definition',
+        description: 'Properties are additional fields you can configure to be sent along with an event capture.',
+    },
+    [Scene.ReplayFilePlayback]: {
+        projectBased: true,
+        name: 'File playback',
+        activityScope: ActivityScope.REPLAY,
+    },
+    [Scene.ReplayPlaylist]: {
+        projectBased: true,
+        name: 'Replay playlist',
+        activityScope: ActivityScope.REPLAY,
+    },
+    [Scene.ReplaySettings]: {
+        projectBased: true,
+        name: 'Settings',
+        activityScope: ActivityScope.REPLAY,
+    },
+    [Scene.ReplaySingle]: {
+        projectBased: true,
+        name: 'Replay recording',
+        activityScope: ActivityScope.REPLAY,
+    },
+    [Scene.Replay]: {
+        projectBased: true,
+        name: 'Session replay',
+        activityScope: ActivityScope.REPLAY,
+        layout: 'app-full-scene-height',
+        iconType: 'session_replay',
+        description:
+            'Replay recordings of user sessions to understand how users interact with your product or website.',
+        docsHref: 'https://posthog.com/docs/session-replay',
+    },
+    [Scene.ReplayKiosk]: {
+        projectBased: true,
+        name: 'Kiosk mode',
+        activityScope: ActivityScope.REPLAY,
+        layout: 'plain',
+        hideProjectNotice: true,
+    },
+    [Scene.ResourceTransfer]: {
+        projectBased: true,
+        name: 'Copy to project',
+        layout: 'app-container',
+    },
+    [Scene.DashboardTemplateCopy]: {
+        projectBased: true,
+        name: 'Copy template to project',
+        layout: 'app-container',
+    },
+    [Scene.MarketingAnalytics]: {
+        projectBased: true,
+        name: 'Marketing analytics',
+        layout: 'app-container',
+        description:
+            'Analyze your marketing performance across integrations: spend, impressions, conversions, ROAS, and more metrics.',
+        iconType: 'marketing_analytics',
+        docsHref: 'https://posthog.com/docs/web-analytics/marketing-analytics',
+    },
+    [Scene.MarketingAnalyticsSettings]: {
+        projectBased: true,
+        name: 'Marketing settings',
+        description: 'Configure marketing analytics integrations and data sources.',
+        iconType: 'marketing_settings',
+    },
+    [Scene.SavedInsights]: {
+        projectBased: true,
+        name: 'Product analytics',
+        description: 'Track, analyze, and experiment with user behavior.',
+        activityScope: ActivityScope.INSIGHT,
+        iconType: 'product_analytics',
+        docsHref: 'https://posthog.com/docs/product-analytics',
+    },
+    [Scene.Health]: {
+        projectBased: true,
+        name: 'Health',
+        description: 'Monitor the health of your PostHog integrations.',
+        iconType: 'health',
+    },
+    [Scene.HealthCategoryDetail]: {
+        projectBased: true,
+        name: 'Health detail',
+        iconType: 'health',
+    },
+    [Scene.HealthAlerts]: {
+        projectBased: true,
+        name: 'Health alerts',
+        description: 'Subscribe to alerts when health checks fire.',
+        iconType: 'health',
+    },
+    [Scene.PipelineStatus]: {
+        projectBased: true,
+        name: 'Pipeline status',
+        description: 'Monitor the status of your data pipelines.',
+        iconType: 'pipeline_status',
+    },
+    [Scene.SdkHealth]: {
+        projectBased: true,
+        name: 'SDK health',
+        iconType: 'sdk_health',
+        description:
+            'Monitor and maintain your PostHog SDK integrations by automatically detecting version issues, configuration problems, and implementation patterns across your applications.',
+    },
+    [Scene.Exports]: {
+        projectBased: true,
+        name: 'Exports',
+        iconType: 'exports',
+        description:
+            'Retrieve your exports here. Exports are generated asynchronously and may take a few seconds to complete.',
+    },
+    [Scene.SessionAttributionExplorer]: { projectBased: true, name: 'Session attribution explorer (beta)' },
+    [Scene.SessionProfile]: { projectBased: true, name: 'Session profile', iconType: 'session_profile' },
+    [Scene.Settings]: { projectBased: true, name: 'Settings' },
+    [Scene.IdentityProviderConfig]: { projectBased: true, name: 'Configure identity provider' },
+    [Scene.DataDeletionRequestNew]: { projectBased: true, name: 'New deletion request' },
+    [Scene.Signup]: { onlyUnauthenticated: true, name: 'Sign up', layout: 'plain' },
+    [Scene.Site]: { projectBased: true, hideProjectNotice: true, layout: 'app-raw' },
+    [Scene.StartupProgram]: { name: 'PostHog for Startups', organizationBased: true, layout: 'plain' },
+    [Scene.SurveyWizard]: {
+        projectBased: true,
+        name: 'Create survey',
+        layout: 'app-raw-no-header',
+    },
+    [Scene.SurveyFormBuilder]: {
+        projectBased: true,
+        name: 'Create form',
+    },
+    [Scene.Survey]: {
+        projectBased: true,
+        name: 'Survey',
+        activityScope: ActivityScope.SURVEY,
+    },
+    [Scene.Surveys]: {
+        projectBased: true,
+        name: 'Surveys',
+        activityScope: ActivityScope.SURVEY,
+        description: 'Create surveys to collect feedback from your users',
+        iconType: 'survey',
+        docsHref: 'https://posthog.com/docs/surveys',
+    },
+    [Scene.ProductTours]: {
+        projectBased: true,
+        name: 'Product tours',
+        description: 'Guide users through your product with interactive tours',
+        iconType: 'product_tour',
+    },
+    [Scene.ProductTour]: {
+        projectBased: true,
+        name: 'Product tour',
+    },
+    [Scene.SystemStatus]: { instanceLevel: true, name: 'Instance panel' },
+    [Scene.ToolbarLaunch]: { projectBased: true, name: 'Launch toolbar' },
+    [Scene.Transformations]: {
+        projectBased: true,
+        name: 'Transformations',
+        description:
+            'Transformations let you modify, filter, and enrich event data to improve data quality, privacy, and consistency.',
+        activityScope: ActivityScope.HOG_FUNCTION,
+        iconType: 'data_pipeline',
+    },
+    [Scene.EventFiltering]: {
+        projectBased: true,
+        name: 'Event ingestion filtering',
+        description: 'Drop events at ingestion time based on event metadata.',
+        iconType: 'data_pipeline',
+    },
+    [Scene.Unsubscribe]: { allowUnauthenticated: true, layout: 'plain' },
+    [Scene.CodeCanvasLink]: { allowUnauthenticated: true, layout: 'app-raw' },
+    [Scene.CodeChannelLink]: { allowUnauthenticated: true, layout: 'plain' },
+    [Scene.CodeTaskLink]: { allowUnauthenticated: true, layout: 'plain' },
+    [Scene.CodeLoopLink]: { allowUnauthenticated: true, layout: 'plain' },
+    [Scene.VerifyEmail]: { allowUnauthenticated: true, layout: 'plain' },
+    [Scene.WebAnalyticsPageReports]: {
+        projectBased: true,
+        name: 'Page reports',
+        layout: 'app-container',
+    },
+    [Scene.WebAnalyticsWebVitals]: {
+        projectBased: true,
+        name: 'Web vitals',
+        layout: 'app-container',
+    },
+    [Scene.WebAnalyticsHealth]: {
+        projectBased: true,
+        name: 'Health',
+        layout: 'app-container',
+    },
+    [Scene.WebAnalyticsLive]: {
+        projectBased: true,
+        name: 'Live',
+        layout: 'app-container',
+    },
+    [Scene.WebAnalytics]: {
+        projectBased: true,
+        name: 'Web analytics',
+        layout: 'app-container',
+        description: 'Analyze your web analytics data to understand website performance and user behavior.',
+        iconType: 'web_analytics',
+        docsHref: 'https://posthog.com/docs/web-analytics',
+    },
+    [Scene.WebAnalyticsRecap]: {
+        projectBased: true,
+        name: 'Weekly recap',
+        layout: 'app-raw',
+        description: "A delightful weekly recap of this project's web analytics.",
+        iconType: 'web_analytics',
+    },
+    [Scene.OrganizationDeactivated]: {
+        projectBased: false,
+        organizationBased: true,
+        name: 'Organization Deactivated',
+        layout: 'plain',
+    },
+    [Scene.OrganizationPendingDeletion]: {
+        projectBased: false,
+        organizationBased: true,
+        name: 'Organization Pending Deletion',
+        layout: 'plain',
+    },
+    [Scene.ProjectPendingDeletion]: {
+        projectBased: true,
+        name: 'Project Pending Deletion',
+        layout: 'plain',
+    },
+    ...productConfiguration,
+}
+
+const redirectPipeline = (id: string, fallbackUrl: string): string => {
+    // Hog functions (destinations & transformations)
+    if (id.startsWith('hog-')) {
+        return urls.hogFunction(id.replace('hog-', ''))
+    }
+    // Batch exports (destinations)
+    if (id.startsWith('batch-export-')) {
+        return urls.batchExport(id.replace('batch-export-', ''))
+    }
+    // Legacy plugins (transformations)
+    if (id.startsWith('plugin-')) {
+        return urls.legacyPlugin(id.replace('plugin-', ''))
+    }
+    // Data warehouse sources (sources)
+    if (id.startsWith('managed-') || id.startsWith('self-managed-')) {
+        return urls.dataWarehouseSource(id)
+    }
+    // Fallback to list view
+    return fallbackUrl
+}
+
+// NOTE: These redirects will fully replace the URL. If you want to keep support for query and hash params then you should use a function (not string) redirect
+// NOTE: If you need a query param to be automatically forwarded to the redirect URL, add it to the forwardedRedirectQueryParams array
+export const forwardedRedirectQueryParams: string[] = ['modal']
+export const redirects: Record<
+    string,
+    string | ((params: Params, searchParams: Params, hashParams: Params) => string)
+> = {
+    '/action': urls.createAction(),
+    // The Views pane became Analytics; these keep old links in the Today navigation working.
+    '/views': urls.analyticsList(),
+    '/views/new': urls.analyticsList(),
+    // Analytics opens on View all; the bare path stays as the pane's prefix.
+    [urls.analytics()]: urls.analyticsList(),
+    // Collections were called spaces; this keeps old links working.
+    '/analytics/spaces': urls.analyticsSpaces(),
+    '/analytics/product-analytics': urls.insights(),
+    '/action/:id': ({ id }) => urls.action(id),
+    '/actions': urls.actions(),
+    '/activity': urls.activity(),
+    '/activity/explore': (_params, searchParams, hashParams) =>
+        combineUrl(urls.activity(ActivityTab.ExploreEvents), searchParams, hashParams).url,
+    '/annotations': () => urls.annotations(),
+    '/annotations/:id': ({ id }) => urls.annotation(id),
+    '/batch_exports/:id': ({ id }) => urls.batchExport(id),
+    '/batch_exports': urls.destinations('batch'),
+    // Billing lives at /organization/billing. A bare /billing has no scene, so send it there.
+    // /billing/authorization_status keeps its own scene route, so it must not be caught here.
+    '/billing': urls.organizationBilling(),
+    // The scene lives at /code-review (hyphen); catch the old underscore variant, keeping the
+    // ?review= / ?reviews_scope= deep links that PR status comments bake in
+    '/code_review': (_params, searchParams, hashParams) => combineUrl(urls.codeReview(), searchParams, hashParams).url,
+    '/dashboards': urls.dashboards(),
+    // New dashboards open in a modal on the list page. `/dashboard/new` is a guessed URL,
+    // so send it there with the modal open instead of matching `/dashboard/:id`.
+    '/dashboard/new': `${urls.dashboards()}#newDashboard=modal`,
+    '/data-management': urls.eventDefinitions(),
+    '/data-management/database': urls.sources(),
+    '/data-management/data-warehouse': urls.sources(),
+    '/data-pipelines': urls.sources(),
+    // TODO: Temporary redirect because of moving marketing Analytics out of web analytics. I will remove this after a month.
+    '/web/marketing': (_, searchParams) => {
+        const params = new URLSearchParams(searchParams as Record<string, string>).toString()
+        return urls.marketingAnalyticsApp() + (params ? `?${params}` : '')
+    },
+    '/web/ai-search': urls.webAnalyticsPagePerformance(),
+
+    // A short link to share. It opens a new personal API key with the source map upload scopes filled in.
+    '/source-maps-key': combineUrl(urls.settings('user-api-keys'), { preset: 'source_map_upload' }).url,
+    '/events': urls.activity(),
+    '/events/:id/*': ({ id, _ }, { event }) => {
+        const query = getEventLookupQuery(id)
+        const source = query.source as EventsQuery
+        if (typeof event === 'string' && event) {
+            // The events query reads some events, such as flag calls, from their own table.
+            // It picks that table only when the query filters to the event name, so a uuid filter alone misses the row.
+            source.event = event
+        }
+        try {
+            const timestamp = decodeURIComponent(_)
+            source.after = dayjs(timestamp).subtract(15, 'second').startOf('second').toISOString()
+            source.before = dayjs(timestamp).add(15, 'second').startOf('second').toISOString()
+        } catch {
+            lemonToast.error('Invalid event timestamp')
+        }
+        return combineUrl(urls.activity(ActivityTab.ExploreEvents), {}, { q: query }).url
+    },
+
+    '/events/actions': urls.actions(),
+    '/events/properties': urls.propertyDefinitions(),
+    '/events/properties/:id': ({ id }) => urls.propertyDefinition(tryDecodeURIComponent(id)),
+    '/events/stats': urls.eventDefinitions(),
+    '/events/stats/:id': ({ id }) => urls.eventDefinition(id),
+    '/i/:shortId': ({ shortId }) => urls.insightView(shortId),
+    '/instance': urls.instanceStatus(),
+    '/instance/query_performance': urls.experimentsStaffTools(),
+    '/me/settings': urls.settings('user'),
+    '/new': urls.newTab(),
+    // Only billing, confirm-creation and create-project have an `/organization*` scene. Every other
+    // path here is guessed or bookmarked, matched no route, and rendered the 404 screen.
+    '/organization': urls.settings('organization'),
+    '/organization/members': urls.settings('organization'),
+    '/organization/settings': urls.settings('organization'),
+    '/organization/projects': urls.settings('organization'),
+    '/organization/settings/projects': urls.settings('organization'),
+    '/organization/projects/new': urls.projectCreateFirst(),
+    '/organization/create': urls.organizationCreateFirst(),
+    '/organization/new': urls.organizationCreateFirst(),
+    '/pipeline': urls.sources(),
+    '/pipelines': urls.sources(),
+    '/pipeline/new/site-app': urls.webScriptsNew(),
+    '/pipeline/site_apps': urls.webScripts(),
+    '/pipeline/site-apps': urls.webScripts(),
+    '/apps': urls.webScripts(),
+    '/apps/new': urls.webScriptsNew(),
+    '/pipeline/sources/:id': ({ id }) => redirectPipeline(id, urls.sources()),
+    '/pipeline/destinations/:id': ({ id }) => redirectPipeline(id, urls.destinations()),
+    '/pipeline/transformations/:id': ({ id }) => redirectPipeline(id, urls.transformations()),
+    '/pipeline/site-apps/:id': ({ id }) => redirectPipeline(id, urls.webScripts()),
+    '/pipeline/sources/:id/:tab': ({ id }) => redirectPipeline(id, urls.sources()),
+    '/pipeline/destinations/:id/:tab': ({ id }) => redirectPipeline(id, urls.destinations()),
+    '/pipeline/site-apps/:id/:tab': ({ id }) => redirectPipeline(id, urls.webScripts()),
+    '/pipeline/transformations/:id/:tab': ({ id }) => redirectPipeline(id, urls.transformations()),
+    '/pipeline/destinations': urls.destinations(),
+    '/pipeline/sources': urls.sources(),
+    '/pipeline/transformations': urls.transformations(),
+    '/pipeline/data-import': urls.sources(),
+    // There is no /project/new scene; send typed URLs and old bookmarks to the create-project flow
+    '/project/new': urls.projectCreateFirst(),
+    '/project/settings': urls.settings('project'),
+    '/project/settings/:section': ({ section }, _searchParams, hashParams) =>
+        combineUrl(urls.settings(section as SettingSectionId), {}, hashParams).url,
+    // The quickstart landing page is gone; keep old bookmarks and pinned tabs out of a 404
+    '/quickstart': urls.default(),
+    '/recordings/file-playback': () => urls.replayFilePlayback(),
+    '/recordings/playlists/:id': ({ id }) => urls.replayPlaylist(id),
+    '/recordings/settings': () => urls.replaySettings(),
+    '/recordings/:id': ({ id }) => urls.replaySingle(id),
+    '/recordings': (_params, _searchParams, hashParams) => {
+        if (hashParams.sessionRecordingId) {
+            // Previous URLs for an individual recording were like: /recordings/#sessionRecordingId=foobar
+            return urls.replaySingle(hashParams.sessionRecordingId)
+        }
+        return urls.replay()
+    },
+    '/replay': urls.replay(),
+    '/replay/recent': (_params, searchParams) =>
+        urls.replay(undefined, searchParams.filters, searchParams.sessionRecordingId),
+    '/replay/templates': (_params, searchParams, hashParams) =>
+        combineUrl(urls.replay(), { ...searchParams, showFilters: true, filtersTab: 'templates' }, hashParams).url,
+    '/saved_insights': urls.savedInsights(),
+    '/settings': urls.settings(),
+    '/settings/organization-rbac': urls.settings('organization-roles'),
+
+    '/max': (_params, searchParams, hashParams) => combineUrl(urls.ai(), searchParams, hashParams).url,
+    '/max/history': (_params, searchParams, hashParams) => combineUrl(urls.aiHistory(), searchParams, hashParams).url,
+
+    // Redirect old path-based /configuration URLs to query param format
+    '/functions/:id/configuration': ({ id }) => urls.hogFunction(id, 'configuration'),
+    '/dashboard/:id/text-tiles/:tileId': ({ id, tileId }) =>
+        combineUrl(urls.dashboardTile(id, tileId), { tileType: 'text' }).url,
+    '/dashboard/:id/button-tiles/:tileId': ({ id, tileId }) =>
+        combineUrl(urls.dashboardTile(id, tileId), { tileType: 'button' }).url,
+
+    ...productRedirects,
+}
+
+export const routes: Record<string, [Scene | string, string]> = {
+    [urls.newTab()]: [Scene.NewTab, 'newTab'],
+    [urls.dashboards()]: [Scene.Dashboards, 'dashboards'],
+    [urls.dashboardTemplateCopyToProject(':sourceTemplateId')]: [Scene.DashboardTemplateCopy, 'dashboardTemplateCopy'],
+    [urls.dashboard(':id')]: [Scene.Dashboard, 'dashboard'],
+    [urls.dashboardTile(':id', ':tileId')]: [Scene.Dashboard, 'dashboardTile'],
+    [urls.dashboardSharing(':id')]: [Scene.Dashboard, 'dashboardSharing'],
+    [urls.dashboardSubscriptions(':id')]: [Scene.Dashboard, 'dashboardSubscriptions'],
+    [urls.dashboardSubscription(':id', ':subscriptionId')]: [Scene.Dashboard, 'dashboardSubscription'],
+    [urls.ingestionWarnings()]: [Scene.DataManagement, 'ingestionWarnings'],
+    [urls.ingestionWarningsV2()]: [Scene.DataManagement, 'ingestionWarningsV2'],
+    [urls.insightQuickStart()]: [Scene.InsightQuickStart, 'insightQuickStart'],
+    [urls.insightNew()]: [Scene.Insight, 'insightNew'],
+    [urls.insightEdit(':shortId' as InsightShortId)]: [Scene.Insight, 'insightEdit'],
+    [urls.insightView(':shortId' as InsightShortId)]: [Scene.Insight, 'insightView'],
+    [urls.insightSubcriptions(':shortId' as InsightShortId)]: [Scene.Insight, 'insightSubcriptions'],
+    [urls.insightSubcription(':shortId' as InsightShortId, ':itemId')]: [Scene.Insight, 'insightSubcription'],
+    [urls.insightAlerts(':shortId' as InsightShortId)]: [Scene.Insight, 'insightAlerts'],
+    [urls.insightSharing(':shortId' as InsightShortId)]: [Scene.Insight, 'insightSharing'],
+    [urls.savedInsights()]: [Scene.SavedInsights, 'savedInsights'],
+    [urls.webAnalytics()]: [Scene.WebAnalytics, 'webAnalytics'],
+    [urls.webAnalyticsWebVitals()]: [Scene.WebAnalytics, 'webAnalyticsWebVitals'],
+    [urls.webAnalyticsPagePerformance()]: [Scene.WebAnalytics, 'webAnalyticsPagePerformance'],
+    [urls.webAnalyticsAgents()]: [Scene.WebAnalytics, 'webAnalyticsAgents'],
+    [urls.webAnalyticsHealth()]: [Scene.WebAnalyticsHealth, 'webAnalyticsHealth'],
+    [urls.webAnalyticsLive()]: [Scene.WebAnalyticsLive, 'webAnalyticsLive'],
+    [urls.webAnalyticsRecap()]: [Scene.WebAnalyticsRecap, 'webAnalyticsRecap'],
+    [urls.webAnalyticsPageReports()]: [Scene.WebAnalytics, 'webAnalyticsPageReports'],
+    [urls.marketingAnalyticsApp()]: [Scene.MarketingAnalytics, 'marketingAnalytics'],
+    [urls.revenueSettings()]: [Scene.DataManagement, 'revenue'],
+    [urls.dataWarehouseManagedViewsets()]: [Scene.DataManagement, 'dataWarehouseManagedViewsets'],
+    [urls.coreEvents()]: [Scene.DataManagement, 'coreEvents'],
+    [urls.eventDefinitions()]: [Scene.DataManagement, 'eventDefinitions'],
+    [urls.eventDefinition(':id')]: [Scene.EventDefinition, 'eventDefinition'],
+    [urls.eventDefinitionEdit(':id')]: [Scene.EventDefinitionEdit, 'eventDefinitionEdit'],
+    [urls.propertyDefinitions()]: [Scene.DataManagement, 'propertyDefinitions'],
+    [urls.propertyDefinition(':id')]: [Scene.PropertyDefinition, 'propertyDefinition'],
+    [urls.propertyDefinitionEdit(':id')]: [Scene.PropertyDefinitionEdit, 'propertyDefinitionEdit'],
+    [urls.schemaManagement()]: [Scene.DataManagement, 'schemaManagement'],
+    [urls.dataManagementHistory()]: [Scene.DataManagement, 'dataManagementHistory'],
+    [urls.database()]: [Scene.DataManagement, 'database'],
+    [urls.activity(ActivityTab.ExploreEvents)]: [Scene.ExploreEvents, 'exploreEvents'],
+    [urls.activity(ActivityTab.ExploreSessions)]: [Scene.ExploreSessions, 'exploreSessions'],
+    [urls.activity(ActivityTab.ExploreFlagCalls)]: [Scene.ExploreFlagCalls, 'exploreFlagCalls'],
+    [urls.activity(ActivityTab.LiveEvents)]: [Scene.LiveEvents, 'liveEvents'],
+    [urls.replay()]: [Scene.Replay, 'replay'],
+    // One entry for every available tab
+    ...Object.values(ReplayTabs).reduce(
+        (acc, tab) => {
+            acc[urls.replay(tab)] = [Scene.Replay, `replay:${tab}`]
+            return acc
+        },
+        {} as Record<string, [Scene, string]>
+    ),
+    [urls.resourceTransfer(':resourceKind', ':resourceId')]: [Scene.ResourceTransfer, 'resourceTransfer'],
+    [urls.replayFilePlayback()]: [Scene.ReplayFilePlayback, 'replayFilePlayback'],
+    [urls.replayKiosk()]: [Scene.ReplayKiosk, 'replayKiosk'],
+    [urls.replaySingle(':id')]: [Scene.ReplaySingle, 'replaySingle'],
+    [urls.replayPlaylist(':id')]: [Scene.ReplayPlaylist, 'replayPlaylist'],
+    [urls.replaySettings()]: [Scene.ReplaySettings, 'replaySettings'],
+    [urls.sessionProfile(':id')]: [Scene.SessionProfile, 'sessionProfile'],
+    [urls.customCss()]: [Scene.CustomCss, 'customCss'],
+    [urls.cohort(':id')]: [Scene.Cohort, 'cohort'],
+    [urls.cohortCalculationHistory(':id')]: [Scene.CohortCalculationHistory, 'cohortCalculationHistory'],
+    [urls.cohorts()]: [Scene.Cohorts, 'cohorts'],
+    [urls.experiments()]: [Scene.Experiments, 'experiments'],
+    // Must come before the parameterized /experiments/:id route
+    [urls.experimentsStaffTools()]: ['ExperimentsStaffTools' as Scene, 'experimentsStaffTools'],
+    [urls.experimentsSharedMetrics()]: [Scene.ExperimentsSharedMetrics, 'experimentsSharedMetrics'],
+    [urls.experimentsSharedMetric(':id')]: [Scene.ExperimentsSharedMetric, 'experimentsSharedMetric'],
+    [urls.experimentsSharedMetric(':id', ':action')]: [Scene.ExperimentsSharedMetric, 'experimentsSharedMetric'],
+    [urls.experiment(':id')]: [Scene.Experiment, 'experiment'],
+    [urls.experiment(':id', ':formMode')]: [Scene.Experiment, 'experiment'],
+    [urls.surveys()]: [Scene.Surveys, 'surveys'],
+    [urls.surveyWizard(':id')]: [Scene.SurveyWizard, 'surveyWizard'],
+    [urls.surveyFormBuilder(':id')]: [Scene.SurveyFormBuilder, 'surveyFormBuilder'],
+    [urls.survey(':id')]: [Scene.Survey, 'survey'],
+    [urls.productTours()]: [Scene.ProductTours, 'productTours'],
+    [urls.productTour(':id')]: [Scene.ProductTour, 'productTour'],
+    [urls.approval(':id')]: [Scene.Approval, 'approval'],
+    // pinned: the backend builds this path into the approval link it returns, which people share
+    [urls.workloadTrustPolicyRequest(':id')]: [Scene.WorkloadTrustPolicyRequest, 'workloadTrustPolicyRequest'],
+    [urls.sqlEditor()]: [Scene.SQLEditor, 'sqlEditor'],
+    [urls.featureFlags()]: [Scene.FeatureFlags, 'featureFlags'],
+    [urls.featureFlagTemplates()]: ['FeatureFlagTemplates' as Scene, 'featureFlagTemplates'],
+    [urls.featureFlagsStaffTools()]: ['FeatureFlagsStaffTools' as Scene, 'featureFlagsStaffTools'],
+    [urls.cohortsStaffTools()]: ['CohortsStaffTools' as Scene, 'cohortsStaffTools'],
+    [urls.featureFlag(':id')]: [Scene.FeatureFlag, 'featureFlag'],
+    [urls.variables()]: [Scene.DataManagement, 'variables'],
+    [urls.variableEdit(':id')]: [Scene.SqlVariableEdit, 'sqlVariableEdit'],
+    [urls.projectHomepage()]: [Scene.ProjectHomepage, 'projectHomepage'],
+    [urls.todayReport(':reportId')]: [Scene.ProjectHomepage, 'todayReport'],
+    [urls.library()]: [Scene.Library, 'library'],
+    [urls.library(':objectType')]: [Scene.Library, 'libraryObjectType'],
+    [urls.analyticsList()]: [Scene.AnalyticsList, 'analyticsList'],
+    [urls.analyticsMine()]: [Scene.AnalyticsList, 'analyticsMine'],
+    [urls.analyticsSpaces()]: [Scene.AnalyticsSpaces, 'analyticsSpaces'],
+    [urls.tools()]: [Scene.Tools, 'tools'],
+    [urls.aiHistory()]: [Scene.Max, 'maxHistory'],
+    [urls.ai()]: [Scene.Max, 'max'],
+    [urls.projectCreateFirst()]: [Scene.ProjectCreateFirst, 'projectCreateFirst'],
+    [urls.organizationBilling()]: [Scene.Billing, 'organizationBilling'],
+    [urls.organizationBillingRealTimeUsage()]: [Scene.RealTimeUsage, 'organizationBillingRealTimeUsage'],
+    [urls.organizationBillingSection(':section' as BillingSectionId)]: [
+        Scene.BillingSection,
+        'organizationBillingSection',
+    ],
+    [urls.billingAuthorizationStatus()]: [Scene.BillingAuthorizationStatus, 'billingAuthorizationStatus'],
+    [urls.organizationCreateFirst()]: [Scene.OrganizationCreateFirst, 'organizationCreateFirst'],
+    [urls.organizationCreationConfirm()]: [Scene.OrganizationCreationConfirm, 'organizationCreationConfirm'],
+    [urls.instanceStatus()]: [Scene.SystemStatus, 'instanceStatus'],
+    [urls.instanceSettings()]: [Scene.SystemStatus, 'instanceSettings'],
+    [urls.instanceStaffUsers()]: [Scene.SystemStatus, 'instanceStaffUsers'],
+    [urls.instanceKafkaInspector()]: [Scene.SystemStatus, 'instanceKafkaInspector'],
+    [urls.instanceMetrics()]: [Scene.SystemStatus, 'instanceMetrics'],
+    [urls.asyncMigrations()]: [Scene.AsyncMigrations, 'asyncMigrations'],
+    [urls.asyncMigrationsFuture()]: [Scene.AsyncMigrations, 'asyncMigrationsFuture'],
+    [urls.webScripts()]: [Scene.WebScripts, 'webScripts'],
+    [urls.webScriptsNew()]: [Scene.DataPipelinesNew, 'webScriptsNew'],
+    [urls.asyncMigrationsSettings()]: [Scene.AsyncMigrations, 'asyncMigrationsSettings'],
+    [urls.deadLetterQueue()]: [Scene.DeadLetterQueue, 'deadLetterQueue'],
+    [urls.destinations()]: [Scene.Destinations, 'destinations'],
+    [urls.materializedColumns()]: [Scene.MaterializedColumns, 'materializedColumns'],
+    [urls.transformations()]: [Scene.Transformations, 'transformations'],
+    [urls.eventFiltering()]: [Scene.EventFiltering, 'eventFiltering'],
+    [urls.toolbarLaunch()]: [Scene.ToolbarLaunch, 'toolbarLaunch'],
+    [urls.site(':url')]: [Scene.Site, 'site'],
+    [urls.login()]: [Scene.Login, 'login'],
+    [urls.login2FA()]: [Scene.Login2FA, 'login2FA'],
+    [urls.accountConnected(':kind')]: [Scene.AccountConnected, 'accountConnected'],
+    [urls.credentialReview()]: [Scene.CredentialReview, 'credentialReview'],
+    [urls.cliAuthorize()]: [Scene.CLIAuthorize, 'cliAuthorize'],
+    [urls.oauthDeviceAuthorize()]: [Scene.OAuthDeviceAuthorize, 'oauthDeviceAuthorize'],
+    [urls.cliLive()]: [Scene.CLILive, 'cliLive'],
+    [urls.preflight()]: [Scene.PreflightCheck, 'preflight'],
+    [urls.signup()]: [Scene.Signup, 'signup'],
+    [urls.inviteSignup(':id')]: [Scene.InviteSignup, 'inviteSignup'],
+    [urls.passwordReset()]: [Scene.PasswordReset, 'passwordReset'],
+    [urls.passwordResetComplete(':uuid', ':token')]: [Scene.PasswordResetComplete, 'passwordResetComplete'],
+    [urls.twoFactorReset(':uuid', ':token')]: [Scene.TwoFactorReset, 'twoFactorReset'],
+    [urls.onboarding({ productKey: ':productKey' })]: [Scene.Onboarding, 'onboarding'],
+    [urls.onboarding({ campaign: ':campaign' })]: [Scene.OnboardingCoupon, 'onboardingCoupon'],
+    [urls.onboarding()]: [Scene.Onboarding, 'onboarding'],
+    [urls.onboardingWelcome()]: [Scene.OnboardingWelcome, 'onboardingWelcome'],
+    [urls.verifyEmail()]: [Scene.VerifyEmail, 'verifyEmail'],
+    [urls.verifyEmail(':uuid')]: [Scene.VerifyEmail, 'verifyEmailWithUuid'],
+    // Links from emails sent before the switch to verification codes.
+    [`${urls.verifyEmail(':uuid')}/:token`]: [Scene.VerifyEmail, 'verifyEmailWithToken'],
+    [urls.vercelConnect()]: [Scene.VercelConnect, 'vercelConnect'],
+    [urls.vercelLinkError()]: [Scene.VercelLinkError, 'vercelLinkError'],
+    [urls.agenticAccountMismatch()]: [Scene.AgenticAccountMismatch, 'agenticAccountMismatch'],
+    [urls.unsubscribe()]: [Scene.Unsubscribe, 'unsubscribe'],
+    [urls.codeCanvasLink(':channelId', ':dashboardId')]: [Scene.CodeCanvasLink, 'codeCanvasLink'],
+    [urls.codeChannelLink(':channelId')]: [Scene.CodeChannelLink, 'codeChannelLink'],
+    [urls.codeChannelLink(':channelId', ':taskId')]: [Scene.CodeChannelLink, 'codeChannelThreadLink'],
+    [urls.codeTaskLink(':taskId')]: [Scene.CodeTaskLink, 'codeTaskLink'],
+    [urls.codeLoopLink(':loopId')]: [Scene.CodeLoopLink, 'codeLoopLink'],
+    [urls.integrationsRedirect(':kind')]: [Scene.IntegrationsRedirect, 'integrationsRedirect'],
+    [urls.integration(':slug')]: [Scene.IntegrationsLanding, 'integrationsLanding'],
+    [urls.stripeConfirmInstall()]: [Scene.StripeConfirmInstall, 'stripeConfirmInstall'],
+    [urls.debugQuery()]: [Scene.DebugQuery, 'debugQuery'],
+    [urls.debugHog()]: [Scene.DebugHog, 'debugHog'],
+    [urls.terminal()]: [Scene.Terminal, 'terminal'],
+    [urls.projectFiles()]: [Scene.ProjectFiles, 'projectFiles'],
+
+    [urls.notebook(':shortId')]: [Scene.Notebook, 'notebook'],
+    [urls.notebooks()]: [Scene.Notebooks, 'notebooks'],
+    [urls.canvas()]: [Scene.Canvas, 'canvas'],
+    [urls.identityProviderConfig(':feature', ':configId')]: [Scene.IdentityProviderConfig, 'identityProviderConfig'],
+    [urls.dataDeletionRequestNew()]: [Scene.DataDeletionRequestNew, 'dataDeletionRequestNew'],
+    [urls.settings(':section' as any)]: [Scene.Settings, 'settings'],
+    [urls.moveToPostHogCloud()]: [Scene.MoveToPostHogCloud, 'moveToPostHogCloud'],
+    [urls.advancedActivityLogs()]: [Scene.AdvancedActivityLogs, 'advancedActivityLogs'],
+    [urls.sessionAttributionExplorer()]: [Scene.SessionAttributionExplorer, 'sessionAttributionExplorer'],
+    [urls.coupons(':campaign')]: [Scene.Coupons, 'coupons'],
+    [urls.health()]: [Scene.Health, 'health'],
+    [urls.pipelineStatus()]: [Scene.PipelineStatus, 'pipelineStatus'],
+    [urls.sdkHealth()]: [Scene.SdkHealth, 'sdkHealth'],
+    [urls.healthAlerts()]: [Scene.HealthAlerts, 'healthAlerts'],
+    // Parameterized route must come after static /health/* routes
+    [urls.healthCategory(':category')]: [Scene.HealthCategoryDetail, 'healthCategoryDetail'],
+    [urls.exports()]: [Scene.Exports, 'exports'],
+    [urls.startups()]: [Scene.StartupProgram, 'startupProgram'],
+    [urls.startups(':referrer')]: [Scene.StartupProgram, 'startupProgramWithReferrer'],
+    // The settings navigation's home for this page, next to billing. The /startups routes stay until links move over.
+    [urls.organizationStartups()]: [Scene.StartupProgram, 'organizationStartupProgram'],
+    [urls.organizationStartups(':referrer')]: [Scene.StartupProgram, 'organizationStartupProgramWithReferrer'],
+    [urls.agenticAuthorize()]: [Scene.AgenticAuthorize, 'agenticAuthorize'],
+    [urls.oauthAuthorize()]: [Scene.OAuthAuthorize, 'oauthAuthorize'],
+    [urls.dataPipelinesNew(':kind' as any)]: [Scene.DataPipelinesNew, 'dataPipelinesNew'],
+    [urls.batchExportNew(':service')]: [Scene.BatchExportNew, 'batchExportNew'],
+    [urls.batchExport(':id')]: [Scene.BatchExport, 'batchExport'],
+    [urls.legacyPlugin(':id')]: [Scene.LegacyPlugin, 'legacyPlugin'],
+    [urls.hogFunction(':id')]: [Scene.HogFunction, 'hogFunction'],
+    [urls.hogFunctionNew(':templateId')]: [Scene.HogFunction, 'hogFunctionNew'],
+    [urls.organizationDeactivated()]: [Scene.OrganizationDeactivated, 'organizationDeactivated'],
+    [urls.organizationPendingDeletion()]: [Scene.OrganizationPendingDeletion, 'organizationPendingDeletion'],
+    [urls.projectPendingDeletion()]: [Scene.ProjectPendingDeletion, 'projectPendingDeletion'],
+    ...productRoutes,
+}

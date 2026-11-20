@@ -1,0 +1,1951 @@
+import {
+    MakeLogicType,
+    actions,
+    afterMount,
+    connect,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    propsChanged,
+    reducers,
+    selectors,
+} from 'kea'
+import { forms } from 'kea-forms'
+import type { DeepPartial, DeepPartialMap, FieldName, ValidationErrorType } from 'kea-forms'
+import posthog from 'posthog-js'
+
+import { ApiError, readableErrorMessage } from 'lib/api-error'
+import { lemonToast } from 'lib/lemon-ui/LemonToast'
+import { projectLogic } from 'scenes/projectLogic'
+
+import { aiConsentLogic } from '~/layout/ai/aiConsentLogic'
+import { type AttachedContextItem, attachedContextItemKey } from '~/layout/ai/attachedContext'
+import { attachedContextLogic } from '~/layout/ai/attachedContextLogic'
+
+import {
+    buildRunCreateRequest,
+    getDefaultModelForTaskRuntime,
+    getRuntimeAdapterForModel,
+    resolveEffortForModel,
+} from 'products/posthog_ai/frontend/utils/composerModels'
+import {
+    getDefaultModeForRuntimeAdapter,
+    getModeOption,
+    type PermissionMode,
+    resolveModeForRuntimeAdapter,
+} from 'products/posthog_ai/frontend/utils/composerModes'
+import {
+    tasksRunCreate,
+    tasksRunsClearConversationCreate,
+    tasksRunsCommandCreate,
+} from 'products/tasks/frontend/generated/api'
+import {
+    type ModelChoiceApi,
+    type ReasoningEffortEnumApi,
+    RuntimeAdapterEnumApi,
+    TaskExecutionModeEnumApi,
+    type TaskRunDetailDTOApi,
+    type TaskRuntimeEnumApi,
+    type WarmTaskResumeRequestApi,
+} from 'products/tasks/frontend/generated/api.schemas'
+
+import type { PermissionRequestRecord, StagedAttachment } from '../types/streamTypes'
+import { isPiTaskRuntime } from '../types/taskTypes'
+import { uploadRunAttachments, uploadStagedTaskAttachments } from '../utils/artifactUpload'
+import { rememberAttachmentPreview } from '../utils/attachmentPreviews'
+import type { PendingAttachment } from '../utils/attachments'
+import { extractCommentContexts, withCommentContexts } from '../utils/commentContext'
+import { contextItemLine, wrapWithPosthogContext } from '../utils/posthogContextBlock'
+import type { ReplySuggestions } from '../utils/replySuggestions'
+import { submitWithWarmRunRetry } from '../utils/warmRunSubmission'
+import { chatContextLogic, chatSendItems } from './chatContextLogic'
+import { codexBillingLogic, pickedCodexModelAccess, usesChatGptPlan } from './codexBillingLogic'
+import { composerAttachmentsLogic } from './composerAttachmentsLogic'
+import { modelCatalogueLogic } from './modelCatalogueLogic'
+import { type CancellationState, runCancellationLogic } from './runCancellationLogic'
+import { isTerminalRunStatus, runStreamLogic } from './runStreamLogic'
+import type { RunStatus } from './runStreamLogic'
+import { taskCommentContextsLogic } from './taskCommentContextsLogic'
+import { taskDraftListeners } from './taskDraftListeners'
+import type { DraftRecovery } from './taskDraftPersistence'
+import { taskRunDefaultsLogic } from './taskRunDefaultsLogic'
+import { taskWarmLogic, type WarmSubmission } from './taskWarmLogic'
+import { toolStreamEventsLogic } from './toolStreamEventsLogic'
+
+/** What the agent session runs with before the user picks anything in this composer. */
+export interface SessionBaseline {
+    model: string | null
+    effort: string | null
+}
+
+export interface RunInteractionLogicProps {
+    /** Empty until creation attaches a real task and run. */
+    taskId: string
+    runId: string
+    /** Keeps the composer state alive across an optimistic creation's ID handoff. */
+    interactionKey?: string
+    /**
+     * Optional override for the bound `runStreamLogic` key. The logic keys its own state by
+     * `interactionKey ?? runId`, but connects to the stream under `streamKey ?? runId` so it
+     * can adopt an optimistic-create instance seeded under a client `streamKey` — sharing the exact stream
+     * `RunSurface` binds, never diverging from it. API calls still use the real `runId`.
+     */
+    streamKey?: string
+    initialDraft?: string
+    onDraftAdopted?: () => void
+    flushDraft?: () => void
+    /** Context exclusive to the runner that owns this interaction. */
+    contextItems?: AttachedContextItem[]
+    /** The run's stored model / reasoning effort / launch mode, injected by the consumer. They seed the picker's
+     * display and the config a terminal-run send launches the next run with (override ?? this ?? default). */
+    currentModel?: string | null
+    currentEffort?: string | null
+    currentMode?: string | null
+    /** The harness the run booted on. Authoritative — a live run can't be moved to another one. */
+    currentRuntimeAdapter?: string | null
+    /** Who pays for the run's Codex model use, from the run state. A live run keeps it. */
+    currentCodexModelAccess?: string | null
+    taskRuntime?: TaskRuntimeEnumApi
+    /** Called with the new run's id after a terminal-run send starts a fresh run, so the surface can
+     * re-point selection to it (the run lifecycle / selection is a tasks-scene concern, injected here). */
+    onRunStarted?: (runId: string, handoff?: RunContinuationHandoff) => void
+}
+
+export interface RunContinuationHandoff {
+    run: TaskRunDetailDTOApi
+    streamKey: string
+    draft: string
+}
+
+/**
+ * Why a staged message is waiting on the user instead of draining on its own. `cancelled` covers a Stop or
+ * a run that ended, where nothing reached the agent, so the next thing the user submits can carry it. After
+ * `unconfirmed` the message may already be with the agent — only an explicit send may repeat it.
+ */
+export type QueueHold = 'cancelled' | 'unconfirmed' | null
+
+type TurnCancelCause = 'user_stop' | 'steer' | 'unknown'
+
+/** One follow-up staged in the queue while the agent is mid-turn. */
+export interface QueuedMessage {
+    id: string
+    content: string
+}
+
+// Identifies a staged message for the duration of its stay in the buffer, so editing or removing one row
+// leaves the others alone. Module-scoped because the ids only have to be unique within a single buffer.
+let queuedMessageSequence = 0
+const nextQueuedMessageId = (): string => `queued-${++queuedMessageSequence}`
+
+// Agent-server (ACP) session config option ids — see the `/code` agent's buildConfigOptions. The model
+// option's id is `model`; the effort option's id is `effort` (its category is `thought_level`).
+const MODEL_CONFIG_ID = 'model'
+const EFFORT_CONFIG_ID = 'effort'
+// The agent-server's permission-mode config option (`/code`'s "mode" preset). Sending
+// `set_config_option { configId: 'mode' }` is how `/code` applies a live shift+tab mode change.
+const MODE_CONFIG_ID = 'mode'
+
+/** Hands the echo each file's name plus a handle to its bytes, so the message can draw it right away. */
+function stageAttachmentPreviews(attachments: PendingAttachment[]): StagedAttachment[] {
+    return attachments.map(({ file }) => ({ name: file.name, previewId: rememberAttachmentPreview(file) }))
+}
+
+/** Matches a bare `/clear` invocation, not a longer command that starts with it. */
+function isClearCommand(content: string): boolean {
+    return /^\/clear(?:\s|$)/.test(content)
+}
+
+const GENERIC_RUN_START_FAILURE = 'Failed to start a new run. Please try again.'
+
+/**
+ * The run-create endpoint refuses for many distinct reasons and words each one for a person, so the
+ * body says whether to retry, change branch, or start over where the generic string cannot.
+ *
+ * Only a refusal below 500 speaks for itself. A 5xx is a fault on our side or in the gateway, and
+ * its body is either empty or an internal message. The warm-run retry code is the one 5xx
+ * exception, because the backend words that one for the user.
+ */
+function runStartFailureMessage(error: unknown): string {
+    if (!(error instanceof ApiError)) {
+        return GENERIC_RUN_START_FAILURE
+    }
+    if (error.code === 'warm_run_activation_unavailable') {
+        return "Couldn't start this run yet. Please try again."
+    }
+    if (error.status === undefined || error.status >= 500) {
+        return GENERIC_RUN_START_FAILURE
+    }
+    return readableErrorMessage(error.data) ?? GENERIC_RUN_START_FAILURE
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface runInteractionLogicValues {
+    dataProcessingAccepted: boolean // aiConsentLogic
+    seenContextLinesByTask: Record<string, string[]> // attachedContextLogic
+    sentContextKeysByTask: Record<string, string[]> // attachedContextLogic
+    pageItems: AttachedContextItem[] // chatContextLogic
+    picks: AttachedContextItem[] // chatContextLogic
+    queuedAttachments: PendingAttachment[] // composerAttachmentsLogic
+    stagedAttachments: PendingAttachment[] // composerAttachmentsLogic
+    catalogue: ModelChoiceApi[] // modelCatalogueLogic
+    currentProjectId: number | null // projectLogic
+    cancellationState: CancellationState // runCancellationLogic
+    bootstrappedRunId: string | null // runStreamLogic
+    bootstrappedTaskId: string | null // runStreamLogic
+    conversationClearSupported: boolean // runStreamLogic
+    currentMode: string | null // runStreamLogic
+    currentRunStatus: RunStatus | null // runStreamLogic
+    isThinking: boolean // runStreamLogic
+    pendingPermissionRequest: PermissionRequestRecord | null // runStreamLogic
+    permissionResponseRequestIds: Set<string> // runStreamLogic
+    replySuggestions: ReplySuggestions | null // runStreamLogic
+    respondingToPermission: boolean // runStreamLogic
+    runOpening: boolean // runStreamLogic
+    runStarted: boolean // runStreamLogic
+    defaultEffort: string | null // taskRunDefaultsLogic
+    defaultModel: string | null // taskRunDefaultsLogic
+    acceptedReplySuggestion: string | null
+    canSend: boolean
+    clearing: boolean
+    composerActive: boolean
+    composerFocused: boolean
+    composerForm: {
+        draft: string
+    }
+    composerFormAllErrors: Record<string, any>
+    composerFormChanged: boolean
+    composerFormErrors: DeepPartialMap<
+        {
+            draft: string
+        },
+        ValidationErrorType
+    >
+    composerFormHasErrors: boolean
+    composerFormManualErrors: Record<string, any>
+    composerFormTouched: boolean
+    composerFormTouches: Record<string, boolean>
+    composerFormValidationErrors: DeepPartialMap<
+        {
+            draft: string
+        },
+        ValidationErrorType
+    >
+    consentBlocked: boolean
+    consentBlockedSource: 'draft' | 'queue' | 'steer'
+    contextCandidates: AttachedContextItem[]
+    deferredSteerRequestId: string | null
+    dismissedReplySuggestionTurn: number | null
+    draftRecovery: DraftRecovery
+    effortOverride: string | null
+    hasUnresolvedApproval: boolean
+    isBusy: boolean
+    isComposerFormSubmitting: boolean
+    isComposerFormValid: boolean
+    isSubmitting: boolean
+    isTerminal: boolean
+    modeOverride: PermissionMode | null
+    modelOverride: string | null
+    pendingContextItems: AttachedContextItem[]
+    queueEditing: boolean
+    queueHeld: boolean
+    queueHold: QueueHold
+    queuedMessages: QueuedMessage[]
+    replySuggestion: string | null
+    selectedEffort: ReasoningEffortEnumApi
+    selectedMode: PermissionMode
+    selectedModel: string
+    sending: boolean
+    sentEffort: string | null
+    sentMode: PermissionMode | null
+    sentModel: string | null
+    sessionBaseline: SessionBaseline
+    showComposerFormErrors: boolean
+    startingRun: boolean
+    steerPending: boolean
+    unsentStartupMode: PermissionMode | null
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface runInteractionLogicActions {
+    contextDelivered: (
+        taskId: string,
+        items: AttachedContextItem[],
+        fromNewChat?: boolean | undefined
+    ) => {
+        fromNewChat: boolean
+        items: AttachedContextItem[]
+        taskId: string
+    } // attachedContextLogic
+    claimAttachmentsForQueue: () => {
+        value: true
+    } // composerAttachmentsLogic
+    releaseQueuedAttachments: () => {
+        value: true
+    } // composerAttachmentsLogic
+    removeAttachments: (ids: string[]) => {
+        ids: string[]
+    } // composerAttachmentsLogic
+    setUploading: (uploading: boolean) => {
+        uploading: boolean
+    } // composerAttachmentsLogic
+    requestCancellation: () => {
+        value: true
+    } // runCancellationLogic
+    attachOptimisticResume: (
+        taskId: string,
+        run: TaskRunDetailDTOApi
+    ) => {
+        run: TaskRunDetailDTOApi
+        taskId: string
+    } // runStreamLogic
+    cancelPermissionDelivery: () => {
+        value: true
+    } // runStreamLogic
+    cancelRun: (
+        run?:
+            | {
+                  runId: string
+                  taskId: string
+              }
+            | undefined
+    ) => {
+        run:
+            | {
+                  runId: string
+                  taskId: string
+              }
+            | undefined
+    } // runStreamLogic
+    clearPermissionRequest: () => {
+        value: true
+    } // runStreamLogic
+    handleTerminalStatus: (status: {
+        errorMessage?: string | null
+        replayedFromHistory?: boolean
+        status: RunStatus
+    }) => {
+        errorMessage?: string | null | undefined
+        replayedFromHistory?: boolean | undefined
+        status: RunStatus
+    } // runStreamLogic
+    ingestPermissionRequest: (
+        record: PermissionRequestRecord,
+        replayedFromHistory?: boolean | undefined
+    ) => {
+        record: PermissionRequestRecord
+        replayedFromHistory: boolean
+    } // runStreamLogic
+    markPermissionRequestResolved: (requestId: string) => {
+        requestId: string
+    } // runStreamLogic
+    markTurnComplete: (isReplay?: boolean | undefined) => {
+        isReplay: boolean
+    } // runStreamLogic
+    permissionResponseFailed: (requestId: string) => {
+        requestId: string
+    } // runStreamLogic
+    permissionRunChanged: () => {
+        value: true
+    } // runStreamLogic
+    pushConversationCleared: () => {
+        value: true
+    } // runStreamLogic
+    pushHumanMessage: (
+        content: string,
+        stagedAttachments?: StagedAttachment[] | undefined
+    ) => {
+        content: string
+        stagedAttachments: StagedAttachment[] | undefined
+    } // runStreamLogic
+    resetStream: () => {
+        value: true
+    } // runStreamLogic
+    respondToPermission: (payload: {
+        answers?: Record<string, string>
+        customInput?: string
+        optionId: string
+        requestId: string
+    }) => {
+        answers?: Record<string, string> | undefined
+        customInput?: string | undefined
+        optionId: string
+        requestId: string
+    } // runStreamLogic
+    rollbackOptimisticResume: () => {
+        value: true
+    } // runStreamLogic
+    setCurrentMode: (mode: string) => {
+        mode: string
+    } // runStreamLogic
+    startOptimisticResume: (
+        message: string,
+        stagedAttachments?: StagedAttachment[] | undefined
+    ) => {
+        message: string
+        stagedAttachments: StagedAttachment[] | undefined
+    } // runStreamLogic
+    claimApplyBackTargets: (streamKey: string) => {
+        streamKey: string
+    } // toolStreamEventsLogic
+    releaseApplyBackTargets: (streamKey: string) => {
+        streamKey: string
+    } // toolStreamEventsLogic
+    acceptReplySuggestion: (
+        reply: string,
+        key: string
+    ) => {
+        key: string
+        reply: string
+        turnIndex: number | null
+    }
+    applyPendingCommentText: () => {
+        value: true
+    }
+    beginTaskDraftDelivery: (content: string) => {
+        content: string
+    }
+    blockOnConsent: (source?: 'draft' | 'queue' | 'steer') => {
+        source: 'draft' | 'queue' | 'steer'
+    }
+    clearAcceptedReplySuggestion: () => {
+        value: true
+    }
+    clearConsentBlock: () => {
+        value: true
+    }
+    clearConversation: () => {
+        value: true
+    }
+    clearQueue: () => {
+        value: true
+    }
+    dismissReplySuggestion: (turnIndex: number) => {
+        turnIndex: number
+    }
+    enableTaskDraftPersistence: (
+        userId: string,
+        projectId: number
+    ) => {
+        projectId: number
+        userId: string
+    }
+    enqueueMessage: (content: string) => {
+        content: string
+        id: string
+    }
+    finishTaskDraftDelivery: () => {
+        value: true
+    }
+    flushQueue: (steer?: boolean) => {
+        steer: boolean
+    }
+    handleEscape: () => {
+        value: true
+    }
+    hydrateTaskDraft: (taskId?: string) => {
+        taskId: string | undefined
+    }
+    persistTaskDraft: () => {
+        value: true
+    }
+    prependQueuedMessages: (rows: QueuedMessage[]) => {
+        rows: QueuedMessage[]
+    }
+    queueDeliveryFailed: () => {
+        value: true
+    }
+    removeQueuedMessage: (id: string) => {
+        id: string
+    }
+    reportReplySuggestionShown: (turnIndex: number) => {
+        turnIndex: number
+    }
+    resetComposerForm: (values?: { draft: string }) => {
+        values?: {
+            draft: string
+        }
+    }
+    sendNow: (
+        content: string,
+        source: 'draft' | 'queue',
+        steer?: boolean,
+        rows?: QueuedMessage[]
+    ) => {
+        content: string
+        rows: QueuedMessage[]
+        source: 'draft' | 'queue'
+        steer: boolean
+    }
+    setClearing: (clearing: boolean) => {
+        clearing: boolean
+    }
+    setComposerFocused: (focused: boolean) => {
+        focused: boolean
+    }
+    setComposerFormManualErrors: (errors: Record<string, any>) => {
+        errors: Record<string, any>
+    }
+    setComposerFormValue: (
+        key: FieldName,
+        value: any
+    ) => {
+        name: FieldName
+        value: any
+    }
+    setComposerFormValues: (
+        values: DeepPartial<{
+            draft: string
+        }>
+    ) => {
+        values: DeepPartial<{
+            draft: string
+        }>
+    }
+    setDeferredSteer: (requestId: string | null) => {
+        requestId: string | null
+    }
+    setDraftRecovery: (recovery: DraftRecovery) => {
+        recovery: DraftRecovery
+    }
+    setEffort: (effort: string) => {
+        effort: string
+    }
+    setMode: (mode: PermissionMode) => {
+        beforeStart: boolean
+        mode: PermissionMode
+    }
+    setModel: (model: string) => {
+        model: string
+    }
+    setQueueEditing: (editing: boolean) => {
+        editing: boolean
+    }
+    setSending: (sending: boolean) => {
+        sending: boolean
+    }
+    setSentEffort: (effort: string) => {
+        effort: string
+    }
+    setSentMode: (mode: PermissionMode) => {
+        hasStartupOverride: boolean
+        mode: PermissionMode
+    }
+    setSentModel: (model: string) => {
+        model: string
+    }
+    setStartingRun: (starting: boolean) => {
+        starting: boolean
+    }
+    startNewRun: (content: string) => {
+        content: string
+    }
+    steerQueue: () => {
+        value: true
+    }
+    submitAfterConsent: () => {
+        value: true
+    }
+    submitComposerForm: () => {
+        value: boolean
+    }
+    submitComposerFormFailure: (
+        error: Error,
+        errors: Record<string, any>
+    ) => {
+        error: Error
+        errors: Record<string, any>
+    }
+    submitComposerFormRequest: (composerForm: { draft: string }) => {
+        composerForm: {
+            draft: string
+        }
+    }
+    submitComposerFormSuccess: (composerForm: { draft: string }) => {
+        composerForm: {
+            draft: string
+        }
+    }
+    touchComposerFormField: (key: string) => {
+        key: string
+    }
+    updateQueuedMessage: (
+        id: string,
+        content: string
+    ) => {
+        content: string
+        id: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface runInteractionLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        hasUnresolvedApproval: (
+            pendingPermissionRequest: PermissionRequestRecord | null,
+            permissionResponseRequestIds: Set<string>
+        ) => boolean
+        steerPending: (deferredSteerRequestId: string | null, sending: boolean) => boolean
+        composerActive: (
+            pendingPermissionRequest: PermissionRequestRecord | null,
+            respondingToPermission: boolean,
+            isTerminal: boolean
+        ) => boolean
+        isTerminal: (currentRunStatus: RunStatus | null) => boolean
+        sessionBaseline: (defaultModel: string | null, defaultEffort: string | null, arg: any) => SessionBaseline
+        selectedModel: (
+            modelOverride: string | null,
+            arg: any,
+            sessionBaseline: SessionBaseline,
+            catalogue: ModelChoiceApi[],
+            arg2: any,
+            isTerminal: boolean,
+            arg3: any
+        ) => string
+        selectedEffort: (
+            effortOverride: string | null,
+            arg: any,
+            sessionBaseline: SessionBaseline,
+            selectedModel: string,
+            catalogue: ModelChoiceApi[]
+        ) => ReasoningEffortEnumApi
+        selectedMode: (
+            unsentStartupMode: PermissionMode | null,
+            modeOverride: PermissionMode | null,
+            currentMode: string | null,
+            arg: any,
+            arg2: any
+        ) => PermissionMode
+        replySuggestion: (
+            replySuggestions: ReplySuggestions | null,
+            dismissedReplySuggestionTurn: number | null,
+            isBusy: boolean,
+            isSubmitting: boolean
+        ) => string | null
+        isBusy: (
+            isThinking: boolean,
+            runOpening: boolean,
+            runStarted: boolean,
+            isTerminal: boolean,
+            runId: string
+        ) => boolean
+        canSend: (
+            sending: boolean,
+            cancellationState: CancellationState,
+            isTerminal: boolean,
+            currentProjectId: number | null,
+            currentRunStatus: RunStatus | null,
+            bootstrappedRunId: string | null,
+            bootstrappedTaskId: string | null,
+            runId: string,
+            taskId: string,
+            runStarted: boolean
+        ) => boolean
+        queueHeld: (queuedMessages: QueuedMessage[], queueHold: QueueHold) => boolean
+        isSubmitting: (sending: boolean, startingRun: boolean, clearing: boolean) => boolean
+        contextCandidates: (
+            pageItems: AttachedContextItem[],
+            picks: AttachedContextItem[],
+            arg: AttachedContextItem[] | undefined
+        ) => AttachedContextItem[]
+        pendingContextItems: (
+            contextCandidates: AttachedContextItem[],
+            sentContextKeysByTask: Record<string, string[]>,
+            seenContextLinesByTask: Record<string, string[]>,
+            arg: string
+        ) => AttachedContextItem[]
+    }
+}
+
+export type runInteractionLogicType = MakeLogicType<
+    runInteractionLogicValues,
+    runInteractionLogicActions,
+    RunInteractionLogicProps,
+    runInteractionLogicMeta
+>
+
+function takeCommentContexts(props: RunInteractionLogicProps, content: string): string {
+    const commentLogic = props.taskId ? taskCommentContextsLogic.findMounted({ taskId: props.taskId }) : null
+    if (!commentLogic || isClearCommand(content)) {
+        return content
+    }
+    const attachments = composerAttachmentsLogic.findMounted({ attachmentsKey: props.interactionKey ?? props.runId })
+    const screenshots = commentLogic.values.commentContexts.flatMap(({ screenshotFile }) =>
+        screenshotFile ? [screenshotFile] : []
+    )
+    if (attachments && screenshots.length > 0) {
+        attachments.actions.addFiles(screenshots)
+    }
+    const stagedFiles = new Set(attachments?.values.stagedAttachments.map(({ file }) => file) ?? [])
+    const stagedNames = new Set([...stagedFiles].map((file) => file.name))
+    const contexts = commentLogic.values.commentContexts.map(({ label, body, screenshot, screenshotFile }) => {
+        const attached = screenshotFile ? stagedFiles.has(screenshotFile) : !!screenshot && stagedNames.has(screenshot)
+        return attached ? { label, body, screenshot: screenshotFile?.name ?? screenshot } : { label, body }
+    })
+    const message = withCommentContexts(contexts, content)
+    commentLogic.actions.clearCommentContexts()
+    return message
+}
+
+/**
+ * Max-agnostic interaction facade for a single task run. The UI binds to this one logic to drive every
+ * user → run interaction — sending follow-ups, staging an editable "Up next" message while the agent is
+ * busy, and (re-exposed from `runStreamLogic`) answering questions / approving operations. It owns no
+ * transport: the SSE stream, thread projection, run status, and permission routing all live in
+ * `runStreamLogic`, which this connects to by `streamKey` (the `runId`).
+ *
+ * Queueing is client-side: a follow-up typed while the agent is working a turn is staged here, and each one
+ * keeps its own row so the user can edit or drop it on its own. The staged rows are flushed as a single
+ * `user_message` when the turn completes, so follow-ups never fan out into separate turns. This mirrors the
+ * PostHog AI sandbox flush path without any conversation/Max coupling.
+ */
+export const runInteractionLogic = kea<runInteractionLogicType>([
+    path(['products', 'posthog_ai', 'frontend', 'logics', 'runInteractionLogic']),
+    props({} as RunInteractionLogicProps),
+    key((props) => {
+        if (!props.runId && (!props.interactionKey || !props.streamKey)) {
+            throw new Error('A pending composer requires interactionKey and streamKey')
+        }
+        return props.interactionKey ?? props.runId
+    }),
+
+    connect((props: RunInteractionLogicProps) => ({
+        values: [
+            projectLogic,
+            ['currentProjectId'],
+            runStreamLogic({ streamKey: props.streamKey ?? props.runId }),
+            [
+                'currentRunStatus',
+                'pendingPermissionRequest',
+                'respondingToPermission',
+                'isThinking',
+                'runOpening',
+                'runStarted',
+                'currentMode',
+                'conversationClearSupported',
+                'permissionResponseRequestIds',
+                'bootstrappedRunId',
+                'bootstrappedTaskId',
+                'replySuggestions',
+            ],
+            attachedContextLogic,
+            ['sentContextKeysByTask', 'seenContextLinesByTask'],
+            chatContextLogic({ taskId: props.taskId }),
+            ['pageItems', 'picks'],
+            aiConsentLogic,
+            ['dataProcessingAccepted'],
+            modelCatalogueLogic,
+            ['catalogue'],
+            taskRunDefaultsLogic,
+            ['defaultModel', 'defaultEffort'],
+            runCancellationLogic({ streamKey: props.streamKey ?? props.runId }),
+            ['cancellationState'],
+            composerAttachmentsLogic({ attachmentsKey: props.interactionKey ?? props.runId }),
+            ['stagedAttachments', 'queuedAttachments'],
+        ],
+        actions: [
+            runStreamLogic({ streamKey: props.streamKey ?? props.runId }),
+            [
+                'pushHumanMessage',
+                'startOptimisticResume',
+                'rollbackOptimisticResume',
+                'attachOptimisticResume',
+                'pushConversationCleared',
+                'respondToPermission',
+                'cancelRun',
+                'markTurnComplete',
+                'setCurrentMode',
+                'handleTerminalStatus',
+                'markPermissionRequestResolved',
+                'permissionResponseFailed',
+                'ingestPermissionRequest',
+                'permissionRunChanged',
+                'cancelPermissionDelivery',
+                'clearPermissionRequest',
+                'reset as resetStream',
+            ],
+            attachedContextLogic,
+            ['contextDelivered'],
+            toolStreamEventsLogic,
+            ['claimApplyBackTargets', 'releaseApplyBackTargets'],
+            runCancellationLogic({ streamKey: props.streamKey ?? props.runId }),
+            ['requestCancellation'],
+            composerAttachmentsLogic({ attachmentsKey: props.interactionKey ?? props.runId }),
+            ['removeAttachments', 'setUploading', 'claimAttachmentsForQueue', 'releaseQueuedAttachments'],
+        ],
+    })),
+
+    actions(({ values }) => ({
+        enableTaskDraftPersistence: (userId: string, projectId: number) => ({ userId, projectId }),
+        hydrateTaskDraft: (taskId?: string) => ({ taskId }),
+        persistTaskDraft: true,
+        beginTaskDraftDelivery: (content: string) => ({ content }),
+        finishTaskDraftDelivery: true,
+        setDraftRecovery: (recovery: DraftRecovery) => ({ recovery }),
+        setComposerFocused: (focused: boolean) => ({ focused }),
+        setSending: (sending: boolean) => ({ sending }),
+        blockOnConsent: (source: 'draft' | 'queue' | 'steer' = 'draft') => ({ source }),
+        clearConsentBlock: true,
+        submitAfterConsent: true,
+        applyPendingCommentText: true,
+        // Start a fresh run on the task, seeded with this message and chained from the finished run.
+        startNewRun: (content: string) => ({ content }),
+        setStartingRun: (starting: boolean) => ({ starting }),
+        clearConversation: true,
+        setClearing: (clearing: boolean) => ({ clearing }),
+        // Internal: POST one `user_message` now. `source` says where the content lives so a successful send
+        // clears the right place and a failed send preserves it for retry ('draft' → composer, 'queue' →
+        // the staged buffer combined into this send).
+        sendNow: (content: string, source: 'draft' | 'queue', steer: boolean = false, rows: QueuedMessage[] = []) => ({
+            content,
+            source,
+            steer,
+            rows,
+        }),
+        // Stage a follow-up as its own row under the ones already queued.
+        enqueueMessage: (content: string) => ({ id: nextQueuedMessageId(), content }),
+        // Re-stage unsent rows ahead of anything queued since — used to restore a failed queue flush with
+        // the rows it took, so one failure doesn't fuse them into a single uneditable row.
+        prependQueuedMessages: (rows: QueuedMessage[]) => ({ rows }),
+        updateQueuedMessage: (id: string, content: string) => ({ id, content }),
+        removeQueuedMessage: (id: string) => ({ id }),
+        clearQueue: true,
+        // Internal: drain the staged "Up next" message when the agent is idle.
+        flushQueue: (steer: boolean = false) => ({ steer }),
+        steerQueue: true,
+        handleEscape: true,
+        setDeferredSteer: (requestId: string | null) => ({ requestId }),
+        queueDeliveryFailed: true,
+        // Mirrors the queue editor's open/closed state into the logic, so an automatic drain waits for it.
+        setQueueEditing: (editing: boolean) => ({ editing }),
+        acceptReplySuggestion: (reply: string, key: string) => ({
+            reply,
+            key,
+            turnIndex: values.replySuggestions?.turnIndex ?? null,
+        }),
+        dismissReplySuggestion: (turnIndex: number) => ({ turnIndex }),
+        reportReplySuggestionShown: (turnIndex: number) => ({ turnIndex }),
+        clearAcceptedReplySuggestion: true,
+        // Pick the model / reasoning effort for the next message. Selection is held client-side only and
+        // synced to the running agent (via `set_config_option`) at send time — not on each pick. The backend
+        // doesn't persist live changes back to the run state, so the override is the source of truth.
+        setModel: (model: string) => ({ model }),
+        setEffort: (effort: string) => ({ effort }),
+        // Pick the permission mode for the run. Like model/effort, selection is held client-side and synced to
+        // the running agent (via `set_config_option { configId: 'mode' }`) at send time, or seeds the next run.
+        setMode: (mode: PermissionMode) => ({ mode, beforeStart: !values.runStarted }),
+        // Internal: record the model / effort / mode last synced to the agent session, so a send only fires a
+        // `set_config_option` when the pick actually differs from what the session is already running.
+        setSentModel: (model: string) => ({ model }),
+        setSentEffort: (effort: string) => ({ effort }),
+        setSentMode: (mode: PermissionMode) => ({ mode, hasStartupOverride: values.unsentStartupMode !== null }),
+    })),
+
+    reducers({
+        composerFocused: [false, { setComposerFocused: (_, { focused }) => focused }],
+        queueHold: [
+            null as QueueHold,
+            {
+                queueDeliveryFailed: () => 'unconfirmed',
+                requestCancellation: () => 'cancelled',
+                handleTerminalStatus: (state, { status }) => (isTerminalRunStatus(status) ? 'cancelled' : state),
+                // A Stop or a terminal run holds the message it caught, not what the user types afterwards.
+                // Submitting text is an explicit "send this", so it lifts that hold and the buffer drains on
+                // turn end. Without it, every later submit joined a buffer nothing would ever deliver.
+                // An `unconfirmed` hold survives: the send that failed may have reached the agent anyway, so
+                // repeating it needs the user to look at the thread and ask for it.
+                enqueueMessage: (state) => (state === 'cancelled' ? null : state),
+                clearQueue: () => null,
+            },
+        ],
+        // Set while a staged row is open in its editor, so an automatic drain can't send the text the user
+        // is halfway through replacing. The editor itself lives in component state.
+        queueEditing: [
+            false,
+            {
+                setQueueEditing: (_, { editing }) => editing,
+                clearQueue: () => false,
+            },
+        ],
+        dismissedReplySuggestionTurn: [
+            null as number | null,
+            {
+                dismissReplySuggestion: (_, { turnIndex }) => turnIndex,
+                acceptReplySuggestion: (state, { turnIndex }) => turnIndex ?? state,
+            },
+        ],
+        acceptedReplySuggestion: [
+            null as string | null,
+            {
+                acceptReplySuggestion: (_, { reply }) => reply,
+                clearAcceptedReplySuggestion: () => null,
+            },
+        ],
+        consentBlockedSource: ['draft' as 'draft' | 'queue' | 'steer', { blockOnConsent: (_, { source }) => source }],
+        deferredSteerRequestId: [
+            null as string | null,
+            {
+                setDeferredSteer: (_, { requestId }) => requestId,
+                permissionResponseFailed: () => null,
+                ingestPermissionRequest: (state, { record }) => (state === record.requestId ? state : null),
+                permissionRunChanged: () => null,
+                cancelPermissionDelivery: () => null,
+                clearPermissionRequest: () => null,
+                resetStream: () => null,
+                handleTerminalStatus: (state, { status }) => (isTerminalRunStatus(status) ? null : state),
+                clearQueue: () => null,
+            },
+        ],
+        sending: [
+            false,
+            {
+                setSending: (_, { sending }) => sending,
+            },
+        ],
+        consentBlocked: [
+            false,
+            {
+                blockOnConsent: () => true,
+                clearConsentBlock: () => false,
+                submitComposerForm: () => false,
+            },
+        ],
+        startingRun: [
+            false,
+            {
+                setStartingRun: (_, { starting }) => starting,
+            },
+        ],
+        clearing: [
+            false,
+            {
+                setClearing: (_, { clearing }) => clearing,
+            },
+        ],
+        draftRecovery: [
+            null as DraftRecovery,
+            {
+                setDraftRecovery: (_, { recovery }) => recovery,
+                submitComposerForm: () => null,
+                resetComposerForm: () => null,
+            },
+        ],
+        queuedMessages: [
+            [] as QueuedMessage[],
+            {
+                // Each follow-up keeps its own row, in the order it was typed, so the user can edit or drop
+                // one of them without rewriting the rest. They go out together as one message.
+                enqueueMessage: (state, { id, content }) => [...state, { id, content }],
+                // Restore the unsent rows in front of anything staged since, preserving send order.
+                prependQueuedMessages: (state, { rows }) => [...rows, ...state],
+                updateQueuedMessage: (state, { id, content }) =>
+                    state.flatMap((message) =>
+                        message.id === id ? (content.trim() ? [{ ...message, content }] : []) : [message]
+                    ),
+                removeQueuedMessage: (state, { id }) => state.filter((message) => message.id !== id),
+                clearQueue: () => [],
+            },
+        ],
+        // Optimistic, client-side only — null means "use the run's stored model/effort". The logic is keyed by
+        // `runId`, so switching runs gets a fresh instance with the override reset.
+        modelOverride: [
+            null as string | null,
+            {
+                setModel: (_, { model }) => model,
+            },
+        ],
+        effortOverride: [
+            null as string | null,
+            {
+                setEffort: (_, { effort }) => effort,
+            },
+        ],
+        modeOverride: [
+            null as PermissionMode | null,
+            {
+                setMode: (_, { mode }) => mode,
+                setSentMode: (state, { mode, hasStartupOverride }) => (hasStartupOverride ? mode : state),
+                // Unlike model/effort, the mode genuinely changes server-side (e.g. a plan approval moves the
+                // session out of Plan mode) — the agent's confirmed mode is authoritative, so a stale manual
+                // pick must not keep shadowing the stream's `current_mode_update`.
+                setCurrentMode: () => null,
+            },
+        ],
+        // The initial session mode describes the first prompt, not the queued follow-up's selection.
+        unsentStartupMode: [
+            null as PermissionMode | null,
+            {
+                setMode: (_, { mode, beforeStart }) => (beforeStart ? mode : null),
+                setSentMode: () => null,
+            },
+        ],
+        // The model/effort last synced to the agent session via `set_config_option`. null means "not synced
+        // yet this session" — the active config is then the run's stored value (or the default).
+        sentModel: [
+            null as string | null,
+            {
+                setSentModel: (_, { model }) => model,
+            },
+        ],
+        sentEffort: [
+            null as string | null,
+            {
+                setSentEffort: (_, { effort }) => effort,
+            },
+        ],
+        sentMode: [
+            null as PermissionMode | null,
+            {
+                setSentMode: (_, { mode }) => mode,
+                // Cleared alongside `modeOverride` so the send-time sync check compares against the agent's
+                // live mode, not a marker the agent has since moved past.
+                setCurrentMode: () => null,
+            },
+        ],
+    }),
+
+    forms(({ actions, values, props }) => ({
+        // The composer draft lives here so the input region is a real <form>. `submit` is the single entry
+        // point the composer's `onSubmit` calls — it decides send-now vs enqueue vs new-run. It dispatches
+        // synchronously (no await), so `isComposerFormSubmitting` isn't the UI loading state — `isSubmitting`
+        // covers all three in-flight paths. `errors` gates programmatic `submitComposerForm()`; the UI's own
+        // `Composer.Root` disabled-reason is the parallel guard.
+        composerForm: {
+            defaults: { draft: '' as string },
+            errors: ({ draft }) => ({
+                draft: !draft.trim() ? 'Type a message first' : undefined,
+            }),
+            submit: ({ draft }) => {
+                const content = draft.trim()
+                if (!content || values.cancellationState) {
+                    return
+                }
+                if (!values.dataProcessingAccepted) {
+                    actions.blockOnConsent()
+                    return
+                }
+                // A finished run can't take a follow-up signal — send starts a fresh run instead, seeded with
+                // this message and chained from the run just viewed. Except `/clear`, which the agent
+                // handles rather than the model: a whole run to clear a conversation the next run would
+                // rebuild from the log anyway, so the boundary is recorded against this run instead.
+                //
+                // Only when the chain's agent understands the boundary. An older one ignores the marker
+                // and resumes the conversation it was meant to retire, so falling back to an ordinary
+                // new run is the honest degradation — the clear doesn't happen, and nothing claims it did.
+                if (values.isTerminal) {
+                    if (isClearCommand(content) && values.conversationClearSupported) {
+                        actions.clearConversation()
+                        return
+                    }
+                    // A row editor keeps its text in the component until the user saves, so sending now
+                    // would carry the row as it stood before the edit. Wait, as the drain does.
+                    if (values.queueEditing) {
+                        lemonToast.info('Save or cancel your edit first')
+                        return
+                    }
+                    // A finished run can't drain the queue — `canSend` is false for the rest of its life —
+                    // so the staged rows ride along into the run this send starts. Leaving them behind
+                    // stranded them on screen, promising a delivery nothing would ever make.
+                    const staged = values.queuedMessages.map((message) => message.content)
+                    if (staged.length > 0) {
+                        actions.clearQueue()
+                    }
+                    actions.startNewRun([...staged, takeCommentContexts(props, content)].join('\n\n'))
+                    return
+                }
+                // While the agent is working, a send is in flight, or a message is already staged — concatenate
+                // this onto the single queued message so follow-ups never jump ahead or fan out; otherwise send
+                // it straight from the draft. `flushQueue` self-guards, draining only when the run is fully idle.
+                if (
+                    values.isBusy ||
+                    values.hasUnresolvedApproval ||
+                    values.sending ||
+                    values.queuedMessages.length > 0
+                ) {
+                    actions.enqueueMessage(takeCommentContexts(props, content))
+                    actions.claimAttachmentsForQueue()
+                    actions.resetComposerForm()
+                    actions.flushQueue()
+                } else {
+                    actions.sendNow(takeCommentContexts(props, content), 'draft')
+                }
+            },
+        },
+    })),
+
+    selectors({
+        hasUnresolvedApproval: [
+            (s) => [s.pendingPermissionRequest, s.permissionResponseRequestIds],
+            (request: PermissionRequestRecord | null, deliveries: Set<string>): boolean =>
+                !!request || deliveries.size > 0,
+        ],
+        steerPending: [
+            (s) => [s.deferredSteerRequestId, s.sending],
+            (requestId: string | null, sending: boolean): boolean => requestId !== null || sending,
+        ],
+        composerActive: [
+            (s) => [s.pendingPermissionRequest, s.respondingToPermission, s.isTerminal],
+            (request: PermissionRequestRecord | null, responding: boolean, terminal: boolean): boolean =>
+                !request || responding || terminal,
+        ],
+        isTerminal: [
+            (s) => [s.currentRunStatus],
+            (status: null | import('./runStreamLogic').RunStatus): boolean => isTerminalRunStatus(status),
+        ],
+        sessionBaseline: [
+            (s) => [s.defaultModel, s.defaultEffort, (_, p) => p.taskRuntime],
+            (
+                defaultModel: string | null,
+                defaultEffort: string | null,
+                taskRuntime: TaskRuntimeEnumApi | undefined
+            ): SessionBaseline =>
+                isPiTaskRuntime(taskRuntime)
+                    ? { model: null, effort: null }
+                    : { model: defaultModel, effort: defaultEffort },
+        ],
+        // The model/effort to display in the picker and launch the next run with: the optimistic client-side
+        // override, else the run's stored value, else the session baseline, else the runtime's built-in
+        // default. Effort is clamped to one the model supports.
+        selectedModel: [
+            (s) => [
+                s.modelOverride,
+                (_, p) => p.currentModel,
+                s.sessionBaseline,
+                s.catalogue,
+                (_, p) => p.currentRuntimeAdapter,
+                s.isTerminal,
+                (_, p) => p.taskRuntime,
+            ],
+            (
+                override: string | null,
+                current: string | null | undefined,
+                baseline: SessionBaseline,
+                catalogue: ModelChoiceApi[],
+                runtimeAdapter: string | null | undefined,
+                terminal: boolean,
+                taskRuntime: TaskRuntimeEnumApi | undefined
+            ): string => {
+                const compatibleOverride =
+                    override &&
+                    !terminal &&
+                    runtimeAdapter &&
+                    getRuntimeAdapterForModel(catalogue, override) !== runtimeAdapter
+                        ? null
+                        : override
+                return compatibleOverride ?? current ?? baseline.model ?? getDefaultModelForTaskRuntime(taskRuntime)
+            },
+        ],
+        selectedEffort: [
+            (s) => [s.effortOverride, (_, p) => p.currentEffort, s.sessionBaseline, s.selectedModel, s.catalogue],
+            (
+                override: string | null,
+                current: string | null | undefined,
+                baseline: SessionBaseline,
+                model: string,
+                catalogue: ModelChoiceApi[]
+            ): ReasoningEffortEnumApi =>
+                resolveEffortForModel(catalogue, override ?? current ?? baseline.effort, model),
+        ],
+        // The permission mode to display and launch with: the client-side override, else the session's live
+        // mode (from the stream's `current_mode_update` frames), else the run's stored launch mode, else the
+        // default. The wire values are narrowed via `getModeOption` — an unrecognized mode string (a future
+        // mode, another runtime's vocabulary) degrades to the next fallback instead of leaking out as a
+        // fake `PermissionMode`.
+        selectedMode: [
+            (s) => [
+                s.unsentStartupMode,
+                s.modeOverride,
+                s.currentMode,
+                (_, p) => p.currentMode,
+                (_, p) => p.currentRuntimeAdapter,
+            ],
+            (
+                startupOverride: PermissionMode | null,
+                override: PermissionMode | null,
+                current: string | null,
+                initial: string | null | undefined,
+                runtimeAdapter: string | null | undefined
+            ): PermissionMode => {
+                // Coerce onto the run's own harness: the wire can carry the other runtime's vocabulary
+                // (a run started from desktop or Slack), and showing `full access` on a Claude run — or
+                // sending it — is a mode that runtime rejects.
+                const adapter = runtimeAdapter ?? RuntimeAdapterEnumApi.Claude
+                const picked =
+                    startupOverride ?? override ?? getModeOption(current)?.value ?? getModeOption(initial)?.value
+                return picked ? resolveModeForRuntimeAdapter(adapter, picked) : getDefaultModeForRuntimeAdapter(adapter)
+            },
+        ],
+        replySuggestion: [
+            (s) => [s.replySuggestions, s.dismissedReplySuggestionTurn, s.isBusy, s.isSubmitting],
+            (
+                replySuggestions: ReplySuggestions | null,
+                dismissedTurn: number | null,
+                isBusy: boolean,
+                isSubmitting: boolean
+            ): string | null =>
+                !replySuggestions || isBusy || isSubmitting || replySuggestions.turnIndex === dismissedTurn
+                    ? null
+                    : (replySuggestions.replies[0] ?? null),
+        ],
+        // The agent is actively working a turn — a follow-up typed now should stage rather than send.
+        isBusy: [
+            (s, p) => [s.isThinking, s.runOpening, s.runStarted, s.isTerminal, p.runId],
+            (thinking: boolean, opening: boolean, started: boolean, terminal: boolean, runId: string): boolean =>
+                thinking || opening || (!terminal && (!runId || !started)),
+        ],
+        canSend: [
+            (s, p) => [
+                s.sending,
+                s.cancellationState,
+                s.isTerminal,
+                s.currentProjectId,
+                s.currentRunStatus,
+                s.bootstrappedRunId,
+                s.bootstrappedTaskId,
+                p.runId,
+                p.taskId,
+                s.runStarted,
+            ],
+            (
+                sending: boolean,
+                cancellationState: CancellationState,
+                isTerminal: boolean,
+                currentProjectId: number | null,
+                status: RunStatus | null,
+                activeRunId: string | null,
+                activeTaskId: string | null,
+                runId: string,
+                taskId: string,
+                runStarted: boolean
+            ): boolean =>
+                !sending &&
+                !cancellationState &&
+                !isTerminal &&
+                currentProjectId != null &&
+                status !== null &&
+                !!taskId &&
+                !!runId &&
+                runStarted &&
+                (!activeRunId || activeRunId === runId) &&
+                (!activeTaskId || activeTaskId === taskId),
+        ],
+        // Whether the staged message is waiting on the user rather than on the agent. The queue looks the
+        // same in both cases, so the banner says which it is.
+        queueHeld: [
+            (s) => [s.queuedMessages, s.queueHold],
+            (queued: QueuedMessage[], hold: QueueHold): boolean => queued.length > 0 && hold !== null,
+        ],
+        // In-flight indicator for the composer's send button — a live send, a new-run start, or a clear.
+        isSubmitting: [
+            (s) => [s.sending, s.startingRun, s.clearing],
+            (sending: boolean, startingRun: boolean, clearing: boolean): boolean => sending || startingRun || clearing,
+        ],
+        contextCandidates: [
+            (s) => [s.pageItems, s.picks, (_, p: RunInteractionLogicProps) => p.contextItems],
+            (
+                pageItems: AttachedContextItem[],
+                picks: AttachedContextItem[],
+                pinnedItems: AttachedContextItem[] | undefined
+            ): AttachedContextItem[] => chatSendItems(pageItems, picks, pinnedItems),
+        ],
+        // Attached context not yet wrapped into a message for this task, the snapshot the next send wraps.
+        // Two dedupe layers, both task-scoped (not run-scoped, so the dedupe survives a terminal-run send
+        // re-pointing to a fresh run instance): the in-memory sent keys marked by this session's sends, and
+        // the durable seen lines `runStreamLogic` reconstructs from the run log's resume-chain history —
+        // without the latter, a reload or another tab would re-wrap context the chain already carries.
+        // `text` items are never deduped (matches the backend's `prune_repeated_entity_refs`: repeated
+        // text is intentional, e.g. consecutive error snippets).
+        pendingContextItems: [
+            (s) => [
+                s.contextCandidates,
+                s.sentContextKeysByTask,
+                s.seenContextLinesByTask,
+                (_, p: RunInteractionLogicProps) => p.taskId,
+            ],
+            (
+                contextCandidates: AttachedContextItem[],
+                sentContextKeysByTask: Record<string, string[]>,
+                seenContextLinesByTask: Record<string, string[]>,
+                taskId: string
+            ): AttachedContextItem[] => {
+                const sentKeys = new Set(sentContextKeysByTask[taskId] ?? [])
+                const seenLines = new Set(seenContextLinesByTask[taskId] ?? [])
+                return contextCandidates.filter(
+                    (item) =>
+                        item.type === 'text' ||
+                        (!sentKeys.has(attachedContextItemKey(item)) && !seenLines.has(contextItemLine(item)))
+                )
+            },
+        ],
+    }),
+
+    listeners(({ actions, values, props, cache }) => {
+        const getWarmLogic = (): ReturnType<typeof taskWarmLogic> | undefined => {
+            if (!props.taskId || !props.runId) {
+                return
+            }
+            const warm = taskWarmLogic({ taskId: props.taskId, resumeFromRunId: props.runId })
+            if (cache.warmLogicKey !== warm.key || cache.warmDisposables !== cache.disposables) {
+                cache.disposables.add(() => warm.mount(), 'composer-warm', { pauseOnPageHidden: false })
+                cache.warmLogicKey = warm.key
+                cache.warmDisposables = cache.disposables
+            }
+            return warm
+        }
+        const invalidateSend = (): void => {
+            cache.sendGeneration = (cache.sendGeneration ?? 0) + 1
+            actions.setSending(false)
+        }
+
+        const noteTerminalDraft = (): void => {
+            // Consent gates warming as it gates sending: a warm boots a cloud sandbox and restores
+            // the task's repository snapshot, so typing must not start one before the organization
+            // accepts AI data processing.
+            if (
+                !props.taskId ||
+                !props.runId ||
+                !values.isTerminal ||
+                !values.dataProcessingAccepted ||
+                values.startingRun ||
+                values.draftRecovery ||
+                cache.restoringTaskDraft
+            ) {
+                return
+            }
+            const createRequest = buildRunCreateRequest(
+                values.catalogue,
+                values.selectedModel,
+                values.selectedEffort,
+                values.selectedMode,
+                { resume_from_run_id: props.runId }
+            )
+            getWarmLogic()?.actions.noteDraft(
+                Boolean(values.composerForm.draft.trim()),
+                createRequest as WarmTaskResumeRequestApi,
+                !usesChatGptPlan(getRuntimeAdapterForModel(values.catalogue, values.selectedModel))
+            )
+        }
+
+        // A queue send that never landed goes back as the rows it took, so one failure doesn't fuse them
+        // into a single uneditable row. A send with no rows attached still has its text, so it returns as
+        // one row rather than vanishing.
+        const restoreCommentContexts = (content: string): string => {
+            const { contexts, text } = extractCommentContexts(content)
+            if (contexts.length > 0 && props.taskId) {
+                taskCommentContextsLogic.findMounted({ taskId: props.taskId })?.actions.restoreCommentContexts(contexts)
+            }
+            return contexts.length > 0 ? text : content
+        }
+
+        // Dedupe can prune an item from the wire, such as a re-pick, but the chat still holds it. Recording the whole
+        // set stops every later send in the resume chain from re-inflating it.
+        const recordDelivery = (items: AttachedContextItem[]): void => {
+            actions.contextDelivered(props.taskId, items)
+        }
+
+        const restoreQueuedRows = (rows: QueuedMessage[], content: string): void => {
+            actions.prependQueuedMessages(rows.length > 0 ? rows : [{ id: nextQueuedMessageId(), content }])
+        }
+
+        return {
+            // Only a Stop the cancellation logic accepts counts: one it ignores or fails to send must not claim
+            // the next cancel, which a later steer may cause.
+            [runCancellationLogic({ streamKey: props.streamKey ?? props.runId }).actionTypes.setCancellationState]: ({
+                state,
+            }) => {
+                if (state === 'waiting') {
+                    cache.turnCancelCause = 'user_stop'
+                }
+            },
+            [runCancellationLogic({ streamKey: props.streamKey ?? props.runId }).actionTypes.cancellationFailed]:
+                () => {
+                    cache.turnCancelCause = undefined
+                },
+            // Separates a cancel the user asked for from one a steer caused, which the thread can't tell apart.
+            [runStreamLogic({ streamKey: props.streamKey ?? props.runId }).actionTypes.ingestAcpFrame]: ({
+                entry,
+                source,
+            }) => {
+                if (
+                    source !== 'live' ||
+                    entry.notification.method !== '_posthog/turn_complete' ||
+                    (entry.source_run_id && entry.source_run_id !== values.bootstrappedRunId)
+                ) {
+                    return
+                }
+                const cause: TurnCancelCause = cache.turnCancelCause ?? 'unknown'
+                cache.turnCancelCause = undefined
+                if (entry.notification.params?.stopReason === 'cancelled') {
+                    posthog.capture('task_run_turn_cancelled', {
+                        cause,
+                        task_id: props.taskId,
+                        run_id: values.bootstrappedRunId,
+                    })
+                }
+            },
+            handleEscape: () => {
+                if (values.cancellationState || values.steerPending) {
+                    return
+                }
+                if (values.queuedMessages.length > 0) {
+                    actions.steerQueue()
+                } else if (values.isBusy || (!values.composerActive && !values.isTerminal)) {
+                    actions.requestCancellation()
+                }
+            },
+            submitAfterConsent: () => {
+                actions.clearConsentBlock()
+                if (values.consentBlockedSource === 'steer') {
+                    actions.steerQueue()
+                } else if (values.consentBlockedSource === 'queue') {
+                    actions.flushQueue()
+                } else {
+                    actions.submitComposerForm()
+                }
+            },
+            // Clear before awaiting delivery so new follow-ups survive completion. A failed send restores the
+            // rows it took, and holds them until the user asks again, so nothing is delivered twice.
+            flushQueue: ({ steer }) => {
+                const rows = values.queuedMessages
+                // The staged rows go out as one `user_message`, so follow-ups never fan out into separate
+                // turns — the second would otherwise wait for the turn the first one starts.
+                const queued = rows.map((message) => message.content).join('\n\n')
+                if (
+                    !queued ||
+                    (!steer && (values.isBusy || values.queueHold !== null)) ||
+                    values.queueEditing ||
+                    values.hasUnresolvedApproval ||
+                    !values.canSend
+                ) {
+                    return
+                }
+                if (!values.dataProcessingAccepted) {
+                    actions.blockOnConsent(steer ? 'steer' : 'queue')
+                    return
+                }
+                actions.clearQueue()
+                actions.sendNow(queued, 'queue', steer, rows)
+            },
+
+            steerQueue: () => {
+                if (!values.queuedMessages.length || values.steerPending || !values.canSend) {
+                    return
+                }
+                if (!values.dataProcessingAccepted) {
+                    actions.blockOnConsent('steer')
+                    return
+                }
+                if (values.pendingPermissionRequest && values.pendingPermissionRequest.sourceRunId !== props.runId) {
+                    return
+                }
+                const requestId =
+                    values.pendingPermissionRequest?.requestId ?? [...values.permissionResponseRequestIds][0]
+                if (requestId) {
+                    actions.setDeferredSteer(requestId)
+                } else {
+                    actions.flushQueue(true)
+                }
+            },
+
+            markPermissionRequestResolved: ({ requestId }) => {
+                const steer = values.deferredSteerRequestId === requestId
+                if (steer) {
+                    actions.setDeferredSteer(null)
+                }
+                actions.flushQueue(steer)
+            },
+            // An emptied queue hands its files back rather than deleting them for the user.
+            removeQueuedMessage: () => {
+                if (!values.queuedMessages.length) {
+                    actions.clearQueue()
+                    actions.releaseQueuedAttachments()
+                }
+            },
+            updateQueuedMessage: () => {
+                if (!values.queuedMessages.length) {
+                    actions.clearQueue()
+                    actions.releaseQueuedAttachments()
+                }
+            },
+            // A turn that ended while a row was open skipped the drain, and an idle agent sends no further
+            // turn completion — so retry the drain once the editor closes.
+            setQueueEditing: ({ editing }) => {
+                if (!editing) {
+                    actions.flushQueue()
+                }
+            },
+
+            sendNow: async ({ content, source, steer, rows }) => {
+                if (
+                    !values.canSend ||
+                    !content.trim() ||
+                    values.hasUnresolvedApproval ||
+                    !values.dataProcessingAccepted
+                ) {
+                    // Nothing was sent. The queue buffer was already cleared in `flushQueue`, so re-stage for
+                    // retry; the draft path leaves its content untouched in the composer.
+                    if (source === 'queue') {
+                        restoreQueuedRows(rows, content)
+                    }
+                    return
+                }
+                const projectId = values.currentProjectId
+                const runId = props.runId
+                const taskId = props.taskId
+                const disposables = cache.disposables
+                const generation = (cache.sendGeneration = (cache.sendGeneration ?? 0) + 1)
+                const isCurrent = (): boolean =>
+                    !disposables.isDisposed &&
+                    cache.sendGeneration === generation &&
+                    values.currentProjectId === projectId &&
+                    !values.isTerminal &&
+                    props.runId === runId &&
+                    props.taskId === taskId
+                actions.setSending(true)
+                actions.beginTaskDraftDelivery(content)
+                const streamKey = props.streamKey ?? props.runId
+                // `/clear` goes unwrapped: a context block would hide the command behind it (the
+                // agent reads the command off the front) and mark refs sent that nothing ever read.
+                const pendingContext = isClearCommand(content) ? [] : values.pendingContextItems
+                const deliveredContext = isClearCommand(content) ? [] : values.contextCandidates
+                actions.claimApplyBackTargets(streamKey)
+                // Clear the draft synchronously before the await so text the user types while the send is in
+                // flight isn't clobbered when the request resolves; a failed send restores it ahead of anything
+                // typed since. The queue buffer was already cleared up-front in `flushQueue`.
+                if (source === 'draft') {
+                    actions.resetComposerForm()
+                }
+                actions.persistTaskDraft()
+                try {
+                    // Sync the picked model/effort to the agent session first, but only what the user actually
+                    // changed since the last sync — mid-run config lives as session state, so it must go via a
+                    // `set_config_option` command before the message rather than ride inside `user_message`. A
+                    // failure here aborts the send (the catch restores the content); `setSent*` runs only after a
+                    // successful sync so the next send retries an unsent change.
+                    const setConfigOption = (configId: string, value: string): Promise<unknown> =>
+                        tasksRunsCommandCreate(String(values.currentProjectId), props.taskId, props.runId, {
+                            jsonrpc: '2.0',
+                            method: 'set_config_option',
+                            params: { configId, value },
+                        })
+                    const activeModel =
+                        values.sentModel ??
+                        props.currentModel ??
+                        values.sessionBaseline.model ??
+                        getDefaultModelForTaskRuntime(props.taskRuntime)
+                    const activeEffort = resolveEffortForModel(
+                        values.catalogue,
+                        values.sentEffort ?? props.currentEffort ?? values.sessionBaseline.effort,
+                        activeModel
+                    )
+                    if (values.selectedModel !== activeModel) {
+                        await setConfigOption(MODEL_CONFIG_ID, values.selectedModel)
+                        if (!isCurrent()) {
+                            return
+                        }
+                        actions.setSentModel(values.selectedModel)
+                    }
+                    if (values.selectedEffort !== activeEffort) {
+                        await setConfigOption(EFFORT_CONFIG_ID, values.selectedEffort)
+                        if (!isCurrent()) {
+                            return
+                        }
+                        actions.setSentEffort(values.selectedEffort)
+                    }
+                    if (!isPiTaskRuntime(props.taskRuntime)) {
+                        const modeAdapter = props.currentRuntimeAdapter ?? RuntimeAdapterEnumApi.Claude
+                        const lastKnownMode =
+                            values.sentMode ??
+                            getModeOption(values.currentMode)?.value ??
+                            getModeOption(props.currentMode)?.value
+                        const activeMode = lastKnownMode
+                            ? resolveModeForRuntimeAdapter(modeAdapter, lastKnownMode)
+                            : getDefaultModeForRuntimeAdapter(modeAdapter)
+                        if (values.selectedMode !== activeMode) {
+                            await setConfigOption(MODE_CONFIG_ID, values.selectedMode)
+                            if (!isCurrent()) {
+                                return
+                            }
+                        }
+                        actions.setSentMode(values.selectedMode)
+                    }
+                    // A drain carries the files queued with its text, not whatever the composer holds now.
+                    const sending = source === 'queue' ? values.queuedAttachments : values.stagedAttachments
+                    let artifactIds: string[] = []
+                    if (sending.length > 0) {
+                        actions.setUploading(true)
+                        artifactIds = await uploadRunAttachments(
+                            String(projectId),
+                            taskId,
+                            runId,
+                            sending.map((attachment) => attachment.file)
+                        )
+                        if (!isCurrent()) {
+                            return
+                        }
+                    }
+                    // Wrap the outgoing content with the on-screen context block (invisible to the user —
+                    // `runStreamLogic.unwrapUserMessageContent` strips it on replay, and the echo below is raw).
+                    if (!isCurrent() || values.hasUnresolvedApproval) {
+                        throw new Error('The run cannot accept this message yet')
+                    }
+                    if (steer && !cache.turnCancelCause) {
+                        cache.turnCancelCause = 'steer'
+                    }
+                    const response = await tasksRunsCommandCreate(String(projectId), taskId, runId, {
+                        jsonrpc: '2.0',
+                        method: 'user_message',
+                        params: {
+                            content: wrapWithPosthogContext(content, pendingContext),
+                            ...(steer ? { steer: true } : {}),
+                            ...(artifactIds.length > 0 ? { artifact_ids: artifactIds } : {}),
+                        },
+                    })
+                    if (!isCurrent()) {
+                        return
+                    }
+                    const result = response?.result
+                    if (
+                        response?.jsonrpc !== '2.0' ||
+                        'error' in response ||
+                        typeof result !== 'object' ||
+                        result === null ||
+                        !('queued' in result) ||
+                        result.queued !== true
+                    ) {
+                        throw new Error('The agent did not confirm this message')
+                    }
+                    // The SSE echo (`pushHumanMessage`) reopens the turn — always the raw text the user typed.
+                    // The names ride along so the chips show on send, not when the turn echoes back.
+                    actions.pushHumanMessage(content, stageAttachmentPreviews(sending))
+                    recordDelivery(deliveredContext)
+                    // One attached while this send was in flight belongs to the next message.
+                    actions.removeAttachments(sending.map((attachment) => attachment.id))
+                    actions.finishTaskDraftDelivery()
+                } catch {
+                    if (!isCurrent()) {
+                        return
+                    }
+                    actions.releaseApplyBackTargets(streamKey)
+                    // Restore unsent content for retry, preserving send order — draft content goes back ahead of
+                    // anything typed during the failed send, queue content re-stages ahead of anything staged since.
+                    if (source === 'draft') {
+                        // Land the pending keystroke first: writing the draft cancels the composer's debounced
+                        // sync, so text typed inside that window would be dropped rather than merged behind.
+                        props.flushDraft?.()
+                        const draftContent = restoreCommentContexts(content)
+                        actions.setComposerFormValues({
+                            draft: values.composerForm.draft
+                                ? `${draftContent}\n\n${values.composerForm.draft}`
+                                : draftContent,
+                        })
+                    } else {
+                        actions.queueDeliveryFailed()
+                        restoreQueuedRows(rows, content)
+                        if (steer && cache.turnCancelCause === 'steer') {
+                            cache.turnCancelCause = undefined
+                        }
+                    }
+                    actions.finishTaskDraftDelivery()
+                    lemonToast.error('Failed to send message. Please try again.')
+                } finally {
+                    if (isCurrent()) {
+                        actions.setSending(false)
+                    }
+                    // Drops the spinners off chips that outlived a failed send.
+                    actions.setUploading(false)
+                }
+            },
+
+            // The agent finished a turn — drain any staged follow-ups.
+            markTurnComplete: ({ isReplay }) => {
+                if (!isReplay) {
+                    actions.flushQueue()
+                }
+            },
+
+            // The new model may not support the current effort — clamp the override so it never holds an
+            // unsupported value. No network here: the pick is synced to the agent at send time.
+            setModel: ({ model }) => {
+                const currentEffort = values.effortOverride ?? props.currentEffort ?? values.sessionBaseline.effort
+                const resolvedEffort = resolveEffortForModel(values.catalogue, currentEffort, model)
+                if (resolvedEffort !== currentEffort) {
+                    actions.setEffort(resolvedEffort)
+                }
+                noteTerminalDraft()
+            },
+
+            setEffort: noteTerminalDraft,
+            setMode: noteTerminalDraft,
+            [codexBillingLogic.actionTypes.setPreferredCodexModelAccess]: noteTerminalDraft,
+            setComposerFormValue: noteTerminalDraft,
+            setComposerFormValues: noteTerminalDraft,
+            handleTerminalStatus: () => {
+                if (values.isTerminal) {
+                    invalidateSend()
+                }
+                noteTerminalDraft()
+            },
+            permissionRunChanged: invalidateSend,
+            resetStream: invalidateSend,
+            cancelPermissionDelivery: invalidateSend,
+
+            startNewRun: async ({ content }) => {
+                if (
+                    !props.taskId ||
+                    !props.runId ||
+                    values.startingRun ||
+                    !content.trim() ||
+                    values.currentProjectId == null
+                ) {
+                    return
+                }
+                actions.setStartingRun(true)
+                const streamKey = props.streamKey ?? props.runId
+                const pendingContext = values.pendingContextItems
+                const deliveredContext = values.contextCandidates
+                const disposables = cache.disposables
+                const projectId = String(values.currentProjectId)
+                const taskId = props.taskId
+                const runId = props.runId
+                const isCurrent = (): boolean =>
+                    !disposables.isDisposed &&
+                    String(values.currentProjectId) === projectId &&
+                    props.taskId === taskId &&
+                    props.runId === runId
+                let optimisticStarted = false
+                let accepted = false
+                const stream = runStreamLogic({ streamKey })
+                disposables.add(
+                    () => () => {
+                        if (optimisticStarted && !accepted && stream.isMounted()) {
+                            stream.actions.rollbackOptimisticResume()
+                        }
+                    },
+                    'optimistic-resume',
+                    { pauseOnPageHidden: false }
+                )
+                actions.claimApplyBackTargets(streamKey)
+                try {
+                    // Same endpoint as the "Run again" button, but seeded with the user's message and chained
+                    // from the finished run so the new run continues the thread, and carrying the picked model /
+                    // reasoning effort (the resume schema can't, so we send the Claude create shape). The response
+                    // carries the new run as `run`; the consumer-provided `onRunStarted` re-points to it.
+                    const resumeRequest = {
+                        resume_from_run_id: props.runId,
+                        pending_user_message: wrapWithPosthogContext(content, pendingContext),
+                        mode: TaskExecutionModeEnumApi.Interactive,
+                    }
+                    const codexModelAccess = pickedCodexModelAccess(
+                        getRuntimeAdapterForModel(values.catalogue, values.selectedModel)
+                    )
+                    const createRequest = isPiTaskRuntime(props.taskRuntime)
+                        ? {
+                              ...resumeRequest,
+                              ...(values.modelOverride ? { model: values.selectedModel } : {}),
+                              ...(values.effortOverride ? { reasoning_effort: values.selectedEffort } : {}),
+                          }
+                        : buildRunCreateRequest(
+                              values.catalogue,
+                              values.selectedModel,
+                              values.selectedEffort,
+                              values.selectedMode,
+                              {
+                                  ...resumeRequest,
+                                  ...(codexModelAccess ? { codex_model_access: codexModelAccess } : {}),
+                              }
+                          )
+                    // The task already exists here, so staged artifacts hold the files whether this request
+                    // activates a warm run or cold-boots one.
+                    // The queue rides along into the run this send starts, so its files come too.
+                    const sending = [...values.queuedAttachments, ...values.stagedAttachments]
+                    let stagedArtifactIds: string[] = []
+                    if (sending.length > 0) {
+                        actions.setUploading(true)
+                        stagedArtifactIds = await uploadStagedTaskAttachments(
+                            projectId,
+                            taskId,
+                            sending.map((attachment) => attachment.file)
+                        )
+                        if (!isCurrent()) {
+                            return
+                        }
+                    }
+                    const warmSubmission: WarmSubmission = { projectId, lease: null }
+                    getWarmLogic()?.actions.prepareSubmit(warmSubmission)
+                    actions.beginTaskDraftDelivery(content)
+                    actions.resetComposerForm()
+                    actions.startOptimisticResume(content, stageAttachmentPreviews(sending))
+                    optimisticStarted = true
+                    const result = await submitWithWarmRunRetry(
+                        (options) =>
+                            tasksRunCreate(
+                                projectId,
+                                taskId,
+                                stagedArtifactIds.length > 0
+                                    ? { ...createRequest, pending_user_artifact_ids: stagedArtifactIds }
+                                    : createRequest,
+                                options
+                            ),
+                        disposables
+                    )
+                    if (!isCurrent()) {
+                        return
+                    }
+                    // `?? latest_run` covers the deploy skew window where this bundle outruns the backend.
+                    const run = result.run ?? result.latest_run
+                    getWarmLogic()?.actions.consumeWarm(warmSubmission, run?.id ?? null)
+                    if (!run?.id) {
+                        throw new Error('The run response did not include a run')
+                    }
+                    accepted = true
+                    actions.finishTaskDraftDelivery()
+                    recordDelivery(deliveredContext)
+                    // A failure leaves them staged for the retry.
+                    actions.removeAttachments(sending.map((attachment) => attachment.id))
+                    props.flushDraft?.()
+                    const handoff = { run, streamKey, draft: values.composerForm.draft }
+                    actions.attachOptimisticResume(taskId, run)
+                    props.onRunStarted?.(run.id, handoff)
+                } catch (error) {
+                    if (!isCurrent()) {
+                        return
+                    }
+                    if (accepted) {
+                        throw error
+                    }
+                    if (optimisticStarted) {
+                        actions.rollbackOptimisticResume()
+                    }
+                    actions.releaseApplyBackTargets(streamKey)
+                    const draftContent = restoreCommentContexts(content)
+                    if (optimisticStarted) {
+                        props.flushDraft?.()
+                        actions.setComposerFormValues({
+                            draft: values.composerForm.draft
+                                ? `${draftContent}\n\n${values.composerForm.draft}`
+                                : draftContent,
+                        })
+                        optimisticStarted = false
+                    }
+                    actions.finishTaskDraftDelivery()
+                    lemonToast.error(runStartFailureMessage(error))
+                } finally {
+                    disposables.dispose('optimistic-resume')
+                    if (isCurrent()) {
+                        actions.setStartingRun(false)
+                    }
+                    // Drops the spinners off chips that outlived a failed start.
+                    actions.setUploading(false)
+                }
+            },
+
+            clearConversation: async () => {
+                if (!props.taskId || !props.runId || values.clearing || values.currentProjectId == null) {
+                    return
+                }
+                actions.setClearing(true)
+                try {
+                    await tasksRunsClearConversationCreate(String(values.currentProjectId), props.taskId, props.runId)
+                    // Any successor held right now was warmed before this boundary was written, so its
+                    // restored session still carries the conversation the clear just removed. Hand it
+                    // back; the next keystroke warms a fresh one on the cleared state.
+                    getWarmLogic()?.actions.releaseWarm()
+                    actions.resetComposerForm()
+                    // A finished run has no live stream to echo these back, so paint them from here.
+                    // They match what the backend persisted, so a later replay folds the same thread.
+                    actions.pushHumanMessage('/clear')
+                    actions.pushConversationCleared()
+                } catch {
+                    lemonToast.error('Failed to clear the conversation. Please try again.')
+                } finally {
+                    actions.setClearing(false)
+                }
+            },
+        }
+    }),
+    listeners(taskDraftListeners),
+    listeners(({ actions, values, props, cache }) => ({
+        reportReplySuggestionShown: ({ turnIndex }) => {
+            posthog.capture('posthog ai reply suggestion shown', {
+                task_id: props.taskId,
+                turn_index: turnIndex,
+                suggestion_count: values.replySuggestions?.replies.length,
+            })
+        },
+        acceptReplySuggestion: ({ key, turnIndex }) => {
+            posthog.capture('posthog ai reply suggestion accepted', {
+                task_id: props.taskId,
+                turn_index: turnIndex,
+                key,
+            })
+        },
+        dismissReplySuggestion: ({ turnIndex }) => {
+            posthog.capture('posthog ai reply suggestion dismissed', { task_id: props.taskId, turn_index: turnIndex })
+        },
+        pushHumanMessage: ({ content }) => {
+            const accepted = values.acceptedReplySuggestion
+            if (accepted !== null) {
+                posthog.capture('posthog ai reply suggestion sent', {
+                    task_id: props.taskId,
+                    edited: content.trim() !== accepted,
+                })
+                actions.clearAcceptedReplySuggestion()
+            }
+        },
+        hydrateTaskDraft: () => {
+            const draft = values.composerForm.draft
+            const commentLogic = props.taskId ? taskCommentContextsLogic.findMounted({ taskId: props.taskId }) : null
+            const { contexts, text } = extractCommentContexts(draft)
+            if (commentLogic && contexts.length > 0) {
+                commentLogic.actions.restoreCommentContexts(contexts)
+                actions.setComposerFormValues({ draft: text })
+            }
+            actions.applyPendingCommentText()
+        },
+        applyPendingCommentText: () => {
+            const commentLogic = props.taskId ? taskCommentContextsLogic.findMounted({ taskId: props.taskId }) : null
+            const pendingText = commentLogic?.values.pendingCommentText ?? []
+            if (!commentLogic || pendingText.length === 0 || !cache.taskDraftPersistence) {
+                return
+            }
+            commentLogic.actions.consumePendingCommentText()
+            props.flushDraft?.()
+            const draft = values.composerForm.draft.trimEnd()
+            actions.setComposerFormValues({ draft: [draft, ...pendingText].filter(Boolean).join('\n\n') })
+        },
+    })),
+    propsChanged(({ actions }) => {
+        actions.hydrateTaskDraft()
+    }),
+    afterMount((logic) => {
+        const { actions, props, cache } = logic
+        if (props.initialDraft) {
+            actions.setComposerFormValues({ draft: props.initialDraft })
+            props.onDraftAdopted?.()
+        }
+        cache.disposables.add(
+            () => {
+                const flush = (): void => {
+                    logic.props.flushDraft?.()
+                    actions.persistTaskDraft()
+                }
+                const onVisibilityChange = (): void => {
+                    if (document.visibilityState === 'hidden') {
+                        flush()
+                    }
+                }
+                window.addEventListener('pagehide', flush)
+                document.addEventListener('visibilitychange', onVisibilityChange)
+                return () => {
+                    window.removeEventListener('pagehide', flush)
+                    document.removeEventListener('visibilitychange', onVisibilityChange)
+                }
+            },
+            'task-draft-page-exit',
+            { pauseOnPageHidden: false }
+        )
+    }),
+])

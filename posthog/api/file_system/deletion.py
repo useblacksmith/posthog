@@ -1,0 +1,674 @@
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+from django.apps import apps
+from django.core.exceptions import (
+    ObjectDoesNotExist,
+    ValidationError as DjangoValidationError,
+)
+from django.db import IntegrityError, transaction
+
+import psycopg
+from rest_framework.exceptions import PermissionDenied
+
+from posthog.exceptions import Conflict
+from posthog.models.file_system.file_system import FileSystem, join_path, split_path
+from posthog.models.signals import mute_selected_signals
+
+from products.cdp.backend.models.hog_functions.hog_function import HogFunctionType
+
+logger = logging.getLogger(__name__)
+
+LEGACY_HOG_FUNCTION_TYPES = [
+    "broadcast",
+    "campaign",
+    "source",
+]
+HOG_FUNCTION_TYPES = sorted(set(LEGACY_HOG_FUNCTION_TYPES + list(HogFunctionType.values)))
+
+
+@dataclass(frozen=True)
+class ModelRegistration:
+    app_label: str
+    model_name: str
+    lookup_field: str
+    manager_name: str
+    team_field: str  # Required
+    queryset_modifier: Callable[[Any], Any] | None
+    soft_delete_field: str | None
+    hard_delete: bool | None
+    allow_restore: bool | None
+    undo_message: str
+
+
+@dataclass(frozen=True)
+class ModelCapabilities:
+    soft_delete_field: str | None
+    has_last_modified_by: bool
+    can_restore: bool
+
+    @property
+    def has_soft_delete(self) -> bool:
+        return self.soft_delete_field is not None
+
+
+@dataclass(frozen=True)
+class DeletionResult:
+    type: str
+    ref: str | None
+    mode: Literal["soft", "hard"]
+    can_undo: bool
+    undo: str
+    # The soft-deleted object, which `run_post_delete_batch_hooks` hands to its type's batch hook.
+    instance: Any = field(default=None, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class DeletionContext:
+    entry: FileSystem
+    user: Any | None
+    request: Any | None
+    team: Any | None
+    organization: Any | None
+
+
+@dataclass(frozen=True)
+class RestoreContext:
+    type: str
+    ref: str
+    restore_path: str | None
+    user: Any | None
+    request: Any | None
+    team: Any | None
+    organization: Any | None
+
+
+@dataclass(frozen=True)
+class FileChangeContext:
+    user: Any | None
+    request: Any | None
+
+
+@dataclass(frozen=True)
+class FileObjectRef:
+    team_id: int
+    type: str
+    ref: str
+
+
+PrepareDeleteHook = Callable[[Any | None, int, Any], None]
+DeleteLock = Callable[[Any], list[Any]]
+FileChangeCheck = Callable[[FileChangeContext, Any], None]
+PreDeleteHook = Callable[[DeletionContext, Any], None]
+PostDeleteHook = Callable[[DeletionContext, Any], None]
+PostDeleteBatchHook = Callable[[list[Any]], None]
+PreRestoreHook = Callable[[RestoreContext, Any], None]
+PostRestoreHook = Callable[[RestoreContext, Any], None]
+
+_MODEL_REGISTRY: dict[str, ModelRegistration] = {}
+_PREPARE_DELETE_HOOKS: dict[str, PrepareDeleteHook] = {}
+_PRE_DELETE_HOOKS: dict[str, PreDeleteHook] = {}
+_FILE_CHANGE_CHECKS: dict[str, tuple[FileChangeCheck, tuple[str, ...]]] = {}
+_DELETE_LOCKS: dict[str, tuple[DeleteLock, tuple[str, ...]]] = {}
+_POST_DELETE_HOOKS: dict[str, PostDeleteHook] = {}
+_POST_DELETE_BATCH_HOOKS: dict[str, PostDeleteBatchHook] = {}
+_PRE_RESTORE_HOOKS: dict[str, PreRestoreHook] = {}
+_POST_RESTORE_HOOKS: dict[str, PostRestoreHook] = {}
+
+
+def _default_manager_name(app_label: str, model_name: str) -> str:
+    try:
+        model_class = apps.get_model(app_label, model_name)
+    except LookupError:
+        logger.exception("Unable to resolve model %s.%s during file system registration", app_label, model_name)
+        return "objects"
+
+    if hasattr(model_class, "objects_including_soft_deleted"):
+        return "objects_including_soft_deleted"
+    return "objects"
+
+
+def register_file_system_type(
+    type_string: str,
+    app_label: str,
+    model_name: str,
+    *,
+    lookup_field: str = "id",
+    manager_name: str | None = None,
+    team_field: str = "team",
+    queryset_modifier: Callable[[Any], Any] | None = None,
+    soft_delete_field: str | None = None,
+    hard_delete: bool | None = None,
+    allow_restore: bool | None = None,
+    undo_message: str = "",
+) -> None:
+    """Register a model that participates in the file system."""
+
+    resolved_manager = manager_name or _default_manager_name(app_label, model_name)
+    _MODEL_REGISTRY[type_string] = ModelRegistration(
+        app_label=app_label,
+        model_name=model_name,
+        lookup_field=lookup_field,
+        manager_name=resolved_manager,
+        team_field=team_field,
+        queryset_modifier=queryset_modifier,
+        soft_delete_field=soft_delete_field,
+        hard_delete=hard_delete,
+        allow_restore=allow_restore,
+        undo_message=undo_message,
+    )
+
+
+def register_prepare_delete_hook(type_string: str, hook: PrepareDeleteHook) -> None:
+    _PREPARE_DELETE_HOOKS[type_string] = hook
+
+
+def register_pre_delete_hook(type_string: str, hook: PreDeleteHook) -> None:
+    _PRE_DELETE_HOOKS[type_string] = hook
+
+
+# Runs for every file a request places, changes or unlinks, including files whose object stays. The check
+# gets each object with only `fields` loaded, so a type lists the fields its check reads.
+def register_file_change_check(type_string: str, check: FileChangeCheck, *, fields: tuple[str, ...]) -> None:
+    _FILE_CHANGE_CHECKS[type_string] = (check, fields)
+
+
+# A type registered here has its objects locked before a delete changes them. The lock gets one queryset per
+# type and team, ordered by primary key and loading only `fields`. It must not wait for a lock, because the
+# file system delete calls it while it holds the file rows, and a save of the object locks the object first
+# and the file rows second. The soft delete and the restore load and save only `fields`, so they must hold
+# every field either one writes and every field the save signals read.
+def register_delete_lock(type_string: str, lock: DeleteLock, *, fields: tuple[str, ...]) -> None:
+    _DELETE_LOCKS[type_string] = (lock, fields)
+
+
+def _delete_lock_fields(type_string: str) -> tuple[str, ...] | None:
+    registered = _DELETE_LOCKS.get(type_string)
+    return registered[1] if registered else None
+
+
+def lock_file_system_objects(refs: Iterable[FileObjectRef]) -> dict[FileObjectRef, Any]:
+    refs_by_type: dict[tuple[str, int], set[str]] = {}
+    for object_ref in refs:
+        if object_ref.type in _DELETE_LOCKS and object_ref.type in _MODEL_REGISTRY:
+            refs_by_type.setdefault((object_ref.type, object_ref.team_id), set()).add(object_ref.ref)
+    locked: dict[FileObjectRef, Any] = {}
+    teams: dict[int, Any] = {}
+    for (type_string, team_id), type_refs in sorted(refs_by_type.items()):
+        registration = _MODEL_REGISTRY[type_string]
+        lock, fields = _DELETE_LOCKS[type_string]
+        refs_by_value = _lookup_values(registration, type_refs)
+        if not refs_by_value:
+            continue
+        model = apps.get_model(registration.app_label, registration.model_name)
+        objects = (
+            _get_queryset(registration)
+            .only(*fields)
+            .filter(
+                **{f"{registration.team_field}_id": team_id, f"{registration.lookup_field}__in": list(refs_by_value)}
+            )
+            .order_by("pk")
+        )
+        for instance in lock(objects):
+            # The soft delete's save signals read the team. One instance per team saves a read per object.
+            if team_id not in teams:
+                teams[team_id] = model._meta.get_field(registration.team_field).related_model.objects.get(pk=team_id)
+            setattr(instance, registration.team_field, teams[team_id])
+            for ref in refs_by_value.get(getattr(instance, registration.lookup_field), []):
+                locked[FileObjectRef(team_id=team_id, type=type_string, ref=ref)] = instance
+    return locked
+
+
+def register_post_delete_hook(type_string: str, hook: PostDeleteHook) -> None:
+    _POST_DELETE_HOOKS[type_string] = hook
+
+
+def register_post_delete_batch_hook(type_string: str, hook: PostDeleteBatchHook) -> None:
+    """Registers work that runs once for every object of a type that one delete request soft-deleted,
+    for work whose cost is per call rather than per object."""
+    _POST_DELETE_BATCH_HOOKS[type_string] = hook
+
+
+def run_post_delete_batch_hooks(results: Iterable[DeletionResult]) -> None:
+    """Runs each type's batch hook over the objects in `results`. Call it inside the transaction that
+    deleted them."""
+    instances_by_type: dict[str, list[Any]] = defaultdict(list)
+    for result in results:
+        if result.mode == "soft" and result.instance is not None and result.type in _POST_DELETE_BATCH_HOOKS:
+            instances_by_type[result.type].append(result.instance)
+    for type_string, instances in instances_by_type.items():
+        _POST_DELETE_BATCH_HOOKS[type_string](instances)
+
+
+def register_pre_restore_hook(type_string: str, hook: PreRestoreHook) -> None:
+    _PRE_RESTORE_HOOKS[type_string] = hook
+
+
+def register_post_restore_hook(type_string: str, hook: PostRestoreHook) -> None:
+    _POST_RESTORE_HOOKS[type_string] = hook
+
+
+def _lookup_values(registration: ModelRegistration, refs: Iterable[str]) -> dict[Any, list[str]]:
+    lookup_field = apps.get_model(registration.app_label, registration.model_name)._meta.get_field(
+        registration.lookup_field
+    )
+    values: dict[Any, list[str]] = {}
+    for ref in sorted(refs):
+        try:
+            values.setdefault(lookup_field.to_python(ref), []).append(ref)
+        except (ValueError, TypeError, DjangoValidationError):
+            continue
+    return values
+
+
+def _registered_objects(registration: ModelRegistration, team_id: int, refs: Iterable[str]) -> Any | None:
+    lookup_values = list(_lookup_values(registration, refs))
+    if not lookup_values:
+        return None
+    return _get_queryset(registration).filter(
+        **{f"{registration.team_field}_id": team_id, f"{registration.lookup_field}__in": lookup_values}
+    )
+
+
+# Runs before any pre-delete or pre-restore hook locks an object, so a type can load its checks' data in one query.
+def prepare_file_system_objects(request: Any | None, refs_by_type: Mapping[tuple[int, str], Iterable[str]]) -> None:
+    for (team_id, type_string), refs in sorted(refs_by_type.items()):
+        hook = _PREPARE_DELETE_HOOKS.get(type_string)
+        registration = _MODEL_REGISTRY.get(type_string)
+        if hook is None or registration is None:
+            continue
+        objects = _registered_objects(registration, team_id, refs)
+        if objects is not None:
+            hook(request, team_id, objects)
+
+
+def check_file_system_object_changes(
+    context: FileChangeContext, refs_by_type: Mapping[tuple[int, str], Iterable[str]], *, lock: bool = False
+) -> dict[FileObjectRef, PermissionDenied]:
+    """Run each type's change check and return the refs it refused.
+
+    With `lock`, a type with a delete lock has its objects locked for the rest of the caller's transaction
+    before the check reads them. A save of such an object locks it first, so the save and the file write
+    run one after the other, and each one sees what the other committed. The delete lock never waits, so it
+    cannot deadlock with the file rows the caller already holds.
+    """
+    checked = {key: refs for key, refs in refs_by_type.items() if key[1] in _FILE_CHANGE_CHECKS}
+    prepare_file_system_objects(context.request, checked)
+    denied: dict[FileObjectRef, PermissionDenied] = {}
+    for (team_id, type_string), refs in sorted(checked.items()):
+        registration = _MODEL_REGISTRY.get(type_string)
+        if registration is None:
+            continue
+        check, fields = _FILE_CHANGE_CHECKS[type_string]
+        refs_by_value = _lookup_values(registration, refs)
+        objects = _registered_objects(registration, team_id, refs)
+        if objects is None:
+            continue
+        objects = objects.only(*fields).order_by("pk")
+        delete_lock = _DELETE_LOCKS.get(type_string)
+        for obj in delete_lock[0](objects) if lock and delete_lock else objects:
+            try:
+                check(context, obj)
+            except PermissionDenied as error:
+                for ref in refs_by_value.get(getattr(obj, registration.lookup_field), []):
+                    denied[FileObjectRef(team_id=team_id, type=type_string, ref=ref)] = error
+    return denied
+
+
+def file_system_object_creator_ids(type_string: str, team_id: int, refs: Iterable[str]) -> set[int]:
+    registration = _MODEL_REGISTRY.get(type_string)
+    if registration is None:
+        return set()
+    objects = _registered_objects(registration, team_id, refs)
+    if objects is None:
+        return set()
+    return set(objects.exclude(created_by_id=None).values_list("created_by_id", flat=True))
+
+
+def is_file_system_type_registered(type_string: str) -> bool:
+    return type_string in _MODEL_REGISTRY
+
+
+def get_file_system_registration(type_string: str) -> ModelRegistration | None:
+    return _MODEL_REGISTRY.get(type_string)
+
+
+def is_pk_keyed_file_system_type(registration: ModelRegistration) -> bool:
+    """Whether a type's file system `ref` holds its object's primary key.
+
+    Compares against the model's own pk name rather than the literal "id", because Django lets a
+    model name its primary key any column: a registration whose lookup field is that column is
+    pk-keyed even when it isn't called "id".
+    """
+    model = apps.get_model(registration.app_label, registration.model_name)
+    return registration.lookup_field == model._meta.pk.name
+
+
+def get_non_pk_keyed_file_system_types() -> list[str]:
+    """Registered types whose file system `ref` is something other than the object's primary key."""
+    return [type_string for type_string, reg in _MODEL_REGISTRY.items() if not is_pk_keyed_file_system_type(reg)]
+
+
+def _resolve_user(user: Any | None) -> Any | None:
+    if user is not None and getattr(user, "is_authenticated", False):
+        return user
+    return None
+
+
+def _get_queryset(registration: ModelRegistration):
+    model_class = apps.get_model(registration.app_label, registration.model_name)
+    manager = getattr(model_class, registration.manager_name, model_class.objects)
+    queryset = manager.all()
+    if registration.queryset_modifier:
+        queryset = registration.queryset_modifier(queryset)
+    return queryset
+
+
+def _get_object(
+    registration: ModelRegistration,
+    *,
+    ref: str,
+    team_id: int | None,
+    for_update: bool = False,
+    fields: tuple[str, ...] | None = None,
+) -> Any:
+    queryset = _get_queryset(registration)
+    if fields:
+        queryset = queryset.only(*fields)
+    if for_update:
+        queryset = queryset.select_for_update()
+    filters: dict[str, Any] = {registration.lookup_field: ref, f"{registration.team_field}_id": team_id}
+    return queryset.get(**filters)
+
+
+def _detect_soft_delete_field(model_class: type[Any], preferred: str | None) -> str | None:
+    if preferred:
+        return preferred
+
+    for candidate in ("deleted", "is_deleted"):
+        field = next((f for f in model_class._meta.fields if f.name == candidate), None)
+        if field is None:
+            continue
+        internal_type = getattr(field, "get_internal_type", lambda: None)()
+        if internal_type == "BooleanField":
+            return candidate
+    return None
+
+
+def _introspect_model_capabilities(registration: ModelRegistration) -> ModelCapabilities:
+    model_class = apps.get_model(registration.app_label, registration.model_name)
+
+    soft_delete_field = None
+    if registration.hard_delete is not True:
+        soft_delete_field = _detect_soft_delete_field(model_class, registration.soft_delete_field)
+
+    has_soft_delete = soft_delete_field is not None and registration.hard_delete is not True
+
+    if registration.hard_delete is False and soft_delete_field is None:
+        raise ValueError(f"Soft delete forced for '{registration.model_name}' but no soft delete field was found.")
+
+    allow_restore = registration.allow_restore
+    if allow_restore is None:
+        allow_restore = has_soft_delete
+    else:
+        allow_restore = allow_restore and has_soft_delete
+
+    has_last_modified_by = hasattr(model_class, "last_modified_by")
+
+    return ModelCapabilities(
+        soft_delete_field=soft_delete_field if has_soft_delete else None,
+        has_last_modified_by=has_last_modified_by,
+        can_restore=allow_restore,
+    )
+
+
+def _build_deletion_context(
+    entry: FileSystem,
+    *,
+    user: Any | None,
+    request: Any | None,
+    team: Any | None,
+    organization: Any | None,
+) -> DeletionContext:
+    resolved_user = _resolve_user(user)
+    resolved_team = team or getattr(entry, "team", None)
+    return DeletionContext(
+        entry=entry,
+        user=resolved_user,
+        request=request,
+        team=resolved_team,
+        organization=organization,
+    )
+
+
+def _build_restore_context(
+    type_string: str,
+    ref: str,
+    restore_path: str | None,
+    *,
+    user: Any | None,
+    request: Any | None,
+    team: Any | None,
+    organization: Any | None,
+) -> RestoreContext:
+    return RestoreContext(
+        type=type_string,
+        ref=ref,
+        restore_path=restore_path,
+        user=_resolve_user(user),
+        request=request,
+        team=team,
+        organization=organization,
+    )
+
+
+def delete_file_system_object(
+    entry: FileSystem,
+    *,
+    user: Any | None = None,
+    request: Any | None = None,
+    team: Any | None = None,
+    organization: Any | None = None,
+    locked_objects: Mapping[FileObjectRef, Any] | None = None,
+) -> DeletionResult:
+    """Deletes the object of `entry` and the row. `locked_objects` holds the objects the caller already locked
+    with `lock_file_system_objects`, keyed by the row's ref. Without it, a type with a delete lock locks its
+    object here."""
+    type_string = entry.type
+    ref = entry.ref
+
+    if not ref or type_string == "folder":
+        entry.delete()
+        return DeletionResult(type=type_string, ref=ref, mode="hard", can_undo=False, undo="")
+
+    registration = _MODEL_REGISTRY.get(type_string)
+    if registration is None:
+        logger.warning("No model registered for type '%s'. Removing file system entry only.", type_string)
+        entry.delete()
+        return DeletionResult(type=type_string, ref=ref, mode="hard", can_undo=False, undo="")
+
+    capabilities = _introspect_model_capabilities(registration)
+    context = _build_deletion_context(entry, user=user, request=request, team=team, organization=organization)
+
+    try:
+        if type_string in _DELETE_LOCKS:
+            key = FileObjectRef(team_id=entry.team_id, type=type_string, ref=ref)
+            if locked_objects is None:
+                locked_objects = lock_file_system_objects([key])
+            if key not in locked_objects:
+                raise ObjectDoesNotExist
+            instance = locked_objects[key]
+        else:
+            instance = _get_object(registration, ref=ref, team_id=entry.team_id)
+    except (ObjectDoesNotExist, DjangoValidationError, ValueError, TypeError):
+        # A ref the lookup field can't hold (`FileSystem.ref` is a plain CharField, set by the
+        # caller when the row is created) is the same situation as one that resolves to nothing:
+        # the row references no object, so drop the row itself.
+        logger.warning("File system entry for type '%s' with ref '%s' has no backing object.", type_string, ref)
+        entry.delete()
+        return DeletionResult(
+            type=type_string,
+            ref=ref,
+            mode="hard",
+            can_undo=False,
+            undo=registration.undo_message,
+        )
+
+    pre_hook = _PRE_DELETE_HOOKS.get(type_string)
+    if pre_hook:
+        pre_hook(context, instance)
+
+    if capabilities.has_soft_delete:
+        assert capabilities.soft_delete_field is not None
+        setattr(instance, capabilities.soft_delete_field, True)
+        if capabilities.has_last_modified_by and context.user is not None:
+            instance.last_modified_by = context.user
+        with mute_selected_signals():
+            instance.save()
+        entry.delete()
+        post_hook = _POST_DELETE_HOOKS.get(type_string)
+        if post_hook:
+            post_hook(context, instance)
+        return DeletionResult(
+            type=type_string,
+            ref=ref,
+            mode="soft",
+            can_undo=capabilities.can_restore,
+            undo=registration.undo_message,
+            instance=instance,
+        )
+
+    if capabilities.has_last_modified_by and context.user is not None:
+        instance.last_modified_by = context.user
+        with mute_selected_signals():
+            instance.save(update_fields=["last_modified_by"])
+    with mute_selected_signals():
+        instance.delete()
+    entry.delete()
+    post_hook = _POST_DELETE_HOOKS.get(type_string)
+    if post_hook:
+        post_hook(context, instance)
+    return DeletionResult(
+        type=type_string,
+        ref=ref,
+        mode="hard",
+        can_undo=False,
+        undo=registration.undo_message,
+    )
+
+
+def get_restorable_object(type_string: str, ref: str, *, team_id: int | None) -> Any | None:
+    """Resolve the object an `undo_delete` would restore, or None when there is nothing to restore.
+
+    Returns None for unregistered types, types that can't be restored, refs with no backing object,
+    and objects that aren't currently soft-deleted. Callers must treat every None the same way:
+    a per-case outcome would let a caller probe which refs exist.
+    """
+    registration = _MODEL_REGISTRY.get(type_string)
+    if registration is None:
+        return None
+
+    capabilities = _introspect_model_capabilities(registration)
+    if not capabilities.has_soft_delete or not capabilities.can_restore:
+        return None
+
+    try:
+        instance = _get_object(registration, ref=ref, team_id=team_id, fields=_delete_lock_fields(type_string))
+    except (ObjectDoesNotExist, DjangoValidationError, ValueError, TypeError):
+        # `ref` is caller-supplied and every model's lookup field rejects a different shape: an
+        # integer pk raises ValueError on "oops", a UUID pk raises ValidationError. Those are all
+        # the same answer as a missing object, and must return it identically so a caller can't
+        # tell a malformed ref from one that resolves to something they aren't allowed to see.
+        return None
+
+    assert capabilities.soft_delete_field is not None
+    if not getattr(instance, capabilities.soft_delete_field, False):
+        return None
+
+    return instance
+
+
+def undo_delete(
+    *,
+    type_string: str,
+    ref: str,
+    restore_path: str | None = None,
+    user: Any | None = None,
+    request: Any | None = None,
+    team: Any | None = None,
+    organization: Any | None = None,
+) -> Any:
+    registration = _MODEL_REGISTRY.get(type_string)
+    if registration is None:
+        raise ValueError(f"No model registered for type '{type_string}'")
+
+    capabilities = _introspect_model_capabilities(registration)
+    if not capabilities.has_soft_delete:
+        raise ValueError(f"Type '{type_string}' does not support undo operations")
+    if not capabilities.can_restore:
+        raise ValueError(f"Undo for type '{type_string}' has been disabled")
+
+    context = _build_restore_context(
+        type_string,
+        ref,
+        restore_path,
+        user=user,
+        request=request,
+        team=team,
+        organization=organization,
+    )
+
+    team_id = getattr(team, "id", None)
+    try:
+        instance = _get_object(
+            registration, ref=ref, team_id=team_id, for_update=True, fields=_delete_lock_fields(type_string)
+        )
+    except ObjectDoesNotExist as exc:
+        raise ValueError(f"Unable to restore {type_string} with ref '{ref}'") from exc
+
+    # Re-check the soft-delete flag here rather than trusting the caller's earlier check
+    # (get_restorable_object): that check and this restore run as separate queries, so a
+    # concurrent change to this object in between must not be silently overwritten by an
+    # unconditional restore - e.g. reviving a feature flag someone deliberately disabled in the
+    # gap between the check and this call. The row is locked for the rest of the caller's
+    # transaction, because reading it unlocked would leave the same gap between this check and
+    # the save below that the check exists to close.
+    assert capabilities.soft_delete_field is not None
+    if not getattr(instance, capabilities.soft_delete_field):
+        raise ValueError(f"{type_string} with ref '{ref}' is not currently deleted")
+
+    pre_hook = _PRE_RESTORE_HOOKS.get(type_string)
+    if pre_hook:
+        pre_hook(context, instance)
+
+    setattr(instance, capabilities.soft_delete_field, False)
+
+    if restore_path and hasattr(instance, "_create_in_folder"):
+        segments = split_path(restore_path)
+        folder_path = join_path(segments[:-1]) if len(segments) > 1 else ""
+        instance._create_in_folder = folder_path or None
+
+    if capabilities.has_last_modified_by and context.user is not None:
+        instance.last_modified_by = context.user
+
+    try:
+        # A savepoint, so the unique violation leaves the caller's transaction usable for the 409.
+        with mute_selected_signals(), transaction.atomic():
+            instance.save()
+    except IntegrityError as exc:
+        if not isinstance(exc.__cause__, psycopg.errors.UniqueViolation):
+            raise
+        raise Conflict(
+            "Can't restore this because another item now uses its key. Change that item's key first, then try again."
+        ) from exc
+
+    post_hook = _POST_RESTORE_HOOKS.get(type_string)
+    if post_hook:
+        post_hook(context, instance)
+
+    return instance

@@ -1,0 +1,488 @@
+import uuid
+import datetime as dt
+from contextlib import contextmanager
+from typing import Any
+
+import pytest
+from unittest.mock import MagicMock, call, patch
+
+from products.warehouse_sources.backend.models.external_data_job import ExternalDataJob
+from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+from products.warehouse_sources.backend.temporal.data_imports.cdc.activities import cleanup_orphan_slots_activity
+from products.warehouse_sources.backend.temporal.data_imports.cdc.types import CDCLag
+from products.warehouse_sources.backend.temporal.data_imports.sources.postgres.cdc.config import PostgresCDCConfig
+
+pytestmark = pytest.mark.django_db
+
+_ACTIVITIES = "products.warehouse_sources.backend.temporal.data_imports.cdc.activities"
+_BILLING_EXPIRY = "products.warehouse_sources.backend.temporal.data_imports.cdc.billing_expiry"
+
+
+def _create_source(team, *, deleted=False, job_inputs=None):
+    return ExternalDataSource.objects.create(
+        team_id=team.pk,
+        source_id=str(uuid.uuid4()),
+        connection_id=str(uuid.uuid4()),
+        status="Completed",
+        source_type="Postgres",
+        deleted=deleted,
+        job_inputs=job_inputs,
+    )
+
+
+def _create_cdc_schema(team, source, name="users"):
+    return ExternalDataSchema.objects.create(
+        team_id=team.pk,
+        source=source,
+        name=name,
+        sync_type=ExternalDataSchema.SyncType.CDC,
+        should_sync=True,
+        sync_type_config={"cdc_mode": "streaming"},
+    )
+
+
+def _cdc_job_inputs(*, enabled=True, management="posthog", auto_drop_slot=True, slot="posthog_slot", pub="posthog_pub"):
+    return {
+        "cdc_enabled": enabled,
+        "cdc_management_mode": management,
+        "cdc_auto_drop_slot": auto_drop_slot,
+        "cdc_slot_name": slot,
+        "cdc_publication_name": pub,
+    }
+
+
+def _mock_adapter(*, lag_bytes=0, retention_cap_mb=None, slot_survives_drop=False):
+    """Adapter mock that decodes config for real (proving the encrypted-job_inputs path)
+    but stubs every database connection."""
+    adapter = MagicMock()
+    adapter.parse_cdc_config.side_effect = lambda source: PostgresCDCConfig.from_source(source)
+
+    @contextmanager
+    def _conn(source, connect_timeout=15):
+        yield MagicMock()
+
+    adapter.management_connection.side_effect = _conn
+    adapter.get_lag.return_value = (
+        None if lag_bytes is None else CDCLag(behind_bytes=lag_bytes, retention_cap_mb=retention_cap_mb)
+    )
+    adapter.stream_exists.return_value = slot_survives_drop
+    return adapter
+
+
+_SCHEDULE_LOOKUP: dict[str, dict[str, Any]] = {
+    "present": {"return_value": True},
+    "missing": {"return_value": False},
+    "error": {"side_effect": TimeoutError()},
+}
+
+
+def _run(adapter, *, schedule_state="present"):
+    with (
+        patch("products.warehouse_sources.backend.temporal.data_imports.cdc.activities.activity") as mock_activity,
+        patch("products.warehouse_sources.backend.temporal.data_imports.cdc.activities.HeartbeaterSync"),
+        patch("products.warehouse_sources.backend.temporal.data_imports.cdc.activities.close_old_connections"),
+        patch(
+            "products.warehouse_sources.backend.temporal.data_imports.cdc.activities.get_cdc_adapter",
+            return_value=adapter,
+        ),
+        patch("products.data_warehouse.backend.logic.data_load.service.delete_cdc_extraction_schedule") as mock_delete,
+        patch(
+            "products.data_warehouse.backend.logic.data_load.service.cdc_extraction_schedule_exists",
+            **_SCHEDULE_LOOKUP[schedule_state],
+        ),
+        # mark_cdc_broken (critical-lag paths) reaches Temporal / Kafka / analytics — stub the boundaries.
+        patch("products.data_warehouse.backend.logic.data_load.service.pause_cdc_extraction_schedule") as mock_pause,
+        patch("products.data_warehouse.backend.logic.data_load.service.pause_external_data_schedule"),
+        patch("products.notifications.backend.facade.api.create_notification"),
+        patch("posthoganalytics.capture"),
+    ):
+        cleanup_orphan_slots_activity()
+    return mock_activity, mock_delete, mock_pause
+
+
+def test_encrypted_cdc_source_is_selected(team):
+    # Regression: cdc_enabled is encrypted at rest, so the old ORM filter never matched
+    # and the sweeper checked zero sources. It must now reach the active lag-check path.
+    _create_source(team, job_inputs=_cdc_job_inputs())
+    adapter = _mock_adapter(lag_bytes=0)
+
+    _run(adapter)
+
+    adapter.get_lag.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "job_inputs",
+    [
+        None,
+        _cdc_job_inputs(enabled=False),
+        _cdc_job_inputs(slot=""),
+        _cdc_job_inputs(pub=""),
+    ],
+)
+def test_disabled_or_incomplete_sources_skipped(team, job_inputs):
+    _create_source(team, job_inputs=job_inputs)
+    adapter = _mock_adapter()
+
+    _run(adapter)
+
+    adapter.get_lag.assert_not_called()
+
+
+def test_deleted_posthog_managed_drops_resources_and_schedule(team):
+    _create_source(team, deleted=True, job_inputs=_cdc_job_inputs(management="posthog"))
+    adapter = _mock_adapter()
+
+    _, mock_delete, _ = _run(adapter)
+
+    mock_delete.assert_called_once()
+    adapter.drop_stream.assert_called_once()
+    adapter.get_lag.assert_not_called()
+
+
+def test_deleted_self_managed_drops_schedule_but_not_slot(team):
+    _create_source(team, deleted=True, job_inputs=_cdc_job_inputs(management="self_managed"))
+    adapter = _mock_adapter()
+
+    _, mock_delete, _ = _run(adapter)
+
+    mock_delete.assert_called_once()
+    adapter.drop_stream.assert_not_called()
+
+
+def test_deleted_source_purges_shadow_buffer_prefixes(team):
+    # destroy() defers all external reaping to the sweep, so the sweep must purge the
+    # deleted source's buffer prefixes — including soft-deleted CDC schema rows.
+    source = _create_source(team, deleted=True, job_inputs=_cdc_job_inputs())
+    schema = _create_cdc_schema(team, source)
+    schema.deleted = True
+    schema.save()
+
+    adapter = _mock_adapter()
+    with patch(
+        "products.warehouse_sources.backend.temporal.data_imports.cdc.activities.purge_buffer_prefix"
+    ) as mock_purge:
+        _run(adapter)
+
+    assert [call.args[1] for call in mock_purge.call_args_list] == [str(schema.id)]
+
+
+@pytest.mark.parametrize("slot_survives_drop, stopped", [(False, True), (True, False)])
+def test_critical_lag_posthog_auto_drop_stops_capture_once_the_slot_is_gone(team, slot_survives_drop, stopped):
+    source = _create_source(team, job_inputs=_cdc_job_inputs(auto_drop_slot=True))
+    schema = _create_cdc_schema(team, source)
+    adapter = _mock_adapter(
+        lag_bytes=5000 * 1024 * 1024,  # 5000 MB > 2048 MB critical default
+        slot_survives_drop=slot_survives_drop,
+    )
+
+    _, _, mock_pause = _run(adapter)
+
+    adapter.drop_stream.assert_called_once()
+    source.refresh_from_db()
+    assert (source.status == ExternalDataSource.Status.ERROR) is stopped
+    schema.refresh_from_db()
+    assert (schema.status == ExternalDataSchema.Status.FAILED) is stopped
+    assert schema.sync_type_config.get("cdc_broken", {}).get("reason") == (
+        "auto_dropped_critical_lag" if stopped else None
+    )
+    assert mock_pause.call_args_list == ([call(str(source.id))] if stopped else [])
+
+
+@pytest.mark.parametrize(
+    "reason, lag_mb, cleared",
+    [
+        ("critical_lag_self_managed", 10, True),
+        ("critical_lag_self_managed", 1500, False),
+        ("auth_failed", 10, False),
+    ],
+)
+def test_self_managed_lag_marker_clears_once_lag_recovers(team, reason, lag_mb, cleared):
+    source = _create_source(team, job_inputs=_cdc_job_inputs(management="self_managed"))
+    source.status = ExternalDataSource.Status.ERROR
+    source.save()
+    schema = _create_cdc_schema(team, source)
+    schema.sync_type_config = {**schema.sync_type_config, "cdc_broken": {"reason": reason}}
+    schema.save()
+
+    _run(_mock_adapter(lag_bytes=lag_mb * 1024 * 1024))
+
+    schema.refresh_from_db()
+    source.refresh_from_db()
+    assert ("cdc_broken" not in schema.sync_type_config) is cleared
+    assert (source.status == ExternalDataSource.Status.RUNNING) is cleared
+
+
+def test_critical_lag_auto_drop_disabled_does_not_drop(team):
+    # cdc_auto_drop_slot stored as boolean False round-trips to "False"; str_to_bool must
+    # decode it as False so the safety net stays off.
+    _create_source(team, job_inputs=_cdc_job_inputs(auto_drop_slot=False))
+    adapter = _mock_adapter(lag_bytes=5000 * 1024 * 1024)
+
+    _run(adapter)
+
+    adapter.drop_stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "existing_reason, marked_table_syncs, expected_reason, expected_status",
+    [
+        (None, True, "critical_lag_self_managed", ExternalDataSource.Status.ERROR),
+        ("legacy_lane_retired", True, "legacy_lane_retired", "Completed"),
+        ("legacy_lane_retired", False, "critical_lag_self_managed", ExternalDataSource.Status.ERROR),
+    ],
+)
+def test_critical_lag_self_managed_marks_broken_without_drop_or_pause(
+    team, existing_reason, marked_table_syncs, expected_reason, expected_status
+):
+    source = _create_source(team, job_inputs=_cdc_job_inputs(management="self_managed"))
+    schema = _create_cdc_schema(team, source)
+    if existing_reason:
+        marked = schema if marked_table_syncs else _create_cdc_schema(team, source, name="sync_off")
+        marked.sync_type_config = {**marked.sync_type_config, "cdc_broken": {"reason": existing_reason}}
+        marked.should_sync = marked_table_syncs
+        marked.save()
+    adapter = _mock_adapter(lag_bytes=5000 * 1024 * 1024)
+
+    _, _, mock_pause = _run(adapter)
+
+    # Customer owns the slot: surface the broken state but never drop or pause — it may recover.
+    adapter.drop_stream.assert_not_called()
+    mock_pause.assert_not_called()
+    source.refresh_from_db()
+    assert source.status == expected_status
+    schema.refresh_from_db()
+    assert schema.sync_type_config["cdc_broken"]["reason"] == expected_reason
+
+
+def _restore_case(
+    case_id,
+    *,
+    management="self_managed",
+    retention_cap_mb=None,
+    lag_mb=5000,
+    schedule_state="missing",
+    existing_reason=None,
+    restored=True,
+    dropped=False,
+    expected_reason=None,
+):
+    return pytest.param(
+        management,
+        retention_cap_mb,
+        lag_mb,
+        schedule_state,
+        existing_reason,
+        restored,
+        dropped,
+        expected_reason,
+        id=case_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "management, retention_cap_mb, lag_mb, schedule_state, existing_reason, restored, dropped, expected_reason",
+    [
+        _restore_case("missing_schedule_is_restored_without_lag_blame"),
+        _restore_case("capped_slot_is_kept_while_capture_catches_up", management="posthog", retention_cap_mb=10000),
+        _restore_case(
+            "uncapped_slot_is_dropped_without_a_restore",
+            management="posthog",
+            restored=False,
+            dropped=True,
+            expected_reason="auto_dropped_critical_lag",
+        ),
+        _restore_case(
+            "existing_schedule_is_left_alone",
+            schedule_state="present",
+            restored=False,
+            expected_reason="critical_lag_self_managed",
+        ),
+        _restore_case(
+            "repair_owns_the_schedule",
+            existing_reason="auto_dropped_critical_lag",
+            restored=False,
+            expected_reason="auto_dropped_critical_lag",
+        ),
+        _restore_case(
+            "failed_lookup_still_checks_the_lag",
+            schedule_state="error",
+            restored=False,
+            expected_reason="critical_lag_self_managed",
+        ),
+        _restore_case("lag_below_the_warning_threshold_skips_the_lookup", lag_mb=100, restored=False),
+    ],
+)
+def test_lagging_source_restores_a_missing_extraction_schedule(
+    team, management, retention_cap_mb, lag_mb, schedule_state, existing_reason, restored, dropped, expected_reason
+):
+    source = _create_source(team, job_inputs=_cdc_job_inputs(management=management))
+    schema = _create_cdc_schema(team, source)
+    if existing_reason:
+        schema.sync_type_config = {**schema.sync_type_config, "cdc_broken": {"reason": existing_reason}}
+        schema.save()
+
+    adapter = _mock_adapter(lag_bytes=lag_mb * 1024 * 1024, retention_cap_mb=retention_cap_mb)
+    with patch("products.data_warehouse.backend.logic.data_load.service.sync_cdc_extraction_schedule") as mock_sync:
+        _, _, mock_pause = _run(adapter, schedule_state=schedule_state)
+
+    assert mock_sync.called is restored
+    assert adapter.drop_stream.called is dropped
+    assert mock_pause.called is dropped
+    schema.refresh_from_db()
+    assert (schema.sync_type_config.get("cdc_broken") or {}).get("reason") == expected_reason
+
+
+def _job(team, source, schema, status, age, workflow_id=None):
+    job = ExternalDataJob.objects.create(
+        team_id=team.pk, pipeline=source, schema=schema, status=status, rows_synced=0, workflow_id=workflow_id
+    )
+    ExternalDataJob.objects.filter(id=job.id).update(created_at=dt.datetime.now(tz=dt.UTC) - age)
+
+
+def _billing_blocked_schema(team, source, *, blocked_for, last_load_ago=None, other_outcome_ago=None, name="users"):
+    schema = _create_cdc_schema(team, source, name=name)
+    ExternalDataSchema.objects.filter(id=schema.id).update(
+        status=ExternalDataSchema.Status.BILLING_LIMIT_REACHED,
+        last_synced_at=dt.datetime.now(tz=dt.UTC) - (last_load_ago or blocked_for),
+    )
+    if other_outcome_ago is not None:
+        _job(team, source, schema, ExternalDataJob.Status.FAILED, other_outcome_ago)
+    _job(team, source, schema, ExternalDataJob.Status.BILLING_LIMIT_REACHED, blocked_for)
+    return schema
+
+
+@pytest.mark.parametrize(
+    "job_inputs, dropped, paused",
+    [
+        (_cdc_job_inputs(), True, True),
+        (_cdc_job_inputs(auto_drop_slot=False), False, False),
+        (_cdc_job_inputs(management="self_managed"), False, False),
+    ],
+)
+def test_a_source_blocked_by_billing_past_buffer_retention_is_marked_broken(team, job_inputs, dropped, paused):
+    source = _create_source(team, job_inputs=job_inputs)
+    schema = _billing_blocked_schema(team, source, blocked_for=dt.timedelta(days=15))
+    adapter = _mock_adapter()
+
+    with patch(f"{_BILLING_EXPIRY}.is_team_limited", return_value=True):
+        _, _, mock_pause = _run(adapter)
+
+    assert adapter.drop_stream.called is dropped
+    assert mock_pause.called is paused
+    schema.refresh_from_db()
+    assert schema.sync_type_config["cdc_broken"]["reason"] == "billing_limit_expired"
+    adapter.get_lag.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "blocked_for, other_outcome_ago, team_limited, already_broken",
+    [
+        (dt.timedelta(days=3), None, True, False),
+        (dt.timedelta(days=15), None, False, False),
+        (dt.timedelta(days=15), None, True, True),
+        (dt.timedelta(days=1), dt.timedelta(days=2), True, False),
+    ],
+)
+def test_a_source_is_left_running_unless_billing_blocks_it_past_buffer_retention(
+    team, blocked_for, other_outcome_ago, team_limited, already_broken
+):
+    source = _create_source(team, job_inputs=_cdc_job_inputs())
+    schema = _billing_blocked_schema(
+        team, source, blocked_for=blocked_for, last_load_ago=dt.timedelta(days=15), other_outcome_ago=other_outcome_ago
+    )
+    if already_broken:
+        ExternalDataSchema.objects.filter(id=schema.id).update(
+            sync_type_config={**schema.sync_type_config, "cdc_broken": {"reason": "auto_dropped_critical_lag"}}
+        )
+    adapter = _mock_adapter()
+
+    with patch(f"{_BILLING_EXPIRY}.is_team_limited", return_value=team_limited):
+        _run(adapter)
+
+    adapter.drop_stream.assert_not_called()
+    schema.refresh_from_db()
+    assert (schema.sync_type_config.get("cdc_broken") or {}).get("reason") != "billing_limit_expired"
+
+
+def test_a_slot_that_survives_the_drop_keeps_billing_capture_running(team):
+    # drop_stream only logs a refused drop, so pausing capture on the strength of the call alone
+    # would leave a live slot with nothing advancing it and the customer's WAL growing.
+    source = _create_source(team, job_inputs=_cdc_job_inputs())
+    schema = _billing_blocked_schema(team, source, blocked_for=dt.timedelta(days=15))
+    adapter = _mock_adapter(slot_survives_drop=True, lag_bytes=5000 * 1024 * 1024)
+
+    with patch(f"{_BILLING_EXPIRY}.is_team_limited", return_value=True):
+        _, _, mock_pause = _run(adapter)
+
+    adapter.drop_stream.assert_called()
+    mock_pause.assert_not_called()
+    adapter.get_lag.assert_called_once()
+    source.refresh_from_db()
+    assert source.status != ExternalDataSource.Status.ERROR
+    schema.refresh_from_db()
+    assert "cdc_broken" not in schema.sync_type_config
+
+
+@pytest.mark.parametrize("other_job", ["sibling_table_completed", "capture_failed"])
+def test_a_job_that_is_not_the_tables_own_sync_does_not_defer_the_billing_stop(team, other_job):
+    source = _create_source(team, job_inputs=_cdc_job_inputs())
+    schema = _billing_blocked_schema(team, source, blocked_for=dt.timedelta(days=15))
+    if other_job == "sibling_table_completed":
+        sibling = _billing_blocked_schema(team, source, blocked_for=dt.timedelta(hours=1), name="events")
+        _job(team, source, sibling, ExternalDataJob.Status.COMPLETED, dt.timedelta(hours=1))
+    else:
+        _job(
+            team,
+            source,
+            schema,
+            ExternalDataJob.Status.FAILED,
+            dt.timedelta(days=1),
+            workflow_id=f"cdc-extraction-{source.id}",
+        )
+    adapter = _mock_adapter()
+
+    with patch(f"{_BILLING_EXPIRY}.is_team_limited", return_value=True):
+        _run(adapter)
+
+    adapter.drop_stream.assert_called_once()
+    schema.refresh_from_db()
+    assert schema.sync_type_config["cdc_broken"]["reason"] == "billing_limit_expired"
+
+
+@pytest.mark.parametrize(
+    "job_inputs, limited_after, cleared",
+    [
+        (_cdc_job_inputs(auto_drop_slot=False), False, True),
+        (_cdc_job_inputs(management="self_managed"), False, True),
+        (_cdc_job_inputs(auto_drop_slot=False), True, False),
+        (_cdc_job_inputs(), False, False),
+    ],
+)
+def test_a_kept_slot_is_no_longer_broken_once_the_team_is_under_the_limit(team, job_inputs, limited_after, cleared):
+    source = _create_source(team, job_inputs=job_inputs)
+    schema = _billing_blocked_schema(team, source, blocked_for=dt.timedelta(days=15))
+
+    with patch(f"{_BILLING_EXPIRY}.is_team_limited", return_value=True):
+        _run(_mock_adapter())
+    with patch(f"{_BILLING_EXPIRY}.is_team_limited", return_value=limited_after):
+        _run(_mock_adapter())
+
+    schema.refresh_from_db()
+    source.refresh_from_db()
+    assert ("cdc_broken" not in schema.sync_type_config) is cleared
+    assert (source.status == ExternalDataSource.Status.RUNNING) is cleared
+
+
+def test_a_failed_billing_check_still_checks_the_slots_lag(team):
+    source = _create_source(team, job_inputs=_cdc_job_inputs())
+    schema = _create_cdc_schema(team, source)
+    adapter = _mock_adapter(lag_bytes=5000 * 1024 * 1024)
+
+    with patch(f"{_ACTIVITIES}.blocked_past_buffer_retention", side_effect=RuntimeError("quota cache down")):
+        _run(adapter)
+
+    adapter.drop_stream.assert_called_once()
+    schema.refresh_from_db()
+    assert schema.sync_type_config["cdc_broken"]["reason"] == "auto_dropped_critical_lag"

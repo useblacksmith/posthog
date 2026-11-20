@@ -1,0 +1,91 @@
+name: 'Paths Changes Filter'
+description: 'Execute your workflow steps only if relevant files are modified. Vendored fork of dorny/paths-filter with include-exclude matching (positive patterns are OR-ed includes, ! patterns veto).'
+author: 'Michal Dorner <dorner.michal@gmail.com>'
+inputs:
+    token:
+        description: 'GitHub Access Token'
+        required: false
+        default: ${{ github.token }}
+    working-directory:
+        description: 'Relative path under $GITHUB_WORKSPACE where the repository was checked out.'
+        required: false
+    ref:
+        description: |
+            Git reference (e.g. branch name) from which the changes will be detected.
+            This option is ignored if action is triggered by pull_request event.
+        required: false
+    base:
+        description: |
+            Git reference (e.g. branch name) against which the changes will be detected. Defaults to repository default branch (e.g. master).
+            If it references same branch it was pushed to, changes are detected against the most recent commit before the push.
+            This option is ignored if action is triggered by pull_request event.
+        required: false
+    filters:
+        description: 'Path to the configuration file or YAML string with filters definition'
+        required: true
+    shared-image-policy:
+        description: 'Canonical shared-image policy projected into legacy filters; channel destinations require publisher integration'
+        required: false
+    list-files:
+        description: |
+            Enables listing of files matching the filter:
+              'none'  - Disables listing of matching files (default).
+              'csv'   - Coma separated list of filenames.
+                        If needed it uses double quotes to wrap filename with unsafe characters.
+              'json'  - Serialized as JSON array.
+              'shell' - Space delimited list usable as command line argument list in linux shell.
+                        If needed it uses single or double quotes to wrap filename with unsafe characters.
+              'escape'- Space delimited list usable as command line argument list in linux shell.
+                        Backslash escapes every potentially unsafe character.
+        required: false
+        default: none
+    initial-fetch-depth:
+        description: |
+            How many commits are initially fetched from base branch.
+            If needed, each subsequent fetch doubles the previously requested number of commits
+            until the merge-base is found or there are no more commits in the history.
+            This option takes effect only when changes are detected using git against different base branch.
+        required: false
+        default: '100'
+    reuse-checks:
+        description: |
+            Check run names, one per line, that must all have passed on the previous head of the pull request,
+            and on every head back to the last one where the suite ran.
+            When set, a push that changes no file the scoped filters match reports those filters as unchanged,
+            so the jobs they gate are skipped and the earlier result stands. Leave empty to turn reuse off.
+        required: false
+    reuse-proof-checks:
+        description: |
+            Check run names, one per line, of jobs that run only when the suite really runs.
+            A head counts as tested when one of them concluded success there. Required when reuse-checks is set.
+        required: false
+    reuse-check-apps:
+        description: |
+            GitHub App slugs, one per line, whose check runs count for reuse-checks and reuse-proof-checks.
+            A check run of the same name from any other App is ignored. Defaults to github-actions.
+        required: false
+    reuse-filter-source:
+        description: 'Path of the file that defines the filters. Defaults to the filters file, or to the workflow file.'
+        required: false
+    reuse-filters:
+        description: 'Filter names, one per line, that reuse applies to. Defaults to every filter.'
+        required: false
+    reuse-blocking-labels:
+        description: 'Pull request labels, one per line, that turn reuse off.'
+        required: false
+    reuse-disabled:
+        description: "Set to 'true' to turn reuse off without removing the other inputs."
+        required: false
+outputs:
+    changes:
+        description: JSON array with names of all filters matching any of changed files
+    reused:
+        description: "'true' when the scoped filters were reported as unchanged because an earlier result was reused"
+    reused_from:
+        description: Commit whose passing result was reused, or empty
+runs:
+    using: 'node24'
+    main: 'dist/index.js'
+branding:
+    color: blue
+    icon: filter

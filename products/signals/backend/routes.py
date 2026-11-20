@@ -1,0 +1,146 @@
+from posthog.api.routing import RouterRegistry
+
+import products.signals.backend.views as signals
+from products.signals.backend.presentation.activity_summary import ActivitySummaryMembersViewSet, ActivitySummaryViewSet
+from products.signals.backend.presentation.anomalies import AnomalyViewSet
+from products.signals.backend.presentation.inbox_status import InboxStatusViewSet
+from products.signals.backend.presentation.inbox_summary import InboxSummaryViewSet
+from products.signals.backend.presentation.onboarding import InboxOnboardingViewSet
+from products.signals.backend.presentation.reviewer_exclusions import SignalReviewerExclusionViewSet
+from products.signals.backend.presentation.scout_rubrics import SignalScoutRubricViewSet
+from products.signals.backend.presentation.spend import (
+    SignalMonthlyUsageViewSet,
+    SignalSourceSpendViewSet,
+    SignalSpendViewSet,
+)
+from products.signals.backend.presentation.trial import SelfDrivingTrialViewSet
+from products.signals.backend.scout_chat import SignalScoutChatTaskViewSet
+from products.signals.backend.scout_harness.views import (
+    SignalProjectProfileViewSet,
+    SignalScoutConfigViewSet,
+    SignalScoutMembersViewSet,
+    SignalScoutMetadataViewSet,
+    SignalScoutNoteViewSet,
+    SignalScoutReportDiscussionsViewSet,
+    SignalScoutRunViewSet,
+    SignalScoutViewSet,
+    SignalScratchpadViewSet,
+)
+from products.signals.backend.scout_suggestions_api import SignalScoutSuggestionViewSet
+from products.signals.backend.views import SignalViewSet
+
+
+def register_routes(routers: RouterRegistry) -> None:
+    routers.projects.register(r"signals/usage", SignalMonthlyUsageViewSet, "project_signals_usage", ["team_id"])
+    routers.projects.register(r"signals/spend", SignalSpendViewSet, "project_signals_spend", ["team_id"])
+    routers.projects.register(
+        r"signals/source_spend", SignalSourceSpendViewSet, "project_signals_source_spend", ["team_id"]
+    )
+    routers.projects.register(r"signals/onboarding", InboxOnboardingViewSet, "project_signals_onboarding", ["team_id"])
+    routers.projects.register(r"signals/inbox_status", InboxStatusViewSet, "project_signals_inbox_status", ["team_id"])
+    routers.projects.register(r"signals/trial", SelfDrivingTrialViewSet, "project_signals_trial", ["team_id"])
+    routers.projects.register(
+        r"signals/inbox_summary", InboxSummaryViewSet, "project_signals_inbox_summary", ["team_id"]
+    )
+    routers.projects.register(
+        r"signals/activity_summary", ActivitySummaryViewSet, "project_signals_activity_summary", ["team_id"]
+    )
+    routers.projects.register(
+        r"signals/activity_summary_members",
+        ActivitySummaryMembersViewSet,
+        "project_signals_activity_summary_members",
+        ["team_id"],
+    )
+    routers.projects.register(r"signals/anomalies", AnomalyViewSet, "project_signals_anomalies", ["team_id"])
+    routers.projects.register(
+        r"signals/scout/rubrics", SignalScoutRubricViewSet, "project_signals_scout_rubrics", ["team_id"]
+    )
+    routers.projects.register(
+        r"signals/reviewer_exclusions",
+        SignalReviewerExclusionViewSet,
+        "project_signals_reviewer_exclusions",
+        ["team_id"],
+    )
+    routers.projects.register(r"signals", SignalViewSet, "project_signals", ["team_id"])
+    signal_reports_router = routers.projects.register(
+        r"signals/reports", signals.SignalReportViewSet, "project_signal_reports", ["team_id"]
+    )
+    signal_reports_router.register(
+        r"checks",
+        signals.SignalReportCheckViewSet,
+        "project_signal_report_checks",
+        ["team_id", "report_id"],
+    )
+    signal_reports_router.register(
+        r"artefacts",
+        signals.SignalReportArtefactViewSet,
+        "project_signal_report_artefacts",
+        ["team_id", "report_id"],
+    )
+    routers.projects.register(
+        r"signals/source_configs", signals.SignalSourceConfigViewSet, "project_signal_source_configs", ["team_id"]
+    )
+    routers.projects.register(r"signals/config", signals.SignalTeamConfigViewSet, "project_signal_config", ["team_id"])
+    routers.projects.register(
+        r"signals/processing", signals.SignalProcessingViewSet, "project_signal_processing", ["team_id"]
+    )
+    # Signals agent HTTP surface — exposed via MCP as `scout-*` tools. Most reads (runs,
+    # memory, project profile) are public-grantable via `signal_scout:read`; writes — and the member
+    # roster read — are sandbox-scope only via the internal `signal_scout_internal` scope object.
+    routers.projects.register(r"signals/scout/runs", SignalScoutRunViewSet, "project_signals_scout_runs", ["team_id"])
+    routers.projects.register(
+        r"signals/scout/configs", SignalScoutConfigViewSet, "project_signals_scout_configs", ["team_id"]
+    )
+    routers.projects.register(
+        r"signals/scout/scratchpad", SignalScratchpadViewSet, "project_signals_scout_scratchpad", ["team_id"]
+    )
+    # Steering notes team members (or their agents) leave for the scouts. Reads are public
+    # (`signal_scout:read`); writes require skill-authoring-level authorization — see the viewset.
+    routers.projects.register(
+        r"signals/scout/notes", SignalScoutNoteViewSet, "project_signals_scout_notes", ["team_id"]
+    )
+    routers.projects.register(
+        r"signals/scout/project_profile",
+        SignalProjectProfileViewSet,
+        "project_signals_scout_project_profile",
+        ["team_id"],
+    )
+    routers.projects.register(
+        r"signals/scout/metadata",
+        SignalScoutMetadataViewSet,
+        "project_signals_scout_metadata",
+        ["team_id"],
+    )
+    # Reviewer-routing roster. `signal_scout_internal:read` (internal scope) → sandbox-only, never in
+    # the public MCP catalog; the org-nested member tools the scoped-team token can't reach can't serve this.
+    routers.projects.register(
+        r"signals/scout/members",
+        SignalScoutMembersViewSet,
+        "project_signals_scout_members",
+        ["team_id"],
+    )
+    # Discussions on the calling scout's own reports. Internal scope → sandbox-only, like the roster.
+    routers.projects.register(
+        r"signals/scout/report_discussions",
+        SignalScoutReportDiscussionsViewSet,
+        "project_signals_scout_report_discussions",
+        ["team_id"],
+    )
+    # Scout chat kickoff: server-minted tasks with the reserved SIGNALS_CHAT origin, so the
+    # generally-available Inbox chat CTAs work without the Desktop waitlist that gates the
+    # generic task run endpoints.
+    routers.projects.register(
+        r"signals/scout/chat_tasks",
+        SignalScoutChatTaskViewSet,
+        "project_signals_scout_chat_tasks",
+        ["team_id"],
+    )
+    # Pre-computed "Suggested for this project" scout batch (read / dismiss / refresh); the scouts
+    # tab reads it with zero wait, the chat_tasks path above stays the interactive alternative.
+    routers.projects.register(
+        r"signals/scout/suggestions",
+        SignalScoutSuggestionViewSet,
+        "project_signals_scout_suggestions",
+        ["team_id"],
+    )
+    routers.projects.register(r"signals/scout", SignalScoutViewSet, "project_signals_scout", ["team_id"])

@@ -1,0 +1,299 @@
+import { useActions, useValues } from 'kea'
+import { memo } from 'react'
+
+import { IconMegaphone, IconPlusSmall } from '@posthog/icons'
+import { LemonBanner, LemonButton, LemonInput, LemonModal, LemonTag, LemonTextArea, Link } from '@posthog/lemon-ui'
+
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { getAccessControlDisabledReason } from 'lib/utils/accessControlUtils'
+import { urls } from 'scenes/urls'
+
+import { AccessControlLevel, AccessControlResourceType, type ExternalDataSourceType } from '~/types'
+
+import { SourceIcon } from '../../shared/components/SourceIcon'
+import { SourceReleaseTag } from '../../shared/components/SourceReleaseTag'
+import { WarehouseWizardHint } from '../../shared/components/WarehouseWizardHint'
+import { CatalogItem, sourceCatalogLogic } from './sourceCatalogLogic'
+
+// Horizontal card: logo on the left, name/status/action stacked on the right. `min-h` (not a fixed
+// height) so a wrapped name plus the "Notify me" button can never clip.
+// Exported so `SourceCatalogSkeleton` lays its placeholders out on the same grid, and the tiles
+// don't jump when the real catalog lands.
+export const CATALOG_TILE_CLASS =
+    'flex flex-row items-center gap-4 p-5 min-h-[8.5rem] rounded-lg border border-border bg-surface-primary'
+export const CATALOG_GRID_CLASS = 'grid grid-cols-[repeat(auto-fill,minmax(15rem,1fr))] gap-3'
+
+export interface SourceCatalogProps {
+    allowedSources?: ExternalDataSourceType[]
+}
+
+// Memoized so the whole grid doesn't re-render per keystroke in the search input or request
+// modal: item references are stable across unrelated updates (catalogItems has a result
+// equality check) and the callbacks are kea actions.
+const SourceTile = memo(function SourceTile({
+    item,
+    accessDisabledReason,
+    interestRegistered,
+    onNotify,
+    onSelect,
+}: {
+    item: CatalogItem
+    accessDisabledReason: string | null
+    interestRegistered: boolean
+    onNotify: (item: CatalogItem) => void
+    onSelect: (item: CatalogItem) => void
+}): JSX.Element {
+    const comingSoon = item.status === 'coming_soon'
+    const content = (
+        <>
+            <div className="shrink-0">
+                <SourceIcon type={item.iconType} size="medium" disableTooltip />
+            </div>
+            <div className="flex flex-col items-start gap-2 min-w-0 text-left">
+                <div className="font-medium text-sm leading-tight line-clamp-2">{item.label}</div>
+                {item.description && (
+                    <div className="text-xs text-secondary leading-snug line-clamp-2">{item.description}</div>
+                )}
+                {comingSoon ? (
+                    <>
+                        <LemonTag type="warning">Coming soon</LemonTag>
+                        <LemonTag
+                            type={interestRegistered ? 'success' : 'primary'}
+                            icon={interestRegistered ? undefined : <IconMegaphone />}
+                        >
+                            {interestRegistered ? "We'll let you know" : 'Notify me'}
+                        </LemonTag>
+                    </>
+                ) : (
+                    <div className="flex flex-wrap items-center gap-1">
+                        {item.existingSource && (
+                            <Tooltip title="You already have a source of this type. Connecting another one needs a table name prefix so its tables don't clash.">
+                                <LemonTag type="completion">Already connected</LemonTag>
+                            </Tooltip>
+                        )}
+                        <SourceReleaseTag releaseStatus={item.releaseStatus} />
+                    </div>
+                )}
+            </div>
+        </>
+    )
+
+    if (comingSoon) {
+        if (interestRegistered) {
+            return (
+                <Tooltip title="We'll let you know when this source launches.">
+                    <div className={`${CATALOG_TILE_CLASS} cursor-default`}>{content}</div>
+                </Tooltip>
+            )
+        }
+        // A whole tile that only reacts on its small inner button reads as broken: people click
+        // the tile, nothing happens, and they move on without asking to be told about the source.
+        return (
+            <Tooltip title="This source isn't available yet. Select it and we'll let you know when it launches.">
+                <button
+                    type="button"
+                    className={`${CATALOG_TILE_CLASS} hover:border-primary cursor-pointer`}
+                    onClick={() => onNotify(item)}
+                    data-attr="catalog-notify-me"
+                >
+                    {content}
+                </button>
+            </Tooltip>
+        )
+    }
+
+    if (accessDisabledReason) {
+        return (
+            <Tooltip title={accessDisabledReason}>
+                <div className={`${CATALOG_TILE_CLASS} opacity-50 cursor-not-allowed`}>{content}</div>
+            </Tooltip>
+        )
+    }
+
+    return (
+        <Link
+            to={item.url}
+            className={`${CATALOG_TILE_CLASS} hover:border-primary cursor-pointer`}
+            data-attr="catalog-source"
+            onClick={() => onSelect(item)}
+        >
+            {content}
+        </Link>
+    )
+})
+
+function RequestSourceTile({ onRequest }: { onRequest: () => void }): JSX.Element {
+    return (
+        <button
+            type="button"
+            className={`${CATALOG_TILE_CLASS} border-dashed hover:border-primary cursor-pointer text-left`}
+            onClick={onRequest}
+            data-attr="catalog-request-source"
+        >
+            <div className="shrink-0 flex items-center justify-center w-[60px]">
+                <IconPlusSmall className="text-3xl text-muted" />
+            </div>
+            <div className="flex flex-col items-start gap-2 min-w-0">
+                <div className="font-medium text-sm leading-tight">Request a source</div>
+                <div className="text-xs text-muted">Tell us what you'd like to connect</div>
+            </div>
+        </button>
+    )
+}
+
+export function SourceCatalog({ allowedSources }: SourceCatalogProps): JSX.Element {
+    const logic = sourceCatalogLogic({ allowedSources })
+    const {
+        filteredItems,
+        categoriesWithCounts,
+        search,
+        selectedCategory,
+        selectedCategoryLabel,
+        hasCrossCategoryMatches,
+        customSourceItem,
+        registeredInterestSources,
+        sourceRequestModalOpen,
+        sourceRequestText,
+    } = useValues(logic)
+    const {
+        setSearch,
+        setSelectedCategory,
+        registerInterest,
+        showSourceRequest,
+        hideSourceRequest,
+        setSourceRequestText,
+        submitSourceRequest,
+        selectSourceType,
+    } = useActions(logic)
+
+    const accessDisabledReason = getAccessControlDisabledReason(
+        AccessControlResourceType.ExternalDataSource,
+        AccessControlLevel.Editor
+    )
+
+    return (
+        <div className="flex flex-col sm:flex-row gap-4">
+            <div className="flex flex-row sm:flex-col gap-1 sm:w-56 sm:shrink-0 overflow-x-auto">
+                {categoriesWithCounts.map((cat) => (
+                    <LemonButton
+                        key={cat.category}
+                        active={selectedCategory === cat.category}
+                        fullWidth
+                        onClick={() => setSelectedCategory(cat.category)}
+                        sideIcon={<span className="text-muted text-xs">{cat.count}</span>}
+                    >
+                        <span className="text-left">{cat.label}</span>
+                    </LemonButton>
+                ))}
+            </div>
+
+            <div className="flex flex-col gap-4 flex-1">
+                {/* The wizard CLI creates sources through the same API, so it can't help a user
+                    who lacks the access — show what unblocks them instead. */}
+                {accessDisabledReason ? (
+                    <LemonBanner type="info">
+                        You don't have permission to connect a data warehouse source. Ask a project admin for editor
+                        access to data warehouse sources.
+                    </LemonBanner>
+                ) : (
+                    <WarehouseWizardHint />
+                )}
+                <LemonInput
+                    type="search"
+                    placeholder="Search sources..."
+                    value={search}
+                    onChange={setSearch}
+                    autoFocus
+                />
+
+                {filteredItems.length === 0 && (
+                    <div className="flex flex-col gap-1">
+                        {hasCrossCategoryMatches ? (
+                            <div className="text-muted text-sm">
+                                No sources match "{search.trim()}" in {selectedCategoryLabel}.{' '}
+                                <Link onClick={() => setSelectedCategory('all')}>Search all categories</Link> or request
+                                one below.
+                            </div>
+                        ) : (
+                            <div className="text-muted text-sm">
+                                No sources match.{' '}
+                                <Link
+                                    onClick={() => {
+                                        setSearch('')
+                                        setSelectedCategory('all')
+                                    }}
+                                >
+                                    Clear filters
+                                </Link>{' '}
+                                or request one below.
+                            </div>
+                        )}
+                        {customSourceItem && !hasCrossCategoryMatches && !accessDisabledReason && (
+                            <div className="text-muted text-sm">
+                                If the tool has a REST API, you can connect it with a{' '}
+                                <Link
+                                    to={customSourceItem.url}
+                                    onClick={() => selectSourceType(customSourceItem)}
+                                    data-attr="catalog-empty-custom-source"
+                                >
+                                    {customSourceItem.label}
+                                </Link>
+                                .
+                            </div>
+                        )}
+                        {/* Sources bring data into PostHog; users after an export (e.g. searching
+                            "webhook") land here by mistake, so point them at destinations. */}
+                        <div className="text-muted text-sm">
+                            Trying to send data out to another tool?{' '}
+                            <Link to={urls.destinations()}>Set up a destination</Link>.
+                        </div>
+                    </div>
+                )}
+
+                <div className={CATALOG_GRID_CLASS}>
+                    {filteredItems.map((item) => (
+                        <SourceTile
+                            key={item.name}
+                            item={item}
+                            accessDisabledReason={accessDisabledReason}
+                            interestRegistered={registeredInterestSources.includes(item.name)}
+                            onNotify={registerInterest}
+                            onSelect={selectSourceType}
+                        />
+                    ))}
+                    <RequestSourceTile onRequest={showSourceRequest} />
+                </div>
+            </div>
+
+            <LemonModal
+                isOpen={sourceRequestModalOpen}
+                onClose={hideSourceRequest}
+                title="Request a source"
+                description="Tell us which source you'd like to connect and we'll take it into account."
+                footer={
+                    <>
+                        <LemonButton type="secondary" onClick={hideSourceRequest}>
+                            Cancel
+                        </LemonButton>
+                        <LemonButton
+                            type="primary"
+                            onClick={submitSourceRequest}
+                            disabledReason={!sourceRequestText.trim() ? 'Describe the source first' : undefined}
+                            data-attr="catalog-request-source-submit"
+                        >
+                            Submit request
+                        </LemonButton>
+                    </>
+                }
+            >
+                <LemonTextArea
+                    value={sourceRequestText}
+                    onChange={setSourceRequestText}
+                    placeholder="e.g. Acme CRM — https://acme.com/developers/api"
+                    minRows={3}
+                    autoFocus
+                />
+            </LemonModal>
+        </div>
+    )
+}

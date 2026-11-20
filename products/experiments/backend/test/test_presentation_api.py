@@ -1,0 +1,10729 @@
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any, cast
+from uuid import uuid4
+
+import unittest
+import time_machine
+from posthog.test.base import ClickhouseTestMixin, FuzzyInt, _create_event, _create_person, flush_persons_and_events
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
+
+from django.core.cache import cache
+from django.db import connection
+from django.db.models import F
+from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
+from django.utils import timezone
+
+from dateutil import parser
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.schema import (
+    ExperimentApiMetric,
+    ExperimentFunnelMetric,
+    ExperimentMeanMetric,
+    ExperimentRatioMetric,
+    ExperimentRetentionMetric,
+)
+
+from posthog.auth import IDJagAccessTokenAuthentication, OAuthAccessTokenAuthentication, PersonalAPIKeyAuthentication
+from posthog.constants import AvailableFeature
+from posthog.models import Organization, OrganizationMembership, Team
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.oauth import OAuthAccessToken, OAuthApplication
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.team.extensions import get_or_create_team_extension
+from posthog.models.user import User
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+from posthog.test.test_journeys import journeys_for
+
+from products.access_control.backend.facade.api import upsert_property_access_control
+from products.access_control.backend.facade.contracts import PropertyAccessLevel, UpsertPropertyAccessControlInput
+from products.access_control.backend.models.access_control import AccessControl
+from products.actions.backend.facade.contracts import Action
+from products.actions.backend.facade.testing import create_action, update_action
+from products.cohorts.backend.models.cohort import Cohort
+from products.event_definitions.backend.models import PropertyDefinition
+from products.event_definitions.backend.models.event_definition import EventDefinition
+from products.experiments.backend.experiment_service import ExperimentService
+from products.experiments.backend.health.context import ConditionSetTraffic
+from products.experiments.backend.hogql_queries.exposure_query_logic import EXPERIMENT_EXPOSURE_EVENT_CUTOFF
+from products.experiments.backend.metric_calculation.config import (
+    build_primary_calculation_configs,
+    get_metric_calculation_config,
+)
+from products.experiments.backend.models.experiment import (
+    EXPOSURE_FROZEN_GROUP_KEY,
+    EXPOSURE_FROZEN_GROUP_MARKER,
+    Experiment,
+    ExperimentHoldout,
+    ExperimentMetricResult,
+    ExperimentSavedMetric,
+    ExperimentTimeseriesRecalculation,
+    ExperimentToSavedMetric,
+)
+from products.experiments.backend.models.team_experiments_config import TeamExperimentsConfig
+from products.experiments.backend.models.web_experiment import WebExperiment
+from products.experiments.backend.presentation.serializers import ExperimentSerializer
+from products.experiments.backend.presentation.views import LIST_DEFERRED_FIELDS, EnterpriseExperimentsViewSet
+from products.experiments.backend.setup_context import EXPERIMENT_SETUP_CONTEXT_FLAG
+from products.experiments.backend.test.utils import patch_exposure_event_flag
+from products.feature_flags.backend.facade.enums import FlagEvaluationsMode
+from products.feature_flags.backend.models.evaluation_context import EvaluationContext, FeatureFlagEvaluationContext
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.feature_flags.backend.models.organization_feature_flags_config import OrganizationFeatureFlagsConfig
+
+from ee.api.test.base import APILicensedTest
+
+
+def _make(cls, **attrs):
+    """Build an auth instance without running __init__, setting only the attributes the test needs."""
+    instance = cls.__new__(cls)
+    for key, value in attrs.items():
+        setattr(instance, key, value)
+    return instance
+
+
+_HEALTH_PAUSED = ("flag_off_while_running", "running_but_flag_disabled")
+_REBALANCED = {
+    "filters": {
+        "groups": [{"properties": [], "rollout_percentage": 100}],
+        "multivariate": {
+            "variants": [{"key": "control", "rollout_percentage": 80}, {"key": "test", "rollout_percentage": 20}]
+        },
+    }
+}
+_WITH_A_SECOND_CONDITION = {
+    "filters": {
+        "groups": [
+            {"properties": [], "rollout_percentage": 100},
+            {"properties": [{"key": "plan", "value": ["pro"], "operator": "exact", "type": "person"}]},
+        ],
+        "multivariate": {
+            "variants": [{"key": "control", "rollout_percentage": 50}, {"key": "test", "rollout_percentage": 50}]
+        },
+    }
+}
+_HEALTH_TRAFFIC = ConditionSetTraffic(
+    since=datetime(2026, 10, 12, tzinfo=UTC),
+    until=datetime(2026, 10, 19, tzinfo=UTC),
+    team_timezone="UTC",
+    people_by_set={1: 120, 2: 880},
+    calls=2000,
+    remotely_evaluated_calls=2000,
+    people_assigned_outside=0,
+)
+_HEALTH_METRIC = {
+    "kind": "ExperimentMetric",
+    "metric_type": "mean",
+    "uuid": "health-inline-metric",
+    "source": {"kind": "EventsNode", "event": "$pageview"},
+}
+
+_FLAG_CONFIG_KEYS = (
+    "feature_flag_variants",
+    "rollout_percentage",
+    "aggregation_group_type_index",
+    "feature_flag_payloads",
+    "ensure_experience_continuity",
+)
+
+
+def _hoist_flag_config(payload: dict[str, Any]) -> dict[str, Any]:
+    """Test helper: rewrite an experiment write payload that sets up flag config through the
+    deprecated `parameters` keys into the `feature_flag` object the write API now requires. Non-flag
+    `parameters` keys are preserved, and any `feature_flag` already on the payload is merged into."""
+    parameters = payload.get("parameters")
+    if not isinstance(parameters, dict) or not any(key in parameters for key in _FLAG_CONFIG_KEYS):
+        return payload
+    payload = {**payload}
+    parameters = {**parameters}
+    feature_flag: dict[str, Any] = {**(payload.get("feature_flag") or {})}
+    filters: dict[str, Any] = {**(feature_flag.get("filters") or {})}
+    if "feature_flag_variants" in parameters:
+        filters["multivariate"] = {"variants": parameters.pop("feature_flag_variants")}
+    if "rollout_percentage" in parameters:
+        filters["groups"] = [{"properties": [], "rollout_percentage": parameters.pop("rollout_percentage")}]
+    if "aggregation_group_type_index" in parameters:
+        filters["aggregation_group_type_index"] = parameters.pop("aggregation_group_type_index")
+    if "feature_flag_payloads" in parameters:
+        filters["payloads"] = parameters.pop("feature_flag_payloads")
+    if "ensure_experience_continuity" in parameters:
+        feature_flag["ensure_experience_continuity"] = parameters.pop("ensure_experience_continuity")
+    if filters:
+        feature_flag["filters"] = filters
+    payload["feature_flag"] = feature_flag
+    payload["parameters"] = parameters
+    return payload
+
+
+class _HoistFlagConfigClientMixin:
+    """Flag config now belongs on the `feature_flag` object. The API still accepts it through the
+    deprecated `parameters` keys (copying it onto the object for backward compatibility), but many
+    fixtures in this file set it up via `parameters` as a convenience. This mixin transparently
+    relocates those keys on experiment create/update requests so setup exercises the explicit
+    `feature_flag` object path. Requests that already send a `feature_flag` object (or carry no flag
+    config) pass through untouched.
+
+    Tests that assert the deprecated-`parameters` copy behavior itself must NOT use this mixin — they
+    send the deprecated keys directly (see TestExperimentParametersFlagConfigCompatibility)."""
+
+    def setUp(self) -> None:
+        super().setUp()  # type: ignore[misc]
+        real_post = self.client.post  # type: ignore[attr-defined]
+        real_patch = self.client.patch  # type: ignore[attr-defined]
+
+        def _wrap(method: Any) -> Any:
+            def wrapper(path: str, data: Any = None, *args: Any, **kwargs: Any) -> Any:
+                if isinstance(data, dict) and "/experiments/" in path.rstrip("/") + "/":
+                    data = _hoist_flag_config(data)
+                return method(path, data, *args, **kwargs)
+
+            return wrapper
+
+        self.client.post = _wrap(real_post)  # type: ignore[attr-defined]
+        self.client.patch = _wrap(real_patch)  # type: ignore[attr-defined]
+
+
+class TestExperimentCRUD(_HoistFlagConfigClientMixin, APILicensedTest):
+    # List experiments
+    def test_can_list_experiments(self):
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @parameterized.expand(
+        [
+            (None, None),
+            (None, []),
+            ([], None),
+        ]
+    )
+    def test_can_list_experiments_with_null_metrics(self, metrics: list | None, metrics_secondary: list | None) -> None:
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            created_by=self.user,
+            key="null-metrics-flag",
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="Null metrics experiment",
+            feature_flag=flag,
+            metrics=metrics,
+            metrics_secondary=metrics_secondary,
+        )
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 1)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @parameterized.expand(
+        [
+            ("draft", "draft"),
+            ("running", "running"),
+            ("exposure_frozen", "exposure_frozen"),
+            ("paused", "paused"),
+            ("stopped", "stopped"),
+            ("complete", "stopped"),
+        ]
+    )
+    def test_can_filter_experiments_by_status(self, status_filter: str, expected_status: str) -> None:
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Draft experiment",
+                "feature_flag_key": "draft-filter-flag",
+                "parameters": None,
+            },
+        )
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Running experiment",
+                "feature_flag_key": "running-filter-flag",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+        )
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Stopped experiment",
+                "feature_flag_key": "stopped-filter-flag",
+                "start_date": "2021-12-01T10:23",
+                "end_date": "2021-12-10T00:00",
+                "parameters": None,
+            },
+        )
+        # A running experiment with the freeze marker on its flag groups: must show up only under
+        # exposure_frozen — and its presence proves the running filter excludes frozen experiments.
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Frozen experiment",
+                "feature_flag_key": "frozen-filter-flag",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+        )
+        frozen_flag = FeatureFlag.objects.get(team=self.team, key="frozen-filter-flag")
+        frozen_flag.filters = {
+            **frozen_flag.filters,
+            "groups": [
+                {**group, EXPOSURE_FROZEN_GROUP_KEY: True, "description": EXPOSURE_FROZEN_GROUP_MARKER}
+                for group in frozen_flag.filters.get("groups", [])
+            ],
+        }
+        frozen_flag.save()
+        # A frozen experiment that was then paused (flag deactivated, stamps still on the groups):
+        # paused takes precedence, so it must show up under paused — not under exposure_frozen,
+        # where it would misreport a flag that serves no one as still holding variants.
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Paused frozen experiment",
+                "feature_flag_key": "paused-frozen-filter-flag",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+        )
+        paused_frozen_flag = FeatureFlag.objects.get(team=self.team, key="paused-frozen-filter-flag")
+        paused_frozen_flag.filters = {
+            **paused_frozen_flag.filters,
+            "groups": [
+                {**group, EXPOSURE_FROZEN_GROUP_KEY: True, "description": EXPOSURE_FROZEN_GROUP_MARKER}
+                for group in paused_frozen_flag.filters.get("groups", [])
+            ],
+        }
+        paused_frozen_flag.active = False
+        paused_frozen_flag.save()
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/?status={status_filter}")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 1)
+        self.assertEqual(response.json()["results"][0]["status"], expected_status)
+
+    def test_status_filter_treats_partially_stamped_flag_as_running(self) -> None:
+        # A frozen flag with a manually-added unstamped group reopens enrollment through that group.
+        # The status filter must classify it the same way Experiment.is_exposure_frozen does (all groups
+        # stamped, not just some): running, not exposure_frozen. Guards the list query against regressing
+        # to a "some group is stamped" JSONB-containment match.
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Reopened experiment",
+                "feature_flag_key": "reopened-filter-flag",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+        )
+        experiment_id = create_response.json()["id"]
+        flag = FeatureFlag.objects.get(team=self.team, key="reopened-filter-flag")
+        flag.filters = {
+            **flag.filters,
+            "groups": [
+                *(
+                    {**group, EXPOSURE_FROZEN_GROUP_KEY: True, "description": EXPOSURE_FROZEN_GROUP_MARKER}
+                    for group in flag.filters.get("groups", [])
+                ),
+                {"properties": [], "rollout_percentage": 100},
+            ],
+        }
+        flag.save()
+
+        frozen_ids = [e["id"] for e in self._status_filter_results("exposure_frozen")]
+        running_ids = [e["id"] for e in self._status_filter_results("running")]
+        assert experiment_id not in frozen_ids
+        assert experiment_id in running_ids
+
+    def _status_filter_results(self, status_filter: str) -> list[dict[str, Any]]:
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/?status={status_filter}")
+        assert response.status_code == status.HTTP_200_OK
+        return response.json()["results"]
+
+    def _create_experiment_with_metric_event(self, name: str, flag_key: str, event: str) -> Experiment:
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            created_by=self.user,
+            key=flag_key,
+            name=f"Flag for {flag_key}",
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        return Experiment.objects.create(
+            team=self.team,
+            name=name,
+            feature_flag=flag,
+            metrics=[
+                {"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "EventsNode", "event": event}}
+            ],
+        )
+
+    def test_can_filter_experiments_by_event(self) -> None:
+        purchase_experiment = self._create_experiment_with_metric_event("Purchase", "purchase-flag", "purchase")
+        self._create_experiment_with_metric_event("Signup", "signup-flag", "signup")
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/?event=purchase")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 1)
+        self.assertEqual(response.json()["results"][0]["id"], purchase_experiment.id)
+
+    def test_filter_by_event_resolves_actions(self) -> None:
+        action = create_action(team=self.team, name="Checked out", steps_json=[{"event": "checkout"}])
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            created_by=self.user,
+            key="action-flag",
+            name="Flag for action-flag",
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="Action experiment",
+            feature_flag=flag,
+            metrics=[
+                {"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "ActionsNode", "id": action.id}}
+            ],
+        )
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/?event=checkout")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 1)
+        self.assertEqual(response.json()["results"][0]["id"], experiment.id)
+
+    def test_filter_by_event_matches_saved_metric(self) -> None:
+        experiment = self._create_experiment_with_metric_event("Saved metric", "saved-metric-flag", "primary_event")
+        saved_metric = ExperimentSavedMetric.objects.create(
+            team=self.team,
+            name="Conversion",
+            query={
+                "kind": "ExperimentMetric",
+                "metric_type": "mean",
+                "source": {"kind": "EventsNode", "event": "saved_event"},
+            },
+        )
+        ExperimentToSavedMetric.objects.create(experiment=experiment, saved_metric=saved_metric)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/?event=saved_event")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["count"], 1)
+        self.assertEqual(response.json()["results"][0]["id"], experiment.id)
+
+    def test_getting_experiments_is_not_nplus1(self) -> None:
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            data={
+                "name": "Test Experiment",
+                "feature_flag_key": f"flag_0",
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+            format="json",
+        ).json()
+
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            data={
+                "name": "Test Experiment",
+                "feature_flag_key": f"exp_flag_000",
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "start_date": "2021-12-01T10:23",
+                "end_date": "2021-12-01T10:23",
+                "archived": True,
+                "parameters": None,
+            },
+            format="json",
+        ).json()
+
+        with self.assertNumQueries(FuzzyInt(13, 17)):
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        for i in range(1, 5):
+            self.client.post(
+                f"/api/projects/{self.team.id}/experiments/",
+                data={
+                    "name": "Test Experiment",
+                    "feature_flag_key": f"flag_{i}",
+                    "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                    "start_date": "2021-12-01T10:23",
+                    "parameters": None,
+                },
+                format="json",
+            ).json()
+
+        with self.assertNumQueries(FuzzyInt(13, 17)):
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def _create_fully_populated_experiment(self, index: int) -> Experiment:
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key=f"populated-flag-{index}",
+            created_by=self.user,
+        )
+        context = EvaluationContext.objects.create(team=self.team, name=f"context-{index}")
+        FeatureFlagEvaluationContext.objects.create(feature_flag=flag, evaluation_context=context)
+
+        holdout = ExperimentHoldout.objects.create(
+            team=self.team,
+            name=f"Holdout {index}",
+            created_by=self.user,
+            filters=[{"properties": [], "rollout_percentage": 10, "variant": f"holdout-{index}"}],
+        )
+        cohort = Cohort.objects.create(team=self.team, name=f"Cohort {index}")
+
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name=f"Populated experiment {index}",
+            feature_flag=flag,
+            holdout=holdout,
+            exposure_cohort=cohort,
+            created_by=self.user,
+            start_date=datetime(2021, 12, 1, 10, 23, tzinfo=UTC),
+        )
+
+        saved_metric = ExperimentSavedMetric.objects.create(
+            team=self.team,
+            name=f"Saved metric {index}",
+            created_by=self.user,
+            query={
+                "kind": "ExperimentMetric",
+                "metric_type": "mean",
+                "source": {"kind": "EventsNode", "event": "$pageview"},
+            },
+        )
+        ExperimentToSavedMetric.objects.create(experiment=experiment, saved_metric=saved_metric)
+        return experiment
+
+    def test_listing_experiments_with_related_objects_is_not_nplus1(self) -> None:
+        # Each experiment carries a feature flag (+ evaluation context), a holdout (+ created_by),
+        # an exposure cohort, and a saved metric — the relations that previously triggered N+1 queries.
+        self._create_fully_populated_experiment(0)
+
+        with CaptureQueriesContext(connection) as single_row:
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["count"], 1)
+
+        for i in range(1, 5):
+            self._create_fully_populated_experiment(i)
+
+        with CaptureQueriesContext(connection) as five_rows:
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["count"], 5)
+
+        # Query count must stay flat as rows grow — five experiments must not cost more than one.
+        self.assertLessEqual(len(five_rows.captured_queries), len(single_row.captured_queries))
+        # The list serializer stamps no calculation keys, so the saved metrics cost no extra query.
+        self.assertEqual(len(five_rows.captured_queries), 13)
+
+    def test_experiment_detail_with_saved_metrics_reads_each_relation_once(self) -> None:
+        experiment = self._create_fully_populated_experiment(0)
+        second_saved_metric = ExperimentSavedMetric.objects.create(
+            team=self.team,
+            name="Second saved metric",
+            created_by=self.user,
+            query={"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "EventsNode", "event": "b"}},
+        )
+        ExperimentToSavedMetric.objects.create(
+            experiment=experiment, saved_metric=second_saved_metric, metadata={"type": "secondary"}
+        )
+        self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}/")
+
+        # The saved-metric fingerprints reuse the prefetched links and add one read of the team's
+        # experiment settings, whatever the number of saved metrics.
+        with self.assertNumQueries(15):
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        fingerprints = [saved_metric["query"].get("fingerprint") for saved_metric in response.json()["saved_metrics"]]
+        self.assertEqual(len(fingerprints), 2)
+        self.assertTrue(all(fingerprints))
+
+    def _create_experiment_with_action_metrics(self, index: int) -> tuple[Experiment, Action]:
+        action = create_action(team=self.team, name=f"Action {index}", steps_json=[{"event": f"event_{index}"}])
+        flag = FeatureFlag.objects.create(team=self.team, key=f"action-metric-flag-{index}", created_by=self.user)
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name=f"Action metric experiment {index}",
+            feature_flag=flag,
+            created_by=self.user,
+            metrics=[
+                {"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "ActionsNode", "id": action.id}}
+            ],
+            metrics_secondary=[
+                {"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "ActionsNode", "id": action.id}}
+            ],
+        )
+        saved_metric = ExperimentSavedMetric.objects.create(
+            team=self.team,
+            name=f"Saved action metric {index}",
+            created_by=self.user,
+            query={
+                "kind": "ExperimentMetric",
+                "metric_type": "mean",
+                "source": {"kind": "ActionsNode", "id": action.id},
+            },
+        )
+        ExperimentToSavedMetric.objects.create(experiment=experiment, saved_metric=saved_metric)
+        return experiment, action
+
+    def test_listing_experiments_with_action_metrics_is_not_nplus1(self) -> None:
+        # The list serializer omits metrics, so no per-metric Action lookups happen during
+        # serialization. Query count must stay flat as rows grow.
+        self._create_experiment_with_action_metrics(0)
+
+        with CaptureQueriesContext(connection) as single_row:
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["count"], 1)
+
+        for i in range(1, 5):
+            self._create_experiment_with_action_metrics(i)
+
+        with CaptureQueriesContext(connection) as five_rows:
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["count"], 5)
+
+        self.assertLessEqual(len(five_rows.captured_queries), len(single_row.captured_queries))
+
+    def test_list_query_defers_heavy_metric_columns(self) -> None:
+        # Omitting the metric fields lets the list query defer the heavy JSON columns — they must not
+        # be SELECTed from posthog_experiment. metrics/metrics_secondary are the exception: the
+        # is_legacy annotation references them in its predicate (see list_is_legacy_annotation), so
+        # they appear in the WHERE/CASE but never in the SELECT output — the response still omits them
+        # (test_list_omits_heavy_metric_fields_kept_on_detail). The other deferred columns stay absent.
+        self._create_experiment_with_action_metrics(0)
+
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment_selects = [
+            query["sql"] for query in ctx.captured_queries if 'FROM "posthog_experiment"' in query["sql"]
+        ]
+        self.assertTrue(experiment_selects, "expected at least one SELECT against posthog_experiment")
+        # Inspected by the is_legacy predicate, so allowed in the SQL (but not in the SELECT output).
+        predicate_columns = {"metrics", "metrics_secondary"}
+        for sql in experiment_selects:
+            for column in LIST_DEFERRED_FIELDS:
+                if column in predicate_columns:
+                    continue
+                # Table-qualified so a same-named column on a joined table (e.g. feature_flag.filters)
+                # doesn't trigger a false positive.
+                self.assertNotIn(f'"posthog_experiment"."{column}"', sql)
+
+    def test_list_reports_is_legacy(self) -> None:
+        # is_legacy must survive the metric omission — it's computed in SQL on the list path so the
+        # frontend badge/duplicate/copy guards keep working without loading the deferred metric JSON.
+        # Cover the inline-metric path and the saved-metric (EXISTS) path, plus a non-legacy control.
+        non_legacy, action = self._create_experiment_with_action_metrics(0)
+
+        legacy_inline = Experiment.objects.create(
+            team=self.team,
+            name="Legacy inline",
+            feature_flag=FeatureFlag.objects.create(team=self.team, key="legacy-inline", created_by=self.user),
+            created_by=self.user,
+            metrics=[{"kind": "ExperimentTrendsQuery"}],
+        )
+
+        legacy_via_saved = Experiment.objects.create(
+            team=self.team,
+            name="Legacy via saved metric",
+            feature_flag=FeatureFlag.objects.create(team=self.team, key="legacy-saved", created_by=self.user),
+            created_by=self.user,
+            metrics=[
+                {"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "ActionsNode", "id": action.id}}
+            ],
+        )
+        legacy_saved_metric = ExperimentSavedMetric.objects.create(
+            team=self.team,
+            name="Legacy saved metric",
+            created_by=self.user,
+            query={"kind": "ExperimentFunnelsQuery"},
+        )
+        ExperimentToSavedMetric.objects.create(experiment=legacy_via_saved, saved_metric=legacy_saved_metric)
+
+        results = self.client.get(f"/api/projects/{self.team.id}/experiments").json()["results"]
+        by_id = {r["id"]: r for r in results}
+
+        self.assertFalse(by_id[non_legacy.id]["is_legacy"])
+        self.assertTrue(by_id[legacy_inline.id]["is_legacy"])
+        self.assertTrue(by_id[legacy_via_saved.id]["is_legacy"])
+
+    def test_detail_reports_is_legacy(self) -> None:
+        experiment, _ = self._create_experiment_with_action_metrics(0)
+        Experiment.objects.filter(pk=experiment.pk).update(metrics=[{"kind": "ExperimentTrendsQuery"}])
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.json()["is_legacy"])
+
+    @parameterized.expand(
+        [
+            ("legacy_kind", {"kind": "ExperimentFunnelsQuery"}),
+            ("no_kind", {"metric_type": "mean", "source": {"kind": "EventsNode", "event": "$pageview"}}),
+            ("no_metric_type", {"kind": "ExperimentMetric", "source": {"kind": "EventsNode", "event": "$pageview"}}),
+        ]
+    )
+    def test_detail_serves_no_effective_query_for_a_query_outside_the_metric_union(
+        self, _name: str, saved_query: dict[str, Any]
+    ) -> None:
+        experiment, _ = self._create_experiment_with_action_metrics(0)
+        ExperimentSavedMetric.objects.filter(experimenttosavedmetric__experiment=experiment).update(query=saved_query)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.json()["saved_metrics"][0]["effective_query"])
+
+    @parameterized.expand(
+        [
+            # (name, flag enabled for team, start_date offset from cutoff in days, expected event)
+            ("before_cutoff", True, -7, "$feature_flag_called"),
+            ("after_cutoff", True, 7, "$experiment_exposure"),
+            ("after_cutoff_flag_disabled", False, 7, "$feature_flag_called"),
+        ]
+    )
+    def test_detail_reports_resolved_exposure_event(
+        self, _name: str, flag_enabled: bool, start_offset_days: int, expected_event: str
+    ) -> None:
+        # The frontend names the exposure event from this field, so it has to agree with what the
+        # results queries actually read (resolve_default_exposure_event). Resolution compares
+        # start_date against a fixed constant, so these cases need no clock control.
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="resolved-exposure-event",
+            feature_flag=FeatureFlag.objects.create(
+                team=self.team, key=f"resolved-exposure-{_name}", created_by=self.user
+            ),
+            start_date=EXPERIMENT_EXPOSURE_EVENT_CUTOFF + timedelta(days=start_offset_days),
+        )
+
+        with patch_exposure_event_flag(enabled=flag_enabled):
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["resolved_exposure_event"], expected_event)
+
+    @parameterized.expand(
+        [
+            ("no_metric", {}, None, [_HEALTH_PAUSED, ("no_metric", None)]),
+            ("inline_primary_metric_counts", {"metrics": [_HEALTH_METRIC]}, None, [_HEALTH_PAUSED]),
+            ("inline_secondary_metric_counts", {"metrics_secondary": [_HEALTH_METRIC]}, None, [_HEALTH_PAUSED]),
+            ("shared_primary_metric_counts", {}, {"metadata": {"type": "primary"}}, [_HEALTH_PAUSED]),
+            ("shared_secondary_metric_counts", {}, {"metadata": {"type": "secondary"}}, [_HEALTH_PAUSED]),
+            ("shared_metric_without_type_counts", {}, {}, [_HEALTH_PAUSED]),
+            (
+                "baseline_not_a_variant",
+                {"metrics": [_HEALTH_METRIC], "stats_config": {"baseline_variant_key": "holdout"}},
+                None,
+                [_HEALTH_PAUSED, ("flag_variants_mismatch", "no_control_variant")],
+            ),
+            (
+                "split_edited_after_launch",
+                {"metrics": [_HEALTH_METRIC]},
+                None,
+                [_HEALTH_PAUSED, ("split_changed_mid_run", "rebalanced")],
+                (timedelta(days=1), _REBALANCED),
+            ),
+            (
+                "split_edited_before_launch",
+                {"metrics": [_HEALTH_METRIC]},
+                None,
+                [_HEALTH_PAUSED],
+                (-timedelta(days=1), _REBALANCED),
+            ),
+            (
+                "key_renamed_after_launch",
+                {"metrics": [_HEALTH_METRIC]},
+                None,
+                [_HEALTH_PAUSED, ("bucketing_changed_mid_run", "key_changed")],
+                (timedelta(days=1), {"key": "health-findings-renamed"}),
+            ),
+            (
+                "condition_added_after_launch",
+                {"metrics": [_HEALTH_METRIC]},
+                None,
+                [_HEALTH_PAUSED, ("release_conditions_changed_mid_run", "conditions_changed")],
+                (timedelta(days=1), _WITH_A_SECOND_CONDITION),
+            ),
+        ]
+    )
+    def test_health_reports_findings(
+        self,
+        _name: str,
+        experiment_fields: dict[str, Any],
+        shared_metric_link: dict[str, Any] | None,
+        expected: list[tuple[str, str | None]],
+        flag_edit: tuple[timedelta, dict[str, Any]] | None = None,
+    ) -> None:
+        start_date = timezone.now() - timedelta(days=3)
+        EventDefinition.objects.create(
+            team=self.team, project=self.project, name="$pageview", last_seen_at=timezone.now()
+        )
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key=f"health-findings-{_name}",
+            created_by=self.user,
+            active=False,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        FeatureFlagEvaluationContext.objects.create(
+            feature_flag=flag, evaluation_context=EvaluationContext.objects.create(team=self.team, name="web-app")
+        )
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="health-findings",
+            feature_flag=flag,
+            start_date=start_date,
+            metrics=experiment_fields.get("metrics", []),
+            metrics_secondary=experiment_fields.get("metrics_secondary", []),
+            stats_config=experiment_fields.get("stats_config", {}),
+        )
+        if shared_metric_link is not None:
+            saved_metric = ExperimentSavedMetric.objects.create(
+                team=self.team,
+                name="Shared metric",
+                created_by=self.user,
+                query={
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            )
+            link_response = self.client.patch(
+                f"/api/projects/{self.team.id}/experiments/{experiment.id}",
+                {"saved_metrics_ids": [{"id": saved_metric.id, **shared_metric_link}]},
+                format="json",
+            )
+            self.assertEqual(link_response.status_code, status.HTTP_200_OK, link_response.json())
+        if flag_edit is not None:
+            from_launch, fields = flag_edit
+            self._edit_flag_at(flag, start_date + from_launch, fields)
+
+        with patch("products.experiments.backend.health.exposure_gate.query_any_exposure", return_value=True):
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}/health/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        health = response.json()
+        self.assertEqual([(finding["code"], finding["subcode"]) for finding in health["findings"]], expected)
+        self.assertEqual(health["findings"][0]["actions"], ["open_feature_flag"])
+        self.assertEqual(health["findings"][0]["diagnostic_ref"], "A5")
+        self.assertEqual(health["findings"][0]["check"], "flag_state")
+        self.assertEqual(
+            {key: health["checks"][0][key] for key in ("key", "status", "values", "rule")},
+            {
+                "key": "flag_state",
+                "status": "finding",
+                "values": {
+                    "flag_active": False,
+                    "flag_deleted": False,
+                    "flag_rolled_out": True,
+                    "shipped_variant": None,
+                },
+                "rule": None,
+            },
+        )
+        # The condition set added after launch has no rollout percentage, which the flag service reads as 100.
+        added_condition = (
+            [{"rollout_percentage": 100.0, "property_count": 1, "aggregation_group_type_index": None}]
+            if _name == "condition_added_after_launch"
+            else []
+        )
+        self.assertEqual(
+            health["setup"],
+            {
+                "release_conditions": [
+                    {"rollout_percentage": 100.0, "property_count": 0, "aggregation_group_type_index": None},
+                    *added_condition,
+                ],
+                "early_exit": False,
+                "bucketing_identifier": "distinct_id",
+                "aggregation_group_type_index": None,
+                "evaluation_runtime": "all",
+                "evaluation_contexts": ["web-app"],
+                "ensure_experience_continuity": False,
+            },
+        )
+        if _name == "condition_added_after_launch":
+            conditions = next(c for c in health["checks"] if c["key"] == "release_conditions_changed_mid_run")
+            self.assertEqual([row["before_exposure"] for row in conditions["rows"]], [False])
+
+    @parameterized.expand(
+        [
+            ("session", None, False, ("rebalanced", None)),
+            ("session_without_flag_access", None, True, ("not_checked", "no_history_access")),
+            (
+                "token_without_query_scope",
+                ["experiment:read", "activity_log:read"],
+                False,
+                ("not_checked", "no_query_access"),
+            ),
+            (
+                "token_without_activity_scope",
+                ["experiment:read", "query:read"],
+                False,
+                ("not_checked", "no_history_access"),
+            ),
+            (
+                "token_with_query_and_activity_scopes",
+                ["experiment:read", "query:read", "activity_log:read"],
+                False,
+                ("rebalanced", None),
+            ),
+        ]
+    )
+    def test_health_checks_the_split_history_only_with_flag_and_query_access(
+        self,
+        _name: str,
+        token_scopes: list[str] | None,
+        restrict_flag: bool,
+        expected_split_finding: tuple[str, str | None],
+    ) -> None:
+        start_date = timezone.now() - timedelta(days=3)
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key=f"health-split-access-{_name}",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        experiment = Experiment.objects.create(
+            team=self.team, name="health-split-access", feature_flag=flag, start_date=start_date
+        )
+        self._edit_flag_at(flag, start_date + timedelta(days=1), _REBALANCED)
+        headers: dict[str, str] = {}
+        if restrict_flag:
+            self._enable_access_control()
+            self._restrict_flag_and_login_as_member(flag.key, f"health-{_name}@posthog.com")
+        if token_scopes is not None:
+            token = generate_random_token_personal()
+            PersonalAPIKey.objects.create(
+                user=self.user, label="health", secure_value=hash_key_value(token), scopes=token_scopes
+            )
+            self.client.logout()
+            headers = {"authorization": f"Bearer {token}"}
+
+        with patch("products.experiments.backend.health.exposure_gate.query_any_exposure", return_value=True):
+            response = self.client.get(
+                f"/api/projects/{self.team.id}/experiments/{experiment.id}/health/", headers=headers
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        split_findings = [
+            (finding["subcode"], finding["reason"])
+            for finding in response.json()["findings"]
+            if finding["code"] == "split_changed_mid_run"
+        ]
+        self.assertEqual(split_findings, [expected_split_finding])
+
+    @parameterized.expand(
+        [
+            ("pinned_share_above_five_percent", None, _HEALTH_TRAFFIC, "warning"),
+            ("traffic_query_fails", None, RuntimeError("unexpected"), "info"),
+            ("token_without_query_scope", ["experiment:read", "activity_log:read"], _HEALTH_TRAFFIC, "info"),
+            ("reader_denied_the_reason", None, _HEALTH_TRAFFIC, "info", "$feature_flag_reason"),
+        ]
+    )
+    def test_health_grades_pinned_conditions_by_their_traffic(
+        self,
+        _name: str,
+        token_scopes: list[str] | None,
+        traffic: ConditionSetTraffic | Exception,
+        expected_severity: str,
+        denied_property: str | None = None,
+    ) -> None:
+        experiment = self._create_experiment_with_a_pinned_condition(f"health-pinned-{_name}")
+        if denied_property is not None:
+            self._deny_event_property(denied_property)
+        headers: dict[str, str] = {}
+        if token_scopes is not None:
+            token = generate_random_token_personal()
+            PersonalAPIKey.objects.create(
+                user=self.user, label="health", secure_value=hash_key_value(token), scopes=token_scopes
+            )
+            self.client.logout()
+            headers = {"authorization": f"Bearer {token}"}
+
+        with patch(
+            "products.experiments.backend.health.condition_set_traffic.query_condition_set_traffic",
+            side_effect=[traffic],
+        ):
+            response = self.client.get(
+                f"/api/projects/{self.team.id}/experiments/{experiment.id}/health/", headers=headers
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertEqual(
+            [
+                (finding["subcode"], finding["severity"])
+                for finding in response.json()["findings"]
+                if finding["code"] == "forced_variant_release_condition"
+            ],
+            [("some_conditions_pinned", expected_severity)],
+        )
+
+    @parameterized.expand(
+        [
+            ("variants_assigned_outside", 300, ("assigned_outside_flag_service", "info")),
+            ("no_one_assigned_outside", 0, ("running_but_no_rollout", "warning")),
+        ]
+    )
+    def test_health_reads_the_calls_of_a_flag_with_no_rollout(
+        self, _name: str, people_assigned_outside: int, expected: tuple[str, str]
+    ) -> None:
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key=f"health-no-rollout-{_name}",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 0}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="health-no-rollout",
+            feature_flag=flag,
+            start_date=timezone.now() - timedelta(days=3),
+            metrics=[_HEALTH_METRIC],
+        )
+        traffic = replace(_HEALTH_TRAFFIC, people_by_set={}, people_assigned_outside=people_assigned_outside)
+
+        with patch(
+            "products.experiments.backend.health.condition_set_traffic.query_condition_set_traffic",
+            side_effect=[traffic],
+        ):
+            response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}/health/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertEqual(
+            [
+                (finding["subcode"], finding["severity"])
+                for finding in response.json()["findings"]
+                if finding["code"] == "flag_off_while_running"
+            ],
+            [expected],
+        )
+
+    @parameterized.expand(
+        [
+            ("staff_session", True, None, status.HTTP_200_OK, (True, True, "read", [120, 880], "ok", "ok")),
+            (
+                "staff_token_without_query_scope",
+                True,
+                ["experiment:read", "activity_log:read"],
+                status.HTTP_200_OK,
+                (False, None, "no_query_access", None, "ok", "skipped"),
+            ),
+            (
+                "staff_denied_a_flag_call_property",
+                True,
+                None,
+                status.HTTP_200_OK,
+                (True, True, "denied_properties", None, "ok", "ok"),
+                "$feature_flag_reason",
+            ),
+            (
+                "staff_denied_a_property_the_sdk_profile_reads",
+                True,
+                None,
+                status.HTTP_200_OK,
+                (True, True, "read", [120, 880], "ok", "skipped"),
+                "$lib",
+            ),
+            ("not_staff", False, None, status.HTTP_403_FORBIDDEN, None),
+        ]
+    )
+    def test_health_inputs_serve_what_the_checks_read_to_staff_only(
+        self,
+        _name: str,
+        is_staff: bool,
+        token_scopes: list[str] | None,
+        expected_status: int,
+        expected: tuple[bool, bool | None, str, list[int] | None, str, str] | None,
+        denied_property: str | None = None,
+    ) -> None:
+        self.user.is_staff = is_staff
+        self.user.save()
+        experiment = self._create_experiment_with_a_pinned_condition(f"health-inputs-{_name}")
+        experiment.feature_flag.last_called_at = timezone.now() - timedelta(days=1)
+        experiment.feature_flag.save()
+        if denied_property is not None:
+            self._deny_event_property(denied_property)
+        headers: dict[str, str] = {}
+        if token_scopes is not None:
+            token = generate_random_token_personal()
+            PersonalAPIKey.objects.create(
+                user=self.user, label="health", secure_value=hash_key_value(token), scopes=token_scopes
+            )
+            self.client.logout()
+            headers = {"authorization": f"Bearer {token}"}
+
+        with patch(
+            "products.experiments.backend.health.condition_set_traffic.query_condition_set_traffic",
+            return_value=_HEALTH_TRAFFIC,
+        ):
+            response = self.client.get(
+                f"/api/projects/{self.team.id}/experiments/{experiment.id}/health_inputs/", headers=headers
+            )
+
+        self.assertEqual(response.status_code, expected_status, response.content)
+        if expected is None:
+            return
+        inputs = response.json()
+        self.assertEqual(
+            [(condition["number"], condition["pinned_variant"]) for condition in inputs["flag"]["release_conditions"]],
+            [(1, "test"), (2, None)],
+        )
+        self.assertEqual(inputs["exposure_events"]["required_flag_key"], f"health-inputs-{_name}")
+        traffic = inputs["condition_set_traffic"]
+        self.assertEqual(
+            (
+                inputs["flag_last_called_at"] is not None,
+                inputs["flag_called_during_run"],
+                inputs["condition_set_traffic_status"],
+                [people["people"] for people in traffic["people_by_set"]] if traffic else None,
+                inputs["project"]["team_defaults"]["status"],
+                inputs["project"]["sdk_profile"]["status"],
+            ),
+            expected,
+        )
+
+    @parameterized.expand(
+        [
+            ("no_split_change", False, True, None, (True, None, [])),
+            ("change_before_any_exposure", True, False, None, (True, None, [False])),
+            ("change_after_an_exposure", True, True, None, (True, None, [True])),
+            (
+                "token_without_query_scope",
+                True,
+                True,
+                ["experiment:read", "activity_log:read"],
+                (False, "no_query_access", [False]),
+            ),
+        ]
+    )
+    def test_health_inputs_report_every_split_change_and_whether_it_counts(
+        self,
+        _name: str,
+        rebalance: bool,
+        exposed: bool,
+        token_scopes: list[str] | None,
+        expected: tuple[bool, str | None, list[bool]],
+    ) -> None:
+        self.user.is_staff = True
+        self.user.save()
+        start_date = timezone.now() - timedelta(days=3)
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key=f"health-inputs-split-{_name}",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        experiment = Experiment.objects.create(
+            team=self.team, name="health-inputs-split", feature_flag=flag, start_date=start_date
+        )
+        if rebalance:
+            self._edit_flag_at(flag, start_date + timedelta(days=1), _REBALANCED)
+        headers: dict[str, str] = {}
+        if token_scopes is not None:
+            token = generate_random_token_personal()
+            PersonalAPIKey.objects.create(
+                user=self.user, label="health", secure_value=hash_key_value(token), scopes=token_scopes
+            )
+            self.client.logout()
+            headers = {"authorization": f"Bearer {token}"}
+
+        with patch("products.experiments.backend.health.exposure_gate.query_any_exposure", return_value=exposed):
+            response = self.client.get(
+                f"/api/projects/{self.team.id}/experiments/{experiment.id}/health_inputs/", headers=headers
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        history = response.json()["flag_history"]
+        self.assertEqual(
+            (
+                history["checked"],
+                history["not_checked_reason"],
+                [change["counted"] for change in history["changes"]],
+            ),
+            expected,
+        )
+        self.assertEqual(
+            [(change["kind"], change["changed"], change["before"], change["after"]) for change in history["changes"]],
+            [("split", "Split", "control 50%, test 50%", "control 80%, test 20%")] if rebalance else [],
+        )
+
+    def _deny_event_property(self, name: str) -> None:
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.PROPERTY_ACCESS_CONTROL, "name": AvailableFeature.PROPERTY_ACCESS_CONTROL}
+        ]
+        self.organization.save()
+        denied = PropertyDefinition.objects.create(
+            team=self.team, name=name, property_type="String", type=PropertyDefinition.Type.EVENT
+        )
+        upsert_property_access_control(
+            team_id=self.team.id,
+            created_by_id=self.user.id,
+            input=UpsertPropertyAccessControlInput(
+                property_definition_id=str(denied.id),
+                access_level=PropertyAccessLevel.NONE,
+                organization_member_id=self.organization_membership.id,
+            ),
+        )
+
+    def _create_experiment_with_a_pinned_condition(self, flag_key: str) -> Experiment:
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key=flag_key,
+            created_by=self.user,
+            filters={
+                "groups": [
+                    {
+                        "properties": [
+                            {"key": "email", "value": "@example.com", "operator": "icontains", "type": "person"}
+                        ],
+                        "rollout_percentage": 100,
+                        "variant": "test",
+                    },
+                    {"properties": [], "rollout_percentage": 100},
+                ],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        return Experiment.objects.create(
+            team=self.team,
+            name="health-pinned",
+            feature_flag=flag,
+            start_date=timezone.now() - timedelta(days=3),
+            metrics=[_HEALTH_METRIC],
+        )
+
+    def _edit_flag_at(self, flag: FeatureFlag, at: datetime, fields: dict[str, Any]) -> None:
+        with time_machine.travel(at), self.captureOnCommitCallbacks(execute=True):
+            for field, value in fields.items():
+                setattr(flag, field, value)
+            flag.save()
+
+    @parameterized.expand(
+        [("after_cutoff", 30, "$experiment_exposure"), ("before_cutoff", -30, "$feature_flag_called")]
+    )
+    def test_draft_resolves_exposure_event_against_now(
+        self, _name: str, now_offset_days: int, expected_event: str
+    ) -> None:
+        # A draft has no start_date, so the field reports what launching now would resolve to —
+        # otherwise the setup UI names the old event for an experiment about to use the new one.
+        # Serialized directly rather than over HTTP: the frozen clock would expire the session.
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="draft-resolved-exposure-event",
+            feature_flag=FeatureFlag.objects.create(
+                team=self.team, key=f"draft-resolved-exposure-{_name}", created_by=self.user
+            ),
+            start_date=None,
+        )
+
+        with (
+            time_machine.travel(EXPERIMENT_EXPOSURE_EVENT_CUTOFF + timedelta(days=now_offset_days), tick=False),
+            patch_exposure_event_flag(enabled=True),
+        ):
+            serialized = ExperimentSerializer(
+                experiment, context={"team_id": self.team.id, "get_team": lambda: self.team}
+            ).data
+
+        self.assertEqual(serialized["resolved_exposure_event"], expected_event)
+
+    def test_retrieving_experiment_refreshes_action_names(self) -> None:
+        # Action-name refresh lives on the detail response — the list endpoint no longer
+        # returns metrics (see ExperimentBasicSerializer).
+        experiment, action = self._create_experiment_with_action_metrics(0)
+        update_action(action, name="Renamed action")
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result = response.json()
+
+        self.assertEqual(result["metrics"][0]["source"]["name"], "Renamed action")
+        self.assertEqual(result["metrics_secondary"][0]["source"]["name"], "Renamed action")
+        self.assertEqual(result["saved_metrics"][0]["query"]["source"]["name"], "Renamed action")
+
+    def test_list_omits_heavy_metric_fields_kept_on_detail(self) -> None:
+        # The list view never renders metric definitions, so they're excluded from the list
+        # response (letting the query defer the JSON columns and skip the saved-metric prefetch).
+        # The detail response still includes them.
+        experiment, _ = self._create_experiment_with_action_metrics(0)
+
+        list_result = next(
+            r
+            for r in self.client.get(f"/api/projects/{self.team.id}/experiments").json()["results"]
+            if r["id"] == experiment.id
+        )
+        for omitted in ["metrics", "metrics_secondary", "saved_metrics"]:
+            self.assertNotIn(omitted, list_result)
+        # Fields the list view does use are still present.
+        for kept in ["name", "status", "feature_flag", "parameters"]:
+            self.assertIn(kept, list_result)
+
+        detail_result = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}").json()
+        for present in ["metrics", "metrics_secondary", "saved_metrics"]:
+            self.assertIn(present, detail_result)
+
+    def test_creating_updating_basic_experiment(self):
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+        self.assertEqual(response.json()["stats_config"], {"method": "bayesian"})
+
+        id = response.json()["id"]
+        experiment = Experiment.objects.get(pk=id)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+
+        end_date = "2021-12-10T00:00"
+
+        # Now update
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {"description": "Bazinga", "end_date": end_date},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(pk=id)
+        self.assertEqual(experiment.description, "Bazinga")
+        assert experiment.end_date is not None
+        self.assertEqual(experiment.end_date.strftime("%Y-%m-%dT%H:%M"), end_date)
+
+    @patch("django.db.transaction.on_commit", side_effect=lambda func: func())
+    @patch("products.experiments.backend.experiment_service.report_user_action")
+    def test_creating_experiment_reports_user_action(self, mock_report_user_action, _mock_on_commit):
+        ff_key = "tracked-experiment"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Tracked Experiment",
+                "description": "",
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [{"order": 0, "id": "$pageview"}],
+                    "properties": [],
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        mock_report_user_action.assert_called_once()
+        self.assertEqual(mock_report_user_action.call_args.args[0], self.user)
+        self.assertEqual(mock_report_user_action.call_args.args[1], "experiment created")
+        self.assertEqual(
+            mock_report_user_action.call_args.args[2],
+            {
+                "experiment_id": response.json()["id"],
+                "experiment_name": "Tracked Experiment",
+                "feature_flag_key": ff_key,
+                "type": "product",
+                "status": "draft",
+                "metrics_count": 0,
+                "secondary_metrics_count": 0,
+                "saved_metrics_count": 0,
+                "has_description": False,
+                "has_conclusion_comment": False,
+                "variant_count": 2,
+                "created_at": ANY,
+                "creation_mode": "new",
+                "is_imported": False,
+                "experiment_create_deprecated_fields": ["filters"],
+            },
+        )
+        self.assertEqual(mock_report_user_action.call_args.kwargs["team"], self.team)
+        self.assertIsNotNone(mock_report_user_action.call_args.kwargs["request"])
+
+    @parameterized.expand(
+        [
+            ("explicit_true_team_false", False, True, True),
+            ("explicit_false_team_false", False, False, False),
+            ("omitted_team_false", False, None, False),
+            ("omitted_team_true", True, None, True),
+            ("explicit_false_overrides_team_true", True, False, False),
+        ]
+    )
+    def test_creating_experiment_ensure_experience_continuity(
+        self, _name, flags_persistence_default, params_value, expected
+    ):
+        self.team.flags_persistence_default = flags_persistence_default
+        self.team.save()
+
+        ff_key = f"test-continuity-{_name}"
+        parameters: dict = {}
+        if params_value is not None:
+            parameters["ensure_experience_continuity"] = params_value
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": f"Test Experiment {_name}",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": parameters,
+                "filters": {
+                    "events": [{"order": 0, "id": "$pageview"}],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.ensure_experience_continuity, expected)
+
+    def test_creating_experiment_with_rollout_percentage(self):
+        ff_key = "test-rollout-flag"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment with Rollout",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {"rollout_percentage": 50},
+                "filters": {
+                    "events": [{"order": 0, "id": "$pageview"}],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.filters["groups"][0]["rollout_percentage"], 50)
+
+    def test_creating_experiment_without_rollout_percentage_defaults_to_100(self):
+        ff_key = "test-default-rollout-flag"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment Default Rollout",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {
+                    "events": [{"order": 0, "id": "$pageview"}],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.filters["groups"][0]["rollout_percentage"], 100)
+
+    def test_updating_experiment_preserves_release_conditions(self):
+        ff_key = "test-update-rollout-flag"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment Update Rollout",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {"rollout_percentage": 80},
+                "filters": {
+                    "events": [{"order": 0, "id": "$pageview"}],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.filters["groups"][0]["rollout_percentage"], 80)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control Group", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test Variant", "rollout_percentage": 50},
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        created_ff.refresh_from_db()
+        self.assertEqual(created_ff.filters["groups"][0]["rollout_percentage"], 80)
+
+    def test_updating_experiment_applies_rollout_percentage_to_feature_flag(self):
+        ff_key = "test-rollout-flag"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment Rollout",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {"rollout_percentage": 80},
+                "filters": {
+                    "events": [{"order": 0, "id": "$pageview"}],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control Group", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test Variant", "rollout_percentage": 50},
+                    ],
+                    "rollout_percentage": 30,
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        flag = FeatureFlag.objects.get(key=ff_key, team=self.team)
+        self.assertEqual(flag.filters["groups"][0]["rollout_percentage"], 30)
+
+    def test_creating_updating_web_experiment(self):
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "type": "web",
+                "description": "",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+        web_experiment_id = response.json()["id"]
+        self.assertEqual(
+            WebExperiment.objects.get(pk=web_experiment_id).variants,
+            {"test": {"rollout_percentage": 50}, "control": {"rollout_percentage": 50}},
+        )
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+
+        id = response.json()["id"]
+        end_date = "2021-12-10T00:00"
+
+        # Now update
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {"description": "Bazinga", "end_date": end_date},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(pk=id)
+        self.assertEqual(experiment.description, "Bazinga")
+        assert experiment.end_date is not None
+        self.assertEqual(experiment.end_date.strftime("%Y-%m-%dT%H:%M"), end_date)
+
+    def test_cannot_assign_holdout_from_another_team(self):
+        other_org = Organization.objects.create(name="Other Org")
+        other_team = Team.objects.create(organization=other_org, name="Other Team")
+        other_holdout = ExperimentHoldout.objects.create(
+            team=other_team,
+            name="Other Team Holdout",
+            filters=[{"properties": [], "rollout_percentage": 20, "variant": "holdout"}],
+        )
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "feature_flag_key": "holdout-idor-test",
+                "holdout_id": other_holdout.id,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("does not exist", response.json()["detail"])
+
+    def test_transferring_holdout_to_another_group(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_holdouts/",
+            data={
+                "name": "Test Experiment holdout",
+                "filters": [
+                    {
+                        "properties": [],
+                        "rollout_percentage": 20,
+                        "variant": "holdout",
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        holdout_id = response.json()["id"]
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment holdout")
+        self.assertEqual(
+            response.json()["filters"],
+            [{"properties": [], "rollout_percentage": 20, "variant": f"holdout-{holdout_id}"}],
+        )
+
+        # Generate draft experiment to be part of holdout
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+                "holdout_id": holdout_id,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertEqual(
+            created_ff.filters["holdout"],
+            {"id": holdout_id, "exclusion_percentage": 20},
+        )
+
+        exp_id = response.json()["id"]
+
+        # new holdout, and update experiment
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_holdouts/",
+            data={
+                "name": "Test Experiment holdout 2",
+                "filters": [
+                    {
+                        "properties": [],
+                        "rollout_percentage": 5,
+                        "variant": "holdout",
+                    }
+                ],
+            },
+            format="json",
+        )
+        holdout_2_id = response.json()["id"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {"holdout_id": holdout_2_id},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(pk=exp_id)
+        self.assertEqual(experiment.holdout_id, holdout_2_id)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(
+            created_ff.filters["holdout"],
+            {"id": holdout_2_id, "exclusion_percentage": 5},
+        )
+
+        # update parameters
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {
+                "parameters": {
+                    "feature_flag_variants": [
+                        {
+                            "key": "control",
+                            "name": "Control Group",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_1",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_2",
+                            "name": "Test Variant",
+                            "rollout_percentage": 34,
+                        },
+                    ]
+                },
+            },
+        )
+
+        experiment = Experiment.objects.get(pk=exp_id)
+        self.assertEqual(experiment.holdout_id, holdout_2_id)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(
+            created_ff.filters["holdout"],
+            {"id": holdout_2_id, "exclusion_percentage": 5},
+        )
+        self.assertEqual(
+            created_ff.filters["multivariate"]["variants"],
+            [
+                {"key": "control", "name": "Control Group", "rollout_percentage": 33},
+                {"key": "test_1", "name": "Test Variant", "rollout_percentage": 33},
+                {"key": "test_2", "name": "Test Variant", "rollout_percentage": 34},
+            ],
+        )
+
+        # remove holdouts
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {"holdout_id": None},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(pk=exp_id)
+        self.assertEqual(experiment.holdout_id, None)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.filters["holdout"], None)
+
+        # try adding invalid holdout
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {"holdout_id": 123456},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], 'Invalid pk "123456" - object does not exist.')
+
+        # add back holdout
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {"holdout_id": holdout_2_id},
+        )
+
+        # launch experiment and try updating holdouts again
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {"start_date": "2021-12-01T10:23"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {"holdout_id": holdout_id},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "Can't update holdout on running Experiment")
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(
+            created_ff.filters["holdout"],
+            {"id": holdout_2_id, "exclusion_percentage": 5},
+        )
+
+    @parameterized.expand(
+        [
+            ("event_source", False, True),
+            ("action_source_renamed_after_the_save", True, True),
+            ("limit_without_link_breakdowns", False, False),
+        ]
+    )
+    def test_saved_metric_fingerprint_is_stamped_from_the_merged_query(
+        self, _name: str, rename_action: bool, link_has_breakdowns: bool
+    ):
+        """The stamped fingerprint tells the frontend which timeseries rows to read. It must be computed on
+        the saved query with the link overrides applied, the same dict the daily workflow files its rows
+        under, or the chart reads an empty series for an override-configured saved metric."""
+        breakdowns = [{"type": "event", "property": "$os_name"}] if link_has_breakdowns else []
+        action = create_action(team=self.team, name="Stored name", steps_json=[{"event": "$pageview"}])
+        source = (
+            {"kind": "ActionsNode", "id": action.id, "name": action.name}
+            if rename_action
+            else {"kind": "EventsNode", "event": "$pageview"}
+        )
+        saved_metric_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Breakdown saved metric",
+                "query": {"kind": "ExperimentMetric", "metric_type": "mean", "source": source},
+            },
+        )
+        if rename_action:
+            update_action(action, name="Current name")
+        metadata = {"type": "primary", "breakdowns": breakdowns, "breakdown_limit": 20}
+        experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Breakdown fingerprint",
+                "feature_flag_key": "breakdown-fingerprint",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+                "filters": {"events": [{"order": 0, "id": "$pageview"}], "properties": []},
+                "saved_metrics_ids": [{"id": saved_metric_response.json()["id"], "metadata": metadata}],
+            },
+        )
+        self.assertEqual(experiment_response.status_code, status.HTTP_201_CREATED)
+
+        detail = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_response.json()['id']}/")
+        served = detail.json()["saved_metrics"][0]
+        stamped = served["query"]["fingerprint"]
+        if rename_action:
+            self.assertEqual(served["query"]["source"]["name"], "Current name")
+        # The link limit applies only together with link breakdowns.
+        self.assertEqual(
+            served["effective_query"],
+            {
+                **served["query"],
+                "breakdownFilter": (
+                    {"breakdowns": breakdowns, "breakdown_limit": 20} if link_has_breakdowns else {"breakdowns": []}
+                ),
+            },
+        )
+
+        experiment = Experiment.objects.get(pk=experiment_response.json()["id"])
+        saved_query = experiment.saved_metrics.first().query  # type: ignore[union-attr]
+        calculation_config = get_metric_calculation_config(experiment, saved_query["uuid"])
+        assert calculation_config is not None
+        self.assertEqual(stamped, calculation_config.calculation_key())
+        if link_has_breakdowns:
+            # The raw query hashes differently when real breakdowns exist, so a stamp computed on it would
+            # point the chart at rows that do not exist.
+            raw_query_config = calculation_config.settings.build_metric_config(
+                metric_id=calculation_config.metric_id, role=calculation_config.role, definition=saved_query
+            )
+            self.assertNotEqual(stamped, raw_query_config.calculation_key())
+
+    def test_saved_metrics(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Test Experiment saved metric",
+                "description": "Test description",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            },
+        )
+
+        saved_metric_id = response.json()["id"]
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment saved metric")
+        self.assertEqual(response.json()["description"], "Test description")
+        saved_metric_uuid = response.json()["query"]["uuid"]
+        self.assertTrue(saved_metric_uuid)
+        self.assertEqual(
+            response.json()["query"],
+            {
+                "kind": "ExperimentMetric",
+                "metric_type": "mean",
+                "source": {"kind": "EventsNode", "event": "$pageview"},
+                "uuid": saved_metric_uuid,
+            },
+        )
+        self.assertEqual(response.json()["created_by"]["id"], self.user.pk)
+
+        # Generate experiment to have saved metric
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+                "saved_metrics_ids": [{"id": saved_metric_id, "metadata": {"type": "secondary"}}],
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        exp_id = response.json()["id"]
+
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+        self.assertEqual(Experiment.objects.get(pk=exp_id).saved_metrics.count(), 1)
+        experiment_to_saved_metric = Experiment.objects.get(pk=exp_id).experimenttosavedmetric_set.first()
+        assert experiment_to_saved_metric is not None
+        self.assertEqual(experiment_to_saved_metric.metadata, {"type": "secondary"})
+        saved_metric = Experiment.objects.get(pk=exp_id).saved_metrics.first()
+        assert saved_metric is not None
+        self.assertEqual(saved_metric.id, saved_metric_id)
+        self.assertEqual(
+            saved_metric.query,
+            {
+                "kind": "ExperimentMetric",
+                "metric_type": "mean",
+                "source": {"kind": "EventsNode", "event": "$pageview"},
+                "uuid": saved_metric_uuid,
+            },
+        )
+
+        # Now try updating experiment with new saved metric
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Test Experiment saved metric 2",
+                "description": "Test description 2",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageleave"},
+                },
+            },
+        )
+
+        saved_metric_2_id = response.json()["id"]
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment saved metric 2")
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {
+                "saved_metrics_ids": [
+                    {"id": saved_metric_id, "metadata": {"type": "secondary"}},
+                    {"id": saved_metric_2_id, "metadata": {"type": "tertiary"}},
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.assertEqual(Experiment.objects.get(pk=exp_id).saved_metrics.count(), 2)
+        experiment_to_saved_metrics = list(Experiment.objects.get(pk=exp_id).experimenttosavedmetric_set.all())
+        self.assertEqual(experiment_to_saved_metrics[0].metadata, {"type": "secondary"})
+        self.assertEqual(experiment_to_saved_metrics[1].metadata, {"type": "tertiary"})
+        saved_metrics = list(Experiment.objects.get(pk=exp_id).saved_metrics.all())
+        self.assertEqual(sorted([saved_metrics[0].id, saved_metrics[1].id]), [saved_metric_id, saved_metric_2_id])
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {"saved_metrics_ids": []},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Experiment.objects.get(pk=exp_id).saved_metrics.count(), 0)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {
+                "saved_metrics_ids": [
+                    {"id": saved_metric_id, "metadata": {"type": "secondary"}},
+                ]
+            },
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {"saved_metrics_ids": None},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Experiment.objects.get(pk=exp_id).saved_metrics.count(), 0)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {
+                "saved_metrics_ids": [
+                    {"id": saved_metric_id, "metadata": {"type": "secondary"}},
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Experiment.objects.get(pk=exp_id).saved_metrics.count(), 1)
+
+        # not updating saved metrics shouldn't change anything
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {
+                "name": "Test Experiment 2",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(Experiment.objects.get(pk=exp_id).saved_metrics.count(), 1)
+
+        # now delete saved metric
+        response = self.client.delete(f"/api/projects/{self.team.id}/experiment_saved_metrics/{saved_metric_id}")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        # make sure experiment in question was updated as well
+        self.assertEqual(Experiment.objects.get(pk=exp_id).saved_metrics.count(), 0)
+
+    def test_validate_saved_metrics_payload(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Test Experiment saved metric",
+                "description": "Test description",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            },
+        )
+
+        saved_metric_id = response.json()["id"]
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Generate experiment to have saved metric
+        ff_key = "a-b-tests"
+        exp_data = {
+            "name": "Test Experiment",
+            "description": "",
+            "start_date": "2021-12-01T10:23",
+            "end_date": None,
+            "feature_flag_key": ff_key,
+            "parameters": None,
+            "filters": {
+                "events": [
+                    {"order": 0, "id": "$pageview"},
+                    {"order": 1, "id": "$pageleave"},
+                ],
+                "properties": [],
+            },
+        }
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                **exp_data,
+                "saved_metrics_ids": [{"id": saved_metric_id, "metadata": {"xxx": "secondary"}}],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["type"], "validation_error")
+        self.assertEqual(
+            response.json()["detail"],
+            "Metadata must have a type key",
+        )
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                **exp_data,
+                "saved_metrics_ids": [{"saved_metric": saved_metric_id}],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["type"], "validation_error")
+        self.assertEqual(response.json()["detail"], "Saved metric must have an id")
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                **exp_data,
+                "saved_metrics_ids": [{"id": 12345678}],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["type"], "validation_error")
+        self.assertEqual(response.json()["detail"], "Saved metric does not exist or does not belong to this project")
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                **exp_data,
+                "saved_metrics_ids": {"id": saved_metric_id},
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["type"], "validation_error")
+        self.assertEqual(response.json()["detail"], 'Expected a list of items but got type "dict".')
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                **exp_data,
+                "saved_metrics_ids": [[saved_metric_id]],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["type"], "validation_error")
+        self.assertEqual(response.json()["detail"], "Saved metric must be an object")
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                **exp_data,
+                "saved_metrics_ids": [{"id": saved_metric_id, "metadata": "secondary"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["type"], "validation_error")
+        self.assertEqual(response.json()["detail"], "Metadata must be an object")
+
+    def test_adding_behavioral_cohort_filter_to_experiment_fails(self):
+        cohort = Cohort.objects.create(
+            team=self.team,
+            filters={
+                "properties": {
+                    "type": "AND",
+                    "values": [
+                        {
+                            "key": "$pageview",
+                            "event_type": "events",
+                            "time_value": 2,
+                            "time_interval": "week",
+                            "value": "performed_event_first_time",
+                            "type": "behavioral",
+                        },
+                    ],
+                }
+            },
+            name="cohort_behavioral",
+        )
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        id = response.json()["id"]
+
+        # Now update
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {"filters": {"properties": [{"key": "id", "value": cohort.pk, "type": "cohort"}]}},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["type"], "validation_error")
+        self.assertEqual(
+            response.json()["detail"],
+            "Experiments do not support global filter properties",
+        )
+
+    def test_invalid_create(self):
+        # Draft experiment
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": None,  # invalid
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {},
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "This field may not be null.")
+
+    def test_rejects_metrics_with_dict_properties_on_create(self):
+        dict_properties_metric = {
+            "kind": "ExperimentMetric",
+            "metric_type": "mean",
+            "source": {
+                "kind": "EventsNode",
+                "event": "$pageview",
+                "properties": {
+                    "$current_url": {
+                        "value": "/start",
+                        "operator": "icontains",
+                    }
+                },
+            },
+        }
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Bad metrics experiment",
+                "feature_flag_key": "bad-metrics-flag",
+                "parameters": {},
+                "filters": {},
+                "metrics": [dict_properties_metric],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["attr"], "metrics")
+
+    def test_rejects_metrics_with_dict_properties_on_update(self):
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Good experiment",
+                "feature_flag_key": "update-metrics-flag",
+                "parameters": {},
+                "filters": {},
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = create_response.json()["id"]
+
+        dict_properties_metric = {
+            "kind": "ExperimentMetric",
+            "metric_type": "mean",
+            "source": {
+                "kind": "EventsNode",
+                "event": "$pageview",
+                "properties": {
+                    "$current_url": {
+                        "value": "/start",
+                        "operator": "icontains",
+                    }
+                },
+            },
+        }
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"metrics": [dict_properties_metric]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["attr"], "metrics")
+
+    def test_rejects_metrics_with_invalid_kind(self):
+        """Regression test: invalid metric kinds should be rejected, not silently skipped."""
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Invalid kind experiment",
+                "feature_flag_key": "invalid-kind-flag",
+                "parameters": {},
+                "filters": {},
+                "metrics": [{"kind": "ExperimentEventMetric", "event": "test"}],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["attr"], "metrics")
+
+    def test_accepts_metrics_with_array_properties(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Good metrics experiment",
+                "feature_flag_key": "good-metrics-flag",
+                "parameters": {},
+                "filters": {},
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {
+                            "kind": "EventsNode",
+                            "event": "$pageview",
+                            "properties": [
+                                {
+                                    "key": "$current_url",
+                                    "value": "/start",
+                                    "operator": "icontains",
+                                    "type": "event",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_experiment_date_validation(self):
+        ff_key = "a-b-tests"
+
+        # Test 1: End date same as start date
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2024-02-10T00:00:00Z",
+                "end_date": "2024-02-10T00:00:00Z",
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {},
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "End date must be after start date")
+
+        # Test 2: End date before start date
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2024-02-10T00:00:00Z",
+                "end_date": "2024-02-09T00:00:00Z",
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {},
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "End date must be after start date")
+
+        # Test 3: Valid dates
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2024-02-10T00:00:00Z",
+                "end_date": "2024-02-11T00:00:00Z",
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {},
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["start_date"], "2024-02-10T00:00:00Z")
+        self.assertEqual(response.json()["end_date"], "2024-02-11T00:00:00Z")
+
+        # Test 4: Update with invalid dates
+        experiment_id = response.json()["id"]
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {
+                "start_date": "2024-02-15T00:00:00Z",
+                "end_date": "2024-02-14T00:00:00Z",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "End date must be after start date")
+
+        # Test 5: Only start date provided (should be valid)
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2024-02-10T00:00:00Z",
+                "end_date": None,
+                "feature_flag_key": ff_key + "_2",
+                "parameters": {},
+                "filters": {},
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["start_date"], "2024-02-10T00:00:00Z")
+        self.assertIsNone(response.json()["end_date"])
+
+        # Test 6: Only end date provided (should be valid)
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": "2024-02-11T00:00:00Z",
+                "feature_flag_key": ff_key + "_3",
+                "parameters": {},
+                "filters": {},
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIsNone(response.json()["start_date"])
+        self.assertEqual(response.json()["end_date"], "2024-02-11T00:00:00Z")
+
+    def test_invalid_update(self):
+        # Draft experiment
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {"events": []},
+            },
+        )
+
+        id = response.json()["id"]
+
+        # Now update
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {
+                "description": "Bazinga",
+                "filters": {},
+                "feature_flag_key": "new_key",
+            },  # invalid
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json()["detail"],
+            "Can't update keys: get_feature_flag_key on Experiment",
+        )
+
+    def test_draft_experiment_doesnt_have_FF_active(self):
+        # Draft experiment
+        ff_key = "a-b-tests"
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {"events": []},
+            },
+        )
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertFalse(created_ff.active)
+
+    def test_draft_experiment_doesnt_have_FF_active_even_after_updates(self):
+        # Draft experiment
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {"events": []},
+            },
+        )
+
+        id = response.json()["id"]
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertFalse(created_ff.active)
+
+        # Now update
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {
+                "description": "Bazinga",
+                "filters": {
+                    "events": [{"id": "$pageview"}],
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertFalse(created_ff.active)  # didn't change to enabled while still draft
+
+        # Now launch experiment
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {"start_date": "2021-12-01T10:23"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertTrue(created_ff.active)
+
+    def test_launching_draft_experiment_activates_FF(self):
+        # Draft experiment
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {"events": [{"id": "$pageview"}]},
+            },
+        )
+
+        id = response.json()["id"]
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertFalse(created_ff.active)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {"description": "Bazinga", "start_date": "2021-12-01T10:23"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        updated_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertTrue(updated_ff.active)
+
+    def test_draft_experiment_update_doesnt_delete_ff_payloads(self):
+        # Draft experiment
+        ff_key = "a-b-tests-with-flag-payloads"
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {"events": []},
+            },
+        )
+        id = create_response.json()["id"]
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        # Update feature flag payloads
+        created_ff.filters["payloads"] = {"test": '"test-payload"', "control": '"control-payload"'}
+        created_ff.save()
+
+        # Update parameters on experiment
+        update_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {
+                "description": "Update parameters",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {
+                            "key": "control",
+                            "name": "Control Group",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "special",
+                            "name": "Special Variant",
+                            "rollout_percentage": 34,
+                        },
+                    ]
+                },
+            },
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+
+        updated_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(updated_ff.filters["payloads"], {"test": '"test-payload"', "control": '"control-payload"'})
+
+    def test_create_multivariate_experiment_can_update_variants_in_draft(self):
+        ff_key = "a-b-test"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {
+                            "key": "control",
+                            "name": "Control Group",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_1",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_2",
+                            "name": "Test Variant",
+                            "rollout_percentage": 34,
+                        },
+                    ]
+                },
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertEqual(created_ff.active, False)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test_1")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][2]["key"], "test_2")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+
+        id = response.json()["id"]
+
+        experiment = Experiment.objects.get(id=response.json()["id"])
+        self.assertTrue(experiment.is_draft)
+        # Now try updating FF
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {
+                "description": "Bazinga",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {
+                            "key": "control",
+                            "name": "Control Group",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_1",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_2",
+                            "name": "Test Variant",
+                            "rollout_percentage": 24,
+                        },
+                        {
+                            "key": "test_3",
+                            "name": "Test Variant",
+                            "rollout_percentage": 10,
+                        },
+                    ]
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertEqual(created_ff.active, False)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][3]["key"], "test_3")
+
+    def test_create_multivariate_experiment(self):
+        ff_key = "a-b-test"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {
+                            "key": "control",
+                            "name": "Control Group",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_1",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_2",
+                            "name": "Test Variant",
+                            "rollout_percentage": 34,
+                        },
+                    ]
+                },
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertEqual(created_ff.active, True)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test_1")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][2]["key"], "test_2")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+
+        id = response.json()["id"]
+
+        experiment = Experiment.objects.get(id=response.json()["id"])
+        self.assertFalse(experiment.is_draft)
+
+        def _patch_flag_variants(variants: list, extra: dict | None = None) -> Any:
+            return self.client.patch(
+                f"/api/projects/{self.team.id}/experiments/{id}",
+                {
+                    "description": "Bazinga",
+                    "update_feature_flag_params": True,
+                    "feature_flag": {"filters": {"multivariate": {"variants": variants}}},
+                    **(extra or {}),
+                },
+            )
+
+        # Changing the variant count on a running experiment is rejected even with the opt-in.
+        response = _patch_flag_variants(
+            [
+                {"key": "control", "name": "X", "rollout_percentage": 50},
+                {"key": "test", "name": "Y", "rollout_percentage": 50},
+            ]
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "Can't update feature_flag_variants on Experiment")
+
+        # Changing only the rollout percentages of the same variants is allowed with the opt-in.
+        response = _patch_flag_variants(
+            [
+                {"key": "control", "name": "Control Group", "rollout_percentage": 35},
+                {"key": "test_1", "name": "Test Variant", "rollout_percentage": 33},
+                {"key": "test_2", "name": "Test Variant", "rollout_percentage": 32},
+            ],
+            extra={"description": "Bazinga 222"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertEqual(response.json()["description"], "Bazinga 222")
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.active, True)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["rollout_percentage"], 35)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["rollout_percentage"], 33)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][2]["rollout_percentage"], 32)
+
+        # Renaming variant keys on a running experiment is rejected even with the opt-in.
+        response = _patch_flag_variants(
+            [
+                {"key": "control", "name": "Control Group", "rollout_percentage": 33},
+                {"key": "test", "name": "Test Variant", "rollout_percentage": 33},
+                {"key": "test2", "name": "Test Variant", "rollout_percentage": 34},
+            ]
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "Can't update feature_flag_variants on Experiment")
+
+        # Non-flag parameter keys update independently of the flag.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {"description": "Bazinga", "parameters": {"recommended_sample_size": 1500}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["parameters"]["recommended_sample_size"], 1500)
+
+    def test_parameters_feature_flag_config_is_sourced_from_the_flag(self):
+        """The `parameters` projection sources feature-flag config (variants, rollout percentage,
+        aggregation group type) from the linked flag, not the stored `parameters` column. This is
+        what lets us stop persisting the mirror — a stale column must never surface in the response.
+        """
+        ff_key = "ff-config-from-flag"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Source of truth",
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control Group", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test Variant", "rollout_percentage": 50},
+                    ],
+                    "rollout_percentage": 100,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        # Make the flag (the source of truth) diverge from the stored mirror: new rollouts,
+        # an aggregation group type, and a 20% overall rollout.
+        flag = FeatureFlag.objects.get(key=ff_key, team_id=self.team.id)
+        flag.filters = {
+            "groups": [{"properties": [], "rollout_percentage": 20}],
+            "multivariate": {
+                "variants": [
+                    {"key": "control", "name": "Control Group", "rollout_percentage": 60},
+                    {"key": "test", "name": "Test Variant", "rollout_percentage": 40},
+                ]
+            },
+            "aggregation_group_type_index": 1,
+        }
+        flag.save()
+
+        # Leave a deliberately stale mirror in the column — what the reverse-sync used to keep
+        # fresh. The projection must ignore it entirely and read from the flag.
+        experiment = Experiment.objects.get(id=experiment_id)
+        experiment.parameters = {
+            **(experiment.parameters or {}),
+            "feature_flag_variants": [{"key": "stale", "rollout_percentage": 99}],
+            "rollout_percentage": 100,
+            "aggregation_group_type_index": None,
+        }
+        experiment.save()
+
+        expected_variants = [
+            {"key": "control", "name": "Control Group", "rollout_percentage": 60, "split_percent": 60},
+            {"key": "test", "name": "Test Variant", "rollout_percentage": 40, "split_percent": 40},
+        ]
+
+        # Detail endpoint (ExperimentSerializer)
+        detail_parameters = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()[
+            "parameters"
+        ]
+        self.assertEqual(detail_parameters["feature_flag_variants"], expected_variants)
+        self.assertEqual(detail_parameters["rollout_percentage"], 20)
+        self.assertEqual(detail_parameters["aggregation_group_type_index"], 1)
+
+        # List endpoint (ExperimentBasicSerializer shares the same projection)
+        results = self.client.get(f"/api/projects/{self.team.id}/experiments/").json()["results"]
+        list_parameters = next(e["parameters"] for e in results if e["id"] == experiment_id)
+        self.assertEqual(list_parameters["feature_flag_variants"], expected_variants)
+        self.assertEqual(list_parameters["aggregation_group_type_index"], 1)
+
+    @parameterized.expand([("string", "{}"), ("list", ["control"])])
+    def test_non_dict_parameters_column_does_not_break_reads(self, _name, stored_parameters):
+        ff_key = f"ff-bad-parameters-{_name}"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "Legacy blob", "feature_flag_key": ff_key},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        # Legacy rows can hold a non-dict here; .update() bypasses the serializer, as those writes did.
+        Experiment.objects.filter(id=experiment_id).update(parameters=stored_parameters)
+
+        detail = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}")
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+        self.assertEqual([v["key"] for v in detail.json()["parameters"]["feature_flag_variants"]], ["control", "test"])
+
+        listed = self.client.get(f"/api/projects/{self.team.id}/experiments/")
+        self.assertEqual(listed.status_code, status.HTTP_200_OK)
+        parameters = next(e["parameters"] for e in listed.json()["results"] if e["id"] == experiment_id)
+        self.assertEqual([v["key"] for v in parameters["feature_flag_variants"]], ["control", "test"])
+
+    def test_feature_flag_config_is_not_persisted_into_parameters(self):
+        """Create and update consume feature-flag config to build/sync the flag, but never store it
+        in the deprecated `parameters` column. Non-flag keys (e.g. variant_notes) are preserved.
+        """
+        ff_key = "ff-config-not-stored"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "No mirror",
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ],
+                    "rollout_percentage": 100,
+                    "variant_notes": {"control": "baseline"},
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        experiment = Experiment.objects.get(id=experiment_id)
+        assert experiment.parameters is not None
+        self.assertNotIn("feature_flag_variants", experiment.parameters)
+        self.assertNotIn("rollout_percentage", experiment.parameters)
+        self.assertEqual(experiment.parameters["variant_notes"], {"control": "baseline"})
+        flag = FeatureFlag.objects.get(key=ff_key, team_id=self.team.id)
+        self.assertEqual([v["key"] for v in flag.variants], ["control", "test"])
+
+        # A draft update that re-sends the full parameters blob also strips the flag config and
+        # keeps the non-flag keys.
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ],
+                    "variant_notes": {"control": "still baseline"},
+                },
+            },
+        )
+        experiment.refresh_from_db()
+        assert experiment.parameters is not None
+        self.assertNotIn("feature_flag_variants", experiment.parameters)
+        self.assertEqual(experiment.parameters["variant_notes"], {"control": "still baseline"})
+
+    def test_create_experiment_with_feature_flag_config_object(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF object create",
+                "feature_flag_key": "ff-object-create",
+                "feature_flag": {
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "name": "Control", "rollout_percentage": 50},
+                                {"key": "test", "name": "Test", "rollout_percentage": 50},
+                            ]
+                        },
+                        "groups": [{"properties": [], "rollout_percentage": 80}],
+                    },
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+
+        flag = FeatureFlag.objects.get(key="ff-object-create", team_id=self.team.id)
+        self.assertEqual([v["key"] for v in flag.variants], ["control", "test"])
+        self.assertEqual(flag.filters["groups"][0]["rollout_percentage"], 80)
+
+        experiment = Experiment.objects.get(id=response.json()["id"])
+        self.assertNotIn("feature_flag_variants", experiment.parameters or {})
+        self.assertEqual(
+            [v["key"] for v in response.json()["parameters"]["feature_flag_variants"]],
+            ["control", "test"],
+        )
+
+    def test_update_draft_experiment_with_feature_flag_config_object(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF object update",
+                "feature_flag_key": "ff-object-update",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ],
+                    "minimum_detectable_effect": 30,
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+        experiment_id = create.json()["id"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {
+                "feature_flag": {
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "rollout_percentage": 34},
+                                {"key": "test", "rollout_percentage": 33},
+                                {"key": "test_2", "rollout_percentage": 33},
+                            ]
+                        }
+                    }
+                }
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag = FeatureFlag.objects.get(key="ff-object-update", team_id=self.team.id)
+        self.assertEqual([v["key"] for v in flag.variants], ["control", "test", "test_2"])
+
+        # A feature_flag-only PATCH must not clobber unrelated parameters.
+        experiment = Experiment.objects.get(id=experiment_id)
+        self.assertEqual((experiment.parameters or {})["minimum_detectable_effect"], 30)
+
+    def test_echoed_feature_flag_object_is_ignored_on_round_trip(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF echo",
+                "feature_flag_key": "ff-echo",
+                "feature_flag": {
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "rollout_percentage": 50},
+                                {"key": "test", "rollout_percentage": 50},
+                            ]
+                        }
+                    }
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+        experiment_id = create.json()["id"]
+
+        # Read-modify-write client: the frontend spreads the whole GET response into the save,
+        # including the serialized read-only flag (which carries `id`). That echo carries no write
+        # intent and must be ignored rather than reapplied.
+        echoed_flag = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()[
+            "feature_flag"
+        ]
+        self.assertIn("id", echoed_flag)
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"description": "unrelated edit", "feature_flag": echoed_flag},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag = FeatureFlag.objects.get(key="ff-echo", team_id=self.team.id)
+        self.assertEqual([v["rollout_percentage"] for v in flag.variants], [50, 50])
+
+        # A genuine edit through a config-only object (no `id`) is applied.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {
+                "feature_flag": {
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "rollout_percentage": 60},
+                                {"key": "test", "rollout_percentage": 40},
+                            ]
+                        }
+                    }
+                }
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag.refresh_from_db()
+        self.assertEqual([v["rollout_percentage"] for v in flag.variants], [60, 40])
+
+    def test_partial_feature_flag_object_preserves_omitted_flag_config(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF partial",
+                "feature_flag_key": "ff-partial",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 34},
+                        {"key": "red", "rollout_percentage": 33},
+                        {"key": "blue", "rollout_percentage": 33},
+                    ],
+                    "aggregation_group_type_index": 1,
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+        experiment_id = create.json()["id"]
+        flag = FeatureFlag.objects.get(key="ff-partial", team_id=self.team.id)
+        self.assertEqual(flag.filters["aggregation_group_type_index"], 1)
+
+        # A rollout-only config object must not reset the flag's variants to defaults or clear
+        # its aggregation group type — omitted config keeps the flag's current state.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"feature_flag": {"filters": {"groups": [{"properties": [], "rollout_percentage": 30}]}}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag.refresh_from_db()
+        self.assertEqual([v["key"] for v in flag.variants], ["control", "red", "blue"])
+        self.assertEqual(flag.filters["aggregation_group_type_index"], 1)
+        self.assertEqual(flag.filters["groups"][0]["rollout_percentage"], 30)
+
+    @parameterized.expand(
+        [
+            ("filters_not_object", {"filters": "oops"}),
+            ("multivariate_not_object", {"filters": {"multivariate": [1]}}),
+            ("group_not_object", {"filters": {"groups": ["x"]}}),
+            (
+                "group_properties_unsupported",
+                {"filters": {"groups": [{"properties": [{"key": "email", "value": "a"}], "rollout_percentage": 50}]}},
+            ),
+            (
+                "multiple_groups_unsupported",
+                {"filters": {"groups": [{"rollout_percentage": 50}, {"rollout_percentage": 100}]}},
+            ),
+            (
+                "unknown_group_key",
+                {"filters": {"groups": [{"properties": [], "rollout_percentage": 50, "variant": "test"}]}},
+            ),
+            (
+                "unknown_top_level_key",
+                {"active": False, "filters": {"groups": [{"properties": [], "rollout_percentage": 50}]}},
+            ),
+            ("unknown_filters_key", {"filters": {"super_groups": []}}),
+        ]
+    )
+    def test_invalid_feature_flag_object_returns_400(self, _name, feature_flag_input):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "FF invalid", "feature_flag_key": "ff-invalid", "feature_flag": feature_flag_input},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.json())
+        self.assertFalse(FeatureFlag.objects.filter(key="ff-invalid", team_id=self.team.id).exists())
+
+    def test_feature_flag_object_normalizes_control_variant_key(self):
+        # Same normalization as the legacy parameters path — LLM/MCP payloads often send 'Control'.
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF control case",
+                "feature_flag_key": "ff-control-case",
+                "feature_flag": {
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "Control", "rollout_percentage": 50},
+                                {"key": "test", "rollout_percentage": 50},
+                            ]
+                        }
+                    }
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        flag = FeatureFlag.objects.get(key="ff-control-case", team_id=self.team.id)
+        self.assertEqual([v["key"] for v in flag.variants], ["control", "test"])
+
+    def test_feature_flag_object_on_running_experiment_requires_opt_in(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF running",
+                "feature_flag_key": "ff-running",
+                "start_date": "2021-12-01T10:23",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+        experiment_id = create.json()["id"]
+        new_variants_input = {
+            "feature_flag": {
+                "filters": {
+                    "multivariate": {
+                        "variants": [
+                            {"key": "control", "rollout_percentage": 60},
+                            {"key": "test", "rollout_percentage": 40},
+                        ]
+                    }
+                }
+            }
+        }
+
+        # Without the opt-in the service would sync nothing — reject loudly instead.
+        response = self.client.patch(f"/api/projects/{self.team.id}/experiments/{experiment_id}", new_variants_input)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("update_feature_flag_params", str(response.json()))
+        flag = FeatureFlag.objects.get(key="ff-running", team_id=self.team.id)
+        self.assertEqual([v["rollout_percentage"] for v in flag.variants], [50, 50])
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {**new_variants_input, "update_feature_flag_params": True},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag.refresh_from_db()
+        self.assertEqual([v["rollout_percentage"] for v in flag.variants], [60, 40])
+
+    def test_feature_flag_object_payloads_and_continuity_live_on_the_flag(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF payloads",
+                "feature_flag_key": "ff-payloads",
+                "feature_flag": {
+                    "ensure_experience_continuity": True,
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "rollout_percentage": 50},
+                                {"key": "test", "rollout_percentage": 50},
+                            ]
+                        },
+                        "payloads": {"test": '"v1"'},
+                    },
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        experiment_id = response.json()["id"]
+
+        flag = FeatureFlag.objects.get(key="ff-payloads", team_id=self.team.id)
+        self.assertEqual(flag.filters["payloads"], {"test": '"v1"'})
+        self.assertTrue(flag.ensure_experience_continuity)
+        experiment = Experiment.objects.get(id=experiment_id)
+        self.assertNotIn("feature_flag_payloads", experiment.parameters or {})
+        self.assertNotIn("ensure_experience_continuity", experiment.parameters or {})
+
+        # A draft update through the object syncs payloads to the flag too.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"feature_flag": {"filters": {"payloads": {"test": '"v2"'}}}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag.refresh_from_db()
+        self.assertEqual(flag.filters["payloads"], {"test": '"v2"'})
+        self.assertEqual([v["key"] for v in flag.variants], ["control", "test"])
+
+    def test_duplicate_experiment_carries_flag_payloads_and_continuity(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF clone source",
+                "feature_flag_key": "ff-clone-src",
+                "feature_flag": {
+                    "ensure_experience_continuity": True,
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "rollout_percentage": 50},
+                                {"key": "test", "rollout_percentage": 50},
+                            ]
+                        },
+                        "payloads": {"test": '"v1"'},
+                    },
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+
+        # The stored column carries no flag config, so the duplicate's new flag must inherit
+        # payloads and continuity from the source flag, not lose them.
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{create.json()['id']}/duplicate",
+            {"feature_flag_key": "ff-clone-dst"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        new_flag = FeatureFlag.objects.get(key="ff-clone-dst", team_id=self.team.id)
+        self.assertEqual(new_flag.filters["payloads"], {"test": '"v1"'})
+        self.assertTrue(new_flag.ensure_experience_continuity)
+
+    def test_stale_persisted_flag_config_is_not_echoed_back_onto_the_flag(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF stale echo",
+                "feature_flag_key": "ff-stale-echo",
+                "feature_flag": {
+                    "ensure_experience_continuity": True,
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "rollout_percentage": 50},
+                                {"key": "test", "rollout_percentage": 50},
+                            ]
+                        },
+                        "payloads": {"test": '"live"'},
+                    },
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+        experiment_id = create.json()["id"]
+
+        # Legacy rows still carry flag config in the column until the backfill strips it.
+        Experiment.objects.filter(id=experiment_id).update(
+            parameters={
+                "feature_flag_variants": [
+                    {"key": "control", "rollout_percentage": 90},
+                    {"key": "test", "rollout_percentage": 10},
+                ],
+                "feature_flag_payloads": {"test": '"stale"'},
+                "ensure_experience_continuity": False,
+            }
+        )
+
+        # Reads must project the flag's live config so a read-modify-write client echoes live
+        # values — not the stale column — into its next save.
+        get_parameters = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()[
+            "parameters"
+        ]
+        self.assertEqual(get_parameters["feature_flag_payloads"], {"test": '"live"'})
+        self.assertTrue(get_parameters["ensure_experience_continuity"])
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"name": "FF stale echo renamed", "parameters": get_parameters},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag = FeatureFlag.objects.get(key="ff-stale-echo", team_id=self.team.id)
+        self.assertEqual(flag.filters["payloads"], {"test": '"live"'})
+        self.assertTrue(flag.ensure_experience_continuity)
+        self.assertEqual([v["rollout_percentage"] for v in flag.variants], [50, 50])
+
+    def test_partial_feature_flag_object_ignores_stale_column_config(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF stale column",
+                "feature_flag_key": "ff-stale-column",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+        experiment_id = create.json()["id"]
+
+        # Legacy rows still carry stale flag config in the column until the backfill strips it;
+        # patch semantics must backfill omitted config from the flag's live state, not the column.
+        Experiment.objects.filter(id=experiment_id).update(
+            parameters={
+                "feature_flag_variants": [
+                    {"key": "control", "rollout_percentage": 90},
+                    {"key": "stale", "rollout_percentage": 10},
+                ],
+                "rollout_percentage": 5,
+            }
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"feature_flag": {"filters": {"payloads": {"test": '"v1"'}}}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag = FeatureFlag.objects.get(key="ff-stale-column", team_id=self.team.id)
+        self.assertEqual(flag.filters["payloads"], {"test": '"v1"'})
+        self.assertEqual([v["key"] for v in flag.variants], ["control", "test"])
+        self.assertEqual(flag.filters["groups"][0]["rollout_percentage"], 100)
+
+    def test_feature_flag_object_with_null_id_is_write_intent(self):
+        # Typed clients may serialize an optional id as null; only a non-null id marks an echo.
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF null id",
+                "feature_flag_key": "ff-null-id",
+                "feature_flag": {
+                    "id": None,
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "rollout_percentage": 34},
+                                {"key": "test_a", "rollout_percentage": 33},
+                                {"key": "test_b", "rollout_percentage": 33},
+                            ]
+                        }
+                    },
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        flag = FeatureFlag.objects.get(key="ff-null-id", team_id=self.team.id)
+        self.assertEqual([v["key"] for v in flag.variants], ["control", "test_a", "test_b"])
+
+    def test_create_with_existing_flag_and_feature_flag_config_returns_400(self):
+        FeatureFlag.objects.create(
+            team=self.team,
+            key="ff-preexisting",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        # The service links an existing flag as-is, so explicit config would be silently dropped.
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF preexisting",
+                "feature_flag_key": "ff-preexisting",
+                "feature_flag": {
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "rollout_percentage": 60},
+                                {"key": "test", "rollout_percentage": 40},
+                            ]
+                        }
+                    }
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already exists", str(response.json()))
+
+    def test_config_free_feature_flag_stub_is_ignored(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF stub",
+                "feature_flag_key": "ff-stub",
+                "start_date": "2021-12-01T10:23",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+
+        # An object with no config keys carries no write intent — clients that include such stubs
+        # in write bodies must keep working, even on running experiments.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{create.json()['id']}",
+            {"name": "FF stub renamed", "feature_flag": {"key": "ff-stub", "active": True}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertEqual(response.json()["name"], "FF stub renamed")
+
+    def test_duplicate_experiment_with_null_flag_continuity_stays_off(self):
+        create = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "FF null continuity",
+                "feature_flag_key": "ff-null-continuity",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.json())
+        FeatureFlag.objects.filter(key="ff-null-continuity", team_id=self.team.id).update(
+            ensure_experience_continuity=None
+        )
+        # A NULL continuity behaves as off; the clone must not pick up the team default instead.
+        self.team.flags_persistence_default = True
+        self.team.save()
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{create.json()['id']}/duplicate",
+            {"feature_flag_key": "ff-null-continuity-copy"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        new_flag = FeatureFlag.objects.get(key="ff-null-continuity-copy", team_id=self.team.id)
+        self.assertFalse(new_flag.ensure_experience_continuity)
+
+    def test_experiment_response_includes_feature_flag(self):
+        """Test that experiment responses include the feature_flag field correctly serialized."""
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Feature Flag Test",
+                "feature_flag_key": "test-flag-serialization",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Verify feature_flag is included and properly serialized
+        response_data = response.json()
+        self.assertIn("feature_flag", response_data)
+        self.assertIsNotNone(response_data["feature_flag"])
+        self.assertEqual(response_data["feature_flag"]["key"], "test-flag-serialization")
+        self.assertIn("id", response_data["feature_flag"])
+        self.assertIn("active", response_data["feature_flag"])
+
+        # Also test GET to ensure serialization works for retrieval too
+        experiment_id = response_data["id"]
+        get_response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}")
+        self.assertEqual(get_response.status_code, status.HTTP_200_OK)
+
+        get_data = get_response.json()
+        self.assertIn("feature_flag", get_data)
+        self.assertIsNotNone(get_data["feature_flag"])
+        self.assertEqual(get_data["feature_flag"]["key"], "test-flag-serialization")
+
+    def test_creating_multivariate_experiment_without_control_variant(self):
+        # No 'control' variant is required; the baseline defaults to the first variant downstream.
+        ff_key = "a-b-test"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {
+                            "key": "test_0",
+                            "name": "Baseline Group",
+                            "rollout_percentage": 34,
+                        },
+                        {
+                            "key": "test_1",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_2",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        flag = FeatureFlag.objects.get(key=ff_key)
+        flag_keys = [v["key"] for v in flag.filters["multivariate"]["variants"]]
+        self.assertEqual(flag_keys, ["test_0", "test_1", "test_2"])
+        # The inferred baseline is pinned, not left implicit (order-sensitive).
+        self.assertEqual(response.json()["stats_config"]["baseline_variant_key"], "test_0")
+
+    @parameterized.expand(
+        [
+            ("Control",),
+            ("CONTROL",),
+            ("cOnTrOl",),
+        ]
+    )
+    def test_creating_experiment_normalizes_capitalized_control_key(self, control_key: str):
+        # LLM callers often emit `Control` or `CONTROL` from natural-language input.
+        # The serializer should rewrite it to lowercase `control` instead of rejecting,
+        # since intent is unambiguous and the runtime treats `control` as a reserved key.
+        ff_key = f"case-insensitive-{control_key.lower()}-{control_key}"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": f"Capitalized control {control_key}",
+                "description": "",
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": control_key, "name": "Control", "split_percent": 50},
+                        {"key": "test", "name": "Test", "split_percent": 50},
+                    ]
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        variants = response.json()["parameters"]["feature_flag_variants"]
+        self.assertEqual([v["key"] for v in variants], ["control", "test"])
+        # The persisted flag should also use lowercase `control`.
+        flag = FeatureFlag.objects.get(key=ff_key)
+        flag_keys = [v["key"] for v in flag.filters["multivariate"]["variants"]]
+        self.assertEqual(flag_keys, ["control", "test"])
+
+    def test_creating_experiment_does_not_collapse_when_control_already_present(self):
+        # If both `control` and `Control` are passed, normalization must NOT run —
+        # otherwise it would rewrite `Control` → `control` and produce two duplicate
+        # entries. The downstream FeatureFlagSerializer may then accept (variants
+        # preserved) or reject (duplicate-key error) — both prove the normalization
+        # path was skipped. A wrong rewrite would surface as duplicate `control` keys
+        # in the 201 response, which the assertion below would catch.
+        ff_key = "control-and-capital-control"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Both controls",
+                "description": "",
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "lowercase", "split_percent": 50},
+                        {"key": "Control", "name": "Capitalized", "split_percent": 50},
+                    ]
+                },
+            },
+            format="json",
+        )
+
+        # Must land on a deterministic outcome — not silently bypass.
+        self.assertIn(response.status_code, [status.HTTP_201_CREATED, status.HTTP_400_BAD_REQUEST])
+        if response.status_code == status.HTTP_201_CREATED:
+            variants = response.json()["parameters"]["feature_flag_variants"]
+            self.assertEqual([v["key"] for v in variants], ["control", "Control"])
+
+    def test_creating_updating_experiment_with_group_aggregation(self):
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                    "aggregation_group_type_index": 1,
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+        self.assertTrue(created_ff.filters["aggregation_group_type_index"] is None)
+
+        id = response.json()["id"]
+
+        # Now update group type index on filter
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {
+                "description": "Bazinga",
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                    "aggregation_group_type_index": 0,
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(pk=id)
+        self.assertEqual(experiment.description, "Bazinga")
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertFalse(created_ff.active)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+        self.assertTrue(created_ff.filters["aggregation_group_type_index"] is None)
+
+        # Now remove group type index
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {
+                "description": "Bazinga",
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                    # "aggregation_group_type_index": None, # removed key
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(pk=id)
+        self.assertEqual(experiment.description, "Bazinga")
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertFalse(created_ff.active)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+        self.assertTrue(created_ff.filters["aggregation_group_type_index"] is None)
+
+    def test_creating_experiment_with_group_aggregation_parameter(self):
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "aggregation_group_type_index": 0,
+                },
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+        self.assertEqual(created_ff.filters["aggregation_group_type_index"], 0)
+
+        id = response.json()["id"]
+
+        # Now update group type index on filter
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{id}",
+            {
+                "description": "Bazinga",
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                    "aggregation_group_type_index": 1,
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(pk=id)
+        self.assertEqual(experiment.description, "Bazinga")
+
+        created_ff = FeatureFlag.objects.get(key=ff_key)
+        self.assertEqual(created_ff.key, ff_key)
+        self.assertFalse(created_ff.active)
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][0]["key"], "control")
+        self.assertEqual(created_ff.filters["multivariate"]["variants"][1]["key"], "test")
+        self.assertEqual(created_ff.filters["groups"][0]["properties"], [])
+        self.assertEqual(created_ff.filters["aggregation_group_type_index"], 0)
+
+    def test_used_in_experiment_is_populated_correctly_for_feature_flag_list(self) -> None:
+        ff_key = "a-b-test"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {
+                            "key": "control",
+                            "name": "Control Group",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_1",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_2",
+                            "name": "Test Variant",
+                            "rollout_percentage": 34,
+                        },
+                    ]
+                },
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+        created_experiment = response.json()["id"]
+
+        # add another random feature flag
+        self.client.post(
+            f"/api/projects/{self.team.id}/feature_flags/",
+            data={
+                "name": f"flag",
+                "key": f"flag_0",
+                "filters": {"groups": [{"rollout_percentage": 5}]},
+            },
+            format="json",
+        ).json()
+
+        # TODO: Make sure permission bool doesn't cause n + 1
+        # +1 query for survey internal flag IDs lookup, +1 for the project's replay gates
+        with self.assertNumQueries(19):
+            response = self.client.get(f"/api/projects/{self.team.id}/feature_flags")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            result = response.json()
+
+            self.assertEqual(result["count"], 2)
+
+            self.assertCountEqual(
+                [(res["key"], res["experiment_set"]) for res in result["results"]],
+                [("flag_0", []), (ff_key, [created_experiment])],
+            )
+
+    def test_create_draft_experiment_with_filters(self) -> None:
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+    def test_create_launched_experiment_with_filters(self) -> None:
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+    def test_create_draft_experiment_without_filters(self) -> None:
+        ff_key = "a-b-tests"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {},
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+    def test_create_experiment_inherits_team_default_only_count_matured_users(self):
+        config = get_or_create_team_extension(self.team, TeamExperimentsConfig)
+        config.default_only_count_matured_users = True
+        config.save()
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Team Default Matured",
+                "feature_flag_key": "team-default-matured",
+                "parameters": None,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.json()["only_count_matured_users"])
+
+    def test_create_experiment_explicit_false_overrides_team_default_only_count_matured_users(self):
+        config = get_or_create_team_extension(self.team, TeamExperimentsConfig)
+        config.default_only_count_matured_users = True
+        config.save()
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Override Matured",
+                "feature_flag_key": "override-matured",
+                "parameters": None,
+                "only_count_matured_users": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(response.json()["only_count_matured_users"])
+
+    def test_create_experiment_with_feature_flag_without_control(self):
+        # An existing flag without a 'control' variant is eligible; the baseline
+        # defaults to the first variant downstream.
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Beta feature",
+            key="beta-feature",
+            filters={
+                "multivariate": {
+                    "variants": [
+                        {"key": "test-1", "rollout_percentage": 50},
+                        {"key": "test-2", "rollout_percentage": 50},
+                    ]
+                }
+            },
+            created_by=self.user,
+        )
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Beta experiment",
+                "feature_flag_key": feature_flag.key,
+                "parameters": {},
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        self.assertEqual(response.json()["feature_flag"]["id"], feature_flag.id)
+
+    def test_create_experiment_with_feature_flag_insufficient_variants(self):
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Single variant flag",
+            key="single-variant-flag",
+            filters={
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 100},
+                    ]
+                }
+            },
+            created_by=self.user,
+        )
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Single variant experiment",
+                "feature_flag_key": feature_flag.key,
+                "parameters": {},
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json()["detail"],
+            "Feature flag must have at least 2 variants (a baseline and at least one test variant)",
+        )
+
+    def test_create_experiment_with_parameters_insufficient_variants(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Single variant experiment",
+                "feature_flag_key": "single-variant-key",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 100},
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json()["detail"],
+            "Feature flag must have at least 2 variants (a baseline and at least one test variant)",
+        )
+
+    def test_create_experiment_with_valid_existing_feature_flag(self):
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Beta feature",
+            key="beta-feature",
+            filters={
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                }
+            },
+            created_by=self.user,
+        )
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Beta experiment",
+                "feature_flag_key": feature_flag.key,
+                "parameters": {},
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["feature_flag"]["id"], feature_flag.id)
+
+    def test_create_multiple_experiments_with_same_feature_flag(self):
+        # Create a feature flag with proper structure for experiments
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Shared feature flag",
+            key="shared-feature-flag",
+            filters={
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                }
+            },
+            created_by=self.user,
+        )
+
+        # Create first experiment with this feature flag
+        first_experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "First experiment",
+                "feature_flag_key": feature_flag.key,
+                "parameters": {},
+            },
+        )
+
+        self.assertEqual(first_experiment_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(first_experiment_response.json()["feature_flag"]["id"], feature_flag.id)
+
+        # Create second experiment with the same feature flag - this would have previously failed
+        second_experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Second experiment",
+                "feature_flag_key": feature_flag.key,
+                "parameters": {},
+            },
+        )
+
+        # Assert that the second experiment is created successfully
+        self.assertEqual(second_experiment_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second_experiment_response.json()["feature_flag"]["id"], feature_flag.id)
+
+        # Verify both experiments exist and point to the same feature flag
+        first_experiment_id = first_experiment_response.json()["id"]
+        second_experiment_id = second_experiment_response.json()["id"]
+
+        # Ensure both experiments exist in the database
+        first_experiment = Experiment.objects.get(id=first_experiment_id)
+        second_experiment = Experiment.objects.get(id=second_experiment_id)
+
+        # Verify both experiments use the same feature flag
+        self.assertEqual(first_experiment.feature_flag_id, feature_flag.id)
+        self.assertEqual(second_experiment.feature_flag_id, feature_flag.id)
+
+    def test_feature_flag_and_experiment_sync(self):
+        # Create an experiment with control and test variants
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "My test experiment",
+                "feature_flag_key": "experiment-test-flag",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control Group", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test Variant", "rollout_percentage": 50},
+                    ]
+                },
+                "filters": {"insight": "TRENDS", "events": [{"order": 0, "id": "$pageview"}]},
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        experiment_id = response.json()["id"]
+        feature_flag_id = response.json()["feature_flag"]["id"]
+
+        # Fetch the FeatureFlag object
+        feature_flag = FeatureFlag.objects.get(id=feature_flag_id)
+
+        variants = feature_flag.filters["multivariate"]["variants"]
+
+        # Verify that the variants are correctly populated
+        self.assertEqual(len(variants), 2)
+
+        self.assertEqual(variants[0]["key"], "control")
+        self.assertEqual(variants[0]["name"], "Control Group")
+        self.assertEqual(variants[0]["rollout_percentage"], 50)
+
+        self.assertEqual(variants[1]["key"], "test")
+        self.assertEqual(variants[1]["name"], "Test Variant")
+        self.assertEqual(variants[1]["rollout_percentage"], 50)
+
+        # Change the rollout percentages and groups of the feature flag
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/feature_flags/{feature_flag_id}",
+            {
+                "filters": {
+                    "groups": [
+                        {"properties": [], "rollout_percentage": 99},
+                        {"properties": [], "rollout_percentage": 1},
+                    ],
+                    "payloads": {},
+                    "multivariate": {
+                        "variants": [
+                            {"key": "control", "rollout_percentage": 10},
+                            {"key": "test", "rollout_percentage": 90},
+                        ]
+                    },
+                    "aggregation_group_type_index": 1,
+                }
+            },
+        )
+
+        # The flag is the source of truth; the experiment API projects variants and aggregation
+        # group type from it (no `parameters` mirror is persisted).
+        parameters = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()["parameters"]
+        self.assertEqual(
+            parameters["feature_flag_variants"],
+            [
+                {"key": "control", "rollout_percentage": 10, "split_percent": 10},
+                {"key": "test", "rollout_percentage": 90, "split_percent": 90},
+            ],
+        )
+        self.assertEqual(parameters["aggregation_group_type_index"], 1)
+
+        # Update the experiment with an unrelated change
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"name": "Updated Test Experiment"},
+        )
+
+        # Verify that the feature flag variants and groups remain unchanged
+        feature_flag = FeatureFlag.objects.get(id=feature_flag_id)
+        self.assertEqual(
+            feature_flag.filters["multivariate"]["variants"],
+            [{"key": "control", "rollout_percentage": 10}, {"key": "test", "rollout_percentage": 90}],
+        )
+        self.assertEqual(
+            feature_flag.filters["groups"],
+            [
+                {"properties": [], "rollout_percentage": 99, "aggregation_group_type_index": 1},
+                {"properties": [], "rollout_percentage": 1, "aggregation_group_type_index": 1},
+            ],
+        )
+
+        # Test removing aggregation_group_type_index. PATCH filters merge with the stored
+        # state per top-level key (#50084), so clearing requires an explicit null rather
+        # than omitting the key.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/feature_flags/{feature_flag_id}",
+            {
+                "filters": {
+                    "groups": [
+                        {"properties": [], "rollout_percentage": 99},
+                        {"properties": [], "rollout_percentage": 1},
+                    ],
+                    "payloads": {},
+                    "aggregation_group_type_index": None,
+                    "multivariate": {
+                        "variants": [
+                            {"key": "control", "rollout_percentage": 10},
+                            {"key": "test", "rollout_percentage": 90},
+                        ]
+                    },
+                }
+            },
+        )
+
+        # With no aggregation_group_type_index on the flag, it is absent from the projection too.
+        parameters = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()["parameters"]
+        self.assertNotIn("aggregation_group_type_index", parameters)
+
+    def test_update_experiment_exposure_config_valid(self):
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Test Feature Flag",
+            key="test-feature-flag",
+            filters={},
+        )
+
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="Test Experiment",
+            description="My test experiment",
+            feature_flag=feature_flag,
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}",
+            {
+                "exposure_criteria": {
+                    "filterTestAccounts": True,
+                    "exposure_config": {
+                        "event": "$pageview",
+                        "properties": [
+                            {"key": "plan", "operator": "is_not", "value": "free", "type": "event"},
+                        ],
+                    },
+                }
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(id=experiment.id)
+        assert experiment.exposure_criteria is not None
+        exposure_criteria = cast(dict[str, Any], experiment.exposure_criteria)
+        exposure_config = cast(dict[str, Any], exposure_criteria["exposure_config"])
+        self.assertEqual(exposure_criteria["filterTestAccounts"], True)
+        self.assertEqual(exposure_config["event"], "$pageview")
+        self.assertEqual(
+            exposure_config["properties"],
+            [{"key": "plan", "operator": "is_not", "value": "free", "type": "event"}],
+        )
+
+    def test_update_experiment_exposure_config_invalid(self):
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Test Feature Flag",
+            key="test-feature-flag",
+            filters={},
+        )
+
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="Test Experiment",
+            description="My test experiment",
+            feature_flag=feature_flag,
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}",
+            {
+                "exposure_criteria": {
+                    "filterTestAccounts": True,
+                    "exposure_config": {
+                        # Invalid event and properties
+                        "event": "",
+                        "properties": [
+                            1,
+                        ],
+                    },
+                }
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_update_experiment_repository_validates_and_normalizes(self):
+        feature_flag = FeatureFlag.objects.create(team=self.team, key="repo-field-flag", filters={})
+        experiment = Experiment.objects.create(team=self.team, name="Repo field", feature_flag=feature_flag)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}",
+            {"repository": "not-a-repo"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}",
+            {"repository": "Acme/Web"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertEqual(response.json()["repository"], "acme/web")
+
+    def test_create_experiment_with_repository(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Repo on create",
+                "feature_flag_key": "repo-on-create-flag",
+                "repository": "Acme/Web",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        self.assertEqual(response.json()["repository"], "acme/web")
+
+    def test_update_experiment_exposure_config_with_action(self):
+        # Create an action
+        action = create_action(
+            name="Test Action",
+            team=self.team,
+            steps_json=[{"event": "purchase", "properties": [{"key": "plan", "value": "premium", "type": "event"}]}],
+        )
+
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Test Feature Flag",
+            key="test-feature-flag",
+            filters={},
+        )
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="Test Experiment",
+            description="My test experiment",
+            feature_flag=feature_flag,
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}",
+            {
+                "exposure_criteria": {
+                    "filterTestAccounts": False,
+                    "exposure_config": {
+                        "kind": "ActionsNode",
+                        "id": action.id,
+                    },
+                }
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        experiment = Experiment.objects.get(id=experiment.id)
+        assert experiment.exposure_criteria is not None
+        self.assertEqual(experiment.exposure_criteria["filterTestAccounts"], False)
+        self.assertEqual(experiment.exposure_criteria["exposure_config"]["kind"], "ActionsNode")
+        self.assertEqual(experiment.exposure_criteria["exposure_config"]["id"], action.id)
+
+    def test_create_experiment_in_specific_folder(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Folder Test Experiment",
+                "description": "This experiment goes in a custom folder",
+                "feature_flag_key": "folder-experiment",
+                # ensure the experiment is in draft so it doesn't fail if user doesn't pass certain date fields
+                "start_date": None,
+                "filters": {"events": [], "properties": []},
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 50},
+                        {"key": "test", "rollout_percentage": 50},
+                    ]
+                },
+                "_create_in_folder": "Special Folder/Experiments",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        experiment_id = response.json()["id"]
+        self.assertTrue(Experiment.objects.filter(id=experiment_id).exists())
+
+        ff_key = response.json()["feature_flag_key"]
+        self.assertTrue(FeatureFlag.objects.filter(team=self.team, key=ff_key).exists())
+        ff_id = FeatureFlag.objects.filter(team=self.team, key=ff_key).first().id
+
+        from posthog.models.file_system.file_system import FileSystem
+
+        fs_entry = FileSystem.objects.filter(team=self.team, ref=str(experiment_id), type="experiment").first()
+        assert fs_entry is not None, "Expected a FileSystem entry for the newly created experiment."
+        assert "Special Folder/Experiments" in fs_entry.path, (
+            f"Expected path to contain 'Special Folder/Experiments', got {fs_entry.path}"
+        )
+
+        ff_entry = FileSystem.objects.filter(team=self.team, ref=str(ff_id), type="feature_flag").first()
+        assert ff_entry is not None, "Expected a FileSystem entry for the newly created feature flag."
+        assert "Special Folder/Experiments" in ff_entry.path, (
+            f"Expected path to contain 'Special Folder/Experiments', got {ff_entry.path}"
+        )
+
+    def test_list_endpoint_excludes_deleted_experiments(self):
+        """Test that list endpoint doesn't return soft-deleted experiments"""
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "feature_flag_key": "test-flag",
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+            format="json",
+        )
+        experiment_id = response.json()["id"]
+
+        response2 = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Active Experiment",
+                "feature_flag_key": "active-flag",
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+            format="json",
+        )
+        active_experiment_id = response2.json()["id"]
+
+        # Soft delete the first experiment
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"deleted": True},
+            format="json",
+        )
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/")
+        experiment_ids = [exp["id"] for exp in response.json()["results"]]
+
+        # Should only contain the active experiment
+        self.assertIn(active_experiment_id, experiment_ids)
+        self.assertNotIn(experiment_id, experiment_ids)
+
+    def test_detail_endpoint_returns_404_for_deleted_experiment(self):
+        """Test that detail endpoint returns 404 for soft-deleted experiments"""
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "feature_flag_key": "test-flag",
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+            format="json",
+        )
+        experiment_id = response.json()["id"]
+
+        # Soft delete the experiment
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"deleted": True},
+            format="json",
+        )
+
+        # Try to get the deleted experiment
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_restore_allows_payload_with_additional_fields(self):
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Restorable Experiment",
+                "feature_flag_key": "restore-flag",
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+            format="json",
+        )
+        experiment = create_response.json()
+
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment['id']}/",
+            {"deleted": True},
+            format="json",
+        )
+
+        restore_payload = {"deleted": False, "name": experiment["name"]}
+        restore_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment['id']}/",
+            restore_payload,
+            format="json",
+        )
+
+        self.assertEqual(restore_response.status_code, status.HTTP_200_OK)
+        self.assertFalse(restore_response.json()["deleted"])
+
+    @parameterized.expand(
+        [
+            ("flag_deleted", True, status.HTTP_400_BAD_REQUEST),
+            ("flag_alive", False, status.HTTP_200_OK),
+        ]
+    )
+    def test_restore_with_flag_state(self, _name, delete_flag, expected_status):
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Restore Flag State Test",
+                "feature_flag_key": f"restore-flag-state-{_name}",
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+            format="json",
+        )
+        experiment = create_response.json()
+        feature_flag_id = experiment["feature_flag"]["id"]
+
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment['id']}/",
+            {"deleted": True},
+            format="json",
+        )
+
+        if delete_flag:
+            self.client.patch(
+                f"/api/projects/{self.team.id}/feature_flags/{feature_flag_id}/",
+                {"deleted": True},
+                format="json",
+            )
+
+        restore_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment['id']}/",
+            {"deleted": False, "name": experiment["name"]},
+            format="json",
+        )
+
+        self.assertEqual(restore_response.status_code, expected_status)
+        if expected_status == status.HTTP_400_BAD_REQUEST:
+            self.assertIn("linked feature flag has been deleted", restore_response.json()["detail"])
+        else:
+            self.assertFalse(restore_response.json()["deleted"])
+
+    def test_create_experiment_with_missing_parameters(self):
+        ff_key = "a-b-tests"
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "feature_flag_key": ff_key,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_duplicate_experiment(self) -> None:
+        """Test that experiments can be duplicated with the same settings and metrics"""
+        ff_key = "duplicate-test-flag"
+
+        # Create original experiment
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Original Experiment",
+                "description": "Original description",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control Group", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test Variant", "rollout_percentage": 50},
+                    ]
+                },
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+                "metrics_secondary": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$click"},
+                    }
+                ],
+                "stats_config": {"method": "bayesian"},
+                "exposure_criteria": {"filterTestAccounts": True},
+            },
+        )
+
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        # Duplicate the experiment
+        duplicate_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/duplicate/",
+            {},
+        )
+
+        self.assertEqual(duplicate_response.status_code, status.HTTP_201_CREATED)
+        duplicate_experiment = duplicate_response.json()
+
+        # Verify duplicate has correct properties
+        self.assertEqual(duplicate_experiment["name"], "Original Experiment (Copy)")
+        self.assertEqual(duplicate_experiment["description"], original_experiment["description"])
+        self.assertEqual(duplicate_experiment["type"], original_experiment["type"])
+        self.assertEqual(duplicate_experiment["parameters"], original_experiment["parameters"])
+        self.assertEqual(duplicate_experiment["filters"], original_experiment["filters"])
+
+        # Compare metric content ignoring fingerprints (they differ due to different
+        # start_dates) and uuids (regenerated by clone so the duplicate has its own
+        # identity space — see _regenerate_all_metric_uuids).
+        def strip_identity(metrics):
+            return [{k: v for k, v in metric.items() if k not in ("fingerprint", "uuid")} for metric in metrics or []]
+
+        self.assertEqual(
+            strip_identity(duplicate_experiment["metrics"]), strip_identity(original_experiment["metrics"])
+        )
+        self.assertEqual(
+            strip_identity(duplicate_experiment["metrics_secondary"]),
+            strip_identity(original_experiment["metrics_secondary"]),
+        )
+        # Clone must regenerate every metric uuid.
+        original_uuids = {m["uuid"] for m in original_experiment["metrics"] or []}
+        duplicate_uuids = {m["uuid"] for m in duplicate_experiment["metrics"] or []}
+        if original_uuids:
+            self.assertTrue(original_uuids.isdisjoint(duplicate_uuids))
+
+        self.assertEqual(duplicate_experiment["stats_config"], original_experiment["stats_config"])
+        self.assertEqual(duplicate_experiment["exposure_criteria"], original_experiment["exposure_criteria"])
+
+        # Verify feature flag is reused
+        self.assertEqual(duplicate_experiment["feature_flag_key"], original_experiment["feature_flag_key"])
+
+        # Verify reset fields
+        self.assertIsNone(duplicate_experiment["start_date"])
+        self.assertIsNone(duplicate_experiment["end_date"])
+        self.assertFalse(duplicate_experiment["archived"])
+        self.assertFalse(duplicate_experiment["deleted"])
+
+        # Verify different IDs
+        self.assertNotEqual(duplicate_experiment["id"], original_experiment["id"])
+
+    def test_duplicate_experiment_name_conflict_resolution(self) -> None:
+        """Test that duplicate experiment names are handled with incremental suffixes"""
+        ff_key = "name-conflict-test-flag"
+
+        # Create original experiment
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Conflict Test",
+                "feature_flag_key": ff_key,
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+            },
+        )
+
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        # Create first duplicate
+        first_duplicate_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/duplicate/",
+            {},
+        )
+
+        self.assertEqual(first_duplicate_response.status_code, status.HTTP_201_CREATED)
+        first_duplicate = first_duplicate_response.json()
+        self.assertEqual(first_duplicate["name"], "Conflict Test (Copy)")
+
+        # Create second duplicate to test name conflict resolution
+        second_duplicate_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/duplicate/",
+            {},
+        )
+
+        self.assertEqual(second_duplicate_response.status_code, status.HTTP_201_CREATED)
+        second_duplicate = second_duplicate_response.json()
+        self.assertEqual(second_duplicate["name"], "Conflict Test (Copy) 1")
+
+    def test_duplicate_experiment_with_custom_feature_flag(self) -> None:
+        """Test that experiments can be duplicated with a different feature flag"""
+        # Create original experiment
+        original_ff_key = "original-flag"
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Original Experiment",
+                "description": "Original description",
+                "start_date": "2021-12-01T10:23",
+                "end_date": None,
+                "feature_flag_key": original_ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control Group", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test Variant", "rollout_percentage": 50},
+                    ]
+                },
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+                "metrics_secondary": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$click"},
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        # Create a new feature flag to use for the duplicate
+        new_flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="duplicate-test-flag",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+
+        # Duplicate the experiment with a custom feature flag
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/duplicate",
+            {"feature_flag_key": new_flag.key},
+        )
+
+        assert response.status_code == 201
+        duplicate_data = response.json()
+
+        # Verify the duplicate uses the new feature flag
+        assert duplicate_data["feature_flag_key"] == "duplicate-test-flag"
+        assert duplicate_data["feature_flag"]["key"] == "duplicate-test-flag"
+
+        # Verify the duplicate has the same settings
+        assert duplicate_data["description"] == original_experiment["description"]
+        assert duplicate_data["filters"] == original_experiment["filters"]
+
+        # feature_flag_variants should come from the new flag; other parameters should match the original
+        # The API response includes split_percent alongside rollout_percentage
+        expected_variants = [
+            {**v, "split_percent": v["rollout_percentage"]} for v in new_flag.filters["multivariate"]["variants"]
+        ]
+        assert duplicate_data["parameters"]["feature_flag_variants"] == expected_variants
+        assert {**duplicate_data["parameters"], "feature_flag_variants": None} == {
+            **original_experiment["parameters"],
+            "feature_flag_variants": None,
+        }
+
+        # Compare metric content ignoring fingerprints (they differ due to different
+        # start_dates) and uuids (regenerated by clone).
+        def strip_identity(metrics):
+            return [{k: v for k, v in metric.items() if k not in ("fingerprint", "uuid")} for metric in metrics or []]
+
+        assert strip_identity(duplicate_data["metrics"]) == strip_identity(original_experiment["metrics"])
+        assert strip_identity(duplicate_data["metrics_secondary"]) == strip_identity(
+            original_experiment["metrics_secondary"]
+        )
+        original_uuids = {m["uuid"] for m in original_experiment["metrics"] or []}
+        duplicate_uuids = {m["uuid"] for m in duplicate_data["metrics"] or []}
+        if original_uuids:
+            assert original_uuids.isdisjoint(duplicate_uuids)
+
+        # Verify temporal fields are reset
+        assert duplicate_data["start_date"] is None
+        assert duplicate_data["end_date"] is None
+        assert duplicate_data["archived"] is False
+
+    def test_duplicate_experiment_with_existing_flag_uses_new_flag_variants(self) -> None:
+        """Test that duplicating with an existing feature flag uses that flag's variants, not the original's"""
+        # Create original experiment with specific variants
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Original Experiment",
+                "feature_flag_key": "original-flag",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control Group", "rollout_percentage": 50},
+                        {"key": "original-variant", "name": "Original Variant", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        # Create a new feature flag with DIFFERENT variants
+        new_flag_variants = [
+            {"key": "control", "name": "Control", "rollout_percentage": 34},
+            {"key": "new-variant-1", "name": "New Variant 1", "rollout_percentage": 33},
+            {"key": "new-variant-2", "name": "New Variant 2", "rollout_percentage": 33},
+        ]
+        new_flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="new-flag-with-different-variants",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {"variants": new_flag_variants},
+            },
+        )
+
+        # Duplicate the experiment using the new feature flag
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/duplicate",
+            {"feature_flag_key": new_flag.key},
+        )
+
+        assert response.status_code == 201
+        duplicate_data = response.json()
+
+        # The duplicate should use the NEW flag's variants, not the original's
+        assert duplicate_data["feature_flag_key"] == "new-flag-with-different-variants"
+        # The API response includes split_percent alongside rollout_percentage
+        expected_variants = [{**v, "split_percent": v["rollout_percentage"]} for v in new_flag_variants]
+        assert duplicate_data["parameters"]["feature_flag_variants"] == expected_variants
+
+    def test_duplicate_experiment_rejects_blank_feature_flag_key(self) -> None:
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Original Experiment",
+                "feature_flag_key": "original-flag",
+            },
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        duplicate_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/duplicate/",
+            {"feature_flag_key": ""},
+        )
+
+        self.assertEqual(duplicate_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            Experiment.objects.filter(team=self.team, name="Original Experiment (Copy)", deleted=False).count(),
+            0,
+        )
+
+    @parameterized.expand(
+        [
+            ("duplicate", "duplicate", False),
+            ("copy_to_project", "copy_to_project", True),
+        ]
+    )
+    @patch("django.db.transaction.on_commit", side_effect=lambda func: func())
+    @patch("products.experiments.backend.experiment_service.report_user_action")
+    def test_clone_experiment_reports_creation_mode(
+        self,
+        _name: str,
+        expected_mode: str,
+        needs_target_team: bool,
+        mock_report_user_action: MagicMock,
+        _mock_on_commit: MagicMock,
+    ) -> None:
+        target_team = (
+            Team.objects.create(organization=self.organization, name="Target Team") if needs_target_team else None
+        )
+
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "Original Experiment", "feature_flag_key": f"{expected_mode}-analytics-flag"},
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_id = original_response.json()["id"]
+        mock_report_user_action.reset_mock()
+
+        if target_team:
+            url = f"/api/projects/{self.team.id}/experiments/{original_id}/copy_to_project/"
+            body: dict = {"target_team_id": target_team.id}
+            expected_team = target_team
+        else:
+            url = f"/api/projects/{self.team.id}/experiments/{original_id}/duplicate/"
+            body = {}
+            expected_team = self.team
+
+        response = self.client.post(url, body)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        result = response.json()
+
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "experiment created",
+            {
+                "experiment_id": result["id"],
+                "experiment_name": result["name"],
+                "feature_flag_key": result["feature_flag_key"],
+                "type": result["type"],
+                "status": result["status"],
+                "metrics_count": 0,
+                "secondary_metrics_count": 0,
+                "saved_metrics_count": 0,
+                "has_description": False,
+                "has_conclusion_comment": False,
+                "variant_count": 2,
+                "created_at": ANY,
+                "creation_mode": expected_mode,
+                "is_imported": False,
+                "allow_unknown_events": True,
+                "experiment_create_deprecated_fields": [],
+            },
+            team=expected_team,
+            request=ANY,
+        )
+
+    def test_copy_experiment_to_project(self) -> None:
+        target_team = Team.objects.create(organization=self.organization, name="Target Team")
+
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Original Experiment",
+                "description": "Original description",
+                "feature_flag_key": "copy-test-flag",
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control Group", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test Variant", "rollout_percentage": 50},
+                    ]
+                },
+                "filters": {"events": [{"order": 0, "id": "$pageview"}]},
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+                "metrics_secondary": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$click"},
+                    }
+                ],
+                "stats_config": {"method": "bayesian"},
+                "exposure_criteria": {"filterTestAccounts": True},
+                "allow_unknown_events": True,
+            },
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/copy_to_project/",
+            {"target_team_id": target_team.id},
+        )
+        self.assertEqual(copy_response.status_code, status.HTTP_201_CREATED)
+        copied_experiment = copy_response.json()
+
+        self.assertEqual(copied_experiment["name"], "Original Experiment (Copy)")
+        self.assertEqual(copied_experiment["description"], original_experiment["description"])
+        self.assertNotEqual(copied_experiment["id"], original_experiment["id"])
+        self.assertIsNone(copied_experiment["start_date"])
+        self.assertIsNone(copied_experiment["end_date"])
+
+        # Compare metric content ignoring fingerprints and uuids (regenerated by clone).
+        def strip_identity(metrics):
+            return [{k: v for k, v in metric.items() if k not in ("fingerprint", "uuid")} for metric in metrics or []]
+
+        self.assertEqual(strip_identity(copied_experiment["metrics"]), strip_identity(original_experiment["metrics"]))
+        self.assertEqual(
+            strip_identity(copied_experiment["metrics_secondary"]),
+            strip_identity(original_experiment["metrics_secondary"]),
+        )
+        original_uuids = {m["uuid"] for m in original_experiment["metrics"] or []}
+        copied_uuids = {m["uuid"] for m in copied_experiment["metrics"] or []}
+        if original_uuids:
+            self.assertTrue(original_uuids.isdisjoint(copied_uuids))
+
+        self.assertEqual(copied_experiment["stats_config"], original_experiment["stats_config"])
+        self.assertEqual(copied_experiment["exposure_criteria"], original_experiment["exposure_criteria"])
+
+        # Verify experiment was created in the target team
+        target_experiment = Experiment.objects.get(id=copied_experiment["id"])
+        self.assertEqual(target_experiment.team_id, target_team.id)
+
+    def test_copy_experiment_to_project_creates_disabled_flag(self) -> None:
+        target_team = Team.objects.create(organization=self.organization, name="Target Team")
+
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Flag Test Experiment",
+                "feature_flag_key": "disabled-flag-test",
+            },
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/copy_to_project/",
+            {"target_team_id": target_team.id},
+        )
+        self.assertEqual(copy_response.status_code, status.HTTP_201_CREATED)
+
+        # The feature flag in the target team should be disabled (experiment is a draft)
+        target_flag = FeatureFlag.objects.get(key="disabled-flag-test", team_id=target_team.id)
+        self.assertFalse(target_flag.active)
+
+    def test_copy_experiment_to_project_reuses_existing_flag(self) -> None:
+        target_team = Team.objects.create(organization=self.organization, name="Target Team")
+
+        # Pre-create a flag in the target team
+        existing_flag = FeatureFlag.objects.create(
+            team=target_team,
+            key="existing-flag",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Reuse Flag Experiment",
+                "feature_flag_key": "existing-flag",
+            },
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/copy_to_project/",
+            {"target_team_id": target_team.id},
+        )
+        self.assertEqual(copy_response.status_code, status.HTTP_201_CREATED)
+        copied_experiment = copy_response.json()
+
+        # Should reuse the existing flag
+        self.assertEqual(copied_experiment["feature_flag"]["id"], existing_flag.id)
+
+    @parameterized.expand([("duplicate", False), ("copy_to_project", True)])
+    def test_clone_rejects_key_of_flag_that_cannot_back_an_experiment(self, action: str, cross_project: bool) -> None:
+        target_team = (
+            Team.objects.create(organization=self.organization, name="Target Team") if cross_project else self.team
+        )
+        FeatureFlag.objects.create(
+            team=target_team,
+            key="taken-key",
+            created_by=self.user,
+            filters={"groups": [{"properties": [], "rollout_percentage": 100}]},
+        )
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "Source", "feature_flag_key": "source-flag"},
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        body: dict = {"feature_flag_key": "taken-key"}
+        if cross_project:
+            body["target_team_id"] = target_team.id
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_response.json()['id']}/{action}/", body
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json()["detail"],
+            "A feature flag with key 'taken-key' already exists in the target project and can't back an experiment. "
+            "Choose a different feature flag key.",
+        )
+        self.assertFalse(Experiment.objects.filter(team=target_team, feature_flag__key="taken-key").exists())
+
+    def test_copy_experiment_to_project_skips_saved_metrics_and_holdout(self) -> None:
+        target_team = Team.objects.create(organization=self.organization, name="Target Team")
+
+        holdout = ExperimentHoldout.objects.create(
+            team=self.team,
+            name="Test Holdout",
+            filters=[{"properties": [], "rollout_percentage": 10, "variant": f"holdout-test"}],
+        )
+
+        saved_metric_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Saved Metric",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(saved_metric_response.status_code, status.HTTP_201_CREATED)
+        saved_metric_id = saved_metric_response.json()["id"]
+
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Full Experiment",
+                "feature_flag_key": "saved-metric-test",
+                "holdout_id": holdout.id,
+                "saved_metrics_ids": [{"id": saved_metric_id, "metadata": {"type": "primary"}}],
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+                "allow_unknown_events": True,
+            },
+            format="json",
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        # Verify original has holdout and saved metrics
+        self.assertEqual(original_experiment["holdout"]["id"], holdout.id)
+        self.assertTrue(len(original_experiment["saved_metrics"]) > 0)
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/copy_to_project/",
+            {"target_team_id": target_team.id},
+        )
+        self.assertEqual(copy_response.status_code, status.HTTP_201_CREATED)
+        copied_experiment = copy_response.json()
+
+        # Holdout and saved metrics should not be copied
+        self.assertIsNone(copied_experiment["holdout"])
+        self.assertEqual(len(copied_experiment["saved_metrics"]), 0)
+
+    def test_copy_experiment_to_project_unauthorized_target(self) -> None:
+        other_org = Organization.objects.create(name="Other Org")
+        other_team = Team.objects.create(organization=other_org, name="Other Team")
+
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Auth Test Experiment",
+                "feature_flag_key": "auth-test-flag",
+            },
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/copy_to_project/",
+            {"target_team_id": other_team.id},
+        )
+        self.assertIn(copy_response.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
+
+    def _enable_access_control(self) -> None:
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL}
+        ]
+        self.organization.save()
+
+    def _create_experiment_to_copy(self, name: str, feature_flag_key: str) -> int:
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": name, "feature_flag_key": feature_flag_key},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        return response.json()["id"]
+
+    def test_copy_experiment_to_project_requires_experiment_access_in_target(self) -> None:
+        self._enable_access_control()
+        target_team = Team.objects.create(organization=self.organization, name="Target Team")
+        AccessControl.objects.create(team=target_team, resource="experiment", access_level="none")
+        experiment_id = self._create_experiment_to_copy("Target denied", "target-denied-flag")
+
+        member = User.objects.create_and_join(self.organization, "no-target-experiments@posthog.com", None)
+        self.client.force_login(member)
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/copy_to_project/",
+            {"target_team_id": target_team.id},
+        )
+
+        self.assertEqual(copy_response.status_code, status.HTTP_403_FORBIDDEN, copy_response.content)
+        self.assertFalse(Experiment.objects.filter(team_id=target_team.id).exists())
+
+    @parameterized.expand([("eligible_flag", True), ("ineligible_flag", False)])
+    def test_copy_experiment_to_project_refuses_denied_flag_in_target(self, _name: str, eligible: bool) -> None:
+        self._enable_access_control()
+        target_team = Team.objects.create(organization=self.organization, name="Target Team")
+        # A denied flag that can't back an experiment must still 403, not 400 on its eligibility.
+        filters: dict = {"groups": [{"properties": [], "rollout_percentage": 100}]}
+        if eligible:
+            filters["multivariate"] = {
+                "variants": [
+                    {"key": "control", "name": "Control", "rollout_percentage": 50},
+                    {"key": "test", "name": "Test", "rollout_percentage": 50},
+                ]
+            }
+            filters["payloads"] = {"control": '{"secret": "control"}', "test": '{"secret": "test"}'}
+        target_flag = FeatureFlag.objects.create(
+            team=target_team, key="target-private-flag", created_by=self.user, filters=filters
+        )
+        AccessControl.objects.create(
+            team=target_team, resource="feature_flag", resource_id=str(target_flag.id), access_level="none"
+        )
+        experiment_id = self._create_experiment_to_copy("Flag denied", "source-only-flag")
+
+        # The flag's creator keeps access regardless of access controls, so copy as a plain member.
+        member = User.objects.create_and_join(self.organization, "no-target-flag@posthog.com", None)
+        self.client.force_login(member)
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/copy_to_project/",
+            {"target_team_id": target_team.id, "feature_flag_key": "target-private-flag"},
+        )
+
+        self.assertEqual(copy_response.status_code, status.HTTP_403_FORBIDDEN, copy_response.content)
+        self.assertNotIn("secret", copy_response.content.decode())
+        self.assertFalse(Experiment.objects.filter(team_id=target_team.id).exists())
+
+    def test_copy_experiment_to_project_rejects_key_not_scoped_to_target(self) -> None:
+        target_team = Team.objects.create(organization=self.organization, name="Target Team")
+        experiment_id = self._create_experiment_to_copy("Scoped key", "scoped-key-flag")
+
+        token = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            user=self.user,
+            label="source-only",
+            secure_value=hash_key_value(token),
+            scopes=["experiment:write"],
+            scoped_teams=[self.team.id],
+        )
+        self.client.logout()
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/copy_to_project/",
+            {"target_team_id": target_team.id},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+
+        self.assertEqual(copy_response.status_code, status.HTTP_403_FORBIDDEN, copy_response.content)
+        self.assertFalse(Experiment.objects.filter(team_id=target_team.id).exists())
+
+    def test_create_experiment_refuses_flag_without_editor_access(self) -> None:
+        self._enable_access_control()
+        restricted_flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="restricted-flag",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ]
+                },
+            },
+        )
+        AccessControl.objects.create(
+            team=self.team, resource="feature_flag", resource_id=str(restricted_flag.id), access_level="none"
+        )
+
+        member = User.objects.create_and_join(self.organization, "no-flag-editor@posthog.com", None)
+        self.client.force_login(member)
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "Adopts restricted flag", "feature_flag_key": "restricted-flag"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.content)
+        self.assertFalse(Experiment.objects.filter(feature_flag_id=restricted_flag.id).exists())
+
+    def test_create_experiment_refuses_new_flag_without_flag_create_access(self) -> None:
+        self._enable_access_control()
+        AccessControl.objects.create(team=self.team, resource="feature_flag", access_level="none")
+
+        member = User.objects.create_and_join(self.organization, "no-flag-create@posthog.com", None)
+        self.client.force_login(member)
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "Mints a new flag", "feature_flag_key": "minted-flag"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.content)
+        self.assertFalse(FeatureFlag.objects.filter(key="minted-flag", team_id=self.team.id).exists())
+
+    def _restrict_flag_and_login_as_member(self, flag_key: str, email: str) -> FeatureFlag:
+        flag = FeatureFlag.objects.get(key=flag_key, team=self.team)
+        AccessControl.objects.create(
+            team=self.team, resource="feature_flag", resource_id=str(flag.id), access_level="none"
+        )
+        member = User.objects.create_and_join(self.organization, email, None)
+        self.client.force_login(member)
+        return flag
+
+    @parameterized.expand(
+        [
+            ("launch", "launch/", False, False),
+            ("pause", "pause/", True, True),
+            ("resume", "resume/", True, False),
+            ("ship_variant", "ship_variant/", True, True),
+        ]
+    )
+    def test_lifecycle_action_refuses_a_flag_the_user_cannot_edit(
+        self, name: str, path_suffix: str, needs_running: bool, flag_active_before: bool
+    ) -> None:
+        self._enable_access_control()
+        flag_key = f"lifecycle-{name}-flag"
+        if needs_running:
+            experiment_id = self._create_running_experiment(name=f"Lifecycle {name}", flag_key=flag_key)["id"]
+            if name == "resume":
+                pause = self.client.post(f"/api/projects/{self.team.id}/experiments/{experiment_id}/pause/")
+                self.assertEqual(pause.status_code, status.HTTP_200_OK, pause.content)
+        else:
+            experiment_id = self._create_experiment_to_copy(f"Lifecycle {name}", flag_key)
+
+        flag = self._restrict_flag_and_login_as_member(flag_key, f"no-flag-{name}@posthog.com")
+        self.assertEqual(flag.active, flag_active_before)
+
+        body = {"variant_key": "control"} if name == "ship_variant" else None
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/{path_suffix}",
+            body,
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.content)
+        flag.refresh_from_db()
+        self.assertEqual(flag.active, flag_active_before)
+
+    def test_patching_a_draft_without_touching_the_flag_needs_no_flag_access(self) -> None:
+        self._enable_access_control()
+        experiment_id = self._create_experiment_to_copy("Rename only", "rename-only-flag")
+        self._restrict_flag_and_login_as_member("rename-only-flag", "no-flag-rename@posthog.com")
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"name": "Renamed without flag access"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertEqual(Experiment.objects.get(id=experiment_id).name, "Renamed without flag access")
+
+    def test_launching_by_patching_start_date_refuses_a_flag_the_user_cannot_edit(self) -> None:
+        self._enable_access_control()
+        experiment_id = self._create_experiment_to_copy("Patch launch", "patch-launch-flag")
+        flag = self._restrict_flag_and_login_as_member("patch-launch-flag", "no-flag-patch@posthog.com")
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"start_date": "2026-01-01T00:00:00Z"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.content)
+        flag.refresh_from_db()
+        self.assertFalse(flag.active)
+        self.assertIsNone(Experiment.objects.get(id=experiment_id).start_date)
+
+    def test_copy_experiment_to_project_uses_selected_target_team(self) -> None:
+        target_team = Team.objects.create(organization=self.organization, name="Target Team")
+        secondary_target_team = Team.objects.create(
+            organization=self.organization,
+            project=target_team.project,
+            name="Secondary Target Team",
+        )
+
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Environment selection experiment",
+                "feature_flag_key": "environment-selection-flag",
+            },
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/copy_to_project/",
+            {"target_team_id": secondary_target_team.id},
+        )
+        self.assertEqual(copy_response.status_code, status.HTTP_201_CREATED)
+
+        copied_experiment = Experiment.objects.get(id=copy_response.json()["id"])
+        self.assertEqual(copied_experiment.team_id, secondary_target_team.id)
+
+    def test_copy_experiment_to_project_missing_target(self) -> None:
+        original_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Missing Target Experiment",
+                "feature_flag_key": "missing-target-flag",
+            },
+        )
+        self.assertEqual(original_response.status_code, status.HTTP_201_CREATED)
+        original_experiment = original_response.json()
+
+        copy_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{original_experiment['id']}/copy_to_project/",
+            {},
+        )
+        self.assertEqual(copy_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_metric_fingerprinting(self):
+        """Test that metric fingerprints are computed correctly on create and update"""
+
+        # Step 1: Create experiment with 3 metrics (tests create method fingerprinting)
+        ff_key = "fingerprint-test"
+
+        initial_mean_metric = {
+            "uuid": "metric-1",
+            "name": "Initial Mean Metric",
+            "kind": "ExperimentMetric",
+            "metric_type": "mean",
+            "source": {
+                "kind": "EventsNode",
+                "event": "$session_duration",
+            },
+        }
+
+        initial_funnel_metric = {
+            "uuid": "metric-2",
+            "name": "Initial Funnel Metric",
+            "kind": "ExperimentMetric",
+            "metric_type": "funnel",
+            "series": [
+                {"kind": "EventsNode", "event": "$pageview"},
+                {"kind": "EventsNode", "event": "$autocapture"},
+            ],
+        }
+
+        initial_ratio_metric = {
+            "uuid": "metric-3",
+            "name": "Initial Ratio Metric",
+            "kind": "ExperimentMetric",
+            "metric_type": "ratio",
+            "numerator": {"kind": "EventsNode", "event": "$session_duration"},
+            "denominator": {"kind": "EventsNode", "event": "$autocapture"},
+        }
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Fingerprint Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {},
+                "filters": {},
+                "metrics": [initial_mean_metric, initial_funnel_metric, initial_ratio_metric],
+                "primary_metrics_ordered_uuids": ["metric-1", "metric-2", "metric-3"],
+            },
+        )
+        exp_id = response.json()["id"]
+        initial_metrics = response.json()["metrics"]
+
+        expected_initial_fingerprints = {
+            "mean": "d2e1f06570c3ec0af658c6255890c0ee509e0a275cbc80f630d8e8718a1b8c25",
+            "funnel": "dc70f252171bb66b8b40a28ba702ad2907c61d0962b54f332dee96afd67b240c",
+            "ratio": "ac46d8229e2ec5558200082a3f5d2e4e6e5041585d4f07dbd28930ee90fad235",
+        }
+
+        for metric in initial_metrics:
+            metric_type = metric["metric_type"]
+            self.assertEqual(metric["fingerprint"], expected_initial_fingerprints[metric_type])
+
+        # Step 2: Update with different metrics, conversion windows, start_date, stats_config, exposure_criteria
+        updated_funnel_metric = {
+            "goal": "increase",
+            "kind": "ExperimentMetric",
+            "uuid": "964398d7-ec8a-424d-890b-4e6bbc9a5c84",
+            "series": [{"kind": "EventsNode", "name": "$pageview", "event": "$pageview"}],
+            "metric_type": "funnel",
+            "conversion_window": 14,
+            "conversion_window_unit": "day",
+            "funnel_order_type": "unordered",
+        }
+
+        updated_mean_metric = {
+            "goal": "increase",
+            "kind": "ExperimentMetric",
+            "uuid": "824e38ae-f9d7-41f4-962c-74c9e744529a",
+            "source": {"kind": "EventsNode", "name": "$pageview", "event": "$pageview"},
+            "metric_type": "mean",
+            "conversion_window": 14,
+            "conversion_window_unit": "day",
+            "lower_bound_percentile": 0.05,
+            "upper_bound_percentile": 0.95,
+        }
+
+        updated_ratio_metric = {
+            "goal": "decrease",
+            "kind": "ExperimentMetric",
+            "uuid": "70e0c887-1f32-4c7d-8405-0faded2e9722",
+            "numerator": {"kind": "EventsNode", "name": "$pageview", "event": "$pageview"},
+            "denominator": {"kind": "EventsNode", "math": "total", "name": "$pageview", "event": "$pageview"},
+            "metric_type": "ratio",
+            "conversion_window": 14,
+            "conversion_window_unit": "day",
+        }
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}",
+            {
+                "allow_unknown_events": True,
+                "metrics": [updated_funnel_metric, updated_mean_metric, updated_ratio_metric],
+                "primary_metrics_ordered_uuids": [
+                    "964398d7-ec8a-424d-890b-4e6bbc9a5c84",
+                    "824e38ae-f9d7-41f4-962c-74c9e744529a",
+                    "70e0c887-1f32-4c7d-8405-0faded2e9722",
+                ],
+                "start_date": "2024-01-01T10:00:00Z",
+                "stats_config": {"method": "frequentist"},
+                "exposure_criteria": {
+                    "exposure_config": {
+                        "kind": "ExperimentEventExposureConfig",
+                        "event": "$feature_flag_called",
+                        "properties": [],
+                    },
+                },
+            },
+        )
+
+        updated_metrics = response.json()["metrics"]
+
+        expected_updated_fingerprints = {
+            "mean": "24bf7ca8d497f33ace065e9e5facd961a4a2cb68938263b4008266fb22055f98",
+            "funnel": "c1325e7c9c494859e14901f144e99532745d6c22a8cb1536ef1cd9574cfa5672",
+            "ratio": "9d74f7f895166c1ac12708a4bc2aa8c61c963bb98a9ad15fecf747b79e706631",
+        }
+
+        for metric in updated_metrics:
+            metric_type = metric["metric_type"]
+            self.assertEqual(metric["fingerprint"], expected_updated_fingerprints[metric_type])
+
+    @parameterized.expand([("stale_client_fingerprint", "&fingerprint=" + "0" * 64), ("no_client_fingerprint", "")])
+    def test_timeseries_results_reads_the_key_of_the_current_settings(self, _name: str, fingerprint_param: str) -> None:
+        start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        flag = FeatureFlag.objects.create(team=self.team, created_by=self.user, key="chart-key-flag")
+        experiment = Experiment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            feature_flag=flag,
+            name="Chart key",
+            start_date=start,
+            end_date=start + timedelta(hours=12),
+            metrics=[{"kind": "ExperimentMetric", "metric_type": "mean", "uuid": "m1"}],
+        )
+        calculation_config = get_metric_calculation_config(experiment, "m1")
+        assert calculation_config is not None
+        ExperimentMetricResult.objects.create(
+            experiment=experiment,
+            metric_uuid="m1",
+            fingerprint=calculation_config.calculation_key(),
+            query_from=start,
+            query_to=start + timedelta(days=1),
+            status=ExperimentMetricResult.Status.COMPLETED,
+            result={"variant_results": []},
+            completed_at=start + timedelta(days=1),
+        )
+
+        response = self.client.get(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}/timeseries_results/?metric_uuid=m1"
+            f"{fingerprint_param}"
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.content
+        assert response.json()["timeseries"] == {start.date().isoformat(): {"variant_results": []}}
+        assert response.json()["configuration_by_day"] == {start.date().isoformat(): "current"}
+
+    @parameterized.expand([("stale_client_definition", {"fingerprint": "0" * 64}), ("uuid_only", {})])
+    def test_recalculate_timeseries_backfills_the_experiment_definition_under_its_key(
+        self, _name: str, extra_body: dict
+    ) -> None:
+        flag = FeatureFlag.objects.create(team=self.team, created_by=self.user, key="backfill-key-flag")
+        metric = {
+            "kind": "ExperimentMetric",
+            "metric_type": "mean",
+            "uuid": "m1",
+            "source": {"kind": "EventsNode", "event": "$pageview"},
+        }
+        experiment = Experiment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            feature_flag=flag,
+            name="Backfill key",
+            start_date=timezone.now() - timedelta(days=2),
+            metrics=[metric],
+        )
+        posted_metric = (
+            {**metric, "source": {"kind": "EventsNode", "event": "stale_event"}} if extra_body else {"uuid": "m1"}
+        )
+
+        with patch("products.experiments.backend.presentation.views.sync_connect") as mock_connect:
+            mock_connect.return_value.start_workflow = AsyncMock()
+            response = self.client.post(
+                f"/api/projects/{self.team.id}/experiments/{experiment.id}/recalculate_timeseries/",
+                {"metric": posted_metric, **extra_body},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+        calculation_config = get_metric_calculation_config(experiment, "m1")
+        assert calculation_config is not None
+        request = ExperimentTimeseriesRecalculation.objects.get(id=response.json()["id"])
+        assert (request.fingerprint, request.metric["source"]["event"]) == (
+            calculation_config.calculation_key(),
+            "$pageview",
+        )
+
+    def test_creating_draft_experiment_sets_status_draft(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Status Draft Test",
+                "feature_flag_key": "status-draft-flag",
+                "parameters": None,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["status"], "draft")
+        # False counterpart to the wiring guard in test_launching_experiment_sets_status_running,
+        # proving the field tracks the property value rather than being hardcoded truthy.
+        self.assertFalse(response.json()["can_freeze_exposure"])
+
+    def test_launching_experiment_sets_status_running(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Status Running Test",
+                "feature_flag_key": "status-running-flag",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["status"], "running")
+        # Wiring guard for the serializer-computed field; the case matrix lives on the
+        # model property test (test_can_freeze_exposure_property).
+        self.assertTrue(response.json()["can_freeze_exposure"])
+
+    def test_ending_experiment_sets_status_stopped(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Status Stopped Test",
+                "feature_flag_key": "status-stopped-flag",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+        )
+        experiment_id = response.json()["id"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"end_date": "2021-12-10T00:00"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["status"], "stopped")
+
+    def test_update_draft_to_running_sets_status(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Draft to Running",
+                "feature_flag_key": "draft-to-running-flag",
+                "parameters": None,
+            },
+        )
+        experiment_id = response.json()["id"]
+        self.assertEqual(response.json()["status"], "draft")
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"start_date": "2021-12-01T10:23"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["status"], "running")
+
+    def test_duplicating_running_experiment_sets_status_draft(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Running Experiment",
+                "feature_flag_key": "running-dup-flag",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+        )
+        self.assertEqual(response.json()["status"], "running")
+        experiment_id = response.json()["id"]
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/duplicate/",
+            {"feature_flag_key": "running-dup-flag-copy"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["status"], "draft")
+
+    def test_duplicating_stopped_experiment_sets_status_draft(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Stopped Experiment",
+                "feature_flag_key": "stopped-dup-flag",
+                "start_date": "2021-12-01T10:23",
+                "parameters": None,
+            },
+        )
+        experiment_id = response.json()["id"]
+
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"end_date": "2021-12-10T00:00"},
+        )
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/duplicate/",
+            {"feature_flag_key": "stopped-dup-flag-copy"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["status"], "draft")
+
+    # ------------------------------------------------------------------
+    # Launch endpoint
+    # ------------------------------------------------------------------
+
+    def test_launch_experiment_endpoint(self):
+        # Create a draft experiment with metrics
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Launch Endpoint Test",
+                "feature_flag_key": "launch-endpoint-flag",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+        self.assertEqual(response.json()["status"], "draft")
+
+        # Verify flag is inactive
+        flag = FeatureFlag.objects.get(key="launch-endpoint-flag", team=self.team)
+        self.assertFalse(flag.active)
+
+        # Launch the experiment
+        launch_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/launch/",
+        )
+        self.assertEqual(launch_response.status_code, status.HTTP_200_OK)
+
+        data = launch_response.json()
+        self.assertEqual(data["status"], "running")
+        self.assertIsNotNone(data["start_date"])
+
+        # Verify flag is now active
+        flag.refresh_from_db()
+        self.assertTrue(flag.active)
+
+    def test_launch_experiment_endpoint_already_running(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Already Running Endpoint",
+                "feature_flag_key": "already-running-endpoint",
+                "start_date": "2024-01-01T10:00",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        launch_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/launch/",
+        )
+        self.assertEqual(launch_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_launch_experiment_endpoint_without_metrics(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "No Metrics Endpoint",
+                "feature_flag_key": "no-metrics-endpoint",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        launch_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/launch/",
+        )
+        self.assertEqual(launch_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(launch_response.json()["status"], "running")
+
+    def test_launch_experiment_endpoint_with_list_body(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "List Body Endpoint",
+                "feature_flag_key": "list-body-endpoint-flag",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        # The endpoint declares no request body, so a JSON array must not reach the flag serializer
+        # as a non-dict `request.data`.
+        launch_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/launch/",
+            [],
+            format="json",
+        )
+        self.assertEqual(launch_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(launch_response.json()["status"], "running")
+
+        flag = FeatureFlag.objects.get(key="list-body-endpoint-flag", team=self.team)
+        self.assertTrue(flag.active)
+
+    def test_archive_experiment_endpoint(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Archive Endpoint Test",
+                "feature_flag_key": "archive-endpoint-flag",
+                "start_date": "2024-01-01T10:00",
+                "end_date": "2024-01-15T10:00",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+        self.assertFalse(response.json()["archived"])
+
+        archive_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/archive/",
+        )
+        self.assertEqual(archive_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(archive_response.json()["archived"])
+
+    def test_archive_experiment_endpoint_disables_feature_flag(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Archive And Disable Flag",
+                "feature_flag_key": "archive-disable-flag",
+                "start_date": "2024-01-01T10:00",
+                "end_date": "2024-01-15T10:00",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+        feature_flag_id = response.json()["feature_flag"]["id"]
+
+        archive_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/archive/",
+            {"disable_feature_flag": True},
+            format="json",
+        )
+        self.assertEqual(archive_response.status_code, status.HTTP_200_OK)
+
+        # The response must reflect the flag we just disabled, not a stale pre-mutation echo.
+        # MinimalFeatureFlagSerializer exposes active but not archived, so archived is checked on the row.
+        self.assertFalse(archive_response.json()["feature_flag"]["active"])
+
+        feature_flag = FeatureFlag.objects.get(id=feature_flag_id)
+        self.assertFalse(feature_flag.active)
+        self.assertTrue(feature_flag.archived)
+
+    def test_archive_endpoint_disable_requires_feature_flag_write_scope(self):
+        def _make_experiment(name: str, key: str) -> tuple[int, int]:
+            resp = self.client.post(
+                f"/api/projects/{self.team.id}/experiments/",
+                {
+                    "allow_unknown_events": True,
+                    "name": name,
+                    "feature_flag_key": key,
+                    "start_date": "2024-01-01T10:00",
+                    "end_date": "2024-01-15T10:00",
+                    "metrics": [
+                        {
+                            "kind": "ExperimentMetric",
+                            "metric_type": "mean",
+                            "source": {"kind": "EventsNode", "event": "$pageview"},
+                        }
+                    ],
+                },
+                format="json",
+            )
+            self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+            return resp.json()["id"], resp.json()["feature_flag"]["id"]
+
+        def _pat(scopes: list[str]) -> str:
+            token = generate_random_token_personal()
+            PersonalAPIKey.objects.create(user=self.user, label="t", secure_value=hash_key_value(token), scopes=scopes)
+            return token
+
+        exp_deny, _ = _make_experiment("Scope Deny", "scope-deny-flag")
+        exp_no_disable, _ = _make_experiment("Scope No Disable", "scope-no-disable-flag")
+        exp_allow, flag_allow = _make_experiment("Scope Allow", "scope-allow-flag")
+
+        self.client.logout()
+
+        # experiment:write alone can't disable the linked flag — that needs feature_flag:write.
+        token = _pat(["experiment:write"])
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_deny}/archive/",
+            {"disable_feature_flag": True},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN, resp.content)
+
+        # experiment:write alone still archives when not disabling the flag.
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_no_disable}/archive/",
+            {"disable_feature_flag": False},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+        # With feature_flag:write, disabling the linked flag is allowed.
+        token = _pat(["experiment:write", "feature_flag:write"])
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_allow}/archive/",
+            {"disable_feature_flag": True},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        flag = FeatureFlag.objects.get(id=flag_allow)
+        self.assertFalse(flag.active)
+        self.assertTrue(flag.archived)
+
+    @parameterized.expand(
+        [
+            # Personal API key: scopes come off the key.
+            (
+                "pak_denied",
+                _make(PersonalAPIKeyAuthentication, personal_api_key=SimpleNamespace(scopes=["experiment:write"])),
+                False,
+            ),
+            (
+                "pak_allowed",
+                _make(
+                    PersonalAPIKeyAuthentication,
+                    personal_api_key=SimpleNamespace(scopes=["experiment:write", "feature_flag:write"]),
+                ),
+                True,
+            ),
+            ("pak_wildcard", _make(PersonalAPIKeyAuthentication, personal_api_key=SimpleNamespace(scopes=["*"])), True),
+            # OAuth: scope is a space-separated string that must be split.
+            (
+                "oauth_denied",
+                _make(OAuthAccessTokenAuthentication, access_token=SimpleNamespace(scope="experiment:write")),
+                False,
+            ),
+            (
+                "oauth_allowed",
+                _make(
+                    OAuthAccessTokenAuthentication,
+                    access_token=SimpleNamespace(scope="experiment:write feature_flag:write"),
+                ),
+                True,
+            ),
+            ("oauth_wildcard", _make(OAuthAccessTokenAuthentication, access_token=SimpleNamespace(scope="*")), True),
+            (
+                "oauth_empty_scope",
+                _make(OAuthAccessTokenAuthentication, access_token=SimpleNamespace(scope=None)),
+                False,
+            ),
+            # ID-JAG: scopes are already a list.
+            ("id_jag_denied", _make(IDJagAccessTokenAuthentication, scopes=["experiment:write"]), False),
+            (
+                "id_jag_allowed",
+                _make(IDJagAccessTokenAuthentication, scopes=["experiment:write", "feature_flag:write"]),
+                True,
+            ),
+            ("id_jag_wildcard", _make(IDJagAccessTokenAuthentication, scopes=["*"]), True),
+            # Session and other non-token auth aren't scope-limited.
+            ("session_auth", None, True),
+            ("other_auth", object(), True),
+        ]
+    )
+    def test_token_can_write_feature_flag_per_token_type(self, _name, authenticator, expected):
+        request = cast(Any, SimpleNamespace(successful_authenticator=authenticator))
+        viewset = EnterpriseExperimentsViewSet()
+        self.assertEqual(viewset._token_can_write_feature_flag(request), expected)
+
+    def test_archive_experiment_endpoint_not_ended(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Archive Running Endpoint",
+                "feature_flag_key": "archive-running-endpoint",
+                "start_date": "2024-01-01T10:00",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        archive_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/archive/",
+        )
+        self.assertEqual(archive_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unarchive_experiment_endpoint(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Unarchive Endpoint Test",
+                "feature_flag_key": "unarchive-endpoint-flag",
+                "start_date": "2024-01-01T10:00",
+                "end_date": "2024-01-15T10:00",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        # Archive first
+        archive_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/archive/",
+        )
+        self.assertEqual(archive_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(archive_response.json()["archived"])
+
+        # Unarchive
+        unarchive_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/unarchive/",
+        )
+        self.assertEqual(unarchive_response.status_code, status.HTTP_200_OK)
+        self.assertFalse(unarchive_response.json()["archived"])
+
+    def test_unarchive_experiment_endpoint_not_archived(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Unarchive Not Archived",
+                "feature_flag_key": "unarchive-not-archived-flag",
+                "start_date": "2024-01-01T10:00",
+                "end_date": "2024-01-15T10:00",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        unarchive_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/unarchive/",
+        )
+        self.assertEqual(unarchive_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def _create_running_experiment(self, name: str = "Running Test", flag_key: str = "running-flag") -> dict:
+        """Helper: create an experiment and launch it via the API."""
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": name,
+                "feature_flag_key": flag_key,
+                "allow_unknown_events": True,
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        launch_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/launch/",
+        )
+        self.assertEqual(launch_response.status_code, status.HTTP_200_OK)
+        return launch_response.json()
+
+    def test_pause_experiment_endpoint(self):
+        data = self._create_running_experiment(name="Pause Endpoint", flag_key="pause-endpoint-flag")
+        experiment_id = data["id"]
+
+        # Flag should be active after launch
+        flag = FeatureFlag.objects.get(key="pause-endpoint-flag", team=self.team)
+        self.assertTrue(flag.active)
+
+        pause_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/pause/",
+        )
+        self.assertEqual(pause_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(pause_response.json()["status"], "paused")
+        self.assertFalse(pause_response.json()["feature_flag"]["active"])
+
+        # Verify flag is now inactive
+        flag.refresh_from_db()
+        self.assertFalse(flag.active)
+
+    def test_resume_experiment_endpoint(self):
+        data = self._create_running_experiment(name="Resume Endpoint", flag_key="resume-endpoint-flag")
+        experiment_id = data["id"]
+
+        # Pause first
+        pause_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/pause/",
+        )
+        self.assertEqual(pause_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(pause_response.json()["status"], "paused")
+
+        # Resume
+        resume_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/resume/",
+        )
+        self.assertEqual(resume_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(resume_response.json()["status"], "running")
+        self.assertTrue(resume_response.json()["feature_flag"]["active"])
+
+        flag = FeatureFlag.objects.get(key="resume-endpoint-flag", team=self.team)
+        self.assertTrue(flag.active)
+
+    def test_pause_experiment_already_paused_returns_400(self):
+        data = self._create_running_experiment(name="Double Pause", flag_key="double-pause-flag")
+        experiment_id = data["id"]
+
+        self.client.post(f"/api/projects/{self.team.id}/experiments/{experiment_id}/pause/")
+
+        second_pause = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/pause/",
+        )
+        self.assertEqual(second_pause.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_resume_experiment_not_paused_returns_400(self):
+        data = self._create_running_experiment(name="Resume Not Paused", flag_key="resume-not-paused-flag")
+        experiment_id = data["id"]
+
+        resume_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/resume/",
+        )
+        self.assertEqual(resume_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_pause_draft_experiment_returns_400(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Pause Draft",
+                "feature_flag_key": "pause-draft-flag",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        pause_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/pause/",
+        )
+        self.assertEqual(pause_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_pause_ended_experiment_returns_400(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Pause Ended",
+                "feature_flag_key": "pause-ended-flag",
+                "start_date": "2024-01-01T10:00",
+                "end_date": "2024-01-15T10:00",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        pause_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/pause/",
+        )
+        self.assertEqual(pause_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch(
+        "products.cohorts.backend.models.cohort.Cohort.insert_users_list_by_id_uuid_pairs_skip_validation",
+        return_value=0,
+    )
+    @patch(
+        "products.experiments.backend.experiment_service.get_person_ids_and_uuids_by_uuids",
+        new=lambda team_id, uuids, **kwargs: [(index + 1, person_uuid) for index, person_uuid in enumerate(uuids)],
+    )
+    @patch(
+        "products.experiments.backend.experiment_service.ExperimentService._fetch_exposed_person_uuids",
+        return_value=["00000000-0000-0000-0000-000000000001"],
+    )
+    def test_freeze_exposure_endpoint(self, mock_fetch: MagicMock, mock_insert: MagicMock) -> None:
+        data = self._create_running_experiment(name="Freeze Endpoint", flag_key="freeze-endpoint-flag")
+        experiment_id = data["id"]
+
+        freeze_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/freeze_exposure/",
+        )
+        self.assertEqual(freeze_response.status_code, status.HTTP_200_OK)
+        body = freeze_response.json()
+        # Frozen exposure is still running under the hood — precedence puts exposure_frozen first.
+        self.assertEqual(body["status"], "exposure_frozen")
+        # Unlike pause, the flag stays active; unlike end, end_date stays null so metrics keep flowing.
+        self.assertIsNone(body["end_date"])
+        self.assertTrue(body["feature_flag"]["active"])
+
+        # A frozen-but-still-running experiment also serializes as exposure_frozen on GET.
+        get_response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}/")
+        self.assertEqual(get_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(get_response.json()["status"], "exposure_frozen")
+
+    @patch(
+        "products.cohorts.backend.models.cohort.Cohort.insert_users_list_by_id_uuid_pairs_skip_validation",
+        return_value=0,
+    )
+    @patch(
+        "products.experiments.backend.experiment_service.get_person_ids_and_uuids_by_uuids",
+        new=lambda team_id, uuids, **kwargs: [(index + 1, person_uuid) for index, person_uuid in enumerate(uuids)],
+    )
+    @patch(
+        "products.experiments.backend.experiment_service.ExperimentService._fetch_exposed_person_uuids",
+        return_value=["00000000-0000-0000-0000-000000000001"],
+    )
+    def test_freeze_exposure_already_frozen_returns_400(self, mock_fetch: MagicMock, mock_insert: MagicMock) -> None:
+        data = self._create_running_experiment(name="Double Freeze", flag_key="double-freeze-flag")
+        experiment_id = data["id"]
+
+        self.client.post(f"/api/projects/{self.team.id}/experiments/{experiment_id}/freeze_exposure/")
+
+        second_freeze = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/freeze_exposure/",
+        )
+        self.assertEqual(second_freeze.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch(
+        "products.cohorts.backend.models.cohort.Cohort.insert_users_list_by_id_uuid_pairs_skip_validation",
+        return_value=0,
+    )
+    @patch(
+        "products.experiments.backend.experiment_service.get_person_ids_and_uuids_by_uuids",
+        new=lambda team_id, uuids, **kwargs: [(index + 1, person_uuid) for index, person_uuid in enumerate(uuids)],
+    )
+    @patch(
+        "products.experiments.backend.experiment_service.ExperimentService._fetch_exposed_person_uuids",
+        return_value=["00000000-0000-0000-0000-000000000001"],
+    )
+    def test_unfreeze_exposure_endpoint(self, mock_fetch: MagicMock, mock_insert: MagicMock) -> None:
+        data = self._create_running_experiment(name="Unfreeze Endpoint", flag_key="unfreeze-endpoint-flag")
+        experiment_id = data["id"]
+        freeze_response = self.client.post(f"/api/projects/{self.team.id}/experiments/{experiment_id}/freeze_exposure/")
+        self.assertEqual(freeze_response.status_code, status.HTTP_200_OK)
+
+        unfreeze_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/unfreeze_exposure/",
+        )
+        self.assertEqual(unfreeze_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(unfreeze_response.json()["status"], "running")
+
+        # Not frozen anymore — a second unfreeze is rejected.
+        second_unfreeze = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/unfreeze_exposure/",
+        )
+        self.assertEqual(second_unfreeze.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_freeze_exposure_draft_returns_400(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "Freeze Draft", "feature_flag_key": "freeze-draft-flag"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        freeze_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/freeze_exposure/",
+        )
+        self.assertEqual(freeze_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_end_experiment_endpoint(self):
+        data = self._create_running_experiment(name="End Endpoint", flag_key="end-endpoint-flag")
+        experiment_id = data["id"]
+
+        end_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/end/",
+            {"conclusion": "won", "conclusion_comment": "Test variant won"},
+            format="json",
+        )
+        self.assertEqual(end_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(end_response.json()["status"], "stopped")
+        self.assertIsNotNone(end_response.json()["end_date"])
+        self.assertEqual(end_response.json()["conclusion"], "won")
+        self.assertEqual(end_response.json()["conclusion_comment"], "Test variant won")
+        # Flag should remain active
+        self.assertTrue(end_response.json()["feature_flag"]["active"])
+
+    def test_end_experiment_invalid_conclusion_returns_400(self):
+        data = self._create_running_experiment(name="End Invalid Conclusion", flag_key="end-invalid-conclusion-flag")
+        experiment_id = data["id"]
+
+        end_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/end/",
+            {"conclusion": "amazing"},
+            format="json",
+        )
+        self.assertEqual(end_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_end_experiment_draft_returns_400(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "End Draft",
+                "feature_flag_key": "end-draft-endpoint-flag",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        end_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/end/",
+            format="json",
+        )
+        self.assertEqual(end_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_end_endpoint_cleanup_pr_requires_task_write_scope(self):
+        exp_deny = self._create_running_experiment(name="Cleanup Deny", flag_key="cleanup-deny-flag")["id"]
+        exp_no_opt = self._create_running_experiment(name="Cleanup No Opt", flag_key="cleanup-no-opt-flag")["id"]
+        exp_allow = self._create_running_experiment(name="Cleanup Allow", flag_key="cleanup-allow-flag")["id"]
+
+        def _pat(scopes: list[str]) -> str:
+            token = generate_random_token_personal()
+            PersonalAPIKey.objects.create(user=self.user, label="t", secure_value=hash_key_value(token), scopes=scopes)
+            return token
+
+        self.client.logout()
+
+        # experiment:write alone can't open a cleanup PR; opening one starts a task, which needs task:write.
+        token = _pat(["experiment:write"])
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_deny}/end/",
+            {"conclusion": "won", "open_cleanup_pr": True},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN, resp.content)
+
+        # experiment:write alone still ends the experiment when not opening a PR.
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_no_opt}/end/",
+            {"conclusion": "won", "open_cleanup_pr": False},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+        # With task:write, opting in is allowed.
+        token = _pat(["experiment:write", "task:write"])
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_allow}/end/",
+            {"conclusion": "won", "open_cleanup_pr": True},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+    def test_cleanup_pr_allowed_for_session_users(self):
+        exp_ship = self._create_running_experiment(name="Cleanup Session Ship", flag_key="cleanup-session-ship-flag")[
+            "id"
+        ]
+
+        # Session auth carries no scopes, and opening a cleanup PR is not gated on the Desktop
+        # waitlist, so both actions succeed ("end first, ship later" flow).
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_ship}/end/",
+            {"conclusion": "won", "open_cleanup_pr": True},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_ship}/ship_variant/",
+            {"variant_key": "test", "conclusion": "won", "open_cleanup_pr": True},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+    def test_flag_cleanup_task_endpoint(self):
+        exp_id = self._create_running_experiment(name="Cleanup Status", flag_key="cleanup-status-flag")["id"]
+
+        # No cleanup task opened yet.
+        resp = self.client.get(f"/api/projects/{self.team.id}/experiments/{exp_id}/flag_cleanup_task/")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+        task_id = uuid4()
+        Experiment.objects.filter(id=exp_id).update(flag_cleanup_task_id=task_id)
+
+        run = SimpleNamespace(
+            status="completed",
+            is_terminal=True,
+            pr_url="https://github.com/PostHog/posthog/pull/123",
+            team_id=self.team.id,
+        )
+        with (
+            patch(
+                "products.experiments.backend.presentation.views.tasks_facade.get_latest_run_by_task",
+                return_value={str(task_id): run},
+            ),
+            patch(
+                "products.experiments.backend.presentation.views.tasks_facade.task_visible",
+                return_value=True,
+            ) as mock_task_visible,
+        ):
+            resp = self.client.get(f"/api/projects/{self.team.id}/experiments/{exp_id}/flag_cleanup_task/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(
+            resp.json(),
+            {
+                "task_id": str(task_id),
+                "run_status": "completed",
+                "is_terminal": True,
+                "pr_url": "https://github.com/PostHog/posthog/pull/123",
+                "can_view_task": True,
+            },
+        )
+        mock_task_visible.assert_called_once_with(task_id, self.team.pk, self.user.id)
+
+        # No Task row exists for this id, so the real visibility check reports False.
+        with patch(
+            "products.experiments.backend.presentation.views.tasks_facade.get_latest_run_by_task",
+            return_value={str(task_id): run},
+        ):
+            resp = self.client.get(f"/api/projects/{self.team.id}/experiments/{exp_id}/flag_cleanup_task/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertFalse(resp.json()["can_view_task"])
+
+        # A PR URL that doesn't point at GitHub is dropped rather than rendered as a link.
+        run = SimpleNamespace(
+            status="completed", is_terminal=True, pr_url="http://evil.example.com/pr/1", team_id=self.team.id
+        )
+        with patch(
+            "products.experiments.backend.presentation.views.tasks_facade.get_latest_run_by_task",
+            return_value={str(task_id): run},
+        ):
+            resp = self.client.get(f"/api/projects/{self.team.id}/experiments/{exp_id}/flag_cleanup_task/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertIsNone(resp.json()["pr_url"])
+
+        # A run in another team (experiment transferred across projects) is treated as absent.
+        run = SimpleNamespace(
+            status="completed",
+            is_terminal=True,
+            pr_url="https://github.com/PostHog/posthog/pull/123",
+            team_id=self.team.id + 1,
+        )
+        with patch(
+            "products.experiments.backend.presentation.views.tasks_facade.get_latest_run_by_task",
+            return_value={str(task_id): run},
+        ):
+            resp = self.client.get(f"/api/projects/{self.team.id}/experiments/{exp_id}/flag_cleanup_task/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(resp.json()["run_status"], "queued")
+        self.assertFalse(resp.json()["is_terminal"])
+        self.assertIsNone(resp.json()["pr_url"])
+
+        # Task recorded but no run row yet: reported as queued, non-terminal.
+        with patch(
+            "products.experiments.backend.presentation.views.tasks_facade.get_latest_run_by_task",
+            return_value={},
+        ):
+            resp = self.client.get(f"/api/projects/{self.team.id}/experiments/{exp_id}/flag_cleanup_task/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(resp.json()["run_status"], "queued")
+        self.assertFalse(resp.json()["is_terminal"])
+
+    @parameterized.expand(
+        [
+            # (name, stored_repository, team_default, cached_repos, expected_body)
+            (
+                "no_integration",
+                None,
+                None,
+                None,
+                {"repository": None, "source": "no_integration", "candidates": []},
+            ),
+            (
+                "single_repo",
+                None,
+                None,
+                {"acme/web": "acme/web"},
+                {"repository": "acme/web", "source": "single_repo", "candidates": ["acme/web"]},
+            ),
+            (
+                "ambiguous",
+                None,
+                None,
+                {"acme/web": "acme/web", "acme/api": "acme/api"},
+                {"repository": None, "source": "ambiguous", "candidates": ["acme/api", "acme/web"]},
+            ),
+            (
+                "explicit",
+                "acme/api",
+                None,
+                {"acme/web": "acme/web", "acme/api": "acme/api"},
+                {"repository": "acme/api", "source": "explicit", "candidates": ["acme/api", "acme/web"]},
+            ),
+            (
+                "stale_explicit_needs_a_new_choice",
+                "gone/repo",
+                None,
+                {"acme/web": "acme/web"},
+                {"repository": None, "source": "ambiguous", "candidates": ["acme/web"]},
+            ),
+            (
+                "stale_explicit_with_empty_cache",
+                "gone/repo",
+                None,
+                {},
+                {"repository": None, "source": "no_integration", "candidates": []},
+            ),
+            (
+                "team_default",
+                None,
+                "acme/api",
+                {"acme/web": "acme/web", "acme/api": "Acme/API"},
+                {"repository": "Acme/API", "source": "team_default", "candidates": ["Acme/API", "acme/web"]},
+            ),
+            (
+                "stale_team_default_falls_through",
+                None,
+                "gone/repo",
+                {"acme/web": "acme/web", "acme/api": "acme/api"},
+                {"repository": None, "source": "ambiguous", "candidates": ["acme/api", "acme/web"]},
+            ),
+        ]
+    )
+    @patch("products.tasks.backend.facade.repo_selection.team_repository_names")
+    def test_flag_cleanup_target_endpoint(
+        self, _name, stored_repository, team_default, cached_repos, expected_body, mock_repository_names
+    ):
+        exp_id = self._create_running_experiment(name="Cleanup Target", flag_key="cleanup-target-flag")["id"]
+        if stored_repository:
+            Experiment.objects.filter(id=exp_id).update(repository=stored_repository)
+        if team_default:
+            config = get_or_create_team_extension(self.team, TeamExperimentsConfig)
+            config.flag_cleanup_repository = team_default
+            config.save()
+        mock_repository_names.return_value = cached_repos
+
+        resp = self.client.get(f"/api/projects/{self.team.id}/experiments/{exp_id}/flag_cleanup_target/")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(resp.json(), expected_body)
+
+    @parameterized.expand(
+        [
+            # (name, open_cleanup_pr, repository, expected_status)
+            # Nothing persists in any of these: the value only sticks when a cleanup PR
+            # actually opens against it, which needs the repo in the GitHub installation.
+            ("not_persisted_when_cleanup_does_not_run", True, "acme/web", status.HTTP_200_OK),
+            ("ignored_without_opt_in", False, "acme/web", status.HTTP_200_OK),
+            ("invalid_format_rejected", True, "not-a-repo", status.HTTP_400_BAD_REQUEST),
+        ]
+    )
+    def test_end_endpoint_repository(self, _name, open_cleanup_pr, repository, expected_status):
+        exp_id = self._create_running_experiment(name="End With Repo", flag_key="end-with-repo-flag")["id"]
+
+        resp = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{exp_id}/end/",
+            {"conclusion": "won", "open_cleanup_pr": open_cleanup_pr, "repository": repository},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, expected_status, resp.content)
+        self.assertIsNone(Experiment.objects.get(id=exp_id).repository)
+
+    @patch("products.experiments.backend.experiment_service.report_user_action")
+    @patch("products.experiments.backend.experiment_service.tasks_facade.create_and_run_task")
+    @patch("products.tasks.backend.facade.repo_selection.team_repository_names")
+    def test_end_endpoint_repository_persists_normalized_when_cleanup_opens(
+        self, mock_repository_names, mock_create_task, _mock_report
+    ):
+        mock_repository_names.return_value = {"acme/web": "Acme/Web", "acme/api": "acme/api"}
+        mock_create_task.return_value = SimpleNamespace(task_id=uuid4())
+        exp_id = self._create_running_experiment(name="End With Repo Live", flag_key="end-with-repo-live-flag")["id"]
+
+        with self.captureOnCommitCallbacks(execute=True):
+            resp = self.client.post(
+                f"/api/projects/{self.team.id}/experiments/{exp_id}/end/",
+                {"conclusion": "won", "open_cleanup_pr": True, "repository": "ACME/Web"},
+                format="json",
+            )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(mock_create_task.call_args.kwargs["repository"], "Acme/Web")
+        self.assertEqual(Experiment.objects.get(id=exp_id).repository, "acme/web")
+
+    @patch("products.experiments.backend.experiment_service.report_user_action")
+    @patch("products.experiments.backend.experiment_service.tasks_facade.create_and_run_task")
+    @patch("products.tasks.backend.facade.repo_selection.team_repository_names")
+    def test_set_repository_as_team_default_requires_project_admin(
+        self, mock_repository_names, mock_create_task, _mock_report
+    ):
+        mock_repository_names.return_value = {"acme/web": "acme/web", "acme/api": "acme/api"}
+        mock_create_task.return_value = SimpleNamespace(task_id=uuid4())
+        exp_member = self._create_running_experiment(name="Default Deny", flag_key="team-default-deny-flag")["id"]
+        exp_admin = self._create_running_experiment(name="Default Allow", flag_key="team-default-allow-flag")["id"]
+        body = {
+            "conclusion": "won",
+            "open_cleanup_pr": True,
+            "repository": "acme/web",
+            "set_repository_as_team_default": True,
+        }
+
+        # A team-wide default is environment configuration, admin-gated like experiments_config.
+        # Without an access-control row every member is effectively admin, so pin the project's
+        # default access to member to exercise the deny path.
+        AccessControl.objects.create(
+            team=self.team, resource="project", resource_id=self.team.id, access_level="member"
+        )
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        resp = self.client.post(f"/api/projects/{self.team.id}/experiments/{exp_member}/end/", body, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN, resp.content)
+        self.assertIsNone(get_or_create_team_extension(self.team, TeamExperimentsConfig).flag_cleanup_repository)
+
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        with self.captureOnCommitCallbacks(execute=True):
+            resp = self.client.post(f"/api/projects/{self.team.id}/experiments/{exp_admin}/end/", body, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(
+            get_or_create_team_extension(self.team, TeamExperimentsConfig).flag_cleanup_repository, "acme/web"
+        )
+
+    def test_ship_variant_endpoint_default_preserves_groups(self):
+        data = self._create_running_experiment(name="Ship Endpoint", flag_key="ship-endpoint-flag")
+        experiment_id = data["id"]
+        original_groups = data["feature_flag"]["filters"].get("groups", [])
+
+        ship_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/ship_variant/",
+            {"variant_key": "test", "conclusion": "won", "conclusion_comment": "Test won"},
+            format="json",
+        )
+        self.assertEqual(ship_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(ship_response.json()["status"], "stopped")
+        self.assertIsNotNone(ship_response.json()["end_date"])
+        self.assertEqual(ship_response.json()["conclusion"], "won")
+        self.assertEqual(ship_response.json()["conclusion_comment"], "Test won")
+
+        # Variant distribution was flipped
+        flag_filters = ship_response.json()["feature_flag"]["filters"]
+        variants = flag_filters["multivariate"]["variants"]
+        test_variant = next(v for v in variants if v["key"] == "test")
+        control_variant = next(v for v in variants if v["key"] == "control")
+        self.assertEqual(test_variant["rollout_percentage"], 100)
+        self.assertEqual(control_variant["rollout_percentage"], 0)
+
+        # Default behavior: existing groups preserved, no catch-all prepended
+        self.assertEqual(flag_filters["groups"], original_groups)
+
+        activity_log = ActivityLog.objects.filter(
+            scope="Experiment", item_id=str(experiment_id), activity="variant_shipped"
+        ).latest("created_at")
+        assert activity_log.detail is not None
+        shipped_change = next(c for c in activity_log.detail["changes"] if c["field"] == "shipped_variant")
+        self.assertEqual(shipped_change["after"], "test")
+
+    def test_ship_variant_endpoint_release_to_everyone_prepends_catch_all(self):
+        data = self._create_running_experiment(name="Ship Everyone", flag_key="ship-everyone-flag")
+        experiment_id = data["id"]
+
+        ship_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/ship_variant/",
+            {"variant_key": "test", "release_to_everyone": True, "conclusion": "won"},
+            format="json",
+        )
+        self.assertEqual(ship_response.status_code, status.HTTP_200_OK)
+
+        flag_filters = ship_response.json()["feature_flag"]["filters"]
+        variants = flag_filters["multivariate"]["variants"]
+        test_variant = next(v for v in variants if v["key"] == "test")
+        self.assertEqual(test_variant["rollout_percentage"], 100)
+
+        # release_to_everyone: catch-all prepended
+        self.assertEqual(flag_filters["groups"][0]["rollout_percentage"], 100)
+        self.assertEqual(flag_filters["groups"][0]["properties"], [])
+        self.assertIn("Added automatically", flag_filters["groups"][0].get("description", ""))
+
+    def test_ship_variant_on_stopped_experiment(self):
+        data = self._create_running_experiment(name="Ship Stopped Endpoint", flag_key="ship-stopped-endpoint-flag")
+        experiment_id = data["id"]
+
+        # End the experiment first
+        self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/end/",
+            {"conclusion": "inconclusive"},
+            format="json",
+        )
+
+        # Ship a variant on the already-ended experiment
+        ship_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/ship_variant/",
+            {"variant_key": "test", "conclusion": "won"},
+            format="json",
+        )
+        self.assertEqual(ship_response.status_code, status.HTTP_200_OK)
+        # Conclusion updated
+        self.assertEqual(ship_response.json()["conclusion"], "won")
+
+        # Flag filters rewritten
+        variants = ship_response.json()["feature_flag"]["filters"]["multivariate"]["variants"]
+        test_variant = next(v for v in variants if v["key"] == "test")
+        self.assertEqual(test_variant["rollout_percentage"], 100)
+
+    def test_ship_variant_invalid_variant_key_returns_400(self):
+        data = self._create_running_experiment(
+            name="Ship Invalid Variant", flag_key="ship-invalid-variant-endpoint-flag"
+        )
+        experiment_id = data["id"]
+
+        ship_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/ship_variant/",
+            {"variant_key": "nonexistent"},
+            format="json",
+        )
+        self.assertEqual(ship_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_ship_variant_missing_variant_key_returns_400(self):
+        data = self._create_running_experiment(name="Ship Missing Key", flag_key="ship-missing-key-endpoint-flag")
+        experiment_id = data["id"]
+
+        ship_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/ship_variant/",
+            {},
+            format="json",
+        )
+        self.assertEqual(ship_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_ship_variant_draft_returns_400(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Ship Draft",
+                "feature_flag_key": "ship-draft-endpoint-flag",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        experiment_id = response.json()["id"]
+
+        ship_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/ship_variant/",
+            {"variant_key": "test"},
+            format="json",
+        )
+        self.assertEqual(ship_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_ship_variant_invalid_conclusion_returns_400(self):
+        data = self._create_running_experiment(
+            name="Ship Invalid Conclusion", flag_key="ship-invalid-conclusion-endpoint-flag"
+        )
+        experiment_id = data["id"]
+
+        ship_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/ship_variant/",
+            {"variant_key": "test", "conclusion": "amazing"},
+            format="json",
+        )
+        self.assertEqual(ship_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # ------------------------------------------------------------------
+    # Action ID validation & event name warnings in API responses
+    # ------------------------------------------------------------------
+
+    def test_create_with_nonexistent_action_returns_400(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Bad Action Experiment",
+                "feature_flag_key": "bad-action-api-flag",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "ActionsNode", "id": 999999},
+                    },
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("999999", response.json()["detail"])
+
+    def test_create_with_unknown_event_returns_400(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Unknown Event Experiment",
+                "feature_flag_key": "unknown-event-api-flag",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pagevew"},
+                    },
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("$pagevew", response.json()["detail"])
+
+    def test_create_with_known_event_succeeds(self):
+        EventDefinition.objects.create(team=self.team, name="$pageview")
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Known Event Experiment",
+                "feature_flag_key": "known-event-api-flag",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    },
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_update_with_unknown_event_returns_400(self):
+        EventDefinition.objects.create(team=self.team, name="$pageview")
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Update Event Error Experiment",
+                "feature_flag_key": "update-event-error-api-flag",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    },
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = create_response.json()["id"]
+
+        update_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "totally_fake_event"},
+                    },
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class TestExperimentParametersFlagConfigCompatibility(APILicensedTest):
+    """Flag config belongs on the `feature_flag` object now, but many external clients still send it
+    through the deprecated `parameters` keys. Rather than reject those requests, the API copies that
+    config into the `feature_flag` object so legacy callers keep working. This class sends the
+    deprecated keys directly (it deliberately does NOT use _HoistFlagConfigClientMixin) to lock in
+    the copy behavior, the read-modify-write echo tolerance, and the running-experiment guard."""
+
+    @parameterized.expand(
+        [
+            (
+                "variants",
+                {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ]
+                },
+                lambda p: [v["key"] for v in p["feature_flag_variants"]] == ["control", "test"],
+            ),
+            ("rollout", {"rollout_percentage": 50}, lambda p: p["rollout_percentage"] == 50),
+            ("aggregation", {"aggregation_group_type_index": 0}, lambda p: p["aggregation_group_type_index"] == 0),
+            (
+                "payloads",
+                {"feature_flag_payloads": {"control": '"x"'}},
+                lambda p: p["feature_flag_payloads"] == {"control": '"x"'},
+            ),
+            ("continuity", {"ensure_experience_continuity": True}, lambda p: p["ensure_experience_continuity"] is True),
+        ]
+    )
+    def test_create_copies_deprecated_flag_config_to_flag(self, name: str, parameters: dict, check) -> None:
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": f"copy {name}", "feature_flag_key": f"copy-{name}", "parameters": parameters},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        self.assertTrue(FeatureFlag.objects.filter(key=f"copy-{name}", team_id=self.team.id).exists())
+        # The read response projects the linked flag's config back into `parameters`, so it reflects
+        # the config the deprecated keys were copied onto the flag.
+        self.assertTrue(check(response.json()["parameters"]), response.json()["parameters"])
+
+    def _create_via_flag_object(
+        self, key: str = "echo-source", start_date: str | None = None, variants: list[dict] | None = None
+    ) -> int:
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": key,
+                "feature_flag_key": key,
+                "start_date": start_date,
+                "feature_flag": {
+                    "filters": {
+                        "multivariate": {
+                            "variants": variants
+                            or [
+                                {"key": "control", "name": "Control", "rollout_percentage": 50},
+                                {"key": "test", "name": "Test", "rollout_percentage": 50},
+                            ]
+                        }
+                    }
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        return response.json()["id"]
+
+    def test_update_tolerates_unchanged_parameters_echo(self) -> None:
+        experiment_id = self._create_via_flag_object()
+        # A read-modify-write client spreads the GET response's `parameters` (which carries the
+        # projected flag config, split_percent and all) straight back into the save. That unchanged
+        # echo must be stripped and tolerated, not resynced — else every UI save breaks.
+        echoed_parameters = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()[
+            "parameters"
+        ]
+        self.assertIn("feature_flag_variants", echoed_parameters)
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"description": "unrelated edit", "parameters": echoed_parameters},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        # The echoed flag config never lands in the stored column.
+        experiment = Experiment.objects.get(id=experiment_id)
+        self.assertNotIn("feature_flag_variants", experiment.parameters or {})
+
+    @parameterized.expand(
+        [
+            (
+                "variants",
+                {
+                    "feature_flag_variants": [
+                        {"key": "control", "rollout_percentage": 30},
+                        {"key": "test", "rollout_percentage": 70},
+                    ]
+                },
+                lambda flag: [v["rollout_percentage"] for v in flag.variants] == [30, 70],
+            ),
+            ("rollout", {"rollout_percentage": 25}, lambda flag: flag.filters["groups"][0]["rollout_percentage"] == 25),
+        ]
+    )
+    def test_draft_update_copies_differing_parameters_flag_config_to_flag(
+        self, name: str, override: dict, check
+    ) -> None:
+        experiment_id = self._create_via_flag_object()
+        echoed_parameters = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()[
+            "parameters"
+        ]
+        # A genuine change through the deprecated surface on a draft is copied into the feature_flag
+        # object and applied to the linked flag, not silently dropped.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"parameters": {**echoed_parameters, **override}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag = FeatureFlag.objects.get(key="echo-source", team_id=self.team.id)
+        self.assertTrue(check(flag), flag.filters)
+
+    def test_running_update_requires_opt_in_for_differing_parameters_flag_config(self) -> None:
+        experiment_id = self._create_via_flag_object(key="running-echo-source", start_date="2021-12-01T10:23")
+        echoed_parameters = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()[
+            "parameters"
+        ]
+        differing = {
+            **echoed_parameters,
+            "feature_flag_variants": [
+                {"key": "control", "rollout_percentage": 60},
+                {"key": "test", "rollout_percentage": 40},
+            ],
+        }
+        # Routing through the feature_flag path means the deprecated surface can't bypass the
+        # running-experiment guard: a differing change without the opt-in is rejected, not applied.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"parameters": differing},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.json())
+        self.assertIn("update_feature_flag_params", str(response.json()))
+        flag = FeatureFlag.objects.get(key="running-echo-source", team_id=self.team.id)
+        self.assertEqual([v["rollout_percentage"] for v in flag.variants], [50, 50])
+
+        # With the opt-in the change applies.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"parameters": differing, "update_feature_flag_params": True},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag.refresh_from_db()
+        self.assertEqual([v["rollout_percentage"] for v in flag.variants], [60, 40])
+
+    @parameterized.expand(
+        [
+            # Read-modify-write: echo the full flag-config projection GET returns, plus a non-flag key.
+            ("echo_plus_non_flag_key", lambda echoed: {**echoed, "variant_notes": {"control": "n"}}),
+            # Bare non-flag PATCH carrying no flag-config keys at all.
+            ("non_flag_key_only", lambda _echoed: {"variant_notes": {"control": "n"}}),
+        ]
+    )
+    def test_draft_non_flag_parameters_patch_preserves_flag_variants(self, name: str, build_parameters) -> None:
+        key = f"preserve-{name}"
+        experiment_id = self._create_via_flag_object(
+            key=key,
+            variants=[
+                {"key": "control", "name": "Control", "rollout_percentage": 30},
+                {"key": "test", "name": "Test", "rollout_percentage": 70},
+            ],
+        )
+        echoed_parameters = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()[
+            "parameters"
+        ]
+        # A PATCH that carries no genuine flag-config change must never resync the linked flag: its
+        # non-default variants must survive, not reset to DEFAULT_VARIANTS (50/50).
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"parameters": build_parameters(echoed_parameters)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        flag = FeatureFlag.objects.get(key=key, team_id=self.team.id)
+        self.assertEqual([v["rollout_percentage"] for v in flag.variants], [30, 70], flag.filters)
+
+    def _updated_event_props(self, mock_report_user_action: MagicMock) -> dict:
+        events = [c for c in mock_report_user_action.call_args_list if c.args[1] == "experiment updated"]
+        assert len(events) == 1, f"expected one 'experiment updated' event, got {len(events)}"
+        return events[0].args[2]
+
+    @patch("products.experiments.backend.experiment_service.report_user_action")
+    def test_update_event_records_deprecated_config_change_on_draft(self, mock_report_user_action: MagicMock) -> None:
+        experiment_id = self._create_via_flag_object(key="upd-changed")
+        # Normalize `parameters` to {} first, so the second PATCH's stripped flag config produces no row
+        # diff at all: the deprecated flag write is then the ONLY reason to report.
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"parameters": {"rollout_percentage": 40}},
+        )
+        mock_report_user_action.reset_mock()
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"parameters": {"rollout_percentage": 25}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        props = self._updated_event_props(mock_report_user_action)
+        self.assertEqual(props["changed_fields"], [])
+        self.assertEqual(props["experiment_update_deprecated_parameters_keys"], ["rollout_percentage"])
+        self.assertTrue(props["experiment_update_deprecated_config_changed"])
+
+    @patch("products.experiments.backend.experiment_service.report_user_action")
+    def test_update_event_records_projection_echo_as_unchanged(self, mock_report_user_action: MagicMock) -> None:
+        experiment_id = self._create_via_flag_object(key="upd-echo")
+        echoed = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}").json()["parameters"]
+        self.assertIn("feature_flag_variants", echoed)
+        mock_report_user_action.reset_mock()
+        # A faithful GET-to-PATCH echo lists the projected keys (the reader proxy) but must not count
+        # as a flag-config write, else the deprecation bake window never closes.
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {"description": "unrelated edit", "parameters": echoed},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        props = self._updated_event_props(mock_report_user_action)
+        self.assertIn("feature_flag_variants", props["experiment_update_deprecated_parameters_keys"])
+        self.assertFalse(props["experiment_update_deprecated_config_changed"])
+
+    @patch("products.experiments.backend.experiment_service.report_user_action")
+    def test_update_event_records_flag_object_write_as_unchanged(self, mock_report_user_action: MagicMock) -> None:
+        experiment_id = self._create_via_flag_object(key="upd-clean")
+        mock_report_user_action.reset_mock()
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}",
+            {
+                "description": "clean flag write",
+                "feature_flag": {
+                    "filters": {
+                        "multivariate": {
+                            "variants": [
+                                {"key": "control", "name": "Control", "rollout_percentage": 40},
+                                {"key": "test", "name": "Test", "rollout_percentage": 60},
+                            ]
+                        }
+                    }
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        props = self._updated_event_props(mock_report_user_action)
+        self.assertNotIn("experiment_update_deprecated_parameters_keys", props)
+        self.assertFalse(props["experiment_update_deprecated_config_changed"])
+
+
+class TestExperimentAuxiliaryEndpoints(_HoistFlagConfigClientMixin, ClickhouseTestMixin, APILicensedTest):
+    def _generate_experiment(self, start_date="2024-01-01T10:23", extra_parameters=None):
+        ff_key = "a-b-test"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "description": "",
+                "start_date": start_date,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {
+                            "key": "control",
+                            "name": "Control Group",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_1",
+                            "name": "Test Variant",
+                            "rollout_percentage": 33,
+                        },
+                        {
+                            "key": "test_2",
+                            "name": "Test Variant",
+                            "rollout_percentage": 34,
+                        },
+                    ],
+                    **(extra_parameters or {}),
+                },
+                "filters": {
+                    "events": [
+                        {"order": 0, "id": "$pageview"},
+                        {"order": 1, "id": "$pageleave"},
+                    ],
+                    "properties": [],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+        return response
+
+    def _assert_cohort_calculated(self, cohort: dict[str, Any]) -> None:
+        # Every caller runs transaction.on_commit callbacks at once, so one refetch reads the finished calculation.
+        if cohort["is_calculating"]:
+            response = self.client.get(f"/api/projects/{self.team.id}/cohorts/{cohort['id']}")
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+            cohort = response.json()
+        self.assertFalse(cohort["is_calculating"], f"Cohort {cohort['id']} is still calculating")
+
+    # The test writes its flag calls to events only, and the native JSON events table reads them from flag_evaluations.
+    @override_settings(CLICKHOUSE_HOGQL_USE_NEW_EVENTS_SCHEMA=False)
+    @patch("django.db.transaction.on_commit", side_effect=lambda func: func())
+    def test_create_exposure_cohort_for_experiment(self, patch_on_commit: MagicMock):
+        # From mode 1 on, the cohorts API rejects new criteria on $feature_flag_called, and the exposure cohort must still save.
+        OrganizationFeatureFlagsConfig.objects.update_or_create(
+            organization=self.organization,
+            defaults={"flag_evaluations_mode": FlagEvaluationsMode.READ_FLAG_EVALUATIONS},
+        )
+        response = self._generate_experiment("2024-01-01T10:23")
+
+        created_experiment = response.json()["id"]
+
+        journeys_for(
+            {
+                "person1": [
+                    {
+                        "event": "$feature_flag_called",
+                        "timestamp": "2024-01-02",
+                        "properties": {"$feature_flag": "a-b-test", "$feature_flag_response": "control"},
+                    },
+                    {
+                        "event": "$feature_flag_called",
+                        "timestamp": "2024-01-03",
+                        "properties": {"$feature_flag": "a-b-test", "$feature_flag_response": "control"},
+                    },
+                ],
+                "person2": [
+                    {
+                        "event": "$feature_flag_called",
+                        "timestamp": "2024-01-02",
+                        "properties": {"$feature_flag": "a-b-test", "$feature_flag_response": "test_1"},
+                    },
+                ],
+                "personX": [
+                    {
+                        "event": "$feature_flag_called",
+                        "timestamp": "2024-01-02",
+                        "properties": {"$feature_flag": "a-b-test2", "$feature_flag_response": "test_1"},
+                    },
+                ],
+                # out of time range
+                "person3": [
+                    {
+                        "event": "$feature_flag_called",
+                        "timestamp": "2023-01-02",
+                        "properties": {"$feature_flag": "a-b-test", "$feature_flag_response": "control"},
+                    },
+                ],
+                # wrong event
+                "person_out_of_control": [
+                    {"event": "$pageview", "timestamp": "2024-01-03"},
+                    {"event": "$pageleave", "timestamp": "2024-01-05"},
+                ],
+                # doesn't have feature value set
+                "person_out_of_end_date": [
+                    {
+                        "event": "$feature_flag_called",
+                        "timestamp": "2024-01-03",
+                        "properties": {"$feature/a-b-test": "control"},
+                    },
+                ],
+            },
+            self.team,
+        )
+        flush_persons_and_events()
+
+        # now call to make cohort
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{created_experiment}/create_exposure_cohort_for_experiment/",
+            {},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        cohort = response.json()["cohort"]
+        self.assertEqual(cohort["name"], 'Users exposed to experiment "Test Experiment"')
+        self.assertEqual(cohort["experiment_set"], [created_experiment])
+
+        cohort_id = cohort["id"]
+
+        self._assert_cohort_calculated(cohort)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/cohorts/{cohort_id}/persons/?cohort={cohort_id}")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(["person1", "person2"], sorted([res["name"] for res in response.json()["results"]]))
+
+    @parameterized.expand(
+        [
+            # (name, start_date)
+            ("before_cutoff", "2026-08-20T10:00"),
+            ("after_cutoff", "2026-09-10T10:00"),
+        ]
+    )
+    @patch("django.db.transaction.on_commit", side_effect=lambda func: func())
+    def test_create_exposure_cohort_for_flag_evaluations_only_org(
+        self, _name: str, start_date: str, patch_on_commit: MagicMock
+    ):
+        # Ingestion writes no $feature_flag_called rows to events for this org. Only the $experiment_exposure copies reach events.
+        OrganizationFeatureFlagsConfig.objects.update_or_create(
+            organization=self.organization,
+            defaults={"flag_evaluations_mode": FlagEvaluationsMode.FLAG_EVALUATIONS_ONLY},
+        )
+        response = self._generate_experiment(start_date)
+        created_experiment = response.json()["id"]
+        start = datetime.fromisoformat(start_date)
+
+        journeys_for(
+            {
+                "exposed": [
+                    {
+                        "event": "$experiment_exposure",
+                        "timestamp": (start + timedelta(days=2)).isoformat(),
+                        "properties": {"$feature_flag": "a-b-test", "$feature_flag_response": "control"},
+                    },
+                ],
+                "other_flag": [
+                    {
+                        "event": "$experiment_exposure",
+                        "timestamp": (start + timedelta(days=2)).isoformat(),
+                        "properties": {"$feature_flag": "a-b-test2", "$feature_flag_response": "control"},
+                    },
+                ],
+                "before_start": [
+                    {
+                        "event": "$experiment_exposure",
+                        "timestamp": (start - timedelta(days=2)).isoformat(),
+                        "properties": {"$feature_flag": "a-b-test", "$feature_flag_response": "control"},
+                    },
+                ],
+            },
+            self.team,
+        )
+        flush_persons_and_events()
+
+        with patch_exposure_event_flag(enabled=True):
+            response = self.client.post(
+                f"/api/projects/{self.team.id}/experiments/{created_experiment}/create_exposure_cohort_for_experiment/",
+                {},
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        cohort = response.json()["cohort"]
+        cohort_id = cohort["id"]
+
+        self._assert_cohort_calculated(cohort)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/cohorts/{cohort_id}/persons/?cohort={cohort_id}")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(["exposed"], [res["name"] for res in response.json()["results"]])
+
+    @patch("django.db.transaction.on_commit", side_effect=lambda func: func())
+    def test_create_exposure_cohort_for_experiment_with_custom_event_exposure(self, patch_on_commit: MagicMock):
+        self.maxDiff = None
+
+        cohort_extra = Cohort.objects.create(
+            team=self.team,
+            filters={
+                "properties": {
+                    "type": "AND",
+                    "values": [
+                        {
+                            "key": "$pageview",
+                            "value": "http://example.com",
+                            "type": "person",
+                            "operator": "exact",
+                        },
+                    ],
+                }
+            },
+            name="cohort_X",
+        )
+        response = self._generate_experiment(
+            "2024-01-01T10:23",
+            {
+                "custom_exposure_filter": {
+                    "events": [
+                        {
+                            "id": "custom_exposure_event",
+                            "order": 0,
+                            "entity_type": "events",
+                            "properties": [
+                                {"key": "bonk", "value": "bonk"},
+                                {"key": "id", "value": cohort_extra.id, "type": "cohort"},
+                                {"key": "properties.$current_url in ('x', 'y')", "type": "hogql"},
+                                {"key": "bonk-person", "value": "bonk", "type": "person"},
+                            ],
+                        }
+                    ],
+                    "filter_test_accounts": False,
+                }
+            },
+        )
+
+        created_experiment = response.json()["id"]
+
+        journeys_for(
+            {
+                "person1": [
+                    {
+                        "event": "custom_exposure_event",
+                        "timestamp": "2024-01-02",
+                        "properties": {"$current_url": "x", "bonk": "bonk"},
+                    },
+                ],
+                "person2": [
+                    {
+                        "event": "custom_exposure_event",
+                        "timestamp": "2024-01-02",
+                        "properties": {"$current_url": "y", "bonk": "bonk"},
+                    },
+                ],
+                "person2-no-bonk": [
+                    {
+                        "event": "custom_exposure_event",
+                        "timestamp": "2024-01-02",
+                        "properties": {"$current_url": "y"},
+                    },
+                ],
+                "person2-not-in-prop": [
+                    {
+                        "event": "custom_exposure_event",
+                        "timestamp": "2024-01-02",
+                        "properties": {"$current_url": "yxxxx"},
+                    },
+                ],
+                "personX": [
+                    {
+                        "event": "$feature_flag_called",
+                        "timestamp": "2024-01-02",
+                        "properties": {"$feature_flag": "a-b-test2", "$feature_flag_response": "test_1"},
+                    },
+                ],
+                # out of time range
+                "person3": [
+                    {
+                        "event": "custom_exposure_event",
+                        "timestamp": "2023-01-02",
+                        "properties": {"$current_url": "y"},
+                    },
+                ],
+                # wrong event
+                "person_out_of_control": [
+                    {"event": "$pageview", "timestamp": "2024-01-03"},
+                    {"event": "$pageleave", "timestamp": "2024-01-05"},
+                ],
+            },
+            self.team,
+        )
+        flush_persons_and_events()
+
+        # now call to make cohort
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{created_experiment}/create_exposure_cohort_for_experiment/",
+            {},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        cohort = response.json()["cohort"]
+        self.assertEqual(cohort["name"], 'Users exposed to experiment "Test Experiment"')
+        self.assertEqual(cohort["experiment_set"], [created_experiment])
+        self.assertEqual(
+            cohort["filters"],
+            {
+                "properties": {
+                    "type": "OR",
+                    "values": [
+                        {
+                            "type": "OR",
+                            "values": [
+                                {
+                                    "bytecode": [
+                                        "_H",
+                                        1,
+                                        32,
+                                        "custom_exposure_event",
+                                        32,
+                                        "event",
+                                        1,
+                                        1,
+                                        11,
+                                        32,
+                                        "bonk",
+                                        32,
+                                        "bonk",
+                                        32,
+                                        "properties",
+                                        1,
+                                        2,
+                                        11,
+                                        32,
+                                        "x",
+                                        32,
+                                        "y",
+                                        44,
+                                        2,
+                                        32,
+                                        "$current_url",
+                                        32,
+                                        "properties",
+                                        1,
+                                        2,
+                                        21,
+                                        3,
+                                        2,
+                                        3,
+                                        2,
+                                    ],
+                                    "conditionHash": "605645c960b2c67c",
+                                    "event_filters": [
+                                        {"key": "bonk", "type": "event", "value": "bonk"},
+                                        {"key": "properties.$current_url in ('x', 'y')", "type": "hogql"},
+                                    ],
+                                    "event_type": "events",
+                                    "explicit_datetime": "2024-01-01T10:23:00+00:00",
+                                    "key": "custom_exposure_event",
+                                    "negation": False,
+                                    "type": "behavioral",
+                                    "value": "performed_event",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+
+        cohort_id = cohort["id"]
+
+        self._assert_cohort_calculated(cohort)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/cohorts/{cohort_id}/persons/?cohort={cohort_id}")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(["person1", "person2"], sorted([res["name"] for res in response.json()["results"]]))
+
+    @patch("django.db.transaction.on_commit", side_effect=lambda func: func())
+    def test_create_exposure_cohort_for_experiment_with_custom_action_filters_exposure(
+        self, patch_on_commit: MagicMock
+    ):
+        cohort_extra = Cohort.objects.create(
+            team=self.team,
+            filters={
+                "properties": {
+                    "type": "AND",
+                    "values": [
+                        {
+                            "key": "$pageview",
+                            "value": "http://example.com",
+                            "type": "person",
+                            "operator": "exact",
+                        },
+                    ],
+                }
+            },
+            name="cohort_X",
+        )
+
+        action1 = create_action(
+            team=self.team,
+            name="action1",
+            steps_json=[
+                {
+                    "event": "insight viewed",
+                    "properties": [
+                        {
+                            "key": "insight",
+                            "type": "event",
+                            "value": ["RETENTION"],
+                            "operator": "exact",
+                        },
+                        {
+                            "key": "id",
+                            "value": cohort_extra.id,
+                            "type": "cohort",
+                        },
+                    ],
+                },
+                {
+                    "event": "insight viewed",
+                    "properties": [
+                        {
+                            "key": "filters_count",
+                            "type": "event",
+                            "value": "1",
+                            "operator": "gt",
+                        }
+                    ],
+                },
+                {
+                    "event": "$autocapture",
+                    "url": "/123",
+                    "url_matching": "regex",
+                },
+            ],
+        )
+        response = self._generate_experiment(
+            datetime.now() - timedelta(days=5),
+            {
+                "custom_exposure_filter": {
+                    "actions": [
+                        {
+                            "id": str(action1.id),  # should support string ids
+                            "order": 0,
+                            "entity_type": "actions",
+                            "properties": [
+                                {"key": "bonk", "value": "bonk"},
+                                {"key": "id", "value": cohort_extra.id, "type": "cohort"},
+                                {"key": "properties.$current_url in ('x', 'y')", "type": "hogql"},
+                                {"key": "bonk-person", "value": "bonk", "type": "person"},
+                            ],
+                        }
+                    ],
+                    "filter_test_accounts": False,
+                }
+            },
+        )
+
+        created_experiment = response.json()["id"]
+
+        journeys_for(
+            {
+                "person1": [
+                    {
+                        "event": "insight viewed",
+                        "timestamp": datetime.now() - timedelta(days=2),
+                        "properties": {"$current_url": "x", "bonk": "bonk", "filters_count": 2},
+                    },
+                ],
+                "person2": [
+                    {
+                        "event": "insight viewed",
+                        "timestamp": datetime.now() - timedelta(days=2),
+                        "properties": {
+                            "$current_url": "y",
+                            "bonk": "bonk",
+                            "insight": "RETENTION",
+                        },  # missing pageview person property
+                    },
+                ],
+                "person2-no-bonk": [
+                    {
+                        "event": "insight viewed",
+                        "timestamp": datetime.now() - timedelta(days=2),
+                        "properties": {"$current_url": "y", "filters_count": 3},
+                    },
+                ],
+                "person2-not-in-prop": [
+                    {
+                        "event": "$autocapture",
+                        "timestamp": datetime.now() - timedelta(days=2),
+                        "properties": {
+                            "$current_url": "https://posthog.com/feedback/1234"
+                        },  # can't match because clashing current_url filters
+                    },
+                ],
+            },
+            self.team,
+        )
+
+        _create_person(
+            distinct_ids=["1"],
+            team_id=self.team.pk,
+            properties={"$pageview": "http://example.com"},
+        )
+        _create_event(
+            event="insight viewed",
+            team=self.team,
+            distinct_id="1",
+            properties={"insight": "RETENTION", "$current_url": "x", "bonk": "bonk"},
+            timestamp=datetime.now() - timedelta(days=2),
+        )
+        _create_person(
+            distinct_ids=["2"],
+            team_id=self.team.pk,
+            properties={"$pageview": "http://example.com"},
+        )
+        _create_event(
+            event="insight viewed",
+            team=self.team,
+            distinct_id="2",
+            properties={"insight": "RETENTION", "$current_url": "x"},
+            timestamp=datetime.now() - timedelta(days=2),
+        )
+        flush_persons_and_events()
+
+        cohort_extra.calculate_people_ch(pending_version=1)
+
+        # now call to make cohort
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{created_experiment}/create_exposure_cohort_for_experiment/",
+            {},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        cohort = response.json()["cohort"]
+        self.assertEqual(cohort["name"], 'Users exposed to experiment "Test Experiment"')
+        self.assertEqual(cohort["experiment_set"], [created_experiment])
+
+        self.maxDiff = None
+        target_filter = cohort["filters"]["properties"]["values"][0]["values"][0]
+        self.assertEqual(
+            target_filter["event_filters"],
+            [
+                {"key": "bonk", "type": "event", "value": "bonk"},
+                {"key": "properties.$current_url in ('x', 'y')", "type": "hogql"},
+            ],
+            cohort["filters"],
+        )
+        self.assertEqual(
+            target_filter["event_type"],
+            "actions",
+        )
+        self.assertEqual(
+            target_filter["key"],
+            action1.id,
+        )
+        self.assertEqual(
+            target_filter["type"],
+            "behavioral",
+        )
+        self.assertEqual(
+            target_filter["value"],
+            "performed_event",
+        )
+        explicit_datetime = parser.isoparse(target_filter["explicit_datetime"])
+
+        self.assertTrue(
+            explicit_datetime <= datetime.now(UTC) - timedelta(days=5)
+            and explicit_datetime >= datetime.now(UTC) - timedelta(days=5, hours=1)
+        )
+
+        cohort_id = cohort["id"]
+
+        self._assert_cohort_calculated(cohort)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/cohorts/{cohort_id}/persons/?cohort={cohort_id}")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(["1", "person1"], sorted([res["name"] for res in response.json()["results"]]))
+
+    def test_create_exposure_cohort_for_experiment_with_invalid_action_filters_exposure(self):
+        response = self._generate_experiment(
+            "2024-01-01T10:23",
+            {
+                "custom_exposure_filter": {
+                    "actions": [
+                        {
+                            "id": "oogabooga",
+                            "order": 0,
+                            "entity_type": "actions",
+                            "properties": [
+                                {"key": "bonk", "value": "bonk"},
+                                {"key": "properties.$current_url in ('x', 'y')", "type": "hogql"},
+                                {"key": "bonk-person", "value": "bonk", "type": "person"},
+                            ],
+                        }
+                    ],
+                    "filter_test_accounts": False,
+                }
+            },
+        )
+
+        created_experiment = response.json()["id"]
+
+        # now call to make cohort
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{created_experiment}/create_exposure_cohort_for_experiment/",
+            {},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "Invalid action ID")
+
+    def test_create_exposure_cohort_for_experiment_with_draft_experiment(self):
+        response = self._generate_experiment(None)
+
+        created_experiment = response.json()["id"]
+
+        # now call to make cohort
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{created_experiment}/create_exposure_cohort_for_experiment/",
+            {},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "Experiment does not have a start date")
+
+    def test_create_exposure_cohort_for_experiment_with_existing_cohort(self):
+        response = self._generate_experiment()
+
+        created_experiment = response.json()["id"]
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{created_experiment}/create_exposure_cohort_for_experiment/",
+            {},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # now call to make cohort again
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/{created_experiment}/create_exposure_cohort_for_experiment/",
+            {},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "Experiment already has an exposure cohort")
+
+    def test_create_experiment_with_stats_config(self) -> None:
+        """Test that stats_config can be passed from frontend and is preserved"""
+        ff_key = "stats-config-test"
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Stats Config Test Experiment",
+                "description": "",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {},
+                "stats_config": {
+                    "method": "bayesian",
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["name"], "Stats Config Test Experiment")
+        self.assertEqual(response.json()["feature_flag_key"], ff_key)
+
+        # Verify stats_config is preserved with custom fields
+        stats_config = response.json()["stats_config"]
+        self.assertEqual(stats_config["method"], "bayesian")
+
+    def test_create_experiment_uses_team_default_confidence_level(self) -> None:
+        config = get_or_create_team_extension(self.team, TeamExperimentsConfig)
+        config.default_experiment_confidence_level = 0.90
+        config.save()
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Test Experiment",
+                "feature_flag_key": "test-confidence-level",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        stats_config = response.json()["stats_config"]
+        self.assertAlmostEqual(stats_config["bayesian"]["ci_level"], 0.90)
+        self.assertAlmostEqual(stats_config["frequentist"]["alpha"], 0.10)
+
+    def test_experiment_activity_logging_shows_correct_user_for_updates(self):
+        """Test that experiment activity logs show the correct user for both creation and updates."""
+
+        # Create a second user to test with
+        second_user = User.objects.create_user(
+            email="second@posthog.com", password="testpass123", first_name="Second", last_name="User"
+        )
+        self.organization.members.add(second_user)
+
+        # Create experiment with first user (self.user)
+        ff_key = "activity-logging-test"
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Activity Logging Test Experiment",
+                "description": "Testing activity logging fix",
+                "start_date": None,
+                "end_date": None,
+                "feature_flag_key": ff_key,
+                "parameters": None,
+                "filters": {},
+            },
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = create_response.json()["id"]
+
+        # Check creation activity log shows first user
+        creation_logs = ActivityLog.objects.filter(
+            scope="Experiment", item_id=str(experiment_id), activity="created"
+        ).order_by("-created_at")
+        self.assertEqual(len(creation_logs), 1)
+        self.assertEqual(creation_logs[0].user, self.user)
+
+        # Switch to second user and update the experiment
+        self.client.force_login(second_user)
+        update_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {
+                "description": "Updated description by second user",
+            },
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+
+        # Check update activity log shows second user (not the creator)
+        update_logs = ActivityLog.objects.filter(
+            scope="Experiment", item_id=str(experiment_id), activity="updated"
+        ).order_by("-created_at")
+        self.assertEqual(len(update_logs), 1)
+        self.assertEqual(update_logs[0].user, second_user)
+
+        # Verify the fix: the update activity log should NOT show the first user
+        self.assertNotEqual(update_logs[0].user, self.user)
+
+    def test_activity_endpoint_returns_only_this_experiments_changes(self):
+        saved_metric_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Activity saved metric",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            },
+        )
+        self.assertEqual(saved_metric_response.status_code, status.HTTP_201_CREATED)
+        saved_metric_id = saved_metric_response.json()["id"]
+        holdout_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_holdouts/",
+            data={
+                "name": "Activity holdout",
+                "filters": [{"properties": [], "rollout_percentage": 20, "variant": "holdout"}],
+            },
+            format="json",
+        )
+        self.assertEqual(holdout_response.status_code, status.HTTP_201_CREATED)
+        holdout_id = holdout_response.json()["id"]
+
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Experiment with children",
+                "feature_flag_key": "activity-endpoint-one",
+                "holdout_id": holdout_id,
+                "saved_metrics_ids": [{"id": saved_metric_id, "metadata": {"type": "secondary"}}],
+            },
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = create_response.json()["id"]
+        flag_id = create_response.json()["feature_flag"]["id"]
+        self.client.patch(f"/api/projects/{self.team.id}/experiments/{experiment_id}/", {"description": "Updated"})
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiment_holdouts/{holdout_id}/", {"name": "Renamed holdout"}
+        )
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/{saved_metric_id}/", {"name": "Renamed metric"}
+        )
+        flag_patch_response = self.client.patch(
+            f"/api/projects/{self.team.id}/feature_flags/{flag_id}/", {"active": False}
+        )
+        self.assertEqual(flag_patch_response.status_code, status.HTTP_200_OK)
+
+        other_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "Unrelated experiment", "feature_flag_key": "activity-endpoint-two"},
+        )
+        other_experiment_id = other_response.json()["id"]
+        other_flag_id = other_response.json()["feature_flag"]["id"]
+        self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{other_experiment_id}/", {"description": "Unrelated update"}
+        )
+        self.client.patch(f"/api/projects/{self.team.id}/feature_flags/{other_flag_id}/", {"active": False})
+        # An unrelated shared metric whose pk collides with the experiment's id
+        ActivityLog.objects.create(
+            team_id=self.team.pk,
+            organization_id=self.organization.id,
+            scope="Experiment",
+            item_id=str(experiment_id),
+            activity="updated",
+            detail={"type": "shared_metric", "name": "Colliding metric"},
+        )
+        # Same ids under an unrelated scope: leaks if any clause drops its scope match
+        for colliding_item_id in (str(experiment_id), str(flag_id)):
+            ActivityLog.objects.create(
+                team_id=self.team.pk,
+                organization_id=self.organization.id,
+                scope="Insight",
+                item_id=colliding_item_id,
+                activity="updated",
+                detail={"name": "Colliding insight"},
+            )
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}/activity?limit=50")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.json()["results"]
+
+        item_ids = {entry["item_id"] for entry in results}
+        # Scoped, because experiments and feature flags number from separate sequences and so reuse
+        # each other's ids. Matching the id alone reads this experiment's own flag entry as the
+        # unrelated experiment leaking in, whenever the two sequences happen to line up.
+        experiment_item_ids = {entry["item_id"] for entry in results if entry["scope"] == "Experiment"}
+        self.assertNotIn(str(other_experiment_id), experiment_item_ids)
+        self.assertLessEqual(item_ids, {str(experiment_id), str(holdout_id), str(saved_metric_id), str(flag_id)})
+        flag_entries = [entry for entry in results if entry["scope"] == "FeatureFlag"]
+        self.assertEqual({entry["item_id"] for entry in flag_entries}, {str(flag_id)})
+        self.assertIn("updated", [entry["activity"] for entry in flag_entries])
+        self.assertNotIn("Colliding insight", {(entry["detail"] or {}).get("name") for entry in results})
+        own_activities = [entry["activity"] for entry in results if entry["item_id"] == str(experiment_id)]
+        self.assertIn("created", own_activities)
+        self.assertIn("updated", own_activities)
+        detail_types = {(entry["detail"] or {}).get("type") for entry in results}
+        self.assertIn("holdout", detail_types)
+        self.assertIn("shared_metric", detail_types)
+        self.assertFalse(
+            any(
+                entry["item_id"] == str(experiment_id) and (entry["detail"] or {}).get("type") == "shared_metric"
+                for entry in results
+            )
+        )
+
+    def test_activity_endpoint_omits_flag_entries_without_flag_access(self):
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL}
+        ]
+        self.organization.save()
+
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {"name": "Restricted flag", "feature_flag_key": "activity-restricted-flag"},
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = create_response.json()["id"]
+        flag_id = create_response.json()["feature_flag"]["id"]
+        flag_patch_response = self.client.patch(
+            f"/api/projects/{self.team.id}/feature_flags/{flag_id}/", {"active": False}
+        )
+        self.assertEqual(flag_patch_response.status_code, status.HTTP_200_OK)
+
+        AccessControl.objects.create(
+            team=self.team, resource="feature_flag", resource_id=str(flag_id), access_level="none"
+        )
+        # The flag's creator keeps access regardless of access controls, so query as a plain member
+        other_user = User.objects.create_and_join(self.organization, "no-flag-access@posthog.com", None)
+        self.client.force_login(other_user)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment_id}/activity?limit=50")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.json()["results"]
+        self.assertTrue(results)
+        self.assertEqual({entry["scope"] for entry in results}, {"Experiment"})
+
+    def test_web_experiment_activity_logging_excludes_parameters_through_main_endpoint(self):
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Web experiment activity logging flag",
+            key="web-experiment-activity-logging",
+            filters={},
+        )
+        experiment = Experiment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Web experiment activity logging",
+            description="Original description",
+            type=Experiment.ExperimentType.WEB,
+            parameters={},
+            feature_flag=feature_flag,
+        )
+
+        update_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}/",
+            {
+                "description": "Updated through the main experiments endpoint",
+                "parameters": None,
+            },
+            format="json",
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+
+        activity_log = ActivityLog.objects.filter(
+            scope="Experiment", item_id=str(experiment.id), activity="updated"
+        ).latest("created_at")
+        assert activity_log.detail is not None
+
+        change_fields = [change["field"] for change in activity_log.detail["changes"]]
+        self.assertIn("description", change_fields)
+        self.assertNotIn("parameters", change_fields)
+
+    def test_running_time_calculation_output_drift_writes_no_activity_row(self):
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            name="Running time drift flag",
+            key="running-time-drift",
+            filters={},
+        )
+        experiment = Experiment.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Running time drift",
+            feature_flag=feature_flag,
+            running_time_calculation={
+                "minimum_detectable_effect": 5,
+                "recommended_sample_size": 1000,
+                "recommended_running_time": 14,
+            },
+        )
+
+        drift_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}/",
+            {
+                "running_time_calculation": {
+                    "minimum_detectable_effect": 5,
+                    "recommended_sample_size": 2000,
+                    "recommended_running_time": 28,
+                }
+            },
+            format="json",
+        )
+        self.assertEqual(drift_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            ActivityLog.objects.filter(scope="Experiment", item_id=str(experiment.id), activity="updated").count(),
+            0,
+        )
+
+        input_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}/",
+            {
+                "running_time_calculation": {
+                    "minimum_detectable_effect": 10,
+                    "recommended_sample_size": 500,
+                    "recommended_running_time": 7,
+                }
+            },
+            format="json",
+        )
+        self.assertEqual(input_response.status_code, status.HTTP_200_OK)
+        activity_log = ActivityLog.objects.filter(
+            scope="Experiment", item_id=str(experiment.id), activity="updated"
+        ).latest("created_at")
+        assert activity_log.detail is not None
+        change_fields = [change["field"] for change in activity_log.detail["changes"]]
+        self.assertIn("running_time_calculation", change_fields)
+
+    def test_experiment_saved_metric_activity_logging_shows_correct_user_for_updates(self):
+        """Test that experiment saved metric activity logs show the correct user for both creation and updates."""
+
+        # Create a second user to test with
+        second_user = User.objects.create_user(
+            email="second@posthog.com", password="testpass123", first_name="Second", last_name="User"
+        )
+        self.organization.members.add(second_user)
+
+        # Create experiment saved metric with first user (self.user)
+        create_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Activity Logging Test Metric",
+                "description": "Testing saved metric activity logging fix",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        metric_id = create_response.json()["id"]
+
+        # Check creation activity log shows first user
+        creation_logs = ActivityLog.objects.filter(
+            scope="Experiment",  # Note: ExperimentSavedMetric logs under "Experiment" scope
+            item_id=str(metric_id),
+            activity="created",
+        ).order_by("-created_at")
+        self.assertEqual(len(creation_logs), 1)
+        self.assertEqual(creation_logs[0].user, self.user)
+
+        # Switch to second user and update the metric
+        self.client.force_login(second_user)
+        update_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/{metric_id}/",
+            {
+                "description": "Updated description by second user",
+            },
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+
+        # Check update activity log shows second user (not the creator)
+        update_logs = ActivityLog.objects.filter(
+            scope="Experiment",  # Note: ExperimentSavedMetric logs under "Experiment" scope
+            item_id=str(metric_id),
+            activity="updated",
+        ).order_by("-created_at")
+        self.assertEqual(len(update_logs), 1)
+        self.assertEqual(update_logs[0].user, second_user)
+
+        # Verify the fix: the update activity log should NOT show the first user
+        self.assertNotEqual(update_logs[0].user, self.user)
+
+    def test_experiment_to_saved_metric_metadata_change_activity_logging(self):
+        """Test that changes to ExperimentToSavedMetric metadata are logged under Experiment scope."""
+        # Create a saved metric
+        saved_metric_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Activity Test Metric",
+                "description": "Testing metadata activity logging",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(saved_metric_response.status_code, status.HTTP_201_CREATED)
+        saved_metric_id = saved_metric_response.json()["id"]
+
+        # Create experiment with saved metric including metadata
+        experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Metadata Activity Test",
+                "feature_flag_key": "metadata-activity-test",
+                "saved_metrics_ids": [{"id": saved_metric_id, "metadata": {"type": "primary"}}],
+            },
+            format="json",
+        )
+        self.assertEqual(experiment_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = experiment_response.json()["id"]
+
+        # Verify activity log was created for the saved metric config link
+        created_logs = ActivityLog.objects.filter(
+            scope="Experiment",
+            item_id=str(experiment_id),
+            activity="created",
+            detail__type="saved_metric_config",
+        )
+        self.assertEqual(created_logs.count(), 1)
+        self.assertEqual(created_logs[0].user, self.user)
+        assert created_logs[0].detail is not None
+        self.assertEqual(created_logs[0].detail["name"], "Activity Test Metric")
+
+        # Update the metadata (add a breakdown)
+        update_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {
+                "saved_metrics_ids": [
+                    {"id": saved_metric_id, "metadata": {"type": "primary", "breakdowns": [{"property": "country"}]}}
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+
+        # Verify an "updated" activity log was created with the metadata change
+        updated_logs = ActivityLog.objects.filter(
+            scope="Experiment",
+            item_id=str(experiment_id),
+            activity="updated",
+            detail__type="saved_metric_config",
+        )
+        self.assertEqual(updated_logs.count(), 1)
+        self.assertEqual(updated_logs[0].user, self.user)
+        assert updated_logs[0].detail is not None
+        self.assertEqual(updated_logs[0].detail["name"], "Activity Test Metric")
+
+        # Verify the changes include the metadata field
+        changes = updated_logs[0].detail.get("changes", [])
+        metadata_change = next((c for c in changes if c.get("field") == "metadata"), None)
+        assert metadata_change is not None
+        self.assertEqual(metadata_change["before"], {"type": "primary"})
+        self.assertEqual(metadata_change["after"], {"type": "primary", "breakdowns": [{"property": "country"}]})
+
+    def test_saved_metric_add_remove_does_not_log_ordering_changes(self):
+        # Create a saved metric
+        saved_metric_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Ordering Test Metric",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(saved_metric_response.status_code, status.HTTP_201_CREATED)
+        saved_metric_id = saved_metric_response.json()["id"]
+
+        # Create experiment without saved metrics
+        experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Ordering Activity Test",
+                "feature_flag_key": "ordering-activity-test",
+            },
+            format="json",
+        )
+        self.assertEqual(experiment_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = experiment_response.json()["id"]
+
+        # Count logs before adding saved metric
+        logs_before_add = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count()
+
+        # Add a saved metric to the experiment
+        update_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"saved_metrics_ids": [{"id": saved_metric_id, "metadata": {"type": "secondary"}}]},
+            format="json",
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+
+        # Adding a metric leaves the ordering alone: it is a display hint the client sends only on reorder.
+        experiment = Experiment.objects.get(id=experiment_id)
+        self.assertIsNone(experiment.secondary_metrics_ordered_uuids)
+
+        # Exactly 1 new log should be created (the saved_metric_config, not ordering changes)
+        logs_after_add = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count()
+        self.assertEqual(logs_after_add - logs_before_add, 1)
+
+        # Verify the new log is for saved_metric_config, not ordering
+        config_logs = ActivityLog.objects.filter(
+            item_id=str(experiment_id),
+            scope="Experiment",
+            activity="created",
+            detail__type="saved_metric_config",
+        )
+        self.assertEqual(config_logs.count(), 1)
+
+        # Verify NO ordering change logs exist
+        all_logs = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment")
+        ordering_logs = [
+            log
+            for log in all_logs
+            if log.detail
+            and any(
+                change.get("field") in ("primary_metrics_ordered_uuids", "secondary_metrics_ordered_uuids")
+                for change in (log.detail.get("changes") or [])
+            )
+        ]
+        self.assertEqual(len(ordering_logs), 0, "Ordering changes should not be logged")
+
+        # Count logs before removing saved metric
+        logs_before_remove = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count()
+
+        # Remove the saved metric
+        remove_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"saved_metrics_ids": []},
+            format="json",
+        )
+        self.assertEqual(remove_response.status_code, status.HTTP_200_OK)
+
+        experiment.refresh_from_db()
+        self.assertIsNone(experiment.secondary_metrics_ordered_uuids)
+
+        # Exactly 1 new log should be created (the saved_metric_config deletion)
+        logs_after_remove = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count()
+        self.assertEqual(logs_after_remove - logs_before_remove, 1)
+
+        # Verify the new log is for saved_metric_config deletion
+        delete_logs = ActivityLog.objects.filter(
+            item_id=str(experiment_id),
+            scope="Experiment",
+            activity="deleted",
+            detail__type="saved_metric_config",
+        )
+        self.assertEqual(delete_logs.count(), 1)
+
+    @parameterized.expand(
+        [
+            ("duplicates_deduped", ["uuid-a", "uuid-a", "uuid-b"], status.HTTP_200_OK, ["uuid-a", "uuid-b"]),
+            ("missing_metric_uuid_accepted", ["not-a-metric"], status.HTTP_200_OK, ["not-a-metric"]),
+            ("null_stored", None, status.HTTP_200_OK, None),
+            ("blank_entry_rejected", ["uuid-a", ""], status.HTTP_400_BAD_REQUEST, ["uuid-a"]),
+            ("non_list_rejected", "uuid-a", status.HTTP_400_BAD_REQUEST, ["uuid-a"]),
+        ]
+    )
+    def test_ordering_field_is_normalized_not_checked_against_metrics(
+        self, _name: str, payload: object, expected_status: int, expected_stored: list[str] | None
+    ):
+        experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Ordering Normalization",
+                "feature_flag_key": "ordering-normalization",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "uuid": "uuid-a",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    },
+                ],
+                "primary_metrics_ordered_uuids": ["uuid-a"],
+            },
+            format="json",
+        )
+        self.assertEqual(experiment_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = experiment_response.json()["id"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"primary_metrics_ordered_uuids": payload},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, expected_status, response.json())
+        self.assertEqual(Experiment.objects.get(id=experiment_id).primary_metrics_ordered_uuids, expected_stored)
+
+    def test_user_initiated_metric_reorder_is_logged(self):
+        """A standalone reorder (no add/remove) must produce an activity log entry."""
+        # Seed the experiment with two inline metrics so there is something to reorder
+        experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Reorder Activity Test",
+                "feature_flag_key": "reorder-activity-test",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "uuid": "reorder-uuid-a",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    },
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "uuid": "reorder-uuid-b",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    },
+                ],
+                "primary_metrics_ordered_uuids": ["reorder-uuid-a", "reorder-uuid-b"],
+            },
+            format="json",
+        )
+        self.assertEqual(experiment_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = experiment_response.json()["id"]
+
+        logs_before_reorder = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count()
+
+        reorder_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"primary_metrics_ordered_uuids": ["reorder-uuid-b", "reorder-uuid-a"]},
+            format="json",
+        )
+        self.assertEqual(reorder_response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(id=experiment_id)
+        self.assertEqual(experiment.primary_metrics_ordered_uuids, ["reorder-uuid-b", "reorder-uuid-a"])
+
+        logs_after_reorder = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count()
+        self.assertEqual(logs_after_reorder - logs_before_reorder, 1)
+
+        reorder_log = (
+            ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment", activity="updated")
+            .order_by("-created_at")
+            .first()
+        )
+        assert reorder_log is not None and reorder_log.detail is not None
+        changes = reorder_log.detail.get("changes") or []
+        ordering_change = next((c for c in changes if c.get("field") == "primary_metrics_ordered_uuids"), None)
+        assert ordering_change is not None, "Explicit reorder must produce a primary_metrics_ordered_uuids change"
+        self.assertEqual(ordering_change["before"], ["reorder-uuid-a", "reorder-uuid-b"])
+        self.assertEqual(ordering_change["after"], ["reorder-uuid-b", "reorder-uuid-a"])
+
+    def test_explicit_reorder_in_same_patch_as_saved_metric_add_is_logged(self):
+        """If the user supplies ordering alongside an add/remove, the reorder must still be logged."""
+        # Create a saved metric the experiment can later adopt
+        saved_metric_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Combined PATCH Saved Metric",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "$pageview"},
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(saved_metric_response.status_code, status.HTTP_201_CREATED)
+        saved_metric_id = saved_metric_response.json()["id"]
+        saved_metric_uuid = saved_metric_response.json()["query"]["uuid"]
+
+        # Start with one inline primary metric so we have an existing ordering to permute
+        experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": "Combined PATCH Activity Test",
+                "feature_flag_key": "combined-patch-activity",
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "uuid": "combined-inline-uuid",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    },
+                ],
+                "primary_metrics_ordered_uuids": ["combined-inline-uuid"],
+            },
+            format="json",
+        )
+        self.assertEqual(experiment_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = experiment_response.json()["id"]
+
+        logs_before = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count()
+
+        # Same PATCH: adds the saved metric AND explicitly reorders so the saved metric goes first.
+        update_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {
+                "saved_metrics_ids": [{"id": saved_metric_id, "metadata": {"type": "primary"}}],
+                "primary_metrics_ordered_uuids": [saved_metric_uuid, "combined-inline-uuid"],
+            },
+            format="json",
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(id=experiment_id)
+        self.assertEqual(
+            experiment.primary_metrics_ordered_uuids,
+            [saved_metric_uuid, "combined-inline-uuid"],
+        )
+
+        # Two new logs: the saved_metric_config add AND the experiment-level reorder.
+        new_logs = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count() - logs_before
+        self.assertEqual(new_logs, 2)
+
+        # The saved metric add is captured
+        config_logs = ActivityLog.objects.filter(
+            item_id=str(experiment_id),
+            scope="Experiment",
+            activity="created",
+            detail__type="saved_metric_config",
+        )
+        self.assertEqual(config_logs.count(), 1)
+
+        # The user-supplied reorder is also captured in a separate Experiment update log
+        reorder_logs = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment", activity="updated")
+        ordering_changes = [
+            change
+            for log in reorder_logs
+            if log.detail
+            for change in (log.detail.get("changes") or [])
+            if change.get("field") == "primary_metrics_ordered_uuids"
+        ]
+        self.assertEqual(len(ordering_changes), 1, "User-supplied reorder must be logged once")
+        self.assertEqual(ordering_changes[0]["before"], ["combined-inline-uuid"])
+        self.assertEqual(ordering_changes[0]["after"], [saved_metric_uuid, "combined-inline-uuid"])
+
+    @parameterized.expand(
+        [
+            ("primary", "primary_metrics_ordered_uuids", "secondary_metrics_ordered_uuids"),
+            ("secondary", "secondary_metrics_ordered_uuids", "primary_metrics_ordered_uuids"),
+        ]
+    )
+    def test_bulk_remove_shared_metrics_does_not_touch_ordering(
+        self, role: str, ordering_field: str, other_ordering_field: str
+    ):
+        saved_metric_uuids: list[str] = []
+        saved_metric_ids: list[int] = []
+        for index in range(2):
+            response = self.client.post(
+                f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+                {
+                    "name": f"Bulk Remove Metric {index + 1}",
+                    "query": {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    },
+                },
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            saved_metric_ids.append(response.json()["id"])
+            saved_metric_uuids.append(response.json()["query"]["uuid"])
+
+        experiment_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "allow_unknown_events": True,
+                "name": f"Bulk Remove Activity Test ({role})",
+                "feature_flag_key": f"bulk-remove-activity-{role}",
+                "saved_metrics_ids": [
+                    {"id": saved_metric_id, "metadata": {"type": role}} for saved_metric_id in saved_metric_ids
+                ],
+                ordering_field: saved_metric_uuids,
+            },
+            format="json",
+        )
+        self.assertEqual(experiment_response.status_code, status.HTTP_201_CREATED)
+        experiment_id = experiment_response.json()["id"]
+
+        logs_before = ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").count()
+
+        # A removal sends no ordering: the stale entries match nothing and are ignored on read.
+        inline_metrics_field = "metrics" if role == "primary" else "metrics_secondary"
+        remove_response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {
+                inline_metrics_field: [],
+                "saved_metrics_ids": [],
+            },
+            format="json",
+        )
+        self.assertEqual(remove_response.status_code, status.HTTP_200_OK)
+
+        experiment = Experiment.objects.get(id=experiment_id)
+        self.assertEqual(getattr(experiment, ordering_field), saved_metric_uuids)
+
+        # Two new logs expected: one saved_metric_config deleted per removed link.
+        new_logs = list(
+            ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment").order_by("created_at")
+        )
+        added = new_logs[logs_before:]
+        self.assertEqual(len(added), 2, "Two saved_metric_config deleted entries expected")
+        for log in added:
+            assert log.detail is not None
+            self.assertEqual(log.activity, "deleted")
+            self.assertEqual(log.detail["type"], "saved_metric_config")
+
+        # No ordering change should be logged on any entry (existing or new).
+        ordering_changes = [
+            change
+            for log in ActivityLog.objects.filter(item_id=str(experiment_id), scope="Experiment")
+            if log.detail
+            for change in (log.detail.get("changes") or [])
+            if change.get("field") in (ordering_field, other_ordering_field)
+        ]
+        self.assertEqual(
+            ordering_changes,
+            [],
+            "Bulk-remove must not log a primary/secondary ordering change",
+        )
+
+    def test_cannot_add_saved_metric_from_different_team(self):
+        team_b = Team.objects.create(organization=self.organization, name="Team B")
+
+        # Create a saved metric in team A (self.team)
+        saved_metric_response = self.client.post(
+            f"/api/projects/{self.team.id}/experiment_saved_metrics/",
+            {
+                "name": "Team A Metric",
+                "description": "This metric belongs to Team A",
+                "query": {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "funnel",
+                    "series": [{"kind": "EventsNode", "event": "$pageview"}],
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(saved_metric_response.status_code, status.HTTP_201_CREATED)
+        team_a_metric_id = saved_metric_response.json()["id"]
+
+        # Create an experiment in team B
+        experiment_response = self.client.post(
+            f"/api/projects/{team_b.id}/experiments/",
+            {
+                "name": "Team B Experiment",
+                "feature_flag_key": "team-b-flag",
+                "parameters": None,
+            },
+            format="json",
+        )
+        self.assertEqual(experiment_response.status_code, status.HTTP_201_CREATED)
+        team_b_experiment_id = experiment_response.json()["id"]
+
+        # Try to add Team A's saved metric to Team B's experiment
+        # This should fail with validation error
+        update_response = self.client.patch(
+            f"/api/projects/{team_b.id}/experiments/{team_b_experiment_id}/",
+            {
+                "saved_metrics_ids": [{"id": team_a_metric_id, "metadata": {"type": "primary"}}],
+            },
+            format="json",
+        )
+
+        self.assertEqual(update_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("does not exist or does not belong to this project", str(update_response.json()))
+
+
+class TestExperimentParametersFieldMutation(APILicensedTest):
+    """
+    ExperimentParametersField translates split_percent <-> rollout_percentage at the API
+    boundary. Both methods must be pure transformations — mutating caller state would leak
+    the alias translation into serializer.initial_data, request.data, activity logs, Sentry
+    reports, and any downstream consumer that reads the original input/output.
+    """
+
+    def test_to_internal_value_does_not_mutate_input_dict(self):
+        from products.experiments.backend.presentation.serializers import ExperimentParametersField
+
+        input_dict = {
+            "feature_flag_variants": [
+                {"key": "control", "split_percent": 50},
+                {"key": "test", "split_percent": 50},
+            ]
+        }
+
+        ExperimentParametersField().to_internal_value(input_dict)
+
+        # Caller's dict must still have split_percent (not replaced by rollout_percentage)
+        assert input_dict == {
+            "feature_flag_variants": [
+                {"key": "control", "split_percent": 50},
+                {"key": "test", "split_percent": 50},
+            ]
+        }
+
+    def test_to_representation_does_not_mutate_stored_value(self):
+        from products.experiments.backend.presentation.serializers import ExperimentParametersField
+
+        stored_value = {
+            "feature_flag_variants": [
+                {"key": "control", "rollout_percentage": 50},
+                {"key": "test", "rollout_percentage": 50},
+            ]
+        }
+
+        ExperimentParametersField().to_representation(stored_value)
+
+        # Stored value (the model's in-memory parameters dict) must not gain split_percent
+        assert stored_value == {
+            "feature_flag_variants": [
+                {"key": "control", "rollout_percentage": 50},
+                {"key": "test", "rollout_percentage": 50},
+            ]
+        }
+
+
+class TestExperimentRunningTimeCalculation(_HoistFlagConfigClientMixin, APILicensedTest):
+    EXPOSURE_ESTIMATE_CONFIG = {
+        "conversionRateInputType": "manual",
+        "manualMetricType": "funnel",
+        "manualBaselineValue": 5,
+        "manualExposureRate": 100,
+    }
+
+    def _create_experiment(self, **overrides: Any) -> dict:
+        payload: dict[str, Any] = {
+            "name": "Running time experiment",
+            "feature_flag_key": "running-time-flag",
+            "filters": {"events": [{"order": 0, "id": "$pageview"}], "properties": []},
+            **overrides,
+        }
+        response = self.client.post(f"/api/projects/{self.team.id}/experiments/", payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        return response.json()
+
+    def test_create_with_legacy_parameters_does_not_populate_running_time_calculation(self):
+        created = self._create_experiment(
+            parameters={
+                "minimum_detectable_effect": 25,
+                "recommended_running_time": 14,
+                "recommended_sample_size": 5000,
+                "exposure_estimate_config": self.EXPOSURE_ESTIMATE_CONFIG,
+            }
+        )
+
+        # Legacy calculator keys in `parameters` are no longer mirrored into the canonical field.
+        self.assertEqual(created["running_time_calculation"], {})
+
+        experiment = Experiment.objects.get(pk=created["id"])
+        self.assertEqual(experiment.running_time_calculation, {})
+
+    def test_create_with_running_time_calculation_does_not_touch_parameters(self):
+        created = self._create_experiment(
+            running_time_calculation={
+                "minimum_detectable_effect": 20,
+                "exposure_estimate_config": self.EXPOSURE_ESTIMATE_CONFIG,
+            }
+        )
+
+        self.assertEqual(
+            created["running_time_calculation"],
+            {"minimum_detectable_effect": 20, "exposure_estimate_config": self.EXPOSURE_ESTIMATE_CONFIG},
+        )
+        self.assertNotIn("minimum_detectable_effect", created["parameters"] or {})
+        self.assertNotIn("exposure_estimate_config", created["parameters"] or {})
+
+        experiment = Experiment.objects.get(pk=created["id"])
+        self.assertEqual(
+            experiment.running_time_calculation,
+            {"minimum_detectable_effect": 20, "exposure_estimate_config": self.EXPOSURE_ESTIMATE_CONFIG},
+        )
+        self.assertNotIn("minimum_detectable_effect", experiment.parameters or {})
+
+    def test_update_running_time_calculation_does_not_touch_parameters(self):
+        created = self._create_experiment(
+            parameters={
+                "feature_flag_variants": [
+                    {"key": "control", "rollout_percentage": 50},
+                    {"key": "test", "rollout_percentage": 50},
+                ],
+            }
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{created['id']}/",
+            {"running_time_calculation": {"minimum_detectable_effect": 10, "recommended_running_time": 7}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+
+        experiment = Experiment.objects.get(pk=created["id"])
+        self.assertEqual(
+            experiment.running_time_calculation,
+            {"minimum_detectable_effect": 10, "recommended_running_time": 7},
+        )
+        # Calculator keys never leak into `parameters`, and the variants on the flag are untouched.
+        self.assertNotIn("minimum_detectable_effect", experiment.parameters or {})
+        self.assertNotIn("recommended_running_time", experiment.parameters or {})
+        flag = FeatureFlag.objects.get(key="running-time-flag")
+        self.assertEqual(len(flag.filters["multivariate"]["variants"]), 2)
+
+    def test_update_running_time_calculation_does_not_touch_feature_flag(self):
+        variants = [
+            {"key": "control", "rollout_percentage": 34},
+            {"key": "test_a", "rollout_percentage": 33},
+            {"key": "test_b", "rollout_percentage": 33},
+        ]
+        created = self._create_experiment(parameters={"feature_flag_variants": variants})
+        flag = FeatureFlag.objects.get(key="running-time-flag")
+        self.assertEqual(len(flag.filters["multivariate"]["variants"]), 3)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{created['id']}/",
+            {"running_time_calculation": {"minimum_detectable_effect": 15}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+
+        flag.refresh_from_db()
+        self.assertEqual(len(flag.filters["multivariate"]["variants"]), 3)
+
+    def test_update_parameters_does_not_touch_running_time_calculation(self):
+        created = self._create_experiment(
+            running_time_calculation={"minimum_detectable_effect": 15},
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{created['id']}/",
+            {"parameters": {"minimum_detectable_effect": 30, "recommended_sample_size": 1000}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+
+        experiment = Experiment.objects.get(pk=created["id"])
+        # The canonical field is independent of legacy `parameters` calculator keys.
+        self.assertEqual(experiment.running_time_calculation, {"minimum_detectable_effect": 15})
+
+    def test_running_time_calculation_and_parameters_are_independent(self):
+        created = self._create_experiment()
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{created['id']}/",
+            {
+                "parameters": {"minimum_detectable_effect": 99},
+                "running_time_calculation": {"minimum_detectable_effect": 11},
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+
+        experiment = Experiment.objects.get(pk=created["id"])
+        # Each side is stored exactly as sent — no cross-write between them.
+        self.assertEqual(experiment.running_time_calculation, {"minimum_detectable_effect": 11})
+        assert experiment.parameters is not None
+        self.assertEqual(experiment.parameters["minimum_detectable_effect"], 99)
+
+    @parameterized.expand(
+        [
+            ("unknown_key", {"not_a_real_key": 1}),
+            ("non_numeric_mde", {"minimum_detectable_effect": "twenty"}),
+            ("boolean_running_time", {"recommended_running_time": True}),
+            ("non_object_exposure_config", {"exposure_estimate_config": "manual"}),
+        ]
+    )
+    def test_invalid_running_time_calculation_rejected(self, _name: str, value: dict):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Invalid running time",
+                "feature_flag_key": "invalid-running-time-flag",
+                "running_time_calculation": value,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class TestExperimentExcludedVariants(_HoistFlagConfigClientMixin, APILicensedTest):
+    THREE_VARIANTS = [
+        {"key": "control", "rollout_percentage": 34},
+        {"key": "test-1", "rollout_percentage": 33},
+        {"key": "test-2", "rollout_percentage": 33},
+    ]
+
+    def _create_experiment(self, **overrides: Any) -> dict:
+        payload: dict[str, Any] = {
+            "name": "Excluded variants experiment",
+            "feature_flag_key": "excluded-variants-flag",
+            "filters": {"events": [{"order": 0, "id": "$pageview"}], "properties": []},
+            **overrides,
+        }
+        response = self.client.post(f"/api/projects/{self.team.id}/experiments/", payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        return response.json()
+
+    def test_create_with_excluded_variants_writes_only_column(self):
+        created = self._create_experiment(
+            parameters={"feature_flag_variants": self.THREE_VARIANTS},
+            excluded_variants=["test-2"],
+        )
+
+        self.assertEqual(created["excluded_variants"], ["test-2"])
+
+        experiment = Experiment.objects.get(pk=created["id"])
+        self.assertEqual(experiment.excluded_variants, ["test-2"])
+        # No longer mirrored into the deprecated parameters blob
+        assert experiment.parameters is not None
+        self.assertNotIn("excluded_variants", experiment.parameters)
+
+    def test_update_excluded_variants_does_not_require_feature_flag_variants(self):
+        """The headline of the parameters split: excluding a variant no longer requires
+        re-sending feature_flag_variants, because validation resolves against the flag."""
+        created = self._create_experiment(parameters={"feature_flag_variants": self.THREE_VARIANTS})
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{created['id']}/",
+            {"excluded_variants": ["test-2"]},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+
+        experiment = Experiment.objects.get(pk=created["id"])
+        self.assertEqual(experiment.excluded_variants, ["test-2"])
+        # Only the column is written; the deprecated parameters blob is untouched
+        self.assertNotIn("excluded_variants", experiment.parameters or {})
+        flag = FeatureFlag.objects.get(key="excluded-variants-flag")
+        self.assertEqual(len(flag.filters["multivariate"]["variants"]), 3)
+
+    def test_update_excluded_variants_does_not_touch_feature_flag(self):
+        created = self._create_experiment(parameters={"feature_flag_variants": self.THREE_VARIANTS})
+        flag = FeatureFlag.objects.get(key="excluded-variants-flag")
+        self.assertEqual(len(flag.filters["multivariate"]["variants"]), 3)
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{created['id']}/",
+            {"excluded_variants": ["test-2"]},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+
+        flag.refresh_from_db()
+        self.assertEqual(len(flag.filters["multivariate"]["variants"]), 3)
+
+    @parameterized.expand(
+        [
+            ("unknown_variant", ["does-not-exist"]),
+            ("baseline_excluded", ["control"]),
+            ("all_test_variants_excluded", ["test-1", "test-2"]),
+        ]
+    )
+    def test_update_excluded_variants_validates_against_flag_variants(self, _name: str, excluded_variants: list):
+        created = self._create_experiment(parameters={"feature_flag_variants": self.THREE_VARIANTS})
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{created['id']}/",
+            {"excluded_variants": excluded_variants},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.json())
+
+    @parameterized.expand(
+        [
+            ("non_list", "test-2"),
+            ("non_string_element", [123]),
+        ]
+    )
+    def test_invalid_excluded_variants_rejected(self, _name: str, value):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Invalid excluded variants",
+                "feature_flag_key": "invalid-excluded-variants-flag",
+                "excluded_variants": value,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+MANUAL = {"exposure_estimate_config": {"conversionRateInputType": "manual"}, "recommended_sample_size": 5000}
+
+
+class TestRunningTimeTargetEndpoint(APILicensedTest):
+    def _experiment(
+        self,
+        running_time_calculation: dict[str, Any],
+        *,
+        with_result: bool = True,
+        stats_config: dict | None = None,
+        paused_variant_samples: int | None = None,
+        result_days_ago: float = 0,
+    ) -> Experiment:
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="revenue-flag",
+            created_by=self.user,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {
+                    "variants": [
+                        {"key": "control", "rollout_percentage": 80},
+                        {"key": "test", "rollout_percentage": 20},
+                        *([{"key": "paused", "rollout_percentage": 0}] if paused_variant_samples else []),
+                    ]
+                },
+            },
+        )
+        launched_at = timezone.now() - timedelta(days=3)
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="revenue",
+            feature_flag=flag,
+            start_date=launched_at,
+            metrics=[
+                {
+                    "kind": "ExperimentMetric",
+                    "metric_type": "mean",
+                    "source": {"kind": "EventsNode", "event": "purchase", "math": "sum"},
+                    "uuid": "revenue",
+                }
+            ],
+            running_time_calculation=running_time_calculation,
+            stats_config=stats_config or {},
+        )
+        if with_result:
+            spread = {"number_of_samples": 1000, "sum": 1000, "sum_squares": 26000}
+            ExperimentMetricResult.objects.create(
+                experiment=experiment,
+                metric_uuid="revenue",
+                fingerprint=build_primary_calculation_configs(experiment)[0].calculation_key(),
+                query_from=launched_at,
+                query_to=timezone.now() - timedelta(days=result_days_ago),
+                completed_at=timezone.now(),
+                status=ExperimentMetricResult.Status.COMPLETED,
+                result={
+                    "baseline": {"key": "control", **spread},
+                    "variant_results": [
+                        {"key": "test", "method": "bayesian", **spread},
+                        *(
+                            [
+                                {
+                                    "key": "paused",
+                                    "method": "bayesian",
+                                    "number_of_samples": paused_variant_samples,
+                                    "sum": paused_variant_samples,
+                                    "sum_squares": 26 * paused_variant_samples,
+                                }
+                            ]
+                            if paused_variant_samples
+                            else []
+                        ),
+                    ],
+                },
+            )
+        return experiment
+
+    @parameterized.expand(
+        [
+            ("sized_from_the_result_and_the_split", {}, {}, "", (30, 13903, 2000, True)),
+            ("no_result_yet", {}, {"with_result": False}, "", (30, None, None, False)),
+            (
+                "a_saved_effect_outside_the_editable_range",
+                {"minimum_detectable_effect": 0.5},
+                {},
+                "",
+                (0.5, 50050051, 2000, True),
+            ),
+            (
+                "a_paused_variant_counts_toward_nothing",
+                {},
+                {"paused_variant_samples": 300},
+                "",
+                (30, 13903, 2000, True),
+            ),
+            ("manual_mode_keeps_the_saved_target", MANUAL, {}, "", (30, 5000, None, False)),
+            (
+                "manual_experiment_sized_from_the_results_on_request",
+                MANUAL,
+                {},
+                "?mode=automatic",
+                (30, 13903, 2000, True),
+            ),
+        ]
+    )
+    def test_returns_the_target_the_header_compares(
+        self,
+        _name: str,
+        running_time_calculation: dict[str, Any],
+        setup: dict[str, Any],
+        query: str,
+        expected: tuple[float, int | None, int | None, bool],
+    ) -> None:
+        experiment = self._experiment(running_time_calculation, **setup)
+
+        response = self.client.get(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}/running_time_target/{query}"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        effect, sample_size, current, has_outlook = expected
+        self.assertEqual(
+            response.json(),
+            {
+                "minimum_detectable_effect": effect,
+                "recommended_sample_size": sample_size,
+                "current_sample_size": current,
+                "outlook": ANY if has_outlook else None,
+            },
+        )
+        if has_outlook:
+            assert current is not None
+            outlook = response.json()["outlook"]
+            # Launched three days ago, so the exposures so far set the rate and the next marks are weeks 1, 2 and 4.
+            self.assertAlmostEqual(outlook["exposures_per_day"], current / 3, places=0)
+            self.assertEqual([c["weeks_since_launch"] for c in outlook["upcoming_checkpoints"]], [1, 2, 4])
+
+    @parameterized.expand(
+        [
+            # Launched three days ago with results up to yesterday: 2,000 exposures over two days.
+            ("results_up_to_yesterday", 1, 1000),
+            # A backfill stamps today with the end of the day, but its data ends when it ran: 2,000 over three days.
+            ("a_backfill_of_today", -0.5, 2000 / 3),
+        ]
+    )
+    def test_projects_the_rate_over_the_window_the_results_cover(
+        self, _name: str, result_days_ago: float, exposures_per_day: float
+    ) -> None:
+        experiment = self._experiment({}, result_days_ago=result_days_ago)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}/running_time_target/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertAlmostEqual(response.json()["outlook"]["exposures_per_day"], exposures_per_day, places=0)
+
+    @parameterized.expand(
+        [
+            ("bayesian_99_percent", {"method": "bayesian", "bayesian": {"ci_level": 0.99}}, 20688),
+            ("frequentist_90_percent", {"method": "frequentist", "frequentist": {"alpha": 0.1}}, 10952),
+        ]
+    )
+    def test_sizes_at_the_experiments_confidence_level(
+        self, _name: str, stats_config: dict[str, Any], sample_size: int
+    ) -> None:
+        experiment = self._experiment({}, stats_config=stats_config)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment.id}/running_time_target/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertEqual(response.json()["recommended_sample_size"], sample_size)
+
+
+class TestCalculateRunningTimeEndpoint(APILicensedTest):
+    def _calculate(self, payload: dict[str, Any]):
+        return self.client.post(
+            f"/api/projects/{self.team.id}/experiments/calculate_running_time/",
+            payload,
+            format="json",
+        )
+
+    @parameterized.expand(
+        [
+            ("mean_count", {"metric_type": "mean_count", "baseline_value": 4, "minimum_detectable_effect": 5}, 6400),
+            (
+                "mean_sum_or_avg",
+                {"metric_type": "mean_sum_or_avg", "baseline_value": 50, "minimum_detectable_effect": 5},
+                3200,
+            ),
+            ("funnel", {"metric_type": "funnel", "baseline_value": 0.1, "minimum_detectable_effect": 50}, 1152),
+        ]
+    )
+    def test_sample_size_from_baseline_value(self, _name: str, payload: dict, expected_sample_size: int):
+        response = self._calculate(payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertEqual(response.json()["recommended_sample_size"], expected_sample_size)
+
+    def test_includes_running_time_when_exposure_rate_given(self):
+        response = self._calculate(
+            {
+                "metric_type": "mean_count",
+                "baseline_value": 4,
+                "minimum_detectable_effect": 5,
+                "exposure_rate_per_day": 100,
+            }
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        body = response.json()
+        self.assertEqual(body["recommended_sample_size"], 6400)
+        self.assertEqual(body["recommended_running_time_days"], 64)
+
+    def test_running_time_is_null_without_exposure_rate(self):
+        response = self._calculate({"metric_type": "funnel", "baseline_value": 0.1, "minimum_detectable_effect": 50})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertIsNone(response.json()["recommended_running_time_days"])
+
+    def test_mean_from_baseline_stats(self):
+        response = self._calculate(
+            {
+                "metric_type": "mean_sum_or_avg",
+                "minimum_detectable_effect": 30,
+                "baseline_stats": {"number_of_samples": 1000, "sum": 1000, "sum_squares": 26000},
+            }
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        body = response.json()
+        self.assertAlmostEqual(body["variance"], 25000 / 999, places=4)
+        self.assertEqual(body["recommended_sample_size"], 8898)
+
+    def test_ratio_from_baseline_stats(self):
+        response = self._calculate(
+            {
+                "metric_type": "ratio",
+                "minimum_detectable_effect": 10,
+                "baseline_stats": {
+                    "number_of_samples": 10000,
+                    "sum": 500000,
+                    "sum_squares": 30000000,
+                    "denominator_sum": 50000,
+                    "denominator_sum_squares": 300000,
+                    "numerator_denominator_sum_product": 2600000,
+                },
+            }
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        body = response.json()
+        self.assertAlmostEqual(body["baseline_value"], 10, places=4)
+        self.assertAlmostEqual(body["variance"], 32, places=1)
+        self.assertEqual(body["recommended_sample_size"], 1025)
+
+    def test_funnel_from_step_counts(self):
+        response = self._calculate(
+            {
+                "metric_type": "funnel",
+                "minimum_detectable_effect": 50,
+                "baseline_stats": {"number_of_samples": 1000, "sum": 100, "step_counts": [1000, 100]},
+            }
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        body = response.json()
+        self.assertAlmostEqual(body["baseline_value"], 0.1, places=4)
+        self.assertIsNone(body["variance"])
+        self.assertEqual(body["recommended_sample_size"], 1152)
+
+    @parameterized.expand(
+        [
+            ("missing_baseline", {"metric_type": "funnel", "minimum_detectable_effect": 5}),
+            ("zero_mde", {"metric_type": "funnel", "baseline_value": 0.1, "minimum_detectable_effect": 0}),
+            ("non_finite_baseline", {"metric_type": "funnel", "baseline_value": "nan", "minimum_detectable_effect": 5}),
+            ("ratio_without_variance", {"metric_type": "ratio", "baseline_value": 10, "minimum_detectable_effect": 10}),
+            (
+                "ratio_stats_without_denominator_sum",
+                {
+                    "metric_type": "ratio",
+                    "minimum_detectable_effect": 10,
+                    "baseline_stats": {"number_of_samples": 10000, "sum": 500000, "sum_squares": 30000000},
+                },
+            ),
+        ]
+    )
+    def test_invalid_input_rejected(self, _name: str, payload: dict):
+        response = self._calculate(payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.json())
+
+    @parameterized.expand(
+        [
+            ("effect_too_small_to_compute", {"baseline_value": 0.1, "minimum_detectable_effect": 1e-160}),
+            (
+                "exposure_rate_too_small_to_compute",
+                {"baseline_value": 0.1, "minimum_detectable_effect": 1e-160, "exposure_rate_per_day": 1e-320},
+            ),
+        ]
+    )
+    def test_extreme_input_gives_no_estimate(self, _name: str, payload: dict):
+        response = self._calculate({"metric_type": "funnel", **payload})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertEqual(
+            (response.json()["recommended_sample_size"], response.json()["recommended_running_time_days"]), (None, None)
+        )
+
+
+class TestExperimentSetupContextEndpoint(ClickhouseTestMixin, APILicensedTest):
+    def setUp(self) -> None:
+        super().setUp()
+        cache.clear()
+
+    def _post(self, payload: dict[str, Any], *, flag_on: bool = True, **kwargs: Any):
+        with patch(
+            "posthoganalytics.feature_enabled",
+            side_effect=lambda key, *args, **_: flag_on and key == EXPERIMENT_SETUP_CONTEXT_FLAG,
+        ):
+            return self.client.post(
+                f"/api/projects/{self.team.id}/experiments/setup_context/", payload, format="json", **kwargs
+            )
+
+    @parameterized.expand([("flag_off", False, status.HTTP_404_NOT_FOUND), ("flag_on", True, status.HTTP_200_OK)])
+    def test_flag_gates_endpoint_for_read_scoped_personal_api_key(
+        self, _name: str, flag_on: bool, expected_status: int
+    ) -> None:
+        token = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            user=self.user,
+            label="read",
+            secure_value=hash_key_value(token),
+            scopes=["experiment:read", "experiment_saved_metric:read", "query:read"],
+        )
+        self.client.logout()
+
+        response = self._post({}, flag_on=flag_on, headers={"authorization": f"Bearer {token}"})
+
+        assert response.status_code == expected_status, response.content
+        if flag_on:
+            sections = response.json()
+            assert sections["target_surface"] == {"status": "skipped", "data": None}
+            assert sections["team_defaults"]["status"] == "ok"
+            assert sections["sdk_profile"]["status"] == "ok"
+
+    @parameterized.expand(
+        [
+            # Saved-metric names, events and reuse counts sit behind the saved-metric API's own scope.
+            ("without_saved_metric_scope", ["experiment:read", "query:read"]),
+            # Event counts for caller-chosen events are the same data /query/ gates behind query:read.
+            ("without_query_scope", ["experiment:read", "experiment_saved_metric:read"]),
+        ]
+    )
+    def test_rejects_key_missing_a_scope_for_data_it_would_return(self, _name: str, scopes: list[str]) -> None:
+        token = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            user=self.user, label="partial", secure_value=hash_key_value(token), scopes=scopes
+        )
+        self.client.logout()
+
+        response = self._post({}, flag_on=True, headers={"authorization": f"Bearer {token}"})
+
+        assert response.status_code == 403, response.content
+
+    @parameterized.expand(
+        [
+            (
+                "url_filter_without_pageview",
+                {"target_event": "$screen", "target_url_contains": "pricing"},
+                "target_url_contains",
+            ),
+            (
+                "metric_event_equals_target_event",
+                {"target_event": "$pageview", "metric_event": "$pageview"},
+                "metric_event",
+            ),
+            (
+                "target_properties_without_target_event",
+                {"target_properties": [{"key": "$pathname", "type": "event", "value": ["/"]}]},
+                "target_properties",
+            ),
+            (
+                "metric_properties_without_metric_event",
+                {"metric_properties": [{"key": "plan", "type": "event", "value": ["paid"]}]},
+                "metric_properties",
+            ),
+            (
+                "a_filter_type_the_query_cannot_apply",
+                {"target_event": "$pageview", "target_properties": [{"key": "id", "type": "cohort", "value": 1}]},
+                "target_properties",
+            ),
+            (
+                "an_operator_the_query_cannot_apply",
+                {
+                    "target_event": "$pageview",
+                    "target_properties": [
+                        {"key": "flag", "type": "event", "operator": "flag_evaluates_to", "value": ["true"]}
+                    ],
+                },
+                "target_properties",
+            ),
+            (
+                "more_filters_than_the_maximum",
+                {
+                    "target_event": "$pageview",
+                    "target_properties": [
+                        {"key": f"p-{index}", "type": "event", "value": ["x"]} for index in range(11)
+                    ],
+                },
+                "target_properties",
+            ),
+        ]
+    )
+    def test_rejects_input_that_cannot_produce_an_answer(
+        self, _name: str, payload: dict[str, Any], expected_attr: str
+    ) -> None:
+        response = self._post(payload)
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST, response.content
+        assert response.json()["attr"] == expected_attr
+
+    @parameterized.expand(
+        [
+            ("flag_on_for_staff_only", "staff", status.HTTP_200_OK),
+            ("flag_on_for_customer_only", "customer", status.HTTP_404_NOT_FOUND),
+        ]
+    )
+    def test_flag_is_evaluated_for_the_impersonating_staff_user(
+        self, _name: str, flag_on_for: str, expected_status: int
+    ) -> None:
+        self.user.is_staff = True
+        self.user.save()
+        customer = User.objects.create_and_join(self.organization, "setup-context-customer@example.com", None)
+        flag_distinct_id = str(self.user.distinct_id if flag_on_for == "staff" else customer.distinct_id)
+        self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": customer.id}),
+            data={"read_only": "true", "reason": "Setup context support ticket"},
+            format="multipart",
+        )
+        assert self.client.get("/api/users/@me/").json()["email"] == customer.email
+
+        with patch(
+            "posthoganalytics.feature_enabled",
+            side_effect=lambda key, distinct_id, *args, **_: (
+                key == EXPERIMENT_SETUP_CONTEXT_FLAG and distinct_id == flag_distinct_id
+            ),
+        ):
+            response = self.client.post(f"/api/projects/{self.team.id}/experiments/setup_context/", {}, format="json")
+
+        assert response.status_code == expected_status, response.content
+
+    def test_omits_experiments_the_user_cannot_access(self) -> None:
+        other_user = self._create_user("setup-context-other@posthog.com")
+        visible_flag = FeatureFlag.objects.create(team=self.team, created_by=self.user, key="setup-visible")
+        hidden_flag = FeatureFlag.objects.create(team=self.team, created_by=other_user, key="setup-hidden")
+        visible = Experiment.objects.create(
+            team=self.team, name="Visible", created_by=self.user, feature_flag=visible_flag
+        )
+        hidden = Experiment.objects.create(
+            team=self.team, name="Hidden", created_by=other_user, feature_flag=hidden_flag
+        )
+        AccessControl.objects.create(resource="experiment", resource_id=hidden.id, team=self.team, access_level="none")
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        response = self._post({})
+
+        assert response.status_code == status.HTTP_200_OK, response.content
+        listed = [experiment["id"] for experiment in response.json()["previous_experiments"]["data"]["experiments"]]
+        assert listed == [visible.id]
+
+    def test_serializes_a_context_with_every_section_populated(self) -> None:
+        # The response serializer runs outside the per-section guard, so a field it cannot render
+        # fails the whole endpoint rather than one section. Only a populated context reaches the
+        # nested serializers for the outcome, the SDK rows and the two baselines.
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            created_by=self.user,
+            key="setup-populated",
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": 100}],
+                "multivariate": {"variants": [{"key": "control", "rollout_percentage": 50}]},
+            },
+        )
+        # The result belongs to the run that starts here, so both dates come from one value.
+        started_at = timezone.now() - timedelta(days=10)
+        experiment = Experiment.objects.create(
+            team=self.team,
+            name="Populated",
+            created_by=self.user,
+            feature_flag=flag,
+            start_date=started_at,
+            metrics=[{"kind": "ExperimentMetric", "metric_type": "mean", "uuid": "populated-metric"}],
+        )
+        calculation_config = get_metric_calculation_config(experiment, "populated-metric")
+        assert calculation_config is not None
+        ExperimentMetricResult.objects.create(
+            experiment=experiment,
+            metric_uuid="populated-metric",
+            fingerprint=calculation_config.calculation_key(),
+            query_from=started_at,
+            query_to=timezone.now(),
+            status=ExperimentMetricResult.Status.COMPLETED,
+            result={
+                "baseline": {"key": "control", "number_of_samples": 100, "sum": 1, "sum_squares": 1},
+                "variant_results": [{"key": "test", "number_of_samples": 90, "significant": True}],
+            },
+            completed_at=timezone.now(),
+        )
+        ExperimentToSavedMetric.objects.create(
+            experiment=experiment,
+            saved_metric=ExperimentSavedMetric.objects.create(
+                team=self.team,
+                name="Revenue",
+                query={"kind": "ExperimentMetric", "metric_type": "mean", "uuid": "saved-uuid"},
+            ),
+            metadata={"type": "secondary"},
+        )
+        _create_person(team=self.team, distinct_ids=["buyer"])
+        for event in ["$pageview", "purchase"]:
+            _create_event(
+                team=self.team,
+                event=event,
+                distinct_id="buyer",
+                timestamp=timezone.now() - timedelta(days=1),
+                properties={
+                    "$lib": "web",
+                    "$is_identified": False,
+                    "$device_id": "device-1",
+                    "$pathname": "/",
+                },
+            )
+        _create_event(
+            team=self.team,
+            event="$feature_flag_called",
+            distinct_id="buyer",
+            timestamp=timezone.now() - timedelta(days=1),
+            properties={"$lib": "web", "$feature_flag": "setup-populated", "$feature_flag_response": "control"},
+        )
+        flush_persons_and_events()
+
+        response = self._post(
+            {
+                "target_event": "$pageview",
+                "target_properties": [{"key": "$pathname", "type": "event", "operator": "exact", "value": ["/"]}],
+                "metric_event": "purchase",
+            }
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.content
+        context = response.json()
+        assert {name: section["status"] for name, section in context.items()} == {
+            "team_defaults": "ok",
+            "sdk_profile": "ok",
+            "target_surface": "ok",
+            "candidate_metric": "ok",
+            "previous_experiments": "ok",
+            "shared_metrics": "ok",
+        }
+        assert context["sdk_profile"]["data"]["libs"][0]["lib"] == "web"
+        # The echoed filters are parsed and dumped through pydantic, so the operator reaches JSON
+        # as its value rather than as an enum the renderer cannot write.
+        assert context["target_surface"]["data"]["target_properties"] == [
+            {"key": "$pathname", "operator": "exact", "type": "event", "value": ["/"]}
+        ]
+        assert context["candidate_metric"]["data"]["funnel_baseline_stats"]["number_of_samples"] == 1
+        assert context["candidate_metric"]["data"]["mean_count_baseline_stats"]["number_of_samples"] == 1
+        assert context["previous_experiments"]["data"]["experiments"][0]["outcome"]["analyzed_exposures"] == 190
+        assert context["shared_metrics"]["data"]["metrics"][0]["name"] == "Revenue"
+
+
+class TestExperimentSerializerSuperset(unittest.TestCase):
+    """Structural guard: ExperimentBasicSerializer must stay a subset of ExperimentSerializer.
+
+    ExperimentBasicApi is a structural subset of ExperimentApi in generated frontend types.
+    If a field is added to the detail serializer but forgotten in the basic one the superset
+    invariant holds — but the reverse (basic grows a field not in detail) would break it, and
+    a mismatched read_only/required on a shared field would produce divergent nullability.
+    """
+
+    def test_basic_fields_are_subset_of_full_fields(self) -> None:
+        from products.experiments.backend.presentation.serializers import (
+            ExperimentBasicSerializer,
+            ExperimentSerializer,
+        )
+
+        basic = ExperimentBasicSerializer()
+        full = ExperimentSerializer()
+        basic_field_names = set(basic.fields.keys())
+        full_field_names = set(full.fields.keys())
+        extra = basic_field_names - full_field_names
+        self.assertFalse(
+            extra,
+            f"ExperimentBasicSerializer has fields not present in ExperimentSerializer: {extra}. "
+            "ExperimentBasicApi must remain a structural subset of ExperimentApi.",
+        )
+
+    def test_shared_fields_have_matching_read_only_and_required(self) -> None:
+        from products.experiments.backend.presentation.serializers import (
+            ExperimentBasicSerializer,
+            ExperimentSerializer,
+        )
+
+        basic = ExperimentBasicSerializer()
+        full = ExperimentSerializer()
+        shared = set(basic.fields.keys()) & set(full.fields.keys())
+        mismatches: list[str] = []
+        for name in sorted(shared):
+            b_field = basic.fields[name]
+            f_field = full.fields[name]
+            if b_field.read_only != f_field.read_only:
+                mismatches.append(f"{name}: read_only basic={b_field.read_only} full={f_field.read_only}")
+            if b_field.required != f_field.required:
+                mismatches.append(f"{name}: required basic={b_field.required} full={f_field.required}")
+        self.assertFalse(
+            mismatches,
+            "Shared fields have mismatched read_only/required between serializers:\n" + "\n".join(mismatches),
+        )
+
+
+class TestExperimentApiExposureCriteriaParity(unittest.TestCase):
+    """Structural guard: the slim API exposure-criteria schema must expose every writable field.
+
+    ``exposure_criteria`` is stored as a plain JSONField, so the backend accepts any field at
+    runtime. ``ExperimentApiExposureCriteria`` is the slim type that drives the OpenAPI spec and,
+    downstream, the MCP tool / frontend write schema. A field honored at runtime (read from
+    ``ExperimentExposureCriteria``) but missing from the slim type is silently stripped by the
+    generated client before it ever reaches the API — which is how ``multiple_variant_handling``
+    looked settable via ``experiment-get`` yet never saved via ``experiment-update``.
+    """
+
+    def test_api_schema_exposes_every_runtime_field(self) -> None:
+        from posthog.schema import ExperimentApiExposureCriteria, ExperimentExposureCriteria
+
+        runtime_fields = set(ExperimentExposureCriteria.model_fields)
+        api_fields = set(ExperimentApiExposureCriteria.model_fields)
+        dropped = runtime_fields - api_fields
+        self.assertFalse(
+            dropped,
+            f"ExperimentApiExposureCriteria omits exposure_criteria fields the runtime honors: {dropped}. "
+            "Generated write clients (MCP, frontend) strip these silently — add them to the slim API "
+            "type in frontend/src/queries/schema/schema-general.ts and rerun hogli build:schema.",
+        )
+
+
+class TestExperimentApiMetricParity(unittest.TestCase):
+    """A field missing from the slim API metric schema is stripped by the generated write clients."""
+
+    INTENTIONALLY_OMITTED = {
+        # Server-computed or internal.
+        "fingerprint",
+        "response",
+        "version",
+        # Shared-metric linkage, set through the shared metric endpoints.
+        "isSharedMetric",
+        "sharedMetricId",
+        # Breakdowns are not exposed on the write schema yet.
+        "breakdownFilter",
+        "breakdownAttributionType",
+        "breakdownAttributionValue",
+    }
+
+    def test_api_schema_exposes_every_runtime_field(self) -> None:
+        runtime_fields: set[str] = set()
+        for metric_model in (
+            ExperimentMeanMetric,
+            ExperimentFunnelMetric,
+            ExperimentRatioMetric,
+            ExperimentRetentionMetric,
+        ):
+            runtime_fields |= set(metric_model.model_fields)
+
+        api_fields = set(ExperimentApiMetric.model_fields)
+        dropped = runtime_fields - api_fields - self.INTENTIONALLY_OMITTED
+        self.assertFalse(
+            dropped,
+            f"ExperimentApiMetric omits metric fields the runtime honors: {dropped}. "
+            "Generated write clients (MCP, frontend) strip these silently — add them to the slim API "
+            "type in frontend/src/queries/schema/schema-general.ts and rerun hogli build:schema, or "
+            "add them to INTENTIONALLY_OMITTED with a reason.",
+        )
+
+
+class TestExperimentTags(APILicensedTest):
+    def _create_experiment(self, name: str, flag_key: str, tags: list[str] | None = None) -> dict:
+        payload: dict[str, Any] = {"name": name, "feature_flag_key": flag_key}
+        if tags is not None:
+            payload["tags"] = tags
+        response = self.client.post(f"/api/projects/{self.team.id}/experiments/", payload, format="json")
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        return response.json()
+
+    def test_create_with_tags_persists_and_normalizes_them(self):
+        # Guards the expected_fields allowlist in ExperimentSerializer.create: if tags stops being
+        # popped before that check, every tagged create fails with "Can't create keys: tags".
+        experiment = self._create_experiment("Tagged", "tags-create-flag", tags=["Growth", "checkout"])
+        assert sorted(experiment["tags"]) == ["checkout", "growth"]
+        detail = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment['id']}/").json()
+        assert sorted(detail["tags"]) == ["checkout", "growth"]
+
+    def test_update_replaces_tags_and_untagged_update_preserves_them(self):
+        experiment = self._create_experiment("Tagged", "tags-update-flag", tags=["one"])
+
+        # A PATCH that doesn't mention tags must not wipe them (tags=None no-op in update()).
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment['id']}/",
+            {"description": "still tagged"},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["tags"] == ["one"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment['id']}/",
+            {"tags": ["two", "three"]},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert sorted(response.json()["tags"]) == ["three", "two"]
+
+        # tags: [] clears (None preserves, [] clears — both ride the same pop in update())
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment['id']}/",
+            {"tags": []},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["tags"] == []
+        detail = self.client.get(f"/api/projects/{self.team.id}/experiments/{experiment['id']}/").json()
+        assert detail["tags"] == []
+
+    @parameterized.expand(
+        [
+            ("tags_match", 'tags=["growth"]', {"A"}),
+            ("tags_no_match", 'tags=["nonexistent"]', set()),
+            ("excluded_tags", 'excluded_tags=["growth"]', {"B", "C"}),
+            ("tags_and_excluded", 'tags=["shared"]&excluded_tags=["growth"]', {"B"}),
+        ]
+    )
+    def test_list_filters_by_tags(self, _name: str, query: str, expected_names: set[str]):
+        self._create_experiment("A", "tags-list-flag-a", tags=["growth", "shared"])
+        self._create_experiment("B", "tags-list-flag-b", tags=["shared"])
+        self._create_experiment("C", "tags-list-flag-c")
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/?{query}")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert {row["name"] for row in response.json()["results"]} == expected_names
+
+    def test_list_includes_tags(self):
+        # ExperimentBasicSerializer takes a different (deferred) queryset path than the detail
+        # serializer; this catches the list prefetch/serialization of tags breaking independently.
+        experiment = self._create_experiment("Tagged", "tags-list-flag", tags=["growth"])
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/")
+        row = next(r for r in response.json()["results"] if r["id"] == experiment["id"])
+        assert row["tags"] == ["growth"]
+
+    def test_bulk_update_tags(self):
+        # Wiring guard for TaggedItemViewSetMixin on the experiments viewset: team-scoped queryset,
+        # per-object mutation, and missing IDs reported as skipped.
+        experiment = self._create_experiment("Bulk", "tags-bulk-flag", tags=["existing"])
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/bulk_update_tags/",
+            {"ids": [experiment["id"], 999999], "action": "add", "tags": ["added"]},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        body = response.json()
+        assert body["updated"] == [{"id": experiment["id"], "tags": ["added", "existing"]}]
+        assert body["skipped"] == [{"id": 999999, "reason": "Not found or no edit access"}]
+
+    def test_bulk_update_tags_works_with_personal_api_key(self):
+        # scope_object_write_actions must include bulk_update_tags for PAT access — a config-only
+        # regression that no session-auth test would catch.
+        experiment = self._create_experiment("PAT", "tags-pat-flag")
+        personal_api_key = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="X",
+            user=self.user,
+            scopes=["experiment:write"],
+            secure_value=hash_key_value(personal_api_key),
+        )
+        self.client.logout()
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/bulk_update_tags/",
+            {"ids": [experiment["id"]], "action": "set", "tags": ["via-pat"]},
+            format="json",
+            headers={"authorization": f"Bearer {personal_api_key}"},
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["updated"] == [{"id": experiment["id"], "tags": ["via-pat"]}]
+
+    def test_matching_ids_applies_list_filters(self):
+        tagged = self._create_experiment("Tagged", "tags-matching-flag-a", tags=["growth"])
+        self._create_experiment("Untagged", "tags-matching-flag-b")
+        response = self.client.get(f'/api/projects/{self.team.id}/experiments/matching_ids/?tags=["growth"]')
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json() == {"ids": [tagged["id"]], "total": 1}
+
+    def test_matching_ids_excludes_view_only_experiments(self):
+        editable = self._create_experiment("Mine", "tags-acl-flag-a")
+
+        other_user = self._create_user("other-tags-acl@posthog.com")
+        flag = FeatureFlag.objects.create(team=self.team, created_by=other_user, key="tags-acl-flag-b")
+        view_only = Experiment.objects.create(team=self.team, name="Theirs", created_by=other_user, feature_flag=flag)
+        AccessControl.objects.create(
+            resource="experiment", resource_id=view_only.id, team=self.team, access_level="viewer"
+        )
+
+        response = self.client.get(f"/api/projects/{self.team.id}/experiments/matching_ids/")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert view_only.id not in response.json()["ids"]
+        assert editable["id"] in response.json()["ids"]
+
+
+class TestExperimentConcurrency(_HoistFlagConfigClientMixin, APILicensedTest):
+    """Optimistic concurrency on experiment updates: stale writes carrying `version` +
+    `original_experiment` merge concurrent metric changes per uuid and 409 on everything else.
+    Guards the incident class where a stale tab's full-array PATCH silently deleted metrics
+    other users had added since the tab loaded."""
+
+    def _metric(self, event: str) -> dict:
+        return {"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "EventsNode", "event": event}}
+
+    def _create_experiment(self, key: str, metrics: list | None = None, metrics_secondary: list | None = None) -> dict:
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": f"Concurrency {key}",
+                "feature_flag_key": key,
+                "parameters": {
+                    "feature_flag_variants": [
+                        {"key": "control", "name": "Control", "rollout_percentage": 50},
+                        {"key": "test", "name": "Test", "rollout_percentage": 50},
+                    ]
+                },
+                "metrics": metrics or [],
+                "metrics_secondary": metrics_secondary or [],
+                "allow_unknown_events": True,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
+        return response.json()
+
+    def _patch(self, experiment_id: int, payload: dict) -> Any:
+        return self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment_id}/",
+            {"allow_unknown_events": True, **payload},
+        )
+
+    def _original(self, snapshot: dict) -> dict:
+        """The base snapshot the frontend sends: the metric collections as this client last saw them."""
+        return {
+            "metrics": snapshot.get("metrics") or [],
+            "metrics_secondary": snapshot.get("metrics_secondary") or [],
+            "saved_metrics_ids": [
+                {"id": link["saved_metric"], "metadata": link["metadata"]}
+                for link in snapshot.get("saved_metrics") or []
+            ],
+        }
+
+    def _original_with_scalars(self, snapshot: dict) -> dict:
+        """The extended base the frontend sends: metric collections plus the scalar fields the
+        experiment surfaces PATCH, so the server can three-way merge scalars per field too."""
+        return {
+            **self._original(snapshot),
+            **{
+                field: snapshot.get(field)
+                for field in (
+                    "name",
+                    "description",
+                    "start_date",
+                    "end_date",
+                    "exposure_criteria",
+                    "stats_config",
+                    "running_time_calculation",
+                    "holdout_id",
+                    "conclusion",
+                    "conclusion_comment",
+                    "parameters",
+                    "excluded_variants",
+                    "only_count_matured_users",
+                )
+            },
+        }
+
+    def _events(self, metrics: list) -> set[str]:
+        return {metric["source"]["event"] for metric in metrics}
+
+    def test_stale_delete_merges_with_concurrent_additions(self) -> None:
+        # Incident replay: a stale tab deletes 1 of the 3 metrics it saw while teammates
+        # added 4 more; the stale write must not remove the 4 unseen metrics.
+        snapshot = self._create_experiment(
+            "incident-replay", metrics_secondary=[self._metric(f"e{i}") for i in (1, 2, 3)]
+        )
+        teammate_write = self._patch(
+            snapshot["id"],
+            {"metrics_secondary": [*snapshot["metrics_secondary"], *(self._metric(f"e{i}") for i in (4, 5, 6, 7))]},
+        )
+        self.assertEqual(teammate_write.status_code, status.HTTP_200_OK)
+
+        stale_delete = self._patch(
+            snapshot["id"],
+            {
+                "metrics_secondary": snapshot["metrics_secondary"][1:],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_delete.status_code, status.HTTP_200_OK, stale_delete.json())
+        result = stale_delete.json()
+        self.assertEqual(self._events(result["metrics_secondary"]), {"e2", "e3", "e4", "e5", "e6", "e7"})
+
+    def test_concurrent_additions_of_different_metrics_both_survive(self) -> None:
+        snapshot = self._create_experiment("both-add", metrics=[self._metric("base")])
+        self.assertEqual(
+            self._patch(snapshot["id"], {"metrics": [*snapshot["metrics"], self._metric("theirs")]}).status_code,
+            status.HTTP_200_OK,
+        )
+
+        stale_add = self._patch(
+            snapshot["id"],
+            {
+                "metrics": [*snapshot["metrics"], self._metric("mine")],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_add.status_code, status.HTTP_200_OK, stale_add.json())
+        self.assertEqual(self._events(stale_add.json()["metrics"]), {"base", "theirs", "mine"})
+
+    def test_same_metric_edited_by_both_conflicts(self) -> None:
+        snapshot = self._create_experiment("double-edit", metrics=[self._metric("original_event")])
+        their_metric = {**snapshot["metrics"][0], "source": {"kind": "EventsNode", "event": "their_event"}}
+        self.assertEqual(self._patch(snapshot["id"], {"metrics": [their_metric]}).status_code, status.HTTP_200_OK)
+
+        my_metric = {**snapshot["metrics"][0], "source": {"kind": "EventsNode", "event": "my_event"}}
+        stale_edit = self._patch(
+            snapshot["id"],
+            {
+                "metrics": [my_metric],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_edit.status_code, status.HTTP_409_CONFLICT)
+        body = stale_edit.json()
+        self.assertIn("detail", body)
+        self.assertEqual(body["current_version"], 1)
+        self.assertEqual(body["conflicting_metric_uuids"], [snapshot["metrics"][0]["uuid"]])
+        experiment = Experiment.objects.get(id=snapshot["id"])
+        self.assertEqual((experiment.metrics or [])[0]["source"]["event"], "their_event")
+
+    @parameterized.expand(
+        [
+            ("stale_delete_vs_concurrent_edit", "delete_mine"),
+            ("stale_edit_vs_concurrent_delete", "delete_theirs"),
+        ]
+    )
+    def test_edit_vs_delete_of_same_metric_conflicts(self, _name: str, mode: str) -> None:
+        snapshot = self._create_experiment(f"edit-vs-delete-{mode}", metrics=[self._metric("contested")])
+        edited = {**snapshot["metrics"][0], "source": {"kind": "EventsNode", "event": "edited"}}
+        theirs = [] if mode == "delete_theirs" else [edited]
+        self.assertEqual(self._patch(snapshot["id"], {"metrics": theirs}).status_code, status.HTTP_200_OK)
+
+        mine = [edited] if mode == "delete_theirs" else []
+        stale_write = self._patch(
+            snapshot["id"],
+            {
+                "metrics": mine,
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_write.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(stale_write.json()["conflicting_metric_uuids"], [snapshot["metrics"][0]["uuid"]])
+
+    @parameterized.expand(
+        [
+            ("their_description_edit", {"description": "theirs"}, "description"),
+            ("their_stats_config_edit", {"stats_config": {"method": "frequentist"}}, "stats_config"),
+        ]
+    )
+    def test_concurrent_scalar_edit_does_not_block_stale_metrics_write(
+        self, _name: str, their_payload: dict, edited_field: str
+    ) -> None:
+        # A metric-only PATCH omits scalar fields, so it can't clobber them: the other
+        # side's scalar edit and this stale metric addition must both survive.
+        snapshot = self._create_experiment(f"scalar-{edited_field}", metrics=[self._metric("base")])
+        self.assertEqual(self._patch(snapshot["id"], their_payload).status_code, status.HTTP_200_OK)
+
+        stale_metrics_write = self._patch(
+            snapshot["id"],
+            {
+                "metrics": [*snapshot["metrics"], self._metric("mine")],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_metrics_write.status_code, status.HTTP_200_OK, stale_metrics_write.json())
+        self.assertEqual(self._events(stale_metrics_write.json()["metrics"]), {"base", "mine"})
+        their_value = their_payload[edited_field]
+        current_value = stale_metrics_write.json()[edited_field]
+        if isinstance(their_value, dict):
+            self.assertEqual({key: current_value.get(key) for key in their_value}, their_value)
+        else:
+            self.assertEqual(current_value, their_value)
+
+    def test_stale_scalar_write_without_base_value_conflicts_with_any_concurrent_change(self) -> None:
+        snapshot = self._create_experiment("stale-scalar", metrics=[self._metric("base")])
+        concurrent = self._patch(snapshot["id"], {"metrics": [*snapshot["metrics"], self._metric("theirs")]})
+        self.assertEqual(concurrent.status_code, status.HTTP_200_OK)
+
+        stale_description_write = self._patch(
+            snapshot["id"],
+            {
+                "description": "mine",
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_description_write.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("description", stale_description_write.json()["conflicting_fields"])
+
+    def test_stale_start_date_change_merges_over_concurrent_calculator_autosave(self) -> None:
+        # Incident replay: the running-time calculator auto-saves its estimate on results load,
+        # silently bumping the version; the user's start-date change from the same (now stale)
+        # tab must apply instead of 409ing. Also exercises the datetime base: the client echoes
+        # the ISO string it read while the row holds a datetime.
+        created = self._create_experiment("autosave-race", metrics=[self._metric("base")])
+        launch = self.client.post(f"/api/projects/{self.team.id}/experiments/{created['id']}/launch/")
+        self.assertEqual(launch.status_code, status.HTTP_200_OK, launch.json())
+        snapshot = launch.json()
+
+        autosave = self._patch(
+            snapshot["id"],
+            {"running_time_calculation": {"recommended_running_time": 12, "recommended_sample_size": 3400}},
+        )
+        self.assertEqual(autosave.status_code, status.HTTP_200_OK)
+
+        new_start = "2026-07-27T16:10:00Z"
+        stale_start_date_write = self._patch(
+            snapshot["id"],
+            {
+                "start_date": new_start,
+                "version": snapshot["version"],
+                "original_experiment": self._original_with_scalars(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_start_date_write.status_code, status.HTTP_200_OK, stale_start_date_write.json())
+        result = stale_start_date_write.json()
+        self.assertEqual(parser.parse(result["start_date"]), parser.parse(new_start))
+        self.assertEqual(result["running_time_calculation"]["recommended_running_time"], 12)
+
+    @parameterized.expand(
+        [
+            ("with_scalar_base", True),
+            ("without_scalar_base", False),
+        ]
+    )
+    def test_stale_write_resending_unchanged_scalar_is_not_a_conflict(self, _name: str, with_base: bool) -> None:
+        # The distribution modal resends holdout_id even when the user only changed the variant
+        # split; an unchanged value must not conflict just because the write is stale.
+        holdout = ExperimentHoldout.objects.create(
+            team=self.team,
+            name=f"Concurrency holdout {_name}",
+            filters=[{"properties": [], "rollout_percentage": 10, "variant": "holdout-x"}],
+            created_by=self.user,
+        )
+        created = self._create_experiment(f"noop-holdout-{with_base}", metrics=[self._metric("base")])
+        linked = self._patch(created["id"], {"holdout_id": holdout.id})
+        self.assertEqual(linked.status_code, status.HTTP_200_OK)
+        snapshot = linked.json()
+
+        concurrent = self._patch(snapshot["id"], {"metrics": [*snapshot["metrics"], self._metric("theirs")]})
+        self.assertEqual(concurrent.status_code, status.HTTP_200_OK)
+
+        stale_echo = self._patch(
+            snapshot["id"],
+            {
+                "holdout_id": holdout.id,
+                "version": snapshot["version"],
+                "original_experiment": self._original_with_scalars(snapshot) if with_base else self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_echo.status_code, status.HTTP_200_OK, stale_echo.json())
+        self.assertEqual(stale_echo.json()["holdout_id"], holdout.id)
+        self.assertEqual(self._events(stale_echo.json()["metrics"]), {"base", "theirs"})
+
+    def test_stale_write_echoing_base_scalar_does_not_revert_concurrent_edit(self) -> None:
+        # A form save resends fields the user didn't touch; echoing the base value must not
+        # revert what a teammate changed meanwhile, while the user's own edit still applies.
+        snapshot = self._create_experiment("echo-base", metrics=[self._metric("base")])
+        their_edit = self._patch(snapshot["id"], {"description": "rewritten by a teammate"})
+        self.assertEqual(their_edit.status_code, status.HTTP_200_OK)
+
+        stale_form_save = self._patch(
+            snapshot["id"],
+            {
+                "description": snapshot["description"],
+                "name": "New name from the stale tab",
+                "version": snapshot["version"],
+                "original_experiment": self._original_with_scalars(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_form_save.status_code, status.HTTP_200_OK, stale_form_save.json())
+        self.assertEqual(stale_form_save.json()["description"], "rewritten by a teammate")
+        self.assertEqual(stale_form_save.json()["name"], "New name from the stale tab")
+
+    def test_stale_same_scalar_field_double_edit_still_conflicts(self) -> None:
+        # All three values must differ: an edit that matches the base is not "my change"
+        # (the echo rule), and one that matches the current value is a no-op.
+        snapshot = self._create_experiment("double-scalar", metrics=[self._metric("base")])
+        their_edit = self._patch(snapshot["id"], {"description": "their rewrite"})
+        self.assertEqual(their_edit.status_code, status.HTTP_200_OK)
+
+        stale_conflicting_edit = self._patch(
+            snapshot["id"],
+            {
+                "description": "my rewrite",
+                "version": snapshot["version"],
+                "original_experiment": self._original_with_scalars(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_conflicting_edit.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(stale_conflicting_edit.json()["conflicting_fields"], ["description"])
+        experiment = Experiment.objects.get(id=snapshot["id"])
+        self.assertEqual(experiment.description, "their rewrite")
+
+    def test_stale_variant_notes_write_merges_on_flag_linked_experiment(self) -> None:
+        # Incident replay for the variant notes/images path: reads project the linked flag's
+        # config into `parameters` while writes strip it before storage, so the client's base
+        # never matches the stored column byte-for-byte — the merge must compare `parameters`
+        # in stored shape instead of treating the projection as a concurrent edit.
+        snapshot = self._create_experiment("notes-over-autosave", metrics=[self._metric("base")])
+        self.assertIn("feature_flag_variants", snapshot["parameters"])
+
+        autosave = self._patch(
+            snapshot["id"],
+            {"running_time_calculation": {"recommended_running_time": 9, "recommended_sample_size": 1200}},
+        )
+        self.assertEqual(autosave.status_code, status.HTTP_200_OK)
+
+        stale_notes_write = self._patch(
+            snapshot["id"],
+            {
+                "parameters": {**snapshot["parameters"], "variant_notes": {"control": "baseline notes"}},
+                "version": snapshot["version"],
+                "original_experiment": self._original_with_scalars(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_notes_write.status_code, status.HTTP_200_OK, stale_notes_write.json())
+        result = stale_notes_write.json()
+        self.assertEqual(result["parameters"]["variant_notes"], {"control": "baseline notes"})
+        self.assertEqual(result["running_time_calculation"]["recommended_running_time"], 9)
+
+    def test_stale_reorder_is_stored_as_sent_and_keeps_the_concurrent_addition(self) -> None:
+        snapshot = self._create_experiment("reorder", metrics=[self._metric("m1"), self._metric("m2")])
+        added = self._patch(snapshot["id"], {"metrics": [*snapshot["metrics"], self._metric("m3")]})
+        self.assertEqual(added.status_code, status.HTTP_200_OK)
+
+        uuid_1, uuid_2 = (metric["uuid"] for metric in snapshot["metrics"])
+        stale_reorder = self._patch(
+            snapshot["id"],
+            {
+                "metrics": snapshot["metrics"],
+                "primary_metrics_ordered_uuids": [uuid_2, uuid_1],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_reorder.status_code, status.HTTP_200_OK, stale_reorder.json())
+        # The ordering is a display hint, so the unlisted m3 renders last without an entry.
+        self.assertEqual(stale_reorder.json()["primary_metrics_ordered_uuids"], [uuid_2, uuid_1])
+        self.assertEqual(self._events(stale_reorder.json()["metrics"]), {"m1", "m2", "m3"})
+
+    def test_stale_shared_metric_removal_keeps_concurrently_linked_metric(self) -> None:
+        saved_1 = ExperimentSavedMetric.objects.create(
+            team=self.team,
+            name="Shared one",
+            query={"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "EventsNode", "event": "s1"}},
+        )
+        saved_2 = ExperimentSavedMetric.objects.create(
+            team=self.team,
+            name="Shared two",
+            query={"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "EventsNode", "event": "s2"}},
+        )
+        created = self._create_experiment("shared-removal")
+        linked = self._patch(
+            created["id"], {"saved_metrics_ids": [{"id": saved_1.id, "metadata": {"type": "secondary"}}]}
+        )
+        self.assertEqual(linked.status_code, status.HTTP_200_OK)
+        snapshot = linked.json()
+
+        concurrent_link = self._patch(
+            snapshot["id"],
+            {
+                "saved_metrics_ids": [
+                    {"id": saved_1.id, "metadata": {"type": "secondary"}},
+                    {"id": saved_2.id, "metadata": {"type": "secondary"}},
+                ]
+            },
+        )
+        self.assertEqual(concurrent_link.status_code, status.HTTP_200_OK)
+
+        stale_removal = self._patch(
+            snapshot["id"],
+            {
+                "saved_metrics_ids": [],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_removal.status_code, status.HTTP_200_OK, stale_removal.json())
+        remaining = [link["saved_metric"] for link in stale_removal.json()["saved_metrics"]]
+        self.assertEqual(remaining, [saved_2.id])
+
+    def test_shared_metric_metadata_double_edit_conflicts(self) -> None:
+        saved = ExperimentSavedMetric.objects.create(
+            team=self.team,
+            name="Contested shared",
+            query={"kind": "ExperimentMetric", "metric_type": "mean", "source": {"kind": "EventsNode", "event": "s1"}},
+        )
+        created = self._create_experiment("shared-metadata")
+        linked = self._patch(created["id"], {"saved_metrics_ids": [{"id": saved.id, "metadata": {"type": "primary"}}]})
+        self.assertEqual(linked.status_code, status.HTTP_200_OK)
+        snapshot = linked.json()
+
+        their_edit = self._patch(
+            snapshot["id"], {"saved_metrics_ids": [{"id": saved.id, "metadata": {"type": "secondary"}}]}
+        )
+        self.assertEqual(their_edit.status_code, status.HTTP_200_OK)
+
+        stale_edit = self._patch(
+            snapshot["id"],
+            {
+                "saved_metrics_ids": [{"id": saved.id, "metadata": {"type": "primary", "breakdowns": []}}],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_edit.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(stale_edit.json()["conflicting_metric_uuids"], [f"saved_metric:{saved.id}"])
+
+    def test_update_without_version_keeps_last_write_wins_behavior(self) -> None:
+        snapshot = self._create_experiment("no-version", metrics=[self._metric("base")])
+        self.assertEqual(
+            self._patch(snapshot["id"], {"metrics": [*snapshot["metrics"], self._metric("theirs")]}).status_code,
+            status.HTTP_200_OK,
+        )
+
+        unversioned_write = self._patch(snapshot["id"], {"metrics": snapshot["metrics"]})
+
+        self.assertEqual(unversioned_write.status_code, status.HTTP_200_OK)
+        self.assertEqual(self._events(unversioned_write.json()["metrics"]), {"base"})
+
+    def test_null_stored_version_is_treated_as_zero(self) -> None:
+        snapshot = self._create_experiment("null-version", metrics=[self._metric("base")])
+        Experiment.objects.filter(id=snapshot["id"]).update(version=None)
+
+        versioned_write = self._patch(snapshot["id"], {"description": "updated", "version": 0})
+
+        self.assertEqual(versioned_write.status_code, status.HTTP_200_OK)
+        self.assertEqual(versioned_write.json()["version"], 1)
+
+    def test_sequential_writes_with_refreshed_version_increment_monotonically(self) -> None:
+        snapshot = self._create_experiment("sequential", metrics=[self._metric("base")])
+        first = self._patch(snapshot["id"], {"description": "first", "version": snapshot["version"]})
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(first.json()["version"], snapshot["version"] + 1)
+
+        second = self._patch(snapshot["id"], {"description": "second", "version": first.json()["version"]})
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.json()["version"], snapshot["version"] + 2)
+
+    def test_launch_fingerprint_churn_is_not_a_phantom_metric_conflict(self) -> None:
+        snapshot = self._create_experiment("launch-churn", metrics=[self._metric("base")])
+        launch = self.client.post(f"/api/projects/{self.team.id}/experiments/{snapshot['id']}/launch/")
+        self.assertEqual(launch.status_code, status.HTTP_200_OK, launch.json())
+
+        # The launch rewrote every metric fingerprint; that server-side churn must not read
+        # as a concurrent edit of the metric this stale write edits.
+        my_metric = {**snapshot["metrics"][0], "source": {"kind": "EventsNode", "event": "edited"}}
+        stale_edit = self._patch(
+            snapshot["id"],
+            {
+                "metrics": [my_metric],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_edit.status_code, status.HTTP_200_OK, stale_edit.json())
+        self.assertEqual(self._events(stale_edit.json()["metrics"]), {"edited"})
+        self.assertIsNotNone(stale_edit.json()["start_date"])
+
+    def test_stale_metric_addition_merges_after_concurrent_launch(self) -> None:
+        # A concurrent launch changes start_date, but a metric-only PATCH omits it,
+        # so the stale addition merges and the launch survives.
+        snapshot = self._create_experiment("launch-merge", metrics=[self._metric("base")])
+        launch = self.client.post(f"/api/projects/{self.team.id}/experiments/{snapshot['id']}/launch/")
+        self.assertEqual(launch.status_code, status.HTTP_200_OK)
+
+        stale_edit = self._patch(
+            snapshot["id"],
+            {
+                "metrics": [*snapshot["metrics"], self._metric("mine")],
+                "version": snapshot["version"],
+                "original_experiment": self._original(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_edit.status_code, status.HTTP_200_OK, stale_edit.json())
+        self.assertEqual(self._events(stale_edit.json()["metrics"]), {"base", "mine"})
+        self.assertIsNotNone(stale_edit.json()["start_date"])
+
+    def test_version_without_original_is_plain_compare_and_swap(self) -> None:
+        snapshot = self._create_experiment("plain-cas", metrics=[self._metric("base")])
+        self.assertEqual(
+            self._patch(snapshot["id"], {"metrics": [*snapshot["metrics"], self._metric("theirs")]}).status_code,
+            status.HTTP_200_OK,
+        )
+
+        stale_write = self._patch(
+            snapshot["id"],
+            {"metrics": snapshot["metrics"], "version": snapshot["version"]},
+        )
+
+        self.assertEqual(stale_write.status_code, status.HTTP_409_CONFLICT)
+        body = stale_write.json()
+        self.assertEqual(body["current_version"], snapshot["version"] + 1)
+        self.assertNotIn("conflicting_fields", body)
+
+    def test_duplicate_patch_racing_the_lock_window_succeeds_as_noop(self) -> None:
+        # The UI sometimes dispatches one save as two parallel PATCHes: the loser reaches the
+        # row-locked version re-check only after the winner committed the identical change.
+        # It must succeed with the current state instead of 409ing on a change that saved.
+        snapshot = self._create_experiment("lock-window-twin", metrics=[self._metric("base")])
+        real_sync = ExperimentService._sync_feature_flag_on_update
+
+        def twin_write_then_sync(service: ExperimentService, *args: Any, **kwargs: Any) -> None:
+            Experiment.objects.filter(pk=snapshot["id"]).update(description="the same edit", version=F("version") + 1)
+            return real_sync(service, *args, **kwargs)
+
+        with patch.object(
+            ExperimentService, "_sync_feature_flag_on_update", autospec=True, side_effect=twin_write_then_sync
+        ):
+            duplicate = self._patch(
+                snapshot["id"],
+                {
+                    "description": "the same edit",
+                    "version": snapshot["version"],
+                    "original_experiment": self._original_with_scalars(snapshot),
+                },
+            )
+
+        self.assertEqual(duplicate.status_code, status.HTTP_200_OK, duplicate.json())
+        self.assertEqual(duplicate.json()["description"], "the same edit")
+        self.assertEqual(duplicate.json()["version"], snapshot["version"] + 1)
+
+    def test_stale_running_time_config_edit_merges_over_estimate_churn(self) -> None:
+        # The calculator auto-save rewrites recommended_* on every results load, so a tab is
+        # routinely several versions behind holding a stale estimate echo. Editing the MDE from
+        # that tab must not read as a double-edit of running_time_calculation.
+        created = self._create_experiment("rtc-churn", metrics=[self._metric("base")])
+        seeded = self._patch(
+            created["id"],
+            {
+                "running_time_calculation": {
+                    "minimum_detectable_effect": 5,
+                    "recommended_running_time": 9,
+                    "recommended_sample_size": 800,
+                }
+            },
+        )
+        self.assertEqual(seeded.status_code, status.HTTP_200_OK)
+        snapshot = seeded.json()
+
+        churn = self._patch(
+            snapshot["id"],
+            {
+                "running_time_calculation": {
+                    "minimum_detectable_effect": 5,
+                    "recommended_running_time": 30,
+                    "recommended_sample_size": 4000,
+                }
+            },
+        )
+        self.assertEqual(churn.status_code, status.HTTP_200_OK)
+
+        stale_config_edit = self._patch(
+            snapshot["id"],
+            {
+                "running_time_calculation": {
+                    "minimum_detectable_effect": 10,
+                    "recommended_running_time": 9,
+                    "recommended_sample_size": 800,
+                },
+                "version": snapshot["version"],
+                "original_experiment": self._original_with_scalars(snapshot),
+            },
+        )
+
+        self.assertEqual(stale_config_edit.status_code, status.HTTP_200_OK, stale_config_edit.json())
+        self.assertEqual(stale_config_edit.json()["running_time_calculation"]["minimum_detectable_effect"], 10)
+
+
+_SHIP_TEST_VARIANT = {
+    "feature_flag": {
+        "filters": {
+            "multivariate": {
+                "variants": [{"key": "control", "rollout_percentage": 0}, {"key": "test", "rollout_percentage": 100}]
+            }
+        }
+    },
+    "update_feature_flag_params": True,
+}
+
+_SHIP_TEST_VARIANT_LEGACY = {
+    "parameters": {
+        "feature_flag_variants": [
+            {"key": "control", "rollout_percentage": 0},
+            {"key": "test", "rollout_percentage": 100},
+        ]
+    },
+    "update_feature_flag_params": True,
+}
+
+
+class TestExperimentScoutCallerRules(APILicensedTest):
+    def _experiment(self, *, launched: bool) -> Experiment:
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/experiments/",
+            {
+                "name": "Scout rules",
+                "feature_flag_key": "scout-rules-flag",
+                "allow_unknown_events": True,
+                "metrics": [
+                    {
+                        "kind": "ExperimentMetric",
+                        "metric_type": "mean",
+                        "source": {"kind": "EventsNode", "event": "$pageview"},
+                    }
+                ],
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        if launched:
+            launch = self.client.post(f"/api/projects/{self.team.id}/experiments/{response.json()['id']}/launch/")
+            assert launch.status_code == status.HTTP_200_OK, launch.json()
+        return Experiment.objects.get(id=response.json()["id"])
+
+    def _authenticate(self, scope: str) -> None:
+        application = OAuthApplication.objects.create(
+            name="Signals scout sandbox",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            algorithm="RS256",
+            redirect_uris="https://example.com/callback",
+            organization=self.organization,
+            user=self.user,
+        )
+        token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=application,
+            token="pha_experiment_scout_rules_test",
+            scope=scope,
+            expires=timezone.now() + timedelta(hours=1),
+            scoped_teams=[self.team.id],
+        )
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+    @parameterized.expand(
+        [
+            ("scout_soft_delete", True, "patch", "", {"deleted": True}, True, False, 403),
+            ("scout_unhashable_deleted", True, "patch", "", {"deleted": [True]}, True, False, 400),
+            ("scout_copy_to_project", True, "post", "copy_to_project/", {}, True, False, 403),
+            ("scout_migrate", True, "post", "migrate/", {}, True, False, 403),
+            ("scout_end_with_cleanup_pr", True, "post", "end/", {"open_cleanup_pr": True}, True, False, 403),
+            ("scout_ship_variant", True, "post", "ship_variant/", {"variant_key": "test"}, True, False, 403),
+            (
+                "scout_ship_variant_with_flag_write",
+                True,
+                "post",
+                "ship_variant/",
+                {"variant_key": "test"},
+                True,
+                True,
+                200,
+            ),
+            ("scout_live_flag_rollout", True, "patch", "", _SHIP_TEST_VARIANT, True, False, 403),
+            ("scout_live_flag_rollout_legacy", True, "patch", "", _SHIP_TEST_VARIANT_LEGACY, True, False, 403),
+            ("scout_live_flag_rollout_with_flag_write", True, "patch", "", _SHIP_TEST_VARIANT, True, True, 200),
+            ("scout_draft_flag_rollout", False, "patch", "", _SHIP_TEST_VARIANT, True, False, 200),
+            ("scout_pause", True, "post", "pause/", {}, True, False, 200),
+            ("non_scout_soft_delete", True, "patch", "", {"deleted": True}, False, False, 200),
+            ("non_scout_ship_variant", True, "post", "ship_variant/", {"variant_key": "test"}, False, False, 200),
+            ("non_scout_live_flag_rollout", True, "patch", "", _SHIP_TEST_VARIANT, False, False, 200),
+        ]
+    )
+    def test_scout_experiment_writes(
+        self,
+        _name: str,
+        launched: bool,
+        method: str,
+        path: str,
+        body: dict[str, Any],
+        is_scout: bool,
+        with_flag_write: bool,
+        expected_status: int,
+    ) -> None:
+        experiment = self._experiment(launched=launched)
+        assert experiment.feature_flag is not None
+        flag_filters_before = experiment.feature_flag.filters
+        scopes = ["experiment:read", "experiment:write"]
+        if is_scout:
+            # A real scout token also carries `task:write` from INTERNAL_SCOPES.
+            scopes += ["signal_scout_internal:write", "task:write"]
+        if with_flag_write:
+            scopes.append("feature_flag:write")
+        self._authenticate(" ".join(scopes))
+
+        response = getattr(self.client, method)(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}/{path}", body, format="json"
+        )
+
+        assert response.status_code == expected_status, response.json()
+        experiment.refresh_from_db()
+        experiment.feature_flag.refresh_from_db()
+        if expected_status >= 400:
+            assert not experiment.deleted
+            assert experiment.end_date is None
+            assert experiment.feature_flag.filters == flag_filters_before
+            assert Experiment.objects.filter(team=self.team).count() == 1
+
+    @parameterized.expand([("running", True, False), ("draft_on_live_flag", False, True)])
+    def test_scout_cannot_change_a_live_flag_holdout(self, _name: str, launched: bool, reuse_live_flag: bool) -> None:
+        if reuse_live_flag:
+            FeatureFlag.objects.create(
+                team=self.team,
+                created_by=self.user,
+                key="scout-rules-flag",
+                active=True,
+                filters={
+                    "groups": [{"properties": [], "rollout_percentage": 100}],
+                    "multivariate": {
+                        "variants": [
+                            {"key": "control", "rollout_percentage": 50},
+                            {"key": "test", "rollout_percentage": 50},
+                        ]
+                    },
+                },
+            )
+        experiment = self._experiment(launched=launched)
+        assert experiment.feature_flag is not None
+        flag_filters_before = experiment.feature_flag.filters
+        holdout = ExperimentHoldout.objects.create(
+            team=self.team,
+            name="Scout holdout",
+            created_by=self.user,
+            filters=[{"properties": [], "rollout_percentage": 10, "variant": "holdout-scout"}],
+        )
+        self._authenticate("experiment:read experiment:write signal_scout_internal:write task:write")
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/experiments/{experiment.id}/",
+            {"holdout_id": holdout.id, "update_feature_flag_params": True},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN, response.json()
+        experiment.refresh_from_db()
+        experiment.feature_flag.refresh_from_db()
+        assert experiment.holdout is None
+        assert experiment.feature_flag.filters == flag_filters_before

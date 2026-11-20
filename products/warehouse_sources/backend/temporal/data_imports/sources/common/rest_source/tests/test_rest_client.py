@@ -1,0 +1,845 @@
+import json
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest
+from unittest.mock import MagicMock, patch
+
+from parameterized import parameterized
+from requests import Response
+from requests.exceptions import ChunkedEncodingError, ProxyError, ReadTimeout, TooManyRedirects
+
+from posthog.temporal.common.errors import NonReportableError
+
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.auth import APIKeyAuth
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.exceptions import (
+    IgnoreResponseException,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.paginators import (
+    BasePaginator,
+    SinglePagePaginator,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client import (
+    RESTClient,
+    RESTClientNonRetryableError,
+    RESTClientRetryableError,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.safe_point import activate_safe_point
+
+
+def _make_response(json_body: Any, status_code: int = 200) -> Response:
+    resp = Response()
+    resp.status_code = status_code
+    resp._content = json.dumps(json_body).encode()
+    resp.headers["Content-Type"] = "application/json"
+    return resp
+
+
+def _make_empty_response(content: bytes = b"", status_code: int = 200) -> Response:
+    # A successful response whose body is empty (or whitespace-only) — `response.json()`
+    # raises "Expecting value: line 1 column 1 (char 0)", the shape an endpoint returns
+    # when it has nothing to send back.
+    resp = Response()
+    resp.status_code = status_code
+    resp._content = content
+    resp.headers["Content-Type"] = "application/json"
+    resp.url = "https://api.example.com/items"
+    return resp
+
+
+def _make_truncated_response(status_code: int = 200) -> Response:
+    # Simulates a body cut off mid-stream — `response.json()` raises a JSONDecodeError
+    # ("Unterminated string"), the same shape we see when an upstream truncates a large page.
+    resp = Response()
+    resp.status_code = status_code
+    resp._content = b'{"results": [{"id": 1, "name": "unterminated'
+    resp.headers["Content-Type"] = "application/json"
+    resp.url = "https://api.example.com/items"
+    return resp
+
+
+def _make_non_json_response(content: bytes, status_code: int = 200) -> Response:
+    # A successful response whose body never begins as JSON — an HTML/plain-text error
+    # page or login redirect returned with a 2xx. `response.json()` raises "Expecting
+    # value: line 1 column 1 (char 0)", identical to a truncated body cut off at the start.
+    resp = Response()
+    resp.status_code = status_code
+    resp._content = content
+    resp.headers["Content-Type"] = "application/json"
+    resp.url = "https://api.example.com/items"
+    return resp
+
+
+class TestRESTClient:
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_paginate_single_page(self, MockSession) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        mock_session.send.return_value = _make_response({"results": [{"id": 1}, {"id": 2}]})
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert len(pages) == 1
+        assert pages[0] == [{"id": 1}, {"id": 2}]
+
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_paginate_multiple_pages(self, MockSession) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        responses = [
+            _make_response([{"id": 1}]),
+            _make_response([{"id": 2}]),
+        ]
+        mock_session.send.side_effect = responses
+
+        class TwoPagePaginator(BasePaginator):
+            def __init__(self):
+                super().__init__()
+                self._page = 0
+
+            def update_state(self, response, data=None):
+                self._page += 1
+                self._has_next_page = self._page < 2
+
+            def update_request(self, request):
+                pass
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(client.paginate(path="/items", paginator=TwoPagePaginator()))
+
+        assert len(pages) == 2
+        assert pages[0] == [{"id": 1}]
+        assert pages[1] == [{"id": 2}]
+
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_paginate_with_hooks(self, MockSession) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        mock_session.send.return_value = _make_response({"data": [{"id": 1}]})
+
+        hook_called = []
+
+        def my_hook(response, **kwargs):
+            hook_called.append(True)
+
+        client = RESTClient(base_url="https://api.example.com")
+        list(
+            client.paginate(
+                path="/items",
+                data_selector="data",
+                paginator=SinglePagePaginator(),
+                hooks={"response": [my_hook]},
+            )
+        )
+
+        assert len(hook_called) == 1
+
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_paginate_ignore_response_breaks_loop(self, MockSession) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        def raise_ignore(response, **kwargs):
+            raise IgnoreResponseException()
+
+        mock_session.send.return_value = _make_response({"data": []})
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(
+            client.paginate(
+                path="/items",
+                paginator=SinglePagePaginator(),
+                hooks={"response": [raise_ignore]},
+            )
+        )
+
+        assert len(pages) == 0
+
+    # The auth's secret must be registered with the tracked session so it's masked from
+    # logs even when injected into a query param / custom header; no auth → nothing to redact.
+    @pytest.mark.parametrize(
+        "auth,expected_redact_values",
+        [
+            (APIKeyAuth(api_key="sk_live_x", name="key", location="query"), ("sk_live_x",)),
+            (None, ()),
+        ],
+    )
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_builds_session_with_credentials_for_redaction(self, MockSession, auth, expected_redact_values) -> None:
+        MockSession.return_value.headers = {}
+        RESTClient(base_url="https://api.example.com", auth=auth)
+        assert MockSession.call_args.kwargs["redact_values"] == expected_redact_values
+
+    def test_join_url(self) -> None:
+        client = RESTClient(base_url="https://api.example.com")
+        assert client._join_url("/items") == "https://api.example.com/items"
+        assert client._join_url("items") == "https://api.example.com/items"
+
+    def test_join_url_absolute_path(self) -> None:
+        client = RESTClient(base_url="https://api.example.com")
+        assert client._join_url("https://other.com/items") == "https://other.com/items"
+
+    @parameterized.expand(
+        [
+            # Each checkpoint is followed by a safe point, never preceded by one, so the staged
+            # cursor covers the page.
+            ("after_the_page", False, ["page", {"page": 1}, "safe_point", "page", None, "safe_point"]),
+            ("before_the_page", True, [{"page": 1}, "page", "safe_point", None, "page", "safe_point"]),
+        ]
+    )
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_paginate_invokes_resume_hook_once_per_page(
+        self, _name: str, before_yield: bool, expected: list[Any], MockSession
+    ) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        responses = [
+            _make_response([{"id": 1}]),
+            _make_response([{"id": 2}]),
+        ]
+        mock_session.send.side_effect = responses
+
+        class TwoPagePaginator(BasePaginator):
+            def __init__(self):
+                super().__init__()
+                self._page = 0
+
+            def update_state(self, response, data=None):
+                self._page += 1
+                self._has_next_page = self._page < 2
+
+            def update_request(self, request):
+                pass
+
+            def get_resume_state(self):
+                return {"page": self._page}
+
+        saved: list[Any] = []
+
+        client = RESTClient(base_url="https://api.example.com")
+        with activate_safe_point(lambda: saved.append("safe_point"), covers_framework_checkpoints=True):
+            for _page in client.paginate(
+                path="/items",
+                paginator=TwoPagePaginator(),
+                resume_hook=None if before_yield else saved.append,
+                page_state_hook=(lambda state, _has_next_page: saved.append(state)) if before_yield else None,
+            ):
+                saved.append("page")
+
+        # The hook gets the next-page state, then None on the terminal page (nothing to resume to).
+        assert saved == expected
+
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_paginate_invokes_safe_point_without_resume_hook(self, MockSession) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        mock_session.send.side_effect = [_make_response([]), _make_response([])]
+
+        class TwoPagePaginator(BasePaginator):
+            def __init__(self):
+                super().__init__()
+                self._page = 0
+
+            def update_state(self, response, data=None):
+                self._page += 1
+                self._has_next_page = self._page < 2
+
+            def update_request(self, request):
+                pass
+
+        safe_points: list[str] = []
+        client = RESTClient(base_url="https://api.example.com")
+        with activate_safe_point(lambda: safe_points.append("safe_point"), covers_framework_checkpoints=True):
+            list(client.paginate(path="/items", paginator=TwoPagePaginator()))
+
+        assert safe_points == ["safe_point", "safe_point"]
+
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_paginate_seeds_initial_paginator_state(self, MockSession) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        mock_session.send.return_value = _make_response([{"id": 99}])
+
+        class ResumablePaginator(BasePaginator):
+            def __init__(self):
+                super().__init__()
+                self._resume_url: str | None = None
+                self._has_next_page = False
+
+            def init_request(self, request):
+                if self._resume_url is not None:
+                    request.url = self._resume_url
+
+            def update_state(self, response, data=None):
+                self._has_next_page = False
+
+            def update_request(self, request):
+                pass
+
+            def set_resume_state(self, state):
+                self._resume_url = state["url"]
+                self._has_next_page = True
+
+        client = RESTClient(base_url="https://api.example.com")
+        list(
+            client.paginate(
+                path="/items",
+                paginator=ResumablePaginator(),
+                initial_paginator_state={"url": "https://api.example.com/resume-here"},
+            )
+        )
+
+        prepared_request = mock_session.prepare_request.call_args.args[0]
+        # The request URL should be the resumed URL, not the base "/items" path.
+        assert prepared_request.url == "https://api.example.com/resume-here"
+
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_paginate_drops_none_params(self, MockSession) -> None:
+        """``None`` values in ``params`` must be dropped before the request is
+        prepared — otherwise ``requests`` serializes them as the literal string
+        ``"None"`` in the query string."""
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        mock_session.send.return_value = _make_response({"data": []})
+
+        client = RESTClient(base_url="https://api.example.com")
+        list(
+            client.paginate(
+                path="/items",
+                params={"limit": 100, "since": None, "until": None, "name": "alice"},
+                paginator=SinglePagePaginator(),
+            )
+        )
+
+        prepared_request = mock_session.prepare_request.call_args.args[0]
+        assert prepared_request.params == {"limit": 100, "name": "alice"}
+
+    @pytest.mark.parametrize(
+        "make_error",
+        [
+            pytest.param(lambda: _make_response({"error": "rate limited"}, status_code=429), id="429"),
+            pytest.param(lambda: _make_response({"error": "internal"}, status_code=500), id="500"),
+            pytest.param(lambda: _make_response({"error": "timeout"}, status_code=408), id="408"),
+            pytest.param(_make_truncated_response, id="truncated_json"),
+        ],
+    )
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_retries_transient_error_then_succeeds(self, MockSession, mock_sleep, make_error) -> None:
+        # A 429, a 5xx, a 408, and a truncated body are all transient: retry, then succeed.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        error = make_error()
+        error.url = "https://api.example.com/items"
+        ok = _make_response({"results": [{"id": 1}]})
+
+        mock_session.send.side_effect = [error, ok]
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        assert mock_session.send.call_count == 2
+
+    @pytest.mark.parametrize(
+        "make_error",
+        [
+            pytest.param(lambda: _make_response({"error": "rate limited"}, status_code=429), id="429"),
+            pytest.param(_make_truncated_response, id="truncated_json"),
+        ],
+    )
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_raises_retryable_after_persistent_transient_error(
+        self, MockSession, mock_sleep, make_error
+    ) -> None:
+        # A persistent transient failure retries to the cap and re-raises as retryable.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        error = make_error()
+        error.url = "https://api.example.com/items"
+        mock_session.send.return_value = error
+
+        client = RESTClient(base_url="https://api.example.com")
+        with pytest.raises(RESTClientRetryableError) as ctx:
+            list(client.paginate(path="/items", paginator=SinglePagePaginator()))
+
+        assert mock_session.send.call_count == 5
+        # An upstream blip surviving every tenacity attempt is expected to clear on Temporal's own
+        # activity retry, not a PostHog defect, so it must carry the non-reportable marker the
+        # activity interceptor uses to keep it out of error tracking.
+        assert isinstance(ctx.value, NonReportableError)
+
+    @pytest.mark.parametrize(
+        "covers_framework_checkpoints,expected_error,expected_sends",
+        [(True, RuntimeError, 1), (False, RESTClientRetryableError, 5)],
+        ids=["framework_output", "wrapped_output"],
+    )
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_a_retry_wait_is_a_safe_point_only_for_unwrapped_framework_output(
+        self, MockSession, mock_sleep, covers_framework_checkpoints, expected_error, expected_sends
+    ) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        error = _make_response({"error": "rate limited"}, status_code=429)
+        error.url = "https://api.example.com/items"
+        mock_session.send.return_value = error
+
+        def worker_is_shutting_down() -> None:
+            raise RuntimeError("worker shutting down")
+
+        client = RESTClient(base_url="https://api.example.com")
+        with activate_safe_point(worker_is_shutting_down, covers_framework_checkpoints=covers_framework_checkpoints):
+            with pytest.raises(expected_error):
+                list(client.paginate(path="/items", paginator=SinglePagePaginator()))
+
+        assert mock_session.send.call_count == expected_sends
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(b"<!DOCTYPE html><html><body>Service unavailable</body></html>", id="html"),
+            pytest.param(b"  <html>login required</html>", id="html_leading_whitespace"),
+            pytest.param(b"Not Found", id="plain_text"),
+        ],
+    )
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_non_json_response_body_is_non_retryable(self, MockSession, mock_sleep, content) -> None:
+        # A 2xx whose body never begins as JSON is a deterministic non-JSON response, not a
+        # truncated page: fail fast and non-retryably rather than re-fetching the same body
+        # to the retry cap (contrast the truncated-JSON case, which stays retryable).
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        mock_session.send.return_value = _make_non_json_response(content)
+
+        client = RESTClient(base_url="https://api.example.com")
+        with pytest.raises(RESTClientNonRetryableError, match="Non-JSON response from") as ctx:
+            list(client.paginate(path="/items", paginator=SinglePagePaginator()))
+
+        assert mock_session.send.call_count == 1
+        mock_sleep.assert_not_called()
+        # A non-JSON 2xx body is always a customer/upstream condition, so it must carry the
+        # non-reportable marker the activity interceptor uses to keep it out of error tracking.
+        assert isinstance(ctx.value, NonReportableError)
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_non_json_error_message_omits_query_string_secret(self, MockSession, mock_sleep) -> None:
+        # An api_key auth with location="query" puts the secret in the URL. This message flows
+        # into non-retryable-error analytics where session-value redaction doesn't reach, so it
+        # must carry only scheme/host/path — never the query string that holds the key.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        resp = _make_non_json_response(b"<html>nope</html>")
+        resp.url = "https://api.example.com/leads?api_key=super-secret-value&page=1"
+        mock_session.send.return_value = resp
+
+        client = RESTClient(base_url="https://api.example.com")
+        with pytest.raises(RESTClientNonRetryableError) as ctx:
+            list(client.paginate(path="/leads", paginator=SinglePagePaginator()))
+
+        message = str(ctx.value)
+        assert "super-secret-value" not in message
+        assert "api_key" not in message
+        assert "https://api.example.com/leads" in message
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_too_many_redirects_is_non_retryable(self, MockSession, mock_sleep) -> None:
+        # `requests` already exhausted its own redirect cap (30) chasing a final response and
+        # never got one — a deterministic loop baked into how the host answers this URL.
+        # Re-fetching replays the same chain, so this must fail fast rather than retrying to the
+        # tenacity cap (contrast the connection/timeout cases above, which stay retryable).
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock(url="https://api.example.com/items")
+        mock_session.send.side_effect = TooManyRedirects("Exceeded 30 redirects.")
+
+        client = RESTClient(base_url="https://api.example.com")
+        with pytest.raises(RESTClientNonRetryableError, match="Too many redirects") as ctx:
+            list(client.paginate(path="/items", paginator=SinglePagePaginator()))
+
+        assert mock_session.send.call_count == 1
+        mock_sleep.assert_not_called()
+        # A redirect loop is always a customer/upstream condition, so it must carry the
+        # non-reportable marker the activity interceptor uses to keep it out of error tracking.
+        assert isinstance(ctx.value, NonReportableError)
+
+    @pytest.mark.parametrize("content", [b"", b"   \n\t"], ids=["empty", "whitespace_only"])
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_empty_response_body_yields_empty_page_without_retrying(self, MockSession, mock_sleep, content) -> None:
+        # A successful response with an empty/whitespace-only body is a complete "no data"
+        # answer, not a truncated page: yield an empty page and stop, never retrying.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+        mock_session.send.return_value = _make_empty_response(content)
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[]]
+        assert mock_session.send.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_retries_chunked_encoding_error_then_succeeds(self, MockSession, mock_sleep) -> None:
+        # A connection dropped mid-stream surfaces from `send` as ChunkedEncodingError; it's
+        # transient, so reissue the request rather than letting it fail the import.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        ok = _make_response({"results": [{"id": 1}]})
+        mock_session.send.side_effect = [
+            ChunkedEncodingError("Connection broken: InvalidChunkLength(got length b'', 0 bytes read)"),
+            ok,
+        ]
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        assert mock_session.send.call_count == 2
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_raises_retryable_after_persistent_chunked_encoding_error(
+        self, MockSession, mock_sleep
+    ) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        mock_session.send.side_effect = ChunkedEncodingError(
+            "Connection broken: InvalidChunkLength(got length b'', 0 bytes read)"
+        )
+
+        client = RESTClient(base_url="https://api.example.com")
+        with pytest.raises(RESTClientRetryableError):
+            list(client.paginate(path="/items", paginator=SinglePagePaginator()))
+
+        assert mock_session.send.call_count == 5
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_retries_connection_error_then_succeeds(self, MockSession, mock_sleep) -> None:
+        # A proxy refusing/resetting the connection before a request is ever sent surfaces as
+        # requests.exceptions.ProxyError (a ConnectionError subclass); it's transient, so reissue
+        # the request rather than letting it skip this retry loop and fail the import.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock(url="https://api.example.com/items")
+
+        ok = _make_response({"results": [{"id": 1}]})
+        mock_session.send.side_effect = [
+            ProxyError("Cannot connect to proxy."),
+            ok,
+        ]
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        assert mock_session.send.call_count == 2
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_raises_retryable_after_persistent_connection_error(self, MockSession, mock_sleep) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock(url="https://api.example.com/items")
+
+        mock_session.send.side_effect = ProxyError("Cannot connect to proxy.")
+
+        client = RESTClient(base_url="https://api.example.com")
+        with pytest.raises(RESTClientRetryableError):
+            list(client.paginate(path="/items", paginator=SinglePagePaginator()))
+
+        assert mock_session.send.call_count == 5
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_retries_read_timeout_then_succeeds(self, MockSession, mock_sleep) -> None:
+        # A host that accepts the connection then stalls surfaces from `send` as a ReadTimeout.
+        # It's transient from our side, so reissue it through the retry loop rather than letting
+        # it escape uncaught and fail the whole sync on one slow response.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock(url="https://api.example.com/items")
+
+        ok = _make_response({"results": [{"id": 1}]})
+        mock_session.send.side_effect = [ReadTimeout("Read timed out."), ok]
+
+        client = RESTClient(base_url="https://api.example.com", request_timeout=(3.05, 30))
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        assert mock_session.send.call_count == 2
+
+    @pytest.mark.parametrize(
+        "make_error",
+        [
+            pytest.param(lambda: ReadTimeout("Read timed out."), id="read_timeout"),
+            pytest.param(lambda: ProxyError("Cannot connect to proxy."), id="connection_error"),
+        ],
+    )
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_retries_transient_error_from_prepare_request_then_succeeds(
+        self, MockSession, mock_sleep, make_error
+    ) -> None:
+        # A lazily-minted auth token (e.g. OAuth2Auth._obtain_token) makes its own HTTP call from
+        # inside `prepare_request`, before `send` is ever reached. A timeout or dropped connection
+        # there must retry through the same loop as one from `send`, not escape uncaught and fail
+        # the whole sync on one transient mint failure.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.side_effect = [make_error(), MagicMock(url="https://api.example.com/items")]
+
+        ok = _make_response({"results": [{"id": 1}]})
+        mock_session.send.return_value = ok
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        assert mock_session.prepare_request.call_count == 2
+        assert mock_session.send.call_count == 1
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_request_timeout_is_passed_to_session_send(self, MockSession, mock_sleep) -> None:
+        # The configured timeout must reach `session.send` — without it a stalled host holds the
+        # import worker forever, the vulnerability this bound closes.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock(url="https://api.example.com/items")
+        mock_session.send.return_value = _make_response({"results": [{"id": 1}]})
+
+        client = RESTClient(base_url="https://api.example.com", request_timeout=(3.05, 30))
+        list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert mock_session.send.call_args.kwargs["timeout"] == (3.05, 30)
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_max_retry_attempts_one_does_not_retry_or_sleep(self, MockSession, mock_sleep) -> None:
+        # The inline preview sets max_retry_attempts=1: a 429 with a long Retry-After
+        # must raise immediately, never sleeping on the request thread.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        rate_limited = _make_response({"error": "rate limited"}, status_code=429)
+        rate_limited.url = "https://api.example.com/items"
+        rate_limited.headers["Retry-After"] = "300"
+        mock_session.send.return_value = rate_limited
+
+        client = RESTClient(base_url="https://api.example.com", max_retry_attempts=1)
+        with pytest.raises(RESTClientRetryableError):
+            list(client.paginate(path="/items", paginator=SinglePagePaginator()))
+
+        assert mock_session.send.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_backoff_ceiling_widens_the_exponential_fallback(self, MockSession, mock_sleep) -> None:
+        # A 429 without a Retry-After backs off on the exponential fallback, capped at the client's
+        # ceiling. Raising the ceiling lets a source whose rate-limit window is longer than the
+        # default 60s cap wait past it — the fallback grows to 128s here instead of stopping at 60s.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        rate_limited = _make_response({"error": "rate limited"}, status_code=429)
+        rate_limited.url = "https://api.example.com/items"
+        ok = _make_response({"results": [{"id": 1}]})
+        mock_session.send.side_effect = [*[rate_limited] * 8, ok]
+
+        client = RESTClient(base_url="https://api.example.com", max_retry_attempts=9, retry_backoff_max_seconds=300.0)
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        waits = [call.args[0] for call in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_respects_retry_after_header(self, MockSession, mock_sleep) -> None:
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        rate_limited = _make_response({"error": "rate limited"}, status_code=429)
+        rate_limited.url = "https://api.example.com/items"
+        rate_limited.headers["Retry-After"] = "90"
+        ok = _make_response({"results": [{"id": 1}]})
+
+        mock_session.send.side_effect = [rate_limited, ok]
+
+        client = RESTClient(base_url="https://api.example.com")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        assert mock_session.send.call_count == 2
+        mock_sleep.assert_called_once_with(90.0)
+
+    @patch("products.warehouse_sources.backend.temporal.data_imports.sources.common.http.retry_policy.datetime")
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_respects_sentry_rate_limit_reset_header(self, MockSession, mock_sleep, mock_datetime) -> None:
+        # Sentry signals its rate-limit window via ``X-Sentry-Rate-Limit-Reset``
+        # (an epoch timestamp) rather than ``Retry-After``; its fan-out endpoints
+        # sync through this generic client, so the client must honor it.
+        now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+        mock_datetime.now.return_value = now
+
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        rate_limited = _make_response({"error": "rate limited"}, status_code=429)
+        rate_limited.url = "https://sentry.io/api/0/projects/org/proj/users/"
+        rate_limited.headers["X-Sentry-Rate-Limit-Reset"] = str(int(now.timestamp()) + 45)
+        ok = _make_response({"results": [{"id": 1}]})
+
+        mock_session.send.side_effect = [rate_limited, ok]
+
+        client = RESTClient(base_url="https://sentry.io")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        assert mock_session.send.call_count == 2
+        mock_sleep.assert_called_once_with(45.0)
+
+    @patch("products.warehouse_sources.backend.temporal.data_imports.sources.common.http.retry_policy.datetime")
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_respects_x_ratelimit_reset_header(self, MockSession, mock_sleep, mock_datetime) -> None:
+        # SendGrid answers 429 with the common ``X-RateLimit-Reset`` epoch header and no
+        # ``Retry-After``; its Email Activity endpoint allows 6 requests/minute, so falling back
+        # to the short exponential backoff would exhaust the attempt budget inside one window.
+        now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+        mock_datetime.now.return_value = now
+
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        rate_limited = _make_response({"errors": [{"message": "too many requests"}]}, status_code=429)
+        rate_limited.url = "https://api.sendgrid.com/v3/messages"
+        rate_limited.headers["X-RateLimit-Reset"] = str(int(now.timestamp()) + 30)
+        ok = _make_response({"results": [{"id": 1}]})
+
+        mock_session.send.side_effect = [rate_limited, ok]
+
+        client = RESTClient(base_url="https://api.sendgrid.com/v3")
+        pages = list(client.paginate(path="/messages", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        assert mock_session.send.call_count == 2
+        mock_sleep.assert_called_once_with(30.0)
+
+    @patch("tenacity.nap.time.sleep")
+    @patch(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
+    )
+    def test_send_request_prefers_retry_after_over_sentry_reset_header(self, MockSession, mock_sleep) -> None:
+        # ``Retry-After`` is the standard, so it wins when both headers are present.
+        mock_session = MockSession.return_value
+        mock_session.headers = {}
+        mock_session.prepare_request.return_value = MagicMock()
+
+        rate_limited = _make_response({"error": "rate limited"}, status_code=429)
+        rate_limited.url = "https://sentry.io/api/0/projects/org/proj/users/"
+        rate_limited.headers["Retry-After"] = "12"
+        rate_limited.headers["X-Sentry-Rate-Limit-Reset"] = "9999999999"
+        ok = _make_response({"results": [{"id": 1}]})
+
+        mock_session.send.side_effect = [rate_limited, ok]
+
+        client = RESTClient(base_url="https://sentry.io")
+        pages = list(client.paginate(path="/items", data_selector="results", paginator=SinglePagePaginator()))
+
+        assert pages == [[{"id": 1}]]
+        mock_sleep.assert_called_once_with(12.0)

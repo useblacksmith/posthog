@@ -1,0 +1,738 @@
+//! App layer: the seeder poll loop that discovers runs, fills claim slots, and drains on shutdown.
+//! Depends on `store`, `clickhouse`, `kafka`, `domain`, and its `app` siblings (`prepare`,
+//! `execute`, `person_execute`, `person_plan`, `settings`); it is the crate's top module, imported
+//! only by `main`.
+
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use cohort_core::filters::TeamId;
+use common_types::cohort::TeamAllowlist;
+use lifecycle::Handle;
+use metrics::{counter, gauge};
+use sqlx::PgPool;
+use tokio::task::{JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+use crate::clickhouse::person_scanner::PersonScanner;
+use crate::clickhouse::scanner::ChunkScanner;
+use crate::domain::{ClaimCandidate, ClaimCandidates, ClaimKind, RunId, SlotLoad};
+use crate::kafka::pacing::TilePacer;
+use crate::kafka::producer::SeedTileProducer;
+use crate::observability::metrics::{
+    CHUNKS_CLAIMED, CHUNKS_POISONED, CHUNKS_RECLAIMED, RUNS_FAILED_BREAKER,
+    RUNS_FAILED_EXHAUSTED_CHUNKS, RUN_BREAKERS_OPEN, RUN_BREAKER_TRIPS,
+};
+use crate::store::chunks::{Claim, PgChunkStore};
+use crate::store::runs::{complete_trailing_runs, fail_run, RunError, RunKind};
+use crate::store::{Claimant, MaxAttempts, RenderedError};
+
+use super::breaker::{BreakerEvent, RunBreakers};
+use super::completion::CompletionDriver;
+use super::execute::{
+    execute_chunk, record_task_result, BreakerSignal, ChunkOutcome, ChunkTaskContext,
+};
+use super::newest_day::NewestDayIndexes;
+use super::person_execute::{execute_person_chunk, PersonChunkTaskContext};
+use super::person_plan::{plan_person_run, PersonPlanAttempt, PersonPlanRequest};
+use super::prepare::{refresh_runs, run_ids_of_kind, PreparedRun, RefreshOutcome};
+use super::settings::OrchestratorSettings;
+
+const PRODUCER_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+pub const ORCHESTRATOR_LIVENESS_DEADLINE: Duration = Duration::from_secs(60);
+/// One planning scan at a time: it streams a team's whole live person-id set from ClickHouse.
+const MAX_CONCURRENT_PLANNING_SCANS: usize = 1;
+/// How long a run whose planning attempt failed sits out before this replica retries — the
+/// boundary scan is a full-table aggregation on shared ClickHouse, so a failure must not be
+/// re-issued at the poll cadence. It also keeps one perpetually failing run from monopolizing the
+/// planning slot: backed-off runs cede it to the next candidate.
+const PERSON_PLANNING_RETRY_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The person path's infra clients, present only when `SEEDER_PERSON_SEEDS_ENABLED` is on. The
+/// pacer is separate from the behavioral tile pacer so the two throughputs tune independently.
+pub struct PersonComponents {
+    pub scanner: PersonScanner,
+    pub pacer: TilePacer,
+}
+
+/// The run a spawned task works for. A chunk task's claim slot counts against `team_id` and `kind`.
+struct InflightRun {
+    run_id: RunId,
+    team_id: TeamId,
+    kind: RunKind,
+}
+
+/// Which run each spawned task works for. Keyed by task id, so a panicked task, whose result carries
+/// no run, still leaves the map, and un-tracks only itself.
+#[derive(Default)]
+struct InflightTasks(HashMap<tokio::task::Id, InflightRun>);
+
+impl InflightTasks {
+    fn insert(&mut self, task_id: tokio::task::Id, run: InflightRun) {
+        self.0.insert(task_id, run);
+    }
+
+    fn remove(&mut self, task_id: tokio::task::Id) {
+        self.0.remove(&task_id);
+    }
+
+    fn has_run(&self, run_id: RunId) -> bool {
+        self.0.values().any(|inflight| inflight.run_id == run_id)
+    }
+
+    /// Counts only the tasks of `kind`, because each kind has its own slot budget.
+    fn load_of(&self, kind: RunKind, team_id: TeamId, run_id: RunId) -> SlotLoad {
+        self.0
+            .values()
+            .filter(|inflight| inflight.kind == kind && inflight.team_id == team_id)
+            .fold(SlotLoad::default(), |load, inflight| SlotLoad {
+                team: load.team + 1,
+                run: load.run + u32::from(inflight.run_id == run_id),
+            })
+    }
+}
+
+/// The planning slot's bookkeeping: which runs a spawned task covers and when each run's last
+/// attempt failed.
+#[derive(Default)]
+struct PlanningState {
+    inflight: InflightTasks,
+    failed_at: HashMap<RunId, Instant>,
+}
+
+impl PlanningState {
+    fn in_backoff(&self, run_id: RunId) -> bool {
+        self.failed_at
+            .get(&run_id)
+            .is_some_and(|failed_at| failed_at.elapsed() < PERSON_PLANNING_RETRY_BACKOFF)
+    }
+
+    /// Drop cool-downs that have run their course, bounding the failure map. Keyed on age, never on
+    /// the pass's request set: `refresh_runs` yields no requests at all when discovery errors, and
+    /// reading that as "nothing needs planning" would refund every cool-down and put a persistently
+    /// failing run straight back into the sole planning slot.
+    fn expire_backoffs(&mut self) {
+        self.failed_at
+            .retain(|_, failed_at| failed_at.elapsed() < PERSON_PLANNING_RETRY_BACKOFF);
+    }
+}
+
+struct ClaimState {
+    inflight: InflightTasks,
+    breakers: RunBreakers,
+    newest_day: NewestDayIndexes,
+}
+
+pub struct SeederOrchestrator {
+    pool: PgPool,
+    store: PgChunkStore,
+    scanner: ChunkScanner,
+    producer: SeedTileProducer,
+    pacer: TilePacer,
+    allowlist: TeamAllowlist,
+    settings: OrchestratorSettings,
+    handle: Handle,
+    claimant: Claimant,
+    completion_driver: Option<CompletionDriver>,
+    person: Option<PersonComponents>,
+}
+
+impl SeederOrchestrator {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pool: PgPool,
+        scanner: ChunkScanner,
+        producer: SeedTileProducer,
+        pacer: TilePacer,
+        allowlist: TeamAllowlist,
+        settings: OrchestratorSettings,
+        handle: Handle,
+        claimed_by: String,
+        completion_driver: Option<CompletionDriver>,
+        person: Option<PersonComponents>,
+    ) -> Self {
+        let claimant =
+            Claimant::new(claimed_by).expect("seeder claimant is 1..=255 bytes by construction");
+        Self {
+            store: PgChunkStore::new(pool.clone()),
+            pool,
+            scanner,
+            producer,
+            pacer,
+            allowlist,
+            settings,
+            handle,
+            claimant,
+            completion_driver,
+            person,
+        }
+    }
+
+    pub async fn process(self) {
+        let _scope = self.handle.process_scope();
+        let shutdown = self.handle.shutdown_token();
+        let mut poll = tokio::time::interval(self.settings.run_poll_interval);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tasks = JoinSet::new();
+        let mut person_tasks = JoinSet::new();
+        let mut planning: JoinSet<(RunId, PersonPlanAttempt)> = JoinSet::new();
+        let mut planning_state = PlanningState::default();
+        let mut claims = ClaimState {
+            inflight: InflightTasks::default(),
+            breakers: RunBreakers::new(self.settings.breaker),
+            newest_day: NewestDayIndexes::new(self.settings.newest_day_index_max_entries),
+        };
+        let mut eligible_runs = HashMap::new();
+        let mut reported_runs = HashSet::new();
+        self.handle.report_healthy();
+        info!(claimant = %self.claimant.as_str(), "cohort seeder orchestrator starting");
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                Some(result) = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                    self.settle_chunk(result, RunKind::Behavioral, &mut claims).await;
+                    self.fill_claim_slots(
+                        &eligible_runs,
+                        &mut tasks,
+                        &mut person_tasks,
+                        &mut claims,
+                        &shutdown,
+                    )
+                    .await;
+                    self.handle.report_healthy();
+                }
+                Some(result) = person_tasks.join_next_with_id(), if !person_tasks.is_empty() => {
+                    self.settle_chunk(result, RunKind::PersonProperty, &mut claims).await;
+                    self.fill_claim_slots(
+                        &eligible_runs,
+                        &mut tasks,
+                        &mut person_tasks,
+                        &mut claims,
+                        &shutdown,
+                    )
+                    .await;
+                    self.handle.report_healthy();
+                }
+                Some(result) = planning.join_next_with_id(), if !planning.is_empty() => {
+                    match result {
+                        Ok((task_id, (run_id, attempt))) => {
+                            planning_state.inflight.remove(task_id);
+                            if attempt == PersonPlanAttempt::Failed {
+                                planning_state.failed_at.insert(run_id, Instant::now());
+                            }
+                        }
+                        Err(error) => {
+                            planning_state.inflight.remove(error.id());
+                            warn!(error = %error, "person planning task failed unexpectedly");
+                        }
+                    }
+                    self.handle.report_healthy();
+                }
+                _ = poll.tick() => {
+                    let RefreshOutcome { eligible, planning: requests } = refresh_runs(
+                        &self.pool,
+                        &self.store,
+                        &self.allowlist,
+                        self.settings.seed_kinds(),
+                        self.settings.plan_caps,
+                        &mut reported_runs,
+                    )
+                    .await;
+                    eligible_runs = eligible;
+                    self.spawn_person_planning(
+                        requests,
+                        &mut planning,
+                        &mut planning_state,
+                        &shutdown,
+                    );
+                    self.reap_poisoned_chunks(&eligible_runs).await;
+                    // Immediately after reaping, which is where terminal chunk failures are minted,
+                    // and before the completion driver's tick, so a run can never be failed and
+                    // CAS'd to `reconciling` in the same pass.
+                    self.fail_exhausted_runs(&eligible_runs).await;
+                    self.complete_trailing_runs(&eligible_runs).await;
+                    claims.breakers.expire_idle(Instant::now());
+                    publish_open_breakers(&eligible_runs, &claims.breakers);
+                    claims.newest_day.release_idle(&eligible_runs);
+                    self.fill_claim_slots(
+                        &eligible_runs,
+                        &mut tasks,
+                        &mut person_tasks,
+                        &mut claims,
+                        &shutdown,
+                    )
+                    .await;
+                    if let Some(driver) = &self.completion_driver {
+                        // Dispatch work is spawned off this tick, but observation runs inline: a few
+                        // DB reads per reconciling run, plus at most one OffsetFetch and one
+                        // watermark sweep for the whole tick (the driver memoizes both). If the
+                        // per-run cost ever stops being negligible, observation must be spawned like
+                        // dispatch to stay inside the liveness deadline.
+                        driver.tick().await;
+                    }
+                    self.handle.report_healthy();
+                }
+            }
+        }
+
+        // The planning insert is a single statement, so aborting a planner mid-scan leaves either
+        // zero chunks or all chunks.
+        planning.shutdown().await;
+        info!(
+            active_chunks = tasks.len() + person_tasks.len(),
+            "stopping claims and draining active chunks"
+        );
+        while let Some(result) = tasks.join_next().await {
+            record_task_result(&result, RunKind::Behavioral);
+        }
+        while let Some(result) = person_tasks.join_next().await {
+            record_task_result(&result, RunKind::PersonProperty);
+        }
+
+        let producer = self.producer.clone();
+        match tokio::task::spawn_blocking(move || producer.flush(PRODUCER_FLUSH_TIMEOUT)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(error = %error, "producer flush failed during shutdown"),
+            Err(error) => warn!(error = %error, "producer flush task failed during shutdown"),
+        }
+        info!("cohort seeder orchestrator stopped");
+    }
+
+    async fn settle_chunk(
+        &self,
+        result: Result<(tokio::task::Id, ChunkOutcome), JoinError>,
+        kind: RunKind,
+        claims: &mut ClaimState,
+    ) {
+        let task_id = match &result {
+            Ok((task_id, _)) => *task_id,
+            Err(error) => error.id(),
+        };
+        claims.inflight.remove(task_id);
+        let result = result.map(|(_, outcome)| outcome);
+        record_task_result(&result, kind);
+        let Ok(outcome) = result else {
+            return;
+        };
+        let run_id = outcome.run_id();
+        let resource = match outcome.breaker_signal() {
+            BreakerSignal::Success => {
+                claims.breakers.record_success(run_id);
+                return;
+            }
+            BreakerSignal::ResourceFailure(resource) => resource,
+            BreakerSignal::Ignore => return,
+        };
+        match claims
+            .breakers
+            .record_resource_failure(run_id, Instant::now())
+        {
+            BreakerEvent::Unchanged => {}
+            BreakerEvent::Tripped { trips, cooldown } => {
+                counter!(RUN_BREAKER_TRIPS, "kind" => kind.as_str()).increment(1);
+                warn!(
+                    ?run_id,
+                    kind = kind.as_str(),
+                    trips,
+                    cooldown_secs = cooldown.as_secs(),
+                    clickhouse_code = resource.as_str(),
+                    "run breaker opened: ClickHouse keeps refusing this run's scans for lack of resources"
+                );
+            }
+            BreakerEvent::Exhausted { trips } => {
+                let error = RenderedError::from_message(format!(
+                    "the ClickHouse resource breaker opened {trips} times with no confirmed chunk in \
+                     between; last error: {}. The run's scans do not fit the ClickHouse limits: make \
+                     them smaller or raise the limits, then create a new run",
+                    resource.as_str(),
+                ));
+                match fail_run(&self.pool, run_id, &error).await {
+                    Ok(()) => {
+                        counter!(RUNS_FAILED_BREAKER, "kind" => kind.as_str()).increment(1);
+                        warn!(
+                            ?run_id,
+                            kind = kind.as_str(),
+                            trips,
+                            clickhouse_code = resource.as_str(),
+                            "failing run: its ClickHouse resource breaker reached the trip limit"
+                        );
+                    }
+                    Err(RunError::NotActive(_)) => {}
+                    Err(error) => {
+                        claims.breakers.retry_exhausted(run_id);
+                        warn!(
+                            ?run_id,
+                            error = %error,
+                            "failing the run at its breaker trip limit did not apply; its next probe retries it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_person_planning(
+        &self,
+        requests: Vec<PersonPlanRequest>,
+        planning: &mut JoinSet<(RunId, PersonPlanAttempt)>,
+        state: &mut PlanningState,
+        shutdown: &CancellationToken,
+    ) {
+        let (Some(person), Some(person_settings)) = (&self.person, self.settings.person) else {
+            return;
+        };
+        state.expire_backoffs();
+        for request in requests {
+            if planning.len() >= MAX_CONCURRENT_PLANNING_SCANS || shutdown.is_cancelled() {
+                return;
+            }
+            let run = InflightRun {
+                run_id: request.run.run_id,
+                team_id: request.run.team_id,
+                kind: RunKind::PersonProperty,
+            };
+            if state.inflight.has_run(run.run_id) || state.in_backoff(run.run_id) {
+                continue;
+            }
+            let handle = planning.spawn(plan_person_run(
+                self.pool.clone(),
+                self.store.clone(),
+                person.scanner.clone(),
+                person_settings.persons_per_chunk,
+                request,
+                shutdown.clone(),
+            ));
+            state.inflight.insert(handle.id(), run);
+        }
+    }
+
+    /// Dead-letter `scanning` chunks whose lease expired at the attempt cap — the chunks a
+    /// hard-crashed worker left behind, which the claim predicate no longer reclaims.
+    async fn reap_poisoned_chunks(&self, eligible_runs: &HashMap<RunId, PreparedRun>) {
+        for kind in [RunKind::Behavioral, RunKind::PersonProperty] {
+            let run_ids = run_ids_of_kind(eligible_runs, kind);
+            if run_ids.is_empty() {
+                continue;
+            }
+            match self
+                .store
+                .reap_poisoned_chunks(&run_ids, self.settings.max_chunk_attempts)
+                .await
+            {
+                Ok(0) => {}
+                Ok(reaped) => {
+                    counter!(CHUNKS_POISONED, "kind" => kind.as_str()).increment(reaped);
+                    warn!(
+                        reaped,
+                        kind = kind.as_str(),
+                        "dead-lettered scanning chunks whose lease expired at the attempt cap"
+                    );
+                }
+                Err(error) => warn!(error = %error, "reaping poisoned chunks failed"),
+            }
+        }
+    }
+
+    /// Terminalize runs holding a chunk that exhausted its retry budget, one kind at a time.
+    ///
+    /// Such a chunk is never reclaimed again, and the completion CAS demands every readiness chunk
+    /// `confirmed`, so without this the run sits in `seeding` forever and holds its cohort's
+    /// uniqueness slot — no future run for that cohort can ever be created. Failing it frees the
+    /// slot (Django does not count `failed` as active) and puts the reason in `runs.error`. A
+    /// `trailing` run's exhausted chunk fails it the same way, so the run does not trail forever.
+    ///
+    /// Nothing has to be unwound for chunks still mid-scan: their heartbeat and the claim predicate
+    /// both join a `seeding` or `trailing` run status, so they lose their lease on the next beat
+    /// and halt cleanly — the same mechanism a Django-side supersede already relies on.
+    async fn fail_exhausted_runs(&self, eligible_runs: &HashMap<RunId, PreparedRun>) {
+        for kind in [RunKind::Behavioral, RunKind::PersonProperty] {
+            let run_ids = run_ids_of_kind(eligible_runs, kind);
+            if run_ids.is_empty() {
+                continue;
+            }
+            fail_exhausted_runs_of_kind(
+                &self.pool,
+                &self.store,
+                &run_ids,
+                kind,
+                self.settings.max_chunk_attempts,
+            )
+            .await;
+        }
+    }
+
+    /// Complete the trailing runs whose trailing days have all confirmed. Only behavioral runs plan
+    /// trailing days.
+    async fn complete_trailing_runs(&self, eligible_runs: &HashMap<RunId, PreparedRun>) {
+        let run_ids = run_ids_of_kind(eligible_runs, RunKind::Behavioral);
+        match complete_trailing_runs(&self.pool, &run_ids).await {
+            Ok(0) => {}
+            Ok(completed) => info!(completed, "completed trailing runs"),
+            Err(error) => warn!(error = %error, "completing trailing runs failed"),
+        }
+    }
+
+    /// Claim work for whichever kind still has slot capacity. The candidate set is recomputed per
+    /// claim from the remaining capacity, so a person chunk can never occupy a behavioral slot (or
+    /// vice versa) — the two budgets are independent by construction. Each candidate's slot load is
+    /// recomputed per claim too, because every spawn adds a slot to its run and its team.
+    async fn fill_claim_slots(
+        &self,
+        eligible_runs: &HashMap<RunId, PreparedRun>,
+        tasks: &mut JoinSet<ChunkOutcome>,
+        person_tasks: &mut JoinSet<ChunkOutcome>,
+        claims: &mut ClaimState,
+        shutdown: &CancellationToken,
+    ) {
+        loop {
+            if eligible_runs.is_empty() || shutdown.is_cancelled() {
+                return;
+            }
+            let behavioral_room = tasks.len() < self.settings.max_concurrent_chunks.get();
+            let person_room = self.settings.person.is_some_and(|person_settings| {
+                person_tasks.len() < person_settings.max_concurrent_chunks.get()
+            });
+            let now = Instant::now();
+            let mut candidates = Vec::with_capacity(eligible_runs.len());
+            for (run_id, prepared) in eligible_runs {
+                let kind = prepared.kind();
+                let has_room = match kind {
+                    RunKind::Behavioral => behavioral_room,
+                    RunKind::PersonProperty => person_room,
+                };
+                let admitted = has_room
+                    && claims
+                        .breakers
+                        .admits(*run_id, now, claims.inflight.has_run(*run_id));
+                if admitted {
+                    candidates.push(ClaimCandidate {
+                        run_id: *run_id,
+                        load: claims.inflight.load_of(kind, prepared.team_id(), *run_id),
+                    });
+                }
+            }
+            let Some(candidates) = ClaimCandidates::new(candidates) else {
+                return;
+            };
+            let claim = match self
+                .store
+                .claim_next(
+                    &candidates,
+                    &self.claimant,
+                    self.settings.chunk_lease,
+                    self.settings.max_chunk_attempts,
+                )
+                .await
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    warn!(error = %error, "chunk claim failed");
+                    return;
+                }
+            };
+            let Some(Claim { chunk, kind, lease }) = claim else {
+                return;
+            };
+            let chunk_lease = chunk.spec().lease;
+            let Some(prepared) = eligible_runs.get(&chunk_lease.run_id()) else {
+                if let Err(error) = self.store.unclaim(chunk_lease).await {
+                    warn!(?chunk_lease, error = %error, "claimed chunk had no validated run and could not be unclaimed");
+                }
+                continue;
+            };
+            let inflight = InflightRun {
+                run_id: chunk_lease.run_id(),
+                team_id: prepared.team_id(),
+                kind: prepared.kind(),
+            };
+            match prepared {
+                PreparedRun::Behavioral(prepared) => {
+                    record_claim(kind, RunKind::Behavioral);
+                    let ctx = ChunkTaskContext {
+                        chunk,
+                        lease,
+                        prepared: prepared.clone(),
+                        newest_day: claims.newest_day.for_run(&prepared.run),
+                        store: self.store.clone(),
+                        scanner: self.scanner.clone(),
+                        producer: self.producer.clone(),
+                        pacer: self.pacer.clone(),
+                        producer_settings: self.settings.producer,
+                        retry_backoff: self.settings.retry_backoff,
+                    };
+                    let shutdown = shutdown.clone();
+                    let task = tasks.spawn(async move { execute_chunk(ctx, shutdown).await });
+                    claims.inflight.insert(task.id(), inflight);
+                }
+                PreparedRun::Person(run) => {
+                    // Unreachable while the gate is off: discovery never yields person runs then.
+                    let (Some(person), Some(person_settings)) =
+                        (&self.person, self.settings.person)
+                    else {
+                        if let Err(error) = self.store.unclaim(chunk_lease).await {
+                            warn!(?chunk_lease, error = %error, "person chunk claimed with the person path disabled and could not be unclaimed");
+                        }
+                        continue;
+                    };
+                    record_claim(kind, RunKind::PersonProperty);
+                    let ctx = PersonChunkTaskContext {
+                        chunk,
+                        lease,
+                        run: run.clone(),
+                        store: self.store.clone(),
+                        scanner: person.scanner.clone(),
+                        producer: self.producer.clone(),
+                        pacer: person.pacer.clone(),
+                        producer_settings: self.settings.producer,
+                        emission: person_settings.emission,
+                        retry_backoff: self.settings.retry_backoff,
+                    };
+                    let shutdown = shutdown.clone();
+                    let task = person_tasks
+                        .spawn(async move { execute_person_chunk(ctx, shutdown).await });
+                    claims.inflight.insert(task.id(), inflight);
+                }
+            }
+        }
+    }
+}
+
+/// Fail every run in `run_ids` that holds a chunk past the attempt cap; returns how many it failed.
+///
+/// A free function rather than a method so the Postgres suite can drive the fix itself: building a
+/// [`SeederOrchestrator`] needs a scanner, a producer, a pacer and a lifecycle handle, none of which
+/// a store test has, and the method above is only a per-kind loop over this body.
+pub async fn fail_exhausted_runs_of_kind(
+    pool: &PgPool,
+    store: &PgChunkStore,
+    run_ids: &[RunId],
+    kind: RunKind,
+    max_attempts: MaxAttempts,
+) -> u64 {
+    let exhausted = match store
+        .runs_with_exhausted_chunks(run_ids, max_attempts)
+        .await
+    {
+        Ok(exhausted) => exhausted,
+        Err(error) => {
+            warn!(error = %error, "scanning for runs with exhausted chunks failed");
+            return 0;
+        }
+    };
+    let mut failed = 0;
+    for run in exhausted {
+        let error = RenderedError::from_message(format!(
+            "{} chunk(s) exhausted the {} attempt retry budget; chunk {}: {}",
+            run.exhausted,
+            max_attempts.get(),
+            run.chunk_id,
+            run.last_error,
+        ));
+        match fail_run(pool, run.run_id, &error).await {
+            Ok(()) => {
+                counter!(RUNS_FAILED_EXHAUSTED_CHUNKS, "kind" => kind.as_str()).increment(1);
+                failed += 1;
+                warn!(
+                    run_id = ?run.run_id,
+                    exhausted = run.exhausted,
+                    chunk_id = %run.chunk_id,
+                    kind = kind.as_str(),
+                    "failing run: chunks exhausted their retry budget"
+                );
+            }
+            // Already terminal — a later pass re-reads the same exhausted chunks, so this is the
+            // steady state, not an error, and must not re-count the metric.
+            Err(RunError::NotActive(_)) => {}
+            Err(error) => {
+                warn!(run_id = ?run.run_id, error = %error, "failing exhausted run failed")
+            }
+        }
+    }
+    failed
+}
+
+/// Counted over the eligible set, so a run that finished with an open breaker stops counting.
+fn publish_open_breakers(eligible_runs: &HashMap<RunId, PreparedRun>, breakers: &RunBreakers) {
+    for kind in [RunKind::Behavioral, RunKind::PersonProperty] {
+        let open = run_ids_of_kind(eligible_runs, kind)
+            .into_iter()
+            .filter(|run_id| breakers.is_open(*run_id))
+            .count();
+        gauge!(RUN_BREAKERS_OPEN, "kind" => kind.as_str()).set(open as f64);
+    }
+}
+
+fn record_claim(claim_kind: ClaimKind, run_kind: RunKind) {
+    counter!(CHUNKS_CLAIMED, "kind" => run_kind.as_str()).increment(1);
+    if claim_kind == ClaimKind::Reclaim {
+        counter!(CHUNKS_RECLAIMED, "kind" => run_kind.as_str()).increment(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+
+    /// A bookkeeping pass must never refund an unexpired cool-down. Pruning against the pass's
+    /// request set did: a discovery blip yields an empty set, which read as "no run needs
+    /// planning" and handed a persistently failing run the planning slot again on the next tick.
+    #[test]
+    fn expiring_backoffs_keeps_an_unexpired_cooldown() {
+        let mut state = PlanningState::default();
+        let run_id = RunId(Uuid::nil());
+        state.failed_at.insert(run_id, Instant::now());
+
+        state.expire_backoffs();
+
+        assert!(state.in_backoff(run_id));
+    }
+
+    /// Each kind has its own slot budget, so a team's person tasks must not push its behavioral
+    /// runs behind another team's.
+    #[tokio::test]
+    async fn slot_loads_count_only_tasks_of_the_same_kind() {
+        use RunKind::{Behavioral, PersonProperty};
+
+        let (team, other_team) = (TeamId(2), TeamId(3));
+        let [heavy, sibling, person, other] = [1, 2, 3, 4].map(|n| RunId(Uuid::from_u128(n)));
+        let held = [
+            (Behavioral, team, heavy),
+            (Behavioral, team, heavy),
+            (PersonProperty, team, person),
+            (Behavioral, other_team, other),
+        ];
+        let mut tasks = JoinSet::new();
+        let mut inflight = InflightTasks::default();
+        for (kind, team_id, run_id) in held {
+            let run = InflightRun {
+                run_id,
+                team_id,
+                kind,
+            };
+            inflight.insert(tasks.spawn(async {}).id(), run);
+        }
+
+        let cases = [
+            (Behavioral, team, heavy, (2, 2)),
+            (Behavioral, team, sibling, (2, 0)),
+            (PersonProperty, team, person, (1, 1)),
+            (Behavioral, other_team, other, (1, 1)),
+        ];
+        for (kind, team_id, run_id, (team_load, run_load)) in cases {
+            let expected = SlotLoad {
+                team: team_load,
+                run: run_load,
+            };
+            assert_eq!(
+                inflight.load_of(kind, team_id, run_id),
+                expected,
+                "{kind:?} load of {run_id:?} in {team_id:?}"
+            );
+        }
+    }
+}

@@ -1,0 +1,962 @@
+import os
+import json
+import time
+import uuid
+from collections.abc import Callable
+from datetime import timedelta
+from typing import Literal, Optional
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlparse, urlunparse
+
+from django.conf import settings
+
+import structlog
+import posthoganalytics
+from playwright.sync_api import (
+    Error as PlaywrightError,
+    Page,
+    Request,
+    Response,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
+from prometheus_client import Counter, Histogram
+
+from posthog.schema import ChartDisplayType, FunnelLayout, NodeKind
+
+from posthog.hogql.errors import TableAccessDeniedError
+
+from posthog.api.services.query import process_query_dict
+from posthog.api.shared import ImageSizeSerializer
+from posthog.caching.calculate_results import calculate_for_query_based_insight
+from posthog.caching.insight_result import InsightResult
+from posthog.event_usage import AnalyticsProps, EventSource
+from posthog.exceptions_capture import capture_exception
+from posthog.hogql_queries.query_runner import ExecutionMode
+from posthog.query_creator_access import creator_access_revoked, report_creator_access_revoked
+from posthog.schema_migrations.upgrade_manager import upgrade_insight
+from posthog.tasks.exporter import EXPORT_TIMER
+from posthog.utils import absolute_uri
+
+from products.access_control.backend.facade.user_access_control import UserAccessControlError
+from products.dashboards.backend.facade import api as dashboards_api
+from products.exports.backend.facade.api import export_execution_mode, export_limit_context
+from products.exports.backend.models.exported_asset import ExportedAsset, get_render_access_token, save_content
+from products.exports.backend.tasks.dashboard_pdf import PDF_PAGE_WIDTH, render_dashboard_pdf, validate_dashboard_pdf
+from products.exports.backend.tasks.exporter_utils import log_error_if_site_url_not_reachable
+from products.exports.backend.tasks.failure_handler import (
+    BrowserlessUnavailable,
+    InvalidExportContext,
+    classify_failure_type,
+    is_reportable_export_failure,
+)
+from products.exports.backend.tasks.image_size import fit_image_to_size
+from products.exports.backend.url_security import is_heatmap_url_allowed
+from products.product_analytics.backend.facade.api import insight_variables_for_team, map_stale_to_latest
+
+logger = structlog.get_logger(__name__)
+
+IMAGE_EXPORT_RENDER_DURATION = Histogram(
+    "image_export_render_duration_seconds",
+    "Image export render time (browser navigate + wait + screenshot), by backend and outcome",
+    labelnames=["backend", "outcome"],
+    buckets=(0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90, 120, float("inf")),
+)
+IMAGE_EXPORT_RENDER_STAGE_DURATION = Histogram(
+    "image_export_render_stage_duration_seconds",
+    "Image export render time per completed stage, by the content the render waits for",
+    labelnames=["content", "stage"],
+    buckets=(0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, float("inf")),
+)
+IMAGE_EXPORT_RENDER_FAILURE_COUNTER = Counter(
+    "image_export_render_failure_total",
+    "Image export render failures by backend and classified failure type",
+    labelnames=["backend", "failure_type"],
+)
+
+
+def _build_cache_keys_param(insight_cache_keys: Optional[dict[int, str]]) -> str:
+    if not insight_cache_keys:
+        return ""
+    return f"&cache_keys={quote(json.dumps(insight_cache_keys))}"
+
+
+def _exporter_url(query_string: str) -> str:
+    # absolute_uri rejects a `%5c` anywhere in its input, but cache keys embed path-cleaning regexes with backslashes
+    return f"{absolute_uri('/exporter')}?{query_string}"
+
+
+TMP_DIR = "/tmp"  # NOTE: Externalise this to ENV var
+
+MAX_WIDTH_PIXELS = 4000  # Max width for wide content like funnels with many steps
+MAX_HEIGHT_PIXELS = 5000  # Prevents Chrome from consuming excessive memory on very tall pages
+CONTENT_PADDING = 80  # Padding for card borders
+
+REPLAY_WRAPPER_SELECTOR = ".replayer-wrapper"
+MAX_BUTTON_HEIGHT_PIXELS = 80
+
+# The replay player mounts rrweb either in the app document or inside its own same-origin frame
+# document, and a document query never crosses into a frame, so look in both.
+FIND_REPLAY_WRAPPER_JS = f"""(
+    document.querySelector('{REPLAY_WRAPPER_SELECTOR}') ||
+    document.querySelector('iframe.PlayerFrame__document')?.contentDocument?.querySelector('{REPLAY_WRAPPER_SELECTOR}')
+)"""
+
+# Colors go through a canvas because computed colors can be oklch, not sRGB.
+READ_SITE_STYLE_JS = f"""
+    const doc = {FIND_REPLAY_WRAPPER_JS}?.querySelector('iframe')?.contentDocument;
+    const view = doc?.defaultView;
+    if (!doc?.body || !view) {{
+        return null;
+    }}
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 1;
+    const context = canvas.getContext('2d', {{ willReadFrequently: true }});
+    const rgbaByColor = new Map();
+    const rgba = (color) => {{
+        if (!rgbaByColor.has(color)) {{
+            context.clearRect(0, 0, 1, 1);
+            context.fillStyle = 'transparent';
+            context.fillStyle = color;
+            context.fillRect(0, 0, 1, 1);
+            rgbaByColor.set(color, context.getImageData(0, 0, 1, 1).data);
+        }}
+        return rgbaByColor.get(color);
+    }};
+    const hex = (color) => '#' + [...rgba(color).slice(0, 3)].map((c) => c.toString(16).padStart(2, '0')).join('');
+    const isOpaque = (color) => rgba(color)[3] >= 250;
+    const luminance = (color) => {{
+        const [r, g, b] = [...rgba(color).slice(0, 3)].map((c) => {{
+            c /= 255;
+            return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+        }});
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }};
+    const contrast = (a, b) => {{
+        const [lighter, darker] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+        return (lighter + 0.05) / (darker + 0.05);
+    }};
+    // Where nothing paints a background, the canvas color shows, and it follows the page's color scheme.
+    const probe = doc.createElement('div');
+    probe.style.backgroundColor = 'Canvas';
+    doc.documentElement.appendChild(probe);
+    const canvasColor = view.getComputedStyle(probe).backgroundColor;
+    probe.remove();
+    const surfaceByElement = new Map();
+    const surfaceBehind = (element) => {{
+        const unresolved = [];
+        let surface = canvasColor;
+        for (; element; element = element.parentElement) {{
+            if (surfaceByElement.has(element)) {{
+                surface = surfaceByElement.get(element);
+                break;
+            }}
+            unresolved.push(element);
+            const background = view.getComputedStyle(element).backgroundColor;
+            if (isOpaque(background)) {{
+                surface = background;
+                break;
+            }}
+        }}
+        unresolved.forEach((resolved) => surfaceByElement.set(resolved, surface));
+        return surface;
+    }};
+
+    // Below short content the hit is <html>, which paints nothing itself. The body's background fills the canvas.
+    const hit = doc.elementFromPoint(view.innerWidth / 2, view.innerHeight / 2);
+    const center = !hit || hit === doc.documentElement ? doc.body : hit;
+    const background = surfaceBehind(center);
+    const text = view.getComputedStyle(center).color;
+    let button = null;
+    let buttonWeight = 0;
+    for (const element of doc.querySelectorAll('button, a, input[type="submit"], input[type="button"], [role="button"]')) {{
+        const rect = element.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        const onScreen = rect.bottom > 0 && rect.top < view.innerHeight && rect.right > 0 && rect.left < view.innerWidth;
+        if (!area || rect.height > {MAX_BUTTON_HEIGHT_PIXELS} || !onScreen) {{
+            continue;
+        }}
+        // Skip buttons a visitor cannot see: hidden by an ancestor's opacity, clipped, or covered by something else.
+        const onTop = doc.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        if (
+            !element.checkVisibility({{ opacityProperty: true, visibilityProperty: true }}) ||
+            !onTop ||
+            !(element === onTop || element.contains(onTop))
+        ) {{
+            continue;
+        }}
+        // Some design systems paint a button on an inner element that fills it.
+        const children = [...element.children];
+        const painted = [element, ...children, ...children.flatMap((child) => [...child.children])].find((candidate) => {{
+            const box = candidate.getBoundingClientRect();
+            return box.width * box.height >= area * 0.8 && isOpaque(view.getComputedStyle(candidate).backgroundColor);
+        }});
+        const style = painted && view.getComputedStyle(painted);
+        const weight = style ? area * (contrast(style.backgroundColor, surfaceBehind(element.parentElement)) - 1) : 0;
+        if (weight > buttonWeight) {{
+            button = style;
+            buttonWeight = weight;
+        }}
+    }}
+    return {{
+        background_color: hex(background),
+        text_color: hex(text),
+        button_color: button && hex(button.backgroundColor),
+        button_text_color: button && hex(button.color),
+        button_border_radius: button && Math.round(parseFloat(button.borderTopLeftRadius) || 0),
+    }};
+"""
+
+MEASURE_CONTENT_HEIGHT_JS = f"""
+    // The player scales the replay down to fit the viewport, so its scaled box would shrink the viewport
+    // and the replay with it. Measure it unscaled, as the width measure does, and keep its aspect ratio
+    // when the width is capped.
+    const replayElement = {FIND_REPLAY_WRAPPER_JS};
+    if (replayElement) {{
+        const widthCap = Math.min(1, {MAX_WIDTH_PIXELS} / replayElement.offsetWidth);
+        return Math.round(replayElement.offsetHeight * widthCap);
+    }}
+
+    const element = document.querySelector('.InsightCard__viz') ||
+                  document.querySelector('.ExportedInsight__content') ||
+                  document.querySelector('.heatmap-exporter');
+    if (element) {{
+        const rect = element.getBoundingClientRect();
+        return Math.max(rect.height, document.body.scrollHeight);
+    }}
+    return document.body.scrollHeight;
+"""
+
+MEASURE_CONTENT_WIDTH_JS = f"""
+            // Check for heatmap exporter first — its width is set explicitly
+            const heatmapElement = document.querySelector('.heatmap-exporter');
+            if (heatmapElement) {{
+                return heatmapElement.offsetWidth;
+            }}
+
+            // Check for replay player
+            const replayElement = {FIND_REPLAY_WRAPPER_JS};
+            if (replayElement) {{
+                return replayElement.offsetWidth;
+            }}
+
+            // Left-to-right funnel (FunnelStepsBarChart, quill-charts). The bars + legend carry an
+            // explicit pixel width on this element, while every ancestor stretches to fill the wide
+            // export viewport — so measure this element directly rather than the stretched wrapper.
+            const funnelStepsCanvas = document.querySelector('[data-attr="funnel-steps-bar-chart-canvas"]');
+            if (funnelStepsCanvas) {{
+                return Math.ceil(funnelStepsCanvas.getBoundingClientRect().width) + {CONTENT_PADDING};
+            }}
+
+            // Legacy left-to-right funnel (FunnelBarVertical, table-based)
+            // Top-to-bottom funnels use FunnelBarHorizontal and don't need width expansion
+            const funnelElement = document.querySelector('.FunnelBarVertical');
+            if (funnelElement) {{
+                // Force funnel to shrink to content size
+                funnelElement.style.width = 'fit-content';
+                funnelElement.style.maxWidth = 'fit-content';
+
+                const table = funnelElement.querySelector('table');
+                if (table) {{
+                    table.style.width = 'fit-content';
+                    table.style.maxWidth = 'fit-content';
+                }}
+
+                // Force a reflow
+                void funnelElement.offsetWidth;
+
+                // Now measure the actual content width
+                return funnelElement.offsetWidth + {CONTENT_PADDING};
+            }}
+
+            // Fall back to table width for insights
+            const tableElement = document.querySelector('table');
+            if (tableElement) {{
+                return tableElement.offsetWidth * 1.5;
+            }}
+
+            return null;
+        """
+
+ScreenWidth = Literal[600, 800, 1122, 1920, 1400, 4000]
+CSSSelector = Literal[".InsightCard", ".ExportedInsight", ".replayer-wrapper", ".heatmap-exporter", ".react-grid-item"]
+
+
+def _insight_query_wants_legend(query: dict) -> bool:
+    """A static PNG has no hover tooltips, so multi-series charts default the exporter's
+    horizontal legend on — unless the query explicitly opted out."""
+    source = query.get("source", query)  # This to handle the InsightVizNode wrapper
+    if not isinstance(source, dict) or source.get("kind") != NodeKind.TRENDS_QUERY:
+        return False
+    trends_filter = source.get("trendsFilter") or {}
+    if trends_filter.get("showLegend") is False:
+        return False
+    series = source.get("series")
+    return (isinstance(series, list) and len(series) > 1) or bool(source.get("breakdownFilter"))
+
+
+def _insight_query_screenshot_width(query: dict) -> ScreenWidth:
+    """Initial viewport width for an insight-style query render.
+
+    Only left-to-right funnels (vertical layout, which is the default) need the wide
+    viewport — they grow horizontally with step count. Top-to-bottom funnels (horizontal
+    layout) grow vertically, not horizontally. Small funnels are constrained later by the
+    width measurement. The higher the number, the more RAM the Chromium driver needs.
+
+    A metric renders as a card whose height derives from the viewport width, so a narrower
+    viewport keeps it at dashboard-tile size instead of a 400px-tall banner.
+    Mirrors the frontend's check (InsightVizNode wrapper required), which gates the
+    metric card CSS — a bare TrendsQuery gets neither, so it must keep the default viewport.
+    """
+    source = query.get("source", query)  # This to handle the InsightVizNode wrapper
+    is_funnel = source.get("kind") == NodeKind.FUNNELS_QUERY
+    funnels_filter = source.get("funnelsFilter") or {}
+    funnel_layout = funnels_filter.get("layout")
+    is_left_to_right_funnel = is_funnel and (funnel_layout is None or funnel_layout == FunnelLayout.VERTICAL)
+    if is_left_to_right_funnel:
+        return 4000
+
+    trends_filter = source.get("trendsFilter") or {}
+    is_metric = (
+        query.get("kind") == NodeKind.INSIGHT_VIZ_NODE
+        and source.get("kind") == NodeKind.TRENDS_QUERY
+        and trends_filter.get("display") == ChartDisplayType.METRIC
+    )
+    return 600 if is_metric else 800
+
+
+def _export_rendered_asset(
+    exported_asset: ExportedAsset,
+    max_height_pixels: Optional[int] = None,
+    insight_cache_keys: Optional[dict[int, str]] = None,
+) -> None:
+    """
+    Exporting a rendered asset means:
+    1. Loading the asset from the web app in a dedicated rendering mode
+    2. Waiting for the page to have fully loaded before writing the PNG or PDF to disk
+    3. Loading the file into memory and saving it to the exported asset
+    4. Cleanup: Remove the old file and close the browser session
+
+    Args:
+        exported_asset: The asset to export
+        max_height_pixels: Maximum height for the screenshot
+        insight_cache_keys: Map of insight IDs to their cache keys, used to ensure
+            the exporter fetches data from the exact cache that was warmed
+    """
+    image_path = None
+
+    try:
+        if not settings.SITE_URL:
+            raise Exception(
+                "The SITE_URL is not set. The exporter must have HTTP access to the web app in order to work"
+            )
+
+        if not settings.BROWSERLESS_CDP_URL:
+            raise Exception(
+                "BROWSERLESS_CDP_URL is not set. Image exports render via a browserless service and "
+                "cannot run without one configured"
+            )
+
+        image_id = str(uuid.uuid4())
+        extension = "pdf" if exported_asset.export_format == ExportedAsset.ExportFormat.PDF else "png"
+        image_path = os.path.join(TMP_DIR, f"{image_id}.{extension}")
+
+        if not os.path.exists(TMP_DIR):
+            os.makedirs(TMP_DIR)
+
+        access_token = get_render_access_token(exported_asset, timedelta(minutes=15))
+
+        screenshot_width: int
+        wait_for_css_selector: CSSSelector
+        screenshot_height: int = 600
+        page_load_timeout: int = 40
+        if exported_asset.insight is not None:
+            show_legend = exported_asset.insight.show_legend
+            legend_param = "&legend=true" if show_legend else ""
+            cache_keys_param = _build_cache_keys_param(insight_cache_keys)
+            url_to_render = _exporter_url(f"token={access_token}{legend_param}{cache_keys_param}")
+            wait_for_css_selector = ".ExportedInsight"
+            screenshot_width = _insight_query_screenshot_width(exported_asset.insight.query or {})
+        elif exported_asset.dashboard is not None:
+            cache_keys_param = _build_cache_keys_param(insight_cache_keys)
+            url_to_render = _exporter_url(f"token={access_token}{cache_keys_param}")
+            wait_for_css_selector = (
+                ".react-grid-item" if exported_asset.export_format == ExportedAsset.ExportFormat.PDF else ".InsightCard"
+            )
+            screenshot_width = (
+                PDF_PAGE_WIDTH if exported_asset.export_format == ExportedAsset.ExportFormat.PDF else 1920
+            )
+        elif exported_asset.export_context and exported_asset.export_context.get("session_recording_id"):
+            # Handle replay export using /exporter route (same as insights/dashboards)
+            url_to_render = _exporter_url(
+                f"token={access_token}&t={exported_asset.export_context.get('timestamp') or 0}&fullscreen=true"
+            )
+            wait_for_css_selector = exported_asset.export_context.get("css_selector", REPLAY_WRAPPER_SELECTOR)
+            screenshot_width = exported_asset.export_context.get("width", 1400)
+            screenshot_height = exported_asset.export_context.get("height", 600)
+
+            logger.info(
+                "exporting_replay",
+                session_recording_id=exported_asset.export_context.get("session_recording_id"),
+                timestamp=exported_asset.export_context.get("timestamp"),
+                url_to_render=url_to_render,
+                css_selector=wait_for_css_selector,
+                token_preview=access_token[:10],
+            )
+        elif exported_asset.export_context and exported_asset.export_context.get("heatmap_url"):
+            heatmap_url = exported_asset.export_context["heatmap_url"]
+            ok, err = is_heatmap_url_allowed(
+                heatmap_url, exported_asset.export_context.get("heatmap_type"), exported_asset.team
+            )
+            if not ok:
+                raise InvalidExportContext(f"heatmap_url not allowed: {err}")
+
+            # URL-encode the page and data URLs so their inner `?` and `&` (e.g.
+            # `?width=1024&format=jpeg` on screenshot content URLs) don't corrupt
+            # the `/exporter` query string.
+            encoded_page_url = quote(heatmap_url, safe="")
+            encoded_data_url = quote(exported_asset.export_context.get("heatmap_data_url") or "", safe="")
+            url_to_render = _exporter_url(f"token={access_token}&pageURL={encoded_page_url}&dataURL={encoded_data_url}")
+            wait_for_css_selector = exported_asset.export_context.get("css_selector", ".heatmaps-ready")
+            screenshot_width = exported_asset.export_context.get("width", 1400)
+            screenshot_height = exported_asset.export_context.get("height", 600)
+            # Heatmaps wait for the data fetch to complete (`.heatmaps-ready` is added
+            # by HeatmapCanvas after heatmapDataLogic loads the data), which can take a while.
+            page_load_timeout = 100
+
+            logger.info(
+                "exporting_heatmap",
+                heatmap_url=exported_asset.export_context.get("heatmap_url"),
+                url_to_render=url_to_render,
+                css_selector=wait_for_css_selector,
+                token_preview=access_token[:10],
+            )
+        elif exported_asset.export_context and exported_asset.export_context.get("source"):
+            # Ad-hoc query export: no saved insight, the query lives in export_context. The
+            # sharing view computes the (cache-warmed) result server-side at page load, so
+            # give the navigation extra headroom over the insight path.
+            # The exporter page still skips the legend for display types without one.
+            legend_param = (
+                "&legend=true" if _insight_query_wants_legend(exported_asset.export_context["source"]) else ""
+            )
+            url_to_render = _exporter_url(f"token={access_token}{legend_param}")
+            wait_for_css_selector = ".ExportedInsight"
+            screenshot_width = _insight_query_screenshot_width(exported_asset.export_context["source"])
+            page_load_timeout = 100
+        else:
+            raise InvalidExportContext(
+                "Export is missing required dashboard, insight ID, session_recording_id, or query source in export_context",
+                reportable=True,
+            )
+
+        size = ImageSizeSerializer(data=(exported_asset.export_context or {}).get("image_size", {}))
+        size.is_valid(raise_exception=True)
+        image_size = size.validated_data
+        screenshot_width = image_size.get("width") or screenshot_width
+        screenshot_height = image_size.get("height") or screenshot_height
+
+        logger.info("exporting_asset", asset_id=exported_asset.id, render_url=url_to_render)
+
+        render_start = time.perf_counter()
+        read_site_style = bool((exported_asset.export_context or {}).get("read_site_style"))
+        try:
+            site_style = _screenshot_asset_browserless(
+                image_path,
+                url_to_render,
+                screenshot_width,
+                wait_for_css_selector,
+                screenshot_height,
+                max_height_pixels,
+                page_load_timeout,
+                read_site_style,
+                fixed_width=image_size.get("width"),
+                device_scale_factor=1 if any(image_size.values()) else 2,
+                export_pdf=exported_asset.export_format == ExportedAsset.ExportFormat.PDF,
+            )
+            if exported_asset.export_format != ExportedAsset.ExportFormat.PDF:
+                fit_image_to_size(image_path, image_size.get("width"), image_size.get("height"))
+        except Exception as e:
+            IMAGE_EXPORT_RENDER_DURATION.labels(backend="browserless", outcome="failure").observe(
+                time.perf_counter() - render_start
+            )
+            IMAGE_EXPORT_RENDER_FAILURE_COUNTER.labels(
+                backend="browserless", failure_type=classify_failure_type(e)
+            ).inc()
+            raise
+        IMAGE_EXPORT_RENDER_DURATION.labels(backend="browserless", outcome="success").observe(
+            time.perf_counter() - render_start
+        )
+
+        with open(image_path, "rb") as image_file:
+            image_data = image_file.read()
+
+        if read_site_style:
+            exported_asset.export_context = {**(exported_asset.export_context or {}), "site_style": site_style}
+            exported_asset.save(update_fields=["export_context"])
+        save_content(exported_asset, image_data)
+
+        os.remove(image_path)
+
+    except Exception:
+        # Ensure we clean up the tmp file in case anything went wrong
+        if image_path and os.path.exists(image_path):
+            os.remove(image_path)
+
+        log_error_if_site_url_not_reachable()
+
+        raise
+
+
+def _build_cdp_endpoint(cdp_url: str, token: str, session_timeout_ms: int) -> str:
+    parsed = urlparse(cdp_url)
+    query = {
+        key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key not in ("token", "timeout")
+    }
+    if token:
+        query["token"] = token
+    query["timeout"] = str(session_timeout_ms)
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _redact_browserless_token(message: str) -> str:
+    token = settings.BROWSERLESS_TOKEN
+    if not token:
+        return message
+    return message.replace(token, "***").replace(quote_plus(token), "***")
+
+
+def _effective_max_height(max_height_pixels: Optional[int]) -> int:
+    return min(max_height_pixels, MAX_HEIGHT_PIXELS) if max_height_pixels else MAX_HEIGHT_PIXELS
+
+
+def _cap_height(raw_height: int, effective_max: int, url: str, *, final: bool = False) -> int:
+    if raw_height <= effective_max:
+        return raw_height
+    if final:
+        logger.warning(
+            "screenshot_final_height_capped",
+            original_final_height=raw_height,
+            capped_height=effective_max,
+            url=url,
+        )
+    else:
+        logger.warning(
+            "screenshot_height_capped",
+            original_height=raw_height,
+            capped_height=effective_max,
+            url=url,
+        )
+    return effective_max
+
+
+def _resolve_width(raw_width: object, screenshot_width: int, url: str) -> int:
+    if not isinstance(raw_width, (int, float)):
+        return screenshot_width
+    calculated_width = raw_width or screenshot_width
+    if calculated_width > MAX_WIDTH_PIXELS:
+        logger.warning(
+            "screenshot_width_capped",
+            original_width=calculated_width,
+            capped_width=MAX_WIDTH_PIXELS,
+            url=url,
+        )
+    return min(MAX_WIDTH_PIXELS, int(calculated_width))
+
+
+_BROWSERLESS_CONNECTION_ERROR_INDICATORS = (
+    "target closed",
+    "has been closed",
+    "connection closed",
+    "websocket",
+    "disconnected",
+    "econnrefused",
+)
+
+
+def _is_browserless_connection_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(indicator in message for indicator in _BROWSERLESS_CONNECTION_ERROR_INDICATORS)
+
+
+def _save_debug_screenshot(take_screenshot: Callable[[str], object], image_path: str) -> None:
+    try:
+        take_screenshot(image_path)
+        posthoganalytics.tag("image_path", image_path)
+    except Exception:
+        pass
+
+
+# Exports can set their own selector, so the metric label maps the known ones and buckets the rest.
+_RENDER_STAGE_CONTENT = {
+    ".InsightCard": "dashboard",
+    ".ExportedInsight": "insight",
+    REPLAY_WRAPPER_SELECTOR: "replay",
+    ".heatmap-exporter": "heatmap",
+    ".heatmaps-ready": "heatmap",
+}
+
+
+class _RenderStages:
+    def __init__(self, content: str) -> None:
+        self._content = content
+        self._started_at = time.perf_counter()
+
+    def done(self, stage: str) -> None:
+        now = time.perf_counter()
+        IMAGE_EXPORT_RENDER_STAGE_DURATION.labels(content=self._content, stage=stage).observe(now - self._started_at)
+        self._started_at = now
+
+
+def _screenshot_asset_browserless(
+    image_path: str,
+    url_to_render: str,
+    screenshot_width: int,
+    wait_for_css_selector: CSSSelector,
+    screenshot_height: int = 600,
+    max_height_pixels: Optional[int] = None,
+    page_load_timeout: int = 40,
+    read_site_style: bool = False,
+    fixed_width: int | None = None,
+    device_scale_factor: int = 2,
+    *,
+    export_pdf: bool = False,
+) -> Optional[dict]:
+    endpoint = _build_cdp_endpoint(
+        settings.BROWSERLESS_CDP_URL, settings.BROWSERLESS_TOKEN, settings.BROWSERLESS_SESSION_TIMEOUT_MS
+    )
+
+    stages = _RenderStages(content=_RENDER_STAGE_CONTENT.get(str(wait_for_css_selector), "other"))
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.connect_over_cdp(endpoint, timeout=settings.BROWSERLESS_CONNECT_TIMEOUT_MS)
+        except (PlaywrightError, PlaywrightTimeoutError) as e:
+            raise BrowserlessUnavailable(
+                f"Failed to connect to browserless: {_redact_browserless_token(str(e))}"
+            ) from None
+
+        disconnected = [False]
+        browser.on("disconnected", lambda *_: disconnected.__setitem__(0, True))
+        stages.done("connect")
+
+        context = None
+        page = None
+        try:
+            context = browser.new_context(
+                device_scale_factor=device_scale_factor,
+                viewport={"width": screenshot_width, "height": screenshot_height},
+            )
+            page = context.new_page()
+            failed_stylesheets = _watch_failed_stylesheets(page) if read_site_style else []
+            posthoganalytics.tag("url_to_render", url_to_render)
+
+            try:
+                page.goto(url_to_render, wait_until="domcontentloaded", timeout=page_load_timeout * 1000)
+                if wait_for_css_selector == REPLAY_WRAPPER_SELECTOR:
+                    page.wait_for_function(
+                        f"() => !!{FIND_REPLAY_WRAPPER_JS}", timeout=page_load_timeout * 1000, polling=100
+                    )
+                else:
+                    page.wait_for_selector(wait_for_css_selector, state="attached", timeout=page_load_timeout * 1000)
+            except PlaywrightTimeoutError as e:
+                with posthoganalytics.new_context():
+                    posthoganalytics.tag("stage", "image_exporter.page_load_timeout")
+                    _save_debug_screenshot(lambda p: page.screenshot(path=p), image_path)
+                    capture_exception(e)
+
+                raise PlaywrightTimeoutError("Timeout while waiting for the page to load") from e
+            stages.done("page_load")
+
+            try:
+                page.wait_for_selector(".Spinner", state="detached", timeout=20000)
+            except PlaywrightTimeoutError as e:
+                with posthoganalytics.new_context():
+                    posthoganalytics.tag("stage", "image_exporter.wait_for_spinner_timeout")
+                    _save_debug_screenshot(lambda p: page.screenshot(path=p), image_path)
+                    capture_exception(e)
+            stages.done("content")
+
+            if export_pdf:
+                render_dashboard_pdf(page, image_path)
+                stages.done("screenshot")
+                return None
+
+            effective_max = _effective_max_height(max_height_pixels)
+            height = _cap_height(
+                int(page.evaluate(f"() => {{ {MEASURE_CONTENT_HEIGHT_JS} }}")), effective_max, url_to_render
+            )
+            width = max(
+                fixed_width or 0,
+                _resolve_width(
+                    page.evaluate(f"() => {{ {MEASURE_CONTENT_WIDTH_JS} }}"), screenshot_width, url_to_render
+                ),
+            )
+
+            page.set_viewport_size({"width": width, "height": height})
+
+            page.wait_for_timeout(500)
+
+            final_height = _cap_height(
+                int(page.evaluate(f"() => {{ {MEASURE_CONTENT_HEIGHT_JS} }}")), effective_max, url_to_render, final=True
+            )
+
+            if final_height != height:
+                page.set_viewport_size({"width": width, "height": final_height})
+                # Charts redraw their canvas after a resize, so a screenshot taken at once can catch them blank.
+                page.wait_for_timeout(500)
+            page.screenshot(path=image_path)
+            stages.done("screenshot")
+            if not read_site_style:
+                return None
+            site_style = _read_site_style(page, failed_stylesheets)
+            stages.done("site_style")
+            return site_style
+        except BrowserlessUnavailable:
+            raise
+        except PlaywrightTimeoutError:
+            raise
+        except PlaywrightError as e:
+            if disconnected[0] or _is_browserless_connection_error(e):
+                raise BrowserlessUnavailable(_redact_browserless_token(str(e))) from None
+
+            with posthoganalytics.new_context():
+                posthoganalytics.tag("url_to_render", url_to_render)
+                if page:
+                    _save_debug_screenshot(lambda p: page.screenshot(path=p), image_path)
+            capture_exception(e)
+
+            raise
+        finally:
+            if context:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+def _watch_failed_stylesheets(page: Page) -> list[str]:
+    failed: list[str] = []
+
+    def on_request_failed(request: Request) -> None:
+        if request.resource_type == "stylesheet":
+            failed.append(request.url)
+
+    def on_response(response: Response) -> None:
+        if response.request.resource_type == "stylesheet" and not response.ok:
+            failed.append(response.url)
+
+    page.on("requestfailed", on_request_failed)
+    page.on("response", on_response)
+    return failed
+
+
+def _read_site_style(page: Page, failed_stylesheets: list[str]) -> Optional[dict]:
+    if failed_stylesheets:
+        # Without its stylesheets the replayed page shows browser defaults, not the site's colors.
+        return None
+    try:
+        return page.evaluate(f"() => {{ {READ_SITE_STYLE_JS} }}")
+    except PlaywrightError as e:
+        if page.is_closed() or _is_browserless_connection_error(e):
+            raise
+        capture_exception(e)
+        return None
+
+
+def export_image(
+    exported_asset: ExportedAsset, max_height_pixels: Optional[int] = None, source: Optional[EventSource] = None
+) -> None:
+    with posthoganalytics.new_context():
+        posthoganalytics.tag("team_id", exported_asset.team_id if exported_asset else "unknown")
+        posthoganalytics.tag("asset_id", exported_asset.id if exported_asset else "unknown")
+
+        try:
+            # Track cache keys for insights so we can pass them to Chrome for guaranteed cache hits
+            insight_cache_keys: dict[int, str] = {}
+            export_analytics_props: AnalyticsProps = {"source": source or EventSource.EXPORT}
+
+            if exported_asset.insight:
+                logger.info(
+                    "export_image.calculate_insight",
+                    insight_id=exported_asset.insight.id,
+                    dashboard_id=exported_asset.dashboard.id if exported_asset.dashboard else None,
+                )
+
+                # When export_context contains a source query, use it as the query for cache warming.
+                # This captures the user's full current state (variables, filters, date ranges, etc.).
+                # Falls back to the saved insight query for subscriptions and other server-initiated exports.
+                export_context = exported_asset.export_context or {}
+                query_override = export_context.get("source")
+                insight_execution_mode = export_execution_mode(export_context)
+
+                dashboard_variables = None
+                tile_filters_override = None
+                if exported_asset.dashboard:
+                    if exported_asset.dashboard.variables:
+                        variables = insight_variables_for_team(exported_asset.team_id)
+                        dashboard_variables = map_stale_to_latest(exported_asset.dashboard.variables, variables)
+                    tile_filters_override = dashboards_api.tile_filters_overrides(
+                        dashboard_id=exported_asset.dashboard.id, insight_id=exported_asset.insight.id
+                    )
+
+                result: InsightResult | None = None
+                if query_override:
+                    # query_override is upgraded inside calculate_for_query_based_insight,
+                    # so we skip upgrade_insight (which only upgrades insight.query we won't use).
+                    # variables_override is None because query_override already encodes the
+                    # user's full current state — applying saved dashboard variables on top
+                    # would clobber unsaved variable selections.
+                    result = calculate_for_query_based_insight(
+                        exported_asset.insight,
+                        team=exported_asset.team,
+                        dashboard=exported_asset.dashboard,
+                        execution_mode=insight_execution_mode,
+                        # Background render (no request user); attribute the read to the export owner.
+                        user=exported_asset.created_by,
+                        variables_override=None,
+                        tile_filters_override=tile_filters_override,
+                        query_override=query_override,
+                        analytics_props=export_analytics_props,
+                    )
+                elif exported_asset.insight.query is None:
+                    # Nothing to warm: the insight stores only legacy filters, and nothing converts
+                    # those into a query, so the insight renders blank. Raising here would fail the
+                    # whole export instead of producing it with one blank insight, so the render
+                    # starts without a warm cache. The dashboard branch below skips such a tile for
+                    # the same reason.
+                    logger.info(
+                        "export_image.skip_warming_insight_without_query",
+                        insight_id=exported_asset.insight.id,
+                    )
+                else:
+                    with upgrade_insight(exported_asset.insight):
+                        result = calculate_for_query_based_insight(
+                            exported_asset.insight,
+                            team=exported_asset.team,
+                            dashboard=exported_asset.dashboard,
+                            execution_mode=insight_execution_mode,
+                            # Background render (no request user); attribute the read to the export owner.
+                            user=exported_asset.created_by,
+                            variables_override=dashboard_variables,
+                            tile_filters_override=tile_filters_override,
+                            analytics_props=export_analytics_props,
+                        )
+                if result is not None and result.cache_key:
+                    insight_cache_keys[exported_asset.insight.id] = result.cache_key
+            elif exported_asset.dashboard:
+                if exported_asset.export_format == ExportedAsset.ExportFormat.PDF:
+                    validate_dashboard_pdf(exported_asset.dashboard)
+                logger.info(
+                    "export_image.calculate_dashboard_insights",
+                    dashboard_id=exported_asset.dashboard.id,
+                )
+                # Use variable overrides from export_context (user's current unsaved selection),
+                # falling back to saved dashboard variables
+                export_context = exported_asset.export_context or {}
+                dashboard_variables = export_context.get("variables_override")
+                dashboard_filters = exported_asset.get_dashboard_filters()
+                if not dashboard_variables and exported_asset.dashboard.variables:
+                    variables = insight_variables_for_team(exported_asset.team_id)
+                    dashboard_variables = map_stale_to_latest(exported_asset.dashboard.variables, variables)
+
+                tiles = (
+                    exported_asset.dashboard.tiles.select_related("insight")
+                    .filter(insight__isnull=False, insight__deleted=False)
+                    .all()
+                )
+                for tile in tiles:
+                    insight = tile.insight
+                    if not insight or not insight.query:
+                        continue
+
+                    with upgrade_insight(insight):
+                        result = calculate_for_query_based_insight(
+                            insight,
+                            team=exported_asset.team,
+                            dashboard=exported_asset.dashboard,
+                            execution_mode=ExecutionMode.CALCULATE_BLOCKING_ALWAYS,
+                            # Background render (no request user); attribute the read to the export owner.
+                            user=exported_asset.created_by,
+                            variables_override=dashboard_variables,
+                            tile_filters_override=tile.filters_overrides,
+                            filters_override=dashboard_filters,
+                            analytics_props=export_analytics_props,
+                        )
+                        if result.cache_key:
+                            insight_cache_keys[insight.id] = result.cache_key
+            elif exported_asset.export_context and exported_asset.export_context.get("source"):
+                logger.info("export_image.calculate_adhoc_query", asset_id=exported_asset.id)
+                # Ad-hoc query export: run the query now so a bad query fails here (with a real
+                # exception on the asset) rather than inside the headless browser, and so the
+                # sharing view's cache-aggressive recompute at page load is a cache hit.
+                warm_result = process_query_dict(
+                    exported_asset.team,
+                    exported_asset.export_context["source"],
+                    execution_mode=ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE,
+                    limit_context=export_limit_context(exported_asset.export_context),
+                    # Background render (no request user); attribute the read to the export owner.
+                    user=exported_asset.created_by,
+                )
+                # Validation failures come back as an error response rather than raising
+                # (process_query_dict only raises for dashboard contexts) — surface them here
+                # instead of letting the render burn a browserless timeout on a broken page.
+                warm_error = (
+                    warm_result.get("error") if isinstance(warm_result, dict) else getattr(warm_result, "error", None)
+                )
+                if warm_error:
+                    raise InvalidExportContext(f"Invalid query: {warm_error}")
+
+            if exported_asset.export_format == ExportedAsset.ExportFormat.PNG or (
+                exported_asset.export_format == ExportedAsset.ExportFormat.PDF and exported_asset.dashboard_id
+            ):
+                with EXPORT_TIMER.labels(type=exported_asset.export_format).time():
+                    _export_rendered_asset(
+                        exported_asset,
+                        max_height_pixels=max_height_pixels,
+                        insight_cache_keys=insight_cache_keys or None,
+                    )
+            else:
+                raise NotImplementedError(
+                    f"Export to format {exported_asset.export_format} is not supported for insights"
+                )
+        except Exception as e:
+            team_id = str(exported_asset.team.id) if exported_asset else "unknown"
+            logger.error("image_exporter.failed", exception=e, exc_info=True)
+            # A revoked creator's access-denied error is a known limitation - report it as an event
+            # rather than surfacing it in error tracking.
+            if isinstance(e, TableAccessDeniedError) and creator_access_revoked(
+                exported_asset.created_by, exported_asset.team
+            ):
+                report_creator_access_revoked(
+                    user=exported_asset.created_by,
+                    team=exported_asset.team,
+                    source="export",
+                    error=e,
+                    properties={
+                        "exported_asset_id": exported_asset.id,
+                        "insight_id": exported_asset.insight_id,
+                        "dashboard_id": exported_asset.dashboard_id,
+                    },
+                )
+            # The creator is still a member but has no access to a resource the query needs (e.g. web analytics).
+            elif isinstance(e, UserAccessControlError):
+                report_creator_access_revoked(
+                    user=exported_asset.created_by,
+                    team=exported_asset.team,
+                    source="export",
+                    error=e,
+                    reason="missing_resource_access",
+                    properties={
+                        "exported_asset_id": exported_asset.id,
+                        "insight_id": exported_asset.insight_id,
+                        "dashboard_id": exported_asset.dashboard_id,
+                        "resource": e.resource,
+                        "required_level": e.required_level,
+                    },
+                )
+            # A broken saved query is the user's to fix, and the asset already records it.
+            elif is_reportable_export_failure(e):
+                capture_exception(e, additional_properties={"task": "image_export", "team_id": team_id})
+            raise

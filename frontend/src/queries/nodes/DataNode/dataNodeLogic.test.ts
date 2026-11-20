@@ -1,0 +1,1287 @@
+import { waitFor } from '@testing-library/react'
+import { expectLogic, partial } from 'kea-test-utils'
+
+import api, { ApiError } from 'lib/api'
+import { promiseResolveReject } from 'lib/utils/async'
+import { TaskQueue } from 'scenes/dashboard/dashboardUtils'
+
+import { useMocks } from '~/mocks/jest'
+import { dataNodeCollectionLogic } from '~/queries/nodes/DataNode/dataNodeCollectionLogic'
+import {
+    DataNodeLogicProps,
+    QUERY_SCAN_POLL_DEADLINE_MS,
+    QUERY_SCAN_POLL_DELAYS_MS,
+    dataNodeLogic,
+} from '~/queries/nodes/DataNode/dataNodeLogic'
+import { performQuery } from '~/queries/query'
+import { setLatestVersionsOnQuery } from '~/queries/schema/query-versions'
+import { DashboardFilter, HogQLVariable, NodeKind } from '~/queries/schema/schema-general'
+import { initKeaTests } from '~/test/init'
+
+import { ABANDONED_QUERY_GRACE_PERIOD, RESPONSE_CACHE_TTL } from './responseCache'
+
+const SCAN_ENDPOINT = '/api/environments/:team_id/query/scan/:cache_key/'
+// The scan endpoint answers with an empty body while the job runs.
+const PENDING_SCAN = {}
+const DONE_SCAN = {
+    analysis: {
+        assistant_prompt: 'Help me get what this query is trying to find, as fast as possible.',
+        findings: [
+            {
+                kind: 'no_event_filter',
+                message: 'This query read every event in its date range.',
+                fix: 'Add an event filter.',
+                actionable: true,
+            },
+        ],
+        range_share: 0.42,
+        project_share: 0.1,
+    },
+}
+
+function pendingScanResponse(cacheKey = 'cache-key'): Record<string, unknown> {
+    return {
+        results: [],
+        cache_key: cacheKey,
+        query_scan: { rows_read: 10, duration_ms: 2000, analysis_requested: true },
+    }
+}
+
+jest.mock('~/queries/query', () => {
+    return {
+        __esModules: true,
+        ...jest.requireActual('~/queries/query'),
+        performQuery: jest.fn(),
+    }
+})
+const mockedQuery = performQuery as jest.MockedFunction<typeof performQuery>
+
+const testUniqueKey = 'testUniqueKey'
+
+const commonResult = {
+    uuid: '01853a90-ba94-0000-8776-e8df5617c3ec',
+    event: 'update user properties',
+    properties: {},
+    team_id: 1,
+    distinct_id: '123',
+}
+
+describe('dataNodeLogic', () => {
+    let logic: ReturnType<typeof dataNodeLogic.build>
+
+    beforeEach(async () => {
+        initKeaTests()
+    })
+    afterEach(() => logic?.unmount())
+
+    it('shares the dashboard queue capacity with other tile loads', async () => {
+        const loadQueue = new TaskQueue(3)
+        const dashboardLoad = promiseResolveReject<void>()
+        const occupied = loadQueue.run(() => dashboardLoad.promise)
+        const response = { results: [[1]], columns: ['value'] }
+        const queryResult = promiseResolveReject<typeof response>()
+        mockedQuery.mockReset()
+        mockedQuery.mockReturnValue(queryResult.promise)
+        const queries = [1, 2, 3].map((id) =>
+            dataNodeLogic({
+                key: `dashboard-queue-${id}`,
+                query: setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: `SELECT ${id}` }),
+                loadQueue,
+            })
+        )
+        const unmounts = queries.map((query) => query.mount())
+        try {
+            await waitFor(() => expect(mockedQuery).toHaveBeenCalledTimes(2))
+            dashboardLoad.resolve()
+            await occupied
+            await waitFor(() => expect(mockedQuery).toHaveBeenCalledTimes(3))
+            queryResult.resolve(response)
+            await Promise.all(queries.map((query) => expectLogic(query).toFinishAllListeners()))
+            expect(queries.map((query) => query.values.response)).toEqual([response, response, response])
+        } finally {
+            dashboardLoad.resolve()
+            queryResult.resolve(response)
+            unmounts.forEach((unmount) => unmount())
+        }
+    })
+
+    it.each(['pending', 'failed'] as const)('restores a retained query after another query is %s', async (state) => {
+        const query = setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 1' })
+        const response = { results: [[1]], columns: ['value'] }
+        const props: DataNodeLogicProps = { key: testUniqueKey, query, retainResponseOnUnmount: true }
+        const pending = promiseResolveReject<typeof response>()
+        mockedQuery.mockReset()
+        mockedQuery.mockResolvedValueOnce(response).mockReturnValueOnce(pending.promise)
+        logic = dataNodeLogic(props)
+        logic.mount()
+        await expectLogic(logic).toDispatchActions(['loadDataSuccess'])
+
+        dataNodeLogic({
+            ...props,
+            query: setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 2' }),
+        })
+        expect(logic.values.dataLoading).toBe(true)
+        if (state === 'failed') {
+            await expectLogic(logic, () => pending.reject(new Error('Query failed')))
+                .toDispatchActions(['loadDataFailure'])
+                .toMatchValues({ responseError: 'Query failed', responseErrorObject: expect.any(Error) })
+        }
+
+        dataNodeLogic(props)
+        pending.resolve({ results: [[2]], columns: ['value'] })
+        await expectLogic(logic).toFinishAllListeners().toMatchValues({
+            response,
+            responseLoading: false,
+            dataLoading: false,
+            responseError: null,
+            responseErrorObject: null,
+            queryCancelled: false,
+        })
+        expect(mockedQuery).toHaveBeenCalledTimes(2)
+        expect(mockedQuery.mock.calls[1][1]?.signal?.aborted).toBe(true)
+    })
+
+    it('keeps a notebook query running across a remount instead of starting it again', async () => {
+        const query = setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 1' })
+        const response = { results: [[1]], columns: ['value'] }
+        const props: DataNodeLogicProps = { key: testUniqueKey, query, retainResponseOnUnmount: true }
+        const pending = promiseResolveReject<typeof response>()
+        mockedQuery.mockReset()
+        mockedQuery.mockReturnValueOnce(pending.promise)
+        logic = dataNodeLogic(props)
+        logic.mount()
+        await expectLogic(logic).toDispatchActions(['loadData'])
+        expect(mockedQuery).toHaveBeenCalledTimes(1)
+        const queryId = logic.values.queryId
+
+        logic.unmount()
+        expect(mockedQuery.mock.calls[0][1]?.signal?.aborted).toBe(false)
+
+        logic = dataNodeLogic(props)
+        logic.mount()
+        expect(logic.values.dataLoading).toBe(true)
+        expect(logic.values.queryId).toBe(queryId)
+        pending.resolve(response)
+        await expectLogic(logic).toDispatchActions(['loadDataSuccess']).toMatchValues({ response })
+        expect(mockedQuery).toHaveBeenCalledTimes(1)
+    })
+
+    it('cancels a notebook query that no remount picks up within the grace period', async () => {
+        jest.useFakeTimers()
+        try {
+            const query = setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 1' })
+            const props: DataNodeLogicProps = { key: testUniqueKey, query, retainResponseOnUnmount: true }
+            const cancel = jest.spyOn(api, 'delete').mockResolvedValue(undefined)
+            mockedQuery.mockReset()
+            mockedQuery.mockReturnValueOnce(promiseResolveReject<Record<string, any>>().promise)
+            logic = dataNodeLogic(props)
+            logic.mount()
+            await expectLogic(logic).toDispatchActions(['loadData'])
+            const queryId = logic.values.queryId
+            logic.unmount()
+
+            jest.advanceTimersByTime(ABANDONED_QUERY_GRACE_PERIOD - 1)
+            expect(mockedQuery.mock.calls[0][1]?.signal?.aborted).toBe(false)
+            jest.advanceTimersByTime(1)
+            expect(mockedQuery.mock.calls[0][1]?.signal?.aborted).toBe(true)
+            expect(cancel).toHaveBeenCalledWith(expect.stringContaining(`/query/${queryId}/`))
+        } finally {
+            jest.useRealTimers()
+        }
+    })
+
+    it('aborts a reused notebook query when the remounted node loads again', async () => {
+        const query = setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 1' })
+        const response = { results: [[2]], columns: ['value'] }
+        const props: DataNodeLogicProps = { key: testUniqueKey, query, retainResponseOnUnmount: true }
+        mockedQuery.mockReset()
+        mockedQuery.mockReturnValueOnce(promiseResolveReject<typeof response>().promise).mockResolvedValueOnce(response)
+        logic = dataNodeLogic(props)
+        logic.mount()
+        await expectLogic(logic).toDispatchActions(['loadData'])
+        logic.unmount()
+        logic = dataNodeLogic(props)
+        logic.mount()
+
+        await expectLogic(logic, () => logic.actions.loadData())
+            .toDispatchActions(['loadDataSuccess'])
+            .toMatchValues({ response, responseError: null })
+        expect(mockedQuery.mock.calls[0][1]?.signal?.aborted).toBe(true)
+        expect(mockedQuery).toHaveBeenCalledTimes(2)
+    })
+
+    it.each(['query', 'insight response'] as const)(
+        'restores notebook results when the query arrives after mount: %s',
+        async (source) => {
+            const query = setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 1' })
+            const response = { results: [[1]], columns: ['value'] }
+            const props: DataNodeLogicProps = { key: testUniqueKey, query, retainResponseOnUnmount: true }
+            mockedQuery.mockReset()
+            mockedQuery.mockResolvedValue(response)
+            logic = dataNodeLogic(source === 'query' ? props : { ...props, cachedResults: response })
+            logic.mount()
+            if (source === 'query') {
+                await expectLogic(logic).toDispatchActions(['loadDataSuccess'])
+            }
+            logic.unmount()
+            mockedQuery.mockClear()
+
+            logic = dataNodeLogic({ key: props.key } as DataNodeLogicProps)
+            logic.mount()
+            dataNodeLogic(props)
+            await expectLogic(logic).toFinishAllListeners().toMatchValues({ response })
+            expect(mockedQuery).not.toHaveBeenCalled()
+        }
+    )
+
+    it.each(['same', 'query', 'filters', 'expired', 'disabled'] as const)(
+        'reuses a completed notebook response on remount: %s',
+        async (change) => {
+            const clock = jest.spyOn(Date, 'now').mockReturnValue(10_000)
+            const query = setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 1' })
+            const props: DataNodeLogicProps = { key: testUniqueKey, query, retainResponseOnUnmount: true }
+            mockedQuery.mockReset()
+            mockedQuery.mockResolvedValue({ results: [[1]], columns: ['value'] })
+            try {
+                logic = dataNodeLogic(props)
+                logic.mount()
+                await expectLogic(logic).toDispatchActions(['loadDataSuccess'])
+                logic.unmount()
+
+                if (change === 'query') {
+                    props.query = setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 2' })
+                } else if (change === 'filters') {
+                    props.filtersOverride = { date_from: '-14d' }
+                } else if (change === 'expired') {
+                    clock.mockReturnValue(10_000 + RESPONSE_CACHE_TTL / 2)
+                    logic = dataNodeLogic(props)
+                    logic.mount()
+                    await expectLogic(logic).toFinishAllListeners()
+                    logic.unmount()
+                    clock.mockReturnValue(10_000 + RESPONSE_CACHE_TTL)
+                } else if (change === 'disabled') {
+                    props.retainResponseOnUnmount = false
+                }
+                logic = dataNodeLogic(props)
+                logic.mount()
+                if (change === 'same') {
+                    await expectLogic(logic).toFinishAllListeners()
+                    dataNodeLogic({ ...props, cachedResults: { result: null } })
+                    expect(logic.values.response).toEqual({ results: [[1]], columns: ['value'] })
+                    expect(mockedQuery).toHaveBeenCalledTimes(1)
+                    await expectLogic(logic, () => logic.actions.loadData('force_blocking')).toDispatchActions([
+                        'loadDataSuccess',
+                    ])
+                } else {
+                    await expectLogic(logic).toDispatchActions(['loadDataSuccess'])
+                }
+                expect(mockedQuery).toHaveBeenCalledTimes(2)
+            } finally {
+                clock.mockRestore()
+            }
+        }
+    )
+
+    it('does not resubmit a capacity-limited query after unmount', async () => {
+        jest.useFakeTimers()
+        const submit = jest
+            .spyOn(api, 'query')
+            .mockRejectedValueOnce(new ApiError('', 503, new Headers({ 'Retry-After': '5' })))
+            .mockResolvedValue({ results: [] })
+        mockedQuery.mockImplementationOnce(jest.requireActual('~/queries/query').performQuery)
+        try {
+            logic = dataNodeLogic({
+                key: testUniqueKey,
+                query: setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'SELECT 1' }),
+            })
+            logic.mount()
+            await jest.advanceTimersByTimeAsync(0)
+            expect(submit).toHaveBeenCalledTimes(1)
+            expect(logic.values.dataLoading).toBe(true)
+
+            logic.unmount()
+            await jest.advanceTimersByTimeAsync(20000)
+
+            expect(submit).toHaveBeenCalledTimes(1)
+        } finally {
+            submit.mockRestore()
+            jest.useRealTimers()
+        }
+    })
+
+    it('calls query to fetch data', async () => {
+        const results = {}
+        mockedQuery.mockResolvedValueOnce({ results })
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+            }),
+        })
+        logic.mount()
+        expect(performQuery).toHaveBeenCalledTimes(1)
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, response: null })
+            .delay(0)
+            .toMatchValues({ responseLoading: false, response: partial({ results }) })
+
+        // changing the query should trigger a new query, but keep the results while it's loading
+        const results2 = {}
+        mockedQuery.mockResolvedValueOnce({ results: results2 })
+        dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp', 'person'],
+            }),
+        })
+        expect(performQuery).toHaveBeenCalledTimes(2)
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, response: partial({ results }) })
+            .delay(0)
+            .toMatchValues({ responseLoading: false, response: partial({ results: results2 }) })
+
+        // passing in a new "deep equal" query object should not trigger a new query
+        dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp', 'person'],
+            }),
+        })
+        expect(performQuery).toHaveBeenCalledTimes(2)
+        await expectLogic(logic).toMatchValues({ responseLoading: false, response: partial({ results: results2 }) })
+
+        // changing the query kind will clear the results and trigger a new query
+        const results3 = {}
+        mockedQuery.mockResolvedValueOnce({ results: results3 })
+        dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.PersonsNode,
+            }),
+        })
+        expect(performQuery).toHaveBeenCalledTimes(3)
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, response: null })
+            .delay(0)
+            .toMatchValues({ responseLoading: false, response: partial({ results: results3 }) })
+    })
+
+    it.each([
+        ['runs a query with a valid regex filter', '^/api/.*', false, 1],
+        ['skips a query with an invalid regex filter', '(?=lookahead)', false, 0],
+        ['skips a query cancelled during the load', '^/api/cancelled', true, 0],
+    ])('%s once the RE2 engine loads', async (_name, pattern, cancel, expectedCalls) => {
+        mockedQuery.mockResolvedValueOnce({ results: [] })
+        logic = dataNodeLogic({
+            key: `regex-${pattern}`,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+                properties: [{ type: 'event', key: '$current_url', operator: 'regex', value: pattern }],
+            }),
+        })
+        logic.mount()
+        if (cancel) {
+            logic.actions.cancelQuery()
+        }
+
+        await expectLogic(logic).toFinishAllListeners()
+        await waitFor(() => expect(logic.values.responseLoading).toBe(false))
+        expect(performQuery).toHaveBeenCalledTimes(expectedCalls)
+    })
+
+    it('reports the query kind to its collection when the query arrives after mount', async () => {
+        mockedQuery.mockResolvedValueOnce({ results: [] })
+        const collection = dataNodeCollectionLogic({ key: 'test-collection' })
+        collection.mount()
+        logic = dataNodeLogic({ key: testUniqueKey, dataNodeCollectionId: 'test-collection' } as DataNodeLogicProps)
+        logic.mount()
+
+        await expectLogic(collection, () => {
+            dataNodeLogic({
+                key: testUniqueKey,
+                dataNodeCollectionId: 'test-collection',
+                query: setLatestVersionsOnQuery({ kind: NodeKind.EventsQuery, select: ['*'] }),
+            })
+        }).toDispatchActions([collection.actionCreators.collectionNodeLoadData(testUniqueKey, NodeKind.EventsQuery)])
+
+        mockedQuery.mockResolvedValueOnce({ results: [] })
+        await expectLogic(collection, () => {
+            logic.actions.loadData(
+                undefined,
+                undefined,
+                setLatestVersionsOnQuery({ kind: NodeKind.HogQLQuery, query: 'select 1' })
+            )
+        }).toDispatchActions([collection.actionCreators.collectionNodeLoadData(testUniqueKey, NodeKind.HogQLQuery)])
+        collection.unmount()
+    })
+
+    it('force refreshes account table results when filters change', async () => {
+        const assignedQuery = {
+            kind: NodeKind.AccountsTableQuery,
+            columns: [],
+            filters: [{ kind: 'assigned' as const }],
+        }
+        mockedQuery.mockResolvedValue({ results: [] })
+        logic = dataNodeLogic({ key: testUniqueKey, query: assignedQuery })
+        logic.mount()
+        await expectLogic(logic).toDispatchActions(['loadDataSuccess'])
+
+        const unassignedQuery = {
+            kind: NodeKind.AccountsTableQuery,
+            columns: [],
+            filters: [{ kind: 'unassigned' as const }],
+        }
+        mockedQuery.mockClear()
+        dataNodeLogic({ key: testUniqueKey, query: unassignedQuery })
+
+        expect(performQuery).toHaveBeenCalledWith(
+            unassignedQuery,
+            expect.anything(),
+            'force_blocking',
+            expect.any(String),
+            expect.any(Function),
+            undefined,
+            undefined,
+            false,
+            undefined
+        )
+    })
+
+    it('can load new data if EventsQuery sorted by timestamp', async () => {
+        const results = [
+            [
+                { ...commonResult, timestamp: '2022-12-24T17:00:41.165000Z' },
+                'update user properties',
+                '2022-12-24T17:00:41.165000Z',
+            ],
+        ]
+        mockedQuery.mockResolvedValueOnce({
+            columns: ['*', 'event', 'timestamp'],
+            results: results,
+            hasMore: true,
+        })
+
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+            }),
+        })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({
+                responseLoading: true,
+                canLoadNewData: true,
+                newQuery: setLatestVersionsOnQuery({
+                    kind: NodeKind.EventsQuery,
+                    select: ['*', 'event', 'timestamp'],
+                }),
+                response: null,
+            })
+            .delay(0)
+
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNewData: true,
+            newQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+                after: '2022-12-24T17:00:41.165000Z',
+            }),
+            response: partial({ results }),
+        })
+
+        // load new data
+
+        const results2 = [
+            [
+                { ...commonResult, uuid: 'new', timestamp: '2022-12-25T17:00:41.165000Z' },
+                'update user properties',
+                '2022-12-25T17:00:41.165000Z',
+            ],
+        ]
+        mockedQuery.mockResolvedValueOnce({
+            columns: ['*', 'event', 'timestamp'],
+            results: results2,
+            hasMore: true,
+        })
+
+        logic.actions.loadNewData()
+        await expectLogic(logic)
+            .toMatchValues({
+                responseLoading: true,
+                canLoadNewData: true,
+                newQuery: setLatestVersionsOnQuery({
+                    kind: NodeKind.EventsQuery,
+                    select: ['*', 'event', 'timestamp'],
+                    after: '2022-12-24T17:00:41.165000Z',
+                }),
+                response: partial({ results }),
+            })
+            .delay(0)
+
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNewData: true,
+            newQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+                after: '2022-12-25T17:00:41.165000Z',
+            }),
+            response: partial({ results: [...results2, ...results] }),
+        })
+
+        // higlights new rows
+        expect(Array.from(logic.values.highlightedRows)).toEqual([results2[0]])
+    })
+
+    it('can not load new data if EventsQuery not sorted by timestamp', async () => {
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+                orderBy: ['event'],
+            }),
+        })
+        const results: any[][] = []
+        mockedQuery.mockResolvedValueOnce({
+            columns: ['*', 'event', 'timestamp'],
+            results,
+            hasMore: true,
+        })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, canLoadNewData: false, newQuery: null, response: null })
+            .delay(0)
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNewData: false,
+            newQuery: null,
+            response: partial({ results }),
+        })
+    })
+
+    it.each([{ event: '$mcp_tool_call' }, { events: ['$mcp_tool_call'] }])(
+        'keeps the $event event scope in count queries',
+        (eventScope) => {
+            const properties = [{ key: '$mcp_is_error', type: 'event', value: true, operator: 'exact' as const }]
+            logic = dataNodeLogic({
+                autoLoad: false,
+                key: testUniqueKey,
+                query: setLatestVersionsOnQuery({
+                    kind: NodeKind.EventsQuery,
+                    select: ['*'],
+                    ...eventScope,
+                    properties,
+                }),
+            })
+            logic.mount()
+
+            expect(logic.values.totalCountQuery).toMatchObject({
+                kind: NodeKind.EventsQuery,
+                ...eventScope,
+                properties: undefined,
+                select: ['count(*)'],
+            })
+            expect(logic.values.filteredCountQuery).toMatchObject({
+                kind: NodeKind.EventsQuery,
+                ...eventScope,
+                properties,
+                select: ['count(*)'],
+            })
+        }
+    )
+
+    it('clamps EventsQuery pagination to the maximum accumulated rows', async () => {
+        const results = [
+            [
+                { ...commonResult, timestamp: '2022-12-24T17:00:41.165000Z' },
+                'update user properties',
+                '2022-12-24T17:00:41.165000Z',
+            ],
+        ]
+        mockedQuery.mockResolvedValueOnce({
+            columns: ['*', 'event', 'timestamp'],
+            results: results,
+            hasMore: true,
+        })
+
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            maxPaginationRows: 3,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+            }),
+        })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, canLoadNextData: false, nextQuery: null, response: null })
+            .delay(0)
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNextData: true,
+            nextQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+                before: '2022-12-24T17:00:41.165000Z|01853a90-ba94-0000-8776-e8df5617c3ec',
+                limit: 2,
+            }),
+            response: partial({ results }),
+        })
+
+        // load next results
+
+        const results2 = [
+            [
+                { ...commonResult, uuid: 'new', timestamp: '2022-12-23T17:00:41.165000Z' },
+                'update user properties',
+                '2022-12-23T17:00:41.165000Z',
+            ],
+            [
+                { ...commonResult, uuid: 'newer', timestamp: '2022-12-22T17:00:41.165000Z' },
+                'update user properties',
+                '2022-12-22T17:00:41.165000Z',
+            ],
+        ]
+        mockedQuery.mockResolvedValueOnce({
+            columns: ['*', 'event', 'timestamp'],
+            results: results2,
+            hasMore: true,
+        })
+
+        logic.actions.loadNextData()
+        await expectLogic(logic)
+            .toMatchValues({
+                responseLoading: true,
+                canLoadNextData: true,
+                nextQuery: setLatestVersionsOnQuery({
+                    kind: NodeKind.EventsQuery,
+                    select: ['*', 'event', 'timestamp'],
+                    before: '2022-12-24T17:00:41.165000Z|01853a90-ba94-0000-8776-e8df5617c3ec',
+                    limit: 2,
+                }),
+                response: partial({ results }),
+            })
+            .delay(0)
+
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNextData: false,
+            nextQuery: null,
+            response: partial({ results: [...results, ...results2] }),
+        })
+
+        await expectLogic(logic, () => logic.actions.loadNextData()).toFinishAllListeners()
+        expect(mockedQuery).toHaveBeenCalledTimes(2)
+    })
+
+    it('can load next data for PersonsNode', async () => {
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({ kind: NodeKind.PersonsNode }),
+        })
+        const results = [{}, {}, {}]
+        mockedQuery.mockResolvedValueOnce({ results, next: 'next url' })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, canLoadNextData: false, nextQuery: null, response: null })
+            .delay(0)
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNextData: true,
+            nextQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.PersonsNode,
+                limit: 100,
+                offset: 3,
+            }),
+            response: partial({ results }),
+        })
+    })
+
+    it('can load next data for TracesQuery', async () => {
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({ kind: NodeKind.TracesQuery }),
+        })
+        const results = [{}, {}, {}]
+        mockedQuery.mockResolvedValueOnce({ results, hasMore: true })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, canLoadNextData: false, nextQuery: null, response: null })
+            .delay(0)
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNextData: true,
+            nextQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.TracesQuery,
+                limit: 100,
+                offset: 3,
+            }),
+            response: partial({ results }),
+        })
+    })
+
+    it('continues an ErrorTrackingIssueEventsQuery from the cursor of the latest page', async () => {
+        const source = setLatestVersionsOnQuery({ kind: NodeKind.EventsQuery, select: ['*', 'timestamp'] })
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.ErrorTrackingIssueEventsQuery,
+                issueId: 'issue',
+                source,
+                onlyWithRecording: true,
+            }),
+        })
+        mockedQuery.mockResolvedValueOnce({
+            results: [['first']],
+            hasMore: true,
+            nextCursor: 'cursor-1',
+        })
+        logic.mount()
+        await expectLogic(logic).delay(0)
+        await expectLogic(logic).toMatchValues({
+            nextQuery: partial({ source: { ...source, before: 'cursor-1' } }),
+        })
+
+        mockedQuery.mockResolvedValueOnce({
+            results: [['second']],
+            hasMore: true,
+            nextCursor: 'cursor-2',
+        })
+        logic.actions.loadNextData()
+        await expectLogic(logic).delay(0)
+
+        await expectLogic(logic).toMatchValues({
+            response: partial({ results: [['first'], ['second']] }),
+            nextQuery: partial({ source: { ...source, before: 'cursor-2' } }),
+        })
+    })
+
+    it('can load next data for SessionQuery', async () => {
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({ kind: NodeKind.SessionQuery, sessionId: 'session-1' }),
+        })
+        const results = [{}, {}, {}]
+        mockedQuery.mockResolvedValueOnce({ results, hasMore: true })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, canLoadNextData: false, nextQuery: null, response: null })
+            .delay(0)
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNextData: true,
+            nextQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.SessionQuery,
+                sessionId: 'session-1',
+                limit: 100,
+                offset: 3,
+            }),
+            response: partial({ results }),
+        })
+    })
+
+    it('can load next data for AccountsQuery', async () => {
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({ kind: NodeKind.AccountsQuery }),
+        })
+        const results = [[{}], [{}], [{}]]
+        mockedQuery.mockResolvedValueOnce({ results, hasMore: true })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, canLoadNextData: false, nextQuery: null, response: null })
+            .delay(0)
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNextData: true,
+            nextQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.AccountsQuery,
+                limit: 100,
+                offset: 3,
+            }),
+            response: partial({ results }),
+        })
+    })
+
+    it('can load next data for AccountsTableQuery', async () => {
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({ kind: NodeKind.AccountsTableQuery, columns: [], filters: [] }),
+        })
+        const results = [{ id: 'account-1' }, { id: 'account-2' }, { id: 'account-3' }]
+        mockedQuery.mockResolvedValueOnce({ results, hasMore: true })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({ responseLoading: true, canLoadNextData: false, nextQuery: null, response: null })
+            .delay(0)
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNextData: true,
+            nextQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.AccountsTableQuery,
+                columns: [],
+                filters: [],
+                limit: 100,
+                offset: 3,
+            }),
+            response: partial({ results }),
+        })
+    })
+
+    it('can autoload new data for EventsQuery', async () => {
+        const results = [
+            [
+                { ...commonResult, timestamp: '2022-12-24T17:00:41.165000Z' },
+                'update user properties',
+                '2022-12-24T17:00:41.165000Z',
+            ],
+        ]
+        mockedQuery.mockResolvedValueOnce({
+            columns: ['*', 'event', 'timestamp'],
+            results: results,
+            hasMore: true,
+        })
+
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+            }),
+        })
+        logic.mount()
+        await expectLogic(logic)
+            .toMatchValues({
+                responseLoading: true,
+                canLoadNewData: true,
+                newQuery: setLatestVersionsOnQuery({
+                    kind: NodeKind.EventsQuery,
+                    select: ['*', 'event', 'timestamp'],
+                }),
+                response: null,
+                autoLoadToggled: false,
+                autoLoadStarted: false,
+                autoLoadRunning: false,
+            })
+            .delay(0)
+        await expectLogic(logic).toMatchValues({
+            responseLoading: false,
+            canLoadNewData: true,
+            newQuery: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+                after: '2022-12-24T17:00:41.165000Z',
+            }),
+            response: partial({ results }),
+            autoLoadToggled: false,
+            autoLoadStarted: false,
+            autoLoadRunning: false,
+        })
+
+        // load new data
+
+        const results2 = [
+            [
+                { ...commonResult, uuid: 'new', timestamp: '2022-12-25T17:00:41.165000Z' },
+                'update user properties',
+                '2022-12-25T17:00:41.165000Z',
+            ],
+        ]
+        mockedQuery.mockResolvedValueOnce({
+            columns: ['*', 'event', 'timestamp'],
+            results: results2,
+            hasMore: true,
+        })
+
+        // Start the autoloader - this is done in a `useEffect` in the frontend,
+        // to track whether the autoload needs to run or not. This is separate
+        // from the toggle itself.
+        logic.actions.startAutoLoad()
+
+        await expectLogic(logic).toMatchValues({
+            newDataLoading: false,
+            canLoadNewData: true,
+            autoLoadToggled: false,
+            autoLoadStarted: true,
+            autoLoadRunning: false,
+            response: partial({ results }),
+        })
+
+        jest.useFakeTimers()
+
+        // Turn on the autoload toggle
+        logic.actions.toggleAutoLoad()
+
+        await expectLogic(logic).toDispatchActions(['loadNewData', 'loadNewDataSuccess'])
+
+        await expectLogic(logic).toMatchValues({
+            newDataLoading: false,
+            canLoadNewData: true,
+            autoLoadToggled: true,
+            autoLoadStarted: true,
+            autoLoadRunning: true,
+            response: partial({ results: [...results2, ...results] }),
+        })
+        expect(Array.from(logic.values.highlightedRows)).toEqual([results2[0]])
+
+        const results3 = [
+            [
+                { ...commonResult, uuid: 'new3', timestamp: '2022-12-25T17:00:41.165000Z' },
+                'update user properties',
+                '2022-12-25T17:00:41.165000Z',
+            ],
+        ]
+        mockedQuery.mockResolvedValueOnce({
+            columns: ['*', 'event', 'timestamp'],
+            results: results3,
+            hasMore: true,
+        })
+
+        // Autoload is running in the background and will fire in 5 seconds. Check that there's a background script for this.
+        expect(logic.cache.disposables.registry.has('autoLoadInterval')).toBe(true)
+        jest.advanceTimersByTime(31000)
+        await expectLogic(logic)
+            .toDispatchActions(['loadNewData', 'loadNewDataSuccess'])
+            .toMatchValues({
+                newDataLoading: false,
+                canLoadNewData: true,
+                autoLoadToggled: true,
+                autoLoadStarted: true,
+                autoLoadRunning: true,
+                response: partial({ results: [...results3, ...results2, ...results] }),
+            })
+    })
+
+    it('does not call query to fetch data if there are cached results', async () => {
+        logic = dataNodeLogic({
+            key: 'hasCachedResults',
+            query: setLatestVersionsOnQuery({
+                kind: NodeKind.EventsQuery,
+                select: ['*', 'event', 'timestamp'],
+            }),
+            cachedResults: { result: [1, 2, 3] },
+        })
+        logic.mount()
+
+        // Query to fetch the count will still be called
+        expect(performQuery).toHaveBeenCalledTimes(0)
+
+        await expectLogic(logic).toMatchValues({ response: { result: [1, 2, 3] } })
+    })
+
+    it('passes filtersOverride to api', async () => {
+        const filtersOverride: DashboardFilter = {
+            date_from: '2022-12-24T17:00:41.165000Z',
+        }
+        const query = setLatestVersionsOnQuery({
+            kind: NodeKind.EventsQuery,
+            select: ['*', 'event', 'timestamp'],
+        })
+
+        logic = dataNodeLogic({
+            key: 'key',
+            query,
+            filtersOverride,
+        })
+        logic.mount()
+
+        expect(performQuery).toHaveBeenCalledWith(
+            query,
+            expect.anything(),
+            'blocking',
+            expect.any(String),
+            expect.any(Function),
+            { date_from: '2022-12-24T17:00:41.165000Z' },
+            undefined,
+            false,
+            undefined
+        )
+    })
+
+    it('passes variablesOverride to api', async () => {
+        const variablesOverride: Record<string, HogQLVariable> = {
+            test_1: {
+                variableId: 'some_id',
+                code_name: 'some_name',
+                value: 'hello world',
+            },
+        }
+
+        const query = setLatestVersionsOnQuery({
+            kind: NodeKind.EventsQuery,
+            select: ['*', 'event', 'timestamp'],
+        })
+
+        logic = dataNodeLogic({
+            key: 'key',
+            query,
+            variablesOverride,
+        })
+        logic.mount()
+
+        expect(performQuery).toHaveBeenCalledWith(
+            query,
+            expect.anything(),
+            'blocking',
+            expect.any(String),
+            expect.any(Function),
+            undefined,
+            { test_1: { code_name: 'some_name', value: 'hello world', variableId: 'some_id' } },
+            false,
+            undefined
+        )
+    })
+
+    it("doesn't pass undefined filtersOverride to api", async () => {
+        const query = setLatestVersionsOnQuery({
+            kind: NodeKind.EventsQuery,
+            select: ['*', 'event', 'timestamp'],
+        })
+
+        logic = dataNodeLogic({
+            key: 'key',
+            query,
+            filtersOverride: undefined,
+        })
+        logic.mount()
+
+        expect(performQuery).toHaveBeenCalledWith(
+            query,
+            expect.anything(),
+            'blocking',
+            expect.any(String),
+            expect.any(Function),
+            undefined,
+            undefined,
+            false,
+            undefined
+        )
+    })
+
+    it("doesn't pass undefined variablesOverride to api", async () => {
+        const query = setLatestVersionsOnQuery({
+            kind: NodeKind.EventsQuery,
+            select: ['*', 'event', 'timestamp'],
+        })
+
+        logic = dataNodeLogic({
+            key: 'key',
+            query,
+            variablesOverride: undefined,
+        })
+        logic.mount()
+
+        expect(performQuery).toHaveBeenCalledWith(
+            query,
+            expect.anything(),
+            'blocking',
+            expect.any(String),
+            expect.any(Function),
+            undefined,
+            undefined,
+            false,
+            undefined
+        )
+    })
+
+    it('passes limitContext to api', async () => {
+        const query = setLatestVersionsOnQuery({
+            kind: NodeKind.EventsQuery,
+            select: ['*', 'event', 'timestamp'],
+        })
+
+        logic = dataNodeLogic({
+            key: 'key',
+            query,
+            limitContext: 'posthog_ai',
+        })
+        logic.mount()
+
+        expect(performQuery).toHaveBeenCalledWith(
+            query,
+            expect.anything(),
+            'blocking',
+            expect.any(String),
+            expect.any(Function),
+            undefined,
+            undefined,
+            false,
+            'posthog_ai'
+        )
+    })
+
+    it('drops a non-RefreshType refresh argument', async () => {
+        // A caller that wires loadData straight to onClick passes a React MouseEvent as refresh;
+        // it must never reach performQuery, or the query request body fails to serialize.
+        const query = setLatestVersionsOnQuery({
+            kind: NodeKind.EventsQuery,
+            select: ['*', 'event', 'timestamp'],
+        })
+        mockedQuery.mockResolvedValue({ results: [] })
+
+        logic = dataNodeLogic({ key: testUniqueKey, query })
+        logic.mount()
+        await expectLogic(logic).toDispatchActions(['loadDataSuccess'])
+        mockedQuery.mockClear()
+
+        logic.actions.loadData({ type: 'click', target: {} } as any)
+        await expectLogic(logic).toDispatchActions(['loadDataSuccess'])
+
+        expect(performQuery).toHaveBeenCalledWith(
+            query,
+            expect.anything(),
+            'blocking',
+            expect.any(String),
+            expect.any(Function),
+            undefined,
+            undefined,
+            false,
+            undefined
+        )
+    })
+
+    const mountWithPendingScan = (): void => {
+        mockedQuery.mockResolvedValueOnce(pendingScanResponse())
+        logic = dataNodeLogic({
+            key: testUniqueKey,
+            query: setLatestVersionsOnQuery({ kind: NodeKind.EventsQuery, select: ['*'] }),
+        })
+        logic.mount()
+    }
+
+    it('polls a slow run on a backoff and folds the finished scan into the response', async () => {
+        jest.useFakeTimers()
+        try {
+            let scanCalls = 0
+            useMocks({
+                get: {
+                    [SCAN_ENDPOINT]: () => {
+                        scanCalls += 1
+                        return [200, scanCalls === 1 ? PENDING_SCAN : DONE_SCAN]
+                    },
+                },
+            })
+            mountWithPendingScan()
+            await jest.advanceTimersByTimeAsync(0)
+            expect(logic.values.queryScan?.summary.analysis).toBeUndefined()
+
+            await jest.advanceTimersByTimeAsync(QUERY_SCAN_POLL_DELAYS_MS[0])
+            expect(scanCalls).toBe(1)
+            expect(logic.values.queryScan?.summary.analysis).toBeUndefined()
+
+            await jest.advanceTimersByTimeAsync(QUERY_SCAN_POLL_DELAYS_MS[1])
+            expect(scanCalls).toBe(2)
+            expect(logic.values.queryScan?.summary.analysis).not.toBeUndefined()
+            expect(logic.values.queryScan?.summary.analysis?.range_share).toBe(0.42)
+            expect(logic.values.queryScan?.findings).toHaveLength(1)
+            expect(logic.values.queryScan?.assistantPrompt).toBe(DONE_SCAN.analysis.assistant_prompt)
+
+            // The analysis is done, so no more asks go out.
+            await jest.advanceTimersByTimeAsync(60000)
+            expect(scanCalls).toBe(2)
+        } finally {
+            jest.useRealTimers()
+        }
+    })
+
+    it('polls the analysis of a stopped run off its error', async () => {
+        jest.useFakeTimers()
+        try {
+            let scanCalls = 0
+            useMocks({
+                get: {
+                    [SCAN_ENDPOINT]: () => {
+                        scanCalls += 1
+                        return [200, DONE_SCAN]
+                    },
+                },
+            })
+            // A stopped run has no response, so the pointer to its analysis rides on the error.
+            mockedQuery.mockRejectedValueOnce(
+                Object.assign(new Error('Query was cancelled'), {
+                    data: {
+                        extra: {
+                            cache_key: 'cache-key',
+                            query_scan: { rows_read: 10, duration_ms: 2000, killed: true, analysis_requested: true },
+                        },
+                    },
+                })
+            )
+            logic = dataNodeLogic({
+                key: testUniqueKey,
+                query: setLatestVersionsOnQuery({ kind: NodeKind.EventsQuery, select: ['*'] }),
+            })
+            logic.mount()
+
+            await jest.advanceTimersByTimeAsync(QUERY_SCAN_POLL_DELAYS_MS[0])
+            expect(scanCalls).toBe(1)
+            expect(logic.values.queryScan?.summary.killed).toBe(true)
+            expect(logic.values.queryScan?.findings).toHaveLength(1)
+            expect(logic.values.queryScan?.assistantPrompt).toBe(DONE_SCAN.analysis.assistant_prompt)
+
+            await jest.advanceTimersByTimeAsync(60000)
+            expect(scanCalls).toBe(1)
+        } finally {
+            jest.useRealTimers()
+        }
+    })
+
+    it('stops polling when the scan endpoint 404s', async () => {
+        jest.useFakeTimers()
+        try {
+            let scanCalls = 0
+            useMocks({
+                get: {
+                    [SCAN_ENDPOINT]: () => {
+                        scanCalls += 1
+                        return [404, {}]
+                    },
+                },
+            })
+            mountWithPendingScan()
+            await jest.advanceTimersByTimeAsync(2000)
+            expect(scanCalls).toBe(1)
+
+            // A 404 is what a dead job looks like once its pending slot expires, so the poll ends.
+            await jest.advanceTimersByTimeAsync(120000)
+            expect(scanCalls).toBe(1)
+            expect(logic.values.queryScan?.summary.analysis).toBeUndefined()
+        } finally {
+            jest.useRealTimers()
+        }
+    })
+
+    it('stops polling once the run is too old to wait for', async () => {
+        jest.useFakeTimers()
+        try {
+            let scanCalls = 0
+            useMocks({
+                get: {
+                    [SCAN_ENDPOINT]: () => {
+                        scanCalls += 1
+                        return [200, PENDING_SCAN]
+                    },
+                },
+            })
+            mountWithPendingScan()
+
+            await jest.advanceTimersByTimeAsync(QUERY_SCAN_POLL_DEADLINE_MS + 60000)
+            const callsByDeadline = scanCalls
+            // It kept asking on the repeating 30 s interval, past the fixed backoff steps.
+            expect(callsByDeadline).toBeGreaterThan(QUERY_SCAN_POLL_DELAYS_MS.length)
+
+            await jest.advanceTimersByTimeAsync(120000)
+            expect(scanCalls).toBe(callsByDeadline)
+        } finally {
+            jest.useRealTimers()
+        }
+    })
+})

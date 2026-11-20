@@ -1,0 +1,144 @@
+# Skills: zip export + Claude Code plugin marketplace
+
+Spec-compliant ([agentskills.io](https://agentskills.io/specification)) packaging for stored
+skills, plus a live, team-private Claude Code plugin marketplace served straight from the
+database — no git repo, no static files, no build step. Modeled on Mnemion's approach
+(synthesize a virtual git repo on every request).
+
+## Layout
+
+| Module                        | Django? | Responsibility                                                             |
+| ----------------------------- | ------- | -------------------------------------------------------------------------- |
+| `packaging.py`                | no      | `SKILL.md` frontmatter serialization, zip + marketplace file-tree assembly |
+| `git_smart_http.py`           | no      | read-only Git Smart HTTP v2: file tree → packfile / ref advertisement      |
+| `adapters.py`                 | yes     | the only ORM layer: `LLMSkill` rows → the plain export dataclasses         |
+| `credentials.py`              | yes     | mint / reuse / rotate the per-(user,team) read-only marketplace key        |
+| `auth.py`                     | yes     | HTTP Basic → Personal API Key bridge for `git clone`                       |
+| `../api/marketplace_views.py` | yes     | the two git endpoints (`info/refs`, `git-upload-pack`)                     |
+
+The two stdlib-only modules are deliberately Django-free so the packfile synthesis is
+unit-testable against the real `git` binary without booting the app
+(`api/test/test_marketplace_git.py`, `api/test/test_marketplace_packaging.py`).
+
+## Endpoints
+
+- **Zip export** — `GET /api/projects/:team/llm_skills/name/:name/export` → `application/zip`,
+  one spec-compliant skill directory nested under `:name/` (web-authenticated, `llm_skill:read`).
+- **Skill bundle** — `GET /api/projects/:team/llm_skills/bundle?content=stub|full&limit=N` →
+  `application/zip`, every skill the requesting user created or owns (latest, not archived, not
+  `scout`, and readable under the same object-level access filter as the list endpoint), each nested
+  under `<name>/` so the zip unpacks straight into `~/.claude/skills` / `~/.agents/skills`.
+  `content=stub` (default) writes one `SKILL.md` per skill with only its name, description and
+  instructions to fetch the real skill with `skill-get` / `skill-file-get` when it is invoked, so a
+  sandbox gets discovery for a few KB and skill content only moves over MCP when a skill is used.
+  `content=full` writes the rendered `SKILL.md`, bundled files and Codex sidecar. Newest first,
+  `limit` skills (default 50, at most 100; every skill in the zip costs the agent prompt context on
+  each turn) and 5 MB uncompressed for `full`; the walk stops at the first skill that would cross a
+  cap, and sizes are checked from column byte counts before any content loads.
+  `X-Skills-Included`, `X-Skills-Dropped` (over the cap) and `X-Skills-Skipped` (failed the spec
+  check, or a legacy name or file path that is not safe to unpack) carry counts; names are logged.
+  Behind the `skills-store-in-sandbox` flag (off → 404, flag service unavailable → 503).
+  `llm_skill:read`, which the sandbox OAuth token already carries. Throttled per user, so one caller
+  cannot 429 the rest of the project. Consumer-facing contract: `docs/internal/skills/skill-bundle-api.md`.
+- **Resource manifests** — `GET /api/projects/:team/llm_skills/name/:name/manifest/?version=N` and the paged
+  `GET /api/projects/:team/llm_skills/manifests/` return every file of a skill (`SKILL.md` first) with the stored
+  SHA-256 and byte size, plus a `servable` flag against the MCP Skills extension limits, for the MCP server's
+  `skills/get` and `skills/list`. `llm_skill:read`. Contract: `docs/internal/skills/skill-md-api.md`.
+- **Sandbox run state** — `select_skill_stubs` in `adapters.py` is the same stub walk without the zip.
+  The tasks worker calls it when it builds a run's processing context and writes the entries into
+  `TaskRun.state["store_skills"]` (`products/tasks/backend/logic/services/store_skills.py`); the sandbox
+  agent renders one pointer `SKILL.md` per entry into `~/.claude/skills` and `~/.agents/skills`
+  (`packages/agent/packages/harness/src/extensions/skills-store/store-skills.ts`), skipping any name a bundled skill
+  already uses. The stub file the agent writes must stay in step with `render_skill_stub_md`.
+  The list is the acting user's, so the worker writes it again when that user changes after the
+  session started (a warm run activated by its first message, a shared Slack task whose next
+  message comes from another member) and the agent re-reads the run and resyncs the stubs.
+- **Zip import** — `POST /api/projects/:team/llm_skills/import` (multipart `file` field, a spec
+  skill `.zip`) → creates the skill (web-authenticated, `llm_skill:write`). The inverse of
+  export: `parse_skill_zip` reads `SKILL.md` frontmatter + bundled files. Round-trips with export.
+- **Install command** — `GET` (read connection state, no mint) + `POST` (mint/rotate the
+  credential, returns the ready-to-paste command) `…/llm_skills/marketplace/install-command`.
+  Web-authenticated; GET needs `llm_skill:read`, POST needs `llm_skill:write`. Powers the
+  "Connect to Claude Code" UI and the `skill-store-install-command` MCP tool. See
+  [Auth](#auth-a-dedicated-read-only-personal-api-key-revoked-with-the-user) for the
+  per-user credential model.
+- **Marketplace** — `…/llm_skills/marketplace.git/info/refs` + `…/git-upload-pack`. The repo
+  root is `…/llm_skills/marketplace.git`; `git` appends the rest. One plugin per team
+  (`posthog-skill-store`).
+
+## Spec mapping (storage → SKILL.md)
+
+- `allowed_tools` (stored list) → `allowed-tools` (spec's hyphenated, space-separated string). A harness that
+  reads the file treats it as pre-approved; a host that loads the skill over MCP ignores it until the user
+  approves the grant. See `docs/internal/skills/skills-over-mcp.md`.
+- platform `version` → `metadata.version` (the spec defines no top-level version field)
+- `description` is validated against the spec's 1024 limit on export (`compute_spec_problems`, which also
+  decides whether a skill is packageable at all; the API reports its output as `spec_problems`)
+
+## Cross-agent portability
+
+The `SKILL.md` artifact is the open standard ([agentskills.io](https://agentskills.io/specification)),
+read by Claude Code, OpenAI Codex, Gemini CLI, Copilot/VS Code, Cursor, Windsurf, and more — so the
+zip export drops straight into any of them. Each skill tree also includes an `agents/openai.yaml`
+sidecar (`render_codex_openai_yaml`) carrying Codex UI metadata; every other agent ignores it. On
+import (`parse_skill_zip`) that sidecar is skipped since export regenerates it.
+
+## Auth: a dedicated, read-only Personal API Key (revoked with the user)
+
+`git clone` (and therefore `/plugin marketplace add` / `codex plugin marketplace add`) speaks
+only HTTP Basic via git credential helpers — never Bearer, never OAuth. So the marketplace uses
+a **Personal API Key** (`phx_…`) carried as the Basic password. `auth.py` bridges Basic → PAK by
+pulling the token from the Basic credential and reusing the standard Personal API Key flow;
+`APIScopePermission` then enforces the `llm_skill:read` scope and the key's team scoping, and
+`TeamMemberAccessPermission` re-checks the user's current membership.
+
+**Why a Personal API Key, not a Project Secret API Key.** The credential must die with the
+user's access — no manual revocation, no offboarding checklist. A user-tied credential gets that
+for free: PostHog re-evaluates membership on every request, so the clone stops working the moment
+the user leaves the team or loses access. A PSAK is deliberately user-_less_ (built to outlive
+the people who make it), which is exactly the wrong property here. It's still _dedicated and
+read-only_ — one minted-for-this-purpose key per `(user, team)`, scoped to only `llm_skill:read`
+and that one team (`scoped_teams`), not the user's everyday key.
+
+**One credential per (user, team)** (`credentials.py`), labeled `Skill store · team <team-id>`
+under the user's account. The raw token is unrecoverable after creation, so "reuse" means
+return-if-present / roll-if-asked. `install-command`'s `GET` reports whether you're already
+connected without minting (the token can't be shown again), and `POST` only rolls when
+`rotate=true` (the rotate takes the row with `select_for_update` so concurrent rolls can't lose
+an update). The minted token lives in the user's OS keychain / git credential store.
+
+## Versioning / auto-update
+
+Claude Code re-pulls when the `version` in `marketplace.json` / `plugin.json` changes.
+`compute_plugin_version` uses the latest skill change time in microseconds.
+Publishes and archives update this timestamp.
+The synthesized repository cache uses the team ID and version, so repeated clones reuse the same repository.
+Each request reads the version without a time-based cache so a pull sees a change reported by the skills list.
+The shared version function is `api/skill_services.py:team_skills_version`.
+See [skills list conditional requests](../../../../docs/internal/skills/skills-list-conditional-requests.md) for the version's limits and the list ETag.
+
+> **Open question (the spike answers it):** whether Claude Code re-pulls on any version
+> _difference_ or only strictly-greater, and whether background auto-update reliably re-auths
+> via the credential helper. The monotonic-timestamp scheme is safe for either.
+
+## Job one — testing auto-updates (run once a dev env is reachable by a real Claude Code)
+
+1. Expose the dev stack at a URL Claude Code can reach (devbox public URL or a `cloudflared`
+   tunnel in front of `./bin/start` — `localhost` won't do).
+2. Get the ready-to-paste command (mints the per-user read-only credential and embeds it):
+   the **Connect to Claude Code** button in the skills UI, `POST
+/api/environments/:team/llm_skills/marketplace/install-command`, or the
+   `skill-store-install-command` MCP tool. The `phx_…` token is shown once.
+3. Create a skill (UI, API, or the `skill-create` MCP tool) so the marketplace is non-empty.
+4. In Claude Code, paste the command (it is the full
+   `/plugin marketplace add https://x-access-token:phx_…@<host>/api/projects/:team/llm_skills/marketplace.git`),
+   then install the `posthog-skill-store` plugin and confirm a skill loads (`/posthog-skill-store:<name>`).
+5. Publish a change to that skill → the plugin version advances. Trigger / wait for Claude
+   Code's marketplace update and confirm the new `SKILL.md` content is pulled.
+6. Record what actually triggers the re-pull (version diff vs. strictly-greater; manual update
+   vs. background) and whether the credential helper re-auths unattended — that resolves the
+   open question above and tells us whether the version scheme needs adjusting.
+
+Rung 1 (protocol correctness — clone, shallow clone, version bump, `git fsck`) is already
+proven offline against the real `git` binary in `test_marketplace_git.py`; rung 2 (the steps
+above) is the only part that needs a live client.

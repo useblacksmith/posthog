@@ -1,0 +1,122 @@
+import type { PieChartConfig, YAxisFormat, YFormatterConfig } from '@posthog/quill-charts'
+
+import { trendsFilterToYFormatterConfig } from 'products/product_analytics/frontend/insights/trends/shared/trendsAxisFormat'
+
+import type { ChartDisplayType, TrendsFilter } from './types'
+
+export type ChartType = 'line' | 'area' | 'bar' | 'stacked-bar' | 'slope'
+
+// Reuse quill's canonical y-unit union so the two can't drift.
+export type YUnit = YAxisFormat
+
+export interface ChartConfig {
+    showValueLabels: boolean
+    showTrendLine: boolean
+    showConfidenceIntervals: boolean
+    confidenceLevel: number
+    percentStack: boolean
+    yUnit: YUnit
+}
+
+export const DEFAULT_CHART_CONFIG: ChartConfig = {
+    showValueLabels: false,
+    showTrendLine: false,
+    showConfidenceIntervals: false,
+    confidenceLevel: 95,
+    percentStack: false,
+    yUnit: 'numeric',
+}
+
+export const Y_UNIT_OPTIONS: { value: YUnit; label: string }[] = [
+    { value: 'numeric', label: 'Numeric' },
+    { value: 'short', label: 'Compact (1.2K)' },
+    { value: 'percentage', label: 'Percentage (0–100)' },
+    { value: 'percentage_scaled', label: 'Percentage (0–1)' },
+    { value: 'duration', label: 'Duration (s)' },
+    { value: 'duration_ms', label: 'Duration (ms)' },
+    { value: 'currency', label: 'Currency' },
+]
+
+export function chartConfigFromTrendsFilter(trendsFilter: TrendsFilter | undefined): ChartConfig {
+    return {
+        showValueLabels: trendsFilter?.showValuesOnSeries ?? DEFAULT_CHART_CONFIG.showValueLabels,
+        showTrendLine: trendsFilter?.showTrendLines ?? DEFAULT_CHART_CONFIG.showTrendLine,
+        showConfidenceIntervals: trendsFilter?.showConfidenceIntervals ?? DEFAULT_CHART_CONFIG.showConfidenceIntervals,
+        confidenceLevel: trendsFilter?.confidenceLevel ?? DEFAULT_CHART_CONFIG.confidenceLevel,
+        percentStack: trendsFilter?.showPercentStackView ?? DEFAULT_CHART_CONFIG.percentStack,
+        yUnit: trendsFilter?.aggregationAxisFormat ?? DEFAULT_CHART_CONFIG.yUnit,
+    }
+}
+
+// Matches DONUT_INNER_RADIUS_RATIO in TrendsPieChart.tsx so the MCP donut looks like the insight donut.
+const DONUT_INNER_RADIUS_RATIO = 0.6
+
+export interface PieView {
+    config: PieChartConfig
+    valueFormat: YFormatterConfig
+}
+
+// Applies the same slice label rules as TrendsPieChart.tsx, so the preview shows the numbers the saved insight shows.
+export function pieViewFromTrendsFilter(trendsFilter: TrendsFilter | undefined, isDonut: boolean): PieView {
+    const showValue = !!trendsFilter?.showValuesOnSeries
+    const showPercent = !!trendsFilter?.showPercentStackView
+    return {
+        config: {
+            showValueOnSlice: showValue || showPercent,
+            sliceValueDisplay: showValue && showPercent ? 'both' : showPercent ? 'percent' : 'value',
+            isPercent: showPercent,
+            innerRadiusRatio: isDonut ? DONUT_INNER_RADIUS_RATIO : undefined,
+            legend: { show: true, position: 'bottom' },
+        },
+        // PieChart converts slices to percentages itself, so the value format keeps the value's own units.
+        valueFormat: trendsFilterToYFormatterConfig(trendsFilter, false),
+    }
+}
+
+export function defaultChartType(displayType: ChartDisplayType): ChartType {
+    if (displayType === 'SlopeGraph') {
+        return 'slope'
+    }
+    if (displayType === 'ActionsAreaGraph') {
+        return 'area'
+    }
+    if (displayType === 'ActionsUnstackedBar') {
+        return 'bar'
+    }
+    // ActionsBar renders stacked on web, so map it to the stacked option.
+    if (displayType === 'ActionsBar' || displayType === 'ActionsStackedBar') {
+        return 'stacked-bar'
+    }
+    return 'line'
+}
+
+const DISPLAY_FOR_CHART_TYPE: Record<ChartType, ChartDisplayType> = {
+    line: 'ActionsLineGraph',
+    area: 'ActionsAreaGraph',
+    bar: 'ActionsUnstackedBar',
+    'stacked-bar': 'ActionsBar',
+    slope: 'SlopeGraph',
+}
+
+export function displayForChartType(chartType: ChartType): ChartDisplayType {
+    return DISPLAY_FOR_CHART_TYPE[chartType]
+}
+
+export function isBarFamily(chartType: ChartType): boolean {
+    return chartType === 'bar' || chartType === 'stacked-bar'
+}
+
+export function supportsPercentStack(chartType: ChartType): boolean {
+    return chartType === 'area' || chartType === 'stacked-bar'
+}
+
+export interface ResolvedChartView {
+    slopeAvailable: boolean
+    effectiveType: ChartType
+}
+
+// Slope needs at least two time points; below that it falls back to line.
+export function resolveChartView(chartType: ChartType, labelCount: number): ResolvedChartView {
+    const slopeAvailable = labelCount >= 2
+    return { slopeAvailable, effectiveType: chartType === 'slope' && !slopeAvailable ? 'line' : chartType }
+}

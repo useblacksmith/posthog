@@ -1,0 +1,235 @@
+from abc import ABC, abstractmethod
+from typing import Any, Optional
+
+from rest_framework.exceptions import APIException
+
+from posthog.models import Team
+
+
+class BaseAction(ABC):
+    """
+    Base class for all gatable actions.
+
+    Each action defines:
+    - How to detect if a request matches
+    - How to extract intent from a request
+    - How to validate intent
+    - How to apply the change when approved
+    """
+
+    key: Optional[str] = None
+    version: int = 1
+    description: Optional[str] = None
+    resource_type: Optional[str] = None
+
+    endpoint_serializer_class: Optional[Any] = None
+
+    intent_fields: Optional[list[str]] = None
+
+    # Action keys whose policy gates this action when it has no policy of its own.
+    # The fallback policy's conditions name the other action's fields, so they are not evaluated.
+    fallback_policy_action_keys: tuple[str, ...] = ()
+
+    @classmethod
+    def fallback_policy_action_keys_for(cls, organization) -> tuple[str, ...]:
+        """The fallback keys to try for this organization, in order.
+
+        A hook rather than the attribute, because which policy stands in for this action can
+        depend on how far the organization has moved between families.
+        """
+        return cls.fallback_policy_action_keys
+
+    @classmethod
+    def _get_instance(cls, view, *args, **kwargs):
+        if hasattr(view, "context") and "request" in view.context:
+            # Serializer context
+            return args[0] if args else None
+        else:
+            # ViewSet context
+            return view.get_object()
+
+    @classmethod
+    def _get_team(cls, view):
+        if hasattr(view, "context"):
+            team = view.context.get("get_team", lambda: None)()
+            if team is not None:
+                return team
+            # Internal callers omit get_team; derive from the instance/team_id so
+            # detection stays fail-closed instead of silently skipping the gate.
+            instance = getattr(view, "instance", None)
+            team = getattr(instance, "team", None)
+            if team is None and view.context.get("team_id"):
+                team = Team.objects.filter(id=view.context["team_id"]).first()
+            return team
+        else:
+            return getattr(view, "team", None)
+
+    @classmethod
+    def _get_organization(cls, view):
+        if hasattr(view, "context"):
+            org = view.context.get("get_organization", lambda: None)()
+            if org is not None:
+                return org
+            team = cls._get_team(view)
+            return team.organization if team is not None else None
+        else:
+            return getattr(view, "organization", None)
+
+    @classmethod
+    def prepare_context(cls, change_request, base_context: dict[str, Any]) -> dict[str, Any]:
+        """
+        Prepare context for validation and apply operations.
+        Override this to add resource-specific context (e.g., fetch instance).
+        """
+        return base_context
+
+    @classmethod
+    def get_target_filter(cls, intent_data: dict[str, Any]) -> dict[str, Any]:
+        """
+        Return ChangeRequest filters that identify the target of a change request with no resource id.
+
+        Every such change request stores resource_id as NULL, so without these filters the
+        duplicate check matches every other one for the same action.
+        """
+        return {}
+
+    @classmethod
+    @abstractmethod
+    def detect(cls, request, view, *args, **kwargs) -> bool:
+        """
+        Return True if this request should be gated by this action.
+        Called by the decorator to determine if this action applies.
+        """
+        pass
+
+    @classmethod
+    @abstractmethod
+    def extract_intent(cls, request, view, *args, **kwargs) -> dict[str, Any]:
+        """
+        Extract structured intent data from the request.
+        For UPDATE actions: Return current state + desired state + preconditions
+        For CREATE actions: Return full payload
+        """
+        pass
+
+    @classmethod
+    def derive_owner_kind(
+        cls,
+        team,
+        resource_id: Optional[str],
+        intent_data: dict[str, Any],
+    ) -> Optional[str]:
+        """Classify which product owns the resource this change targets.
+
+        Called once when the change request is created and again before it applies, so the two
+        answers can be compared. Return None to opt out: the classification is then not recorded
+        and the apply path has nothing to compare.
+        """
+        return None
+
+    @classmethod
+    def refuse_change_request(cls, request, intent_data: dict[str, Any]) -> Optional[APIException]:
+        """Return an error that refuses the write instead of opening a change request, or None.
+
+        Called only when a policy requires approval for the change.
+        """
+        return None
+
+    @classmethod
+    def check_staleness(
+        cls,
+        intent_data: dict[str, Any],
+        context: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Check if the underlying resource has changed since the CR was created.
+
+        Returns True if the resource is stale (has been modified).
+        Override in subclasses that store preconditions in intent.
+        """
+        return False
+
+    @classmethod
+    def validate_intent(
+        cls,
+        intent_data: dict[str, Any],
+        context: Optional[dict[str, Any]] = None,
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """
+        Validate intent against the endpoint serializer.
+        """
+        if cls.endpoint_serializer_class is None:
+            return True, None
+
+        if "gated_changes" in intent_data:
+            data_to_validate = intent_data["gated_changes"]
+            partial = True
+        else:
+            data_to_validate = intent_data
+            partial = False
+
+        instance = context.get("instance") if context else None
+
+        serializer = cls.endpoint_serializer_class(
+            instance=instance,
+            data=data_to_validate,
+            partial=partial,
+            context=context or {},
+        )
+
+        is_valid = serializer.is_valid()
+        return is_valid, None if is_valid else serializer.errors
+
+    @classmethod
+    @abstractmethod
+    def apply(
+        cls,
+        validated_intent: dict[str, Any],
+        user,
+        context: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """
+        Execute the approved change.
+
+        Must be idempotent and check preconditions.
+        Should raise PreconditionFailed if resource changed.
+        """
+        pass
+
+    @classmethod
+    def get_display_data(cls, intent: dict[str, Any]) -> dict[str, Any]:
+        """
+        Generate human-readable diff for UI display.
+        """
+        if "gated_changes" in intent and "current_state" in intent:
+            return {
+                "before": intent["current_state"],
+                "after": intent["gated_changes"],
+                "changes": cls._compute_diff(
+                    intent["current_state"],
+                    intent["gated_changes"],
+                ),
+            }
+        else:
+            return intent
+
+    @staticmethod
+    def _compute_diff(before: dict, after: dict) -> list:
+        """Compute field-level diff between states"""
+        changes = []
+        all_keys = set(before.keys()) | set(after.keys())
+
+        for key in all_keys:
+            before_val = before.get(key)
+            after_val = after.get(key)
+
+            if before_val != after_val:
+                changes.append(
+                    {
+                        "field": key,
+                        "before": before_val,
+                        "after": after_val,
+                    }
+                )
+
+        return changes

@@ -1,0 +1,726 @@
+from typing import Any, ClassVar, Optional, cast
+
+from posthog.exceptions_capture import capture_exception
+
+from products.warehouse_sources.backend.facade.codebase_detection import detect
+from products.warehouse_sources.backend.facade.source_config import (
+    DataWarehouseSourceCategory,
+    ReleaseStatus,
+    SourceConfig,
+    SourceFieldInputConfig,
+    SourceFieldInputConfigType,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.mixins import (
+    DATABASE_HOST_NOT_ALLOWED_GUIDANCE,
+    HOST_RESOLUTION_EXHAUSTED_MESSAGE,
+    HostNotAllowedError,
+    ValidateDatabaseHostMixin,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import (
+    SourceSchema,
+    rank_incremental_fields,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.mongodb import (
+    MongoDBSourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.mongodb.mongo import (
+    DATABASE_NAME_REQUIRED_ERROR,
+    MONGO_DOCUMENT_MISSING_ID_ERROR,
+    UNSUPPORTED_FILE_OPTION_ERROR,
+    MongoResumeConfig,
+    UnsupportedConnectionOptionError,
+    _parse_connection_string,
+    filter_mongo_incremental_fields,
+    get_collection_names,
+    get_index_keys_by_collection,
+    get_schemas as get_mongo_schemas,
+    get_server_metadata as get_mongo_server_metadata,
+    mongo_client,
+    mongo_source,
+)
+from products.warehouse_sources.backend.types import ExternalDataSourceType
+
+_MONGO_UNREACHABLE_MESSAGE = (
+    "Could not reach your MongoDB cluster. Check that the cluster is running and that PostHog's "
+    "IP addresses are allowlisted in your database's network access settings."
+)
+
+# The same condition reached through a sync rather than the connect form. The schema keeps retrying
+# instead of being disabled, so nothing needs re-enabling and the copy has to say so.
+_MONGO_UNREACHABLE_RETRY_MESSAGE = f"{_MONGO_UNREACHABLE_MESSAGE} The next sync runs on schedule."
+
+# `_parse_connection_string` raises a ValueError when the string isn't a usable MongoDB URI: a
+# wrong or missing scheme, or a host/port that urlparse rejects. The raw reason gives the user
+# little to act on, so point at the expected scheme and format instead.
+_MONGO_INVALID_CONNECTION_STRING_MESSAGE = (
+    # nosemgrep: trailofbits.generic.mongodb-insecure-transport.mongodb-insecure-transport
+    "PostHog couldn't read your MongoDB connection string. It must start with mongodb:// or "
+    "mongodb+srv:// and follow the standard format, for example "
+    "mongodb+srv://user:password@cluster.mongodb.net/database. Check the connection string and try again."
+)
+
+_MONGO_UNESCAPED_CREDENTIALS_MESSAGE = (
+    "Your MongoDB connection string is invalid: the username and password must be percent-encoded "
+    "per RFC 3986. Escape any reserved characters (e.g. : / ? # [ ] @ %) in your credentials — for "
+    "example with urllib.parse.quote_plus — and update the connection string."
+)
+
+_MONGO_ATLAS_SQL_MESSAGE = (
+    "This connection string points at a MongoDB Atlas SQL / Data Federation endpoint "
+    "(its host ends in .query.mongodb.net), which PostHog can't import from — those endpoints "
+    "are served by a query proxy for the Atlas SQL ODBC/JDBC drivers, not the standard MongoDB "
+    "driver. Use your regular cluster connection string (e.g. mongodb+srv://...mongodb.net) instead."
+)
+
+_MONGO_UNSUPPORTED_FILE_OPTION_MESSAGE = (
+    "Your connection string sets tlsCertificateKeyFile or tlsCRLFile. These name files on your own "
+    "machine, which PostHog can't read, so client certificate sign-in isn't supported. Remove them, "
+    "sign in with a username and password, and try again."
+)
+
+_MONGO_GSSAPI_UNSUPPORTED_MESSAGE = (
+    "Your connection string sets authMechanism=GSSAPI, which signs in with Kerberos. PostHog "
+    "doesn't support that authentication mechanism. Sign in with a username and password "
+    "instead, and try again."
+)
+
+_MONGO_AWS_AUTH_UNSUPPORTED_MESSAGE = (
+    "Your connection string sets authMechanism=MONGODB-AWS, which signs in with AWS IAM "
+    "credentials. PostHog doesn't support that authentication mechanism. Sign in with a "
+    "username and password instead, and try again."
+)
+
+_MONGO_HOST_UNRESOLVED_MESSAGE = (
+    "The MongoDB host could not be resolved. Check that the cluster address in your connection "
+    "string is spelled correctly."
+)
+
+_MONGO_SERVER_TOO_OLD_MESSAGE = (
+    "This MongoDB server runs a version PostHog no longer supports. Upgrade the cluster to "
+    "MongoDB 4.2 or newer, then try again."
+)
+
+# pymongo drops a server from the topology when its replica set name differs from the one the
+# connection string asks for, so the cluster the user named is never selectable. The name has to be
+# corrected before any sync can run.
+_MONGO_REPLICA_SET_MISMATCH_MESSAGE = (
+    "The replica set name in your connection string doesn't match the one your cluster reports. "
+    "Check the replicaSet option in the connection string, or copy the current connection string "
+    "from your database provider, then re-enable this sync."
+)
+
+_MONGO_AUTHENTICATION_FAILED_MESSAGE = (
+    "MongoDB authentication failed. Please check the username and password for this source."
+)
+
+_MONGO_PROTOCOL_INCOMPATIBLE_MESSAGE = (
+    "PostHog's MongoDB driver received a reply it doesn't support. This usually means the server "
+    "on the other end of this connection string isn't a genuine MongoDB server, or something "
+    "between PostHog and the server (a proxy or load balancer) is altering the connection. Connect "
+    "to a standard MongoDB server and try again."
+)
+
+_MONGO_NOT_AUTHORIZED_MESSAGE = (
+    "PostHog connected to MongoDB, but this user isn't authorized to list collections on the "
+    "database. Grant the user a read role on the database (e.g. read or readAnyDatabase) and try again."
+)
+
+_MONGO_CONNECT_FAILED_MESSAGE = (
+    "Could not connect to your MongoDB database. Check your connection string and credentials, then try again."
+)
+
+# MongoDB error code 211 (KeyNotFound): the cluster's internal keystore has no HMAC key valid for
+# the requested timestamp. This is a cluster-side key management problem (e.g. key rotation
+# removed keys the importer needed). Retrying reads the same cursor against the same cluster and
+# always fails with the same error, so it is non-retryable.
+_MONGO_KEY_NOT_FOUND_MESSAGE = (
+    "PostHog couldn't sync this MongoDB collection because your cluster reported a key management "
+    "error (MongoDB code 211: KeyNotFound). Your cluster's keystore does not have a valid HMAC key "
+    "for the time range being queried. Check your MongoDB cluster's key management configuration "
+    "and ensure all replica set members are healthy, then try again."
+)
+
+# MongoDB OperationFailure code 125 (CommandFailed) with this errmsg comes from Atlas Data
+# Federation / Online Archive: the federated database's data source still names a cluster that
+# was since renamed or deleted from the Atlas project. The cluster name and project id are
+# variable, so match the fixed phrase between them rather than the whole sentence. A retry reads
+# the same stale data source config and fails the same way every time.
+_MONGO_CLUSTER_NOT_FOUND_MESSAGE = (
+    "MongoDB reported that the cluster this connection refers to no longer exists in your Atlas "
+    "project (MongoDB error code 125: CommandFailed). This happens when connecting through an "
+    "Atlas Data Federation or Online Archive endpoint whose data source still points at a cluster "
+    "that was renamed or deleted. Update the data source in your Federated Database Instance, or "
+    "connect with your cluster's regular connection string instead, then try again."
+)
+
+# Connection succeeded but nothing importable came back. This is usually a wrong-database or
+# permission problem rather than a genuinely empty database: a connection string ending in /admin
+# or /test lands on an empty system database, and a user without read access sees no collections.
+_MONGO_NO_COLLECTIONS_MESSAGE = (
+    "PostHog connected to MongoDB but found no collections in the selected database. Check that "
+    "your connection string points at the database that holds your data (a string ending in /admin "
+    "or /test connects to an empty system database) or set the Database name field, and make sure "
+    "your user has read access to that database's collections."
+)
+
+# Substrings pymongo embeds in ServerSelectionTimeoutError when the resolver says the host name
+# does not exist (EAI_NONAME). The name never resolves until the user corrects it, so a sync that
+# fails this way is a connection-string mistake rather than an outage.
+_DNS_NAME_NOT_FOUND_MARKERS = (
+    "No address associated with hostname",
+    "nodename nor servname provided",
+    "Name or service not known",
+)
+
+_DNS_TEMPORARY_FAILURE_MARKER = "Temporary failure in name resolution"
+
+# The markers above plus EAI_AGAIN, where the resolver itself did not answer. Validation reports
+# both the same way; only the permanent ones classify a sync failure as non-retryable.
+_DNS_RESOLUTION_FAILURE_MARKERS = (*_DNS_NAME_NOT_FOUND_MARKERS, _DNS_TEMPORARY_FAILURE_MARKER)
+
+# For a `mongodb+srv://` URI, pymongo resolves the SRV record via dnspython inside the
+# MongoClient constructor and wraps any dnspython exception as ConfigurationError. dnspython's
+# NXDOMAIN carries this fixed prefix when the SRV record's DNS name doesn't exist at all —
+# a deleted, renamed, or mistyped cluster hostname — distinct from a timed-out lookup.
+_SRV_DNS_NAME_NOT_FOUND_MARKER = "The DNS query name does not exist"
+
+# pymongo raises ConfigurationError from server selection when every server's wire version is
+# below the driver's minimum (pymongo 4.15 dropped MongoDB 4.0). The variable parts are the
+# address and version numbers; this fragment stays fixed.
+_SERVER_TOO_OLD_MARKER = "version of PyMongo requires at least"
+
+# pymongo's OP_MSG reply parser raises ProtocolError with one of four fixed "Unsupported OP_MSG
+# ..." messages (an unexpected checksum flag, an unrecognized flag, a non-zero payload type, or
+# more than one payload section) when the bytes it receives don't match the single-section OP_MSG
+# shape this driver parses. A genuine MongoDB server never sends these; seeing one means whatever
+# answered the connection string isn't speaking the wire protocol this driver expects — a
+# non-MongoDB proxy, a mangling load balancer, or an incompatible MongoDB-wire-protocol emulation.
+# Retrying reads the same malformed reply from the same endpoint every time.
+_MONGO_PROTOCOL_INCOMPATIBLE_MARKER = "Unsupported OP_MSG"
+
+# pymongo raises this exact, fixed ConfigurationError when the connection string sets
+# authMechanism=GSSAPI (Kerberos sign-in) but the optional pykerberos/winkerberos package isn't
+# installed. We don't bundle that package — GSSAPI also needs a Kerberos ticket or keytab from
+# the connecting machine that we have no way to supply either way — so the mechanism never works,
+# a connection string choice the user must change rather than a transient failure a retry clears.
+_GSSAPI_AUTH_UNSUPPORTED_MARKER = "must be installed to use GSSAPI authentication"
+
+# pymongo raises this exact, fixed ConfigurationError message when the connection string sets
+# authMechanism=MONGODB-AWS (AWS IAM credential auth) but the optional pymongo-auth-aws package
+# isn't installed. We don't bundle that package, so the mechanism never works — a connection
+# string choice the user must change, not a transient failure that a retry could clear.
+_MONGO_AWS_AUTH_UNSUPPORTED_MARKER = "MONGODB-AWS authentication requires pymongo-auth-aws"
+
+
+@SourceRegistry.register
+class MongoDBSource(ResumableSource[MongoDBSourceConfig, MongoResumeConfig], ValidateDatabaseHostMixin):
+    # The CA bundle that verifies the server. None means the public bundle; a source for a
+    # MongoDB-compatible service with a private CA sets its own.
+    tls_ca_file: ClassVar[str | None] = None
+    # Matches both MONGO_* and MONGODB_* prefixes (e.g. MONGO_HOST,
+    # MONGODB_URI) in one pattern.
+    codebase_detection = detect(
+        env=("^MONGO(DB)?_", "^ATLAS_URI$", "^MDB_MCP_"),
+        npm=(
+            "mongodb",
+            "mongoose",
+            "mongodb-legacy",
+            "mongodb-client-encryption",
+            "mongosh",
+            "mongodb-mcp-server",
+            "@mongodb-js/charts-embed-dom",
+            "realm-web",
+            "@langchain/mongodb",
+            "@nestjs/mongoose",
+            "@typegoose/typegoose",
+            "connect-mongo",
+            "@auth/mongodb-adapter",
+        ),
+        pypi=(
+            "pymongo",
+            "motor",
+            "pymongo-auth-aws",
+            "pymongocrypt",
+            "pymongoarrow",
+            "django-mongodb-backend",
+            "langchain-mongodb",
+            "llama-index-vector-stores-mongodb",
+            "mongoengine",
+            "beanie",
+            "odmantic",
+            "flask-pymongo",
+        ),
+        cargo=("mongodb", "mongocrypt"),
+        cocoapods=("MongoSwift", "MongoKitten"),
+        composer=(
+            "mongodb/mongodb",
+            "mongodb/laravel-mongodb",
+            "jenssegers/mongodb",
+            "mongodb/builder",
+            "mongodb/mongodb-extension",
+            "mongodb/symfony-bundle",
+            "doctrine/mongodb-odm",
+            "doctrine/mongodb-odm-bundle",
+        ),
+        go=(
+            "go.mongodb.org/mongo-driver",
+            "go.mongodb.org/atlas-sdk",
+            "go.mongodb.org/atlas",
+            "github.com/globalsign/mgo",
+            "gopkg.in/mgo.v2",
+        ),
+        hex=("mongodb_driver", "mongodb", "mongodb_ecto"),
+        maven=(
+            "org.mongodb:mongodb-driver-sync",
+            "org.mongodb:mongodb-driver-reactivestreams",
+            "org.mongodb:mongodb-driver-kotlin-coroutine",
+            "org.mongodb:mongodb-driver-kotlin-sync",
+            "org.mongodb:mongodb-driver-kotlin-extensions",
+            "org.mongodb:mongodb-driver-core",
+            "org.mongodb:mongodb-driver-legacy",
+            "org.mongodb:mongo-java-driver",
+            "org.mongodb:mongodb-driver",
+            "org.mongodb:mongodb-driver-async",
+            "org.mongodb:mongodb-crypt",
+            "org.mongodb.scala:mongo-scala-driver_2.12",
+            "org.mongodb.scala:mongo-scala-driver_2.13",
+            "org.mongodb.scala:mongo-scala-driver_3",
+            "org.mongodb.spark:mongo-spark-connector",
+            "org.mongodb.spark:mongo-spark-connector_2.12",
+            "org.mongodb.spark:mongo-spark-connector_2.13",
+            "org.mongodb.kafka:mongo-kafka-connect",
+            "dev.morphia.morphia:morphia-core",
+            "org.mongodb.morphia:morphia",
+            "org.springframework.data:spring-data-mongodb",
+            "org.springframework.boot:spring-boot-starter-data-mongodb",
+            "org.springframework.boot:spring-boot-starter-data-mongodb-reactive",
+            "io.quarkus:quarkus-mongodb-client",
+            "io.quarkus:quarkus-mongodb-panache",
+        ),
+        pub=("mongo_dart",),
+        rubygems=("mongo", "mongoid", "mongo_kerberos"),
+        swiftpm=("github.com/mongodb/mongo-swift-driver", "github.com/orlandos-nl/mongokitten"),
+    )
+
+    @property
+    def source_type(self) -> ExternalDataSourceType:
+        return ExternalDataSourceType.MONGODB
+
+    @property
+    def credential_kind(self) -> str | None:
+        return "mongodb"
+
+    def get_non_retryable_errors(self) -> dict[str, str | None]:
+        auth_failed_msg = _MONGO_AUTHENTICATION_FAILED_MESSAGE
+        return {
+            _SERVER_TOO_OLD_MARKER: _MONGO_SERVER_TOO_OLD_MESSAGE,
+            UNSUPPORTED_FILE_OPTION_ERROR: _MONGO_UNSUPPORTED_FILE_OPTION_MESSAGE,
+            _GSSAPI_AUTH_UNSUPPORTED_MARKER: _MONGO_GSSAPI_UNSUPPORTED_MESSAGE,
+            # pymongo raises InvalidURI("Username and password must be escaped according to RFC 3986,
+            # use urllib.parse.quote_plus") before any network call when the credentials in the
+            # connection string contain unescaped reserved characters (e.g. ':', '/', '@', '%' in the
+            # password). The same RFC-3986 hint also appears on the "Port contains non-digit characters"
+            # variant, which is the same unescaped-credential mistake. This is a malformed connection
+            # string the user must fix — we can't safely percent-encode it ourselves because the
+            # reserved characters are ambiguous with the URI's own delimiters — so retrying never
+            # recovers. Match the stable RFC-3986 fragment, not the volatile surrounding text.
+            "must be escaped according to RFC 3986": _MONGO_UNESCAPED_CREDENTIALS_MESSAGE,
+            # pymongo raises OperationFailure with codeName 'AuthenticationFailed' (code 18) and
+            # errmsg 'Authentication failed.' when the credentials are wrong. Non-retryable error
+            # matching is case-sensitive, so the previous lowercase "authentication failed" never
+            # matched the real message — key off the stable codeName and the capitalised message.
+            "AuthenticationFailed": auth_failed_msg,
+            "Authentication failed": auth_failed_msg,
+            # MongoDB Atlas reports bad credentials differently from self-hosted MongoDB: instead of
+            # codeName 'AuthenticationFailed' (code 18) it raises OperationFailure with errmsg
+            # 'bad auth : authentication failed' and codeName 'AtlasError' (code 8000). The lowercase
+            # 'authentication failed' here doesn't match the capitalised entries above (matching is
+            # case-sensitive), so key off the stable Atlas-specific 'bad auth' prefix.
+            "bad auth": auth_failed_msg,
+            # pymongo raises OperationFailure with codeName 'Unauthorized' (code 13) and errmsg
+            # 'not authorized on <db> to execute command ...' when the user authenticates but lacks
+            # a read role on the database. str(e) appends the full server response (clusterTime,
+            # signature, BSON ids) via pymongo's _format_detailed_error, so the raw text must never
+            # reach the user — match the stable 'not authorized' fragment. Granting permission is a
+            # config change the user must make, so this never recovers on retry.
+            "not authorized": _MONGO_NOT_AUTHORIZED_MESSAGE,
+            # A view whose pipeline drops `_id` yields documents the importer can't key on. mongo.py
+            # raises MONGO_DOCUMENT_MISSING_ID_ERROR for this instead of a bare KeyError. Every retry
+            # reads the same `_id`-less documents, so it never recovers. Match our own stable phrase.
+            "one of its documents has no _id field": MONGO_DOCUMENT_MISSING_ID_ERROR,
+            "SSL handshake failed": None,
+            # Atlas SQL / Data Federation endpoints live under *.query.mongodb.net and are served by
+            # a query proxy the standard MongoDB driver can't drive: the handshake is closed, the
+            # topology never leaves Unknown, and server selection times out (ServerSelectionTimeoutError,
+            # frequently "connection closed"). This is a wrong-endpoint misconfiguration — the importer
+            # needs a regular cluster connection string — so retrying never recovers. The host suffix
+            # is the stable signal here. Non-retryable patterns are matched before retryable ones,
+            # so this still wins over the "Topology Description:" entry in `get_retryable_errors`
+            # and Atlas SQL users get the wrong-endpoint message.
+            "query.mongodb.net": _MONGO_ATLAS_SQL_MESSAGE,
+            # The resolver answered that the cluster host name does not exist. pymongo surfaces it
+            # as a ServerSelectionTimeoutError whose topology description carries the OS marker, so
+            # match the marker rather than the topology suffix, which a reachable-but-down cluster
+            # emits too. A name that does not resolve stays unresolved until the user fixes it.
+            **dict.fromkeys(_DNS_NAME_NOT_FOUND_MARKERS, _MONGO_HOST_UNRESOLVED_MESSAGE),
+            # The same answer for a mongodb+srv:// URI, whose SRV lookup fails before pymongo picks a
+            # server. The raw dnspython text echoes the cluster host, so it never reaches the customer.
+            _SRV_DNS_NAME_NOT_FOUND_MARKER: _MONGO_HOST_UNRESOLVED_MESSAGE,
+            # pymongo removes every server whose replica set name differs from the `replicaSet` the
+            # connection string asks for, which empties the topology and names the set rather than a
+            # host in the selection error. A cluster that is merely down keeps its servers as Unknown
+            # and reports "No replica set members found yet" instead, so this wording only appears on
+            # a name mismatch. Both shapes are fixed literals in pymongo, so match them directly and
+            # let them beat the "Topology Description:" entry in `get_retryable_errors`.
+            "No replica set members available for replica set name": _MONGO_REPLICA_SET_MISMATCH_MESSAGE,
+            # The same mismatch on a direct connection: pymongo marks the node Unknown with a
+            # ConfigurationError naming both sets, and that text is what the selection timeout carries.
+            "client is configured to connect to a replica set named": _MONGO_REPLICA_SET_MISMATCH_MESSAGE,
+            # MongoDB OperationFailure code 211 (KeyNotFound): the cluster's HMAC keystore has no
+            # valid key for the cursor's timestamp. pymongo formats the full server error response
+            # as part of the exception message; the leading phrase before the variable parts
+            # (timestamp, key id) is stable and unambiguous. Retrying the same cursor against the
+            # same cluster always fails with the same error.
+            "No keys found for HMAC": _MONGO_KEY_NOT_FOUND_MESSAGE,
+            # MongoDB OperationFailure code 125 (CommandFailed): an Atlas Data Federation / Online
+            # Archive data source still names a cluster that no longer exists in the project.
+            "not found in project": _MONGO_CLUSTER_NOT_FOUND_MESSAGE,
+            _MONGO_PROTOCOL_INCOMPATIBLE_MARKER: _MONGO_PROTOCOL_INCOMPATIBLE_MESSAGE,
+            _MONGO_AWS_AUTH_UNSUPPORTED_MARKER: _MONGO_AWS_AUTH_UNSUPPORTED_MESSAGE,
+        }
+
+    def get_retryable_errors(self) -> set[str]:
+        # For a `mongodb+srv://` URI, pymongo resolves the SRV record via dnspython inside the
+        # MongoClient constructor, before any of our own connectivity handling runs. dnspython
+        # already retries across nameservers for the whole resolution lifetime before giving up
+        # with a ConfigurationError wrapping its LifetimeTimeout — a momentary DNS blip on the
+        # resolver PostHog's worker queries, unrelated to the user's cluster hostname — so Temporal
+        # retrying the whole activity is self-recovering. Match dnspython's fixed message prefix,
+        # not the variable timeout duration or nameserver address it's followed by.
+        #
+        # pymongo also raises a bare AutoReconnect("<address>: connection pool paused ...") when a
+        # connection checkout finds the pool not yet READY after an earlier network blip — the
+        # pool's background monitor clears this on its own once it reconnects. Match the fixed
+        # "connection pool paused" phrase pymongo always uses for this state, not the surrounding
+        # host/timeout values.
+        #
+        # pymongo raises ServerSelectionTimeoutError when it can't select a usable cluster node for
+        # the whole selection timeout, and only that error carries the "Topology Description:"
+        # suffix. The suffix alone cannot tell a persistent problem (the worker IP isn't allowlisted,
+        # the cluster is decommissioned) from a cluster that is merely down for one selection window
+        # — a restart, a failover, a short provider outage — because both emit identical text. Treat
+        # the class as retryable so a blip does not disable the schema; the persistent shapes that
+        # can be named are matched above and still do. `get_retry_exhausted_errors` supplies the
+        # message once the retries run out.
+        #
+        # A cluster that is rotating its signing keys fails a command with OperationFailure code 211
+        # (KeyNotFound), which it clears on its own, so Temporal retrying the activity recovers.
+        # mongo.py rewrites that failure to MONGO_KEYS_UNAVAILABLE_ERROR, so match our own stable
+        # phrase — pymongo's text appends the whole server response instead.
+        #
+        # pymongo raises NotPrimaryError when an in-flight read is killed because the server node
+        # is shutting down or stepping down (OperationFailure codeName 'InterruptedAtShutdown',
+        # code 11600) — a routine replica-set failover such as a rolling restart or managed-cluster
+        # maintenance. The driver reconnects to the newly-elected primary, so Temporal retrying the
+        # whole activity is self-recovering. Match the stable errmsg phrase, not the volatile
+        # topologyVersion/clusterTime blob pymongo appends.
+        #
+        # pymongo raises NetworkTimeout (a socket.timeout wrapped by _raise_connection_failure) when
+        # opening a fresh connection — to replace one the pool dropped, mid-sync — takes longer than
+        # connectTimeoutMS. This is the same class of momentary network blip as "connection pool
+        # paused" above, not a persistently unreachable cluster: it carries a host and configured
+        # timeouts but no "Topology Description:" dump, and the next connection attempt (this one,
+        # or a fresh one on the activity's Temporal retry) succeeds once the network recovers.
+        #
+        # pymongo wraps a bare ConnectionResetError in AutoReconnect the same way, when a socket a
+        # cursor is reading from gets an RST mid-sync (a load balancer or the server ending an idle
+        # connection) rather than timing out. Same recovery path as the timeout case above.
+        #
+        # pymongo also wraps a clean EOF the same way: network_layer.py raises OSError("connection
+        # closed") when a read gets zero bytes instead of a reset, which _raise_connection_failure
+        # turns into AutoReconnect("<host>: connection closed (configured timeouts: ...)"). This is
+        # the graceful-close counterpart of the RST case above (an idle-connection reaper, a load
+        # balancer, or Atlas maintenance ending the socket) and recovers the same way on retry.
+        #
+        # OperationFailure code 50 (MaxTimeMSExpired / pymongo's ExecutionTimeout) fires when a
+        # getMore is killed by a cluster-enforced execution-time cap we never configure ourselves
+        # (mongo.py's _EXECUTION_TIMEOUT_ERROR_CODE) — notably Atlas free/shared/flex tiers. mongo.py
+        # already resumes from last_id when this happens mid-stream, and only re-raises when a
+        # getMore was killed before yielding anything (resuming immediately would hit the same cap
+        # in a tight loop). A fresh Temporal retry isn't bound by that same in-flight time budget, so
+        # it is self-recovering and must not flood error tracking on every no-progress getMore.
+        #
+        # OperationFailure code 16500 (codeName 'RequestRateTooLarge') comes from Azure Cosmos DB's
+        # API for MongoDB when the cluster's provisioned throughput is exceeded — the Cosmos DB
+        # equivalent of an HTTP 429. The errmsg itself says the request made no changes and to retry
+        # later (RetryAfterMs), so this is the cluster's own backpressure signal, not a PostHog bug
+        # or a customer credential/config problem; a later Temporal retry recovers once load drops.
+        return {
+            "The resolution lifetime expired",
+            "connection pool paused",
+            "the cluster's signing keys were briefly unavailable",
+            "interrupted at shutdown",
+            "Topology Description:",
+            "timed out (configured timeouts:",
+            "Connection reset by peer",
+            "connection closed (configured timeouts:",
+            "operation exceeded time limit",
+            "RequestRateTooLarge",
+        }
+
+    def get_retry_exhausted_errors(self) -> dict[str, str]:
+        # A server-selection timeout that outlived the retry budget leaves `latest_error` holding
+        # the raw topology dump: every seed host, port, and per-server driver exception. Replace it
+        # with the two things the user can act on, and say the schema is still enabled.
+        #
+        # A resolver that keeps answering EAI_AGAIN fails the same server selection, so its error
+        # carries the topology marker as well. The finalizer stores the first pattern that matches,
+        # so the resolver marker is listed first: without it the user reads the allowlist guidance
+        # and checks network access rules that are already correct. The shared resolver message
+        # names the lookup instead, and says the sync stays enabled.
+        return {
+            _DNS_TEMPORARY_FAILURE_MARKER: HOST_RESOLUTION_EXHAUSTED_MESSAGE,
+            "Topology Description:": _MONGO_UNREACHABLE_RETRY_MESSAGE,
+        }
+
+    def get_schemas(
+        self,
+        config: MongoDBSourceConfig,
+        team_id: int,
+        with_counts: bool = False,
+        names: list[str] | None = None,
+        force_refresh: bool = False,
+        api_version: str | None = None,
+    ) -> list[SourceSchema]:
+        mongo_schemas = get_mongo_schemas(config, team_id=team_id, names=names, tls_ca_file=self.tls_ca_file)
+
+        connection_params = _parse_connection_string(config.connection_string, config.database_name)
+        with mongo_client(config.connection_string, team_id=team_id, tls_ca_file=self.tls_ca_file) as client:
+            db = client[connection_params["database"]]
+            index_keys_by_collection = get_index_keys_by_collection(db, list(mongo_schemas))
+
+        schemas: list[SourceSchema] = []
+        for collection_name, columns in mongo_schemas.items():
+            index_keys = index_keys_by_collection.get(collection_name)
+            incremental_fields = filter_mongo_incremental_fields(
+                columns, index_keys.covered if index_keys else frozenset()
+            )
+            schemas.append(
+                SourceSchema(
+                    name=collection_name,
+                    supports_incremental=len(incremental_fields) > 0,
+                    supports_append=len(incremental_fields) > 0,
+                    incremental_fields=rank_incremental_fields(
+                        [
+                            {
+                                "label": field_name,
+                                "type": field_type,
+                                "field": field_name,
+                                "field_type": field_type,
+                                # Index discovery failed, so we can't tell an unindexed field from an
+                                # indexed one. Don't warn on a guess.
+                                "is_indexed": True if index_keys is None else field_name in index_keys.leading,
+                            }
+                            for field_name, field_type in incremental_fields
+                        ]
+                    ),
+                )
+            )
+
+        return schemas
+
+    def validate_credentials(
+        self,
+        config: MongoDBSourceConfig,
+        team_id: int,
+        schema_name: Optional[str] = None,
+        api_version: str | None = None,
+    ) -> tuple[bool, str | None]:
+        from pymongo.errors import ConfigurationError, OperationFailure, ProtocolError, ServerSelectionTimeoutError
+
+        try:
+            connection_params = _parse_connection_string(config.connection_string, config.database_name)
+        except Exception:
+            return False, _MONGO_INVALID_CONNECTION_STRING_MESSAGE
+
+        if not connection_params.get("database"):
+            return False, DATABASE_NAME_REQUIRED_ERROR
+
+        if not connection_params["is_srv"]:
+            # For SRV connections the hostname is a DNS namespace (e.g.
+            # cluster0.mongodb.net), not a real host. Actual server addresses
+            # are resolved at connection time and validated by
+            # _make_safe_server_selector instead.
+            # This check allows an early failure for obviously invalid connection strings for non SRV connections.
+            valid_host, host_errors = self.is_database_host_valid(connection_params["host"], team_id)
+            if not valid_host:
+                return False, host_errors
+
+        try:
+            collection_names = get_collection_names(config, team_id=team_id, tls_ca_file=self.tls_ca_file)
+            if len(collection_names) == 0:
+                return False, _MONGO_NO_COLLECTIONS_MESSAGE
+        except OperationFailure as e:
+            # pymongo's OperationFailure stringifies the full server response — clusterTime,
+            # signature hashes, BSON ids — so str(e) must never be surfaced. Map the stable error
+            # markers to a clean message; an authorization failure ("not authorized") means the
+            # credentials are valid but lack read access, which is distinct from a bad password.
+            # Both are user-side credential/permission problems we already surface an actionable
+            # message for and classify as non-retryable — never a PostHog bug — so don't report
+            # them to error tracking as non-actionable noise.
+            message = str(e)
+            if "not authorized" in message:
+                return False, _MONGO_NOT_AUTHORIZED_MESSAGE
+            if any(marker in message for marker in ("AuthenticationFailed", "Authentication failed", "bad auth")):
+                return False, _MONGO_AUTHENTICATION_FAILED_MESSAGE
+            # Any other OperationFailure on listCollections is unexpected (server bug, unsupported
+            # option, ...) — capture it so the signal isn't lost, and surface a generic message
+            # rather than mislabelling it as an authentication problem.
+            capture_exception(e)
+            return False, _MONGO_CONNECT_FAILED_MESSAGE
+        except UnsupportedConnectionOptionError:
+            return False, _MONGO_UNSUPPORTED_FILE_OPTION_MESSAGE
+        except HostNotAllowedError:
+            # An SRV URI skips the host check above, so a cluster whose members resolve to private
+            # addresses is only refused once `_make_safe_server_selector` sees them. Report the same
+            # guidance the sync path stores for this condition, and don't capture it: the host is
+            # the user's to fix, never our bug.
+            return False, DATABASE_HOST_NOT_ALLOWED_GUIDANCE
+        except ServerSelectionTimeoutError as e:
+            # pymongo dumps a verbose topology description into str(e); surface a concise,
+            # actionable message instead. A DNS failure means the host doesn't resolve at all,
+            # which is distinct from an allowlist/reachability problem. Server selection only times
+            # out on an upstream connectivity problem the user must fix (cluster paused, IP not
+            # allowlisted, host unresolved, TLS handshake rejected) — never our bug — and we already
+            # return an actionable message for it, so don't report it as error-tracking noise.
+            message = str(e)
+            if any(marker in message for marker in _DNS_RESOLUTION_FAILURE_MARKERS):
+                return False, _MONGO_HOST_UNRESOLVED_MESSAGE
+            return False, _MONGO_UNREACHABLE_MESSAGE
+        except ConfigurationError as e:
+            # InvalidURI (raised with the RFC-3986 hint before any network call when
+            # credentials contain unescaped reserved characters) is itself a ConfigurationError
+            # subclass, so it lands here too. An SRV DNS name that doesn't exist is the same
+            # user-side problem as the non-SRV host-not-found case above. Both are malformed-
+            # input problems the user must fix — already surfaced with an actionable message —
+            # so don't report them to error tracking as noise. Any other ConfigurationError is
+            # unexpected, so capture it and fall back to a generic message.
+            message = str(e)
+            if _SRV_DNS_NAME_NOT_FOUND_MARKER in message:
+                return False, _MONGO_HOST_UNRESOLVED_MESSAGE
+            if _SERVER_TOO_OLD_MARKER in message:
+                return False, _MONGO_SERVER_TOO_OLD_MESSAGE
+            if "must be escaped according to RFC 3986" in message:
+                return False, _MONGO_UNESCAPED_CREDENTIALS_MESSAGE
+            if _GSSAPI_AUTH_UNSUPPORTED_MARKER in message:
+                return False, _MONGO_GSSAPI_UNSUPPORTED_MESSAGE
+            if _MONGO_AWS_AUTH_UNSUPPORTED_MARKER in message:
+                return False, _MONGO_AWS_AUTH_UNSUPPORTED_MESSAGE
+            capture_exception(e)
+            return False, _MONGO_CONNECT_FAILED_MESSAGE
+        except ProtocolError as e:
+            # The server on the other end of this connection string isn't speaking the MongoDB
+            # wire protocol this driver expects — already surfaced with an actionable message, so
+            # don't report it as error-tracking noise.
+            message = str(e)
+            if _MONGO_PROTOCOL_INCOMPATIBLE_MARKER in message:
+                return False, _MONGO_PROTOCOL_INCOMPATIBLE_MESSAGE
+            capture_exception(e)
+            return False, _MONGO_CONNECT_FAILED_MESSAGE
+        except Exception as e:
+            # Any other exception is unexpected: capture it and fall back to a generic message
+            # so internal exception text never reaches the user.
+            capture_exception(e)
+            return False, _MONGO_CONNECT_FAILED_MESSAGE
+
+        return True, None
+
+    def get_server_metadata(self, config: MongoDBSourceConfig, team_id: int) -> dict[str, Any]:
+        return get_mongo_server_metadata(config.connection_string, team_id, tls_ca_file=self.tls_ca_file)
+
+    def resume_covers_run(
+        self,
+        *,
+        incremental_or_append: bool,
+        schema_name: str | None = None,
+    ) -> bool:
+        # The `_id` checkpoint covers a full refresh. It also covers a first incremental or append
+        # sync, but this cannot see the watermark, so those runs keep the incremental retry budget.
+        return not incremental_or_append
+
+    def get_resumable_source_manager(self, inputs: SourceInputs) -> ResumableSourceManager[MongoResumeConfig]:
+        return ResumableSourceManager[MongoResumeConfig](inputs, MongoResumeConfig)
+
+    def source_for_pipeline(
+        self,
+        config: MongoDBSourceConfig,
+        resumable_source_manager: ResumableSourceManager[MongoResumeConfig],
+        inputs: SourceInputs,
+    ) -> SourceResponse:
+        # A reset's first attempt must read from the beginning. Later activity attempts share this
+        # run's checkpoint and destination, so preserve the progress the failed attempt committed.
+        if inputs.reset_pipeline and inputs.activity_attempt == 1:
+            resumable_source_manager.clear_state()
+        return mongo_source(
+            connection_string=config.connection_string,
+            collection_name=inputs.schema_name,
+            should_use_incremental_field=inputs.should_use_incremental_field,
+            logger=inputs.logger,
+            incremental_field=inputs.incremental_field,
+            incremental_field_type=inputs.incremental_field_type,
+            db_incremental_field_last_value=inputs.db_incremental_field_last_value,
+            team_id=inputs.team_id,
+            database_name=config.database_name,
+            resumable_source_manager=resumable_source_manager,
+            tls_ca_file=self.tls_ca_file,
+        )
+
+    @property
+    def get_source_config(self) -> SourceConfig:
+        return SourceConfig(
+            name=ExternalDataSourceType.MONGODB,
+            category=DataWarehouseSourceCategory.DATABASES,
+            featured=True,
+            keywords=["mongo"],
+            label="MongoDB",
+            caption="Enter your MongoDB connection string to automatically pull your MongoDB data into the PostHog Data warehouse.",
+            releaseStatus=ReleaseStatus.GA,
+            iconPath="/static/services/Mongodb.svg",
+            docsUrl="https://posthog.com/docs/cdp/sources/mongodb",
+            fields=cast(
+                list[FieldType],
+                [
+                    SourceFieldInputConfig(
+                        name="connection_string",
+                        label="Connection string",
+                        # The connection string is this source's only credential, so `password` keeps
+                        # it editable on update for rotation.
+                        type=SourceFieldInputConfigType.PASSWORD,
+                        required=True,
+                        placeholder="mongodb://username:password@host:port/database?authSource=admin&tls=true",
+                        caption=(
+                            "In MongoDB Atlas, open your cluster and click **Connect → Drivers** to copy this, "
+                            "then replace `<db_password>` with your database user's password. Self-hosted "
+                            "clusters use the host and port form in the placeholder, keeping `tls=true`."
+                        ),
+                        secret=True,
+                    ),
+                    SourceFieldInputConfig(
+                        name="database_name",
+                        label="Database name",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=False,
+                        placeholder="my_database",
+                        caption=(
+                            "Only needed if your connection string doesn't already include the database "
+                            "(Atlas `mongodb+srv://...` strings usually don't)."
+                        ),
+                        secret=False,
+                    ),
+                ],
+            ),
+        )

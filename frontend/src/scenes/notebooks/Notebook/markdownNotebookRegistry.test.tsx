@@ -1,0 +1,520 @@
+import { fireEvent, render, screen, within } from '@testing-library/react'
+
+import {
+    buildInsertCommands,
+    MarkdownNotebook,
+    getMarkdownNotebookDefaultRegistry,
+    mergeMarkdownNotebookRegistries,
+    omitInsertCommands,
+} from 'lib/components/MarkdownNotebook'
+import {
+    type ComponentPanelVisibility,
+    getInsertedComponentPanelVisibility,
+    withPersistedComponentPanelProps,
+} from 'lib/components/MarkdownNotebook/componentPanels'
+import { parseMarkdownNotebook } from 'lib/components/MarkdownNotebook/markdown'
+import { NotebookComponentShell } from 'lib/components/MarkdownNotebook/NotebookComponentShell'
+import type { NotebookComponentBlockNode } from 'lib/components/MarkdownNotebook/types'
+
+import notebookWidgetCatalog from 'products/notebooks/notebook-widget-catalog.json'
+
+import { NotebookNodeType } from '../types'
+import { KNOWN_NODES } from '../utils'
+import {
+    NOTEBOOK_MARKDOWN_REGISTRY,
+    RealNotebookNodeEdit,
+    RealNotebookNodeIdentityAndViewEdit,
+    getEditableNodeAttributeKeys,
+    NOTEBOOK_HIDDEN_INSERT_COMMAND_KEYS,
+    getMarkdownNodeAttributeLabel,
+    getNodeAttributes,
+    getQueryTitle,
+    getSerializableAttributeInputValue,
+} from './markdownNotebookRegistry'
+
+jest.mock('./MarkdownNotebookEntityPicker', () => ({
+    MarkdownNotebookEntityPicker: ({ kind, onSelect }: { kind: string | null; onSelect: (value: unknown) => void }) =>
+        kind ? (
+            <button
+                aria-label={`Pick from ${kind}`}
+                onClick={() => onSelect({ tagName: 'FeatureFlag', props: { id: 999 } })}
+            />
+        ) : null,
+}))
+
+// Mirrors how MarkdownNotebook composes its menu, so the assertions cover the list a user sees
+// rather than the registry alone: built-in commands are not registry entries, so a node hidden
+// from the registry can still reach the menu through a built-in that inserts the same tag.
+function getInsertCommandsByLabel(label: string): { key: string; category: string; badge?: string }[] {
+    const noop = (): void => {}
+    const commands = omitInsertCommands(
+        buildInsertCommands(
+            mergeMarkdownNotebookRegistries(getMarkdownNotebookDefaultRegistry(), NOTEBOOK_MARKDOWN_REGISTRY),
+            noop,
+            noop,
+            noop,
+            noop,
+            noop
+        ),
+        NOTEBOOK_HIDDEN_INSERT_COMMAND_KEYS
+    )
+
+    return commands
+        .filter((command) => command.label === label)
+        .map((command) => ({ key: command.key, category: command.category, badge: command.badge }))
+}
+
+describe('markdownNotebookRegistry', () => {
+    it.each([undefined, 'saved-widget'])('pins widget identity when opening filters (explicit ID: %s)', (nodeId) => {
+        const node = parseMarkdownNotebook(`<Widget prompt="Draw a chart"${nodeId ? ` nodeId="${nodeId}"` : ''} />`)
+            .nodes[0] as NotebookComponentBlockNode
+        const updated = withPersistedComponentPanelProps(node, NOTEBOOK_MARKDOWN_REGISTRY.components.Widget, {
+            filters: true,
+            results: true,
+        })
+
+        expect(updated.props.nodeId).toBe(nodeId ?? node.id)
+        expect(updated.props.showFilters).toBe(true)
+    })
+
+    describe('notebook registry', () => {
+        it('offers SQL and Python cells without rollout flags', () => {
+            // The unified insert surface: SQLV2 ("SQL") and PythonV2 ("Python") are the only
+            // insertable code cells. The legacy query node renders but must never
+            // be insertable, and the removed legacy code cells are not registered at all: the
+            // content migration rewrites them to SQLV2/PythonV2 before the registry sees them.
+            expect(NOTEBOOK_MARKDOWN_REGISTRY.components.SQLV2.insertCommand).toBeTruthy()
+            expect(NOTEBOOK_MARKDOWN_REGISTRY.components.PythonV2.insertCommand).toBeTruthy()
+            expect(NOTEBOOK_MARKDOWN_REGISTRY.components.Query.insertCommand).toBeUndefined()
+            for (const legacyTag of ['Python', 'DuckSQL', 'HogQLSQL']) {
+                expect(NOTEBOOK_MARKDOWN_REGISTRY.components).not.toHaveProperty(legacyTag)
+            }
+        })
+
+        it('offers widget insertion without feature flags and registers only the Widget component', () => {
+            expect(getInsertCommandsByLabel('Widget')).toEqual([
+                { key: 'component-Widget', category: 'Common', badge: 'BETA' },
+            ])
+            for (const legacyTag of ['GeneratedWidget', 'GenUI']) {
+                expect(NOTEBOOK_MARKDOWN_REGISTRY.components).not.toHaveProperty(legacyTag)
+            }
+            expect(NOTEBOOK_MARKDOWN_REGISTRY.components.Widget.ToolbarComponent).toBeTruthy()
+        })
+
+        // The panel visibility resolver is the notebook shell's public behavior. Testing through it
+        // keeps new programmable blocks usable even if the persisted panel prop changes.
+        it.each([
+            ['SQL', 'component-SQLV2'],
+            ['Python', 'component-PythonV2'],
+            ['Widget', 'component-Widget'],
+        ])('inserts a %s block with its input panel open', (_label, commandKey) => {
+            const insertedNodes: NotebookComponentBlockNode[] = []
+            const noop = (): void => {}
+            const commands = buildInsertCommands(
+                mergeMarkdownNotebookRegistries(getMarkdownNotebookDefaultRegistry(), NOTEBOOK_MARKDOWN_REGISTRY),
+                (_nodeId, node) => insertedNodes.push(node),
+                noop,
+                noop,
+                noop,
+                noop
+            )
+
+            commands.find((command) => command.key === commandKey)?.run('target-node')
+            commands.find((command) => command.key === commandKey)?.run('target-node')
+
+            expect(insertedNodes).toHaveLength(2)
+            expect(insertedNodes[0].props.nodeId).not.toEqual(insertedNodes[1].props.nodeId)
+            expect(getInsertedComponentPanelVisibility(insertedNodes[0]).filters).toBe(true)
+            if (_label !== 'Widget') {
+                expect(insertedNodes[0].props.returnVariable).toMatch(/^[A-Za-z_][A-Za-z0-9_]*$/)
+                expect(insertedNodes[0].props.returnVariable).not.toEqual(insertedNodes[1].props.returnVariable)
+            }
+        })
+    })
+
+    describe('discussion comment composer', () => {
+        it('persists replies and resolution after reopening, and deletes only the thread', () => {
+            const onChange = jest.fn()
+            const markdown =
+                '# Notes\n\n<Comment ref="note" replies={[]} />\n\nA <ref id="note">useful</ref> paragraph.'
+            const { container, unmount } = render(
+                <MarkdownNotebook value={markdown} onChange={onChange} registry={NOTEBOOK_MARKDOWN_REGISTRY} />
+            )
+            fireEvent.change(container.querySelector('textarea[data-attr="notebook-discussion-comment-input"]')!, {
+                target: { value: 'Please review.' },
+            })
+            fireEvent.click(container.querySelector('[aria-label="Send reply"]')!)
+            fireEvent.click(screen.getByText('Resolve'))
+            const saved = onChange.mock.calls.at(-1)![0] as string
+            expect(saved).toContain('Please review.')
+            expect(parseMarkdownNotebook(saved).nodes.find((node) => node.type === 'component')).toMatchObject({
+                props: { resolved: true },
+            })
+            unmount()
+
+            const reopened = render(
+                <MarkdownNotebook value={saved} onChange={onChange} registry={NOTEBOOK_MARKDOWN_REGISTRY} />
+            )
+            expect(reopened.container.querySelector('[data-attr="notebook-discussion-comment-input"]')).toBeNull()
+            fireEvent.click(screen.getByText('Reopen'))
+            expect(reopened.container.querySelector('[data-attr="notebook-discussion-comment-input"]')).not.toBeNull()
+            fireEvent.click(reopened.container.querySelector('[aria-label="Delete thread"]')!)
+            expect(onChange.mock.calls.at(-1)![0]).toBe('# Notes\n\nA useful paragraph.')
+        })
+
+        const renderCommentShell = (
+            componentPanels: ComponentPanelVisibility,
+            mode: 'edit' | 'view'
+        ): ReturnType<typeof render> => {
+            // No `showFilters` in props: composer visibility is driven by the transient panel
+            // state, so the open state never has to be written into the shared document markdown.
+            const node: NotebookComponentBlockNode = {
+                id: 'comment-node',
+                type: 'component',
+                tagName: 'Comment',
+                props: { replies: [] },
+            }
+            return render(
+                <NotebookComponentShell
+                    node={node}
+                    mode={mode}
+                    componentPanels={componentPanels}
+                    persistComponentPanelVisibility={false}
+                    isSelected={false}
+                    registry={NOTEBOOK_MARKDOWN_REGISTRY}
+                    toggleComponentPanel={jest.fn()}
+                    setLocalComponentPanels={jest.fn()}
+                    rememberComponentPanels={jest.fn()}
+                    setBlockRef={jest.fn()}
+                    updateNode={jest.fn()}
+                    deleteNode={jest.fn()}
+                    deleteSelectedNotebookBlocks={jest.fn(() => false)}
+                    insertParagraphAfterNode={jest.fn()}
+                    moveFocusToAdjacentNode={jest.fn(() => false)}
+                />
+            )
+        }
+
+        it.each([
+            ['new thread', { filters: true, results: true }, 'edit', true],
+            ['reopened thread', { filters: false, results: true }, 'edit', true],
+            ['read-only notebook', { filters: false, results: true }, 'view', false],
+        ] as const)('uses notebook permissions for a %s', (_label, componentPanels, mode, expectComposer) => {
+            const { container } = renderCommentShell(componentPanels, mode)
+            const composer = container.querySelector('[data-attr="notebook-discussion-comment-input"]')
+            expect(composer !== null).toBe(expectComposer)
+        })
+    })
+
+    describe('insert menu SQL commands', () => {
+        it('offers the SQLV2 cell as the only SQL command', () => {
+            expect(getInsertCommandsByLabel('SQL')).toEqual([{ key: 'component-SQLV2', category: 'Common' }])
+        })
+
+        // Both the group and the badge come from the node's insertCommand override, so this also
+        // covers the badge surviving buildInsertCommands.
+        it('puts Python beside SQL in the top group, badged as new', () => {
+            expect(getInsertCommandsByLabel('Python')).toEqual([
+                { key: 'component-PythonV2', category: 'Common', badge: 'New' },
+            ])
+        })
+    })
+
+    it('does not make real notebook nodes mutually exclusive in markdown notebooks', () => {
+        expect(NOTEBOOK_MARKDOWN_REGISTRY.components.Recording.exclusiveEditPanel).toBeUndefined()
+        expect(NOTEBOOK_MARKDOWN_REGISTRY.components.FeatureFlag.exclusiveEditPanel).toBeUndefined()
+        expect(NOTEBOOK_MARKDOWN_REGISTRY.components.FeatureFlagCodeExample.exclusiveEditPanel).toBeUndefined()
+    })
+
+    it.each([
+        'FeatureFlag',
+        'FeatureFlagCodeExample',
+        'Survey',
+        'Experiment',
+        'EarlyAccessFeature',
+        'Cohort',
+        'Insight',
+        'Person',
+        'Group',
+        'Recording',
+        'RecordingPlaylist',
+        'ErrorTrackingIssue',
+        'LLMTrace',
+        'Dashboard',
+        'Action',
+        'Workflow',
+    ])('uses the resource-derived title for %s nodes', (tagName) => {
+        expect(NOTEBOOK_MARKDOWN_REGISTRY.components[tagName].editableTitle).toBe(false)
+    })
+
+    it.each([
+        ['FeatureFlag', NotebookNodeType.FeatureFlag],
+        ['Survey', NotebookNodeType.Survey],
+        ['Experiment', NotebookNodeType.Experiment],
+        ['EarlyAccessFeature', NotebookNodeType.EarlyAccessFeature],
+        ['Cohort', NotebookNodeType.Cohort],
+        ['Insight', NotebookNodeType.Query],
+        ['Recording', NotebookNodeType.Recording],
+        ['RecordingPlaylist', NotebookNodeType.RecordingPlaylist],
+        ['Person', NotebookNodeType.Person],
+        ['Group', NotebookNodeType.Group],
+        ['ErrorTrackingIssue', NotebookNodeType.ErrorTrackingIssue],
+        ['LLMTrace', NotebookNodeType.LLMTrace],
+        ['Dashboard', NotebookNodeType.Dashboard],
+        ['Action', NotebookNodeType.Action],
+        ['Workflow', NotebookNodeType.Workflow],
+    ])('registers every catalog view for %s', (tagName, nodeType) => {
+        const widget = notebookWidgetCatalog.widgets[tagName as keyof typeof notebookWidgetCatalog.widgets]
+        const registeredViewNames = [
+            KNOWN_NODES[nodeType].defaultView?.key,
+            ...Object.keys(KNOWN_NODES[nodeType].views ?? {}),
+        ]
+
+        expect(registeredViewNames).toEqual([widget.defaultView.name, ...Object.keys(widget.views)])
+    })
+
+    it.each([
+        {
+            tagName: 'FeatureFlag',
+            nodeType: NotebookNodeType.FeatureFlag,
+            id: 123,
+            idLabel: 'Feature flag ID or key',
+            viewLabel: 'Editor',
+            viewDescription: 'Edit the flag status and release conditions in the notebook.',
+            viewKey: 'editor',
+            viewKeys: ['summary', 'editor', 'conditions', 'implementation'],
+        },
+        {
+            tagName: 'Survey',
+            nodeType: NotebookNodeType.Survey,
+            id: 'survey-id',
+            idLabel: 'Survey ID',
+            viewLabel: 'Preview',
+            viewDescription: 'Show the first page of the survey.',
+            viewKey: 'preview',
+            viewKeys: ['summary', 'preview', 'conditions', 'results'],
+        },
+        {
+            tagName: 'Experiment',
+            nodeType: NotebookNodeType.Experiment,
+            id: 456,
+            idLabel: 'Experiment ID',
+            viewLabel: 'Results',
+            viewDescription: 'Show experiment exposures and primary metric results.',
+            viewKey: 'results',
+            viewKeys: ['summary', 'results'],
+        },
+        {
+            tagName: 'EarlyAccessFeature',
+            nodeType: NotebookNodeType.EarlyAccessFeature,
+            id: 'feature-id',
+            idLabel: 'Early access feature ID',
+            viewLabel: 'Summary',
+            viewDescription: 'Show the feature stage, name, and description.',
+            viewKey: 'summary',
+            viewKeys: ['summary'],
+        },
+        {
+            tagName: 'Cohort',
+            nodeType: NotebookNodeType.Cohort,
+            id: 789,
+            idLabel: 'Cohort ID',
+            viewLabel: 'Summary',
+            viewDescription: 'Show the cohort name, size, and type.',
+            viewKey: 'summary',
+            viewKeys: ['summary'],
+        },
+    ])(
+        'edits the $tagName reference and selects a product-owned view',
+        ({ tagName, nodeType, id, idLabel, viewLabel, viewDescription, viewKey, viewKeys }) => {
+            const updateProps = jest.fn()
+            const { container } = render(
+                <RealNotebookNodeEdit
+                    node={{
+                        id: `${tagName}-node`,
+                        type: 'component',
+                        tagName,
+                        props: { id },
+                    }}
+                    mode="edit"
+                    updateProps={updateProps}
+                    deleteNode={jest.fn()}
+                />
+            )
+            const editor = within(container)
+            const fields = Array.from(container.querySelectorAll('.MarkdownNotebook__component-form > label'))
+            const idInput = editor.getByLabelText(idLabel) as HTMLInputElement
+            const viewInput = editor.getByLabelText('View')
+
+            expect(fields[0].contains(idInput)).toBe(true)
+            expect(fields[1].contains(viewInput)).toBe(true)
+            expect(idInput.value).toEqual(String(id))
+            expect(viewInput.textContent).toContain('Detail')
+
+            fireEvent.click(viewInput)
+            expect(screen.getByLabelText(viewDescription).textContent).toContain(viewLabel)
+            fireEvent.click(screen.getByLabelText(viewDescription))
+
+            expect(updateProps).toHaveBeenCalledWith({ view: viewKey })
+            expect(Object.keys(KNOWN_NODES[nodeType].views ?? {})).toEqual(viewKeys)
+        }
+    )
+
+    it('keeps the resource ID before the view for nodes with product settings', () => {
+        const { container } = render(
+            <RealNotebookNodeIdentityAndViewEdit
+                node={{
+                    id: 'recording-node',
+                    type: 'component',
+                    tagName: 'Recording',
+                    props: { id: 'recording-id' },
+                }}
+                mode="edit"
+                updateProps={jest.fn()}
+                deleteNode={jest.fn()}
+                notebookNodeType={NotebookNodeType.Recording}
+                options={KNOWN_NODES[NotebookNodeType.Recording]}
+            />
+        )
+        const fields = Array.from(container.querySelectorAll('.MarkdownNotebook__component-form > label'))
+
+        expect(fields[0].textContent).toContain('Session recording ID')
+        expect(fields[1].textContent).toContain('View')
+    })
+
+    it('hides the backing canvas ID from generated widget settings', () => {
+        const { container } = render(
+            <RealNotebookNodeIdentityAndViewEdit
+                node={{
+                    id: 'generated-widget-node',
+                    type: 'component',
+                    tagName: 'Widget',
+                    props: { id: 'canvas-id' },
+                }}
+                mode="edit"
+                updateProps={jest.fn()}
+                deleteNode={jest.fn()}
+                notebookNodeType={NotebookNodeType.GeneratedWidget}
+                options={KNOWN_NODES[NotebookNodeType.GeneratedWidget]}
+            />
+        )
+
+        expect(container.childElementCount).toBe(0)
+    })
+
+    it('selects a referenced object from the same picker used by notebook insertion', () => {
+        const updateProps = jest.fn()
+        const { container } = render(
+            <RealNotebookNodeEdit
+                node={{
+                    id: 'feature-flag-node',
+                    type: 'component',
+                    tagName: 'FeatureFlag',
+                    props: { id: 123 },
+                }}
+                mode="edit"
+                updateProps={updateProps}
+                deleteNode={jest.fn()}
+            />
+        )
+        const editor = within(container)
+
+        fireEvent.click(editor.getByLabelText('Select feature flag id or key'))
+        fireEvent.click(screen.getByLabelText('Pick from feature-flag'))
+
+        expect(updateProps).toHaveBeenCalledWith({ id: 999 })
+    })
+
+    it('exposes lightweight editable primitive attrs for real notebook node filters', () => {
+        expect(
+            getEditableNodeAttributeKeys(KNOWN_NODES[NotebookNodeType.FeatureFlag], {
+                id: 123,
+            })
+        ).toEqual(['id'])
+        expect(
+            getEditableNodeAttributeKeys(KNOWN_NODES[NotebookNodeType.Group], {
+                groupTypeIndex: 0,
+                id: 'org_123',
+                placement: 'feed',
+                tabId: 'properties',
+            })
+        ).toEqual(['id', 'groupTypeIndex'])
+        expect(
+            getEditableNodeAttributeKeys(KNOWN_NODES[NotebookNodeType.ZendeskTickets], {
+                personId: undefined,
+                groupKey: undefined,
+            })
+        ).toEqual(['personId', 'groupKey'])
+    })
+
+    it('uses product-specific labels for common reference attrs', () => {
+        expect(getMarkdownNodeAttributeLabel(NotebookNodeType.FeatureFlag, 'id')).toEqual('Feature flag ID or key')
+        expect(getMarkdownNodeAttributeLabel(NotebookNodeType.Group, 'groupTypeIndex')).toEqual('Group type index')
+        expect(getMarkdownNodeAttributeLabel(NotebookNodeType.Person, 'distinctId')).toEqual('Distinct ID')
+        expect(getMarkdownNodeAttributeLabel(NotebookNodeType.ZendeskTickets, 'personId')).toEqual('Person UUID')
+        expect(getMarkdownNodeAttributeLabel(NotebookNodeType.ZendeskTickets, 'groupKey')).toEqual('Group key')
+    })
+
+    it('keeps numeric attrs numeric when edited through markdown filters', () => {
+        expect(getSerializableAttributeInputValue(NotebookNodeType.Cohort, 'id', '123')).toEqual(123)
+        expect(getSerializableAttributeInputValue(NotebookNodeType.Group, 'groupTypeIndex', '2')).toEqual(2)
+        expect(getSerializableAttributeInputValue(NotebookNodeType.FeatureFlag, 'id', 'flag-key')).toEqual('flag-key')
+        expect(getSerializableAttributeInputValue(NotebookNodeType.FeatureFlag, 'id', ' flag-key ')).toEqual('flag-key')
+        expect(getSerializableAttributeInputValue(NotebookNodeType.Group, 'groupTypeIndex', ' not-a-number ')).toEqual(
+            'not-a-number'
+        )
+    })
+
+    it.each(['Query', 'Insight'])('assigns distinct render IDs to identical ID-less %s blocks', (tagName) => {
+        const nodes = parseMarkdownNotebook(`<${tagName} id="example" />\n\n<${tagName} id="example" />`)
+            .nodes as NotebookComponentBlockNode[]
+        const attributes = nodes.map((node) =>
+            getNodeAttributes(node.props, node.id, KNOWN_NODES[NotebookNodeType.Query], NotebookNodeType.Query, false)
+        )
+
+        expect(attributes.map(({ nodeId }) => nodeId)).toEqual(nodes.map(({ id }) => id))
+        expect(attributes[0].nodeId).toBeTruthy()
+        expect(attributes[1].nodeId).toBeTruthy()
+        expect(attributes[0].nodeId).not.toEqual(attributes[1].nodeId)
+    })
+
+    it('renders a SQL cell whose query arrived as a query prop', () => {
+        // Regression: a `<SQLV2 query={…} />` cell (the shape AI-authored notebooks use) has no
+        // `code` prop, so the editor rendered blank with no way to see or run the query.
+        const attributes = getNodeAttributes(
+            {
+                query: {
+                    kind: 'DataVisualizationNode',
+                    source: { kind: 'HogQLQuery', query: 'select event from events' },
+                    display: 'ActionsBar',
+                },
+            },
+            'block-1',
+            KNOWN_NODES[NotebookNodeType.SQLV2],
+            NotebookNodeType.SQLV2,
+            false
+        )
+
+        expect(attributes.code).toEqual('select event from events')
+        expect(attributes.vizQuery).toMatchObject({ display: 'ActionsBar' })
+    })
+
+    describe('getQueryTitle', () => {
+        it.each([
+            [
+                'ActorsQuery resolves to People, not the schema kind',
+                { kind: 'DataTableNode', source: { kind: 'ActorsQuery' } },
+                'People',
+            ],
+            ['EventsQuery resolves to Events', { kind: 'DataTableNode', source: { kind: 'EventsQuery' } }, 'Events'],
+            [
+                'HogQLQuery stays untitled — no SQL body, no generic label',
+                { kind: 'DataTableNode', source: { kind: 'HogQLQuery', query: 'select event from events' } },
+                null,
+            ],
+            ['an unrecognized query suggests no title rather than the raw kind', { kind: 'DataTableNode' }, null],
+        ])('%s', (_label, query, expected) => {
+            expect(getQueryTitle(query)).toEqual(expected)
+        })
+    })
+})

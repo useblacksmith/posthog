@@ -1,0 +1,340 @@
+import { useActions, useValues } from 'kea'
+import { useState } from 'react'
+
+import { IconDownload } from '@posthog/icons'
+import { LemonButton, LemonDialog, LemonInput, LemonMenu } from '@posthog/lemon-ui'
+
+import { TriggerExportProps } from 'lib/components/ExportButton/exporter'
+import { exportsLogic } from 'lib/components/ExportButton/exportsLogic'
+import { SaveToCohortModalContent } from 'lib/components/SaveToCohortModalContent/SaveToCohortModalContent'
+import { PERSON_DEFAULT_DISPLAY_NAME_PROPERTIES } from 'lib/constants'
+import { LemonField } from 'lib/lemon-ui/LemonField'
+import { getAccessControlDisabledReason } from 'lib/utils/accessControlUtils'
+import { pluralize } from 'lib/utils/strings'
+import { teamLogic } from 'scenes/teamLogic'
+
+import {
+    copyTableToCsv,
+    copyTableToExcel,
+    copyTableToJson,
+    projectExportRows,
+} from '~/queries/nodes/DataTable/clipboardUtils'
+import {
+    shouldOptimizeForExport,
+    transformColumnsForExport,
+    transformQuerySourceForExport,
+} from '~/queries/nodes/DataTable/exportTransformers'
+import { defaultDataTableColumns, removeExpressionComment } from '~/queries/nodes/DataTable/utils'
+import { getPersonsEndpoint } from '~/queries/query'
+import { isActorsQuery, isHogQLQuery, isPersonsNode } from '~/queries/schema/node-guards'
+import { DataNode, DataTableNode } from '~/queries/schema/schema-general'
+import { isEventsQuery, isGroupsQuery, isMarketingAnalyticsTableQuery, isSessionsQuery } from '~/queries/utils'
+import { AccessControlLevel, AccessControlResourceType, ExportContext, ExporterFormat } from '~/types'
+
+import { DataTableExportColumnsModal } from './DataTableExportColumnsModal'
+import { dataTableLogic } from './dataTableLogic'
+
+// Sync with posthog/hogql/constants.py
+export const MAX_SELECT_RETURNED_ROWS = 50000
+
+const columnDisallowList = ['person.$delete', '*']
+
+export async function startDownload(
+    query: DataTableNode,
+    onlySelectedColumns: boolean,
+    exportCall: (exportData: TriggerExportProps) => void,
+    format: ExporterFormat = ExporterFormat.CSV,
+    fileNameForExport?: string,
+    columnsOverride?: string[]
+): Promise<void> {
+    const shouldOptimize = shouldOptimizeForExport(query)
+
+    let exportSource = query.source
+
+    const team = teamLogic.findMounted()?.values?.currentTeam
+    const personDisplayNameProperties = team?.person_display_name_properties ?? PERSON_DEFAULT_DISPLAY_NAME_PROPERTIES
+
+    // Remove person column from the source otherwise export fails when there's 1000+ records
+    if (shouldOptimize && isEventsQuery(query.source)) {
+        exportSource = transformQuerySourceForExport(query.source, personDisplayNameProperties)
+    }
+
+    const exportContext: ExportContext = isPersonsNode(query.source)
+        ? { path: getPersonsEndpoint(query.source) }
+        : { source: exportSource }
+
+    if (!exportContext) {
+        throw new Error('Unsupported node type')
+    }
+
+    if (onlySelectedColumns) {
+        let columns = (
+            columnsOverride ??
+            (isEventsQuery(query.source) ||
+            isActorsQuery(query.source) ||
+            isGroupsQuery(query.source) ||
+            isSessionsQuery(query.source)
+                ? query.source.select
+                : null) ??
+            query.columns ??
+            defaultDataTableColumns(query.source.kind)
+        )?.filter((c) => c !== 'person.$delete')
+
+        // Apply export optimizations to columns
+        if (shouldOptimize && isEventsQuery(query.source)) {
+            columns = transformColumnsForExport(columns, personDisplayNameProperties)
+        } else if (isPersonsNode(query.source)) {
+            columns = columns.map((c: string) => (removeExpressionComment(c) === 'person' ? 'email' : c))
+        }
+
+        if (columns.includes('person')) {
+            // Expand the `person` column to `person.id` (canonical UUID, always populated),
+            // `person.distinct_ids.0` (may be blank when the person can't be hydrated), and
+            // `person.is_unresolved` (true for merged/deleted persons whose Postgres row is
+            // missing). The id keeps every row identifiable; is_unresolved must be listed
+            // explicitly so the backend's user_columns filter doesn't drop it.
+            columns = columns.flatMap((c: string) =>
+                c === 'person' ? ['person.id', 'person.distinct_ids.0', 'person.is_unresolved'] : [c]
+            )
+        }
+
+        columns = columns.filter((n: string) => !columnDisallowList.includes(n))
+        exportContext['columns'] = columns
+    }
+    if (fileNameForExport != null) {
+        exportContext['filename'] = fileNameForExport
+    }
+    exportCall({
+        export_format: format,
+        export_context: exportContext,
+    })
+}
+
+interface DataTableExportProps {
+    query: DataTableNode
+    setQuery?: (query: DataTableNode) => void
+    fileNameForExport?: string
+    excludedColumns?: string[]
+    downloadQuery?: DataTableNode
+    iconOnly?: boolean
+}
+
+export function DataTableExport({
+    query,
+    fileNameForExport,
+    excludedColumns = [],
+    downloadQuery,
+    iconOnly = false,
+}: DataTableExportProps): JSX.Element | null {
+    const { dataTableRows, columnsInResponse, columnsInQuery, queryWithDefaults } = useValues(dataTableLogic)
+    const { startExport, createStaticCohort } = useActions(exportsLogic)
+    const [isColumnsModalOpen, setIsColumnsModalOpen] = useState(false)
+    const responseColumns = columnsInResponse ?? columnsInQuery
+    const exportColumns = responseColumns.filter((column) => !excludedColumns.includes(column))
+    const exportQuery = downloadQuery ?? (excludedColumns.length ? { ...query, columns: exportColumns } : query)
+    const exportRows = excludedColumns.length
+        ? projectExportRows(dataTableRows ?? [], responseColumns, exportColumns)
+        : dataTableRows
+
+    const source: DataNode = query.source
+    const filterCount =
+        (isEventsQuery(source) || isPersonsNode(source) ? source.properties?.length || 0 : 0) +
+        (isEventsQuery(source) && source.event ? 1 : 0) +
+        (isPersonsNode(source) && source.search ? 1 : 0)
+    const exportLabel = `Export${filterCount > 0 ? ` (${pluralize(filterCount, 'filter')})` : ''}`
+    const canExportAllColumns = isEventsQuery(source) && source.select.includes('*')
+    const showExportClipboardButtons =
+        isPersonsNode(source) || isEventsQuery(source) || isHogQLQuery(source) || isMarketingAnalyticsTableQuery(source)
+    const canSaveAsCohort = isActorsQuery(source)
+
+    // Creating an export requires editor access to the export resource.
+    const accessControlDisabledReason = getAccessControlDisabledReason(
+        AccessControlResourceType.Export,
+        AccessControlLevel.Editor
+    )
+
+    return (
+        <>
+            <LemonMenu
+                items={[
+                    {
+                        label: 'Export selected columns…',
+                        onClick: () => setIsColumnsModalOpen(true),
+                        'data-attr': 'data-table-export-selected-columns',
+                    },
+                    {
+                        label: 'Export current columns',
+                        items: [
+                            {
+                                label: 'CSV',
+                                onClick: () => {
+                                    void startDownload(
+                                        exportQuery,
+                                        true,
+                                        startExport,
+                                        ExporterFormat.CSV,
+                                        fileNameForExport
+                                    )
+                                },
+                            },
+                            {
+                                label: 'XLSX',
+                                onClick: () => {
+                                    void startDownload(
+                                        exportQuery,
+                                        true,
+                                        startExport,
+                                        ExporterFormat.XLSX,
+                                        fileNameForExport
+                                    )
+                                },
+                            },
+                        ],
+                    },
+                    canExportAllColumns && {
+                        label: 'Export all columns',
+                        items: [
+                            {
+                                label: 'CSV',
+                                onClick: () =>
+                                    void startDownload(
+                                        exportQuery,
+                                        false,
+                                        startExport,
+                                        ExporterFormat.CSV,
+                                        fileNameForExport
+                                    ),
+                            },
+                            {
+                                label: 'XLSX',
+                                onClick: () =>
+                                    void startDownload(
+                                        exportQuery,
+                                        false,
+                                        startExport,
+                                        ExporterFormat.XLSX,
+                                        fileNameForExport
+                                    ),
+                            },
+                        ],
+                    },
+                    showExportClipboardButtons && {
+                        label: 'Copy to clipboard',
+                        items: [
+                            {
+                                label: 'CSV',
+                                onClick: () => {
+                                    if (exportRows) {
+                                        copyTableToCsv(exportRows, exportColumns, queryWithDefaults)
+                                    }
+                                },
+                                'data-attr': 'copy-csv-to-clipboard',
+                            },
+                            {
+                                label: 'JSON',
+                                onClick: () => {
+                                    if (exportRows) {
+                                        copyTableToJson(exportRows, exportColumns, queryWithDefaults)
+                                    }
+                                },
+                                'data-attr': 'copy-json-to-clipboard',
+                            },
+                            {
+                                label: 'Excel',
+                                onClick: () => {
+                                    if (exportRows) {
+                                        copyTableToExcel(exportRows, exportColumns, queryWithDefaults)
+                                    }
+                                },
+                                'data-attr': 'copy-excel-to-clipboard',
+                            },
+                        ],
+                    },
+                    canSaveAsCohort && {
+                        label: 'Save to cohort',
+                        items: [
+                            {
+                                label: 'Save as static cohort',
+                                onClick: () => {
+                                    LemonDialog.openForm({
+                                        title: 'Save as static cohort',
+                                        description: 'This will create a cohort with the current list of people.',
+                                        initialValues: {
+                                            name: '',
+                                        },
+                                        content: (
+                                            <LemonField name="name">
+                                                <LemonInput
+                                                    type="text"
+                                                    data-attr="insight-name"
+                                                    placeholder="Name of the new cohort"
+                                                    autoFocus
+                                                />
+                                            </LemonField>
+                                        ),
+                                        errors: {
+                                            name: (name) => (!name ? 'You must enter a name' : undefined),
+                                        },
+                                        onSubmit: async ({ name }) => createStaticCohort(name, source),
+                                    })
+                                },
+                            },
+                            {
+                                label: 'Add to existing cohort',
+                                onClick: () => {
+                                    LemonDialog.open({
+                                        title: 'Add to existing cohort',
+                                        description: 'This will add the current list of people to a static cohort.',
+                                        content: (closeDialog) => (
+                                            <SaveToCohortModalContent closeModal={closeDialog} query={source} />
+                                        ),
+                                        primaryButton: null,
+                                        secondaryButton: {
+                                            children: 'Cancel',
+                                        },
+                                    })
+                                },
+                            },
+                        ],
+                    },
+                ].filter(Boolean)}
+            >
+                <LemonButton
+                    type="secondary"
+                    icon={<IconDownload />}
+                    data-attr="data-table-export-menu"
+                    size="small"
+                    disabledReason={accessControlDisabledReason ?? undefined}
+                    tooltip={iconOnly ? exportLabel : undefined}
+                    aria-label={iconOnly ? exportLabel : undefined}
+                >
+                    {iconOnly ? null : exportLabel}
+                </LemonButton>
+            </LemonMenu>
+            <DataTableExportColumnsModal
+                isOpen={isColumnsModalOpen}
+                onClose={() => setIsColumnsModalOpen(false)}
+                columns={exportColumns.filter(
+                    (column) => !columnDisallowList.includes(column) && !query.hiddenColumns?.includes(column)
+                )}
+                canCopy={showExportClipboardButtons || isActorsQuery(source)}
+                // A separate download query can name its columns differently, so the table's names do not map onto it.
+                canDownload={!downloadQuery}
+                downloadDisabledReason={accessControlDisabledReason ?? undefined}
+                onCopy={(columns, includeHeader) => {
+                    if (exportRows) {
+                        copyTableToCsv(
+                            projectExportRows(exportRows, exportColumns, columns),
+                            columns,
+                            queryWithDefaults,
+                            includeHeader
+                        )
+                    }
+                }}
+                onDownload={(columns, format) =>
+                    void startDownload(exportQuery, true, startExport, format, fileNameForExport, columns)
+                }
+            />
+        </>
+    )
+}

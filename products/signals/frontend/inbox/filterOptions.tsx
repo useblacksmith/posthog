@@ -1,0 +1,256 @@
+import { JSX } from 'react'
+
+import {
+    IconBrain,
+    IconBug,
+    IconCalendar,
+    IconClock,
+    IconCompass,
+    IconDatabase,
+    IconEye,
+    IconGear,
+    IconGithub,
+    IconGraph,
+    IconList,
+    IconPerson,
+    IconReceipt,
+    IconRefresh,
+    IconStack,
+    IconStar,
+    IconSupport,
+} from '@posthog/icons'
+import { LemonTagType } from '@posthog/lemon-ui'
+
+import type {
+    InboxCreatedWindow,
+    InboxRankingSortField,
+    InboxSortDirection,
+    InboxSortField,
+} from './logics/inboxFiltersLogic'
+import { SignalReportActionability, SignalReportPriority } from './types'
+import { prettifyScoutSkillName } from './utils/scoutRunsWindow'
+
+/**
+ * Per-priority LemonTag type, for surfaces that render a LemonTag. Keep in step with
+ * `PRIORITY_ACCENT`, which holds the same colors as raw CSS vars.
+ */
+export const PRIORITY_TAG_TYPE: Record<SignalReportPriority, LemonTagType> = {
+    P0: 'danger',
+    P1: 'warning',
+    P2: 'caution',
+    P3: 'highlight',
+    P4: 'muted',
+}
+
+/**
+ * Human meaning of each priority code, mirroring the criteria the research agent judges against
+ * (see products/signals/backend/report_generation/research.py). Surfaced in the priority badge
+ * tooltip and the priority filter so users don't have to guess what P0–P4 mean.
+ */
+export const PRIORITY_MEANING: Record<SignalReportPriority, { label: string; description: string }> = {
+    P0: {
+        label: 'Critical',
+        description: 'Production errors, a broken core flow, data loss, or a security vulnerability.',
+    },
+    P1: { label: 'High', description: 'Significant user-facing impact or a clear regression.' },
+    P2: { label: 'Medium', description: 'A clear improvement opportunity, or a contained issue with workarounds.' },
+    P3: { label: 'Low', description: 'A minor improvement or low-impact issue.' },
+    P4: { label: 'Minimal', description: 'Cosmetic or negligible impact, or an optional investigation.' },
+}
+
+/** Shared by the actionability badge and the editable actionability row, so both name a value the same way. */
+export const ACTIONABILITY_LABEL: Record<SignalReportActionability, string> = {
+    immediately_actionable: 'Actionable',
+    requires_human_input: 'Needs input',
+    not_actionable: 'Not actionable',
+}
+
+/**
+ * Single source of truth for per-priority color, as raw CSS vars mirroring `PRIORITY_TAG_TYPE`'s
+ * LemonTag colors. Theme-aware, so contrast holds in both modes. Shared by the priority badge and
+ * the filter dots so the two always match.
+ */
+export const PRIORITY_ACCENT: Record<SignalReportPriority, string> = {
+    P0: 'var(--danger)',
+    P1: 'var(--warning)',
+    P2: 'var(--danger-lighter)',
+    P3: 'var(--color-accent)',
+    P4: 'var(--color-text-secondary)',
+}
+
+// Port of desktop `@posthog/ui/features/inbox/filterOptions`. Drives the Source /
+// Sort filter popovers. Source-product values match the backend
+// `source_product` values.
+
+export interface InboxSortOption {
+    label: string
+    field: InboxSortField
+    direction: InboxSortDirection
+    icon: JSX.Element
+    description?: string
+}
+
+export const INBOX_SORT_OPTIONS: InboxSortOption[] = [
+    {
+        label: 'Recommended',
+        field: 'recommended',
+        direction: 'asc',
+        icon: <IconStar />,
+        description: 'The reports most worth a look come first.',
+    },
+    { label: 'Priority first', field: 'priority', direction: 'asc', icon: <IconList /> },
+    { label: 'Last updated first', field: 'updated_at', direction: 'desc', icon: <IconRefresh /> },
+    { label: 'Newest first', field: 'created_at', direction: 'desc', icon: <IconCalendar /> },
+    { label: 'Oldest first', field: 'created_at', direction: 'asc', icon: <IconClock /> },
+]
+
+/**
+ * The three ranking model scores the inbox shows, in display order. Each reads one outcome head.
+ * The model serves more heads, but the sort menu, the card tag and the activity log lead with these.
+ */
+export interface InboxRankingScore {
+    field: InboxRankingSortField
+    outcome: string
+    /** The model head in raw `ranking_score` artefacts. It differs from the outcome for `fix`, which reads `fixed`. */
+    head: string
+    name: string
+    sortLabel: string
+    /** The short word the card tag uses after a probability with no lift ("12% fix"). Staff only. */
+    tagLabel: string
+    description: string
+    /** Replaces `description` in the score hover card only. The sort menu and the artefact log keep `description`. */
+    hoverCardDescription?: string
+}
+
+export const INBOX_RANKING_SCORES: InboxRankingScore[] = [
+    {
+        field: 'ranking_open',
+        outcome: 'open',
+        head: 'open',
+        name: 'Open',
+        sortLabel: 'Most likely to be opened',
+        tagLabel: 'open',
+        description: 'A person opens the report within 7 days.',
+    },
+    {
+        field: 'ranking_action',
+        outcome: 'action',
+        head: 'action',
+        name: 'Action',
+        sortLabel: 'Most likely to be acted on',
+        tagLabel: 'action',
+        description: 'A person or their agent acts on the report within 14 days.',
+    },
+    {
+        field: 'ranking_fix',
+        outcome: 'fix',
+        head: 'fixed',
+        name: 'Fix',
+        sortLabel: 'Most likely to be fixed',
+        tagLabel: 'fix',
+        description: 'Someone fixes the problem within 30 days.',
+        hoverCardDescription: 'Someone fixes the problem within 30 days (as best we can tell).',
+    },
+]
+
+/** Sorts by the ranking model's served probability for one score, behind the model sort flag. Descending only. */
+export const INBOX_MODEL_SORT_OPTIONS: InboxSortOption[] = INBOX_RANKING_SCORES.map((score) => ({
+    label: score.sortLabel,
+    field: score.field,
+    direction: 'desc',
+    icon: <IconBrain />,
+    description: score.description,
+}))
+
+/** The `personal_tier` values the personal ranking writes, keyed by value. */
+export const INBOX_PERSONAL_TIERS: Record<string, { label: string }> = {
+    top: { label: 'Top' },
+    worth_a_look: { label: 'Worth a look' },
+    later: { label: 'Later' },
+}
+
+/** The sorts the server orders with a ranker, whose rows carry `inbox_merge_key`. */
+export function isMergeKeySortField(field: InboxSortField): field is 'recommended' {
+    return field === 'recommended'
+}
+
+const RANKING_SCORE_BY_FIELD = Object.fromEntries(INBOX_RANKING_SCORES.map((score) => [score.field, score])) as Record<
+    InboxRankingSortField,
+    InboxRankingScore
+>
+
+export function isRankingSortField(field: InboxSortField): field is InboxRankingSortField {
+    return field in RANKING_SCORE_BY_FIELD
+}
+
+export function rankingScoreForField(field: InboxRankingSortField): InboxRankingScore {
+    return RANKING_SCORE_BY_FIELD[field]
+}
+
+export function rankingScoreForHead(head: string): InboxRankingScore | undefined {
+    return INBOX_RANKING_SCORES.find((score) => score.head === head)
+}
+
+export const INBOX_CREATED_WINDOW_OPTIONS: { value: InboxCreatedWindow; label: string; hours: number }[] = [
+    { value: '24h', label: 'Last 24 hours', hours: 24 },
+    { value: '3d', label: 'Last 3 days', hours: 3 * 24 },
+    { value: '7d', label: 'Last 7 days', hours: 7 * 24 },
+    { value: '14d', label: 'Last 14 days', hours: 14 * 24 },
+]
+
+/** The `created_after` bound for a window, computed at request time so a long-open tab never sends a stale bound. */
+export function createdAfterForWindow(window: InboxCreatedWindow | null, now: number = Date.now()): string | undefined {
+    const option = INBOX_CREATED_WINDOW_OPTIONS.find((o) => o.value === window)
+    return option ? new Date(now - option.hours * 60 * 60 * 1000).toISOString() : undefined
+}
+
+export const INBOX_SOURCE_OPTIONS: { value: string; label: string; icon: JSX.Element }[] = [
+    { value: 'replay_vision', label: 'Replay vision', icon: <IconEye /> },
+    { value: 'error_tracking', label: 'Error tracking', icon: <IconBug /> },
+    { value: 'llm_analytics', label: 'AI observability', icon: <IconBrain /> },
+    { value: 'github', label: 'GitHub', icon: <IconGithub /> },
+    { value: 'linear', label: 'Linear', icon: <IconStack /> },
+    { value: 'zendesk', label: 'Zendesk', icon: <IconReceipt /> },
+    { value: 'conversations', label: 'Support', icon: <IconSupport /> },
+    { value: 'pganalyze', label: 'pganalyze', icon: <IconDatabase /> },
+    { value: 'analytics', label: 'Product analytics', icon: <IconGraph /> },
+    {
+        value: 'engineering_analytics',
+        label: 'Engineering analytics',
+        icon: <IconGear />,
+    },
+    { value: 'signals_scout', label: 'Scout', icon: <IconCompass /> },
+    { value: 'user_authored', label: 'Team member', icon: <IconPerson /> },
+]
+
+/** Priority codes in rank order (P0 highest → P4 lowest), driving the Priority filter popover. */
+export const INBOX_PRIORITY_OPTIONS: SignalReportPriority[] = ['P0', 'P1', 'P2', 'P3', 'P4']
+
+export function inboxSortOptionKey(field: InboxSortField, direction: InboxSortDirection): string {
+    return `${field}:${direction}`
+}
+
+export function inboxPriorityFilterLabel(selected: SignalReportPriority[]): string {
+    if (selected.length === 0) {
+        return 'All priorities'
+    }
+    // Codes are short (P0–P4), so list them in rank order rather than collapsing to a count.
+    return [...selected].sort().join(', ')
+}
+
+export function inboxSourceFilterLabel(selected: string[], selectedScouts: string[] = []): string {
+    const parts: string[] = []
+    if (selected.length === 1) {
+        parts.push(INBOX_SOURCE_OPTIONS.find((o) => o.value === selected[0])?.label ?? selected[0])
+    } else if (selected.length > 1) {
+        parts.push(`${selected.length} sources`)
+    }
+    if (selectedScouts.length === 1) {
+        // "Scout · " disambiguates from same-named source products (e.g. the error tracking
+        // scout vs the error tracking source), matching the report rows' attribution label.
+        parts.push(`Scout · ${prettifyScoutSkillName(selectedScouts[0])}`)
+    } else if (selectedScouts.length > 1) {
+        parts.push(`${selectedScouts.length} scouts`)
+    }
+    return parts.length > 0 ? parts.join(' · ') : 'All sources'
+}

@@ -1,0 +1,15 @@
+{
+    "mcpServers": {
+        "phrocs": {
+            "command": "tools/phrocs/mcp.sh"
+        },
+        "posthog-local": {
+            "type": "http",
+            "url": "http://localhost:8787/mcp"
+        },
+        "trunk": {
+            "type": "http",
+            "url": "https://mcp.trunk.io/mcp"
+        }
+    }
+}

@@ -1,0 +1,941 @@
+"""DRF serializers for business_knowledge."""
+
+from urllib.parse import urlparse
+
+from django.conf import settings
+from django.core.files.uploadedfile import UploadedFile
+from django.utils import timezone
+
+from drf_spectacular.utils import extend_schema_field, extend_schema_serializer
+from rest_framework import serializers
+
+from posthog.security.url_validation import is_url_allowed
+
+from .. import url_fetch
+from ..constants import (
+    CRAWL_HARD_MAX_DEPTH,
+    DEFAULT_CRAWL_MAX_DEPTH,
+    DEFAULT_MAX_PAGES,
+    MAX_FILE_SIZE_BYTES,
+    MAX_TEXT_SIZE_BYTES,
+    MAX_URLS_PER_SOURCE,
+)
+from ..models import (
+    REFRESH_INTERVAL_TIMEDELTAS,
+    CrawlMode,
+    EmbeddingStatus,
+    KnowledgeLibrarySource,
+    KnowledgeSource,
+    LearningBackfillStatus,
+    RefreshInterval,
+    SafetyVerdict,
+    SourceType,
+)
+from ..models.constants import SearchMatch
+from ..sandbox import SandboxPollStatus, SandboxToolName
+from ..usage import USAGE_DEFAULT_DAYS, USAGE_MAX_DAYS
+
+
+def _derive_scope_globs(url: str) -> list[str]:
+    """
+    Auto-derive include globs from the entry URL path so that same-origin
+    crawls are scoped to the URL's section by default.
+
+    - Root path (``/`` or empty) → empty list (crawl the whole origin).
+    - Non-root → ``[path, path/*]`` to match the index page + descendants
+      without sibling bleed (e.g. ``/docs/support`` won't grab ``/docs/support-center``).
+    """
+    path = urlparse(url).path.rstrip("/") or "/"
+    if path == "/":
+        return []
+    return [path, f"{path}/*"]
+
+
+class _GlobListField(serializers.ListField):
+    """
+    Tiny wrapper so each entry is validated as a non-empty string and the
+    total list is bounded. Keeps the glob inputs from being used as a DoS
+    vector — fnmatch is cheap but not free per-URL.
+    """
+
+    child = serializers.CharField(max_length=256)
+    max_length = 32
+
+
+class _NameValidationMixin:
+    def validate_name(self, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Name cannot be blank.")
+        return value
+
+
+class _UrlValidationMixin:
+    def validate_url(self, value: str) -> str:
+        try:
+            normalized = url_fetch.normalize_url(value)
+        except url_fetch.UrlFetchError:
+            raise serializers.ValidationError("Invalid URL.")
+        allowed, _reason = is_url_allowed(normalized)
+        if not allowed:
+            raise serializers.ValidationError("URL is not reachable.")
+        return normalized
+
+
+class KnowledgeSourceSerializer(serializers.ModelSerializer):
+    document_count = serializers.IntegerField(
+        source="_document_count",
+        read_only=True,
+        default=0,
+        help_text="Number of documents belonging to this source.",
+    )
+    chunk_count = serializers.IntegerField(
+        source="_chunk_count",
+        read_only=True,
+        default=0,
+        help_text="Number of chunks belonging to this source.",
+    )
+    next_refresh_at = serializers.SerializerMethodField(
+        help_text="When the background coordinator will next auto-refresh this source. Null for manual sources or sources never refreshed.",
+    )
+    has_unsafe_documents = serializers.SerializerMethodField(
+        help_text="True when at least one document in this source was flagged unsafe by the content classifier and is therefore excluded from agent search.",
+    )
+    embedding_status = serializers.SerializerMethodField(
+        help_text=(
+            "Semantic-index state of this source. A `ready` source serves keyword (full-text) search "
+            "immediately, but semantic search needs a background job to classify and embed its documents, "
+            "which can take up to an hour. `pending` — at least one document is still awaiting "
+            "classification or embedding. `completed` — every eligible document has been submitted to the "
+            "embedding pipeline. `disabled` — the organization has not approved AI data processing, so "
+            "embeddings never run and search stays keyword-only. Only meaningful while `status` is `ready`."
+        ),
+    )
+    learned_from_ticket_number = serializers.IntegerField(
+        source="_learned_ticket_number",
+        read_only=True,
+        allow_null=True,
+        default=None,
+        help_text="Support ticket number this learned source came from. Null for sources you added yourself.",
+    )
+    learned_from_ticket_url = serializers.SerializerMethodField(
+        help_text="App URL of the originating support ticket. Null for sources you added yourself.",
+    )
+    library_ids = serializers.SerializerMethodField(
+        help_text="Libraries this source belongs to. Empty when the source is in none.",
+    )
+    cited_run_count = serializers.IntegerField(
+        source="_cited_run_count",
+        read_only=True,
+        default=0,
+        help_text="Number of support agent runs that cited this source.",
+    )
+    last_cited_at = serializers.DateTimeField(
+        source="_last_cited_at",
+        read_only=True,
+        allow_null=True,
+        default=None,
+        help_text="When a support agent run last cited this source. Null when none has.",
+    )
+
+    class Meta:
+        model = KnowledgeSource
+        fields = [
+            "id",
+            "team_id",
+            "name",
+            "source_type",
+            "is_generated",
+            "status",
+            "error_message",
+            "document_count",
+            "chunk_count",
+            "created_at",
+            "updated_at",
+            "source_url",
+            "last_refresh_at",
+            "last_refresh_status",
+            "last_refresh_error",
+            "refresh_interval",
+            "next_refresh_at",
+            "has_unsafe_documents",
+            "embedding_status",
+            "learned_from_ticket_number",
+            "learned_from_ticket_url",
+            "crawl_mode",
+            "crawl_config",
+            "original_filename",
+            "file_content_type",
+            "file_size_bytes",
+            "always_include",
+            "library_ids",
+            "cited_run_count",
+            "last_cited_at",
+        ]
+        read_only_fields = fields
+
+    def get_next_refresh_at(self, obj: KnowledgeSource) -> str | None:
+        delta = REFRESH_INTERVAL_TIMEDELTAS.get(obj.refresh_interval)
+        if delta is None:
+            # `manual` (or unknown) interval — no auto-refresh scheduled.
+            return None
+        if obj.last_refresh_at is None:
+            # On a cadence but never refreshed: `list_due_refresh_sources`
+            # treats this as immediately due, so surface "now" not null.
+            return timezone.now().isoformat()
+        return (obj.last_refresh_at + delta).isoformat()
+
+    def get_has_unsafe_documents(self, obj: KnowledgeSource) -> bool:
+        # Annotated by the logic layer to avoid an N+1 in list responses.
+        return bool(getattr(obj, "_has_unsafe_documents", False))
+
+    @extend_schema_field(serializers.URLField(allow_null=True))
+    def get_learned_from_ticket_url(self, obj: KnowledgeSource) -> str | None:
+        ticket_number = getattr(obj, "_learned_ticket_number", None)
+        if ticket_number is None:
+            return None
+        source_team_id = getattr(obj, "_learned_source_team_id", None)
+        team_id = source_team_id if source_team_id is not None else obj.team_id
+        return f"{settings.SITE_URL}/project/{team_id}/support/tickets/{ticket_number}"
+
+    @extend_schema_field(serializers.ListField(child=serializers.UUIDField()))
+    def get_library_ids(self, obj: KnowledgeSource) -> list[str]:
+        # The list annotation is NULL when a source is in no library, and
+        # missing entirely when a create or update returns the row directly.
+        if "_library_ids" in obj.__dict__:
+            raw = obj.__dict__["_library_ids"] or []
+        else:
+            raw = (
+                KnowledgeLibrarySource.objects.for_team(obj.team_id)
+                .filter(source_id=obj.id)
+                .order_by("library_id")
+                .values_list("library_id", flat=True)
+            )
+        return [str(item) for item in raw]
+
+    @extend_schema_field(serializers.ChoiceField(choices=EmbeddingStatus.choices))
+    def get_embedding_status(self, obj: KnowledgeSource) -> str:
+        # Both inputs are annotated by the logic layer (list_for_team /
+        # get_for_team) to avoid N+1s. When a source is serialized without
+        # annotations (future code path), fall back to a live DB query for
+        # both rather than silently returning the wrong value.
+        if hasattr(obj, "_ai_processing_approved"):
+            approved = bool(obj._ai_processing_approved)
+        else:
+            approved = bool(obj.team.organization.is_ai_data_processing_approved)
+        if not approved:
+            return EmbeddingStatus.DISABLED
+        if hasattr(obj, "_has_pending_embeddings"):
+            pending = bool(obj._has_pending_embeddings)
+        else:
+            from .. import logic
+
+            pending = logic.has_pending_embeddings(obj.id)
+        if pending:
+            return EmbeddingStatus.PENDING
+        return EmbeddingStatus.COMPLETED
+
+
+class CreateTextSourceSerializer(_NameValidationMixin, serializers.Serializer):
+    name = serializers.CharField(
+        max_length=255,
+        help_text="Short human label for the source. Shown in the settings list and in agent citations.",
+    )
+    text = serializers.CharField(
+        trim_whitespace=False,
+        help_text=(
+            "Raw text to index. Capped at 1 MB; larger payloads should be split into multiple sources "
+            "or wait for URL/file support in Stage 2/3."
+        ),
+    )
+    always_include = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="When true, this source's content is injected into every support reply prompt as general context (tone, policies, direction).",
+    )
+
+    def validate_text(self, value: str) -> str:
+        if not value.strip():
+            raise serializers.ValidationError("Text cannot be blank.")
+        if len(value.encode("utf-8")) > MAX_TEXT_SIZE_BYTES:
+            raise serializers.ValidationError(
+                f"Text exceeds the {MAX_TEXT_SIZE_BYTES:,}-byte cap. Split it into smaller sources."
+            )
+        return value
+
+    def to_internal_value(self, data: dict) -> dict:
+        attrs = super().to_internal_value(data)
+        attrs["source_type"] = SourceType.TEXT.value
+        return attrs
+
+
+class UpdateTextSourceSerializer(_NameValidationMixin, serializers.Serializer):
+    """
+    PATCH payload for text sources. All fields optional, at least one
+    required. `text` triggers a re-chunk; `name` or `always_include` alone does not.
+    """
+
+    name = serializers.CharField(
+        max_length=255,
+        required=False,
+        help_text="New human label for the source.",
+    )
+    text = serializers.CharField(
+        required=False,
+        trim_whitespace=False,
+        help_text="Replacement text. Omit to keep the existing content.",
+    )
+    always_include = serializers.BooleanField(
+        required=False,
+        help_text="When true, this source's content is injected into every support reply prompt as general context.",
+    )
+    library_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        help_text="Replaces the libraries this source belongs to. Omit to leave membership unchanged. An empty list removes it from every library.",
+    )
+
+    def validate_text(self, value: str) -> str:
+        if not value.strip():
+            raise serializers.ValidationError("Text cannot be blank.")
+        if len(value.encode("utf-8")) > MAX_TEXT_SIZE_BYTES:
+            raise serializers.ValidationError(
+                f"Text exceeds the {MAX_TEXT_SIZE_BYTES:,}-byte cap. Split it into smaller sources."
+            )
+        return value
+
+    def validate(self, attrs: dict) -> dict:
+        if "name" not in attrs and "text" not in attrs and "always_include" not in attrs and "library_ids" not in attrs:
+            raise serializers.ValidationError(
+                "Provide at least one of `name`, `text`, `always_include`, or `library_ids`."
+            )
+        return attrs
+
+
+class UpdateUrlSourceSerializer(_NameValidationMixin, _UrlValidationMixin, serializers.Serializer):
+    """
+    PATCH payload for URL sources. All fields optional, at least one required.
+    Changing `url` or crawl settings triggers a re-crawl.
+    """
+
+    name = serializers.CharField(
+        max_length=255,
+        required=False,
+        help_text="New human label for the source.",
+    )
+    url = serializers.URLField(
+        max_length=2048,
+        required=False,
+        help_text="New URL. Triggers a re-crawl when changed.",
+    )
+    crawl_mode = serializers.ChoiceField(
+        choices=[CrawlMode.SINGLE.value, CrawlMode.SITEMAP.value, CrawlMode.SAME_ORIGIN.value],
+        required=False,
+        help_text="New crawl mode. Triggers a re-crawl when changed.",
+    )
+    refresh_interval = serializers.ChoiceField(
+        choices=RefreshInterval.choices,
+        required=False,
+        help_text="How often to auto-refresh this source in the background. `manual` disables auto-refresh. Changing it alone does not trigger a re-crawl.",
+    )
+    always_include = serializers.BooleanField(
+        required=False,
+        help_text="When true, this source's content is injected into every support reply prompt as general context.",
+    )
+    include_globs = _GlobListField(
+        required=False,
+        help_text="URL path globs to include.",
+    )
+    exclude_globs = _GlobListField(
+        required=False,
+        help_text="URL path globs to exclude.",
+    )
+    max_pages = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=MAX_URLS_PER_SOURCE,
+        help_text=f"Max pages to fetch. Capped at {MAX_URLS_PER_SOURCE}.",
+    )
+    max_depth = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        max_value=CRAWL_HARD_MAX_DEPTH,
+        help_text="BFS depth for same_origin.",
+    )
+
+    def validate(self, attrs: dict) -> dict:
+        if not attrs:
+            raise serializers.ValidationError("Provide at least one field to update.")
+        return attrs
+
+    def to_internal_value(self, data: dict) -> dict:
+        attrs = super().to_internal_value(data)
+        crawl_config_keys = {"include_globs", "exclude_globs", "max_pages", "max_depth"}
+        crawl_fields = {k: attrs.pop(k) for k in crawl_config_keys if k in attrs}
+        # Re-derive scope when include_globs was NOT sent (user didn't override),
+        # the URL is changing, and mode is same-origin.
+        if (
+            "include_globs" not in crawl_fields
+            and "url" in attrs
+            and attrs.get("crawl_mode", data.get("crawl_mode")) == CrawlMode.SAME_ORIGIN.value
+        ):
+            crawl_fields["include_globs"] = _derive_scope_globs(attrs["url"])
+        if crawl_fields:
+            attrs["crawl_config"] = crawl_fields
+        return attrs
+
+
+class CreateUrlSourceSerializer(_NameValidationMixin, _UrlValidationMixin, serializers.Serializer):
+    """
+    POST payload for URL sources. Normalizes + SSRF-validates the URL here
+    so the client gets a precise 400 instead of a created-but-errored source.
+    The logic layer re-validates on every fetch anyway — this is UX, not
+    security.
+    """
+
+    name = serializers.CharField(
+        max_length=255,
+        help_text="Short human label for the source. Shown in the settings list and in agent citations.",
+    )
+    url = serializers.URLField(
+        max_length=2048,
+        help_text="Public HTTP(S) URL to fetch. Private or internal hosts are rejected.",
+    )
+    refresh_interval = serializers.ChoiceField(
+        choices=RefreshInterval.choices,
+        required=False,
+        default=RefreshInterval.MANUAL,
+        help_text="How often to auto-refresh this source in the background. `manual` disables auto-refresh.",
+    )
+    always_include = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="When true, this source's content is injected into every support reply prompt as general context.",
+    )
+
+    def to_internal_value(self, data: dict) -> dict:
+        attrs = super().to_internal_value(data)
+        attrs["source_type"] = SourceType.URL.value
+        return attrs
+
+
+class CreateCrawlSourceSerializer(_NameValidationMixin, _UrlValidationMixin, serializers.Serializer):
+    """
+    POST payload for multi-URL crawl sources (Stage 2b).
+
+    The entry URL goes through the same SSRF gate as the single-URL endpoint;
+    each URL discovered during the crawl is independently re-validated before
+    fetch, so we never trust a discovered URL just because its parent did.
+    """
+
+    name = serializers.CharField(
+        max_length=255,
+        help_text="Short human label for the source. Shown in the settings list and in agent citations.",
+    )
+    url = serializers.URLField(
+        max_length=2048,
+        help_text="Entry URL. For sitemap mode, this is sitemap.xml (or a page whose origin has /sitemap.xml).",
+    )
+    crawl_mode = serializers.ChoiceField(
+        choices=[CrawlMode.SITEMAP.value, CrawlMode.SAME_ORIGIN.value],
+        help_text="How to expand the entry URL into documents.",
+    )
+    refresh_interval = serializers.ChoiceField(
+        choices=RefreshInterval.choices,
+        required=False,
+        default=RefreshInterval.MANUAL,
+        help_text="How often to auto-refresh this source in the background. `manual` disables auto-refresh.",
+    )
+    always_include = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="When true, this source's content is injected into every support reply prompt as general context.",
+    )
+    include_globs = _GlobListField(
+        required=False,
+        default=list,
+        help_text="URL path globs to include (fnmatch, e.g. `/docs/*`). Empty means include everything.",
+    )
+    exclude_globs = _GlobListField(
+        required=False,
+        default=list,
+        help_text="URL path globs to exclude. Applied after `include_globs`.",
+    )
+    max_pages = serializers.IntegerField(
+        required=False,
+        default=DEFAULT_MAX_PAGES,
+        min_value=1,
+        max_value=MAX_URLS_PER_SOURCE,
+        help_text=f"Max pages to fetch. Capped at {MAX_URLS_PER_SOURCE}.",
+    )
+    max_depth = serializers.IntegerField(
+        required=False,
+        default=DEFAULT_CRAWL_MAX_DEPTH,
+        min_value=0,
+        max_value=CRAWL_HARD_MAX_DEPTH,
+        help_text="BFS depth for `same_origin`. Ignored by `sitemap`.",
+    )
+
+    def to_internal_value(self, data: dict) -> dict:
+        attrs = super().to_internal_value(data)
+        attrs["source_type"] = SourceType.URL.value
+        include_globs = attrs.pop("include_globs")
+        if not include_globs and attrs.get("crawl_mode") == CrawlMode.SAME_ORIGIN.value:
+            include_globs = _derive_scope_globs(attrs["url"])
+        attrs["crawl_config"] = {
+            "include_globs": include_globs,
+            "exclude_globs": attrs.pop("exclude_globs"),
+            "max_pages": attrs.pop("max_pages"),
+            "max_depth": attrs.pop("max_depth"),
+        }
+        return attrs
+
+
+class KnowledgeSourceDocumentSerializer(serializers.Serializer):
+    id = serializers.UUIDField(read_only=True, help_text="Document id.")
+    url = serializers.URLField(
+        read_only=True,
+        allow_blank=True,
+        help_text="Fetched page URL after redirects. Empty for text and file documents.",
+    )
+    title = serializers.CharField(
+        read_only=True,
+        allow_blank=True,
+        help_text="Page title extracted while indexing. Falls back to empty when the page had none.",
+    )
+    safety_verdict = serializers.ChoiceField(
+        choices=SafetyVerdict.choices,
+        read_only=True,
+        help_text="Content-safety verdict. Only `safe` documents are included in search. `unknown` is still waiting on classification.",
+    )
+
+
+class KnowledgeAvailabilitySerializer(serializers.Serializer):
+    has_sources = serializers.BooleanField(
+        read_only=True, help_text="True when the project has at least one business knowledge source."
+    )
+    has_repositories = serializers.BooleanField(
+        read_only=True, help_text="True when this environment has at least one GitHub repository selected."
+    )
+
+
+class KnowledgeDocumentWindowSerializer(serializers.Serializer):
+    """
+    One chunk in a drill-down window over a single knowledge document.
+
+    Output-only — the rows come from the `get_document_window` logic helper
+    (a `KnowledgeSearchResult` dataclass), not the ORM, so this is a plain
+    read serializer rather than a `ModelSerializer`.
+    """
+
+    chunk_id = serializers.UUIDField(
+        read_only=True,
+        help_text="Stable identifier of this chunk. Same value used in search results.",
+    )
+    ordinal = serializers.IntegerField(
+        read_only=True,
+        help_text="Zero-based position of this chunk within its document. Use it as `around_ordinal` to recenter the window.",
+    )
+    content = serializers.CharField(
+        read_only=True,
+        help_text="The chunk's text content.",
+    )
+    heading_path = serializers.CharField(
+        read_only=True,
+        help_text="Breadcrumb of section headings this chunk sits under. Empty when the document has no heading structure.",
+    )
+    source_name = serializers.CharField(
+        read_only=True,
+        help_text="Human label of the knowledge source this chunk belongs to.",
+    )
+    document_title = serializers.CharField(
+        read_only=True,
+        help_text="Title of the document this chunk belongs to.",
+    )
+    url = serializers.CharField(
+        read_only=True,
+        help_text="Fetched page URL. Empty for text and file sources.",
+    )
+
+
+class KnowledgeSearchResultSerializer(serializers.Serializer):
+    """
+    One ranked chunk from a business knowledge search.
+
+    Output-only — the rows come from the ``search_knowledge_for_team`` logic
+    helper (a ``KnowledgeSearchResult`` dataclass), not the ORM.
+    """
+
+    chunk_id = serializers.UUIDField(
+        read_only=True,
+        help_text="Stable identifier of this chunk.",
+    )
+    document_id = serializers.UUIDField(
+        read_only=True,
+        help_text="ID of the parent document. Pass to the document-window endpoint with `around_ordinal` to drill down.",
+    )
+    ordinal = serializers.IntegerField(
+        read_only=True,
+        help_text="Zero-based position of this chunk within its document. Use as `around_ordinal` in the document-window endpoint.",
+    )
+    source_id = serializers.UUIDField(
+        read_only=True,
+        help_text="ID of the knowledge source this chunk belongs to.",
+    )
+    source_name = serializers.CharField(
+        read_only=True,
+        help_text="Human label of the knowledge source this chunk belongs to.",
+    )
+    source_type = serializers.CharField(
+        read_only=True,
+        help_text="Source type: text, URL, or file.",
+    )
+    document_title = serializers.CharField(
+        read_only=True,
+        help_text="Title of the document this chunk belongs to.",
+    )
+    heading_path = serializers.CharField(
+        read_only=True,
+        help_text="Breadcrumb of section headings this chunk sits under. Empty when the document has no heading structure.",
+    )
+    content = serializers.CharField(
+        read_only=True,
+        help_text="The chunk's text content.",
+    )
+    is_generated = serializers.BooleanField(
+        read_only=True,
+        help_text="True when this chunk comes from a generated source learned from a past support ticket.",
+    )
+    url = serializers.CharField(
+        read_only=True,
+        help_text="Fetched page URL. Empty for text and file sources.",
+    )
+    matched_by = serializers.ChoiceField(
+        choices=SearchMatch.choices,
+        read_only=True,
+        help_text=(
+            "Why this chunk is in the result. `both`: the chunk matched the query words and the query meaning, "
+            "the strongest evidence. `semantic`: it matched the meaning only. `keyword`: it shares words with the "
+            "query, which can be a weak match for a long question. `context`: it did not match; it is a neighbour "
+            "of a matching chunk, returned so the match reads in context."
+        ),
+    )
+    similarity = serializers.FloatField(
+        read_only=True,
+        allow_null=True,
+        help_text=(
+            "Semantic similarity between the query and this chunk, from 0 to 1, higher is closer. "
+            "Null when the semantic index did not return this chunk."
+        ),
+    )
+
+
+class CreateFileSourceSerializer(_NameValidationMixin, serializers.Serializer):
+    """
+    Multipart upload payload for file sources. The file's content type is
+    detected from magic bytes server-side — the client-provided Content-Type
+    is ignored for security.
+    """
+
+    name = serializers.CharField(
+        max_length=255,
+        help_text="Short human label for the source.",
+    )
+    file = serializers.FileField(
+        help_text=(
+            f"PDF, DOCX, Markdown (.md), CSV, or plain text (.txt) file. Max {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB."
+        ),
+    )
+    always_include = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="When true, this source's content is injected into every support reply prompt as general context.",
+    )
+
+    def validate_file(self, value: UploadedFile) -> UploadedFile:  # noqa: F821
+        if value.size and value.size > MAX_FILE_SIZE_BYTES:
+            raise serializers.ValidationError(f"File exceeds the {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB cap.")
+        return value
+
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeUsageQuerySerializer(serializers.Serializer):
+    days = serializers.IntegerField(
+        required=False,
+        default=USAGE_DEFAULT_DAYS,
+        min_value=1,
+        max_value=USAGE_MAX_DAYS,
+        help_text=f"Number of days to report, counting back from today. From 1 to {USAGE_MAX_DAYS}.",
+    )
+
+
+class DailyUsageSerializer(serializers.Serializer):
+    date = serializers.DateField(read_only=True, help_text="Day, in UTC.")
+    cited_run_count = serializers.IntegerField(
+        read_only=True, help_text="Support agent runs that cited knowledge on this day."
+    )
+    chunks_ingested = serializers.IntegerField(read_only=True, help_text="Chunks written on this day.")
+    query_count = serializers.IntegerField(read_only=True, help_text="Knowledge searches made on this day.")
+
+
+class SurfaceUsageSerializer(serializers.Serializer):
+    surface = serializers.CharField(
+        read_only=True,
+        help_text=(
+            "Where the usage came from. For chunks: text, url, file, or generated (learned from a support "
+            "ticket). For searches: api (the API and MCP), support, posthog_ai, or learning."
+        ),
+    )
+    total = serializers.IntegerField(read_only=True, help_text="Usage from this surface in the period.")
+
+
+class SourceUsageSerializer(serializers.Serializer):
+    source_id = serializers.UUIDField(read_only=True, help_text="ID of the knowledge source.")
+    name = serializers.CharField(read_only=True, help_text="Name of the knowledge source.")
+    is_generated = serializers.BooleanField(
+        read_only=True, help_text="True when the source was learned from a past support ticket."
+    )
+    cited_run_count = serializers.IntegerField(
+        read_only=True, help_text="Support agent runs that cited this source in the period."
+    )
+    last_cited_at = serializers.DateTimeField(
+        read_only=True, help_text="When a run last cited this source in the period."
+    )
+
+
+class KnowledgeUsageSerializer(serializers.Serializer):
+    """How much the knowledge base was used in a period: ingestion, searches, and support agent citations."""
+
+    days = serializers.IntegerField(read_only=True, help_text="Number of days the report covers, today included.")
+    cited_run_count = serializers.IntegerField(
+        read_only=True, help_text="Support agent runs that cited at least one knowledge source."
+    )
+    learned_cited_run_count = serializers.IntegerField(
+        read_only=True,
+        help_text="Runs that cited at least one source learned from a past support ticket.",
+    )
+    source_count = serializers.IntegerField(read_only=True, help_text="Knowledge sources in the project.")
+    cited_source_count = serializers.IntegerField(
+        read_only=True, help_text="Knowledge sources that at least one run cited in the period."
+    )
+    chunks_ingested = serializers.IntegerField(
+        read_only=True,
+        help_text=(
+            "Chunks written in the period. Content that a refresh finds changed is chunked again and counts again."
+        ),
+    )
+    query_count = serializers.IntegerField(
+        read_only=True, help_text="Knowledge searches made in the period, from every surface."
+    )
+    chunks_by_surface = SurfaceUsageSerializer(
+        many=True, read_only=True, help_text="Chunks written in the period by source type, largest first."
+    )
+    queries_by_surface = SurfaceUsageSerializer(
+        many=True, read_only=True, help_text="Searches in the period by where they came from, largest first."
+    )
+    daily = DailyUsageSerializer(many=True, read_only=True, help_text="One entry per day, oldest first.")
+    top_sources = SourceUsageSerializer(
+        many=True, read_only=True, help_text="The most cited sources in the period, most cited first."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Knowledge gap suggestions
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeGapSuggestionSerializer(serializers.Serializer):
+    id = serializers.UUIDField(read_only=True, help_text="Unique identifier for this gap suggestion.")
+    ticket_id = serializers.UUIDField(read_only=True, help_text="The ticket that surfaced this gap.")
+    topic = serializers.CharField(read_only=True, help_text="Raw topic the AI couldn't answer.")
+    normalized_topic = serializers.CharField(read_only=True, help_text="Normalized cluster key for grouping.")
+    ticket_type = serializers.CharField(read_only=True, help_text="Ticket classification type.")
+    outcome = serializers.CharField(read_only=True, help_text="Pipeline outcome that produced this gap.")
+    status = serializers.CharField(read_only=True, help_text="Current status: pending, accepted, or dismissed.")
+    resolved_source_id = serializers.UUIDField(
+        read_only=True, allow_null=True, help_text="Knowledge source created to fill this gap."
+    )
+    created_at = serializers.DateTimeField(read_only=True, help_text="When this gap was first recorded.")
+
+
+class AggregatedGapSerializer(serializers.Serializer):
+    normalized_topic = serializers.CharField(read_only=True, help_text="Normalized cluster key.")
+    topic = serializers.CharField(read_only=True, help_text="Representative raw topic string.")
+    ticket_count = serializers.IntegerField(read_only=True, help_text="Number of distinct tickets with this gap.")
+
+
+class GapActionSerializer(serializers.Serializer):
+    resolved_source_id = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        help_text="Optional knowledge source to link when accepting.",
+    )
+
+
+class GapTopicActionSerializer(serializers.Serializer):
+    normalized_topic = serializers.CharField(
+        required=True,
+        help_text="The normalized topic key identifying the gap cluster to act on.",
+    )
+    resolved_source_id = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        help_text="Optional knowledge source to link when accepting.",
+    )
+
+
+class GapTopicActionResultSerializer(serializers.Serializer):
+    normalized_topic = serializers.CharField(
+        read_only=True, help_text="The normalized topic cluster that was acted on."
+    )
+    updated = serializers.IntegerField(read_only=True, help_text="Number of gap rows whose status changed.")
+
+
+# ---------------------------------------------------------------------------
+# Learning settings
+# ---------------------------------------------------------------------------
+
+
+class LearningBackfillProgressSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(
+        choices=LearningBackfillStatus.choices,
+        help_text="`running` while PostHog reads past tickets. `completed` once every ticket in the window is read.",
+    )
+    started_at = serializers.DateTimeField(help_text="When someone started learning from past tickets.")
+    finished_at = serializers.DateTimeField(
+        allow_null=True, help_text="When every past ticket was read. Null while the run continues."
+    )
+    tickets_read = serializers.IntegerField(
+        help_text="Tickets analyzed since the run started, including tickets from the regular 7-day pass."
+    )
+    tickets_in_progress = serializers.IntegerField(help_text="Tickets that are being analyzed now.")
+    knowledge_created = serializers.IntegerField(
+        help_text="Analyzed tickets that added a learned source to business knowledge."
+    )
+
+
+@extend_schema_serializer(component_name="BusinessKnowledgeSettings")
+class BusinessKnowledgeSettingsSerializer(serializers.Serializer):
+    learn_from_support_enabled = serializers.BooleanField(
+        help_text=(
+            "When true, PostHog learns reusable knowledge from public human replies on resolved "
+            "support tickets. Requires Support to be enabled for this environment."
+        ),
+    )
+    support_enabled = serializers.BooleanField(
+        read_only=True,
+        help_text="Whether Support is enabled for this environment. Learning cannot be turned on while this is false.",
+    )
+    learning_backfill = LearningBackfillProgressSerializer(
+        read_only=True,
+        allow_null=True,
+        help_text="The last run of learning from past tickets. Null when none ran since learning was turned on.",
+    )
+
+
+class BusinessKnowledgeSettingsUpdateSerializer(serializers.Serializer):
+    learn_from_support_enabled = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "When true, PostHog learns reusable knowledge from public human replies on resolved "
+            "support tickets. Rejected when Support is off for this environment."
+        ),
+    )
+
+    def validate_learn_from_support_enabled(self, value: bool) -> bool:
+        if value and not bool(getattr(self.context.get("team"), "conversations_enabled", False)):
+            raise serializers.ValidationError("Turn on Support to learn from resolved tickets.")
+        return value
+
+
+class SandboxQuestionSerializer(serializers.Serializer):
+    question = serializers.CharField(
+        max_length=4_000,
+        allow_blank=False,
+        trim_whitespace=True,
+        help_text="Question to answer from this project's business knowledge. Blank questions are rejected. Maximum 4000 characters.",
+    )
+
+
+class SandboxRunStartedSerializer(serializers.Serializer):
+    task_id = serializers.UUIDField(help_text="Sandbox task id. Poll this id until the run finishes.")
+    run_id = serializers.UUIDField(help_text="Run id for this question.")
+
+
+class SandboxSourceSerializer(serializers.Serializer):
+    ref = serializers.CharField(help_text="Source reference the reply relies on.")
+    excerpt = serializers.CharField(help_text="Short excerpt that supports the reply.")
+
+
+class SandboxSearchSerializer(serializers.Serializer):
+    tool = serializers.ChoiceField(
+        choices=SandboxToolName.choices,
+        help_text="Business knowledge tool the agent called.",
+    )
+    input = serializers.CharField(help_text="Tool input the agent sent.")
+
+
+class SandboxRunSerializer(serializers.Serializer):
+    task_id = serializers.UUIDField(help_text="Sandbox task id.")
+    run_id = serializers.UUIDField(help_text="Latest run id for this task.")
+    status = serializers.ChoiceField(
+        choices=SandboxPollStatus.choices,
+        help_text="running while the agent works. completed carries reply and sources. failed and cancelled carry error.",
+    )
+    reply = serializers.CharField(
+        allow_null=True,
+        help_text="Answer text when status is completed. Null otherwise.",
+    )
+    sources = SandboxSourceSerializer(
+        many=True,
+        help_text="Sources cited in a completed answer. Empty when the run has not completed.",
+    )
+    searches = SandboxSearchSerializer(
+        many=True,
+        help_text="Business knowledge search and window calls observed in the run log.",
+    )
+    error = serializers.CharField(
+        allow_null=True,
+        help_text="Why the run did not produce an answer. Null while running and on a completed answer.",
+    )
+    docs_search_called = serializers.BooleanField(
+        help_text="True when the run log contains an exact docs-search call. That tool is not granted to this sandbox.",
+    )
+
+
+class PlaygroundChatListSerializer(serializers.Serializer):
+    id = serializers.UUIDField(help_text="Playground chat id.")
+    title = serializers.CharField(
+        help_text="First question, truncated. Empty until someone asks.",
+    )
+    created_at = serializers.DateTimeField(help_text="When this chat was created.")
+    updated_at = serializers.DateTimeField(help_text="When this chat was last asked in.")
+    has_open_turn = serializers.BooleanField(
+        help_text="True while an answer in this chat is still running. Another question in this chat returns 409 until it finishes.",
+    )
+
+
+class PlaygroundTurnSerializer(serializers.Serializer):
+    id = serializers.UUIDField(help_text="Turn id.")
+    question = serializers.CharField(help_text="Question that started this turn's sandbox run.")
+    task_id = serializers.UUIDField(help_text="Sandbox task id for this turn.")
+    position = serializers.IntegerField(help_text="Order of this turn in the chat, starting at 0.")
+    run = SandboxRunSerializer(
+        allow_null=True,
+        help_text="Current sandbox run for this turn. Null when the run cannot be loaded.",
+    )
+    error = serializers.CharField(
+        allow_null=True,
+        help_text="Why this turn could not be loaded. Null when run is present.",
+    )
+
+
+class PlaygroundChatSerializer(PlaygroundChatListSerializer):
+    turns = PlaygroundTurnSerializer(
+        many=True,
+        help_text="Questions in this chat, oldest first. Each turn's answer comes from its sandbox run.",
+    )

@@ -1,0 +1,1165 @@
+import { combineUrl, router } from 'kea-router'
+import { expectLogic } from 'kea-test-utils'
+import posthog from 'posthog-js'
+
+import api from 'lib/api'
+import { ApiError } from 'lib/api-error'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { featureFlagLogic as enabledFeaturesLogic } from 'lib/logic/featureFlagLogic'
+import { showApprovalRequiredToast } from 'scenes/approvals/ApprovalRequiredBanner'
+import { NEW_FLAG } from 'scenes/feature-flags/featureFlagLogic'
+import {
+    FeatureFlagsFilters,
+    FeatureFlagsTab,
+    carriedListFilterParams,
+    featureFlagUrlFromList,
+    featureFlagsListFilterParams,
+    featureFlagsLogic,
+    flagMatchesFilters,
+    flagMatchesSearch,
+    listFilterParamsFromCarried,
+    flagMatchesStatus,
+    flagMatchesType,
+} from 'scenes/feature-flags/featureFlagsLogic'
+import { urls } from 'scenes/urls'
+
+import { resumeKeaLoadersErrors, silenceKeaLoadersErrors } from '~/initKea'
+import { deleteFromTree, refreshTreeItem } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+import { FeatureFlagType } from '~/types'
+
+jest.mock('scenes/approvals/ApprovalRequiredBanner', () => ({
+    showApprovalRequiredToast: jest.fn(),
+}))
+jest.mock('posthog-js')
+jest.mock('~/layout/panel-layout/ProjectTree/projectTreeLogic', () => ({
+    ...jest.requireActual('~/layout/panel-layout/ProjectTree/projectTreeLogic'),
+    deleteFromTree: jest.fn(),
+    refreshTreeItem: jest.fn(),
+}))
+
+function capturesOf(event: string): any[][] {
+    return (posthog.capture as jest.Mock).mock.calls.filter(([name]) => name === event)
+}
+
+describe('flagMatchesSearch', () => {
+    const flag = { ...NEW_FLAG, id: 1, key: 'my-feature', name: 'My Feature Flag' } as FeatureFlagType
+
+    it.each<[string | undefined, boolean]>([
+        [undefined, true],
+        ['my', true],
+        ['MY-FEATURE', true],
+        ['flag', true],
+        ['nonexistent', false],
+    ])('search=%p → %p', (search, expected) => {
+        expect(flagMatchesSearch(flag, search)).toBe(expected)
+    })
+
+    describe('regex-based search', () => {
+        const webAnalyticsFlag = {
+            ...NEW_FLAG,
+            id: 2,
+            key: 'web-analytics',
+            name: 'Web Analytics Feature',
+        } as FeatureFlagType
+        const webUnderscoreFlag = { ...NEW_FLAG, id: 3, key: 'web_dashboard', name: 'Test Flag' } as FeatureFlagType
+        const webSpaceFlag = { ...NEW_FLAG, id: 4, key: 'web analytics', name: 'Space Flag' } as FeatureFlagType
+        const flagWithExperiment = {
+            ...NEW_FLAG,
+            id: 5,
+            key: 'experiment-flag',
+            name: 'Experiment Flag',
+            experiment_set: [1],
+            experiment_set_metadata: [{ id: 1, name: 'My Experiment Test', is_running: false }],
+        } as FeatureFlagType
+
+        it.each<[FeatureFlagType, string, boolean]>([
+            // Regex pattern searches - spaces match any separator
+            [webAnalyticsFlag, 'web ana', true], // "web ana" matches "web-analytics"
+            [webUnderscoreFlag, 'web dash', true], // "web dash" matches "web_dashboard"
+            [webSpaceFlag, 'web ana', true], // "web ana" matches "web analytics"
+            [webAnalyticsFlag, 'web analytics', true], // Should match name
+            [webAnalyticsFlag, 'WEB_ANALYTICS', true], // Pasted code constant matches hyphenated key
+            [webUnderscoreFlag, 'web-dashboard', true],
+            [webAnalyticsFlag, 'web_-analytics', true], // Mixed separator runs collapse
+
+            // Experiment name searches
+            [flagWithExperiment, 'experiment test', true], // Should match experiment name
+            [flagWithExperiment, 'my experiment', true], // Should match experiment name
+            [flagWithExperiment, 'experiment', true], // Should match flag name
+
+            // Searches that shouldn't match
+            [webAnalyticsFlag, 'web mobile', false], // "mobile" not in "web-analytics"
+            [webUnderscoreFlag, 'web mobile', false], // "mobile" not in flag
+            [flagWithExperiment, 'mobile test', false], // "mobile" not in flag or experiment
+            [webAnalyticsFlag, 'WEB_MOBILE', false],
+            [webAnalyticsFlag, '_', false], // Separator-only query matches literally, not every flag
+            [webUnderscoreFlag, '_', true],
+            [webAnalyticsFlag, 'ana_', false], // A trailing separator stays required
+            [webAnalyticsFlag, '_lytics', false], // A leading separator stays required
+            [webUnderscoreFlag, '-dashboard', true],
+
+            // Single word searches (existing behavior)
+            [webAnalyticsFlag, 'web', true],
+            [webAnalyticsFlag, 'analytics', true],
+            [webAnalyticsFlag, 'mobile', false],
+            [flagWithExperiment, 'experiment', true],
+
+            // Test trimming
+            [webAnalyticsFlag, 'web ', true], // Trailing space should be trimmed
+            [webAnalyticsFlag, ' web', true], // Leading space should be trimmed
+            [webAnalyticsFlag, '  web  ', true], // Multiple spaces should be trimmed
+        ])('flag=%p search=%p → %p', (testFlag, search, expected) => {
+            expect(flagMatchesSearch(testFlag, search)).toBe(expected)
+        })
+
+        it('handles null experiment names safely', () => {
+            const flagWithNullExperimentName = {
+                ...NEW_FLAG,
+                id: 5,
+                key: 'null-test-flag',
+                name: 'Flag with Null Test',
+                experiment_set: [2],
+                experiment_set_metadata: [{ id: 2, name: null as any, is_running: false }],
+            } as FeatureFlagType
+
+            // Should not throw error and should still match by flag name
+            expect(flagMatchesSearch(flagWithNullExperimentName, 'flag')).toBe(true)
+            // Should not match by experiment name since it's null
+            expect(flagMatchesSearch(flagWithNullExperimentName, 'experiment')).toBe(false)
+            // Should not throw when searching for something that would only match the null experiment name
+            expect(flagMatchesSearch(flagWithNullExperimentName, 'nonexistent')).toBe(false)
+        })
+
+        it('handles regex metacharacters safely', () => {
+            const testFlag = { ...NEW_FLAG, id: 6, key: 'test[flag]', name: 'Test (Flag)' } as FeatureFlagType
+
+            // Should not throw error and should match using escaped regex
+            expect(() => flagMatchesSearch(testFlag, '[flag]')).not.toThrow()
+            expect(() => flagMatchesSearch(testFlag, '(Flag)')).not.toThrow()
+            expect(() => flagMatchesSearch(testFlag, '*invalid')).not.toThrow()
+            expect(() => flagMatchesSearch(testFlag, '?invalid')).not.toThrow()
+
+            // Should match literal characters
+            expect(flagMatchesSearch(testFlag, '[flag]')).toBe(true)
+            expect(flagMatchesSearch(testFlag, '(Flag)')).toBe(true)
+        })
+    })
+})
+
+describe('flagMatchesStatus', () => {
+    it.each<[boolean, FeatureFlagType['status'], string | undefined, boolean]>([
+        [true, 'ACTIVE', undefined, true],
+        [true, 'ACTIVE', 'true', true],
+        [true, 'ACTIVE', 'false', false],
+        [false, 'ACTIVE', 'false', true],
+        [true, 'STALE', 'STALE', true],
+        [true, 'ACTIVE', 'STALE', true],
+        [false, 'ACTIVE', 'STALE', false],
+    ])('active=%p status=%p filter=%p → %p', (active, status, filter, expected) => {
+        const flag = { ...NEW_FLAG, id: 1, key: 'test', active, status } as FeatureFlagType
+        expect(flagMatchesStatus(flag, filter)).toBe(expected)
+    })
+})
+
+describe('flagMatchesType', () => {
+    const flags = {
+        boolean: { ...NEW_FLAG, id: 1, key: 'bool', filters: { groups: [] } } as FeatureFlagType,
+        multivariant: {
+            ...NEW_FLAG,
+            id: 2,
+            key: 'multi',
+            filters: { groups: [], multivariate: { variants: [{ key: 'a', rollout_percentage: 100 }] } },
+        } as FeatureFlagType,
+        experiment: { ...NEW_FLAG, id: 3, key: 'exp', experiment_set: [1] } as FeatureFlagType,
+        remote_config: { ...NEW_FLAG, id: 4, key: 'remote', is_remote_configuration: true } as FeatureFlagType,
+    }
+
+    it.each<[keyof typeof flags, string | undefined, boolean]>([
+        ['boolean', undefined, true],
+        ['boolean', 'boolean', true],
+        ['boolean', 'multivariant', false],
+        ['multivariant', 'multivariant', true],
+        ['experiment', 'experiment', true],
+        ['remote_config', 'remote_config', true],
+    ])('%s with type=%p → %p', (flagKey, type, expected) => {
+        expect(flagMatchesType(flags[flagKey], type)).toBe(expected)
+    })
+})
+
+describe('flagMatchesFilters', () => {
+    const base = { ...NEW_FLAG, id: 1, key: 'test', active: true } as FeatureFlagType
+
+    describe('archived filter', () => {
+        const liveFlag = { ...base, archived: false } as FeatureFlagType
+        const archivedFlag = { ...base, archived: true } as FeatureFlagType
+
+        it.each<[string, FeatureFlagType, Partial<FeatureFlagsFilters>, boolean]>([
+            ['hides archived by default', archivedFlag, {}, false],
+            ['shows live flags by default', liveFlag, {}, true],
+            ['shows archived when archived=true', archivedFlag, { archived: 'true' }, true],
+            ['hides live when archived=true', liveFlag, { archived: 'true' }, false],
+        ])('%s', (_label, flag, filters, expected) => {
+            expect(flagMatchesFilters(flag, filters as FeatureFlagsFilters)).toBe(expected)
+        })
+    })
+
+    describe('deleted filter', () => {
+        const liveFlag = { ...base, deleted: false } as FeatureFlagType
+        const deletedFlag = { ...base, deleted: true } as FeatureFlagType
+        const archivedDeletedFlag = { ...base, deleted: true, archived: true } as FeatureFlagType
+
+        it.each<[string, FeatureFlagType, Partial<FeatureFlagsFilters>, boolean]>([
+            ['hides deleted by default', deletedFlag, {}, false],
+            ['shows deleted when deleted=true', deletedFlag, { deleted: 'true' }, true],
+            ['hides live when deleted=true', liveFlag, { deleted: 'true' }, false],
+            ['shows a flag archived before its delete', archivedDeletedFlag, { deleted: 'true' }, true],
+            ['hides a deleted flag under archived=true', archivedDeletedFlag, { archived: 'true' }, false],
+        ])('%s', (_label, flag, filters, expected) => {
+            expect(flagMatchesFilters(flag, filters as FeatureFlagsFilters)).toBe(expected)
+        })
+    })
+
+    describe('excluded_tags filter', () => {
+        const flagWithTag = { ...base, archived: false, tags: ['beta', 'internal'] } as FeatureFlagType
+        const flagWithoutTag = { ...base, archived: false, tags: ['beta'] } as FeatureFlagType
+
+        it.each<[string, FeatureFlagType, Partial<FeatureFlagsFilters>, boolean]>([
+            ['excludes a flag whose tag matches excluded_tags', flagWithTag, { excluded_tags: ['internal'] }, false],
+            [
+                'keeps a flag whose tags do not match excluded_tags',
+                flagWithoutTag,
+                { excluded_tags: ['internal'] },
+                true,
+            ],
+            ['keeps a flag when excluded_tags is empty', flagWithTag, { excluded_tags: [] }, true],
+            [
+                'keeps an untagged flag when excluded_tags is set',
+                // Deliberately undefined tags to exercise the optional-chaining guard in flagMatchesFilters.
+                { ...base, tags: undefined } as unknown as FeatureFlagType,
+                { excluded_tags: ['internal'] },
+                true,
+            ],
+            [
+                'excluded_tags wins over tags when both match',
+                flagWithTag,
+                { tags: ['beta'], excluded_tags: ['beta'] },
+                false,
+            ],
+        ])('%s', (_label, flag, filters, expected) => {
+            expect(flagMatchesFilters(flag, filters as FeatureFlagsFilters)).toBe(expected)
+        })
+    })
+
+    describe('creator filter', () => {
+        const flagByUser = (id: number | null): FeatureFlagType =>
+            ({
+                ...base,
+                archived: false,
+                created_by: id == null ? null : ({ id } as FeatureFlagType['created_by']),
+            }) as FeatureFlagType
+
+        it.each<[string, number | null, number[] | undefined, boolean]>([
+            ['no filter set matches any flag', 7, undefined, true],
+            ['no filter set matches a creatorless flag', null, undefined, true],
+            ['no filter set matches a creatorless flag with empty list', null, [], true],
+            ['author in the list matches', 7, [7], true],
+            ['author in a multi-id list matches', 7, [3, 7], true],
+            ['author absent from the list does not match', 7, [3, 5], false],
+            ['creatorless flag is excluded once a filter is set', null, [7], false],
+        ])('%s', (_name, createdById, createdByIdFilter, expected) => {
+            expect(flagMatchesFilters(flagByUser(createdById), { created_by_id: createdByIdFilter })).toBe(expected)
+        })
+    })
+})
+
+describe('the feature flags logic', () => {
+    let logic: ReturnType<typeof featureFlagsLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/projects/:team_id/feature_flags/': () => [200, { results: [], count: 0 }],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagsLogic()
+        logic.mount()
+    })
+
+    it('starts with active tab as "overview"', async () => {
+        await expectLogic(logic).toMatchValues({ activeTab: FeatureFlagsTab.OVERVIEW })
+    })
+
+    it('can set tab to "history"', async () => {
+        await expectLogic(logic, () => {
+            logic.actions.setActiveTab(FeatureFlagsTab.HISTORY)
+        }).toMatchValues({ activeTab: FeatureFlagsTab.HISTORY })
+        expect(router.values.searchParams['tab']).toEqual('history')
+    })
+
+    it('can set tab back to "overview"', async () => {
+        await expectLogic(logic, () => {
+            logic.actions.setActiveTab(FeatureFlagsTab.HISTORY)
+            logic.actions.setActiveTab(FeatureFlagsTab.OVERVIEW)
+        }).toMatchValues({ activeTab: FeatureFlagsTab.OVERVIEW })
+        expect(router.values.searchParams['tab']).toEqual('overview')
+    })
+
+    it('ignores unexpected tab keys', async () => {
+        await expectLogic(logic, () => {
+            logic.actions.setActiveTab(FeatureFlagsTab.HISTORY)
+            logic.actions.setActiveTab('tomato' as FeatureFlagsTab)
+        }).toMatchValues({
+            activeTab: FeatureFlagsTab.HISTORY,
+        })
+        expect(router.values.searchParams['tab']).toEqual('history')
+    })
+
+    it('sets the tab from the URL', async () => {
+        await expectLogic(logic, () => {
+            logic.actions.setActiveTab(FeatureFlagsTab.OVERVIEW)
+            router.actions.push(urls.featureFlags(), { tab: 'history' })
+        }).toMatchValues({
+            activeTab: FeatureFlagsTab.HISTORY,
+        })
+    })
+
+    describe('hasActiveFilters', () => {
+        it('is false on a bare URL where page resolves to undefined', async () => {
+            // urlToAction spreads `page: undefined` over DEFAULT_FILTERS (page: 1), so a full-object
+            // comparison would wrongly flag the default view as filtered and offer "Clear filters".
+            await expectLogic(logic, () => {
+                router.actions.push(urls.featureFlags())
+            }).toFinishAllListeners()
+
+            expect(logic.values.filters.page).toBeUndefined()
+            expect(logic.values.hasActiveFilters).toBe(false)
+            expect(logic.values.shouldShowEmptyState).toBe(true)
+        })
+
+        it.each<[string, Partial<FeatureFlagsFilters>]>([
+            ['a sort order', { order: '-created_at' }],
+            ['whitespace-only search', { search: '   ' }],
+        ])('is false when only %s is set', async (_, filters) => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagsFilters(filters)
+            }).toFinishAllListeners()
+
+            expect(logic.values.hasActiveFilters).toBe(false)
+        })
+
+        it.each<[string, Partial<FeatureFlagsFilters>]>([
+            ['search', { search: 'checkout' }],
+            ['tags', { tags: ['checkout'] }],
+        ])('is true when %s is set', async (_, filters) => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagsFilters(filters)
+            }).toFinishAllListeners()
+
+            expect(logic.values.hasActiveFilters).toBe(true)
+        })
+
+        it('clears active filters without changing the sort order', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagsFilters({ search: 'checkout', order: '-created_at' })
+            }).toFinishAllListeners()
+
+            await expectLogic(logic, () => {
+                logic.actions.resetFilters()
+            }).toFinishAllListeners()
+
+            expect(logic.values.filters.search).toBeUndefined()
+            expect(logic.values.filters.order).toBe('-created_at')
+            expect(logic.values.hasActiveFilters).toBe(false)
+        })
+    })
+
+    describe('carrying list filters through a flag detail page (featureFlagsListFilterParams)', () => {
+        it('returns no params while the filters are at their defaults', () => {
+            // Both default shapes: page 1 after mount, page undefined after a bare-URL visit
+            expect(featureFlagsListFilterParams(logic.values.filters)).toEqual({})
+            expect(featureFlagsListFilterParams({ page: undefined })).toEqual({})
+        })
+
+        it('keeps filter params, drops page 1, and ignores non-filter params', () => {
+            expect(
+                featureFlagsListFilterParams({
+                    search: 'checkout',
+                    created_by_id: '[42]',
+                    page: '1',
+                    tab: 'overview',
+                    edit: 'true',
+                })
+            ).toEqual({ search: 'checkout', created_by_id: '[42]' })
+            expect(featureFlagsListFilterParams({ page: 3 })).toEqual({ page: 3 })
+        })
+
+        it('carries filters on the flag URL under the list_ prefix, clear of detail-page params', () => {
+            const url = featureFlagUrlFromList(1, { search: 'checkout', page: 3 }, { edit: true })
+            expect(url).toContain('list_search=checkout')
+            expect(url).toContain('list_page=3')
+            expect(url).toContain('edit=true')
+            // The flag page's own params stay unshadowed: History pagination reads bare `page`
+            expect(url).not.toMatch(/[?&]page=/)
+            expect(url).not.toMatch(/[?&]search=/)
+        })
+
+        it('round-trips carried params back into list filter params', () => {
+            const flagPageParams = { list_search: 'checkout', list_page: '3', tab: 'history', page: '2' }
+            expect(carriedListFilterParams(flagPageParams)).toEqual({ list_search: 'checkout', list_page: '3' })
+            expect(listFilterParamsFromCarried(flagPageParams)).toEqual({ search: 'checkout', page: '3' })
+        })
+
+        it('restores search, creator, sort, and deleted filters when the crumb hands them back', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagsFilters({
+                    search: 'checkout',
+                    created_by_id: [42],
+                    order: '-created_at',
+                    deleted: 'true',
+                })
+            }).toFinishAllListeners()
+
+            // Opening a flag carries the filters on the detail URL. The same helper builds the
+            // key link, View, and Edit URLs in FeatureFlags.tsx, so this covers all three.
+            const detailUrl = featureFlagUrlFromList(1, logic.values.filters)
+            await expectLogic(logic, () => {
+                router.actions.push(detailUrl)
+            }).toFinishAllListeners()
+
+            // The scene swap remounts the list logic, so its in-memory filters reset
+            logic.unmount()
+            logic = featureFlagsLogic()
+            logic.mount()
+            expect(logic.values.filters.search).toBeUndefined()
+
+            // The detail scene's list crumb rebuilds the list URL from the carried params
+            const crumbUrl = combineUrl(
+                urls.featureFlags(),
+                listFilterParamsFromCarried(router.values.searchParams)
+            ).url
+            await expectLogic(logic, () => {
+                router.actions.push(crumbUrl)
+            }).toFinishAllListeners()
+
+            expect(logic.values.filters.search).toBe('checkout')
+            expect(logic.values.filters.created_by_id).toEqual([42])
+            expect(logic.values.filters.order).toBe('-created_at')
+            expect(logic.values.filters.deleted).toBe('true')
+        })
+
+        it('resets to defaults when the bare list URL is visited directly', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagsFilters({ search: 'checkout', created_by_id: [42] })
+            }).toFinishAllListeners()
+
+            await expectLogic(logic, () => {
+                router.actions.push(urls.featureFlags())
+            }).toFinishAllListeners()
+
+            expect(logic.values.filters.search).toBeUndefined()
+            expect(logic.values.filters.created_by_id).toBeUndefined()
+            expect(logic.values.hasActiveFilters).toBe(false)
+        })
+
+        it('lets explicit URL params win over in-memory filters', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagsFilters({ search: 'checkout' })
+            }).toFinishAllListeners()
+
+            await expectLogic(logic, () => {
+                router.actions.push(urls.featureFlags(), { search: 'onboarding' })
+            }).toFinishAllListeners()
+
+            expect(logic.values.filters.search).toBe('onboarding')
+        })
+    })
+
+    it('redirects a disabled usage deep link to overview after flags load', async () => {
+        enabledFeaturesLogic.actions.setFeatureFlags([], {})
+
+        await expectLogic(logic, () => {
+            router.actions.push(urls.featureFlags(), { tab: FeatureFlagsTab.USAGE })
+        }).toMatchValues({ activeTab: FeatureFlagsTab.OVERVIEW })
+        expect(router.values.searchParams['tab']).toEqual('overview')
+    })
+
+    it('redirects from usage when the rollout flag is disabled', async () => {
+        router.actions.push(urls.featureFlags())
+        enabledFeaturesLogic.actions.setFeatureFlags([FEATURE_FLAGS.FEATURE_FLAG_REQUEST_USAGE], {
+            [FEATURE_FLAGS.FEATURE_FLAG_REQUEST_USAGE]: true,
+        })
+        logic.actions.setActiveTab(FeatureFlagsTab.USAGE)
+
+        await expectLogic(logic, () => {
+            enabledFeaturesLogic.actions.setFeatureFlags([], {})
+        }).toMatchValues({ activeTab: FeatureFlagsTab.OVERVIEW })
+        expect(router.values.searchParams['tab']).toEqual('overview')
+    })
+
+    it('stays on usage when the rollout flag is enabled', async () => {
+        const flags = {
+            [FEATURE_FLAGS.FEATURE_FLAG_REQUEST_USAGE]: true,
+        }
+        enabledFeaturesLogic.actions.setFeatureFlags([FEATURE_FLAGS.FEATURE_FLAG_REQUEST_USAGE], flags)
+
+        await expectLogic(logic, () => {
+            router.actions.push(urls.featureFlags(), { tab: FeatureFlagsTab.USAGE })
+        }).toMatchValues({ activeTab: FeatureFlagsTab.USAGE })
+
+        await expectLogic(logic, () => {
+            enabledFeaturesLogic.actions.setFeatureFlags([FEATURE_FLAGS.FEATURE_FLAG_REQUEST_USAGE], flags)
+        }).toMatchValues({ activeTab: FeatureFlagsTab.USAGE })
+        expect(router.values.searchParams['tab']).toEqual('usage')
+    })
+
+    it('does not rewrite another scene URL when the rollout flag is disabled', async () => {
+        enabledFeaturesLogic.actions.setFeatureFlags([FEATURE_FLAGS.FEATURE_FLAG_REQUEST_USAGE], {
+            [FEATURE_FLAGS.FEATURE_FLAG_REQUEST_USAGE]: true,
+        })
+        logic.actions.setActiveTab(FeatureFlagsTab.USAGE)
+        router.actions.push('/project/997/experiments/1')
+
+        enabledFeaturesLogic.actions.setFeatureFlags([], {})
+
+        expect(router.values.location.pathname).toEqual('/project/997/experiments/1')
+    })
+
+    describe('list request timing', () => {
+        let listGet: jest.SpyInstance
+
+        const listRequests = (): string[] =>
+            listGet.mock.calls.map(([url]) => String(url)).filter((url) => url.includes('/feature_flags/?'))
+
+        beforeEach(() => {
+            logic.unmount()
+            jest.useFakeTimers()
+            listGet = jest.spyOn(api, 'get').mockResolvedValue({ results: [], count: 0 })
+        })
+
+        afterEach(() => {
+            listGet.mockRestore()
+            jest.useRealTimers()
+        })
+
+        it.each<[string, Record<string, string>]>([
+            ['a bare URL', {}],
+            ['a search in the URL', { search: 'checkout' }],
+            ['a status filter in the URL', { active: 'true' }],
+        ])('sends one list request at once when the page opens on %s', async (_, searchParams) => {
+            router.actions.push(urls.featureFlags(), searchParams)
+            logic = featureFlagsLogic()
+            logic.mount()
+
+            expect(listRequests()).toHaveLength(1)
+
+            await jest.advanceTimersByTimeAsync(1000)
+            expect(listRequests()).toHaveLength(1)
+        })
+
+        it('waits for typing in the search box to pause, then sends one request', async () => {
+            logic = featureFlagsLogic()
+            logic.mount()
+            await jest.advanceTimersByTimeAsync(1000)
+            listGet.mockClear()
+
+            logic.actions.setFeatureFlagsFilters({ search: 'chec', page: 1 })
+            await jest.advanceTimersByTimeAsync(100)
+            logic.actions.setFeatureFlagsFilters({ search: 'checkout', page: 1 })
+            await jest.advanceTimersByTimeAsync(299)
+            expect(listRequests()).toHaveLength(0)
+
+            await jest.advanceTimersByTimeAsync(1)
+            expect(listRequests()).toEqual([expect.stringContaining('search=checkout')])
+        })
+
+        it('sends one request with the destination filters when the URL moves from another tab to the overview', async () => {
+            router.actions.push(urls.featureFlags(), { tab: 'history' })
+            logic = featureFlagsLogic()
+            logic.mount()
+            await jest.advanceTimersByTimeAsync(1000)
+            listGet.mockClear()
+
+            router.actions.push(urls.featureFlags(), { tab: 'overview', search: 'checkout' })
+            await jest.advanceTimersByTimeAsync(1000)
+
+            expect(listRequests()).toEqual([expect.stringContaining('search=checkout')])
+        })
+    })
+
+    describe('activity deep-link', () => {
+        it('preserves the activity deep-link param when staying on the history tab', async () => {
+            router.actions.push(urls.featureFlags(), { tab: 'history', activity: 'some-uuid' })
+            await expectLogic(logic, () => {
+                logic.actions.setActiveTab(FeatureFlagsTab.HISTORY)
+            })
+            expect(router.values.searchParams['activity']).toEqual('some-uuid')
+        })
+
+        it('drops the activity deep-link param when switching away from the history tab', async () => {
+            router.actions.push(urls.featureFlags(), { tab: 'history', activity: 'some-uuid' })
+            await expectLogic(logic, () => {
+                logic.actions.setActiveTab(FeatureFlagsTab.OVERVIEW)
+            })
+            expect(router.values.searchParams['activity']).toBeUndefined()
+        })
+    })
+})
+
+describe('updateFeatureFlag 409 handling', () => {
+    let logic: ReturnType<typeof featureFlagsLogic.build>
+
+    // Every test here rejects updateFeatureFlag on purpose; kea-loaders would log each failure
+    beforeEach(silenceKeaLoadersErrors)
+    afterEach(resumeKeaLoadersErrors)
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/projects/:projectId/feature_flags/': () => [
+                    200,
+                    {
+                        results: [{ id: 1, key: 'test-flag', active: false }],
+                        count: 1,
+                    },
+                ],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagsLogic()
+        logic.mount()
+    })
+
+    afterEach(() => {
+        logic?.unmount()
+        jest.restoreAllMocks()
+    })
+
+    it.each([
+        { active: true, expected: 'enable this feature flag' },
+        { active: false, expected: 'disable this feature flag' },
+    ])(
+        'shows approval toast with "$expected" when toggling active=$active gets a 409',
+        async ({ active, expected }) => {
+            const error = { status: 409, data: { change_request_id: 'cr-123', code: 'approval_required' } }
+            jest.spyOn(api, 'update').mockRejectedValueOnce(error)
+
+            logic.actions.updateFeatureFlag({ id: 1, payload: { active } })
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(showApprovalRequiredToast).toHaveBeenCalledWith('cr-123', expected, 'approval_required')
+            expect(posthog.captureException).not.toHaveBeenCalled()
+        }
+    )
+
+    it('does not show approval toast for non-409 errors', async () => {
+        const error = { status: 500, data: { detail: 'Internal server error' } }
+        jest.spyOn(api, 'update').mockRejectedValueOnce(error)
+
+        logic.actions.updateFeatureFlag({ id: 1, payload: { active: true } })
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(showApprovalRequiredToast).not.toHaveBeenCalled()
+    })
+
+    it('does not show approval toast for 409 without change_request_id', async () => {
+        const error = { status: 409, data: { detail: 'Conflict' } }
+        jest.spyOn(api, 'update').mockRejectedValueOnce(error)
+
+        logic.actions.updateFeatureFlag({ id: 1, payload: { active: true } })
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(showApprovalRequiredToast).not.toHaveBeenCalled()
+        // A non-approval 409 stays visible to error tracking; only approval-shaped ones are suppressed
+        expect(posthog.captureException).toHaveBeenCalledWith(error)
+    })
+})
+
+describe('restoreFeatureFlag', () => {
+    let logic: ReturnType<typeof featureFlagsLogic.build>
+    let restoreBodies: unknown[]
+
+    beforeEach(() => {
+        restoreBodies = []
+        const deletedFlags = [
+            { id: 1, key: 'checkout-flag:deleted:1', deleted: true, active: true },
+            { id: 3, key: 'pricing-flag', deleted: true, active: true },
+        ]
+        const restoredIds: number[] = []
+        const restored = (flag: (typeof deletedFlags)[number]): Partial<FeatureFlagType> => ({
+            ...flag,
+            key: flag.key.replace(`:deleted:${flag.id}`, ''),
+            deleted: false,
+        })
+        useMocks({
+            get: {
+                // Answer like the API: a restored flag leaves the deleted view and joins the live one. The deleted
+                // view serves one row per page, so a restore leaves the next deleted flag on the server.
+                '/api/projects/:projectId/feature_flags/': ({ request }) => {
+                    if (new URL(request.url).searchParams.get('deleted') === 'true') {
+                        const stillDeleted = deletedFlags.filter((flag) => !restoredIds.includes(flag.id))
+                        return [200, { results: stillDeleted.slice(0, 1), count: stillDeleted.length }]
+                    }
+                    const live = [
+                        ...deletedFlags.filter((flag) => restoredIds.includes(flag.id)).map(restored),
+                        { id: 2, key: 'live-flag', deleted: false, active: true },
+                    ]
+                    return [200, { results: live, count: live.length }]
+                },
+            },
+            patch: {
+                '/api/projects/:projectId/feature_flags/:id': async ({ request, params }) => {
+                    restoreBodies.push(await request.json())
+                    const flag = deletedFlags.find(({ id }) => id === Number(params.id))!
+                    restoredIds.push(flag.id)
+                    return [200, restored(flag)]
+                },
+            },
+        })
+        initKeaTests()
+        logic = featureFlagsLogic()
+        logic.mount()
+    })
+
+    afterEach(() => {
+        logic?.unmount()
+        jest.restoreAllMocks()
+    })
+
+    beforeEach(silenceKeaLoadersErrors)
+    afterEach(resumeKeaLoadersErrors)
+
+    it('restores the flag, drops it from the deleted view, and refetches the page', async () => {
+        logic.actions.setFeatureFlagsFilters({ deleted: 'true' }, true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        expect(logic.values.displayedFlags.map((flag) => flag.id)).toEqual([1])
+        expect(logic.values.count).toBe(2)
+
+        logic.actions.restoreFeatureFlag({ id: 1 })
+        expect(logic.values.featureFlagsUpdating[1]).toBe(true)
+        await expectLogic(logic).toDispatchActions(['restoreFeatureFlagSuccess'])
+
+        expect(restoreBodies).toEqual([{ deleted: false }])
+        expect(logic.values.displayedFlags).toEqual([])
+        expect(logic.values.count).toBe(1)
+        expect(logic.values.featureFlagsUpdating[1]).toBeUndefined()
+        expect(deleteFromTree).toHaveBeenCalledWith('feature_flag', '1')
+        expect(refreshTreeItem).toHaveBeenCalledWith('feature_flag', '1')
+
+        // Without the refetch the page stays empty with a count of 1, and the flag that was on the next page
+        // can't be reached.
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlags', 'loadFeatureFlagsSuccess'])
+        expect(logic.values.displayedFlags.map((flag) => flag.id)).toEqual([3])
+        expect(logic.values.count).toBe(1)
+    })
+
+    it('lists the restored flag once the person leaves the deleted view', async () => {
+        logic.actions.setFeatureFlagsFilters({ deleted: 'true' }, true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        logic.actions.restoreFeatureFlag({ id: 1 })
+        await expectLogic(logic).toDispatchActions(['restoreFeatureFlagSuccess', 'loadFeatureFlagsSuccess'])
+
+        logic.actions.setFeatureFlagsFilters({ deleted: undefined }, true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+
+        expect(logic.values.displayedFlags.map((flag) => [flag.id, flag.key])).toEqual([
+            [1, 'checkout-flag'],
+            [2, 'live-flag'],
+        ])
+    })
+
+    // Regression guard: the restore used to take one off the count of whatever list was cached when it
+    // resolved, so leaving the deleted view mid-restore lowered the live list's total.
+    it('leaves a view loaded during the restore alone and refetches it', async () => {
+        logic.actions.setFeatureFlagsFilters({ deleted: 'true' }, true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        let finishRestore = (_flag: Partial<FeatureFlagType>): void => {}
+        jest.spyOn(api, 'update').mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    finishRestore = resolve
+                })
+        )
+
+        logic.actions.restoreFeatureFlag({ id: 1 })
+        logic.actions.setFeatureFlagsFilters({}, true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        expect(logic.values.count).toBe(1)
+
+        finishRestore({ id: 1, key: 'checkout-flag', deleted: false, active: true })
+        await expectLogic(logic).toDispatchActions(['restoreFeatureFlagSuccess'])
+
+        expect(logic.values.count).toBe(1)
+        expect(logic.values.displayedFlags.map((flag) => flag.id)).toEqual([2])
+        expect(logic.values.featureFlagsUpdating[1]).toBeUndefined()
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlags', 'loadFeatureFlagsSuccess'])
+    })
+
+    it.each([
+        // The global loader toast skips errors without a status, so the loader shows its own.
+        ['without an HTTP status', new TypeError('Failed to fetch'), true],
+        ['with an HTTP status', { status: 400, detail: 'This flag uses a deleted cohort.' }, false],
+    ])('handles a failed restore %s', async (_label, error, expectOwnToast) => {
+        const toastError = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+        logic.actions.setFeatureFlagsFilters({ deleted: 'true' }, true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        jest.spyOn(api, 'update').mockRejectedValueOnce(error)
+
+        logic.actions.restoreFeatureFlag({ id: 1 })
+        await expectLogic(logic).toDispatchActions(['restoreFeatureFlagFailure'])
+
+        expect(
+            toastError.mock.calls.some(([message]) => message === "Couldn't restore this feature flag. Try again.")
+        ).toBe(expectOwnToast)
+        expect(logic.values.featureFlagsUpdating[1]).toBeUndefined()
+        expect(logic.values.displayedFlags.map((flag) => flag.id)).toEqual([1])
+    })
+})
+
+describe('switching into and out of the deleted view', () => {
+    let logic: ReturnType<typeof featureFlagsLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/projects/:projectId/feature_flags/': ({ request }) =>
+                    new URL(request.url).searchParams.get('deleted') === 'true'
+                        ? [200, { results: [{ id: 1, key: 'old-flag:deleted:1', deleted: true }], count: 1 }]
+                        : [200, { results: [{ id: 2, key: 'live-flag', deleted: false, active: true }], count: 1 }],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagsLogic()
+        logic.mount()
+    })
+
+    afterEach(() => {
+        logic?.unmount()
+    })
+
+    // Regression guard: the table blocks row selection on this flag. Without it, live rows picked while the
+    // deleted view loads stay selected once it lands, and bulk actions then act on flags the view hides.
+    it('flags the switch until the new view lands', async () => {
+        logic.actions.setFeatureFlagsFilters({}, true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        expect(logic.values.switchingDeletedView).toBe(false)
+
+        logic.actions.setFeatureFlagsFilters({ deleted: 'true' }, true)
+        expect(logic.values.displayedFlags.map((flag) => flag.id)).toEqual([2])
+        expect(logic.values.switchingDeletedView).toBe(true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        expect(logic.values.displayedFlags.map((flag) => flag.id)).toEqual([1])
+        expect(logic.values.switchingDeletedView).toBe(false)
+
+        // A search inside the deleted view keeps showing deleted rows, so it isn't a switch.
+        logic.actions.setFeatureFlagsFilters({ search: 'old' })
+        expect(logic.values.switchingDeletedView).toBe(false)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+
+        logic.actions.setFeatureFlagsFilters({}, true)
+        expect(logic.values.switchingDeletedView).toBe(true)
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        expect(logic.values.switchingDeletedView).toBe(false)
+    })
+})
+
+describe('updateFeatureFlagArchived', () => {
+    let logic: ReturnType<typeof featureFlagsLogic.build>
+
+    // One test here rejects the archive request on purpose; kea-loaders would log the failure
+    beforeEach(silenceKeaLoadersErrors)
+    afterEach(resumeKeaLoadersErrors)
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/projects/:projectId/feature_flags/': () => [
+                    200,
+                    {
+                        results: [{ id: 1, key: 'test-flag', active: true }],
+                        count: 1,
+                    },
+                ],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagsLogic()
+        logic.mount()
+        ;(posthog.capture as jest.Mock).mockClear()
+    })
+
+    afterEach(() => {
+        logic?.unmount()
+        jest.restoreAllMocks()
+    })
+
+    it('captures "feature flag archived" only after the archive succeeds', async () => {
+        jest.spyOn(api, 'update').mockResolvedValueOnce({ id: 1, key: 'test-flag', archived: true, active: false })
+
+        logic.actions.updateFeatureFlagArchived({ id: 1, archived: true, via: 'archive-dialog' })
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(capturesOf('feature flag archived')).toEqual([['feature flag archived', { via: 'archive-dialog' }]])
+    })
+
+    it('does not capture "feature flag archived" when the archive request fails', async () => {
+        jest.spyOn(api, 'update').mockRejectedValueOnce({ status: 409, data: { detail: 'Conflict' } })
+
+        logic.actions.updateFeatureFlagArchived({ id: 1, archived: true, via: 'archive-dialog' })
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(capturesOf('feature flag archived')).toHaveLength(0)
+    })
+
+    it('marks the row as updating until the archive resolves', async () => {
+        jest.spyOn(api, 'update').mockResolvedValueOnce({ id: 1, key: 'test-flag', archived: true, active: false })
+
+        logic.actions.updateFeatureFlagArchived({ id: 1, archived: true, via: 'archive-dialog' })
+        expect(logic.values.featureFlagsUpdating[1]).toBe(true)
+
+        await expectLogic(logic).toFinishAllListeners()
+        expect(logic.values.featureFlagsUpdating[1]).toBeUndefined()
+    })
+
+    // The list arm of the disable-and-archive dialog: picking "Disable and archive" from the row
+    // toggle has to reach updateFeatureFlagArchived with the list's own via, not the archive dialog's.
+    it('archives via the disable confirmation when disable and archive is picked', async () => {
+        const openDialog = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+        jest.spyOn(api, 'update').mockResolvedValueOnce({ id: 1, key: 'test-flag', archived: true, active: false })
+
+        logic.actions.toggleFeatureFlagActive(1, false)
+        expect(openDialog.mock.calls[0][0].secondaryButton?.children).toBe('Disable and archive')
+
+        openDialog.mock.calls[0][0].secondaryButton?.onClick?.(undefined as any)
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(capturesOf('feature flag archived')).toEqual([
+            ['feature flag archived', { via: 'disable-confirmation' }],
+        ])
+    })
+
+    it('leaves other rows spinning when one archive fails', async () => {
+        jest.spyOn(api, 'update').mockRejectedValueOnce({ status: 409, data: { detail: 'Conflict' } })
+        logic.actions.setFeatureFlagUpdating(2, true)
+
+        logic.actions.updateFeatureFlagArchived({ id: 1, archived: true, via: 'archive-dialog' })
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.featureFlagsUpdating[1]).toBeUndefined()
+        expect(logic.values.featureFlagsUpdating[2]).toBe(true)
+    })
+})
+
+describe('displayedFlags stability while a load is in flight', () => {
+    let logic: ReturnType<typeof featureFlagsLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/projects/:projectId/feature_flags/': () => [
+                    200,
+                    {
+                        results: [
+                            { id: 1, key: 'alpha', active: true },
+                            { id: 2, key: 'beta', active: true },
+                        ],
+                        count: 2,
+                    },
+                ],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagsLogic()
+        logic.mount()
+    })
+
+    afterEach(() => {
+        logic?.unmount()
+    })
+
+    // Regression guard: displayedFlags must filter the loaded page by the filters it was loaded under, not
+    // the just-changed live filters. Filtering the previous page against a new search before the refetch
+    // lands used to empty the list, which flashed LemonTable's skeleton rows over a table that had data.
+    it('keeps the loaded rows until the refetch lands when a non-matching search is typed', async () => {
+        logic.actions.loadFeatureFlags()
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        expect(logic.values.displayedFlags.map((f) => f.key)).toEqual(['alpha', 'beta'])
+
+        await expectLogic(logic, () => {
+            logic.actions.setFeatureFlagsFilters({ search: 'no-such-flag' })
+        })
+            // setFeatureFlagsFilters debounces the refetch, so this asserts the pre-refetch render.
+            .toMatchValues({
+                filters: expect.objectContaining({ search: 'no-such-flag' }),
+                displayedFlags: [expect.objectContaining({ key: 'alpha' }), expect.objectContaining({ key: 'beta' })],
+            })
+            .toDispatchActions(['loadFeatureFlagsSuccess'])
+
+        // The mock ignores `search`, so the refetch returns alpha and beta again: only the client-side
+        // filter, now stamped with the new search, can empty the list. Asserted outside the expectLogic
+        // chain because a failing toMatchValues there times the test out instead of reporting a diff.
+        expect(logic.values.displayedFlags).toEqual([])
+    })
+
+    // Regression guard: the loader reads `values` live, so reading the filters after its await stamped the
+    // response with whatever had been typed since. displayedFlags then filtered a page against filters it
+    // was never requested under, emptying the list and flashing skeletons over data that had just landed.
+    it('stamps the response with the filters it was requested under, not ones typed while it was in flight', async () => {
+        logic.actions.loadFeatureFlags()
+        // The refetch is debounced 300ms, so this only mutates `filters` while the first request is open.
+        logic.actions.setFeatureFlagsFilters({ search: 'typed-while-loading' })
+
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+
+        expect(logic.values.featureFlags.filters?.search).toBeUndefined()
+        expect(logic.values.displayedFlags.map((f) => f.key)).toEqual(['alpha', 'beta'])
+    })
+
+    // Regression guard: the 300ms debounce spaces out dispatches, not requests, so two loads can be open
+    // at once. Without a breakpoint the slower, older response resolved last and replaced the newer page.
+    it('discards a superseded response that resolves after a newer one', async () => {
+        let releaseStaleResponse = (): void => {}
+        const staleResponseReleased = new Promise<void>((resolve) => {
+            releaseStaleResponse = resolve
+        })
+        let requestCount = 0
+        useMocks({
+            get: {
+                '/api/projects/:projectId/feature_flags/': async () => {
+                    requestCount += 1
+                    if (requestCount === 1) {
+                        await staleResponseReleased
+                        return [200, { results: [{ id: 1, key: 'stale', active: true }], count: 1 }]
+                    }
+                    return [200, { results: [{ id: 2, key: 'fresh', active: true }], count: 1 }]
+                },
+            },
+        })
+
+        logic.actions.loadFeatureFlags()
+        logic.actions.loadFeatureFlags()
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+        expect(logic.values.displayedFlags.map((f) => f.key)).toEqual(['fresh'])
+
+        releaseStaleResponse()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.displayedFlags.map((f) => f.key)).toEqual(['fresh'])
+    })
+})
+
+describe('rows in config version 2', () => {
+    let logic: ReturnType<typeof featureFlagsLogic.build>
+
+    const V1_ROW: FeatureFlagType = { ...NEW_FLAG, id: 1, key: 'release-v1', active: true, version: 4 }
+    const V2_ROW: FeatureFlagType = {
+        ...NEW_FLAG,
+        id: 2,
+        key: 'checkout-rules-v2',
+        active: false,
+        version: 7,
+        filters: { version: 2, return_type: 'boolean', default_value: false, rules: [] },
+    }
+
+    beforeEach(silenceKeaLoadersErrors)
+    afterEach(resumeKeaLoadersErrors)
+
+    beforeEach(async () => {
+        useMocks({
+            get: {
+                '/api/projects/:projectId/feature_flags/': () => [200, { results: [V1_ROW, V2_ROW], count: 2 }],
+                '/api/projects/:projectId/feature_flags/2/': () => [200, { ...V2_ROW, version: 8 }],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagsLogic()
+        logic.mount()
+        logic.actions.loadFeatureFlags()
+        await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess'])
+    })
+
+    afterEach(() => {
+        logic?.unmount()
+        jest.restoreAllMocks()
+    })
+
+    it('loads a list mixing v1 and v2 rows', () => {
+        expect(logic.values.displayedFlags.map((flag) => flag.key)).toEqual(['release-v1', 'checkout-rules-v2'])
+    })
+
+    it('sends the row version only when toggling a v2 row', async () => {
+        const update = jest
+            .spyOn(api, 'update')
+            .mockImplementation(async (_url, payload) => ({ ...V2_ROW, ...(payload as object) }))
+
+        logic.actions.updateFeatureFlag({ id: 2, payload: { active: true } })
+        logic.actions.updateFeatureFlag({ id: 1, payload: { active: false } })
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(update).toHaveBeenCalledWith(expect.stringContaining('/feature_flags/2'), { active: true, version: 7 })
+        expect(update).toHaveBeenCalledWith(expect.stringContaining('/feature_flags/1'), { active: false })
+    })
+
+    it('offers archive only for a v1 row when disabling, and disables a v2 row with its version', async () => {
+        const openDialog = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+        const update = jest
+            .spyOn(api, 'update')
+            .mockImplementation(async (_url, payload) => ({ ...V2_ROW, ...(payload as object) }))
+
+        logic.actions.toggleFeatureFlagActive(1, false)
+        logic.actions.toggleFeatureFlagActive(2, false)
+        expect(openDialog.mock.calls[0][0].secondaryButton?.children).toBe('Disable and archive')
+        expect(openDialog.mock.calls[1][0].secondaryButton).toBeNull()
+
+        openDialog.mock.calls[1][0].primaryButton?.onClick?.(undefined as any)
+        await expectLogic(logic).toFinishAllListeners()
+        expect(update).toHaveBeenCalledWith(expect.stringContaining('/feature_flags/2'), { active: false, version: 7 })
+    })
+
+    it('refetches a v2 row whose version was stale instead of retrying', async () => {
+        // The conflicting write replaced the document, so the row must show it, not only its version.
+        const changedElsewhere = {
+            ...V2_ROW,
+            name: 'Renamed elsewhere',
+            version: 8,
+            filters: { ...V2_ROW.filters, default_value: true },
+        }
+        useMocks({ get: { '/api/projects/:projectId/feature_flags/2/': () => [200, changedElsewhere] } })
+        const detail = 'This feature flag has changed since version 7'
+        const update = jest
+            .spyOn(api, 'update')
+            .mockRejectedValueOnce(new ApiError(undefined, 409, undefined, { detail }))
+        const toastError = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+
+        logic.actions.updateFeatureFlag({ id: 2, payload: { active: true } })
+        await expectLogic(logic).toDispatchActions(['updateFlag', 'updateFeatureFlagFailure']).toFinishAllListeners()
+
+        expect(update).toHaveBeenCalledTimes(1)
+        expect(logic.values.featureFlags.results.find((flag) => flag.id === 2)).toEqual(changedElsewhere)
+        expect(showApprovalRequiredToast).not.toHaveBeenCalled()
+        expect(toastError).toHaveBeenCalledWith(detail)
+    })
+
+    it('keeps the stale refusal as the failure when the refetch also fails', async () => {
+        useMocks({ get: { '/api/projects/:projectId/feature_flags/2/': () => [500, {}] } })
+        const stale = new ApiError(undefined, 409, undefined, {
+            detail: 'This feature flag has changed since version 7',
+        })
+        jest.spyOn(api, 'update').mockRejectedValueOnce(stale)
+        jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+
+        logic.actions.updateFeatureFlag({ id: 2, payload: { active: true } })
+        await expectLogic(logic)
+            .toDispatchActions([
+                (action) =>
+                    action.type === logic.actionTypes.updateFeatureFlagFailure && action.payload.errorObject === stale,
+            ])
+            .toFinishAllListeners()
+
+        expect(logic.values.featureFlags.results.find((flag) => flag.id === 2)).toEqual(V2_ROW)
+    })
+})

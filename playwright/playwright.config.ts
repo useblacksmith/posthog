@@ -1,0 +1,76 @@
+import { defineConfig, devices } from '@playwright/test'
+
+/**
+ * See https://playwright.dev/docs/test-configuration.
+ */
+export default defineConfig({
+    // testDir is the repo root so we can discover tests in two locations:
+    //   - playwright/e2e/**           — cross-cutting and platform-level tests
+    //   - products/*/frontend/e2e/**  — product-owned tests, co-located with the product
+    // testMatch keeps discovery scoped to those two roots so we don't accidentally
+    // pick up unrelated *.spec.ts files (e.g. Jest unit tests under products/).
+    testDir: '..',
+    testMatch: ['playwright/e2e/**/*.spec.ts', 'products/*/frontend/e2e/**/*.spec.ts'],
+    /*
+        Maximum time one test can run for. 
+        Shorter timeout in local dev since it's annoying to wait 90 seconds for a test to run.
+    */
+    timeout: process.env.CI ? 90 * 1000 : 50 * 1000,
+    expect: {
+        /**
+         * Maximum time expect() should wait for the condition to be met.
+         * For example in `await expect(locator).toHaveText();`
+         */
+        timeout: process.env.CI ? 40 * 1000 : 10 * 1000,
+        toHaveScreenshot: {
+            maxDiffPixelRatio: 0.01, // 1% threshold for full-page screenshots
+        },
+    },
+    /* Run tests in files in parallel */
+    fullyParallel: true,
+    /* Fail the build on CI if you accidentally left test.only in the source code. */
+    forbidOnly: !!process.env.CI,
+    /*
+        Retries are 3 on CI when PLAYWRIGHT_RETRIES is unset. Normal CI explicitly
+        sets one retry as a flake safety net, while the nightly audit sets zero to
+        preserve raw per-test failure signal.
+     */
+    retries: process.env.PLAYWRIGHT_RETRIES ? Number(process.env.PLAYWRIGHT_RETRIES) : process.env.CI ? 3 : 2,
+    /* CI passes --workers explicitly, sized against the other processes on its runner. */
+    workers: 6,
+    /* Reporter to use. See https://playwright.dev/docs/test-reporters */
+    reporter: [
+        // Enforces `mode: "run"` quarantine entries — tolerates their failures so
+        // flaky tests can't block CI (schema: .test_quarantine.json). No-op when empty.
+        ['./playwright.quarantine.reporter.ts'],
+        ['html', { open: 'never' }],
+        ...(process.env.CI ? [['junit', { outputFile: 'junit-results.xml', includeRetries: true }] as const] : []),
+        ...(process.env.CI ? [['json', { outputFile: 'results.json' }] as const] : []),
+    ],
+    /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
+    use: {
+        /* Maximum time each action such as `click()` can take. Defaults to 0 (no limit). */
+        actionTimeout: 0,
+        /* Base URL to use in actions like `await page.goto('/')`. */
+        baseURL: process.env.CI ? 'http://localhost:8000' : process.env.BASE_URL || 'http://localhost:8080',
+
+        /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
+        trace: 'on-first-retry',
+
+        /* Locate elements defined by `data-attr-something` with `page.getByTestId('something')` */
+        testIdAttribute: 'data-attr',
+
+        screenshot: 'only-on-failure',
+    },
+
+    /* Configure centralized screenshot directory */
+    snapshotDir: './__snapshots__',
+
+    /* Configure projects for major browsers */
+    projects: [
+        {
+            name: 'chromium',
+            use: { ...devices['Desktop Chrome'] },
+        },
+    ],
+})

@@ -1,0 +1,535 @@
+import uuid
+import datetime as dt
+from urllib.parse import quote
+
+import pytest
+from unittest.mock import patch
+
+from posthog.models import Organization, Team
+from posthog.models.scoping import team_scope
+
+from products.alerts_platform.backend.facade.api import create_configuration
+from products.alerts_platform.backend.facade.contracts import (
+    Grouping,
+    GroupingMode,
+    PlatformAlertConfigurationEdit,
+    SourceKind,
+)
+from products.data_warehouse.backend.logic.external_data_source.notifications import (
+    MAX_SCHEMAS_PER_DIGEST_EMAIL,
+    get_team_ids_with_recent_sync_failures,
+    notify_external_data_sync_failures,
+)
+from products.warehouse_sources.backend.facade.models import (
+    ExternalDataDestination,
+    ExternalDataJob,
+    ExternalDataSchema,
+    ExternalDataSource,
+)
+from products.warehouse_sources.backend.facade.sync_alerts import DEFAULT_FAILURE_ALERT_FLAG, WAREHOUSE_ALERTS_FLAG
+
+pytestmark = [
+    pytest.mark.django_db,
+]
+
+SENDER_PATH = (
+    "products.data_warehouse.backend.logic.external_data_source.notifications.send_external_data_failure_digest"
+)
+FLAG_PATH = "products.warehouse_sources.backend.sync_alerts.default_alert.posthog_feature_flag_enabled"
+BOTH_FLAGS = (WAREHOUSE_ALERTS_FLAG, DEFAULT_FAILURE_ALERT_FLAG)
+
+
+def _create_team_and_source() -> tuple[Team, ExternalDataSource]:
+    org = Organization.objects.create(name="Test Org")
+    team = Team.objects.create(organization=org, name="Test Team")
+    source = ExternalDataSource.objects.create(
+        team=team,
+        source_id=str(uuid.uuid4()),
+        connection_id=str(uuid.uuid4()),
+        destination_id=str(uuid.uuid4()),
+        status="running",
+        source_type="Stripe",
+    )
+    return team, source
+
+
+class TestNotifyExternalDataSyncFailures:
+    def test_sends_digest_with_failing_schemas_classified(self):
+        team, source = _create_team_and_source()
+        ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            should_sync=True,
+            latest_error="transient error",
+        )
+        # PostHog stopped this one itself after a non-retryable error, so it stays in the digest:
+        # only the user can repair the source and turn syncing back on.
+        ExternalDataSchema.objects.create(
+            name="Invoice",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            should_sync=False,
+            auto_disabled_at=dt.datetime.now(dt.UTC),
+            latest_error="Invalid API key",
+        )
+        # CDC breakage halts syncing without flipping should_sync — it must still read as
+        # "action required", not "will retry".
+        ExternalDataSchema.objects.create(
+            name="Accounts",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            should_sync=True,
+            latest_error="Replication slot dropped",
+            sync_type_config={"cdc_broken": {"reason": "auto_dropped_critical_lag"}},
+        )
+
+        with patch(SENDER_PATH) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        mock_sender.assert_called_once()
+        team_id, items = mock_sender.call_args.args
+        assert team_id == team.pk
+        assert [(item["schema_name"], item["paused"]) for item in items] == [
+            ("Accounts", True),
+            ("Invoice", True),
+            ("Charge", False),
+        ]
+        assert items[0]["error"] == "Replication slot dropped"
+        assert items[0]["source_type"] == "Stripe"
+        assert f"managed-{source.id}/syncs?schema=Accounts" in items[0]["url"]
+
+    @pytest.mark.parametrize(
+        "name,label,expected_display",
+        [
+            ("C08LGV7UHS9", "#data-alerts", "#data-alerts"),  # label preferred for display
+            ("Charge", None, "Charge"),  # falls back to name when label is missing
+        ],
+    )
+    def test_display_uses_label_but_url_uses_name(self, name, label, expected_display):
+        team, source = _create_team_and_source()
+        ExternalDataSchema.objects.create(
+            name=name,
+            label=label,
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            latest_error="transient error",
+        )
+
+        with patch(SENDER_PATH) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        (_, items) = mock_sender.call_args.args
+        # The displayed name prefers the human-readable label...
+        assert items[0]["schema_name"] == expected_display
+        # ...but the deep link always keeps using the raw identifier.
+        assert f"?schema={quote(name)}" in items[0]["url"]
+
+    @pytest.mark.parametrize(
+        "error,destination_deleted,expect_destination",
+        [
+            ("Analytics PG: Destination configuration error. Bad host", False, True),
+            ("Charge failed: Analytics PG: connection reset", False, True),
+            ("Analytics PG: Destination configuration error. Bad host", True, False),
+            ("Other PG: connection reset", False, False),
+            ("Invalid API key", False, False),
+        ],
+    )
+    def test_names_the_destination_that_failed(self, error, destination_deleted, expect_destination):
+        team, source = _create_team_and_source()
+        destination = ExternalDataDestination.objects.for_team(team.pk).create(
+            team=team,
+            type=ExternalDataDestination.Type.POSTGRES,
+            name="Analytics PG",
+            deleted=destination_deleted,
+        )
+        ExternalDataSchema.objects.create(
+            name="Charge", team=team, source=source, status=ExternalDataSchema.Status.FAILED, latest_error=error
+        )
+
+        with patch(SENDER_PATH) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        (_, items) = mock_sender.call_args.args
+        assert items[0]["error"] == error
+        if expect_destination:
+            assert items[0]["destination_name"] == "Analytics PG"
+            assert items[0]["destination_url"].endswith(
+                f"/project/{team.pk}/data-management/warehouse-destinations?destination={destination.id}"
+            )
+        else:
+            assert items[0]["destination_name"] is None
+            assert items[0]["destination_url"] is None
+
+    @pytest.mark.parametrize(
+        "status,should_sync,deleted",
+        [
+            (ExternalDataSchema.Status.COMPLETED, True, False),
+            (ExternalDataSchema.Status.RUNNING, True, False),
+            (ExternalDataSchema.Status.BILLING_LIMIT_REACHED, True, False),
+            (ExternalDataSchema.Status.BILLING_LIMIT_TOO_LOW, True, False),
+            (ExternalDataSchema.Status.FAILED, True, True),
+            # The user switched syncing off. The status stays Failed for the syncs UI, but
+            # there is nothing left to chase, so the digest must not report it.
+            (ExternalDataSchema.Status.FAILED, False, False),
+        ],
+    )
+    def test_does_not_send_for_non_failing_or_deleted_schemas(self, status, should_sync, deleted):
+        team, source = _create_team_and_source()
+        ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=status,
+            should_sync=should_sync,
+            deleted=deleted,
+            latest_error="some error",
+        )
+
+        with patch(SENDER_PATH) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        mock_sender.assert_not_called()
+
+    def test_missing_error_defaults_to_unknown(self):
+        team, source = _create_team_and_source()
+        ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            latest_error=None,
+        )
+
+        with patch(SENDER_PATH) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        (_, items) = mock_sender.call_args.args
+        assert items[0]["error"] == "Unknown error"
+
+    def test_swallows_sender_exceptions(self):
+        team, source = _create_team_and_source()
+        ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            latest_error="boom",
+        )
+
+        with patch(SENDER_PATH, side_effect=Exception("smtp down")):
+            notify_external_data_sync_failures(team.pk)
+
+    def test_caps_listed_schemas_and_reports_omitted_count(self):
+        team, source = _create_team_and_source()
+        total = MAX_SCHEMAS_PER_DIGEST_EMAIL + 5
+        schemas = ExternalDataSchema.objects.bulk_create(
+            ExternalDataSchema(
+                name=f"table_{i:03d}",
+                team=team,
+                source=source,
+                status=ExternalDataSchema.Status.FAILED,
+                latest_error="boom",
+            )
+            for i in range(total)
+        )
+
+        with patch(SENDER_PATH, return_value=True) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        (_, items) = mock_sender.call_args.args
+        assert len(items) == MAX_SCHEMAS_PER_DIGEST_EMAIL
+        assert mock_sender.call_args.kwargs["omitted_count"] == 5
+        assert (
+            ExternalDataSchema.objects.filter(
+                id__in=[schema.id for schema in schemas], last_error_notified_at__isnull=False
+            ).count()
+            == total
+        )
+
+    def test_stamps_schemas_after_successful_send(self):
+        team, source = _create_team_and_source()
+        schema = ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            latest_error="boom",
+        )
+
+        with patch(SENDER_PATH, return_value=True):
+            notify_external_data_sync_failures(team.pk)
+
+        schema.refresh_from_db()
+        assert schema.last_error_notified_at is not None
+
+    def test_does_not_stamp_when_email_not_sent(self):
+        team, source = _create_team_and_source()
+        schema = ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            latest_error="boom",
+        )
+
+        with patch(SENDER_PATH, return_value=False):
+            notify_external_data_sync_failures(team.pk)
+
+        schema.refresh_from_db()
+        assert schema.last_error_notified_at is None
+
+    @pytest.mark.parametrize(
+        "flags_on,email_project_members,scoped,enabled,expected_sent",
+        [
+            pytest.param(BOTH_FLAGS, True, False, True, False, id="an_alert_emails_members_about_every_source"),
+            pytest.param((), True, False, True, True, id="flags_off"),
+            pytest.param((DEFAULT_FAILURE_ALERT_FLAG,), True, False, True, True, id="only_the_failure_email_flag_on"),
+            pytest.param((WAREHOUSE_ALERTS_FLAG,), True, False, True, True, id="only_the_warehouse_alerts_flag_on"),
+            pytest.param(BOTH_FLAGS, False, False, True, True, id="the_alert_does_not_email"),
+            pytest.param(BOTH_FLAGS, True, True, True, True, id="the_alert_watches_one_source"),
+            pytest.param(BOTH_FLAGS, True, False, False, True, id="the_alert_is_disabled"),
+        ],
+    )
+    def test_skips_the_digest_only_when_an_alert_emails_members_about_every_source(
+        self,
+        flags_on: tuple[str, ...],
+        email_project_members: bool,
+        scoped: bool,
+        enabled: bool,
+        expected_sent: bool,
+    ) -> None:
+        team, source = _create_team_and_source()
+        schema = ExternalDataSchema.objects.create(
+            name="Charge", team=team, source=source, status=ExternalDataSchema.Status.FAILED, latest_error="boom"
+        )
+        with team_scope(team.pk):
+            create_configuration(
+                team_id=team.pk,
+                source_kind=SourceKind.WAREHOUSE_SOURCE,
+                edit=PlatformAlertConfigurationEdit(
+                    name="Sync failures",
+                    enabled=enabled,
+                    source_config={
+                        "group_by": "source",
+                        "email_project_members": email_project_members,
+                        "source_ids": [str(source.pk)] if scoped else [],
+                    },
+                    grouping=Grouping(mode=GroupingMode.BY_RESULT_LABELS, keys=("source_id",)),
+                    schedule_restriction=None,
+                    evaluation_periods=1,
+                    datapoints_to_alarm=1,
+                    cooldown_minutes=0,
+                ),
+                created_by_id=None,
+            )
+
+        with (
+            patch(FLAG_PATH, side_effect=lambda flag, *args, **kwargs: flag in flags_on),
+            patch(SENDER_PATH, return_value=True) as mock_sender,
+        ):
+            notify_external_data_sync_failures(team.pk)
+
+        schema.refresh_from_db()
+        assert (mock_sender.called, schema.last_error_notified_at is not None) == (expected_sent, expected_sent)
+
+    def test_excludes_schemas_of_deleted_source(self):
+        team, source = _create_team_and_source()
+        ExternalDataSource.objects.filter(id=source.id).update(deleted=True)
+        ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            latest_error="boom",
+        )
+
+        with patch(SENDER_PATH) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        mock_sender.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "run_offset,expected_sent",
+        [
+            (dt.timedelta(hours=1), True),  # failed run after the last notification -> report again
+            (dt.timedelta(hours=-1), False),  # no run since the last notification -> stay silent
+        ],
+    )
+    def test_already_notified_failure_renotifies_only_on_newer_run(self, run_offset, expected_sent):
+        team, source = _create_team_and_source()
+        notified_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+        schema = ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            latest_error="boom",
+            last_error_notified_at=notified_at,
+        )
+        job = ExternalDataJob.objects.create(
+            team=team, pipeline=source, schema=schema, status=ExternalDataJob.Status.FAILED
+        )
+        ExternalDataJob.objects.filter(id=job.id).update(finished_at=notified_at + run_offset)
+
+        with patch(SENDER_PATH) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        assert mock_sender.called == expected_sent
+
+    @pytest.mark.parametrize(
+        "should_sync,auto_disabled,sync_type_config,notified_age",
+        [
+            (False, True, {}, dt.timedelta(days=8)),
+            (False, True, {}, dt.timedelta(days=90)),
+            (True, False, {"cdc_broken": {"reason": "auto_dropped_critical_lag"}}, dt.timedelta(days=8)),
+        ],
+    )
+    def test_paused_schema_is_listed_only_once(self, should_sync, auto_disabled, sync_type_config, notified_age):
+        # A paused schema never runs again, so once a digest has listed it, later digests stay
+        # silent about it however long it stays failed.
+        team, source = _create_team_and_source()
+        notified_at = dt.datetime.now(dt.UTC) - notified_age
+        schema = ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=ExternalDataSchema.Status.FAILED,
+            should_sync=should_sync,
+            auto_disabled_at=notified_at if auto_disabled else None,
+            sync_type_config=sync_type_config,
+            latest_error="Invalid API key",
+            last_error_notified_at=notified_at,
+        )
+        job = ExternalDataJob.objects.create(
+            team=team, pipeline=source, schema=schema, status=ExternalDataJob.Status.FAILED
+        )
+        ExternalDataJob.objects.filter(id=job.id).update(finished_at=notified_at - dt.timedelta(minutes=5))
+
+        with patch(SENDER_PATH) as mock_sender:
+            notify_external_data_sync_failures(team.pk)
+
+        mock_sender.assert_not_called()
+
+
+class TestGetTeamIdsWithRecentSyncFailures:
+    def _create_schema_with_job(
+        self,
+        *,
+        schema_status: str,
+        job_finished_at: dt.datetime,
+        schema_deleted: bool = False,
+        source_deleted: bool = False,
+        last_error_notified_at: dt.datetime | None = None,
+        should_sync: bool = True,
+        auto_disabled_at: dt.datetime | None = None,
+    ) -> Team:
+        team, source = _create_team_and_source()
+        if source_deleted:
+            ExternalDataSource.objects.filter(id=source.id).update(deleted=True)
+        schema = ExternalDataSchema.objects.create(
+            name="Charge",
+            team=team,
+            source=source,
+            status=schema_status,
+            deleted=schema_deleted,
+            should_sync=should_sync,
+            auto_disabled_at=auto_disabled_at,
+            latest_error="boom",
+            last_error_notified_at=last_error_notified_at,
+        )
+        job = ExternalDataJob.objects.create(
+            team=team,
+            pipeline=source,
+            schema=schema,
+            status=ExternalDataJob.Status.FAILED,
+        )
+        ExternalDataJob.objects.filter(id=job.id).update(finished_at=job_finished_at)
+        return team
+
+    def test_includes_team_with_recent_failure_on_failing_schema(self):
+        team = self._create_schema_with_job(
+            schema_status=ExternalDataSchema.Status.FAILED,
+            job_finished_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=2),
+        )
+
+        assert get_team_ids_with_recent_sync_failures() == [team.pk]
+
+    @pytest.mark.parametrize(
+        "schema_status,job_age,schema_deleted,source_deleted,should_sync",
+        [
+            (ExternalDataSchema.Status.FAILED, dt.timedelta(hours=30), False, False, True),
+            (ExternalDataSchema.Status.COMPLETED, dt.timedelta(hours=2), False, False, True),
+            (ExternalDataSchema.Status.FAILED, dt.timedelta(hours=2), True, False, True),
+            (ExternalDataSchema.Status.FAILED, dt.timedelta(hours=2), False, True, True),
+            # Switched off by the user, so the catch-up sweep has nothing to chase.
+            (ExternalDataSchema.Status.FAILED, dt.timedelta(hours=2), False, False, False),
+        ],
+    )
+    def test_excludes_non_actionable_teams(self, schema_status, job_age, schema_deleted, source_deleted, should_sync):
+        self._create_schema_with_job(
+            schema_status=schema_status,
+            job_finished_at=dt.datetime.now(dt.UTC) - job_age,
+            schema_deleted=schema_deleted,
+            source_deleted=source_deleted,
+            should_sync=should_sync,
+        )
+
+        assert get_team_ids_with_recent_sync_failures() == []
+
+    def test_excludes_failures_already_communicated(self):
+        self._create_schema_with_job(
+            schema_status=ExternalDataSchema.Status.FAILED,
+            job_finished_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=2),
+            last_error_notified_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=1),
+        )
+
+        assert get_team_ids_with_recent_sync_failures() == []
+
+    def test_includes_failures_newer_than_the_stamp(self):
+        team = self._create_schema_with_job(
+            schema_status=ExternalDataSchema.Status.FAILED,
+            job_finished_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=1),
+            last_error_notified_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=2),
+        )
+
+        assert get_team_ids_with_recent_sync_failures() == [team.pk]
+
+    def test_includes_failure_blocked_just_after_digest_rollover(self):
+        team = self._create_schema_with_job(
+            schema_status=ExternalDataSchema.Status.FAILED,
+            job_finished_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=24, minutes=10),
+            last_error_notified_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=24, minutes=14),
+        )
+
+        assert get_team_ids_with_recent_sync_failures() == [team.pk]
+
+    @pytest.mark.parametrize("notified_age", [dt.timedelta(days=8), dt.timedelta(days=90)])
+    def test_excludes_paused_schema_already_notified(self, notified_age):
+        # PostHog halted this schema itself, so it never runs again. Its one digest already went
+        # out, so the catch-up sweep must not pick it up again however old that email is.
+        self._create_schema_with_job(
+            schema_status=ExternalDataSchema.Status.FAILED,
+            job_finished_at=dt.datetime.now(dt.UTC) - notified_age - dt.timedelta(minutes=5),
+            last_error_notified_at=dt.datetime.now(dt.UTC) - notified_age,
+            should_sync=False,
+            auto_disabled_at=dt.datetime.now(dt.UTC) - notified_age,
+        )
+
+        assert get_team_ids_with_recent_sync_failures() == []
+
+    def test_only_returns_qualifying_teams(self):
+        qualifying = self._create_schema_with_job(
+            schema_status=ExternalDataSchema.Status.FAILED,
+            job_finished_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=2),
+        )
+        self._create_schema_with_job(
+            schema_status=ExternalDataSchema.Status.COMPLETED,
+            job_finished_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=2),
+        )
+
+        assert get_team_ids_with_recent_sync_failures() == [qualifying.pk]

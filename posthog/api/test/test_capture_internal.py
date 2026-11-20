@@ -1,0 +1,1879 @@
+import inspect
+import threading
+from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
+
+from unittest.mock import MagicMock, patch
+
+from django.test import SimpleTestCase
+
+from parameterized import parameterized
+from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from structlog.testing import capture_logs
+
+from posthog.api.capture import (
+    CAPTURE_V1_EVENTS_REROUTED,
+    CAPTURE_V1_OPTION_CONFLICT,
+    CAPTURE_V1_REQUEST_FAILED,
+    CAPTURE_V1_REQUEST_SUBMITTED,
+    CaptureInternalError,
+    CaptureInternalResult,
+    RequestFailure,
+    _build_v1_headers,
+    _merge_results,
+    _normalize_options_and_properties,
+    _parse_retry_after,
+    _resolve_scalar,
+    capture_ai_internal,
+    capture_batch_ai_internal,
+    capture_batch_internal,
+    capture_internal,
+    prepare_capture_internal_batch,
+)
+from posthog.settings.ingestion import (
+    CAPTURE_AI_INTERNAL_URL,
+    CAPTURE_INTERNAL_URL,
+    CAPTURE_V1_AI_INTERNAL_ENDPOINT,
+    CAPTURE_V1_INTERNAL_ENDPOINT,
+)
+
+EXPECTED_URL = f"{CAPTURE_INTERNAL_URL}{CAPTURE_V1_INTERNAL_ENDPOINT}"
+EXPECTED_AI_URL = f"{CAPTURE_AI_INTERNAL_URL}{CAPTURE_V1_AI_INTERNAL_ENDPOINT}"
+
+
+class MockResponse:
+    """Lightweight mock for requests.Response with configurable body and headers."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        text: str = "",
+    ):
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+        self.text = text or (str(body) if body else "")
+
+    def json(self) -> dict[str, Any]:
+        if self._body is None:
+            raise ValueError("no json body")
+        return self._body
+
+
+class InstallV1Spy:
+    """Spy that records POST calls and returns a configurable sequence of responses.
+
+    Thread-safe: concurrent calls from chunked batch submissions are serialized via lock.
+    """
+
+    def __init__(
+        self,
+        mock_session_fn: MagicMock,
+        responses: list[MockResponse] | None = None,
+        *,
+        responses_by_url: dict[str, MockResponse] | None = None,
+    ):
+        self.calls: list[dict[str, Any]] = []
+        self._responses = list(responses or [MockResponse(body={})])
+        self._call_idx = 0
+        self._lock = threading.Lock()
+
+        def spy_post(url: str, **kwargs: Any) -> MockResponse:
+            with self._lock:
+                self.calls.append({"url": url, **kwargs})
+                if responses_by_url is not None:
+                    return responses_by_url[url]
+                resp = self._responses[min(self._call_idx, len(self._responses) - 1)]
+                self._call_idx += 1
+                return resp
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = spy_post
+        mock_session.mount = MagicMock()
+        mock_session_fn.return_value.__enter__.return_value = mock_session
+        self._mock_session = mock_session
+
+
+def _ok_results(*uuids: str) -> dict[str, Any]:
+    return {"results": {uid: {"result": "ok"} for uid in uuids}}
+
+
+def _make_event(
+    event: str = "test_event",
+    distinct_id: str = "user-1",
+    **extra: Any,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {"event": event, "distinct_id": distinct_id}
+    out.update(extra)
+    return out
+
+
+class TestBuildV1Headers(SimpleTestCase):
+    def test_all_required_headers_present(self) -> None:
+        headers = _build_v1_headers("phc_test123", attempt=1)
+        assert headers["Authorization"] == "Bearer phc_test123"
+        assert headers["Content-Type"] == "application/json"
+        assert "posthog-capture-v1-internal" in headers["User-Agent"]
+        assert headers["PostHog-Sdk-Info"] == "posthog-capture-v1-internal/1.0"
+        assert headers["PostHog-Attempt"] == "1"
+        assert len(headers["PostHog-Request-Id"]) == 36
+        assert "T" in headers["PostHog-Request-Timestamp"]
+
+    def test_attempt_increments(self) -> None:
+        h1 = _build_v1_headers("tok", attempt=1)
+        h2 = _build_v1_headers("tok", attempt=3)
+        assert h1["PostHog-Attempt"] == "1"
+        assert h2["PostHog-Attempt"] == "3"
+
+    def test_request_id_unique_per_call(self) -> None:
+        h1 = _build_v1_headers("tok", attempt=1)
+        h2 = _build_v1_headers("tok", attempt=1)
+        assert h1["PostHog-Request-Id"] != h2["PostHog-Request-Id"]
+
+
+class TestNormalizeOptionsAndProperties(SimpleTestCase):
+    def test_typed_options_propagated(self) -> None:
+        ev: dict[str, Any] = {
+            "options": {"cookieless_mode": True, "disable_skew_correction": True, "product_tour_id": "tour-1"},
+            "properties": {"some_prop": "val"},
+        }
+        parts = _normalize_options_and_properties(ev, process_person_profile=True, event_source="test")
+        assert parts.options["cookieless_mode"] is True
+        assert parts.options["disable_skew_correction"] is True
+        assert parts.options["product_tour_id"] == "tour-1"
+        assert "process_person_profile" not in parts.options
+        assert parts.session_id is None
+        assert parts.window_id is None
+        assert parts.properties == {"some_prop": "val"}
+
+    def test_legacy_properties_lifted_and_stripped(self) -> None:
+        ev: dict[str, Any] = {
+            "properties": {
+                "$cookieless_mode": True,
+                "$ignore_sent_at": True,
+                "$product_tour_id": "tour-2",
+                "$process_person_profile": True,
+                "$session_id": "sess-1",
+                "$window_id": "win-1",
+                "keep_me": 42,
+            },
+        }
+        parts = _normalize_options_and_properties(ev, process_person_profile=True, event_source="test")
+        assert parts.options["cookieless_mode"] is True
+        assert parts.options["disable_skew_correction"] is True
+        assert parts.options["product_tour_id"] == "tour-2"
+        assert parts.session_id == "sess-1"
+        assert parts.window_id == "win-1"
+        assert "$cookieless_mode" not in parts.properties
+        assert "$ignore_sent_at" not in parts.properties
+        assert "$product_tour_id" not in parts.properties
+        assert "$process_person_profile" not in parts.properties
+        assert "$session_id" not in parts.properties
+        assert "$window_id" not in parts.properties
+        assert parts.properties["keep_me"] == 42
+
+    def test_undollared_disable_skew_adjustment_is_an_ordinary_property(self) -> None:
+        ev: dict[str, Any] = {
+            "properties": {"disable_skew_adjustment": True, "other": 1},
+        }
+        parts = _normalize_options_and_properties(ev, process_person_profile=True, event_source="test")
+        assert parts.options == {}
+        assert parts.properties == {"disable_skew_adjustment": True, "other": 1}
+
+    @parameterized.expand(
+        [
+            ("missing_option", {}),
+            ("none_option", {"product_tour_id": None}),
+        ]
+    )
+    def test_legacy_property_fills_a_missing_or_none_option(self, _name: str, options: dict[str, Any]) -> None:
+        ev: dict[str, Any] = {"options": options, "properties": {"$product_tour_id": "tour_legacy"}}
+        parts = _normalize_options_and_properties(ev, process_person_profile=True, event_source="test")
+        assert parts.options == {"product_tour_id": "tour_legacy"}
+        assert "$product_tour_id" not in parts.properties
+
+    def test_explicit_wins_over_legacy_on_conflict(self) -> None:
+        ev: dict[str, Any] = {
+            "options": {"cookieless_mode": False},
+            "session_id": "explicit-sess",
+            "properties": {"$cookieless_mode": True, "$session_id": "legacy-sess"},
+        }
+        parts = _normalize_options_and_properties(ev, process_person_profile=True, event_source="test")
+        assert parts.options["cookieless_mode"] is False
+        assert parts.session_id == "explicit-sess"
+        assert "$cookieless_mode" not in parts.properties
+        assert "$session_id" not in parts.properties
+
+    @parameterized.expand(
+        [
+            ("unknown_key", {"future_option": {"nested": [1, "two"]}}),
+            ("unconverted_string", {"process_person_profile": "no"}),
+            ("unconverted_number", {"cookieless_mode": 1, "disable_skew_correction": 0}),
+            ("non_string_tour_id", {"product_tour_id": 42}),
+            ("explicit_none", {"cookieless_mode": None}),
+        ]
+    )
+    def test_options_pass_through_unchanged(self, _name: str, options: dict[str, Any]) -> None:
+        ev: dict[str, Any] = {"options": options, "properties": {}}
+        parts = _normalize_options_and_properties(ev, process_person_profile=True, event_source="test")
+        assert parts.options == options
+
+    def test_process_person_profile_false_forces_option(self) -> None:
+        ev: dict[str, Any] = {"properties": {}}
+        parts = _normalize_options_and_properties(ev, process_person_profile=False, event_source="test")
+        assert parts.options["process_person_profile"] is False
+
+    def test_process_person_profile_true_leaves_unset(self) -> None:
+        ev: dict[str, Any] = {"properties": {}}
+        parts = _normalize_options_and_properties(ev, process_person_profile=True, event_source="test")
+        assert "process_person_profile" not in parts.options
+
+    def test_no_options_when_all_empty_and_ppp_true(self) -> None:
+        ev: dict[str, Any] = {"properties": {"keep": 1}}
+        parts = _normalize_options_and_properties(ev, process_person_profile=True, event_source="test")
+        assert parts.options == {}
+        assert parts.session_id is None
+        assert parts.window_id is None
+        assert parts.properties == {"keep": 1}
+
+    def test_caller_input_not_mutated(self) -> None:
+        original_props = {"$session_id": "s1", "keep": 1}
+        ev: dict[str, Any] = {"properties": original_props}
+        _normalize_options_and_properties(ev, process_person_profile=False, event_source="test")
+        assert "$session_id" in original_props
+
+    @parameterized.expand(
+        [
+            (
+                "option_conflict",
+                {"options": {"cookieless_mode": False}, "properties": {"$cookieless_mode": True}},
+                "cookieless_mode",
+            ),
+            ("session_id_conflict", {"session_id": "a", "properties": {"$session_id": "b"}}, "session_id"),
+            ("window_id_conflict", {"window_id": "a", "properties": {"$window_id": "b"}}, "window_id"),
+        ]
+    )
+    def test_conflict_increments_metric_without_logging(self, _name: str, ev: dict[str, Any], field: str) -> None:
+        before = CAPTURE_V1_OPTION_CONFLICT.labels(event_source="metric_test", field=field)._value.get()
+        with capture_logs() as logs:
+            _normalize_options_and_properties(ev, process_person_profile=True, event_source="metric_test")
+        after = CAPTURE_V1_OPTION_CONFLICT.labels(event_source="metric_test", field=field)._value.get()
+        assert after == before + 1
+        assert logs == []
+
+    def test_ppp_false_overrides_explicit_true_with_conflict(self) -> None:
+        ev: dict[str, Any] = {
+            "options": {"process_person_profile": True},
+            "properties": {},
+        }
+        before = CAPTURE_V1_OPTION_CONFLICT.labels(event_source="ppp_test", field="process_person_profile")._value.get()
+        with capture_logs() as logs:
+            parts = _normalize_options_and_properties(ev, process_person_profile=False, event_source="ppp_test")
+        after = CAPTURE_V1_OPTION_CONFLICT.labels(event_source="ppp_test", field="process_person_profile")._value.get()
+        assert parts.options["process_person_profile"] is False
+        assert after == before + 1
+        assert logs == []
+
+
+class TestResolveScalar(SimpleTestCase):
+    def test_explicit_wins(self) -> None:
+        assert _resolve_scalar("a", "b", field="f", event_source="t") == "a"
+
+    def test_legacy_fallback(self) -> None:
+        assert _resolve_scalar(None, "b", field="f", event_source="t") == "b"
+
+    def test_both_none(self) -> None:
+        assert _resolve_scalar(None, None, field="f", event_source="t") is None
+
+    def test_no_conflict_when_equal(self) -> None:
+        before = CAPTURE_V1_OPTION_CONFLICT.labels(event_source="eq_test", field="f")._value.get()
+        _resolve_scalar("same", "same", field="f", event_source="eq_test")
+        after = CAPTURE_V1_OPTION_CONFLICT.labels(event_source="eq_test", field="f")._value.get()
+        assert after == before
+
+
+class TestPrepareCaptureInternalBatch(SimpleTestCase):
+    def test_envelope_shape(self) -> None:
+        events = [_make_event()]
+        payload, uuids = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        assert payload["capture_internal"] is True
+        assert payload["historical_migration"] is False
+        assert "created_at" in payload
+        assert len(payload["batch"]) == 1
+        assert len(uuids) == 1
+        assert payload["batch"][0]["uuid"] == uuids[0]
+
+    def test_uuid_generated_when_absent(self) -> None:
+        events = [_make_event()]
+        payload, uuids = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        assert len(uuids[0]) == 36
+        assert payload["batch"][0]["uuid"] == uuids[0]
+
+    def test_uuid_preserved_when_present(self) -> None:
+        uid = str(uuid4())
+        events = [_make_event(event_uuid=uid)]
+        payload, uuids = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        assert uuids[0] == uid
+        assert payload["batch"][0]["uuid"] == uid
+
+    def test_options_omitted_when_empty(self) -> None:
+        events = [_make_event()]
+        payload, _ = prepare_capture_internal_batch(
+            events, token="tok", event_source="test", process_person_profile=True
+        )
+        assert "options" not in payload["batch"][0]
+
+    @parameterized.expand(
+        [
+            ("no_ip", {"$set": {"a": 1}}, {"$geoip_disable": True, "$set": {"a": 1}}),
+            ("client_ip", {"$ip": "203.0.113.7"}, {"$ip": "203.0.113.7"}),
+            ("caller_opts_in", {"$geoip_disable": False}, {"$geoip_disable": False}),
+        ]
+    )
+    def test_geoip_disabled_without_a_client_ip(
+        self, _name: str, properties: dict[str, Any], expected: dict[str, Any]
+    ) -> None:
+        payload, _ = prepare_capture_internal_batch(
+            [_make_event(properties=properties)], token="tok", event_source="test"
+        )
+        assert payload["batch"][0]["properties"] == expected
+
+    def test_options_present_when_set(self) -> None:
+        events = [_make_event(options={"cookieless_mode": True})]
+        payload, _ = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        assert payload["batch"][0]["options"]["cookieless_mode"] is True
+
+    def test_session_window_as_top_level_fields(self) -> None:
+        events = [_make_event(session_id="s1", window_id="w1")]
+        payload, _ = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        entry = payload["batch"][0]
+        assert entry["session_id"] == "s1"
+        assert entry["window_id"] == "w1"
+        assert "$session_id" not in entry.get("properties", {})
+        assert "$window_id" not in entry.get("properties", {})
+
+    def test_distinct_id_fallback_from_properties(self) -> None:
+        events = [{"event": "e", "properties": {"distinct_id": "from_props"}}]
+        payload, _ = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        assert payload["batch"][0]["distinct_id"] == "from_props"
+
+    def test_timestamp_defaults_to_now(self) -> None:
+        events = [_make_event()]
+        before = datetime.now(UTC).isoformat()
+        payload, _ = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        after = datetime.now(UTC).isoformat()
+        ts = payload["batch"][0]["timestamp"]
+        assert before <= ts <= after
+
+    def test_timestamp_non_utc_datetime_converted_correctly(self) -> None:
+        from datetime import timedelta, timezone
+
+        est = timezone(timedelta(hours=-5))
+        # 2024-01-15 17:00 EST = 2024-01-15 22:00 UTC
+        ts_est = datetime(2024, 1, 15, 17, 0, 0, tzinfo=est)
+        events = [_make_event(timestamp=ts_est)]
+        payload, _ = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        assert payload["batch"][0]["timestamp"] == "2024-01-15T22:00:00+00:00"
+
+    def test_timestamp_naive_datetime_assumed_utc(self) -> None:
+        ts_naive = datetime(2024, 6, 1, 12, 0, 0)
+        events = [_make_event(timestamp=ts_naive)]
+        payload, _ = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        assert payload["batch"][0]["timestamp"] == "2024-06-01T12:00:00+00:00"
+
+    @parameterized.expand(
+        [
+            ("empty_token", "", [{"event": "e", "distinct_id": "u"}], "src", "api token is required"),
+            ("no_events", "tok", [], "src", "at least one event is required"),
+            ("empty_event_source", "tok", [{"event": "e", "distinct_id": "u"}], "", "event_source is required"),
+        ]
+    )
+    def test_validation_errors(
+        self, _name: str, token: str, events: list[dict[str, Any]], event_source: str, fragment: str
+    ) -> None:
+        with self.assertRaises(CaptureInternalError) as ctx:
+            prepare_capture_internal_batch(events, token=token, event_source=event_source)
+        assert fragment in str(ctx.exception).lower()
+
+    @parameterized.expand([("missing", {}), ("empty", {"event": ""}), ("not_a_string", {"event": 42})])
+    def test_missing_or_non_string_event_name_raises(self, _name: str, event_field: dict[str, Any]) -> None:
+        events = [{"distinct_id": "u1", "properties": {}, **event_field}]
+        with self.assertRaises(CaptureInternalError) as ctx:
+            prepare_capture_internal_batch(events, token="tok", event_source="src")
+        assert "event name" in str(ctx.exception).lower()
+
+    def test_missing_distinct_id_raises(self) -> None:
+        events = [{"event": "e", "properties": {}}]
+        with self.assertRaises(CaptureInternalError) as ctx:
+            prepare_capture_internal_batch(events, token="tok", event_source="src")
+        assert "distinct_id" in str(ctx.exception).lower()
+
+    @parameterized.expand(
+        [
+            ("$snapshot",),
+            ("$performance_event",),
+            ("$snapshot_items",),
+        ]
+    )
+    def test_replay_event_names_rejected(self, event_name: str) -> None:
+        events = [_make_event(event=event_name)]
+        with self.assertRaises(CaptureInternalError) as ctx:
+            prepare_capture_internal_batch(events, token="tok", event_source="src")
+        assert "replay event" in str(ctx.exception).lower()
+
+    def test_legacy_properties_stripped_in_batch(self) -> None:
+        events = [
+            _make_event(
+                properties={
+                    "$cookieless_mode": True,
+                    "$ignore_sent_at": False,
+                    "$product_tour_id": "t",
+                    "$process_person_profile": True,
+                    "$session_id": "s1",
+                    "$window_id": "w1",
+                    "keep": 1,
+                }
+            )
+        ]
+        payload, _ = prepare_capture_internal_batch(events, token="tok", event_source="test")
+        entry = payload["batch"][0]
+        props = entry["properties"]
+        for key in (
+            "$cookieless_mode",
+            "$ignore_sent_at",
+            "$product_tour_id",
+            "$process_person_profile",
+            "$session_id",
+            "$window_id",
+        ):
+            assert key not in props, f"{key} should have been stripped"
+        assert props["keep"] == 1
+        assert entry["session_id"] == "s1"
+        assert entry["window_id"] == "w1"
+        assert entry["options"]["cookieless_mode"] is True
+
+
+class TestCaptureBatchInternal(SimpleTestCase):
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_happy_path_batch(self, mock_session_fn: MagicMock) -> None:
+        uid1, uid2 = str(uuid4()), str(uuid4())
+        events = [
+            _make_event(event_uuid=uid1),
+            _make_event(event="other", distinct_id="u2", event_uuid=uid2),
+        ]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid1, uid2))])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="happy")
+
+        assert result.status_code == 200
+        assert result.succeeded()
+        assert set(result.ok) == {uid1, uid2}
+        assert not result.dropped
+        assert not result.warnings
+        assert not result.retried
+        assert result.error is None
+
+        assert len(spy.calls) == 1
+        assert spy.calls[0]["url"] == EXPECTED_URL
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_headers_on_initial_request(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        events = [_make_event(event_uuid=uid)]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_batch_internal(events=events, token="phc_abc", event_source="hdr")
+
+        headers = spy.calls[0]["headers"]
+        assert headers["Authorization"] == "Bearer phc_abc"
+        assert headers["Content-Type"] == "application/json"
+        assert headers["PostHog-Sdk-Info"] == "posthog-capture-v1-internal/1.0"
+        assert headers["PostHog-Attempt"] == "1"
+        assert len(headers["PostHog-Request-Id"]) == 36
+        assert "T" in headers["PostHog-Request-Timestamp"]
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_envelope_shape_on_wire(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        events = [_make_event(event_uuid=uid)]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_batch_internal(events=events, token="tok", event_source="env")
+
+        body = spy.calls[0]["json"]
+        assert body["capture_internal"] is True
+        assert body["historical_migration"] is False
+        assert "created_at" in body
+        assert len(body["batch"]) == 1
+        assert body["batch"][0]["uuid"] == uid
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_options_propagated_to_wire(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        options = {
+            "cookieless_mode": True,
+            "disable_skew_correction": "yes",
+            "product_tour_id": "t1",
+            "future_option": {"nested": [1, "two"]},
+        }
+        events = [_make_event(event_uuid=uid, options=options, session_id="s1", window_id="w1")]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_batch_internal(events=events, token="tok", event_source="opt")
+
+        entry = spy.calls[0]["json"]["batch"][0]
+        assert entry["options"] == {**options, "process_person_profile": False}
+        assert entry["session_id"] == "s1"
+        assert entry["window_id"] == "w1"
+        assert "$cookieless_mode" not in entry["properties"]
+        assert "$session_id" not in entry["properties"]
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_options_omitted_when_none_set_and_ppp_true(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        events = [_make_event(event_uuid=uid)]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_batch_internal(events=events, token="tok", event_source="nopt", process_person_profile=True)
+
+        entry = spy.calls[0]["json"]["batch"][0]
+        assert "options" not in entry
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_process_person_profile_false(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        events = [_make_event(event_uuid=uid)]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_batch_internal(events=events, token="tok", event_source="ppp")
+
+        entry = spy.calls[0]["json"]["batch"][0]
+        assert entry["options"]["process_person_profile"] is False
+        assert "$process_person_profile" not in entry["properties"]
+
+    @parameterized.expand(
+        [
+            ("400_validation", 400, {"error": "invalid_request", "error_description": "bad"}),
+            ("401_auth", 401, {"error": "unauthorized", "error_description": "bad token"}),
+            ("402_billing", 402, {"error": "billing_limit", "error_description": "quota"}),
+            ("408_timeout", 408, {"error": "request_timeout", "error_description": "timeout"}),
+            ("413_too_large", 413, {"error": "too_large", "error_description": "payload"}),
+            ("415_media", 415, {"error": "unsupported_media", "error_description": "type"}),
+            ("429_rate_limit", 429, {"error": "rate_limited", "error_description": "slow down"}),
+            ("500_internal", 500, {"error": "internal_error", "error_description": "boom"}),
+            ("502_bad_gateway", 502, {"error": "bad_gateway", "error_description": "upstream"}),
+            ("503_unavailable", 503, {"error": "service_unavailable", "error_description": "down"}),
+            ("504_gateway_timeout", 504, {"error": "gateway_timeout", "error_description": "slow"}),
+        ]
+    )
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_whole_request_failures(
+        self,
+        _name: str,
+        status: int,
+        error_body: dict[str, str],
+        mock_session_fn: MagicMock,
+    ) -> None:
+        events = [_make_event()]
+        InstallV1Spy(mock_session_fn, [MockResponse(status_code=status, body=error_body)])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="fail")
+
+        assert result.status_code == status
+        assert result.error is not None
+        assert result.error["error"] == error_body["error"]
+        assert not result.succeeded()
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_partial_failure_mixed_results(self, mock_session_fn: MagicMock) -> None:
+        u_ok, u_drop, u_warn = str(uuid4()), str(uuid4()), str(uuid4())
+        events = [
+            _make_event(event_uuid=u_ok),
+            _make_event(event_uuid=u_drop, event="drop_me"),
+            _make_event(event_uuid=u_warn, event="warn_me"),
+        ]
+        body: dict[str, Any] = {
+            "results": {
+                u_ok: {"result": "ok"},
+                u_drop: {"result": "drop", "details": "quota"},
+                u_warn: {"result": "warning", "details": "sdk old"},
+            }
+        }
+        InstallV1Spy(mock_session_fn, [MockResponse(body=body)])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="partial")
+
+        assert result.status_code == 200
+        assert u_ok in result.ok
+        assert u_drop in result.dropped
+        assert u_warn in result.warnings
+        assert not result.retried
+        assert not result.succeeded()
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_auto_resubmit_retry_events(self, mock_session_fn: MagicMock, mock_sleep: MagicMock) -> None:
+        u_ok, u_retry = str(uuid4()), str(uuid4())
+        events = [
+            _make_event(event_uuid=u_ok),
+            _make_event(event_uuid=u_retry, event="retryable"),
+        ]
+        first_response = MockResponse(
+            body={
+                "results": {
+                    u_ok: {"result": "ok"},
+                    u_retry: {"result": "retry", "details": "busy"},
+                }
+            },
+            headers={"Retry-After": "2"},
+        )
+        second_response = MockResponse(
+            body={"results": {u_retry: {"result": "ok"}}},
+        )
+        spy = InstallV1Spy(mock_session_fn, [first_response, second_response])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="resub")
+
+        assert result.status_code == 200
+        assert result.succeeded()
+        assert set(result.ok) == {u_ok, u_retry}
+        assert not result.retried
+
+        assert len(spy.calls) == 2
+        mock_sleep.assert_called_once_with(2.0)
+
+        # Second request should have incremented attempt and only retry uuid.
+        second_headers = spy.calls[1]["headers"]
+        assert second_headers["PostHog-Attempt"] == "2"
+        assert second_headers["PostHog-Request-Id"] != spy.calls[0]["headers"]["PostHog-Request-Id"]
+        second_batch = spy.calls[1]["json"]["batch"]
+        assert len(second_batch) == 1
+        assert second_batch[0]["uuid"] == u_retry
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_bounded_retries_exhausted(self, mock_session_fn: MagicMock, mock_sleep: MagicMock) -> None:
+        u_retry = str(uuid4())
+        events = [_make_event(event_uuid=u_retry)]
+        persistent_retry = MockResponse(
+            body={"results": {u_retry: {"result": "retry"}}},
+            headers={"Retry-After": "1"},
+        )
+        InstallV1Spy(mock_session_fn, [persistent_retry, persistent_retry, persistent_retry])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="bounded", max_attempts=2)
+
+        assert result.status_code == 200
+        assert u_retry in result.retried
+        assert not result.succeeded()
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_retry_after_capped(self, mock_session_fn: MagicMock, mock_sleep: MagicMock) -> None:
+        u_retry = str(uuid4())
+        events = [_make_event(event_uuid=u_retry)]
+        resp1 = MockResponse(
+            body={"results": {u_retry: {"result": "retry"}}},
+            headers={"Retry-After": "9999"},
+        )
+        resp2 = MockResponse(body=_ok_results(u_retry))
+        InstallV1Spy(mock_session_fn, [resp1, resp2])
+
+        capture_batch_internal(events=events, token="tok", event_source="cap")
+
+        mock_sleep.assert_called_once_with(5.0)
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_headers_on_resubmit(self, mock_session_fn: MagicMock) -> None:
+        u_retry = str(uuid4())
+        events = [_make_event(event_uuid=u_retry)]
+        resp1 = MockResponse(
+            body={"results": {u_retry: {"result": "retry"}}},
+            headers={"Retry-After": "0"},
+        )
+        resp2 = MockResponse(body=_ok_results(u_retry))
+        spy = InstallV1Spy(mock_session_fn, [resp1, resp2])
+
+        with patch("posthog.api.capture.time.sleep"):
+            capture_batch_internal(events=events, token="tok", event_source="rh")
+
+        h1 = spy.calls[0]["headers"]
+        h2 = spy.calls[1]["headers"]
+        assert h1["PostHog-Attempt"] == "1"
+        assert h2["PostHog-Attempt"] == "2"
+        assert h1["PostHog-Request-Id"] != h2["PostHog-Request-Id"]
+        for h in (h1, h2):
+            assert "Authorization" in h
+            assert "PostHog-Sdk-Info" in h
+            assert "PostHog-Request-Timestamp" in h
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_transport_retry_adapter_mounted(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        events = [_make_event(event_uuid=uid)]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_batch_internal(events=events, token="tok", event_source="mount")
+
+        spy._mock_session.mount.assert_called_once()
+        args = spy._mock_session.mount.call_args
+        assert args[0][0] == EXPECTED_URL
+        adapter = args[0][1]
+        assert isinstance(adapter, HTTPAdapter)
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_all_drop_batch(self, mock_session_fn: MagicMock) -> None:
+        u1, u2 = str(uuid4()), str(uuid4())
+        events = [_make_event(event_uuid=u1), _make_event(event_uuid=u2)]
+        body: dict[str, Any] = {
+            "results": {
+                u1: {"result": "drop", "details": "quota"},
+                u2: {"result": "drop", "details": "restricted"},
+            }
+        }
+        InstallV1Spy(mock_session_fn, [MockResponse(body=body)])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="alldrop")
+
+        assert result.status_code == 200
+        assert not result.succeeded()
+        assert set(result.dropped) == {u1, u2}
+        assert not result.ok
+        assert not result.retried
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_mixed_retry_drop_warn_resubmits_only_retry(
+        self, mock_session_fn: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        u_drop, u_warn, u_retry = str(uuid4()), str(uuid4()), str(uuid4())
+        events = [
+            _make_event(event_uuid=u_drop),
+            _make_event(event_uuid=u_warn),
+            _make_event(event_uuid=u_retry),
+        ]
+        first_resp = MockResponse(
+            body={
+                "results": {
+                    u_drop: {"result": "drop"},
+                    u_warn: {"result": "warning"},
+                    u_retry: {"result": "retry"},
+                }
+            },
+            headers={"Retry-After": "0"},
+        )
+        second_resp = MockResponse(body={"results": {u_retry: {"result": "ok"}}})
+        spy = InstallV1Spy(mock_session_fn, [first_resp, second_resp])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="mix")
+
+        assert len(spy.calls) == 2
+        assert u_drop in result.dropped
+        assert u_warn in result.warnings
+        assert u_retry in result.ok
+        assert not result.retried
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_empty_results_map_marks_unaccounted(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        events = [_make_event(event_uuid=uid)]
+        InstallV1Spy(mock_session_fn, [MockResponse(body={"results": {}})])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="empty")
+
+        assert result.status_code == 200
+        assert uid in result.unaccounted
+        assert not result.ok
+        assert not result.succeeded()
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_non_json_200_body(self, mock_session_fn: MagicMock) -> None:
+        events = [_make_event()]
+        InstallV1Spy(mock_session_fn, [MockResponse(status_code=200, body=None, text="not json")])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="badjson")
+
+        assert result.status_code == 200
+        assert result.error is not None
+        assert result.error["error"] == "invalid_json"
+        assert not result.succeeded()
+
+    @parameterized.expand([("array_body", ["ok"]), ("results_not_object", {"results": ["ok"]})])
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_wrong_shaped_200_body_leaves_every_uuid_unaccounted(
+        self, _name: str, body: Any, mock_session_fn: MagicMock
+    ) -> None:
+        uid = str(uuid4())
+        InstallV1Spy(mock_session_fn, [MockResponse(status_code=200, body=body)])
+
+        result = capture_batch_internal(events=[_make_event(event_uuid=uid)], token="tok", event_source="badshape")
+
+        assert result.error is not None
+        assert result.error["error"] == "invalid_response"
+        assert result.unaccounted == [uid]
+        assert result.request_failures[0].event_count == 1
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_failure_after_a_partial_ack_counts_only_the_resubmitted_events(
+        self, mock_session_fn: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        u_ok, u_retry = str(uuid4()), str(uuid4())
+        events = [_make_event(event_uuid=u_ok), _make_event(event_uuid=u_retry, event="retryable")]
+        resp1 = MockResponse(body={"results": {u_ok: {"result": "ok"}, u_retry: {"result": "retry"}}})
+        resp2 = MockResponse(status_code=503, body={"error": "down"})
+        InstallV1Spy(mock_session_fn, [resp1, resp2])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="partial_then_down")
+
+        assert result.ok == [u_ok]
+        assert result.unaccounted == [u_retry]
+        assert result.request_failures == [
+            RequestFailure(lane="analytics", status_code=503, error={"error": "down"}, event_count=1)
+        ]
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_retry_without_retry_after_header(self, mock_session_fn: MagicMock, mock_sleep: MagicMock) -> None:
+        u_retry = str(uuid4())
+        events = [_make_event(event_uuid=u_retry)]
+        resp1 = MockResponse(
+            body={"results": {u_retry: {"result": "retry"}}},
+        )
+        resp2 = MockResponse(body=_ok_results(u_retry))
+        InstallV1Spy(mock_session_fn, [resp1, resp2])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="noheader")
+
+        assert result.succeeded()
+        mock_sleep.assert_not_called()
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_resubmit_preserves_envelope_metadata(self, mock_session_fn: MagicMock, mock_sleep: MagicMock) -> None:
+        u_retry = str(uuid4())
+        events = [_make_event(event_uuid=u_retry)]
+        resp1 = MockResponse(
+            body={"results": {u_retry: {"result": "retry"}}},
+            headers={"Retry-After": "0"},
+        )
+        resp2 = MockResponse(body=_ok_results(u_retry))
+        spy = InstallV1Spy(mock_session_fn, [resp1, resp2])
+
+        capture_batch_internal(
+            events=events,
+            token="tok",
+            event_source="envelope",
+            historical_migration=True,
+        )
+
+        body1 = spy.calls[0]["json"]
+        body2 = spy.calls[1]["json"]
+        assert body2["capture_internal"] is True
+        assert body2["historical_migration"] is True
+        assert body2["created_at"] == body1["created_at"]
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_max_attempts_one_means_no_resubmit(self, mock_session_fn: MagicMock) -> None:
+        u_retry = str(uuid4())
+        events = [_make_event(event_uuid=u_retry)]
+        resp = MockResponse(
+            body={"results": {u_retry: {"result": "retry"}}},
+            headers={"Retry-After": "0"},
+        )
+        spy = InstallV1Spy(mock_session_fn, [resp])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="noretry", max_attempts=1)
+
+        assert len(spy.calls) == 1
+        assert u_retry in result.retried
+        assert not result.succeeded()
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_drop_round1_retry_ok_round2_merged(self, mock_session_fn: MagicMock, mock_sleep: MagicMock) -> None:
+        u_drop, u_retry = str(uuid4()), str(uuid4())
+        events = [
+            _make_event(event_uuid=u_drop),
+            _make_event(event_uuid=u_retry),
+        ]
+        resp1 = MockResponse(
+            body={
+                "results": {
+                    u_drop: {"result": "drop", "details": "quota"},
+                    u_retry: {"result": "retry"},
+                }
+            },
+            headers={"Retry-After": "0"},
+        )
+        resp2 = MockResponse(body={"results": {u_retry: {"result": "ok"}}})
+        InstallV1Spy(mock_session_fn, [resp1, resp2])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="merge")
+
+        assert u_drop in result.dropped
+        assert u_retry in result.ok
+        assert not result.retried
+        assert result.results[u_drop]["result"] == "drop"
+        assert result.results[u_retry]["result"] == "ok"
+
+    @parameterized.expand(
+        [
+            ("unaccounted_uuid", {}, "unaccounted", False),
+            ("unknown_status", {"result": "new_fancy_status"}, "unaccounted", False),
+            ("drop", {"result": "drop"}, "dropped", False),
+            ("warning", {"result": "warning"}, "warnings", True),
+        ]
+    )
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_terminal_categorization(
+        self,
+        _name: str,
+        entry: dict[str, Any],
+        expected_bucket: str,
+        expect_succeeded: bool,
+        mock_session_fn: MagicMock,
+    ) -> None:
+        uid = str(uuid4())
+        events = [_make_event(event_uuid=uid)]
+        results = {uid: entry} if entry else {}
+        InstallV1Spy(mock_session_fn, [MockResponse(body={"results": results})])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="cat")
+
+        assert uid in getattr(result, expected_bucket)
+        assert result.succeeded() == expect_succeeded
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_transport_exception_returns_structured_error(self, mock_session_fn: MagicMock) -> None:
+        events = [_make_event()]
+        mock_session = MagicMock()
+        mock_session.post.side_effect = RequestsConnectionError("connection refused")
+        mock_session.mount = MagicMock()
+        mock_session_fn.return_value.__enter__.return_value = mock_session
+
+        result = capture_batch_internal(events=events, token="tok", event_source="transport")
+
+        assert result.status_code == 0
+        assert result.error is not None
+        assert result.error["error"] == "transport_error"
+        assert "connection refused" in result.error["error_description"]
+        assert not result.succeeded()
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_transport_failure_marks_events_unaccounted(self, mock_session_fn: MagicMock) -> None:
+        u1, u2 = str(uuid4()), str(uuid4())
+        events = [_make_event(event_uuid=u1), _make_event(event_uuid=u2)]
+        mock_session = MagicMock()
+        mock_session.post.side_effect = RequestsConnectionError("connection refused")
+        mock_session.mount = MagicMock()
+        mock_session_fn.return_value.__enter__.return_value = mock_session
+
+        result = capture_batch_internal(events=events, token="tok", event_source="unacct")
+
+        assert set(result.unaccounted) == {u1, u2}
+        assert not result.ok
+
+    @patch("posthog.api.capture.time.sleep")
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_request_submitted_metric_counts_each_attempt(
+        self, mock_session_fn: MagicMock, mock_sleep: MagicMock
+    ) -> None:
+        u_retry = str(uuid4())
+        events = [_make_event(event_uuid=u_retry)]
+        resp1 = MockResponse(body={"results": {u_retry: {"result": "retry"}}}, headers={"Retry-After": "0"})
+        resp2 = MockResponse(body=_ok_results(u_retry))
+        InstallV1Spy(mock_session_fn, [resp1, resp2])
+
+        before = CAPTURE_V1_REQUEST_SUBMITTED.labels(event_source="reqmetric", lane="analytics")._value.get()
+        capture_batch_internal(events=events, token="tok", event_source="reqmetric")
+        after = CAPTURE_V1_REQUEST_SUBMITTED.labels(event_source="reqmetric", lane="analytics")._value.get()
+
+        # Two HTTP POSTs: initial + one retry round.
+        assert after == before + 2
+
+    @parameterized.expand(
+        [("analytics", capture_batch_internal, "$pageview"), ("ai", capture_batch_ai_internal, "$ai_span")]
+    )
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_request_metrics_carry_the_lane(
+        self, lane: str, entry_point: Any, event_name: str, mock_session_fn: MagicMock
+    ) -> None:
+        InstallV1Spy(mock_session_fn, [MockResponse(status_code=503, body={"error": "down"})])
+        submitted = CAPTURE_V1_REQUEST_SUBMITTED.labels(event_source="lanemetric", lane=lane)
+        failed = CAPTURE_V1_REQUEST_FAILED.labels(event_source="lanemetric", status_code="503", lane=lane)
+        before = (submitted._value.get(), failed._value.get())
+
+        result = entry_point(events=[_make_event(event=event_name)], token="tok", event_source="lanemetric")
+
+        assert (submitted._value.get(), failed._value.get()) == (before[0] + 1, before[1] + 1)
+        assert result.request_failures == [
+            RequestFailure(lane=lane, status_code=503, error={"error": "down"}, event_count=1)
+        ]
+
+
+class TestParseRetryAfter(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("none", None, 0.0),
+            ("empty_string", "", 0.0),
+            ("zero", "0", 0.0),
+            ("positive", "2", 2.0),
+            ("float_value", "1.5", 1.5),
+            ("capped", "9999", 5.0),
+            ("negative_clamped", "-1", 0.0),
+            ("non_numeric_fallback", "garbage", 1.0),
+        ]
+    )
+    def test_parse_retry_after(self, _name: str, header: str | None, expected: float) -> None:
+        assert _parse_retry_after(header) == expected
+
+
+class TestCaptureInternal(SimpleTestCase):
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_single_event_wrapper(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        result = capture_internal(
+            token="tok",
+            event_name="single_test",
+            event_source="single",
+            distinct_id="u1",
+            event_uuid=uid,
+            session_id="s1",
+            window_id="w1",
+            options={"cookieless_mode": True},
+            properties={"custom": "val"},
+        )
+
+        assert result.status_code == 200
+        assert uid in result.ok
+
+        entry = spy.calls[0]["json"]["batch"][0]
+        assert entry["event"] == "single_test"
+        assert entry["distinct_id"] == "u1"
+        assert entry["uuid"] == uid
+        assert entry["session_id"] == "s1"
+        assert entry["window_id"] == "w1"
+        assert entry["options"]["cookieless_mode"] is True
+        assert entry["properties"]["custom"] == "val"
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_single_minimal(self, mock_session_fn: MagicMock) -> None:
+        InstallV1Spy(mock_session_fn, [MockResponse(body={"results": {}})])
+
+        result = capture_internal(
+            token="tok",
+            event_name="minimal",
+            event_source="min",
+            distinct_id="u1",
+        )
+        assert result.status_code == 200
+
+
+class TestCaptureInternalResult(SimpleTestCase):
+    def test_succeeded_true(self) -> None:
+        r = CaptureInternalResult(status_code=200, ok=["a", "b"])
+        assert r.succeeded()
+
+    @parameterized.expand(
+        [
+            ("error", {"error": {"error": "bad"}}, {}),
+            ("dropped", {}, {"dropped": ["a"]}),
+            ("retried", {}, {"retried": ["a"]}),
+            ("unaccounted", {}, {"unaccounted": ["a"]}),
+        ]
+    )
+    def test_succeeded_false(self, _name: str, kwargs: dict[str, Any], list_kwargs: dict[str, Any]) -> None:
+        r = CaptureInternalResult(status_code=200, **kwargs, **list_kwargs)
+        assert not r.succeeded()
+
+    def test_terminal_failures_includes_all_buckets(self) -> None:
+        r = CaptureInternalResult(
+            status_code=200,
+            results={
+                "a": {"result": "drop"},
+                "b": {"result": "retry"},
+                "c": {"result": "unaccounted"},
+            },
+            dropped=["a"],
+            retried=["b"],
+            unaccounted=["c"],
+        )
+        failures = r.terminal_failures()
+        assert set(failures.keys()) == {"a", "b", "c"}
+
+    def test_raise_for_status_on_error(self) -> None:
+        r = CaptureInternalResult(status_code=503, error={"error": "server_error", "error_description": "down"})
+        with self.assertRaises(CaptureInternalError) as ctx:
+            r.raise_for_status()
+        assert "whole-request failure" in str(ctx.exception)
+
+    def test_raise_for_status_names_a_partial_request_failure(self) -> None:
+        # A caller that reads "whole-request failure" resends everything and
+        # double-ingests the acked half; the message must say some events landed.
+        r = CaptureInternalResult(
+            status_code=0,
+            error={"error": "partial_request_failure", "error_description": "1 of 2 requests failed"},
+            ok=["a"],
+            unaccounted=["b"],
+            request_failures=[
+                RequestFailure(lane="ai", status_code=0, error={"error": "transport_error"}, event_count=1)
+            ],
+        )
+        with self.assertRaises(CaptureInternalError) as ctx:
+            r.raise_for_status()
+        assert "partial-request failure (ai 0)" in str(ctx.exception)
+        assert "1 events acked, 1 unaccounted" in str(ctx.exception)
+
+    @parameterized.expand(
+        [
+            (
+                "dropped_reason_left_out",
+                {"dropped": ["a"], "results": {"a": {"result": "drop", "details": "invalid_options"}}},
+                "1 dropped, 0 exhausted retries, 0 unaccounted",
+            ),
+            ("retried", {"retried": ["a"]}, "0 dropped, 1 exhausted retries, 0 unaccounted"),
+            ("unaccounted", {"unaccounted": ["a"]}, "0 dropped, 0 exhausted retries, 1 unaccounted"),
+        ]
+    )
+    def test_raise_for_status_on_partial_failure(self, _name: str, kwargs: dict[str, Any], totals: str) -> None:
+        r = CaptureInternalResult(status_code=200, **kwargs)
+        with self.assertRaises(CaptureInternalError) as ctx:
+            r.raise_for_status()
+        assert str(ctx.exception) == f"capture internal partial failure: {totals}"
+
+    def test_raise_for_status_noop_on_success(self) -> None:
+        r = CaptureInternalResult(status_code=200, ok=["a"])
+        r.raise_for_status()
+
+    @parameterized.expand(
+        [
+            (
+                "counts_per_reason",
+                [("drop", "invalid_options"), ("drop", "invalid_options"), ("drop", "missing_distinct_id")],
+                [("retry", "not_persisted")],
+                "drop/invalid_options=2, drop/missing_distinct_id=1, retry/not_persisted=1",
+            ),
+            (
+                "lists_every_reason",
+                [("drop", f"r{i}") for i in range(1, 7) for _ in range(7 - i)],
+                [("retry", "not_persisted"), ("retry", "rejected")],
+                "drop/r1=6, drop/r2=5, drop/r3=4, drop/r4=3, drop/r5=2, drop/r6=1, retry/not_persisted=1, retry/rejected=1",
+            ),
+            (
+                "cleans_reasons",
+                [("drop", "x" * 100), ("drop", "bad\nreason"), ("drop", "a\u2028b"), ("drop", None), ("drop", " ")],
+                [],
+                f"drop/unspecified=2, drop/ab=1, drop/badreason=1, drop/{'x' * 64}=1",
+            ),
+            ("nothing_lost", [], [], ""),
+        ]
+    )
+    def test_verdict_summary(
+        self,
+        _name: str,
+        dropped: list[tuple[str, str | None]],
+        retried: list[tuple[str, str | None]],
+        expected: str,
+    ) -> None:
+        results: dict[str, dict[str, Any]] = {}
+        for status, details in [*dropped, *retried]:
+            entry: dict[str, Any] = {"result": status}
+            if details is not None:
+                entry["details"] = details
+            results[str(uuid4())] = entry
+        uids = list(results)
+        r = CaptureInternalResult(
+            status_code=200, results=results, dropped=uids[: len(dropped)], retried=uids[len(dropped) :]
+        )
+        assert r.verdict_summary() == expected
+
+
+# --------------------------------------------------------------------------- #
+# Helpers for chunking tests
+# --------------------------------------------------------------------------- #
+
+
+def _make_realistic_event(index: int = 0, **overrides: Any) -> dict[str, Any]:
+    """Generate an event dict with realistic properties (5-10 fields)."""
+    uid = str(uuid4())
+    ev: dict[str, Any] = {
+        "event": f"test_event_{index % 5}",
+        "distinct_id": f"user-{index % 50}",
+        "event_uuid": uid,
+        "timestamp": datetime(2025, 6, 15, 12, 0, index % 60, tzinfo=UTC).isoformat(),
+        "session_id": f"sess-{index % 20}",
+        "properties": {
+            "url": f"https://app.example.com/page/{index}",
+            "referrer": "https://google.com",
+            "screen_width": 1920,
+            "screen_height": 1080,
+            "browser": "Chrome",
+            "os": "macOS",
+            "lib_version": "1.42.0",
+            "custom_metric": index * 3.14,
+        },
+    }
+    ev.update(overrides)
+    return ev
+
+
+def _make_batch(size: int) -> list[dict[str, Any]]:
+    return [_make_realistic_event(i) for i in range(size)]
+
+
+# --------------------------------------------------------------------------- #
+# Chunking orchestration tests
+# --------------------------------------------------------------------------- #
+
+
+class TestBatchChunking(SimpleTestCase):
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 200)
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_MAX_WORKERS", 8)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_small_batch_no_chunking(self, mock_session_fn: MagicMock) -> None:
+        events = _make_batch(200)
+        uuids = [e["event_uuid"] for e in events]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(*uuids))])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="small")
+
+        assert result.succeeded()
+        assert len(result.ok) == 200
+        assert len(spy.calls) == 1
+
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 200)
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_MAX_WORKERS", 8)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_boundary_201_triggers_chunking(self, mock_session_fn: MagicMock) -> None:
+        events = _make_batch(201)
+        uuids = [e["event_uuid"] for e in events]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(*uuids))])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="boundary")
+
+        assert result.succeeded()
+        assert len(result.ok) == 201
+        # 2 chunks: 200 + 1
+        assert len(spy.calls) == 2
+        batch_sizes = sorted(len(c["json"]["batch"]) for c in spy.calls)
+        assert batch_sizes == [1, 200]
+
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 200)
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_MAX_WORKERS", 8)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_large_batch_450_events_three_chunks(self, mock_session_fn: MagicMock) -> None:
+        events = _make_batch(450)
+        uuids = [e["event_uuid"] for e in events]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(*uuids))])
+
+        result = capture_batch_internal(events=events, token="tok", event_source="large")
+
+        assert result.succeeded()
+        assert len(result.ok) == 450
+        assert len(spy.calls) == 3
+        batch_sizes = sorted(len(c["json"]["batch"]) for c in spy.calls)
+        assert batch_sizes == [50, 200, 200]
+
+    @parameterized.expand(
+        [
+            ("transport_error_caller_uuids", RequestsConnectionError("connection refused"), True),
+            ("transport_error_generated_uuids", RequestsConnectionError("connection refused"), False),
+            ("worker_exception_caller_uuids", TypeError("Object of type set is not JSON serializable"), True),
+            ("worker_exception_generated_uuids", TypeError("Object of type set is not JSON serializable"), False),
+        ]
+    )
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 200)
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_MAX_WORKERS", 8)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_partial_chunk_failure_preserves_successful_chunks(
+        self, _name: str, failure: Exception, with_uuids: bool, mock_session_fn: MagicMock
+    ) -> None:
+        events = _make_batch(400)
+        if not with_uuids:
+            for ev in events:
+                del ev["event_uuid"]
+
+        def spy_post(url: str, **kwargs: Any) -> MockResponse:
+            batch = kwargs["json"]["batch"]
+            if any(e["properties"]["url"].endswith("/page/0") for e in batch):
+                return MockResponse(body=_ok_results(*[e["uuid"] for e in batch]))
+            raise failure
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = spy_post
+        mock_session.mount = MagicMock()
+        mock_session_fn.return_value.__enter__.return_value = mock_session
+
+        result = capture_batch_internal(events=events, token="tok", event_source="partial")
+
+        assert result.error is not None
+        assert result.error["error"] == "partial_request_failure"
+        assert len(result.ok) == 200
+        assert len(result.unaccounted) == 200
+        assert set(result.ok).isdisjoint(result.unaccounted)
+        assert all(result.results[uid] == {"result": "unaccounted"} for uid in result.unaccounted)
+        if with_uuids:
+            assert set(result.unaccounted) == {e["event_uuid"] for e in events[200:]}
+        else:
+            assert all("uuid" not in e for e in events)
+        with self.assertRaisesRegex(CaptureInternalError, "200 events acked, 200 unaccounted"):
+            result.raise_for_status()
+
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 200)
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_MAX_WORKERS", 8)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_all_chunks_fail(self, mock_session_fn: MagicMock) -> None:
+        events = _make_batch(400)
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = RequestsConnectionError("network down")
+        mock_session.mount = MagicMock()
+        mock_session_fn.return_value.__enter__.return_value = mock_session
+
+        result = capture_batch_internal(events=events, token="tok", event_source="allfail")
+
+        assert not result.succeeded()
+        assert result.error is not None
+        assert result.error["error"] == "transport_error"
+
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 200)
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_MAX_WORKERS", 8)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_chunked_results_merge_correctly(self, mock_session_fn: MagicMock) -> None:
+        events = _make_batch(400)
+        chunk1_uuids = [e["event_uuid"] for e in events[:200]]
+        chunk2_uuids = [e["event_uuid"] for e in events[200:]]
+
+        def spy_post(url: str, **kwargs: Any) -> MockResponse:
+            batch_uuids = [e["uuid"] for e in kwargs["json"]["batch"]]
+            results: dict[str, Any] = {}
+            for uid in batch_uuids:
+                if uid in chunk1_uuids:
+                    results[uid] = {"result": "ok"}
+                else:
+                    results[uid] = {"result": "drop", "details": "quota"}
+            return MockResponse(body={"results": results})
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = spy_post
+        mock_session.mount = MagicMock()
+        mock_session_fn.return_value.__enter__.return_value = mock_session
+
+        result = capture_batch_internal(events=events, token="tok", event_source="merge")
+
+        assert not result.succeeded()
+        assert len(result.ok) == 200
+        assert len(result.dropped) == 200
+        assert set(result.ok) == set(chunk1_uuids)
+        assert set(result.dropped) == set(chunk2_uuids)
+
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 200)
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_MAX_WORKERS", 8)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_chunked_historical_migration_flag_propagated(self, mock_session_fn: MagicMock) -> None:
+        events = _make_batch(201)
+        uuids = [e["event_uuid"] for e in events]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(*uuids))])
+
+        capture_batch_internal(events=events, token="tok", event_source="hist", historical_migration=True)
+
+        for call in spy.calls:
+            assert call["json"]["historical_migration"] is True
+            assert call["json"]["capture_internal"] is True
+
+    @parameterized.expand(
+        [
+            ("analytics_entry", "$pageview", "$ai_generation", False, EXPECTED_URL, EXPECTED_AI_URL),
+            ("ai_entry", "$ai_generation", "$pageview", True, EXPECTED_AI_URL, EXPECTED_URL),
+        ]
+    )
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 200)
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_MAX_WORKERS", 8)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_odd_event_in_a_large_batch_is_rerouted_and_the_rest_still_chunk_once(
+        self,
+        _name: str,
+        majority_name: str,
+        odd_name: str,
+        ai_lane: bool,
+        majority_url: str,
+        odd_url: str,
+        mock_session_fn: MagicMock,
+    ) -> None:
+        # 200 events on the entry point's lane fit one chunk; the 201st has a
+        # name from the other lane and must travel alone to the other URL
+        # rather than push the majority over the chunk boundary.
+        events = _make_batch(201)
+        for ev in events[:200]:
+            ev["event"] = majority_name
+        events[200]["event"] = odd_name
+        uuids = [e["event_uuid"] for e in events]
+        entry_point = capture_batch_ai_internal if ai_lane else capture_batch_internal
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(*uuids))])
+
+        result = entry_point(events=events, token="tok", event_source="mixed_lanes")
+
+        assert result.succeeded()
+        by_url = {call["url"]: [e["uuid"] for e in call["json"]["batch"]] for call in spy.calls}
+        assert set(by_url) == {majority_url, odd_url}
+        assert by_url[majority_url] == uuids[:200]
+        assert by_url[odd_url] == uuids[200:]
+
+
+class TestMergeResults(SimpleTestCase):
+    def test_merge_all_success(self) -> None:
+        r1 = CaptureInternalResult(status_code=200, results={"a": {"result": "ok"}}, ok=["a"])
+        r2 = CaptureInternalResult(status_code=200, results={"b": {"result": "ok"}}, ok=["b"])
+
+        merged = _merge_results([r1, r2])
+
+        assert merged.status_code == 200
+        assert merged.succeeded()
+        assert set(merged.ok) == {"a", "b"}
+        assert merged.error is None
+
+    def test_merge_with_one_error_reports_a_partial_request_failure(self) -> None:
+        failure = RequestFailure(lane="analytics", status_code=0, error={"error": "transport_error"}, event_count=1)
+        r1 = CaptureInternalResult(status_code=200, results={"a": {"result": "ok"}}, ok=["a"])
+        r2 = CaptureInternalResult(
+            status_code=0,
+            error={"error": "transport_error", "error_description": "timeout"},
+            unaccounted=["b"],
+            request_failures=[failure],
+        )
+
+        merged = _merge_results([r1, r2])
+
+        assert merged.status_code == 0
+        assert not merged.succeeded()
+        assert merged.ok == ["a"]
+        assert merged.unaccounted == ["b"]
+        assert merged.error == {
+            "error": "partial_request_failure",
+            "error_description": "1 of 2 requests failed; first: transport_error: timeout",
+        }
+        assert merged.request_failures == [failure]
+
+    def test_merge_where_every_request_failed_keeps_the_first_error(self) -> None:
+        r1 = CaptureInternalResult(status_code=503, error={"error": "service_unavailable", "error_description": "a"})
+        r2 = CaptureInternalResult(status_code=0, error={"error": "transport_error", "error_description": "b"})
+
+        merged = _merge_results([r1, r2])
+
+        assert merged.error == {"error": "service_unavailable", "error_description": "a"}
+        assert merged.status_code == 503
+
+    def test_merge_mixed_buckets(self) -> None:
+        r1 = CaptureInternalResult(
+            status_code=200,
+            results={"a": {"result": "ok"}, "b": {"result": "drop"}},
+            ok=["a"],
+            dropped=["b"],
+        )
+        r2 = CaptureInternalResult(
+            status_code=200,
+            results={"c": {"result": "warning"}, "d": {"result": "retry"}},
+            warnings=["c"],
+            retried=["d"],
+        )
+
+        merged = _merge_results([r1, r2])
+
+        assert merged.ok == ["a"]
+        assert merged.dropped == ["b"]
+        assert merged.warnings == ["c"]
+        assert merged.retried == ["d"]
+        assert set(merged.results.keys()) == {"a", "b", "c", "d"}
+
+
+class TestAiLaneRouting(SimpleTestCase):
+    """The wire lane follows the `$ai_` prefix, whichever entry point the caller used.
+
+    capture-ai drops a non-AI event per event as ``misrouted_event`` and the analytics
+    deployment would give an `$ai_*` event person processing, so a name on the wrong
+    entry point is rerouted, counted, and never lost.
+    """
+
+    @parameterized.expand(
+        [
+            ("$ai_generation",),
+            ("$ai_span",),
+            ("$ai_evaluation",),
+            # Prefixed but not a name capture may accept. Django routes on the
+            # prefix alone; capture is the authority on which names it admits.
+            ("$ai_custom_metric",),
+            ("$ai_",),
+        ]
+    )
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_ai_event_names_on_the_analytics_entry_point_go_to_the_ai_lane(
+        self, event_name: str, mock_session_fn: MagicMock
+    ) -> None:
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+        before = CAPTURE_V1_EVENTS_REROUTED.labels(event_source="src", from_lane="analytics")._value.get()
+
+        result = capture_batch_internal(
+            events=[_make_event(event=event_name, event_uuid=uid)], token="tok", event_source="src"
+        )
+
+        assert result.succeeded()
+        assert [c["url"] for c in spy.calls] == [EXPECTED_AI_URL]
+        after = CAPTURE_V1_EVENTS_REROUTED.labels(event_source="src", from_lane="analytics")._value.get()
+        assert after - before == 1
+
+    @parameterized.expand([("$pageview",), ("custom_event",), ("$identify",), ("ai_generation",), ("$AI_generation",)])
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_non_ai_event_names_on_the_ai_entry_point_go_to_the_analytics_lane(
+        self, event_name: str, mock_session_fn: MagicMock
+    ) -> None:
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+        before = CAPTURE_V1_EVENTS_REROUTED.labels(event_source="src", from_lane="ai")._value.get()
+
+        result = capture_batch_ai_internal(
+            events=[_make_event(event=event_name, event_uuid=uid)], token="tok", event_source="src"
+        )
+
+        assert result.succeeded()
+        assert [c["url"] for c in spy.calls] == [EXPECTED_URL]
+        after = CAPTURE_V1_EVENTS_REROUTED.labels(event_source="src", from_lane="ai")._value.get()
+        assert after - before == 1
+
+    @parameterized.expand([("analytics_entry", False), ("ai_entry", True)])
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_mixed_batch_is_split_by_name_and_results_merge_by_uuid(
+        self, _name: str, ai_lane: bool, mock_session_fn: MagicMock
+    ) -> None:
+        ai_uid, an_uid, ai_uid2 = str(uuid4()), str(uuid4()), str(uuid4())
+        events = [
+            _make_event(event="$ai_generation", event_uuid=ai_uid),
+            _make_event(event="$pageview", distinct_id="u2", event_uuid=an_uid),
+            _make_event(event="$ai_span", distinct_id="u3", event_uuid=ai_uid2),
+        ]
+        spy = InstallV1Spy(
+            mock_session_fn,
+            responses_by_url={
+                EXPECTED_URL: MockResponse(body=_ok_results(an_uid)),
+                EXPECTED_AI_URL: MockResponse(
+                    body={"results": {ai_uid: {"result": "ok"}, ai_uid2: {"result": "drop"}}}
+                ),
+            },
+        )
+        entry_point = capture_batch_ai_internal if ai_lane else capture_batch_internal
+
+        result = entry_point(events=events, token="tok", event_source="src")
+
+        by_url = {call["url"]: [e["uuid"] for e in call["json"]["batch"]] for call in spy.calls}
+        assert by_url == {EXPECTED_URL: [an_uid], EXPECTED_AI_URL: [ai_uid, ai_uid2]}
+        assert set(result.ok) == {an_uid, ai_uid}
+        assert result.dropped == [ai_uid2]
+        assert set(result.results) == {an_uid, ai_uid, ai_uid2}
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_a_single_lane_batch_makes_one_request_and_counts_no_reroute(self, mock_session_fn: MagicMock) -> None:
+        uid1, uid2 = str(uuid4()), str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid1, uid2))])
+        before = CAPTURE_V1_EVENTS_REROUTED.labels(event_source="src", from_lane="analytics")._value.get()
+
+        capture_batch_internal(
+            events=[_make_event(event_uuid=uid1), _make_event(distinct_id="u2", event_uuid=uid2)],
+            token="tok",
+            event_source="src",
+        )
+
+        assert [c["url"] for c in spy.calls] == [EXPECTED_URL]
+        after = CAPTURE_V1_EVENTS_REROUTED.labels(event_source="src", from_lane="analytics")._value.get()
+        assert after == before
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_historical_migration_travels_with_a_rerouted_ai_event(self, mock_session_fn: MagicMock) -> None:
+        # The flag rides the envelope unchanged; capture ignores it on the AI lane.
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_batch_internal(
+            events=[_make_event(event="$ai_generation", event_uuid=uid)],
+            token="tok",
+            event_source="src",
+            historical_migration=True,
+        )
+
+        assert spy.calls[0]["url"] == EXPECTED_AI_URL
+        assert spy.calls[0]["json"]["historical_migration"] is True
+
+    @parameterized.expand([("properties", ["invalid"]), ("options", "not-a-dict")])
+    @patch("posthog.api.capture.CAPTURE_INTERNAL_BATCH_CHUNK_SIZE", 1)
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_non_dict_event_field_is_rejected_before_any_chunk_publishes(
+        self, key: str, bad_value: Any, mock_session_fn: MagicMock
+    ) -> None:
+        # Normalization runs per chunk inside a worker; a field it cannot read must
+        # fail the whole batch up front, not after an earlier chunk already landed.
+        good_uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(good_uid))])
+        events = [
+            _make_event(event="$pageview", event_uuid=good_uid),
+            {**_make_event(event="$ai_generation", distinct_id="u2"), key: bad_value},
+        ]
+
+        with self.assertRaises(CaptureInternalError) as ctx:
+            capture_batch_internal(events=events, token="tok", event_source="src")
+
+        assert f"capture_internal (src, $ai_generation): {key} must be a dict" in str(ctx.exception)
+        assert spy.calls == []
+
+    @parameterized.expand(
+        [("same_lane", "$ai_generation", "$ai_span"), ("across_lanes", "$ai_generation", "$pageview")]
+    )
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_duplicate_uuids_in_one_batch_are_rejected_before_any_request(
+        self, _name: str, first_name: str, second_name: str, mock_session_fn: MagicMock
+    ) -> None:
+        # Results are keyed by uuid, so a duplicate would let one event's outcome
+        # overwrite the other's; across lanes the loser would vanish without a trace.
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+        events = [
+            _make_event(event=first_name, event_uuid=uid),
+            _make_event(event=second_name, distinct_id="u2", uuid=uid),
+        ]
+
+        with self.assertRaises(CaptureInternalError) as ctx:
+            capture_batch_ai_internal(events=events, token="tok", event_source="src")
+
+        assert f"capture_ai_internal (src): duplicate event_uuid {uid!r}" in str(ctx.exception)
+        assert spy.calls == []
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_both_lanes_of_a_mixed_batch_are_in_flight_at_the_same_time(self, mock_session_fn: MagicMock) -> None:
+        # A slow analytics deployment must not delay the AI request behind it.
+        ai_uid, an_uid = str(uuid4()), str(uuid4())
+        both_started = threading.Barrier(2, timeout=5)
+
+        def spy_post(url: str, **kwargs: Any) -> MockResponse:
+            both_started.wait()
+            return MockResponse(body=_ok_results(*[e["uuid"] for e in kwargs["json"]["batch"]]))
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = spy_post
+        mock_session.mount = MagicMock()
+        mock_session_fn.return_value.__enter__.return_value = mock_session
+        events = [
+            _make_event(event="$ai_generation", event_uuid=ai_uid),
+            _make_event(distinct_id="u2", event_uuid=an_uid),
+        ]
+
+        result = capture_batch_internal(events=events, token="tok", event_source="src")
+
+        assert result.succeeded(), "the barrier would have timed out if the lanes ran one after the other"
+        assert set(result.ok) == {ai_uid, an_uid}
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_one_lane_failing_leaves_the_other_lanes_events_acked(self, mock_session_fn: MagicMock) -> None:
+        ai_uid, an_uid = str(uuid4()), str(uuid4())
+
+        def spy_post(url: str, **kwargs: Any) -> MockResponse:
+            if url == EXPECTED_AI_URL:
+                raise RequestsConnectionError("capture-ai unreachable")
+            return MockResponse(body=_ok_results(an_uid))
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = spy_post
+        mock_session.mount = MagicMock()
+        mock_session_fn.return_value.__enter__.return_value = mock_session
+        events = [
+            _make_event(event="$ai_generation", event_uuid=ai_uid),
+            _make_event(distinct_id="u2", event_uuid=an_uid),
+        ]
+
+        result = capture_batch_internal(events=events, token="tok", event_source="src")
+
+        assert result.ok == [an_uid]
+        assert result.unaccounted == [ai_uid]
+        assert result.error is not None and result.error["error"] == "partial_request_failure"
+        assert [(rf.lane, rf.status_code, rf.event_count) for rf in result.request_failures] == [("ai", 0, 1)]
+        with self.assertRaises(CaptureInternalError) as ctx:
+            result.raise_for_status()
+        assert "partial-request failure (ai 0)" in str(ctx.exception)
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_a_rejected_event_stops_both_lanes_before_any_request(self, mock_session_fn: MagicMock) -> None:
+        # Validation runs over the whole batch before partitioning, so the AI
+        # half must not publish when the analytics half carries a bad event.
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results())])
+        events = [_make_event(event="$ai_generation"), _make_event(event="$snapshot", distinct_id="u2")]
+
+        with self.assertRaises(CaptureInternalError) as ctx:
+            capture_batch_ai_internal(events=events, token="tok", event_source="src")
+
+        assert "capture_ai_internal" in str(ctx.exception), "the error names the entry point the caller used"
+        assert spy.calls == []
+
+
+class TestCaptureAiInternal(SimpleTestCase):
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_posts_to_the_ai_endpoint(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        result = capture_ai_internal(
+            token="tok",
+            event_name="$ai_generation",
+            event_source="ai-src",
+            distinct_id="user-1",
+            event_uuid=uid,
+        )
+
+        assert result.succeeded()
+        assert len(spy.calls) == 1
+        assert spy.calls[0]["url"] == EXPECTED_AI_URL, "AI events must not go to the analytics deployment"
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_analytics_capture_still_posts_to_the_analytics_endpoint(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_internal(token="tok", event_name="$pageview", event_source="src", distinct_id="user-1", event_uuid=uid)
+
+        assert spy.calls[0]["url"] == EXPECTED_URL
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_batch_ai_posts_to_the_ai_endpoint(self, mock_session_fn: MagicMock) -> None:
+        uid1, uid2 = str(uuid4()), str(uuid4())
+        events = [
+            _make_event(event="$ai_generation", event_uuid=uid1),
+            _make_event(event="$ai_span", distinct_id="u2", event_uuid=uid2),
+        ]
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid1, uid2))])
+
+        result = capture_batch_ai_internal(events=events, token="tok", event_source="ai-src")
+
+        assert result.succeeded()
+        assert set(result.ok) == {uid1, uid2}
+        assert spy.calls[0]["url"] == EXPECTED_AI_URL
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_non_ai_name_on_the_ai_entry_point_posts_to_the_analytics_endpoint(
+        self, mock_session_fn: MagicMock
+    ) -> None:
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        result = capture_ai_internal(
+            token="tok", event_name="$pageview", event_source="src", distinct_id="user-1", event_uuid=uid
+        )
+
+        assert result.succeeded()
+        assert [c["url"] for c in spy.calls] == [EXPECTED_URL]
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_session_properties_move_to_top_level_fields_on_the_ai_lane(self, mock_session_fn: MagicMock) -> None:
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+
+        capture_ai_internal(
+            token="tok",
+            event_name="$ai_generation",
+            event_source="ai-src",
+            distinct_id="user-1",
+            event_uuid=uid,
+            properties={"$session_id": "s1", "$window_id": "w1", "$ai_model": "m"},
+        )
+
+        entry = spy.calls[0]["json"]["batch"][0]
+        assert (entry["session_id"], entry["window_id"]) == ("s1", "w1")
+        assert entry["properties"] == {"$geoip_disable": True, "$ai_model": "m"}
+
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_server_side_misrouted_drop_surfaces_per_event(self, mock_session_fn: MagicMock) -> None:
+        """Django routes on the prefix; capture applies its own predicate. A prefixed
+        name capture does not accept comes back as a per-event drop, not an error."""
+        uid = str(uuid4())
+        body = {"results": {uid: {"result": "drop", "details": "misrouted_event"}}}
+        InstallV1Spy(mock_session_fn, [MockResponse(body=body)])
+
+        result = capture_ai_internal(
+            token="tok",
+            event_name="$ai_custom_metric",
+            event_source="ai-src",
+            distinct_id="user-1",
+            event_uuid=uid,
+        )
+
+        assert not result.succeeded()
+        assert result.dropped == [uid]
+        assert result.results[uid]["details"] == "misrouted_event"
+        with self.assertRaises(CaptureInternalError):
+            result.raise_for_status()
+
+
+class TestLaneErrorMessages(SimpleTestCase):
+    """An error must name the entry point the caller actually used, or it sends them
+    looking at the wrong function."""
+
+    def test_analytics_lane_errors_name_capture_internal(self) -> None:
+        with self.assertRaises(CaptureInternalError) as ctx:
+            prepare_capture_internal_batch([_make_event()], token="", event_source="src")
+        assert "capture_internal (src)" in str(ctx.exception)
+        assert "capture_ai_internal" not in str(ctx.exception)
+
+    def test_ai_lane_errors_name_capture_ai_internal(self) -> None:
+        with self.assertRaises(CaptureInternalError) as ctx:
+            prepare_capture_internal_batch(
+                [_make_event(event="$ai_generation")], token="", event_source="src", ai_lane=True
+            )
+        assert "capture_ai_internal (src)" in str(ctx.exception)
+
+    def test_ai_lane_replay_rejection_names_the_ai_entry_point(self) -> None:
+        with self.assertRaises(CaptureInternalError) as ctx:
+            prepare_capture_internal_batch(
+                [_make_event(event="$snapshot")], token="tok", event_source="src", ai_lane=True
+            )
+        assert "capture_ai_internal" in str(ctx.exception)
+        assert "replay event" in str(ctx.exception)
+
+
+class TestLaneIsNotAPublicArgument(SimpleTestCase):
+    """Callers pick an entry point, never a lane flag.
+
+    The entry point names itself in error messages and decides which options the
+    call offers; a public lane flag would let a call site misreport both.
+    """
+
+    @parameterized.expand(
+        [
+            ("capture_internal", capture_internal),
+            ("capture_batch_internal", capture_batch_internal),
+            ("capture_ai_internal", capture_ai_internal),
+            ("capture_batch_ai_internal", capture_batch_ai_internal),
+        ]
+    )
+    def test_public_senders_take_no_lane_flag(self, name: str, fn: Any) -> None:
+        params = inspect.signature(fn).parameters
+        assert "ai_lane" not in params, f"{name} must not expose the lane as an argument"
+
+    @parameterized.expand(
+        [
+            ("capture_internal", capture_internal, EXPECTED_URL),
+            ("capture_ai_internal", capture_ai_internal, EXPECTED_AI_URL),
+        ]
+    )
+    @patch("posthog.api.capture.internal_requests_session")
+    def test_each_entry_point_reaches_exactly_one_lane(
+        self, name: str, fn: Any, expected_url: str, mock_session_fn: MagicMock
+    ) -> None:
+        uid = str(uuid4())
+        spy = InstallV1Spy(mock_session_fn, [MockResponse(body=_ok_results(uid))])
+        event_name = "$ai_generation" if "ai" in name.split("_") else "$pageview"
+
+        fn(token="tok", event_name=event_name, event_source="src", distinct_id="u1", event_uuid=uid)
+
+        assert spy.calls[0]["url"] == expected_url

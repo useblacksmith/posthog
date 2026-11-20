@@ -1,0 +1,1236 @@
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+from posthog.test.base import APIBaseTest
+from unittest.mock import patch
+
+from django.utils import timezone
+
+from parameterized import parameterized
+from rest_framework import status
+from rest_framework.response import Response
+
+from posthog.models.organization import OrganizationMembership
+
+from products.dashboards.backend.models.dashboard import Dashboard
+from products.dashboards.backend.models.dashboard_tile import DashboardTile
+from products.data_modeling.backend.facade.models import DataModelingJob, DataModelingJobEngine, DataWarehouseSavedQuery
+from products.data_warehouse.backend.models.team_data_warehouse_config import TeamDataWarehouseConfig
+from products.data_warehouse.backend.presentation.views.data_warehouse import _pipeline_stats_cache_key
+from products.warehouse_sources.backend.facade.models import (
+    DataWarehouseTable,
+    ExternalDataJob,
+    ExternalDataSchema,
+    ExternalDataSource,
+)
+
+_MW = "products.data_warehouse.backend.presentation.views.data_warehouse.managed_warehouse"
+
+
+class TestDataWarehouseAPI(APIBaseTest):
+    @parameterized.expand(
+        [
+            ("data_status", "managed-warehouse-data-status/"),
+            ("source_schemas", "managed-warehouse-source-schemas/?source_id=00000000-0000-0000-0000-000000000000"),
+        ]
+    )
+    def test_overview_endpoints_require_a_managed_warehouse_flag(self, _name: str, path: str) -> None:
+        with patch(
+            "products.data_warehouse.backend.presentation.views.data_warehouse.managed_warehouse.is_enabled",
+            return_value=False,
+        ):
+            response = self.client.get(f"/api/projects/{self.team.id}/data_warehouse/{path}")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @parameterized.expand(
+        [
+            ("onboarded", True, True),
+            ("not_onboarded", False, False),
+        ]
+    )
+    def test_ready_warehouse_reconciles_only_onboarded_project(
+        self, _name: str, team_onboarded: bool, expected_schedule: bool
+    ) -> None:
+        with (
+            patch(
+                "products.data_warehouse.backend.presentation.views.data_warehouse.managed_warehouse.status_for",
+                return_value=Response({"state": "ready"}, status=200),
+            ),
+            patch(
+                "products.data_warehouse.backend.presentation.views.data_warehouse.managed_warehouse.team_backfill_state",
+                return_value={"has_backfill": team_onboarded, "table_suffix": "prod" if team_onboarded else None},
+            ),
+            patch(
+                "products.data_warehouse.backend.presentation.views.data_warehouse.managed_warehouse.team_onboarding_state",
+                return_value={"team_onboarded": team_onboarded, "schema_name": "prod" if team_onboarded else None},
+            ),
+            patch(
+                "products.data_warehouse.backend.presentation.views.data_warehouse.managed_warehouse.ensure_direct_connection_tables"
+            ) as ensure_tables,
+        ):
+            response = self.client.get(f"/api/projects/{self.team.id}/data_warehouse/warehouse_status/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        if expected_schedule:
+            ensure_tables.assert_called_once_with(self.team.id, self.organization.id)
+        else:
+            ensure_tables.assert_not_called()
+
+    @parameterized.expand([("trino", "trino"), ("duckdb", "duckdb")])
+    def test_warehouse_status_presents_the_connection_for_the_variant(self, _name: str, variant: str) -> None:
+        views = "products.data_warehouse.backend.presentation.views.data_warehouse.managed_warehouse"
+        pgwire = {"host": "my-warehouse.dw.example.com", "port": 5432, "database": "ducklake", "username": "root"}
+        trino_status = {
+            "state": "ready",
+            "ready_at": "2026-09-01T12:00:00Z",
+            "connection": {
+                "host": "my-warehouse.dw.example.com",
+                "port": 443,
+                "catalog": "org_my_warehouse",
+                "username": "root",
+            },
+        }
+        with (
+            patch(f"{views}.status_for", return_value=Response({"state": "ready", "connection": pgwire}, status=200)),
+            patch(f"{views}.team_backfill_state", return_value={"has_backfill": True, "table_suffix": "prod"}),
+            patch(f"{views}.team_onboarding_state", return_value={"team_onboarded": True, "schema_name": "prod"}),
+            patch(f"{views}.ensure_direct_connection_tables"),
+            patch(f"{views}.data_ops_variant", return_value=variant),
+            patch(f"{views}.trino_status_for", return_value=trino_status) as mock_trino_status,
+        ):
+            response = self.client.get(f"/api/projects/{self.team.id}/data_warehouse/warehouse_status/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        if variant == "trino":
+            self.assertIsNone(body["connection"])
+            self.assertEqual(body["trino"], trino_status)
+            mock_trino_status.assert_called_once_with(self.organization.id)
+        else:
+            self.assertEqual(body["connection"], pgwire)
+            self.assertIsNone(body["trino"])
+            mock_trino_status.assert_not_called()
+
+    def test_warehouse_status_skips_the_trino_read_until_the_warehouse_is_ready(self) -> None:
+        views = "products.data_warehouse.backend.presentation.views.data_warehouse.managed_warehouse"
+        pgwire = {"host": "my-warehouse.dw.example.com", "port": 5432, "database": "ducklake", "username": "root"}
+        with (
+            patch(
+                f"{views}.status_for",
+                return_value=Response({"state": "provisioning", "connection": pgwire}, status=200),
+            ),
+            patch(f"{views}.team_backfill_state", return_value={"has_backfill": False, "table_suffix": None}),
+            patch(f"{views}.team_onboarding_state", return_value={"team_onboarded": False, "schema_name": None}),
+            patch(f"{views}.ensure_direct_connection_tables"),
+            patch(f"{views}.data_ops_variant", return_value="trino"),
+            patch(f"{views}.trino_status_for") as mock_trino_status,
+        ):
+            response = self.client.get(f"/api/projects/{self.team.id}/data_warehouse/warehouse_status/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        self.assertIsNone(body["connection"])
+        self.assertIsNone(body["trino"])
+        mock_trino_status.assert_not_called()
+
+    @patch("products.data_warehouse.backend.presentation.views.data_warehouse.execute_hogql_query")
+    def test_property_values_returns_results_with_cache_control(self, mock_execute_hogql_query):
+        table = DataWarehouseTable.objects.create(
+            name="sample_table",
+            format=DataWarehouseTable.TableFormat.Parquet,
+            team=self.team,
+            url_pattern="s3://bucket/sample_table",
+            columns={"name": "String"},
+        )
+
+        mock_execute_hogql_query.return_value = SimpleNamespace(results=[["alpha"], [["beta", "gamma"]], [True]])
+
+        response = self.client.get(
+            f"/api/projects/{self.team.id}/data_warehouse/property_values?key=name&table_name={table.name}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["results"],
+            [{"name": "alpha"}, {"name": "beta"}, {"name": "gamma"}, {"name": "true"}],
+        )
+        self.assertEqual(response["Cache-Control"], "max-age=10")
+
+    @patch("products.data_warehouse.backend.presentation.views.data_warehouse.BillingManager")
+    @patch("products.data_warehouse.backend.presentation.views.data_warehouse.get_cached_instance_license")
+    def test_basic_calculation_with_billing_data(self, mock_license, mock_billing_manager):
+        """trackedBillingRows from billing; pending = db_total - tracked; totalRows = tracked + pending"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/total_rows_stats"
+
+        mock_billing_manager.return_value.get_billing.return_value = {
+            "billing_period": {
+                "current_period_start": "2023-08-01T00:00:00Z",
+                "current_period_end": "2023-09-01T00:00:00Z",
+                "interval": "month",
+            },
+            "usage_summary": {"rows_synced": {"usage": 100}},
+        }
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="test", team=self.team, source=source)
+
+        job = ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            rows_synced=150,
+            billable=True,
+        )
+        ExternalDataJob.objects.filter(pk=job.pk).update(created_at=datetime(2023, 8, 15, tzinfo=UTC))
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["tracked_billing_rows"], 100)
+        self.assertEqual(data["pending_billing_rows"], 50)
+        self.assertEqual(data["total_rows"], 150)
+
+    @patch("products.data_warehouse.backend.presentation.views.data_warehouse.BillingManager")
+    @patch("products.data_warehouse.backend.presentation.views.data_warehouse.get_cached_instance_license")
+    def test_billing_exception_returns_500(self, mock_license, mock_billing_manager):
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/total_rows_stats"
+        mock_billing_manager.return_value.get_billing.side_effect = Exception("Billing service unavailable")
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(data["error"], "An error occurred retrieving billing information")
+
+    def test_job_stats_default_7_days(self):
+        """Test job_stats endpoint with default 7-day period"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/job_stats"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.COMPLETED,
+            rows_synced=100,
+            finished_at=timezone.now(),
+        )
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.FAILED,
+            rows_synced=0,
+            finished_at=timezone.now(),
+        )
+
+        DataModelingJob.objects.create(team=self.team, status=DataModelingJob.Status.COMPLETED, rows_materialized=50)
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["days"], 7)
+        self.assertEqual(data["total_jobs"], 3)
+        self.assertEqual(data["successful_jobs"], 2)
+        self.assertEqual(data["failed_jobs"], 1)
+        self.assertEqual(data["external_data_jobs"]["total"], 2)
+        self.assertEqual(data["external_data_jobs"]["successful"], 1)
+        self.assertEqual(data["external_data_jobs"]["failed"], 1)
+        self.assertEqual(data["modeling_jobs"]["total"], 1)
+        self.assertEqual(data["modeling_jobs"]["successful"], 1)
+        self.assertEqual(data["modeling_jobs"]["failed"], 0)
+        self.assertIn("breakdown", data)
+        self.assertIn("cutoff_time", data)
+
+    @parameterized.expand(
+        [
+            ("billing_limit_reached", ExternalDataJob.Status.BILLING_LIMIT_REACHED),
+            ("billing_limit_too_low", ExternalDataJob.Status.BILLING_LIMIT_TOO_LOW),
+        ]
+    )
+    def test_job_stats_counts_a_billing_stopped_run_as_failed(self, _name: str, job_status: str) -> None:
+        # A run billing stopped is not successful, so leaving it out of the failed count reports it
+        # as neither and the totals stop adding up.
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/job_stats"
+        source = ExternalDataSource.objects.create(
+            source_id="billing-id",
+            connection_id="conn-id",
+            destination_id="dest-id",
+            team=self.team,
+            source_type="Stripe",
+        )
+        schema = ExternalDataSchema.objects.create(name="charges", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=job_status,
+            rows_synced=0,
+            finished_at=timezone.now(),
+        )
+
+        data = self.client.get(endpoint).json()
+
+        self.assertEqual(data["external_data_jobs"]["total"], 1)
+        self.assertEqual(data["external_data_jobs"]["failed"], 1)
+        self.assertEqual(data["external_data_jobs"]["successful"], 0)
+        self.assertEqual(data["failed_jobs"], 1)
+
+    @parameterized.expand(
+        [
+            ("failed", ExternalDataSchema.Status.FAILED, "failed"),
+            ("billing_limit_reached", ExternalDataSchema.Status.BILLING_LIMIT_REACHED, "billing_limit"),
+            ("billing_limit_too_low", ExternalDataSchema.Status.BILLING_LIMIT_TOO_LOW, "billing_limit"),
+        ]
+    )
+    def test_data_health_issues_reports_a_stopped_sync(
+        self, _name: str, schema_status: str, expected_status: str
+    ) -> None:
+        # A sync billing stopped used to be absent from the health list entirely, so the one place
+        # that says why a pipeline stopped said nothing at all.
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/data_health_issues"
+        source = ExternalDataSource.objects.create(
+            source_id="health-id",
+            connection_id="conn-id",
+            destination_id="dest-id",
+            team=self.team,
+            source_type="Stripe",
+        )
+        ExternalDataSchema.objects.create(
+            name="charges",
+            team=self.team,
+            source=source,
+            should_sync=True,
+            status=schema_status,
+            latest_error="it broke",
+        )
+
+        results = self.client.get(endpoint).json()["results"]
+
+        syncs = [issue for issue in results if issue["type"] == "external_data_sync"]
+        self.assertEqual(len(syncs), 1)
+        self.assertEqual(syncs[0]["status"], expected_status)
+        self.assertEqual(syncs[0]["name"], "charges")
+        self.assertEqual(syncs[0]["error"], "it broke")
+        # The source scene keys on a prefixed id, so a bare UUID renders a broken page.
+        self.assertEqual(syncs[0]["url"], f"/data-warehouse/sources/managed-{source.id}")
+
+    def test_data_health_issues_reports_the_sync_type(self) -> None:
+        # A webhook table is pushed to, never pulled, so a caller about scheduled imports needs
+        # to tell it apart rather than calling it stopped.
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/data_health_issues"
+        source = ExternalDataSource.objects.create(
+            source_id="hook-id",
+            connection_id="conn-id",
+            destination_id="dest-id",
+            team=self.team,
+            source_type="Stripe",
+        )
+        ExternalDataSchema.objects.create(
+            name="messages",
+            team=self.team,
+            source=source,
+            should_sync=True,
+            status=ExternalDataSchema.Status.FAILED,
+            sync_type=ExternalDataSchema.SyncType.WEBHOOK,
+        )
+
+        results = self.client.get(endpoint).json()["results"]
+
+        syncs = [issue for issue in results if issue["type"] == "external_data_sync"]
+        self.assertEqual(len(syncs), 1)
+        self.assertEqual(syncs[0]["sync_type"], "webhook")
+
+    def test_completed_activity_filters_by_kind(self) -> None:
+        # Without a kind filter a team with many failing views fills every page with them, and a
+        # caller that only wants imports sees none of its own runs.
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+
+        both = self.client.get(f"{endpoint}?outcome=failed&kind=all").json()["results"]
+        imports = self.client.get(f"{endpoint}?outcome=failed&kind=import").json()["results"]
+        models = self.client.get(f"{endpoint}?outcome=failed&kind=model").json()["results"]
+
+        self.assertTrue(all(row["type"] != "Materialized view" for row in imports))
+        self.assertTrue(all(row["type"] == "Materialized view" for row in models))
+        self.assertEqual(len(both), len(imports) + len(models))
+
+    def test_completed_activity_all_outcome_returns_both(self) -> None:
+        # The ETL runs list shows every sync, not only the failures, so a caller needs one
+        # request that spans both rather than two it has to merge.
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+        source = ExternalDataSource.objects.create(
+            source_id="both-id",
+            connection_id="conn-id",
+            destination_id="dest-id",
+            team=self.team,
+            source_type="Stripe",
+        )
+        schema = ExternalDataSchema.objects.create(name="charges", team=self.team, source=source)
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=5, status="Completed"
+        )
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=0, status="Failed"
+        )
+
+        statuses = {row["status"] for row in self.client.get(f"{endpoint}?outcome=all").json()["results"]}
+
+        self.assertIn("Completed", statuses)
+        self.assertIn("Failed", statuses)
+
+    def test_completed_activity_reports_the_source_id(self) -> None:
+        # Without this the runs list cannot link a run back to its source.
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+        source = ExternalDataSource.objects.create(
+            source_id="link-id",
+            connection_id="conn-id",
+            destination_id="dest-id",
+            team=self.team,
+            source_type="Stripe",
+        )
+        schema = ExternalDataSchema.objects.create(name="charges", team=self.team, source=source)
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=5, status="Completed"
+        )
+
+        results = self.client.get(f"{endpoint}?outcome=completed&kind=import").json()["results"]
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source_id"], str(source.id))
+
+    def test_completed_activity_rejects_an_unknown_kind(self) -> None:
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+        response = self.client.get(f"{endpoint}?kind=nonsense")
+        self.assertEqual(response.status_code, 400)
+
+    def test_data_health_issues_links_a_failed_source_with_a_prefixed_id(self) -> None:
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/data_health_issues"
+        source = ExternalDataSource.objects.create(
+            source_id="broken-id",
+            connection_id="conn-id",
+            destination_id="dest-id",
+            team=self.team,
+            source_type="Stripe",
+            status=ExternalDataSource.Status.ERROR,
+        )
+
+        results = self.client.get(endpoint).json()["results"]
+
+        sources = [issue for issue in results if issue["type"] == "source"]
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["url"], f"/data-warehouse/sources/managed-{source.id}")
+
+    def test_data_health_issues_ignores_a_sync_that_is_switched_off(self) -> None:
+        # A table the user turned off is not a problem to report, however it last ended.
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/data_health_issues"
+        source = ExternalDataSource.objects.create(
+            source_id="off-id",
+            connection_id="conn-id",
+            destination_id="dest-id",
+            team=self.team,
+            source_type="Stripe",
+        )
+        ExternalDataSchema.objects.create(
+            name="charges",
+            team=self.team,
+            source=source,
+            should_sync=False,
+            status=ExternalDataSchema.Status.FAILED,
+        )
+
+        results = self.client.get(endpoint).json()["results"]
+
+        self.assertEqual([issue for issue in results if issue["type"] == "external_data_sync"], [])
+
+    @parameterized.expand(
+        [
+            ("failed", ExternalDataJob.Status.FAILED),
+            ("billing_limit_reached", ExternalDataJob.Status.BILLING_LIMIT_REACHED),
+            ("billing_limit_too_low", ExternalDataJob.Status.BILLING_LIMIT_TOO_LOW),
+        ]
+    )
+    def test_completed_activity_can_return_failed_runs(self, _name: str, job_status: str) -> None:
+        # Before this parameter, no endpoint listed failed runs across sources: running_activity
+        # is Running-only and this one was Completed-only, so a failure was visible only by
+        # opening each source in turn.
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+        source = ExternalDataSource.objects.create(
+            source_id="activity-id",
+            connection_id="conn-id",
+            destination_id="dest-id",
+            team=self.team,
+            source_type="Stripe",
+        )
+        schema = ExternalDataSchema.objects.create(name="charges", team=self.team, source=source)
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=job_status,
+            rows_synced=0,
+            finished_at=timezone.now(),
+        )
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.COMPLETED,
+            rows_synced=5,
+            finished_at=timezone.now(),
+        )
+
+        failed = self.client.get(f"{endpoint}?outcome=failed").json()["results"]
+        completed = self.client.get(endpoint).json()["results"]
+
+        self.assertEqual([run["status"] for run in failed], [job_status])
+        # The default is unchanged, so existing callers keep seeing only successful runs.
+        self.assertEqual([run["status"] for run in completed], [ExternalDataJob.Status.COMPLETED])
+
+    def test_completed_activity_rejects_an_unknown_outcome(self) -> None:
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+
+        response = self.client.get(f"{endpoint}?outcome=sideways")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_the_cache_key_separates_teams_windows_and_aggregates(self) -> None:
+        # The team is part of the key rather than a filter applied to a cached answer. A key that
+        # dropped it would serve one team another team's totals for the whole TTL.
+        self.assertNotEqual(_pipeline_stats_cache_key("job_stats", 1, 7), _pipeline_stats_cache_key("job_stats", 2, 7))
+        # Without the window, asking for 30 days right after 1 day returns the one-day answer.
+        self.assertNotEqual(_pipeline_stats_cache_key("job_stats", 1, 1), _pipeline_stats_cache_key("job_stats", 1, 30))
+        self.assertNotEqual(_pipeline_stats_cache_key("job_stats", 1), _pipeline_stats_cache_key("total_rows_stats", 1))
+
+    def test_job_stats_1_day_hourly_breakdown(self):
+        """Test job_stats endpoint with 1-day period returns hourly breakdown"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/job_stats"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.COMPLETED,
+            rows_synced=100,
+            finished_at=timezone.now(),
+        )
+
+        with self.assertNumQueries(11):
+            response = self.client.get(f"{endpoint}?days=1")
+            data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["days"], 1)
+        self.assertEqual(data["total_jobs"], 1)
+        self.assertEqual(len(data["breakdown"]), 24)
+
+    def test_job_stats_30_days(self):
+        """Test job_stats endpoint with 30-day period"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/job_stats"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.COMPLETED,
+            rows_synced=100,
+            finished_at=timezone.now() - timedelta(days=5),
+        )
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.FAILED,
+            rows_synced=0,
+            finished_at=timezone.now() - timedelta(days=10),
+        )
+
+        with self.assertNumQueries(11):
+            response = self.client.get(f"{endpoint}?days=30")
+            data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["days"], 30)
+        self.assertEqual(data["total_jobs"], 2)
+        self.assertEqual(data["successful_jobs"], 1)
+        self.assertEqual(data["failed_jobs"], 1)
+        self.assertEqual(len(data["breakdown"]), 30)
+
+    def test_job_stats_invalid_days_parameter(self):
+        """Test job_stats endpoint rejects invalid days parameter"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/job_stats"
+
+        response = self.client.get(f"{endpoint}?days=14")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Invalid days parameter", response.json()["error"])
+
+        response = self.client.get(f"{endpoint}?days=invalid")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Invalid days parameter", response.json()["error"])
+
+    def test_job_stats_excludes_old_jobs(self):
+        """Test job_stats endpoint only includes jobs within the specified time range"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/job_stats"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.COMPLETED,
+            rows_synced=100,
+            finished_at=timezone.now() - timedelta(days=3),
+        )
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.COMPLETED,
+            rows_synced=200,
+            finished_at=timezone.now() - timedelta(days=10),
+        )
+
+        response = self.client.get(f"{endpoint}?days=7")
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["total_jobs"], 1)
+        self.assertEqual(data["successful_jobs"], 1)
+
+    def test_job_stats_empty_state(self):
+        """Test job_stats endpoint with no jobs"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/job_stats"
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["total_jobs"], 0)
+        self.assertEqual(data["successful_jobs"], 0)
+        self.assertEqual(data["failed_jobs"], 0)
+        self.assertEqual(data["external_data_jobs"]["total"], 0)
+        self.assertEqual(data["modeling_jobs"]["total"], 0)
+        self.assertIn("breakdown", data)
+
+    def test_job_stats_breakdown_aggregation(self):
+        """Test job_stats breakdown correctly aggregates jobs by time period"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/job_stats"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        today_start = timezone.now().date()
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.COMPLETED,
+            rows_synced=100,
+            finished_at=today_start + timedelta(hours=2),
+        )
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk,
+            schema=schema,
+            team=self.team,
+            status=ExternalDataJob.Status.FAILED,
+            rows_synced=0,
+            finished_at=today_start + timedelta(hours=3),
+        )
+
+        modeling_job = DataModelingJob.objects.create(
+            team=self.team, status=DataModelingJob.Status.COMPLETED, rows_materialized=50
+        )
+        DataModelingJob.objects.filter(pk=modeling_job.pk).update(created_at=today_start + timedelta(hours=4))
+
+        with self.assertNumQueries(11):
+            response = self.client.get(f"{endpoint}?days=7")
+            data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["total_jobs"], 3)
+
+        today_key = str(today_start)
+        self.assertIn(today_key, data["breakdown"])
+        self.assertEqual(data["breakdown"][today_key]["successful"], 2)
+        self.assertEqual(data["breakdown"][today_key]["failed"], 1)
+
+    def test_running_activity_returns_only_running_jobs(self):
+        """Test running_activity endpoint returns only running jobs"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/running_activity"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=100, status="Running"
+        )
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=200, status="Completed"
+        )
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=300, status="Failed"
+        )
+
+        DataModelingJob.objects.create(team=self.team, status="Running", rows_materialized=50)
+        DataModelingJob.objects.create(team=self.team, status="Completed", rows_materialized=75)
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(data["results"]), 2)
+
+        statuses = [activity["status"] for activity in data["results"]]
+        self.assertTrue(all(status == "Running" for status in statuses))
+
+        types = [activity["type"] for activity in data["results"]]
+        self.assertIn("Stripe", types)
+        self.assertIn("Materialized view", types)
+
+    def test_activity_uses_pipeline_id_for_schema_less_jobs(self):
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        running_job = ExternalDataJob.objects.create(
+            pipeline=source, schema=None, team=self.team, status=ExternalDataJob.Status.RUNNING
+        )
+        completed_job = ExternalDataJob.objects.create(
+            pipeline=source, schema=None, team=self.team, status=ExternalDataJob.Status.COMPLETED
+        )
+
+        running_response = self.client.get(f"/api/projects/{self.team.id}/data_warehouse/running_activity?kind=import")
+        completed_response = self.client.get(
+            f"/api/projects/{self.team.id}/data_warehouse/completed_activity?kind=import"
+        )
+
+        self.assertEqual(running_response.json()["results"][0]["id"], str(running_job.id))
+        self.assertEqual(running_response.json()["results"][0]["source_id"], str(source.id))
+        self.assertEqual(completed_response.json()["results"][0]["id"], str(completed_job.id))
+        self.assertEqual(completed_response.json()["results"][0]["source_id"], str(source.id))
+
+    def test_completed_activity_returns_only_completed_jobs(self):
+        """Test completed_activity endpoint returns only jobs with status 'Completed'"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=100, status="Running"
+        )
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=200, status="Completed"
+        )
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=300, status="Failed"
+        )
+
+        DataModelingJob.objects.create(team=self.team, status="Running", rows_materialized=50)
+        DataModelingJob.objects.create(team=self.team, status="Completed", rows_materialized=75)
+        DataModelingJob.objects.create(team=self.team, status="Failed", rows_materialized=25)
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(data["results"]), 2)
+
+        statuses = [activity["status"] for activity in data["results"]]
+        self.assertTrue(all(status == "Completed" for status in statuses))
+
+        types = [activity["type"] for activity in data["results"]]
+        self.assertEqual(types.count("Stripe"), 1)
+        self.assertEqual(types.count("Materialized view"), 1)
+
+    def test_running_activity_pagination(self):
+        """Test running_activity endpoint pagination"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/running_activity"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        for i in range(5):
+            ExternalDataJob.objects.create(
+                pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=100 + i, status="Running"
+            )
+
+        response = self.client.get(f"{endpoint}?limit=2&offset=0")
+        first_page_data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(first_page_data["results"]), 2)
+        self.assertIsNotNone(first_page_data["next"])
+
+        response = self.client.get(f"{endpoint}?limit=2&offset=2")
+        second_page_data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(second_page_data["results"]), 2)
+
+    def test_completed_activity_pagination(self):
+        """Test completed_activity endpoint pagination"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        # Create 7 completed jobs and 3 failed jobs to test filtering and pagination
+        for i in range(10):
+            status = "Completed" if i < 7 else "Failed"
+            ExternalDataJob.objects.create(
+                pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=100 + i, status=status
+            )
+
+        response = self.client.get(f"{endpoint}?limit=3&offset=0")
+        first_page_data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(first_page_data["results"]), 3)
+        self.assertIsNotNone(first_page_data["next"])
+
+        response = self.client.get(f"{endpoint}?limit=3&offset=3")
+        second_page_data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(second_page_data["results"]), 3)
+
+    def test_running_activity_cutoff_days(self):
+        """Test running_activity endpoint respects cutoff_days parameter"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/running_activity"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=100, status="Running"
+        )
+
+        old_job = ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=200, status="Running"
+        )
+        ExternalDataJob.objects.filter(pk=old_job.pk).update(created_at=timezone.now() - timedelta(days=35))
+
+        response = self.client.get(f"{endpoint}?cutoff_days=30")
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(data["results"]), 1)
+        self.assertEqual(data["results"][0]["rows"], 100)
+
+        response = self.client.get(f"{endpoint}?cutoff_days=40")
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(data["results"]), 2)
+
+    def test_completed_activity_cutoff_days(self):
+        """Test completed_activity endpoint respects cutoff_days parameter"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=100, status="Completed"
+        )
+
+        old_job = ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=200, status="Failed"
+        )
+        ExternalDataJob.objects.filter(pk=old_job.pk).update(created_at=timezone.now() - timedelta(days=35))
+
+        response = self.client.get(f"{endpoint}?cutoff_days=30")
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(data["results"]), 1)
+        self.assertEqual(data["results"][0]["rows"], 100)
+
+    def test_running_activity_empty_state(self):
+        """Test running_activity endpoint with no running jobs"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/running_activity"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=100, status="Completed"
+        )
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(data["results"]), 0)
+
+    def test_completed_activity_empty_state(self):
+        """Test completed_activity endpoint with no completed jobs"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+
+        source = ExternalDataSource.objects.create(
+            source_id="test-id", connection_id="conn-id", destination_id="dest-id", team=self.team, source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(name="customers", team=self.team, source=source)
+
+        ExternalDataJob.objects.create(
+            pipeline_id=source.pk, schema=schema, team=self.team, rows_synced=100, status="Running"
+        )
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(data["results"]), 0)
+
+    def test_running_activity_ordering(self):
+        """Test running_activity endpoint returns results ordered by created_at DESC"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/running_activity"
+
+        for i in range(3):
+            DataModelingJob.objects.create(team=self.team, status="Running", rows_materialized=100 + i)
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        created_dates = [result["created_at"] for result in data["results"]]
+        self.assertEqual(created_dates, sorted(created_dates, reverse=True))
+
+    def test_completed_activity_ordering(self):
+        """Test completed_activity endpoint returns results ordered by created_at DESC"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+
+        for i in range(3):
+            status = "Completed" if i % 2 == 0 else "Failed"
+            DataModelingJob.objects.create(team=self.team, status=status, rows_materialized=100 + i)
+
+        response = self.client.get(endpoint)
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        created_dates = [result["created_at"] for result in data["results"]]
+        self.assertEqual(created_dates, sorted(created_dates, reverse=True))
+
+    def test_running_activity_invalid_parameters(self):
+        """Test running_activity endpoint rejects invalid parameters"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/running_activity"
+
+        response = self.client.get(f"{endpoint}?limit=invalid")
+        self.assertEqual(response.status_code, 400)
+
+        response = self.client.get(f"{endpoint}?offset=invalid")
+        self.assertEqual(response.status_code, 400)
+
+        response = self.client.get(f"{endpoint}?cutoff_days=invalid")
+        self.assertEqual(response.status_code, 400)
+
+    def test_completed_activity_invalid_parameters(self):
+        """Test completed_activity endpoint rejects invalid parameters"""
+        endpoint = f"/api/projects/{self.team.id}/data_warehouse/completed_activity"
+
+        response = self.client.get(f"{endpoint}?limit=invalid")
+        self.assertEqual(response.status_code, 400)
+
+        response = self.client.get(f"{endpoint}?offset=invalid")
+        self.assertEqual(response.status_code, 400)
+
+        response = self.client.get(f"{endpoint}?cutoff_days=invalid")
+        self.assertEqual(response.status_code, 400)
+
+    def test_data_ops_dashboard_creates_dashboard_on_first_call(self):
+        endpoint = f"/api/projects/{self.team.pk}/data_warehouse/data_ops_dashboard"
+
+        self.assertFalse(TeamDataWarehouseConfig.objects.filter(team=self.team).exists())
+
+        response = self.client.get(endpoint)
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn("dashboard_id", data)
+        self.assertIsNotNone(data["dashboard_id"])
+
+        dashboard = Dashboard.objects.get(id=data["dashboard_id"])
+        self.assertEqual(dashboard.team_id, self.team.pk)
+        self.assertEqual(dashboard.name, "Data ops overview")
+        self.assertEqual(dashboard.creation_mode, "template")
+
+        config = TeamDataWarehouseConfig.objects.get(team=self.team)
+        self.assertEqual(config.overview_dashboards.filter(id=data["dashboard_id"]).count(), 1)
+
+    def test_data_ops_dashboard_returns_existing_dashboard_on_subsequent_calls(self):
+        endpoint = f"/api/projects/{self.team.pk}/data_warehouse/data_ops_dashboard"
+
+        first_response = self.client.get(endpoint)
+        self.assertEqual(first_response.status_code, 200)
+        first_dashboard_id = first_response.json()["dashboard_id"]
+
+        second_response = self.client.get(endpoint)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(second_response.json()["dashboard_id"], first_dashboard_id)
+
+        self.assertEqual(Dashboard.objects.filter(team=self.team, name="Data ops overview").count(), 1)
+
+    def test_data_ops_dashboard_seeds_starter_tile(self):
+        endpoint = f"/api/projects/{self.team.pk}/data_warehouse/data_ops_dashboard"
+
+        response = self.client.get(endpoint)
+        self.assertEqual(response.status_code, 200)
+
+        dashboard_id = response.json()["dashboard_id"]
+        tiles = DashboardTile.objects.filter(dashboard_id=dashboard_id).select_related("insight")
+        self.assertEqual(tiles.count(), 1)
+
+        tile = tiles.first()
+        assert tile is not None
+        assert tile.insight is not None
+        source = tile.insight.query["source"]  # type: ignore[index]
+        self.assertEqual(source["kind"], "TrendsQuery")
+        self.assertEqual(source["trendsFilter"]["display"], "BoldNumber")
+        self.assertTrue(source["compareFilter"]["compare"])
+
+    def test_data_ops_dashboard_recreates_after_dashboard_deleted(self):
+        endpoint = f"/api/projects/{self.team.pk}/data_warehouse/data_ops_dashboard"
+
+        first_response = self.client.get(endpoint)
+        first_id = first_response.json()["dashboard_id"]
+
+        # Deleting the dashboard cascades and removes it from the M2M relationship automatically
+        Dashboard.objects.filter(id=first_id).delete()
+
+        second_response = self.client.get(endpoint)
+        self.assertEqual(second_response.status_code, 200)
+        new_id = second_response.json()["dashboard_id"]
+        self.assertNotEqual(new_id, first_id)
+        self.assertIsNotNone(new_id)
+
+
+class TestDataHealthIssuesPersonalAPIKey(APIBaseTest):
+    """Verify the data_health_issues action is reachable via personal API keys.
+
+    The custom action is not one of the default read actions, so without an explicit
+    `required_scopes` it returned None and rejected all personal API key access with a 403.
+    The action now declares `warehouse_view:read` + `external_data_source:read`, matching the
+    MCP tool definition, plus `batch_export:read` and `hog_function:read` since the response
+    also includes batch export and HogFunction names, ids, statuses, and error messages.
+    """
+
+    CONFIG_AUTO_LOGIN = False
+
+    ALL_REQUIRED_SCOPES = ["warehouse_view:read", "external_data_source:read", "batch_export:read", "hog_function:read"]
+
+    def _get(self, value: str):
+        return self.client.get(
+            f"/api/projects/{self.team.id}/data_warehouse/data_health_issues/",
+            headers={"authorization": f"Bearer {value}"},
+        )
+
+    @parameterized.expand(
+        [
+            ("all_read_scopes", ALL_REQUIRED_SCOPES),
+            ("wildcard", ["*"]),
+        ]
+    )
+    def test_allowed_with_required_scopes(self, _name, scopes):
+        value = self.create_personal_api_key_with_scopes(scopes)
+        response = self._get(value)
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert "results" in response.json()
+
+    @parameterized.expand(
+        [
+            # All four scopes are required; missing any one is insufficient.
+            ("only_warehouse_view", ["warehouse_view:read"]),
+            ("only_external_data_source", ["external_data_source:read"]),
+            ("only_batch_export", ["batch_export:read"]),
+            ("only_hog_function", ["hog_function:read"]),
+            ("missing_batch_export", ["warehouse_view:read", "external_data_source:read", "hog_function:read"]),
+            ("missing_hog_function", ["warehouse_view:read", "external_data_source:read", "batch_export:read"]),
+            ("unrelated_scope", ["insight:read"]),
+        ]
+    )
+    def test_rejected_without_all_required_scopes(self, _name, scopes):
+        value = self.create_personal_api_key_with_scopes(scopes)
+        response = self._get(value)
+        assert response.status_code == status.HTTP_403_FORBIDDEN, response.json()
+
+
+class TestHoglakeCredentialsPersonalAPIKeyScopes(APIBaseTest):
+    """GET and POST /hoglake_credentials share one route, and DRF gives the POST the GET's
+    action kwargs. The viewset's dangerously_get_required_scopes splits them, so a read-only
+    key can list but not mint a credential."""
+
+    CONFIG_AUTO_LOGIN = False
+
+    def setUp(self):
+        super().setUp()
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+    def _call(self, method: str, value: str):
+        return getattr(self.client, method)(
+            f"/api/projects/{self.team.id}/data_warehouse/hoglake_credentials/",
+            {"name": "laptop", "scope": "read"},
+            content_type="application/json",
+            headers={"authorization": f"Bearer {value}"},
+        )
+
+    @patch(f"{_MW}.list_hoglake_credentials", return_value=Response({"hoglake_credentials": []}))
+    @patch(f"{_MW}.create_hoglake_credential", return_value=Response({"client_id": "hlc_0"}, status=201))
+    def test_read_key_lists_but_cannot_create(self, create, list_):
+        value = self.create_personal_api_key_with_scopes(["warehouse_view:read"])
+
+        assert self._call("get", value).status_code == status.HTTP_200_OK
+        assert self._call("post", value).status_code == status.HTTP_403_FORBIDDEN
+        create.assert_not_called()
+
+    @patch(f"{_MW}.create_hoglake_credential", return_value=Response({"client_id": "hlc_0"}, status=201))
+    def test_write_key_creates(self, create):
+        value = self.create_personal_api_key_with_scopes(["warehouse_view:write"])
+
+        assert self._call("post", value).status_code == status.HTTP_201_CREATED
+        create.assert_called_once()
+
+
+class TestMyHoglakeCredentialsPersonalAPIKeyScopes(APIBaseTest):
+    """GET and POST /my_hoglake_credentials share one route, like /hoglake_credentials."""
+
+    CONFIG_AUTO_LOGIN = False
+
+    def _call(self, method: str, value: str):
+        return getattr(self.client, method)(
+            f"/api/projects/{self.team.id}/data_warehouse/my_hoglake_credentials/",
+            {"name": "laptop", "scope": "read", "team_ids": [self.team.id]},
+            content_type="application/json",
+            headers={"authorization": f"Bearer {value}"},
+        )
+
+    @patch(f"{_MW}.list_my_hoglake_credentials", return_value=Response({"hoglake_credentials": []}))
+    @patch(f"{_MW}.create_my_hoglake_credential", return_value=Response({"client_id": "hlc_0"}, status=201))
+    def test_read_key_lists_but_cannot_create(self, create, list_):
+        value = self.create_personal_api_key_with_scopes(["warehouse_view:read"])
+
+        assert self._call("get", value).status_code == status.HTTP_200_OK
+        assert self._call("post", value).status_code == status.HTTP_403_FORBIDDEN
+        create.assert_not_called()
+
+    @patch(f"{_MW}.create_my_hoglake_credential", return_value=Response({"client_id": "hlc_0"}, status=201))
+    def test_write_key_creates(self, create):
+        value = self.create_personal_api_key_with_scopes(["warehouse_view:write"])
+
+        assert self._call("post", value).status_code == status.HTTP_201_CREATED
+        create.assert_called_once()
+
+
+class TestDataHealthIssuesReadsTheNewestRun(APIBaseTest):
+    """What the failing-materializations panel reports.
+
+    The panel used to read `status` and `latest_error` on the saved query. Both are written only by
+    the retired v1 workflow, so on a converted team they hold whatever v1 last left there, or nothing
+    at all. The newest materialization run is the live signal.
+    """
+
+    def _view(self, name: str, **frozen) -> DataWarehouseSavedQuery:
+        return DataWarehouseSavedQuery.objects.create(
+            team=self.team,
+            name=name,
+            query={"kind": "HogQLQuery", "query": "SELECT 1 AS one"},
+            created_by=self.user,
+            is_materialized=True,
+            **frozen,
+        )
+
+    def _run(self, view, statuss, *, error=None, engine=DataModelingJobEngine.CLICKHOUSE, minutes_ago=0):
+        return DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=view,
+            status=statuss,
+            error=error,
+            engine=engine,
+            rows_materialized=0,
+            last_run_at=timezone.now() - timedelta(minutes=minutes_ago),
+        )
+
+    def _reported(self) -> dict[str, dict]:
+        response = self.client.get(f"/api/projects/{self.team.id}/data_warehouse/data_health_issues/")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        return {r["name"]: r for r in response.json()["results"] if r["type"] == "materialized_view"}
+
+    def test_a_view_whose_newest_run_failed_is_reported_with_that_error(self):
+        view = self._view("orders", status=None, latest_error=None)
+        self._run(view, DataModelingJob.Status.FAILED, error="Memory limit exceeded")
+
+        reported = self._reported()
+
+        assert "orders" in reported
+        assert reported["orders"]["error"] == "Memory limit exceeded"
+
+    def test_a_view_that_recovered_is_not_reported_from_its_frozen_columns(self):
+        view = self._view("orders", status="Failed", latest_error="Ancient v1 error")
+        self._run(view, DataModelingJob.Status.FAILED, error="Ancient v1 error", minutes_ago=60)
+        self._run(view, DataModelingJob.Status.COMPLETED, minutes_ago=1)
+
+        assert "orders" not in self._reported()
+
+    def test_a_managed_warehouse_shadow_success_does_not_stand_in_for_the_serving_run(self):
+        view = self._view("orders")
+        self._run(view, DataModelingJob.Status.FAILED, error="Serving run failed", minutes_ago=10)
+        self._run(
+            view,
+            DataModelingJob.Status.COMPLETED,
+            engine=DataModelingJobEngine.MANAGED_WAREHOUSE,
+            minutes_ago=1,
+        )
+
+        reported = self._reported()
+
+        assert "orders" in reported
+        assert reported["orders"]["error"] == "Serving run failed"
+
+    def test_a_view_that_has_never_run_is_not_reported(self):
+        self._view("orders", status="Failed", latest_error="Ancient v1 error")
+
+        assert "orders" not in self._reported()

@@ -1,0 +1,14 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "date_from": {
+            "description": "Optional start date: an ISO 8601 timestamp (e.g. 2024-01-01T00:00:00Z) or a relative date such as -7d, -24h or -1m",
+            "type": "string"
+        },
+        "date_to": {
+            "description": "Optional end date: an ISO 8601 timestamp (e.g. 2024-01-31T23:59:59Z) or a relative date such as -1d",
+            "type": "string"
+        }
+    },
+    "type": "object"
+}

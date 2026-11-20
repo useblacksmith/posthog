@@ -1,0 +1,722 @@
+import hashlib
+import datetime as dt
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
+
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db import models, transaction
+from django.db.models.fields.json import KeyTransform
+from django.utils import timezone
+from django.utils.functional import Promise
+
+from posthog.models.activity_logging.model_activity import ModelActivityMixin
+from posthog.models.tagged_items_relation import Taggable
+from posthog.models.utils import UUIDModel
+
+# This model loads at django.setup() in every process; posthog.schema (the pydantic
+# models) is runtime-imported in the accessor that materializes the typed query.
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from posthog.schema import RecordingsQuery
+
+# Lives here, not in queries/scanner_candidate_query (which imports SETTLE_INTERVAL from this
+# module), so `initial_watermark`'s default callable never needs to import back up into the
+# query layer — models must stay a dependency leaf for the query layer, never the reverse.
+# 30-min inactivity timeout + 5-min merge-lag buffer.
+SETTLE_INTERVAL = dt.timedelta(minutes=35)
+
+
+def apply_experiment_targeting(query: "RecordingsQuery", targeting: dict | None) -> "RecordingsQuery":
+    """Set a recordings query's exposure filter from an `experiment_targeting` blob.
+
+    Shared by the scanner (live query) and the backfill snapshot (frozen copy of the blob), so the
+    two derive the exposure filter identically. No targeting *clears* the filter rather than leaving
+    it in place: a `query` blob saved before the write-guard (or with targeting later removed) can
+    still carry an `experiment_exposure` that nothing access-checks, and the sweep now runs the query
+    as the creator — so an untouched blob would run an exposure filter no one authorized.
+    """
+    from posthog.schema import RecordingsQueryExperimentExposureFilter  # noqa: PLC0415
+
+    exposure = None
+    if targeting and targeting.get("experiment_id") is not None:
+        exposure = RecordingsQueryExperimentExposureFilter(
+            experiment_id=targeting["experiment_id"],
+            variant=targeting.get("variant") or None,
+            variants=targeting.get("variants") or None,
+        )
+    # Shallow copy replacing only the one field: the caller's query is left untouched, and the
+    # unrelated nested filters are shared by reference rather than deep-copied since nothing mutates them.
+    return query.model_copy(update={"experiment_exposure": exposure})
+
+
+def config_experiment_scope(scanner_config: "dict | None") -> dict | None:
+    """The experiment scope carried inside an experiment scanner's `scanner_config`, or None.
+
+    Carries `balance_variants` and `start_on_launch` across under their scope names, so a scanner
+    that samples proportionally keeps doing so once the sampler reads the scope instead of the
+    config. Both are omitted at their default, because the mirror decides whether it owns a row's
+    scope by comparing the stored blob against a fresh derivation of it.
+    """
+    config = scanner_config if isinstance(scanner_config, dict) else {}
+    if config.get("experiment_id") is None:
+        return None
+    scope: dict = {"experiment_id": config["experiment_id"], "variants": config.get("variants")}
+    if config.get("balance_variants") is False:
+        scope["balance"] = False
+    if config.get("start_on_launch") is True:
+        scope["start_on_launch"] = True
+    return scope
+
+
+class ScannerType(models.TextChoices):
+    MONITOR = "monitor", "Monitor"
+    CLASSIFIER = "classifier", "Classifier"
+    SCORER = "scorer", "Scorer"
+    SUMMARIZER = "summarizer", "Summarizer"
+    EXPERIMENT = "experiment", "Experiment"
+
+
+class ScannerProvider(models.TextChoices):
+    GOOGLE = "google", "Google"
+
+
+class ScannerModel(models.TextChoices):
+    """Selectable models, cheapest first. Members must mirror `billing.GEMINI_MODELS`; when
+    Google supersedes a model, swap the member and remap existing scanners in a migration (see 0052)."""
+
+    GEMINI_3_5_FLASH_LITE = "gemini-3.5-flash-lite", "Gemini 3.5 Flash Lite"
+    GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview", "Gemini 3 Flash"
+    GEMINI_3_8_FLASH = "gemini-3.8-flash", "Gemini 3.8 Flash"
+
+
+def scanner_model_choices() -> list[tuple[str, str | Promise]]:
+    # Callable so growing the enum doesn't generate a no-op migration.
+    return list(ScannerModel.choices)
+
+
+class ScannerOrigin(models.TextChoices):
+    """Where a scanner's config came from, and therefore what the row is allowed to do."""
+
+    # Saved by a user: named, editable, listed, and swept on a schedule.
+    CONFIGURED = "configured", "Configured"
+    # Minted from a config passed inline to a one-off scan (see `inline_scan.py`). Never swept,
+    # never listed, not editable, and reaped once it has nothing to show.
+    INLINE = "inline", "Inline"
+
+
+class ScannerDisabledReason(models.TextChoices):
+    """Why a scanner is off. Null on an enabled scanner, and on one that was created off."""
+
+    MANUAL = "manual", "Turned off by a person"
+    FREE_CREDITS_USED = "free_credits_used", "Free credits used"
+    NO_AI_CONSENT = "no_ai_consent", "No AI consent"
+    CREATOR_LOST_ACCESS = "creator_lost_access", "Creator lost access"
+    EXPERIMENT_DELETED = "experiment_deleted", "Experiment deleted"
+
+
+class PromptValence(models.TextChoices):
+    """Whether the answer a monitor or scorer looks for is good or bad news for the team."""
+
+    GOOD = "good", "Good"
+    BAD = "bad", "Bad"
+    NEUTRAL = "neutral", "Neutral"
+
+
+def prompt_fingerprint(prompt: str) -> str:
+    """Identifies a prompt's text, so a condensed question can be matched to the prompt it came from."""
+    return hashlib.sha256(prompt.encode()).hexdigest()
+
+
+def initial_watermark() -> "datetime":
+    """A new scanner's sweep watermark, started one settle-interval back so its first sweep immediately picks up
+    recordings that have just cleared the settle window instead of a ~settle-interval cold start; it advances
+    forward normally from there, so there's no re-scan."""
+    return timezone.now() - SETTLE_INTERVAL
+
+
+def skipped_window_watermarks() -> dict[str, Any]:
+    """Watermark updates that move both sweep passes to now, so the window behind them is never swept or billed.
+
+    The deep pass walks from its own watermark up to the fast one, so it moves too, and both cursors are
+    cleared because they point partway into ground nobody swept.
+    """
+    watermark = initial_watermark()
+    return {
+        "last_swept_at": watermark,
+        "last_seen_session_id": "",
+        "deep_swept_through": watermark,
+        "deep_seen_session_id": "",
+    }
+
+
+class ReplayScannerManager(models.Manager["ReplayScanner"]):
+    """Fail-closed: `objects` is configured-only, so a new call site can't leak inline scanners.
+
+    Anything that presents, counts, edits, or sweeps a team's scanners wants exactly this. Reading
+    observations back is the one thing that doesn't; go through `scanner_access` for that rather than
+    naming `all_origins` yourself.
+    """
+
+    def get_queryset(self) -> "models.QuerySet[ReplayScanner]":
+        return super().get_queryset().filter(origin=ScannerOrigin.CONFIGURED)
+
+
+class SweepPauseReason(models.TextChoices):
+    CREDIT_LIMIT = "credit_limit", "Credit limit reached"
+    EXPERIMENT_NOT_RUNNING = "experiment_not_running", "Experiment not running"
+    FILTER_ERROR = "filter_error", "Filter cannot run"
+    NO_PRINCIPAL = "no_principal", "No creator to run the filter as"
+
+
+class ReplayScanner(Taggable, ModelActivityMixin, UUIDModel):
+    """A configured probe that gets applied to completed session recordings (see README)."""
+
+    # A scanner sends recordings to an LLM, so its removal stays visible after the row is gone.
+    activity_logging_on_delete = True
+
+    objects = ReplayScannerManager()
+    all_origins = models.Manager()
+
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+")
+    name = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Human-readable name, unique within the team. Empty for inline scanners, which aren't named.",
+    )
+    description = models.TextField(
+        blank=True,
+        default="",
+        help_text="Free-form description for the scanner management UI. Not used by the model.",
+    )
+    goal = models.TextField(
+        null=True,
+        blank=True,
+        help_text="The goal the creator typed or picked when an AI draft built this scanner, kept as written. Null for scanners built any other way.",
+    )
+
+    scanner_type = models.CharField(max_length=32, choices=ScannerType.choices)
+    scanner_config = models.JSONField(default=dict, help_text="Type-specific configuration; always includes `prompt`.")
+    query = models.JSONField(
+        default=dict,
+        help_text="Persisted `posthog.schema.RecordingsQuery` shape; date_from/date_to stripped on save.",
+    )
+    sampling_rate = models.FloatField(
+        default=1.0,
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text="0..1 random downsample applied after the query matches.",
+    )
+
+    provider = models.CharField(max_length=32, choices=ScannerProvider.choices, default=ScannerProvider.GOOGLE)
+    model = models.CharField(max_length=64, choices=scanner_model_choices)
+
+    enabled = models.BooleanField(
+        default=True,
+        help_text="When false, the reconciler removes the scanner's Temporal schedule. On-demand triggers still work.",
+    )
+    disabled_reason = models.CharField(
+        max_length=32,
+        choices=ScannerDisabledReason.choices,
+        null=True,
+        blank=True,
+        help_text="Why the scanner is off. Cleared whenever the scanner is turned on.",
+    )
+    emits_signals = models.BooleanField(default=False)
+
+    origin = models.CharField(
+        max_length=16,
+        choices=ScannerOrigin.choices,
+        default=ScannerOrigin.CONFIGURED,
+        db_default=ScannerOrigin.CONFIGURED,
+        help_text="Whether a user saved this scanner or an inline scan minted it. See `ScannerOrigin`.",
+    )
+    inline_key = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        db_default="",
+        help_text="Config fingerprint an inline scan resolves by. Empty for configured scanners.",
+    )
+
+    scanner_version = models.PositiveIntegerField(
+        default=1,
+        help_text="Increments on every config-changing save. Observations snapshot the version that produced them.",
+    )
+    last_swept_at = models.DateTimeField(
+        default=initial_watermark,
+        help_text="Watermark for the scanner schedule's last fire; mirrors Temporal schedule state for recovery.",
+    )
+    last_seen_session_id = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        db_default="",
+        help_text="Keyset tiebreaker; set when the last batch saturated so the next sweep resumes past session_end ties.",
+    )
+    deep_swept_through = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Watermark for the full-events-lookback catch-up pass; null until the first regular sweep seeds it.",
+    )
+    deep_seen_session_id = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        db_default="",
+        help_text="Keyset tiebreaker paired with deep_swept_through, because a watermark moved without its tiebreaker skips every session tied at that timestamp.",
+    )
+    deep_attempted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the deep pass last started; its cadence gates on this rather than on progress, so a cut-short pass still waits out its interval.",
+    )
+    primed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the one-off priming pass over recent recordings ran; null until the first sweep primes the scanner.",
+    )
+    sweep_read_bytes_by_hour = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Total ClickHouse read bytes per hour bucket (ISO hour -> bytes) across every pass, maintained by the read-metering workflow. Reporting only: each pass throttles on its own bucket.",
+    )
+    fast_read_bytes_by_hour = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="ClickHouse read bytes per hour bucket for the frequent sweep's own queries; drives its throttle, so backfill and catch-up reads do not stretch the cadence users see.",
+    )
+    deep_read_bytes_by_hour = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="ClickHouse read bytes per hour bucket for the deep catch-up pass only; drives its own cadence stretch independently of the frequent sweep.",
+    )
+    sweep_throttle_factor_override = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Manual cadence-stretch multiplier for the frequent sweep; overrides its computed read-budget throttle. 1 disables throttling; null means automatic. Does not affect the deep catch-up pass, which stretches on its own spend.",
+    )
+    sweep_throttle_factor = models.PositiveSmallIntegerField(
+        default=1,
+        db_default=1,
+        help_text="The frequent sweep's read-budget throttle factor as of the read meter's last run, without the override. Read by the reconciler to pick the sweep schedule's interval.",
+    )
+    last_found_candidates_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When a sweep last found sessions to scan. Scanners that rarely find any are swept less often.",
+    )
+    sweep_paused_until = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="The sweep schedule is removed until then, because the scanner cannot scan: credit limit reached, experiment not running, or a broken filter. Any save of the scanner clears it.",
+    )
+    sweep_pause_reason = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        db_default="",
+        choices=SweepPauseReason.choices,
+        help_text="Why the sweep was last paused. Kept past the pause, so the first sweep after it knows whether to skip the paused window.",
+    )
+
+    # Shape: ScannerExperimentTargetingSerializer. Stored because the compiled `query` speaks flag
+    # keys, so the experiment association isn't recoverable from it. Version-tracked, and every scan
+    # and estimate derives its exposure filter from it through `targeted_recordings_query`. Legacy:
+    # the experiment scanner type keeps its targeting in `scanner_config` instead (see
+    # `experiment_scope`).
+    experiment_targeting = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="The experiment this scanner's targeting watches, if any.",
+    )
+
+    # Nullable only until a backfill gives every row an explicit kind; after that a null scope is never a valid
+    # stored state, because "every session" is itself a kind and must be stated.
+    scope = models.JSONField(
+        null=True,
+        blank=True,
+        help_text='Which sessions the scanner watches and the label it gives each one, as `{"kind": ...}`.',
+    )
+
+    estimated_monthly_observations = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Latest projected observations/month for this scanner; enabled scanners are summed org-wide for the quota prognosis.",
+    )
+    estimated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the estimate was last computed. Refreshed on config saves and by the sweep when stale.",
+    )
+    estimate_attempted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When an estimate was last attempted, success or failure. Backs off the refresher on scanners whose estimate query keeps failing.",
+    )
+    filter_error = models.TextField(
+        null=True,
+        blank=True,
+        help_text="Why the scanner's recording filter cannot run, from the last sweep or estimate that tried it. Cleared when the filter changes or a sweep runs it.",
+    )
+    filter_error_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the filter error was recorded. Sweeps skip the scanner until it is a few hours old, then try the filter again.",
+    )
+
+    # Written with the prompt by every path that sets one, see `prompt_questions`; inline scanners keep only a
+    # built-in scan's question. Not version-tracked: it restates the prompt and changes nothing about how the scanner scans.
+    prompt_question = models.TextField(
+        blank=True,
+        default="",
+        db_default="",
+        help_text="The prompt condensed by AI into one question, shown above an observation's answer.",
+    )
+    prompt_question_source = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        db_default="",
+        help_text="`prompt_fingerprint` of the prompt `prompt_question` was condensed from. A mismatch means it is stale.",
+    )
+    # Condensed in the same model call as `prompt_question`, so `prompt_question_source` dates it too.
+    prompt_valence = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        db_default="",
+        choices=PromptValence.choices,
+        help_text="Whether a yes or a high score is good or bad news, judged by AI from the prompt. Empty when "
+        "not judged: the scanner type has no direction, or the model was unavailable.",
+    )
+
+    # Not "monthly": this resets with the org's billing period, which is only a calendar month
+    # until billing syncs a real one. See quota.current_period_bounds.
+    credit_limit = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1)],
+        help_text="Optional cap on this scanner's own credit spend per billing period. Null means no scanner-level cap.",
+    )
+    free_only = models.BooleanField(
+        default=False,
+        db_default=False,
+        help_text=(
+            "Run only while the organization has free credits left this billing period, so the scanner never adds "
+            "spend. When they run out it turns off with `disabled_reason` `free_credits_used`."
+        ),
+    )
+    limit_notified_period_start = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Billing period start this scanner was last reported as having reached its credit limit. Keeps the notification to one per period.",
+    )
+
+    # Admission budget cache: the spend aggregates snapshotted at the last refresh, plus credits
+    # admitted since. The fast admission path is one conditional UPDATE on these columns; the
+    # aggregates re-run under the row lock only when the cache is stale. See create_observation.
+    admission_budget_used = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="Credits counted against credit_limit at the last admission-budget refresh: settled receipts and in-flight reservations.",
+    )
+    admission_budget_refreshed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the admission budget was last recomputed from the spend aggregates. Null until the first capped admission.",
+    )
+    admission_budget_period_start = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Billing period the cached admission budget belongs to. A period mismatch forces a refresh.",
+    )
+    admission_credits_since_refresh = models.PositiveIntegerField(
+        default=0,
+        help_text="Credits admitted since the last admission-budget refresh. Every refresh resets this to the admitting cost, or to zero on a refusal.",
+    )
+
+    # A plain id rather than a foreign key, so that this product holds no constraint on the dashboards table.
+    dashboard_id = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="Dashboard created for this scanner from Replay Vision. Can point at a dashboard the user later deleted.",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        # FK traversal and cascades must still see inline scanners; only `objects` is fail-closed.
+        base_manager_name = "all_origins"
+        constraints = [
+            # Names are a configured-scanner concept; inline rows have none, and several unnamed
+            # rows per team must be allowed to coexist.
+            models.UniqueConstraint(
+                fields=["team", "name"],
+                condition=models.Q(origin=ScannerOrigin.CONFIGURED),
+                name="replay_scanner_unique_configured_team_name",
+            ),
+            # One inline scanner per team per config, so asking the same question twice reuses the
+            # observations it already has instead of minting a scanner per request.
+            models.UniqueConstraint(
+                fields=["team", "inline_key"],
+                condition=models.Q(origin=ScannerOrigin.INLINE),
+                name="replay_scanner_unique_team_inline_key",
+            ),
+            # The discriminator and the fingerprint have to agree, or `configured()` and the inline
+            # lookup would disagree about the same row.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(origin=ScannerOrigin.CONFIGURED, inline_key="")
+                    | (models.Q(origin=ScannerOrigin.INLINE) & ~models.Q(inline_key=""))
+                ),
+                name="replay_scanner_inline_key_matches_origin",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(sampling_rate__gte=0.0) & models.Q(sampling_rate__lte=1.0),
+                name="replay_scanner_sampling_rate_range",
+            ),
+            # A stray 0 would read as "block every observation" to the quota check, and be
+            # indistinguishable from an unset cap. NULL stays valid: it means no scanner-level cap.
+            models.CheckConstraint(
+                condition=models.Q(credit_limit__isnull=True) | models.Q(credit_limit__gte=1),
+                name="replay_scanner_credit_limit_positive",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["team", "enabled"], name="rl_team_enabled_idx"),
+            # Serves the reaper's scan for inline scanners that never produced an observation.
+            models.Index(
+                fields=["created_at"],
+                name="rl_inline_created_idx",
+                condition=models.Q(origin=ScannerOrigin.INLINE),
+            ),
+            # Serves "which scanners watch experiment N" for the experiment page and the launch receiver.
+            # Partial on `scope` alone, never on a kind: callers filter on the id, and an equality on the id
+            # implies `scope IS NOT NULL`, so the planner still uses it. Most scanners have no scope, which
+            # makes this index a fraction of the full one's size for the same plan.
+            models.Index(
+                KeyTransform("experiment_id", "scope"),
+                name="rl_scope_experiment_idx",
+                condition=models.Q(scope__isnull=False),
+            ),
+        ]
+
+    _VERSION_TRACKED_FIELDS = (
+        "scanner_type",
+        "scanner_config",
+        "query",
+        "experiment_targeting",
+        "scope",
+        "sampling_rate",
+        "provider",
+        "model",
+        "emits_signals",
+    )
+    # Fields the persisted volume estimate is computed from; changing them marks the estimate stale.
+    _ESTIMATE_FIELDS = frozenset({"query", "experiment_targeting", "scope", "sampling_rate"})
+
+    # Written by sweeps and the read meter through queryset updates; a stale full save must not clobber them.
+    _MACHINE_OWNED_FIELDS = (
+        "estimate_attempted_at",
+        "filter_error",
+        "filter_error_at",
+        "last_swept_at",
+        "last_seen_session_id",
+        "deep_swept_through",
+        "deep_seen_session_id",
+        "deep_attempted_at",
+        "sweep_read_bytes_by_hour",
+        "fast_read_bytes_by_hour",
+        "deep_read_bytes_by_hour",
+        "sweep_throttle_factor",
+        "last_found_candidates_at",
+        "sweep_pause_reason",
+        "limit_notified_period_start",
+        "admission_budget_used",
+        "admission_budget_refreshed_at",
+        "admission_budget_period_start",
+        "admission_credits_since_refresh",
+    )
+
+    def save(self, *args, **kwargs) -> None:
+        # Any save can be the edit that unblocks a paused sweep, such as a raised credit limit or a fixed
+        # filter, so it resumes the sweep. The reconciler then recreates the schedule and it fires at once.
+        self.sweep_paused_until = None
+        # Mirrored here rather than in the serializer, because the scout writer and the MaxTool
+        # layer both save scanners without one. Must run before the version comparison below, so
+        # a scope that moves with its source store bumps `scanner_version`.
+        update_fields = kwargs.get("update_fields")
+        mirrored = self._mirror_scope_from_legacy_stores(update_fields)
+        if update_fields is not None:
+            update_fields = [*update_fields, "sweep_paused_until", *(["scope"] if mirrored else [])]
+            kwargs["update_fields"] = update_fields
+            relevant = [f for f in self._VERSION_TRACKED_FIELDS if f in update_fields]
+            track_enabled = "enabled" in update_fields
+        else:
+            relevant = list(self._VERSION_TRACKED_FIELDS)
+            track_enabled = True
+        # `_state.adding`, not `self.pk` — UUIDModel assigns the pk in __init__, so pk is truthy even on creates.
+        if not self._state.adding and (relevant or track_enabled):
+            # SELECT FOR UPDATE so concurrent saves can't both bump scanner_version from the same baseline.
+            with transaction.atomic():
+                old = (
+                    # By-pk, so it must resolve whatever origin the row is; `objects` would miss inline rows.
+                    type(self)
+                    .all_origins.select_for_update()
+                    .filter(pk=self.pk)
+                    .only("scanner_version", "enabled", *self._MACHINE_OWNED_FIELDS, *relevant)
+                    .first()
+                )
+                if old is not None:
+                    if update_fields is None:
+                        for field in self._MACHINE_OWNED_FIELDS:
+                            setattr(self, field, getattr(old, field))
+                    changed = {f for f in relevant if getattr(old, f) != getattr(self, f)}
+                    extra_fields = []
+                    if changed:
+                        self.scanner_version = old.scanner_version + 1
+                        extra_fields.append("scanner_version")
+                    estimate_stale = bool(changed & self._ESTIMATE_FIELDS)
+                    if not estimate_stale and "scanner_config" in changed:
+                        # The experiment type keeps its targeting in scanner_config, so a scope
+                        # change there moves the estimate the way an experiment_targeting change
+                        # does; a prompt-only config edit does not.
+                        estimate_stale = old.experiment_scope() != self.experiment_scope()
+                    if estimate_stale:
+                        # A config edit must not wait out a backoff the old config earned.
+                        self.estimated_at = None
+                        self.estimate_attempted_at = None
+                        # The filter changed, so the old filter's error no longer applies.
+                        self.filter_error = None
+                        self.filter_error_at = None
+                        extra_fields.extend(
+                            ["estimated_at", "estimate_attempted_at", "filter_error", "filter_error_at"]
+                        )
+                    if track_enabled and not old.enabled and self.enabled:
+                        # Re-enabling restarts the sweep from now — don't backfill (and bill) the disabled gap.
+                        self.last_swept_at = initial_watermark()
+                        self.last_seen_session_id = ""
+                        # The deep pass sweeps from this watermark up to the fast one, so leaving it
+                        # behind would make its first window span the whole disabled gap.
+                        self.deep_swept_through = self.last_swept_at
+                        self.deep_seen_session_id = ""
+                        self.disabled_reason = None
+                        extra_fields.extend(
+                            [
+                                "last_swept_at",
+                                "last_seen_session_id",
+                                "deep_swept_through",
+                                "deep_seen_session_id",
+                                "disabled_reason",
+                            ]
+                        )
+                    if track_enabled and old.enabled and not self.enabled and self.disabled_reason is None:
+                        self.disabled_reason = ScannerDisabledReason.MANUAL
+                        extra_fields.append("disabled_reason")
+                    if update_fields is not None and extra_fields:
+                        kwargs["update_fields"] = [*update_fields, *extra_fields]
+                super().save(*args, **kwargs)
+            return
+        super().save(*args, **kwargs)
+
+    def turn_off(self, reason: ScannerDisabledReason) -> None:
+        """Turn the scanner off and record why, so the owner sees the cause instead of a bare "Off"."""
+        # nosemgrep: semgrep.rules.security.replay-vision-alert-state-direct-mutation — disables a ReplayScanner, not an alert; scanners have no state machine.
+        self.enabled = False
+        self.disabled_reason = reason
+        self.save(update_fields=["enabled", "disabled_reason", "updated_at"])
+
+    def recordings_query(self) -> "RecordingsQuery":
+        """The persisted candidate filter; an empty `query` parses as a bare RecordingsQuery."""
+        from posthog.schema import RecordingsQuery  # noqa: PLC0415
+
+        return RecordingsQuery.model_validate(self.query or {"kind": "RecordingsQuery"})
+
+    def experiment_scope(self) -> dict | None:
+        """The experiment this scanner watches, wherever it is stored.
+
+        The experiment scanner type keeps `experiment_id` and `variants` in `scanner_config`; the
+        other types use the legacy `experiment_targeting` column. Both stores are access-checked on
+        write and redacted on read, so this is the one place code may read a scanner's experiment.
+
+        Still reads the older stores directly, not `scope`: callers here consume the legacy shape,
+        including the singular `variant` that the scope shape folds into `variants`. `scope_for` is
+        the reader for new code.
+        """
+        if self.scanner_type == ScannerType.EXPERIMENT:
+            return config_experiment_scope(self.scanner_config)
+        return self.experiment_targeting
+
+    _SCOPE_SOURCE_FIELDS = frozenset({"scanner_type", "scanner_config", "experiment_targeting"})
+
+    def _mirror_scope_from_legacy_stores(self, update_fields: "Iterable[str] | None" = None) -> bool:
+        """Track the `scope` column to whichever older store holds this scanner's experiment.
+
+        The mirror follows its source store in every direction, so a retarget moves the scope and a
+        cleared targeting clears it. A stale scope would outlive the edit, and the readout and
+        access checks that move onto `scope` would then gate on an experiment the scanner no longer
+        watches.
+
+        A scope that matches no older store is left alone: it was set directly, which is how the
+        API writes one once it accepts a scope as input.
+
+        A partial save that persists none of the source fields leaves `scope` alone and returns
+        False. Such a save keeps whatever the row already holds, and this instance can be older
+        than the row: a sweep that loaded the scanner before a retarget would otherwise write the
+        experiment it still holds in memory over the one the row now targets.
+        """
+        from products.replay_vision.backend.scope.load import derive_scope  # noqa: PLC0415
+
+        if update_fields is not None and not (self._SCOPE_SOURCE_FIELDS & set(update_fields)):
+            return False
+        derived = derive_scope(self)
+        if derived is None and not self._scope_came_from_a_legacy_store():
+            return False
+        self.scope = derived
+        return True
+
+    def _scope_came_from_a_legacy_store(self) -> bool:
+        """Whether the stored `scope` is this row's own mirror of an older store.
+
+        Distinguishes a scope the mirror wrote, which must follow its source, from one set
+        directly, which the mirror must not clear.
+        """
+        from products.replay_vision.backend.scope.load import derive_scope  # noqa: PLC0415
+
+        if not isinstance(self.scope, dict):
+            return False
+        if self._state.adding:
+            return False
+        old = (
+            type(self)
+            .all_origins.filter(pk=self.pk)
+            .only("scanner_type", "scanner_config", "experiment_targeting")
+            .first()
+        )
+        return old is not None and derive_scope(old) == self.scope
+
+    def targeted_recordings_query(self) -> "RecordingsQuery":
+        """The query every scan and estimate must run: the persisted filter narrowed by the scope.
+
+        Narrowed here rather than persisted into `query` so the experiment can only ever enter
+        through the access-checked scope stores. The serializer rejects `experiment_exposure`
+        inside `query` for the same reason.
+
+        Reads through `scope_for`, so a scanner narrowed only by the `scope` column is filtered
+        the same as one still carrying a legacy store. Reading `experiment_scope()` here instead
+        would return None for that scanner and sweep every session its filters match.
+        """
+        from products.replay_vision.backend.scope.load import scope_for  # noqa: PLC0415
+
+        scope = scope_for(self)
+        query = self.recordings_query()
+        return scope.recordings_filter(query) if scope is not None else apply_experiment_targeting(query, None)
+
+    @property
+    def has_spend_ceiling(self) -> bool:
+        return self.credit_limit is not None or self.free_only
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.scanner_type})"

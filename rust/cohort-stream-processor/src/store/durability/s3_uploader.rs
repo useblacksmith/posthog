@@ -1,0 +1,475 @@
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use futures::stream;
+use futures::StreamExt;
+use object_store::buffered::BufWriter;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+use super::config::DurabilityConfig;
+use super::error::UploadCancelledError;
+use super::lineage::CheckpointLineage;
+use super::s3_client::{create_s3_client, retry_file};
+use super::uploader::CheckpointUploader;
+use crate::observability::metrics::CHECKPOINT_FILES_UPLOADED_TOTAL;
+
+const UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB
+
+/// Holds one upload's files, together, to a byte rate. The upload reads the disk the live path and
+/// the boot rebuild read, so an unpaced full upload competes with them for its whole run.
+struct UploadPace {
+    bytes_per_sec: u64,
+    /// When the bytes admitted so far are paid for. Time spent below the rate is not banked, so a
+    /// slow stretch never turns into a burst at full disk speed.
+    next: Mutex<Instant>,
+}
+
+impl UploadPace {
+    fn new(bytes_per_sec: u64) -> Self {
+        Self {
+            bytes_per_sec: bytes_per_sec.max(1),
+            next: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Counts `bytes`, then waits until the rate allows them.
+    async fn admit(&self, bytes: u64) {
+        let due = {
+            let mut next = self
+                .next
+                .lock()
+                .expect("the pace lock is never held across a panic");
+            *next = (*next).max(Instant::now())
+                + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec as f64);
+            *next
+        };
+        tokio::time::sleep_until(due).await;
+    }
+}
+
+enum ChunkResult {
+    Data(usize),
+    EndOfStream,
+    Cancelled,
+    Error(std::io::Error),
+}
+
+/// `biased;` ensures cancellation is checked before each read attempt.
+async fn read_chunk_cancellable(
+    file: &mut File,
+    buf: &mut [u8],
+    cancel_token: Option<&CancellationToken>,
+) -> ChunkResult {
+    match cancel_token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+
+                _ = token.cancelled() => ChunkResult::Cancelled,
+
+                result = file.read(buf) => match result {
+                    Ok(0) => ChunkResult::EndOfStream,
+                    Ok(n) => ChunkResult::Data(n),
+                    Err(e) => ChunkResult::Error(e),
+                }
+            }
+        }
+        None => match file.read(buf).await {
+            Ok(0) => ChunkResult::EndOfStream,
+            Ok(n) => ChunkResult::Data(n),
+            Err(e) => ChunkResult::Error(e),
+        },
+    }
+}
+
+#[derive(Debug)]
+pub struct S3Uploader {
+    store: Arc<dyn ObjectStore>,
+    config: DurabilityConfig,
+}
+
+impl S3Uploader {
+    pub async fn new(config: DurabilityConfig, lineage: CheckpointLineage) -> Result<Self> {
+        let store = create_s3_client(
+            &config,
+            config.max_concurrent_checkpoint_file_uploads,
+            &lineage.remote_dir(&config.s3_key_prefix),
+        )
+        .await?;
+
+        info!(
+            "S3 uploader initialized for bucket '{}' with max {} concurrent uploads",
+            config.s3_bucket, config.max_concurrent_checkpoint_file_uploads
+        );
+
+        let store: Arc<dyn ObjectStore> = store;
+        Ok(Self { store, config })
+    }
+
+    /// Upload a file with cancellation support. A failure aborts the multipart upload, except one
+    /// inside `shutdown`, which `BufWriter` cannot abort; the bucket's lifecycle rule removes it
+    /// after a day.
+    async fn upload_file_cancellable(
+        &self,
+        local_path: &Path,
+        s3_key: &str,
+        cancel_token: &CancellationToken,
+        pace: &UploadPace,
+    ) -> Result<()> {
+        if cancel_token.is_cancelled() {
+            metrics::counter!(CHECKPOINT_FILES_UPLOADED_TOTAL, "status" => "cancelled")
+                .increment(1);
+            warn!("Upload cancelled before starting: {s3_key}");
+            return Err(UploadCancelledError {
+                reason: format!("before starting: {s3_key}"),
+            }
+            .into());
+        }
+
+        let path = ObjectPath::from(s3_key);
+
+        let mut file = File::open(local_path)
+            .await
+            .with_context(|| format!("Failed to open file: {local_path:?}"))?;
+
+        let file_size = file
+            .metadata()
+            .await
+            .with_context(|| format!("Failed to get metadata for file: {local_path:?}"))?
+            .len();
+
+        // BufWriter switches to multipart upload automatically for large files.
+        let mut upload = BufWriter::new(Arc::clone(&self.store), path.clone());
+
+        let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
+
+        loop {
+            let chunk_result =
+                read_chunk_cancellable(&mut file, &mut buf, Some(cancel_token)).await;
+
+            match chunk_result {
+                ChunkResult::Data(n) => {
+                    if let Err(e) = upload.write_all(&buf[..n]).await {
+                        drop(upload.abort().await);
+                        metrics::counter!(CHECKPOINT_FILES_UPLOADED_TOTAL, "status" => "error")
+                            .increment(1);
+                        return Err(anyhow::Error::new(e))
+                            .with_context(|| format!("Failed to write chunk to S3: {s3_key}"));
+                    }
+                    if cancel_token
+                        .run_until_cancelled(pace.admit(n as u64))
+                        .await
+                        .is_none()
+                    {
+                        return Err(cancel_mid_stream(upload, s3_key).await);
+                    }
+                }
+                ChunkResult::EndOfStream => break,
+                ChunkResult::Cancelled => return Err(cancel_mid_stream(upload, s3_key).await),
+                ChunkResult::Error(e) => {
+                    drop(upload.abort().await);
+                    metrics::counter!(CHECKPOINT_FILES_UPLOADED_TOTAL, "status" => "error")
+                        .increment(1);
+                    return Err(anyhow::Error::new(e)).with_context(|| {
+                        format!("Failed to read chunk from file: {local_path:?}")
+                    });
+                }
+            }
+        }
+
+        upload
+            .shutdown()
+            .await
+            .with_context(|| format!("Failed to complete upload for: {s3_key}"))?;
+
+        metrics::counter!(CHECKPOINT_FILES_UPLOADED_TOTAL, "status" => "success").increment(1);
+        info!(
+            "Uploaded file {local_path:?} ({file_size} bytes) to s3://{}/{}",
+            self.config.s3_bucket, s3_key
+        );
+        Ok(())
+    }
+
+    async fn upload_bytes(&self, s3_key: &str, payload: PutPayload) -> Result<()> {
+        let path = ObjectPath::from(s3_key);
+
+        self.store
+            .put(&path, payload)
+            .await
+            .with_context(|| format!("Failed to upload to S3 key: {s3_key}"))?;
+
+        Ok(())
+    }
+}
+
+async fn cancel_mid_stream(mut upload: BufWriter, s3_key: &str) -> anyhow::Error {
+    drop(upload.abort().await);
+    metrics::counter!(CHECKPOINT_FILES_UPLOADED_TOTAL, "status" => "cancelled").increment(1);
+    warn!("Upload of {s3_key} cancelled mid-stream");
+    UploadCancelledError {
+        reason: format!("mid-stream: {s3_key}"),
+    }
+    .into()
+}
+
+#[async_trait]
+impl CheckpointUploader for S3Uploader {
+    async fn upload_checkpoint_with_plan_cancellable(
+        &self,
+        plan: &super::CheckpointPlan,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<Vec<String>> {
+        if let Some(token) = cancel_token {
+            if token.is_cancelled() {
+                warn!("Upload cancelled before starting batch");
+                return Err(UploadCancelledError {
+                    reason: "before starting batch".to_string(),
+                }
+                .into());
+            }
+        }
+
+        info!(
+            "Starting upload with plan: {} files to upload, {} files referenced from parents",
+            plan.files_to_upload.len(),
+            plan.info.metadata.files.len() - plan.files_to_upload.len()
+        );
+
+        // Child token: a failed file cancels siblings without cancelling the caller.
+        let upload_token = cancel_token
+            .map(|parent| parent.child_token())
+            .unwrap_or_default();
+
+        let pace = UploadPace::new(self.config.upload_max_bytes_per_sec);
+        // At most N files open simultaneously: N * ~18MB (8MB read buf + ~10MB BufWriter).
+        let upload_tasks: Vec<_> = plan
+            .files_to_upload
+            .iter()
+            .map(|f| (f.local_path.clone(), plan.info.get_file_key(&f.filename)))
+            .collect();
+
+        let mut stream = stream::iter(upload_tasks)
+            .map(|(src, dest)| {
+                let token = upload_token.clone();
+                let pace = &pace;
+                async move {
+                    retry_file(&dest, &token, || {
+                        self.upload_file_cancellable(&src, &dest, &token, pace)
+                    })
+                    .await?;
+                    Ok::<String, anyhow::Error>(dest)
+                }
+            })
+            .buffer_unordered(self.config.max_upload_buffers);
+
+        let mut uploaded_keys = Vec::with_capacity(plan.files_to_upload.len());
+        let mut first_error: Option<anyhow::Error> = None;
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(key) => uploaded_keys.push(key),
+                Err(e) => {
+                    first_error = Some(e);
+                    upload_token.cancel();
+                    break;
+                }
+            }
+        }
+
+        while stream.next().await.is_some() {}
+
+        // Metadata is uploaded last so a partial upload is never discoverable via metadata.json.
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
+        if let Some(token) = cancel_token {
+            if token.is_cancelled() {
+                warn!("Upload cancelled before metadata upload");
+                return Err(UploadCancelledError {
+                    reason: "before metadata upload".to_string(),
+                }
+                .into());
+            }
+        }
+
+        let metadata = PutPayload::from(plan.info.metadata.to_json()?);
+        let metadata_key = plan.info.get_metadata_key();
+        retry_file(&metadata_key, &upload_token, || {
+            self.upload_bytes(&metadata_key, metadata.clone())
+        })
+        .await
+        .with_context(|| format!("Failed to upload metadata to S3 key: {metadata_key}"))?;
+
+        info!(
+            "Uploaded {} files and metadata file to s3://{}/{}",
+            plan.files_to_upload.len(),
+            self.config.s3_bucket,
+            plan.info.get_remote_attempt_path(),
+        );
+
+        let mut all_keys = uploaded_keys;
+        all_keys.push(metadata_key);
+        Ok(all_keys)
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.config.s3_bucket.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use object_store::memory::InMemory;
+    use tempfile::TempDir;
+    use tokio::io::AsyncWriteExt;
+
+    use crate::store::durability::flaky_store::FlakyStore;
+    use crate::store::durability::{plan_checkpoint, CheckpointMetadata, PodOrdinal};
+    use crate::store::DbIdentity;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_whose_put_fails_once_is_sent_again_and_the_upload_finishes() {
+        let attempt = TempDir::new().unwrap();
+        std::fs::write(attempt.path().join("000007.sst"), b"sst bytes").unwrap();
+        std::fs::write(attempt.path().join("MANIFEST-000005"), b"manifest").unwrap();
+        let plan = plan_checkpoint(
+            attempt.path(),
+            CheckpointMetadata::new(
+                PodOrdinal::STANDALONE,
+                Utc.with_ymd_and_hms(2026, 10, 25, 10, 49, 0).unwrap(),
+                DbIdentity::for_test("db"),
+            ),
+            "checkpoints".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let metadata = plan.info.metadata.to_json().unwrap();
+        let cases = [
+            (
+                plan.info.get_file_key("000007.sst"),
+                b"sst bytes".as_slice(),
+            ),
+            (plan.info.get_metadata_key(), metadata.as_bytes()),
+        ];
+
+        for (flaky_key, body) in cases {
+            let store = Arc::new(FlakyStore::new(InMemory::new(), &flaky_key));
+            let uploader = S3Uploader {
+                store: store.clone(),
+                config: DurabilityConfig::default(),
+            };
+
+            uploader.upload_checkpoint_with_plan(&plan).await.unwrap();
+
+            assert!(store.tripped(), "{flaky_key}");
+            let uploaded = store
+                .get(&ObjectPath::from(flaky_key.as_str()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(uploaded.as_ref(), body, "{flaky_key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_chunk_cancellable_returns_data_without_token() {
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = tmp_dir.path().join("test_file.txt");
+
+        let mut file = tokio::fs::File::create(&file_path).await.unwrap();
+        file.write_all(b"hello world").await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let mut file = tokio::fs::File::open(&file_path).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+
+        let result = read_chunk_cancellable(&mut file, &mut buf, None).await;
+        match result {
+            ChunkResult::Data(n) => {
+                assert_eq!(n, 11);
+                assert_eq!(&buf[..n], b"hello world");
+            }
+            _ => panic!("Expected Data result"),
+        }
+
+        let result = read_chunk_cancellable(&mut file, &mut buf, None).await;
+        assert!(matches!(result, ChunkResult::EndOfStream));
+    }
+
+    #[tokio::test]
+    async fn read_chunk_cancellable_returns_cancelled_when_pre_cancelled() {
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = tmp_dir.path().join("test_file.txt");
+
+        let mut file = tokio::fs::File::create(&file_path).await.unwrap();
+        file.write_all(b"hello world").await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let mut file = tokio::fs::File::open(&file_path).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+
+        let result = read_chunk_cancellable(&mut file, &mut buf, Some(&token)).await;
+        assert!(
+            matches!(result, ChunkResult::Cancelled),
+            "Expected Cancelled result"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_chunk_cancellable_returns_data_with_active_token() {
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = tmp_dir.path().join("test_file.txt");
+
+        let mut file = tokio::fs::File::create(&file_path).await.unwrap();
+        file.write_all(b"hello world").await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let token = CancellationToken::new();
+
+        let mut file = tokio::fs::File::open(&file_path).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+
+        let result = read_chunk_cancellable(&mut file, &mut buf, Some(&token)).await;
+        match result {
+            ChunkResult::Data(n) => {
+                assert_eq!(n, 11);
+                assert_eq!(&buf[..n], b"hello world");
+            }
+            _ => panic!("Expected Data result"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pace_holds_concurrent_files_to_one_shared_byte_rate() {
+        let pace = UploadPace::new(4 * 1024 * 1024);
+        let started = Instant::now();
+
+        tokio::join!(
+            pace.admit(8 * 1024 * 1024),
+            pace.admit(8 * 1024 * 1024),
+            pace.admit(4 * 1024 * 1024),
+        );
+
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+}

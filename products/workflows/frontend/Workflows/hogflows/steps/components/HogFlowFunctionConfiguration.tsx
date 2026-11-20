@@ -1,0 +1,376 @@
+import { useValues } from 'kea'
+import posthog from 'posthog-js'
+import { useEffect } from 'react'
+
+import { IconCheck } from '@posthog/icons'
+import { LemonCollapse, Link, Spinner } from '@posthog/lemon-ui'
+
+import { CyclotronJobInputs } from 'lib/components/CyclotronJob/CyclotronJobInputs'
+import { templateToConfiguration } from 'scenes/hog-functions/configuration/hogFunctionConfigurationLogic'
+import { EmailFieldErrors } from 'scenes/hog-functions/email-templater/types'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { CyclotronJobInputType, CyclotronJobInvocationGlobals, HogFunctionMappingType } from '~/types'
+
+import { workflowLogic } from '../../../workflowLogic'
+import { hogFlowEditorTestLogic } from '../../panel/testing/hogFlowEditorTestLogic'
+import { isGithubEventTriggerConfig } from '../../registry/triggers/githubTriggerFilters'
+import { isSlackMessageTriggerConfig } from '../../registry/triggers/slackTriggerFilters'
+import { CustomerTaskWorkflowReferenceInput } from './CustomerTaskWorkflowReferenceInput'
+import { EnableEngagementEventsBanner } from './EnableEngagementEventsBanner'
+import { HogFlowFunctionMappings } from './HogFlowFunctionMappings'
+import { WorkflowAutoSaveIndicator } from './WorkflowAutoSaveIndicator'
+
+// Builds the sample globals the input editor uses for autocomplete and unknown-global warnings.
+// The available globals depend on the trigger type: batch runs have no external triggering event,
+// but the worker backfills a real event.distinct_id at dequeue, so batch must expose `event` too or
+// the editor wrongly flags {event.distinct_id} as unknown.
+//
+// The trigger type decides which globals exist, while `realSampleGlobals` (a recent matching event,
+// loaded by the test panel) decides what is inside them, so autocomplete offers the property names
+// the run will actually carry rather than invented ones. Only an event trigger gets a real sample:
+// hogFlowEditorTestLogic synthesizes an example $pageview for every other trigger, whose property
+// names a batch or webhook run never carries, so the sample is ignored outside an event trigger.
+// Placeholders stand in for the rest: globals the sample has not loaded yet, globals it leaves
+// undefined such as `person` on an anonymous event, and globals such as `request` that no event
+// carries at all.
+export function buildSampleGlobals(
+    trigger: { type?: string; filters?: unknown } | undefined | null,
+    variables: Array<Record<string, any>> | undefined | null,
+    realSampleGlobals?: CyclotronJobInvocationGlobals | null
+): Record<string, any> {
+    const triggerType = trigger?.type
+    const workflowVariables: Record<string, any> = {}
+    variables?.forEach((variable) => {
+        // Use placeholder values based on variable type
+        if (variable.type === 'string') {
+            workflowVariables[variable.key] = 'example_value'
+        } else if (variable.type === 'number') {
+            workflowVariables[variable.key] = 123
+        } else if (variable.type === 'boolean') {
+            workflowVariables[variable.key] = true
+        } else if (variable.type === 'dictionary' || variable.type === 'json') {
+            workflowVariables[variable.key] = {}
+        } else {
+            workflowVariables[variable.key] = null
+        }
+    })
+
+    // The worker attaches project and source to every step invocation whatever the trigger
+    // (buildHogFunctionInvocation), so they are never unknown globals.
+    const sampleGlobals: Record<string, any> = {
+        project: {
+            id: 1,
+            name: 'Example project',
+            url: 'https://example.com/project/1',
+        },
+        source: {
+            id: '00000000-0000-0000-0000-000000000000',
+            name: 'Example workflow',
+            url: 'https://example.com/project/1/workflows/1',
+        },
+    }
+
+    if (triggerType === 'webhook') {
+        sampleGlobals.request = {
+            method: 'POST',
+            headers: {},
+            body: {},
+            params: {},
+        }
+    } else if (triggerType === 'event') {
+        sampleGlobals.event = {
+            event: 'example_event',
+            distinct_id: 'user123',
+            properties: {
+                $current_url: 'https://example.com',
+            },
+            timestamp: '2024-01-01T12:00:00Z',
+        }
+        sampleGlobals.person = {
+            id: 'person123',
+            properties: {
+                email: 'user@example.com',
+                name: 'John Doe',
+            },
+        }
+        sampleGlobals.groups = {}
+    } else if (triggerType === 'batch') {
+        // Batch runs carry a synthesized event whose distinct_id the worker backfills from the
+        // person, so {event.distinct_id} resolves at runtime. Expose it here so the editor
+        // doesn't flag it as an unknown global.
+        sampleGlobals.event = {
+            event: '$batch_hog_flow_invocation',
+            distinct_id: 'user123',
+            properties: {},
+            timestamp: '2024-01-01T12:00:00Z',
+        }
+        sampleGlobals.person = {
+            id: 'person123',
+            properties: {
+                email: 'user@example.com',
+                name: 'John Doe',
+            },
+        }
+    } else if (isSlackMessageTriggerConfig(trigger)) {
+        // Property names mirror what the Slack trigger emits (slack_workflow_events.py). No
+        // person: Slack-triggered runs are person-less.
+        sampleGlobals.event = {
+            event: '$slack_message_received',
+            distinct_id: 'U0123456789',
+            properties: {
+                integration_id: 1,
+                channel: 'C0123456789',
+                channel_type: 'channel',
+                slack_team_id: 'T0123456789',
+                user: 'U0123456789',
+                bot_id: null,
+                app_id: null,
+                subtype: null,
+                text: 'Example message text',
+                ts: '1700000000.000100',
+                thread_ts: null,
+                is_thread_reply: false,
+                is_ext_shared_channel: false,
+                slack_event: {},
+            },
+            timestamp: '2024-01-01T12:00:00Z',
+        }
+    } else if (isGithubEventTriggerConfig(trigger)) {
+        // Property names mirror what the GitHub trigger emits (github_workflow_events.py). No
+        // person: GitHub-triggered runs are person-less.
+        sampleGlobals.event = {
+            event: '$github_event_received',
+            distinct_id: 'octocat',
+            properties: {
+                integration_id: 1,
+                event_type: 'issues',
+                action: 'opened',
+                repository: 'PostHog/posthog',
+                repository_visibility: 'public',
+                sender: 'octocat',
+                bot_sender: null,
+                own_app: false,
+                author_association: 'MEMBER',
+                actor_access: 'write',
+                title: 'Example issue title',
+                body: 'Example issue body',
+                review_state: null,
+                number: 123,
+                url: 'https://github.com/PostHog/posthog/issues/123',
+                ref: '',
+                branch: null,
+                installation_id: 1,
+                github_event: {},
+            },
+            timestamp: '2024-01-01T12:00:00Z',
+        }
+    }
+
+    const realGlobalsByKey: Record<string, unknown> = (triggerType === 'event' ? realSampleGlobals : null) ?? {}
+
+    return {
+        ...Object.fromEntries(
+            Object.entries(sampleGlobals).map(([key, placeholder]) => [key, realGlobalsByKey[key] ?? placeholder])
+        ),
+        // Variables are author-declared, so no run samples them and the typed placeholders always stand.
+        variables: workflowVariables,
+    }
+}
+
+// The AI task step's Slack thread toggle only means something when a Slack message can start
+// the workflow; on other triggers the runtime no-ops it, so hide it rather than explain it.
+export function filterInputsSchemaForTrigger<T extends { key: string }>(
+    templateId: string,
+    trigger: { type?: string; filters?: unknown } | undefined | null,
+    inputsSchema: T[]
+): T[] {
+    if (templateId === 'template-posthog-create-task' && !isSlackMessageTriggerConfig(trigger)) {
+        return inputsSchema.filter((schema) => schema.key !== 'reply_in_slack_thread')
+    }
+    return inputsSchema
+}
+
+export function HogFlowFunctionConfiguration({
+    templateId,
+    inputs,
+    setInputs,
+    mappings,
+    setMappings,
+    errors,
+    warnings,
+    emailFieldErrors,
+}: {
+    templateId: string
+    inputs: Record<string, CyclotronJobInputType>
+    mappings?: HogFunctionMappingType[]
+    setInputs: (inputs: Record<string, CyclotronJobInputType>) => void
+    setMappings?: (mappings: HogFunctionMappingType[]) => void
+    errors?: Record<string, string>
+    warnings?: Record<string, string>
+    emailFieldErrors?: EmailFieldErrors
+}): JSX.Element {
+    const { workflow, logicProps, hogFunctionTemplatesById, hogFunctionTemplatesByIdLoading } = useValues(workflowLogic)
+    // The test panel loads a recent matching event; reuse it so autocomplete offers the property
+    // names this workflow really carries. Already mounted by the surrounding step detail panel.
+    const { sampleGlobals: realSampleGlobals } = useValues(hogFlowEditorTestLogic(logicProps))
+    const { currentTeam } = useValues(teamLogic)
+
+    const template = hogFunctionTemplatesById[templateId]
+    const isEmailStep = templateId === 'template-email'
+    const isPushStep = templateId === 'template-native-push'
+    const engagementEventsEnabled = !!currentTeam?.workflows_config?.capture_workflows_engagement_events
+    useEffect(() => {
+        // oxlint-disable-next-line exhaustive-deps
+        if (template) {
+            const defaults = templateToConfiguration(template).inputs ?? {}
+            const currentInputs = inputs ?? {}
+            const hasMissingDefaults = Object.keys(defaults).some((key) => !(key in currentInputs))
+            if (hasMissingDefaults) {
+                setInputs({ ...defaults, ...currentInputs })
+            }
+        }
+        // Re-run once the template resolves: it loads asynchronously, so on first render it can still be
+        // undefined and the defaults would otherwise never be applied.
+    }, [templateId, !!template])
+
+    if (hogFunctionTemplatesByIdLoading) {
+        return (
+            <div className="flex justify-center items-center">
+                <Spinner />
+            </div>
+        )
+    }
+
+    if (!template) {
+        return <TemplateNotFoundFallback templateId={templateId} />
+    }
+
+    const sampleGlobals = buildSampleGlobals(workflow?.trigger, workflow?.variables, realSampleGlobals)
+
+    // Native push carries a long tail of optional Android/iOS override fields. Keep the core message
+    // fields inline and tuck the platform-specific ones into collapsed sections so the form stays flat.
+    const inputsSchema = filterInputsSchemaForTrigger(templateId, workflow?.trigger, template.inputs_schema ?? [])
+    const isPlatformInput = (key: string): boolean => key.startsWith('android_') || key.startsWith('ios_')
+    const isSilentPush = isPushStep && inputs?.delivery?.value === 'silent'
+    const isHiddenForSilentPush = (key: string): boolean => isSilentPush && ['title', 'body', 'image'].includes(key)
+    // The template leaves the title optional so a silent push can skip it. Every other push needs one.
+    const coreInputsSchema = isPushStep
+        ? inputsSchema
+              .filter((s) => !isPlatformInput(s.key) && !isHiddenForSilentPush(s.key))
+              .map((s) => (s.key === 'title' ? { ...s, required: true } : s))
+        : inputsSchema
+    const isAndroidDataOnly = isPushStep && ['android_data_only', 'silent'].includes(inputs?.delivery?.value)
+    const androidInputsSchema = isPushStep
+        ? inputsSchema.filter(
+              (s) => s.key.startsWith('android_') && (!isAndroidDataOnly || s.key === 'android_priority')
+          )
+        : []
+    const iosInputsSchema = isPushStep && !isSilentPush ? inputsSchema.filter((s) => s.key.startsWith('ios_')) : []
+
+    const renderInputs = (schema: typeof inputsSchema): JSX.Element => (
+        <CyclotronJobInputs
+            // The email step is just its message, so the preview takes whatever height the panel
+            // has left rather than sitting above a blank gap
+            className={isEmailStep ? 'flex-1' : undefined}
+            errors={errors}
+            warnings={warnings}
+            emailFieldErrors={emailFieldErrors}
+            // Email edits propagate live into the workflow form, where auto-save persists them
+            // (into the staged draft on active workflows), so the editor needs no save step.
+            emailLiveChanges
+            emailSaveIndicator={<WorkflowAutoSaveIndicator />}
+            configuration={{ inputs: inputs as Record<string, CyclotronJobInputType>, inputs_schema: schema }}
+            showSource={false}
+            sampleGlobalsWithInputs={sampleGlobals}
+            onInputChange={(key, value) => setInputs({ ...inputs, [key]: value })}
+            onInputsChange={(changes) => setInputs({ ...inputs, ...changes })}
+        />
+    )
+
+    return (
+        <>
+            {templateId === 'template-posthog-create-customer-task' ? (
+                <div className="flex flex-col gap-3">
+                    {coreInputsSchema.map((schema) =>
+                        schema.key === 'account_id' || schema.key === 'assigned_to_id' ? (
+                            <CustomerTaskWorkflowReferenceInput
+                                key={schema.key}
+                                schema={schema}
+                                input={inputs[schema.key] ?? { value: null }}
+                                onChange={(value) => setInputs({ ...inputs, [schema.key]: value })}
+                                projectId={currentTeam?.id ?? null}
+                                sampleGlobals={sampleGlobals}
+                                error={errors?.[schema.key]}
+                            />
+                        ) : (
+                            <div key={schema.key}>{renderInputs([schema])}</div>
+                        )
+                    )}
+                </div>
+            ) : (
+                renderInputs(coreInputsSchema)
+            )}
+            {isPushStep && (androidInputsSchema.length > 0 || iosInputsSchema.length > 0) && (
+                <LemonCollapse
+                    className="mt-2"
+                    multiple
+                    panels={[
+                        ...(androidInputsSchema.length > 0
+                            ? [
+                                  {
+                                      key: 'android',
+                                      header: 'Android options',
+                                      content: renderInputs(androidInputsSchema),
+                                  },
+                              ]
+                            : []),
+                        ...(iosInputsSchema.length > 0
+                            ? [{ key: 'ios', header: 'iOS options', content: renderInputs(iosInputsSchema) }]
+                            : []),
+                    ]}
+                />
+            )}
+            {isEmailStep ? (
+                engagementEventsEnabled ? (
+                    <div className="flex items-center gap-1.5 mt-2 text-xs text-muted-alt">
+                        <IconCheck className="text-success text-base" />
+                        <span>Email engagement is being captured as PostHog events.</span>
+                        <Link
+                            to={urls.settings('environment-workflows', 'workflows-engagement-events')}
+                            target="_blank"
+                        >
+                            Manage in settings
+                        </Link>
+                    </div>
+                ) : (
+                    <EnableEngagementEventsBanner />
+                )
+            ) : null}
+            <HogFlowFunctionMappings
+                useMapping={!isPushStep && (Array.isArray(mappings) || (template?.mapping_templates?.length ?? 0) > 0)}
+                inputs={inputs}
+                inputs_schema={template?.inputs_schema ?? []}
+                mappings={mappings ?? []}
+                mappingTemplates={template?.mapping_templates ?? []}
+                onChange={(mappings) => setMappings?.(mappings)}
+            />
+        </>
+    )
+}
+
+// Reaching this fallback means the workflow editor finished loading the template list but the
+// referenced template was not in it — typically a server-side filter regression (see PR #61992)
+// or a workflow that points at a deleted/renamed template. Surfaces to error tracking so an
+// alert can fire before users start reporting it.
+function TemplateNotFoundFallback({ templateId }: { templateId: string }): JSX.Element {
+    useEffect(() => {
+        posthog.captureException(new Error('Workflow editor: hog function template not found'), {
+            severity: 'error',
+            tag: 'workflow_editor_template_not_found',
+            templateId,
+        })
+    }, [templateId])
+    return <div>Template not found!</div>
+}

@@ -1,0 +1,133 @@
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import UUID
+
+import pytest
+import time_machine
+from unittest.mock import MagicMock
+
+from parameterized import parameterized
+
+from posthog.tasks.alerts import schedule_restriction as schedule_restriction_module
+from posthog.tasks.alerts.schedule_restriction import is_utc_datetime_blocked, next_unblocked_utc
+from posthog.tasks.alerts.utils import next_check_at_after_schedule_restriction_change
+
+from products.alerts.backend.models.alert import AlertConfiguration
+from products.alerts_platform.backend.facade.scheduling import CalendarInterval, alert_check_offset
+
+ALERT_ID = UUID("0193f3c6-2a4b-7d2e-8f00-3c1b5d7e9a10")
+HOURLY_OFFSET = alert_check_offset(CalendarInterval.HOURLY, ALERT_ID)
+
+
+class TestIsUtcDatetimeBlockedAndNextUnblocked:
+    def _alert(self, tz: str, restriction: dict[str, Any] | None) -> MagicMock:
+        alert = MagicMock(spec=AlertConfiguration)
+        alert.id = "test-id"
+        alert.team = MagicMock()
+        alert.team.timezone = tz
+        alert.schedule_restriction = restriction
+        return alert
+
+    def test_is_blocked_reads_alert_timezone_and_restriction(self) -> None:
+        alert = self._alert(
+            "America/Los_Angeles",
+            {"blocked_windows": [{"start": "10:00", "end": "12:00"}]},
+        )
+        assert is_utc_datetime_blocked(alert, datetime(2024, 6, 1, 18, 0, tzinfo=UTC)) is True
+
+    def test_next_unblocked_advances_to_end_of_window(self) -> None:
+        alert = self._alert(
+            "UTC",
+            {"blocked_windows": [{"start": "10:00", "end": "12:00"}]},
+        )
+        fro = datetime(2024, 6, 1, 11, 0, tzinfo=UTC)
+        nxt = next_unblocked_utc(alert, fro)
+        assert nxt == datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
+
+    def test_next_unblocked_retries_and_logs_when_scan_hits_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(schedule_restriction_module, "_MAX_UNBLOCK_STEPS", 5)
+        warning = MagicMock()
+        error = MagicMock()
+        monkeypatch.setattr(schedule_restriction_module.logger, "warning", warning)
+        monkeypatch.setattr(schedule_restriction_module.logger, "error", error)
+        alert = self._alert(
+            "UTC",
+            {"blocked_windows": [{"start": "10:00", "end": "12:00"}]},
+        )
+        fro = datetime(2024, 6, 1, 11, 0, tzinfo=UTC)
+        nxt = next_unblocked_utc(alert, fro)
+        assert nxt == datetime(2024, 6, 3, 11, 0, tzinfo=UTC)
+        assert warning.call_count == 2
+        warning.assert_any_call(
+            "schedule_restriction.next_unblocked_utc_exceeded_cap",
+            alert_id="test-id",
+            recursion_depth=0,
+        )
+        error.assert_called_once_with(
+            "schedule_restriction.next_unblocked_utc_giving_up_after_retry",
+            alert_id="test-id",
+        )
+
+
+class TestNextCheckAtAfterScheduleRestrictionChange:
+    def _hourly_alert(self, **kwargs: Any) -> MagicMock:
+        alert = MagicMock(spec=AlertConfiguration)
+        alert.id = ALERT_ID
+        alert.team = MagicMock()
+        alert.team.timezone = "UTC"
+        alert.calculation_interval = "hourly"
+        alert.schedule_start_time = None
+        for k, v in kwargs.items():
+            setattr(alert, k, v)
+        return alert
+
+    def test_cleared_restriction_schedules_from_now_and_restores_existing_value(self) -> None:
+        with time_machine.travel("2026-04-06T14:00:00Z", tick=False):
+            existing = datetime(2026, 4, 7, 18, 30, tzinfo=UTC)
+            alert = self._hourly_alert(schedule_restriction=None, next_check_at=existing)
+            out = next_check_at_after_schedule_restriction_change(alert)
+            assert out == datetime(2026, 4, 6, 15, 0, 0, tzinfo=UTC) + HOURLY_OFFSET
+            assert alert.next_check_at == existing
+
+    @parameterized.expand(
+        [
+            # The first allowed minute is a window end on the hour, so the alert's offset moves the check past it.
+            ("offset_after_window_end", [{"start": "11:00", "end": "16:00"}], HOURLY_OFFSET),
+            # The offset would land inside the next quiet window, so the check stays on the first allowed minute.
+            (
+                "offset_inside_next_window",
+                [{"start": "11:00", "end": "16:00"}, {"start": "16:01", "end": "17:00"}],
+                timedelta(0),
+            ),
+        ]
+    )
+    def test_future_next_check_inside_blocked_window_snaps_to_first_unblocked_minute(
+        self, _name: str, blocked_windows: list[dict[str, str]], offset: timedelta
+    ) -> None:
+        with time_machine.travel("2026-04-06T14:00:00Z", tick=False):
+            alert = self._hourly_alert(
+                schedule_restriction={"blocked_windows": blocked_windows},
+                next_check_at=datetime(2026, 4, 6, 15, 30, tzinfo=UTC),
+            )
+            out = next_check_at_after_schedule_restriction_change(alert)
+            assert out == datetime(2026, 4, 6, 16, 0, 0, tzinfo=UTC) + offset
+
+    def test_custom_schedule_start_time_inside_blocked_window_snaps_to_first_unblocked_minute(self) -> None:
+        with time_machine.travel("2026-04-06T20:00:00Z", tick=False):
+            alert = self._hourly_alert(
+                schedule_restriction={"blocked_windows": [{"start": "22:00", "end": "07:00"}]},
+                schedule_start_time="22:30",
+                next_check_at=None,
+            )
+            out = next_check_at_after_schedule_restriction_change(alert)
+            assert out == datetime(2026, 4, 7, 7, 0, tzinfo=UTC)
+
+    def test_does_not_keep_stale_snap_when_earlier_runs_are_allowed(self) -> None:
+        with time_machine.travel("2026-04-06T16:44:00Z", tick=False):
+            alert = self._hourly_alert(
+                team=MagicMock(timezone="America/Toronto"),
+                schedule_restriction={"blocked_windows": [{"start": "14:00", "end": "16:00"}]},
+                next_check_at=datetime(2026, 4, 6, 20, 0, 0, tzinfo=UTC),
+            )
+            out = next_check_at_after_schedule_restriction_change(alert)
+            assert out == datetime(2026, 4, 6, 17, 0, 0, tzinfo=UTC) + HOURLY_OFFSET

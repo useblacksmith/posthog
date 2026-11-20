@@ -1,0 +1,367 @@
+import { UserNameWithEmail } from 'lib/components/ActivityLog/UserNameWithEmail'
+import { dayjs } from 'lib/dayjs'
+import { LazyLemonMarkdown } from 'lib/lemon-ui/LemonMarkdown/LazyLemonMarkdown'
+import { fullName } from 'lib/utils/strings'
+
+import { ActivityScope, InsightShortId, PersonType, UserBasicType } from '~/types'
+
+import type { ActivityLogCredentialTypeEnumApi } from 'products/platform_features/frontend/generated/api.schemas'
+
+import { workloadActorLabel, parseWorkloadAttribution } from './parseWorkloadAttribution'
+import { WorkloadActorName } from './WorkloadActorName'
+
+export interface ActivityChange {
+    type: ActivityScope
+    action: 'changed' | 'created' | 'deleted' | 'exported' | 'split' | 'merged' | 'copied'
+    field?: string
+    before?: string | number | any[] | Record<string, any> | boolean | null
+    after?: string | number | any[] | Record<string, any> | boolean | null
+}
+
+export interface PersonMerge {
+    type: 'Person'
+    source: PersonType[]
+    target: PersonType
+}
+
+export interface Trigger {
+    job_type: string
+    job_id: string
+    payload: Record<string, any>
+}
+
+export interface ActivityLogDetail {
+    merge: PersonMerge | null
+    trigger: Trigger | null
+    changes: ActivityChange[] | null
+    name: string | null
+    short_id?: InsightShortId | null
+    /** e.g. for property definition carries event, person, or group */
+    type?: string
+    context?: Record<string, any> | null
+}
+
+export type ActivityLogItem = {
+    id?: string
+    user?: Pick<UserBasicType, 'email' | 'first_name' | 'last_name'>
+    activity: string
+    created_at: string
+    scope: ActivityScope | string
+    item_id?: string
+    detail: ActivityLogDetail
+    /** Team (project) the activity belongs to; null for organization-scoped activities. */
+    team_id?: number | null
+    /** Present if the log is used as a notification. Whether the notification is unread. */
+    unread?: boolean
+    /** Whether the activity was initiated by a PostHog staff member impersonating a user. */
+    is_staff?: boolean
+    /** Whether the activity was initiated by the PostHog backend. Example: an exported image when sharing an insight. */
+    is_system?: boolean
+    /** Whether a PostHog team member was impersonating the user when this activity was logged. */
+    was_impersonated?: boolean
+    /** SDK, integration, or scout that triggered this action. Self-reported through the x-posthog-client header, except for a scout, which the server names. */
+    client?: string | null
+    /** Client IP address captured at request time. Null for non-HTTP activity (system, background jobs). */
+    ip_address?: string | null
+    /** Kind of credential that authenticated the request that made the change. Null outside a request and for older entries. */
+    credential_type?: ActivityLogCredentialTypeEnumApi | null
+    /** Login session id or key id of that credential. Both activity log endpoints return it, only for some credential types. */
+    credential_id?: string | null
+}
+
+// the description of a single activity log is a sentence describing one or more changes that makes up the entry
+export type Description = string | JSX.Element | null
+// the extended description gives extra context, like the insight details card to describe a change to an insight
+export type ExtendedDescription = JSX.Element | undefined
+// content too large to sit inline with the sentence, shown as its own tab once the row is expanded
+export type ExpandedView = { label: string; content: JSX.Element }
+export type ActivityLogSummary = {
+    actor: JSX.Element
+    action: Description
+    target: Description
+    preview?: string
+}
+export type ChangeMapping = {
+    description: Description[] | null
+    summary?: Description[]
+    preview?: string
+    extendedDescription?: ExtendedDescription
+    expandedView?: ExpandedView
+    suffix?: string | JSX.Element | null // to override the default suffix
+}
+export type HumanizedChange = {
+    extendedDescription?: ExtendedDescription
+    expandedView?: ExpandedView
+} & ({ description: Exclude<Description, null>; summary: ActivityLogSummary } | { description: null; summary?: never })
+
+export type HumanizedActivityLogItem = {
+    id?: string
+    email?: string | null
+    /** The email to offer on hover, or null when the row already prints it as the actor's name. */
+    emailToReveal?: string | null
+    name?: string
+    isSystem?: boolean
+    wasImpersonated?: boolean
+    /** SDK, integration, or scout that triggered this action. Self-reported through the x-posthog-client header, except for a scout, which the server names. */
+    client?: string | null
+    description: Description
+    /** Markdown the row renders in place of `description`, e.g. a changelog notification's body. */
+    markdownDescription?: string
+    summary?: ActivityLogSummary
+    extendedDescription?: ExtendedDescription // e.g. an insight's filters summary
+    expandedView?: ExpandedView // e.g. a flag's release conditions after the change
+    created_at: dayjs.Dayjs
+    unread?: boolean
+    // used when showing e.g. diff of changes
+    unprocessed?: ActivityLogItem
+}
+
+export type Describer = (logItem: ActivityLogItem, asNotification?: boolean) => HumanizedChange
+
+export function detectBoolean(candidate: unknown): boolean {
+    let b: boolean = !!candidate
+    if (typeof candidate === 'string') {
+        b = candidate.toLowerCase() === 'true'
+    }
+    return b
+}
+
+export function humanize(
+    results: ActivityLogItem[],
+    describerFor?: (logItem?: ActivityLogItem) => Describer | undefined,
+    asNotification?: boolean
+): HumanizedActivityLogItem[] {
+    const logLines: HumanizedActivityLogItem[] = []
+
+    for (const logItem of results) {
+        if (!logItem.detail || !logItem.scope) {
+            // Sometimes we can end up with bad payloads from the backend so we check for some required fields here
+            continue
+        }
+        const describer = describerFor?.(logItem)
+
+        if (!describer) {
+            continue
+        }
+        const { description, summary, extendedDescription, expandedView } = describer(logItem, asNotification)
+
+        if (description !== null) {
+            const workload = parseWorkloadAttribution(logItem)
+            const impersonatedUserName = logItem.user ? fullName(logItem.user) : undefined
+            logLines.push({
+                id: logItem.id,
+                email: actorEmailForLogItem(logItem),
+                emailToReveal: actorEmailToRevealForLogItem(logItem),
+                name: workload
+                    ? workloadActorLabel(workload)
+                    : logItem.was_impersonated
+                      ? `PostHog Support${impersonatedUserName ? ` (as ${impersonatedUserName})` : ''}`
+                      : impersonatedUserName,
+                isSystem: logItem.is_system,
+                wasImpersonated: logItem.was_impersonated,
+                client: logItem.client,
+                description,
+                summary,
+                extendedDescription,
+                expandedView,
+                created_at: dayjs(logItem.created_at),
+                unread: logItem.unread,
+                unprocessed: logItem,
+            })
+        }
+    }
+    return logLines
+}
+
+export function userNameForLogItem(logItem: ActivityLogItem): string {
+    if (logItem.is_system) {
+        return 'PostHog'
+    }
+    const workload = parseWorkloadAttribution(logItem)
+    if (workload) {
+        return workloadActorLabel(workload)
+    }
+    if (logItem.was_impersonated) {
+        return `PostHog Support (as ${nameOrEmailForUser(logItem.user, 'a user')})`
+    }
+    return nameOrEmailForUser(logItem.user, 'A user')
+}
+
+// The user's name can be blank (e.g. SCIM-provisioned members whose IdP omits a name), so fall
+// back to their email — which is always in the payload — before the generic placeholder.
+function nameOrEmailForUser(
+    user: Pick<UserBasicType, 'email' | 'first_name' | 'last_name'> | undefined,
+    fallback: string
+): string {
+    if (!user) {
+        return fallback
+    }
+    return fullName(user) || user.email || fallback
+}
+
+// An impersonated row names PostHog Support as the actor, so the address on it belongs to the
+// member who was impersonated and attributing it to Support would misread the audit trail. Every
+// surface that shows the email must use this, or a row can disclose it in one place and hide it
+// in another.
+export function actorEmailForLogItem(logItem: ActivityLogItem): string | null {
+    if (logItem.is_system || logItem.was_impersonated || parseWorkloadAttribution(logItem)) {
+        return null
+    }
+    return logItem.user?.email ?? null
+}
+
+// Kept apart from actorEmailForLogItem because that one also feeds the Gravatar lookup, and a
+// member whose name is their email still has a Gravatar to show.
+export function actorEmailToRevealForLogItem(logItem: ActivityLogItem): string | null {
+    const email = actorEmailForLogItem(logItem)
+    return email && email !== userNameForLogItem(logItem) ? email : null
+}
+
+/** The person who did the thing, with their email on hover. */
+export function ActivityLogUserName({ logItem }: { logItem: ActivityLogItem }): JSX.Element {
+    const workload = parseWorkloadAttribution(logItem)
+    if (workload) {
+        return <WorkloadActorName attribution={workload} teamId={logItem.team_id} />
+    }
+    return <UserNameWithEmail name={userNameForLogItem(logItem)} email={actorEmailForLogItem(logItem)} />
+}
+
+export function activityLogSummary(
+    logItem: ActivityLogItem,
+    action: Description,
+    target: Description,
+    preview?: string,
+    actor: JSX.Element = <ActivityLogUserName logItem={logItem} />
+): ActivityLogSummary {
+    return { actor, action, target, preview }
+}
+
+const NO_PLURAL_SCOPES: ActivityScope[] = [ActivityScope.DATA_MANAGEMENT]
+
+// Keep in sync with SCOPE_DISPLAY_NAMES in ee/hogai/context/activity_log/context.py
+const SCOPE_DISPLAY_NAMES: Partial<Record<ActivityScope, { singular: string; plural: string }>> = {
+    [ActivityScope.ALERT_CONFIGURATION]: { singular: 'Alert', plural: 'Alerts' },
+    [ActivityScope.BATCH_EXPORT]: { singular: 'Destination', plural: 'Destinations' },
+    [ActivityScope.CANVAS]: { singular: 'Canvas', plural: 'Canvases' },
+    [ActivityScope.PLATFORM_ALERT_CONFIGURATION]: { singular: 'Platform alert', plural: 'Platform alerts' },
+    [ActivityScope.WORKLOAD_TRUST_POLICY]: { singular: 'Trusted workload', plural: 'Trusted workloads' },
+    [ActivityScope.WORKLOAD_TRUST_POLICY_REQUEST]: {
+        singular: 'Trusted workload request',
+        plural: 'Trusted workload requests',
+    },
+    [ActivityScope.DEV_GATEWAY_TOKEN]: { singular: 'Developer mode token', plural: 'Developer mode tokens' },
+    [ActivityScope.EXTERNAL_DATA_SOURCE]: { singular: 'Source', plural: 'Sources' },
+    [ActivityScope.HOG_FUNCTION]: { singular: 'Data pipeline', plural: 'Data pipelines' },
+    [ActivityScope.PERSONAL_API_KEY]: { singular: 'Personal API key', plural: 'Personal API keys' },
+    [ActivityScope.LLM_TRACE]: { singular: 'LLM trace', plural: 'LLM traces' },
+    [ActivityScope.LOG]: { singular: 'Log', plural: 'Logs' },
+    [ActivityScope.PROJECT_SECRET_API_KEY]: {
+        singular: 'Project secret API key',
+        plural: 'Project secret API keys',
+    },
+    [ActivityScope.REPLAY_OBSERVATION]: { singular: 'Observation', plural: 'Observations' },
+    [ActivityScope.TICKET]: { singular: 'Support ticket', plural: 'Support tickets' },
+}
+
+export function humanizeScope(scope: ActivityScope | string, singular = false): string {
+    const customName = SCOPE_DISPLAY_NAMES[scope as ActivityScope]
+    if (customName) {
+        return singular ? customName.singular : customName.plural
+    }
+
+    // Default behavior: split camelCase and add plural 's'
+    let output = scope.split(/(?=[A-Z])/).join(' ')
+
+    if (!singular && !NO_PLURAL_SCOPES.includes(scope as ActivityScope)) {
+        output += 's'
+    }
+
+    return output
+}
+
+export function humanizeActivity(activity: string): string {
+    activity = activity.replace(/_/g, ' ')
+
+    return activity.charAt(0).toUpperCase() + activity.slice(1)
+}
+
+const SIMPLE_ACTIVITY_VERBS: Record<string, string> = {
+    deleted: 'deleted',
+    created: 'created',
+    restored: 'restored',
+    updated: 'updated',
+    minted: 'created',
+    revoked: 'revoked',
+}
+
+function describeComment(
+    logItem: ActivityLogItem,
+    asNotification: boolean,
+    resource: string | JSX.Element
+): HumanizedChange {
+    const description =
+        logItem.scope === 'Comment' ? (
+            <>
+                <ActivityLogUserName logItem={logItem} /> replied to a {humanizeScope(logItem.scope, true)}
+            </>
+        ) : (
+            <>
+                <ActivityLogUserName logItem={logItem} /> commented
+                {asNotification ? <> on a {humanizeScope(logItem.scope, true)}</> : null}
+            </>
+        )
+    const commentContent = logItem.detail.changes?.[0].after as string | undefined
+
+    return {
+        description,
+        summary: activityLogSummary(
+            logItem,
+            logItem.scope === 'Comment' ? 'Replied to a comment' : 'Added a comment',
+            resource
+        ),
+        extendedDescription: commentContent ? (
+            <div className="border rounded bg-surface-primary p-4">
+                <LazyLemonMarkdown lowKeyHeadings disableImages>
+                    {commentContent}
+                </LazyLemonMarkdown>
+            </div>
+        ) : undefined,
+    }
+}
+
+export function defaultDescriber(
+    logItem: ActivityLogItem,
+    asNotification = false,
+    resource?: string | JSX.Element
+): HumanizedChange {
+    resource = resource || logItem.detail.name || `a ${humanizeScope(logItem.scope, true)}`
+
+    const verb = SIMPLE_ACTIVITY_VERBS[logItem.activity]
+    if (verb) {
+        return {
+            summary: activityLogSummary(logItem, humanizeActivity(verb), resource),
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> {verb} <b>{resource}</b>
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'copied_to_project') {
+        return {
+            summary: activityLogSummary(logItem, 'Copied to another project', resource),
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> copied <b>{resource}</b> to another project
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'commented') {
+        return describeComment(logItem, asNotification, resource)
+    }
+
+    return { description: null }
+}

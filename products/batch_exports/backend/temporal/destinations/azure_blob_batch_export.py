@@ -1,0 +1,474 @@
+import json
+import asyncio
+import datetime as dt
+import dataclasses
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+
+from django.conf import settings
+
+from azure.core.exceptions import HttpResponseError
+from azure.core.pipeline.transport import AioHttpTransport
+from azure.storage.blob import StorageErrorCode
+from azure.storage.blob.aio import BlobServiceClient, ContainerClient, ExponentialRetry
+from structlog.contextvars import bind_contextvars
+from temporalio import activity, exceptions, workflow
+from temporalio.common import RetryPolicy
+
+from posthog.integrations import IntegrationManager, IntegrationNotFound
+from posthog.models.integration import AzureBlobIntegration
+from posthog.models.integration.azure_blob import EndpointNotAllowedError, validate_azure_blob_connection_string
+from posthog.security.pinned_aiohttp import pinned_session
+from posthog.temporal.common.base import PostHogWorkflow
+from posthog.temporal.common.heartbeat import Heartbeater
+from posthog.temporal.common.logger import get_write_only_logger
+
+from products.batch_exports.backend.facade.enums import AZURE_BLOB_SUPPORTED_COMPRESSIONS as SUPPORTED_COMPRESSIONS
+from products.batch_exports.backend.service import (
+    AzureBlobBatchExportInputs,
+    BatchExportField,
+    BatchExportInsertInputs,
+    BatchExportModelInput,
+    migrate_batch_export_model,
+)
+from products.batch_exports.backend.temporal.batch_exports import (
+    StartBatchExportRunInputs,
+    events_model_default_fields,
+    get_data_interval,
+    is_over_billing_limit_error,
+    start_batch_export_run,
+)
+from products.batch_exports.backend.temporal.destinations.constants import FILE_FORMAT_EXTENSIONS
+from products.batch_exports.backend.temporal.destinations.utils import EXTERNAL_LOGGER, get_manifest_key, get_object_key
+from products.batch_exports.backend.temporal.pipeline.consumer import Consumer, run_consumer_from_stage
+from products.batch_exports.backend.temporal.pipeline.entrypoint import execute_batch_export_using_internal_stage
+from products.batch_exports.backend.temporal.pipeline.producer import Producer as ProducerFromInternalStage
+from products.batch_exports.backend.temporal.pipeline.transformer import (
+    ParquetStreamTransformer,
+    get_json_stream_transformer,
+)
+from products.batch_exports.backend.temporal.pipeline.types import BatchExportResult
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue, wait_for_schema_or_producer
+from products.batch_exports.backend.temporal.utils import handle_non_retryable_errors
+
+NON_RETRYABLE_ERROR_TYPES = (
+    "AzureBlobIntegrationError",
+    "AzureBlobIntegrationNotFoundError",
+    "ClientAuthenticationError",
+    "EndpointNotAllowedError",
+    "MalformedConnectionStringError",
+    "MissingRequiredPermissionsError",
+    "ResourceNotFoundError",
+    "SSRFBlockedError",
+    "UnsupportedCompressionError",
+    "UnsupportedFileFormatError",
+)
+
+LOGGER = get_write_only_logger(__name__)
+
+
+class UnsupportedFileFormatError(Exception):
+    def __init__(self, file_format: str):
+        super().__init__(f"'{file_format}' is not a supported format for Azure Blob batch exports.")
+
+
+class UnsupportedCompressionError(Exception):
+    def __init__(self, compression: str):
+        super().__init__(f"'{compression}' is not a supported compression for Azure Blob batch exports.")
+
+
+class AzureBlobIntegrationNotFoundError(Exception):
+    def __init__(self, integration_id: int | None, team_id: int):
+        if integration_id is None:
+            super().__init__(f"Azure Blob integration ID not provided for team '{team_id}'")
+        else:
+            super().__init__(f"Azure Blob integration with ID '{integration_id}' not found for team '{team_id}'")
+
+
+class MissingRequiredPermissionsError(Exception):
+    """Raised when missing required permissions in Azure Blob."""
+
+    def __init__(self):
+        super().__init__("Missing required permissions to run this batch export")
+
+
+class MalformedConnectionStringError(Exception):
+    """Raised when Azure SDK cannot parse a connection string."""
+
+    def __init__(self):
+        super().__init__(
+            "The provided connection string is malformed or invalid. Ensure the connection string is made up of key=value pairs separated only by a semicolon (;) with no additional characters in between. Additionally, ensure any endpoints point to valid URLs you control. Example: AccountName=name;AccountKey=key;SomeKey=somevalue"
+        )
+
+
+def _is_authorization_failure_response_error(err: HttpResponseError) -> bool:
+    """Check if the provided response error is an authorization failure.
+
+    'error_code' is monkey-patched dynamically so we must use 'getattr' for type checkers.
+    """
+    return getattr(err, "error_code", None) == StorageErrorCode.AUTHORIZATION_FAILURE
+
+
+@dataclasses.dataclass(frozen=False, kw_only=True)
+class AzureBlobInsertInputs(BatchExportInsertInputs):
+    data_interval_end: str
+    container_name: str
+    integration_id: int
+    prefix: str = ""
+    compression: str | None = None
+    file_format: str = "JSONLines"
+    max_file_size_mb: int | None = None
+    # Defaults to the legacy naming: an activity input recorded before this field existed has no
+    # value for it, so the missing field uses this default and the export keeps its existing names.
+    legacy_parquet_extension: bool = True
+
+
+async def _get_azure_blob_integration(integration_id: int, team_id: int) -> AzureBlobIntegration:
+    try:
+        integration = await IntegrationManager.azure_blob.credentials.aget(team_id, integration_id)
+    except IntegrationNotFound:
+        raise AzureBlobIntegrationNotFoundError(integration_id, team_id)
+
+    return AzureBlobIntegration(integration)
+
+
+def azure_blob_default_fields() -> list[BatchExportField]:
+    """Azure blob default fields include ingested timestamp."""
+    default_fields = events_model_default_fields()
+    default_fields.append({"expression": "NOW64()", "alias": "azure_blob_ingested_timestamp"})
+    return default_fields
+
+
+@asynccontextmanager
+async def azure_container_client(connection_string: str, container_name: str) -> AsyncIterator[ContainerClient]:
+    try:
+        pinned_ips = await asyncio.to_thread(validate_azure_blob_connection_string, connection_string)
+    except EndpointNotAllowedError:
+        raise
+    except ValueError:
+        raise MalformedConnectionStringError()
+
+    async with pinned_session(pinned_ips or {}) as session:
+        async with AioHttpTransport(
+            session=session,
+            # Increase the read timeout to 10 minutes to account for large uploads.
+            read_timeout=600,
+            # Preserved default from BlobServiceClient
+            connection_timeout=20,
+        ) as transport:
+            try:
+                blob_service_client = BlobServiceClient.from_connection_string(
+                    connection_string,
+                    transport=transport,
+                    # These are Azure SDK defaults but we set them explicitly for visibility.
+                    # See: https://learn.microsoft.com/en-us/python/api/azure-storage-blob/azure.storage.blob.blobserviceclient
+                    # Blobs larger than `max_single_put_size` are uploaded in blocks of `max_block_size`.
+                    max_single_put_size=64 * 1024 * 1024,  # 64 MiB
+                    max_block_size=4 * 1024 * 1024,  # 4 MiB
+                    # Azure SDK defaults but we set them explicitly for visibility.
+                    retry_policy=ExponentialRetry(initial_backoff=15, increment_base=3, retry_total=3),
+                    permit_redirects=False,
+                )
+            except ValueError:
+                # The SDK does other checks that we don't
+                raise MalformedConnectionStringError()
+
+            async with blob_service_client as client:
+                yield client.get_container_client(container_name)
+
+
+class AzureBlobConsumer(Consumer):
+    """Consumer that uploads data to Azure Blob Storage."""
+
+    def __init__(
+        self,
+        container_client: ContainerClient,
+        prefix: str,
+        data_interval_start: str | None,
+        data_interval_end: str,
+        batch_export_model: BatchExportModelInput | None,
+        file_format: str,
+        compression: str | None = None,
+        max_file_size_mb: int | None = None,
+        max_concurrency: int = 5,
+        legacy_parquet_extension: bool = True,
+    ):
+        model = migrate_batch_export_model(batch_export_model)
+        super().__init__(model=model.name)
+
+        self.container_client = container_client
+
+        self.prefix = prefix
+        self.data_interval_start = data_interval_start
+        self.data_interval_end = data_interval_end
+        self.batch_export_model = model
+        self.file_format = file_format
+        self.compression = compression
+        self.max_file_size_mb = max_file_size_mb
+        self.max_concurrency = max_concurrency
+        self.legacy_parquet_extension = legacy_parquet_extension
+
+        self.current_buffer = bytearray()
+        self.current_file_index = 0
+        self.files_uploaded: list[str] = []
+
+    @classmethod
+    def from_inputs(
+        cls,
+        inputs: AzureBlobInsertInputs,
+        /,
+        container_client: ContainerClient,
+        max_concurrency: int,
+    ) -> "AzureBlobConsumer":
+        return cls(
+            container_client=container_client,
+            prefix=inputs.prefix,
+            data_interval_start=inputs.data_interval_start,
+            data_interval_end=inputs.data_interval_end,
+            batch_export_model=inputs.batch_export_model,
+            file_format=inputs.file_format,
+            compression=inputs.compression,
+            max_file_size_mb=inputs.max_file_size_mb,
+            max_concurrency=max_concurrency,
+            legacy_parquet_extension=inputs.legacy_parquet_extension,
+        )
+
+    async def consume_chunk(self, data: bytes):
+        self.current_buffer.extend(data)
+
+    async def finalize_file(self):
+        await self._upload_current_buffer()
+        self.current_file_index += 1
+
+    async def finalize(self):
+        if self.current_buffer:
+            await self._upload_current_buffer()
+
+        if self.max_file_size_mb and len(self.files_uploaded) > 1:
+            await self._upload_manifest()
+
+        await self.container_client.close()
+
+    async def _upload_current_buffer(self):
+        if not self.current_buffer:
+            return
+
+        blob_key = get_object_key(
+            prefix=self.prefix,
+            data_interval_start=self.data_interval_start,
+            data_interval_end=self.data_interval_end,
+            batch_export_model=self.batch_export_model,
+            file_format=self.file_format,
+            compression=self.compression,
+            legacy_parquet_extension=self.legacy_parquet_extension,
+            file_number=self.current_file_index,
+            include_file_number=bool(self.max_file_size_mb),
+        )
+        blob_client = self.container_client.get_blob_client(blob_key)
+
+        self.logger.debug("Blob upload started", blob_key=blob_key, size_bytes=len(self.current_buffer))
+
+        try:
+            await blob_client.upload_blob(
+                bytes(self.current_buffer),
+                overwrite=True,
+                max_concurrency=self.max_concurrency,
+            )
+        except HttpResponseError as exc:
+            if _is_authorization_failure_response_error(exc):
+                raise MissingRequiredPermissionsError()
+            else:
+                raise
+
+        self.logger.debug("Blob upload completed", blob_key=blob_key)
+        self.files_uploaded.append(blob_key)
+        self.current_buffer.clear()
+
+    async def _upload_manifest(self):
+        manifest_key = get_manifest_key(
+            prefix=self.prefix,
+            data_interval_start=self.data_interval_start,
+            data_interval_end=self.data_interval_end,
+            batch_export_model=self.batch_export_model,
+        )
+        manifest_content = json.dumps({"files": self.files_uploaded}, indent=2)
+
+        blob_client = self.container_client.get_blob_client(manifest_key)
+
+        try:
+            await blob_client.upload_blob(
+                manifest_content.encode("utf-8"),
+                overwrite=True,
+            )
+        except HttpResponseError as exc:
+            if _is_authorization_failure_response_error(exc):
+                raise MissingRequiredPermissionsError()
+            else:
+                raise
+
+        self.logger.info("Manifest uploaded", manifest_key=manifest_key, file_count=len(self.files_uploaded))
+
+
+@activity.defn
+@handle_non_retryable_errors(NON_RETRYABLE_ERROR_TYPES)
+async def insert_into_azure_blob_activity_from_stage(inputs: AzureBlobInsertInputs) -> BatchExportResult:
+    bind_contextvars(
+        team_id=inputs.team_id,
+        destination="AzureBlob",
+        data_interval_start=inputs.data_interval_start,
+        data_interval_end=inputs.data_interval_end,
+    )
+
+    if inputs.file_format not in FILE_FORMAT_EXTENSIONS:
+        raise UnsupportedFileFormatError(inputs.file_format)
+    if inputs.compression is not None and inputs.compression not in SUPPORTED_COMPRESSIONS[inputs.file_format]:
+        raise UnsupportedCompressionError(inputs.compression)
+
+    external_logger = EXTERNAL_LOGGER.bind()
+
+    azure_integration = await _get_azure_blob_integration(inputs.integration_id, inputs.team_id)
+
+    blob_key = get_object_key(
+        prefix=inputs.prefix,
+        data_interval_start=inputs.data_interval_start,
+        data_interval_end=inputs.data_interval_end,
+        batch_export_model=inputs.batch_export_model,
+        file_format=inputs.file_format,
+        compression=inputs.compression,
+        legacy_parquet_extension=inputs.legacy_parquet_extension,
+        include_file_number=bool(inputs.max_file_size_mb),
+    )
+
+    external_logger.info(
+        "Batch exporting range %s - %s to Azure Blob: %s",
+        inputs.data_interval_start or "START",
+        inputs.data_interval_end or "END",
+        blob_key,
+    )
+
+    async with Heartbeater(), AsyncExitStack() as cleanup:
+        queue = RecordBatchQueue(max_size_bytes=settings.BATCH_EXPORT_AZURE_BLOB_RECORD_BATCH_QUEUE_MAX_SIZE_BYTES)
+        producer = ProducerFromInternalStage()
+
+        assert inputs.batch_export_id is not None
+        producer_task = await producer.start(
+            queue=queue,
+            batch_export_id=inputs.batch_export_id,
+            data_interval_start=inputs.data_interval_start,
+            data_interval_end=inputs.data_interval_end,
+            max_record_batch_size_bytes=1024 * 1024 * 60,  # 60MB
+            stage_folder=inputs.stage_folder,
+        )
+        cleanup.push_async_callback(producer.stop)
+
+        record_batch_schema = await wait_for_schema_or_producer(queue, producer_task)
+        if record_batch_schema is None:
+            external_logger.info(
+                "Batch export will finish early as there is no data matching specified filters in range %s - %s",
+                inputs.data_interval_start or "START",
+                inputs.data_interval_end or "END",
+            )
+            return BatchExportResult(records_completed=0, bytes_exported=0)
+
+        json_columns = ("properties", "person_properties", "set", "set_once")
+        if inputs.file_format.lower() == "jsonlines":
+            transformer = get_json_stream_transformer(
+                compression=inputs.compression,
+                include_inserted_at=True,
+                max_file_size_bytes=inputs.max_file_size_mb * 1024 * 1024 if inputs.max_file_size_mb else 0,
+            )
+        else:
+            transformer = ParquetStreamTransformer(
+                compression=inputs.compression,
+                include_inserted_at=True,
+                max_file_size_bytes=inputs.max_file_size_mb * 1024 * 1024 if inputs.max_file_size_mb else 0,
+            )
+
+        async with azure_container_client(azure_integration.connection_string, inputs.container_name) as client:
+            consumer = AzureBlobConsumer.from_inputs(
+                inputs,
+                container_client=client,
+                max_concurrency=settings.BATCH_EXPORT_AZURE_BLOB_MAX_CONCURRENT_UPLOADS,
+            )
+
+            return await run_consumer_from_stage(
+                queue=queue,
+                consumer=consumer,
+                producer_task=producer_task,
+                transformer=transformer,
+                json_columns=json_columns,
+                records_total=inputs.records_total,
+            )
+
+
+@workflow.defn(name="azure-blob-export", failure_exception_types=[workflow.NondeterminismError])
+class AzureBlobBatchExportWorkflow(PostHogWorkflow):
+    """A Temporal Workflow to export ClickHouse data into Azure Blob Storage."""
+
+    @staticmethod
+    def parse_inputs(inputs: list[str]) -> AzureBlobBatchExportInputs:
+        loaded = json.loads(inputs[0])
+        return AzureBlobBatchExportInputs(**loaded)
+
+    @workflow.run
+    async def run(self, inputs: AzureBlobBatchExportInputs):
+        is_backfill = inputs.get_is_backfill()
+        is_earliest_backfill = inputs.get_is_earliest_backfill()
+        data_interval = get_data_interval(inputs.interval, inputs.data_interval_end, inputs.timezone)
+        should_backfill_from_beginning = is_backfill and is_earliest_backfill
+
+        start_batch_export_run_inputs = StartBatchExportRunInputs(
+            team_id=inputs.team_id,
+            batch_export_id=inputs.batch_export_id,
+            data_interval_start=data_interval.start.isoformat() if not should_backfill_from_beginning else None,
+            data_interval_end=data_interval.end.isoformat(),
+            exclude_events=inputs.exclude_events,
+            include_events=inputs.include_events,
+            backfill_id=inputs.backfill_details.backfill_id if inputs.backfill_details else None,
+        )
+        try:
+            run_id = await workflow.execute_activity(
+                start_batch_export_run,
+                start_batch_export_run_inputs,
+                start_to_close_timeout=dt.timedelta(minutes=5),
+                retry_policy=RetryPolicy(
+                    initial_interval=dt.timedelta(seconds=10),
+                    maximum_interval=dt.timedelta(seconds=60),
+                    maximum_attempts=0,
+                    non_retryable_error_types=["NotNullViolation", "IntegrityError", "OverBillingLimitError"],
+                ),
+            )
+        except exceptions.ActivityError as e:
+            if is_over_billing_limit_error(e):
+                return
+            raise
+
+        if inputs.integration_id is None:
+            raise AzureBlobIntegrationNotFoundError(inputs.integration_id, inputs.team_id)
+
+        insert_inputs = AzureBlobInsertInputs(
+            container_name=inputs.container_name,
+            prefix=inputs.prefix,
+            team_id=inputs.team_id,
+            data_interval_start=data_interval.start.isoformat() if not should_backfill_from_beginning else None,
+            data_interval_end=data_interval.end.isoformat(),
+            compression=inputs.compression,
+            exclude_events=inputs.exclude_events,
+            include_events=inputs.include_events,
+            file_format=inputs.file_format,
+            max_file_size_mb=inputs.max_file_size_mb,
+            legacy_parquet_extension=inputs.legacy_parquet_extension,
+            run_id=run_id,
+            backfill_details=inputs.backfill_details,
+            is_backfill=is_backfill,
+            batch_export_model=inputs.batch_export_model,
+            batch_export_id=inputs.batch_export_id,
+            destination_default_fields=azure_blob_default_fields(),
+            integration_id=inputs.integration_id,
+        )
+
+        await execute_batch_export_using_internal_stage(
+            insert_into_azure_blob_activity_from_stage,
+            insert_inputs,
+            interval=inputs.interval,
+        )

@@ -1,0 +1,484 @@
+import re
+import uuid
+from urllib.parse import unquote
+
+from posthog.test.base import APIBaseTest
+from unittest.mock import MagicMock, patch
+
+from django.test import SimpleTestCase
+
+import requests
+from boto3 import resource
+from botocore.client import Config
+from botocore.exceptions import ClientError
+from parameterized import parameterized
+
+import posthog.storage.object_storage as object_storage_module
+from posthog.settings import (
+    OBJECT_STORAGE_ACCESS_KEY_ID,
+    OBJECT_STORAGE_BUCKET,
+    OBJECT_STORAGE_ENDPOINT,
+    OBJECT_STORAGE_SECRET_ACCESS_KEY,
+)
+from posthog.storage.object_storage import (
+    MULTIPART_MIN_PART_BYTES,
+    ObjectStorage,
+    ObjectStorageError,
+    StoredObjectSummary,
+    UnavailableStorage,
+    append,
+    copy_objects,
+    get_presigned_post,
+    get_presigned_put,
+    get_presigned_url,
+    head_object,
+    health_check,
+    is_usable_endpoint,
+    iter_keys,
+    list_objects,
+    object_storage_client,
+    read,
+    read_bytes,
+    write,
+)
+
+TEST_BUCKET = "test_storage_bucket"
+
+
+class TestStorage(APIBaseTest):
+    def teardown_method(self, method) -> None:
+        s3 = resource(
+            "s3",
+            endpoint_url=OBJECT_STORAGE_ENDPOINT,
+            aws_access_key_id=OBJECT_STORAGE_ACCESS_KEY_ID,
+            aws_secret_access_key=OBJECT_STORAGE_SECRET_ACCESS_KEY,
+            config=Config(signature_version="s3v4"),
+            region_name="us-east-1",
+        )
+        bucket = s3.Bucket(OBJECT_STORAGE_BUCKET)
+        bucket.objects.filter(Prefix=TEST_BUCKET).delete()
+
+    @patch("boto3.client")
+    def test_does_not_create_client_if_storage_is_disabled(self, patched_s3_client) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=False):
+            assert not health_check()
+            patched_s3_client.assert_not_called()
+
+    def test_write_and_read_works_with_known_content(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            session_id = str(uuid.uuid4())
+            chunk_id = uuid.uuid4()
+            name = f"{session_id}/{0}-{chunk_id}"
+            file_name = f"{TEST_BUCKET}/test_write_and_read_works_with_known_content/{name}"
+            write(file_name, "my content")
+            assert read(file_name) == "my content"
+
+    def test_write_and_read_works_with_known_byte_content(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            session_id = str(uuid.uuid4())
+            chunk_id = uuid.uuid4()
+            name = f"{session_id}/{0}-{chunk_id}"
+            file_name = f"{TEST_BUCKET}/test_write_and_read_works_with_known_content/{name}"
+            write(file_name, b"my content")
+            assert read(file_name) == "my content"
+
+    @parameterized.expand(
+        [
+            ("missing", None, False),
+            ("small", b'{"n": 0}', False),
+            ("large", b"x" * MULTIPART_MIN_PART_BYTES, True),
+        ]
+    )
+    def test_append_keeps_existing_content(
+        self, _name: str, existing: bytes | None, expected_assembled_in_storage: bool
+    ) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            file_name = f"{TEST_BUCKET}/test_append_keeps_existing_content/{uuid.uuid4()}"
+            if existing is not None:
+                write(file_name, existing)
+
+            created = append(file_name, b'{"n": 1}', separator=b"\n")
+
+            assert created == (existing is None)
+            self.assertEqual(read_bytes(file_name), (existing + b"\n" if existing else b"") + b'{"n": 1}')
+            head = head_object(file_name)
+            assert head is not None
+            assert head["ETag"].endswith('-2"') == expected_assembled_in_storage
+
+    def test_can_generate_presigned_url_for_existing_file(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            session_id = str(uuid.uuid4())
+            chunk_id = uuid.uuid4()
+            name = f"{session_id}/{0}-{chunk_id}"
+            file_name = f"{TEST_BUCKET}/test_can_generate_presigned_url_for_existing_file/{name}"
+            write(file_name, b"my content")
+
+            presigned_url = get_presigned_url(file_name)
+            assert presigned_url is not None
+            assert re.match(
+                r"^http://localhost:\d+/posthog/test_storage_bucket/test_can_generate_presigned_url_for_existing_file/.*\?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=.*$",
+                presigned_url,
+            )
+
+    def test_can_generate_presigned_url_for_non_existent_file(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            name = "a/b-c"
+            file_name = f"{TEST_BUCKET}/test_can_ignore_presigned_url_for_non_existent_file/{name}"
+
+            presigned_url = get_presigned_url(file_name)
+            assert presigned_url is not None
+            assert re.match(
+                r"^http://localhost:\d+/posthog/test_storage_bucket/test_can_ignore_presigned_url_for_non_existent_file/.*?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=.*$",
+                presigned_url,
+            )
+
+    def test_can_generate_presigned_post_url(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            file_name = f"{TEST_BUCKET}/test_can_generate_presigned_upload_url/{uuid.uuid4()}"
+
+            presigned_url = get_presigned_post(file_name, conditions=[])
+            assert presigned_url is not None
+            assert "fields" in presigned_url
+            assert re.match(
+                r"^http://localhost:\d+/posthog",
+                presigned_url["url"],
+            )
+
+    def test_can_upload_through_a_presigned_put_url(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            file_name = f"{TEST_BUCKET}/test_can_generate_presigned_put_url/{uuid.uuid4()}"
+
+            presigned_url = get_presigned_put(file_name)
+            assert presigned_url is not None
+            # A PUT addresses the object itself, where a POST addresses the bucket root.
+            assert re.match(rf"^http://localhost:\d+/posthog/{re.escape(file_name)}\?", presigned_url)
+
+            response = requests.put(presigned_url, data=b"my content")
+
+            assert response.status_code == 200, response.text
+            assert read(file_name) == "my content"
+
+    def test_presigned_put_url_rejects_a_body_of_another_length(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            file_name = f"{TEST_BUCKET}/test_presigned_put_signs_length/{uuid.uuid4()}"
+            content = b"my content"
+
+            presigned_url = get_presigned_put(file_name, content_length=len(content))
+            assert presigned_url is not None
+            # A signed `content-length` is the only size condition a presigned PUT can carry, and
+            # it replaces the `content-length-range` a POST policy holds.
+            signed_headers = re.search(r"X-Amz-SignedHeaders=([^&]+)", presigned_url)
+            assert signed_headers is not None
+            assert "content-length" in unquote(signed_headers.group(1)).split(";")
+
+            oversized = requests.put(presigned_url, data=content + b" and more")
+
+            assert oversized.status_code >= 400
+            assert read(file_name, missing_ok=True) is None
+            assert requests.put(presigned_url, data=content).status_code == 200
+            assert read(file_name) == "my content"
+
+    def test_can_list_objects_with_prefix(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            shared_prefix = "a_shared_prefix"
+
+            for file in ["a", "b", "c"]:
+                file_name = f"{TEST_BUCKET}/{shared_prefix}/{file}"
+                write(file_name, b"my content")
+
+            listing = list_objects(prefix=f"{TEST_BUCKET}/{shared_prefix}")
+
+            assert listing == [
+                "test_storage_bucket/a_shared_prefix/a",
+                "test_storage_bucket/a_shared_prefix/b",
+                "test_storage_bucket/a_shared_prefix/c",
+            ]
+            assert list(iter_keys(prefix=f"{TEST_BUCKET}/{shared_prefix}", page_size=2)) == listing
+
+    @patch("posthog.storage.object_storage.capture_exception")
+    def test_can_list_unknown_prefix(self, mock_capture_exception) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            shared_prefix = str(uuid.uuid4())
+
+            listing = list_objects(prefix=shared_prefix)
+
+            assert listing is None
+            mock_capture_exception.assert_not_called()
+
+    def test_can_copy_objects_between_prefixes(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            shared_prefix = "a_shared_prefix"
+
+            for file in ["a", "b", "c"]:
+                file_name = f"{TEST_BUCKET}/{shared_prefix}/{file}"
+                write(file_name, b"my content")
+
+            copied_count = copy_objects(
+                source_prefix=f"{TEST_BUCKET}/{shared_prefix}",
+                target_prefix=f"{TEST_BUCKET}/the_destination/folder",
+            )
+            assert copied_count == 3
+
+            listing = list_objects(prefix=f"{TEST_BUCKET}")
+
+            assert listing == [
+                "test_storage_bucket/a_shared_prefix/a",
+                "test_storage_bucket/a_shared_prefix/b",
+                "test_storage_bucket/a_shared_prefix/c",
+                "test_storage_bucket/the_destination/folder/a",
+                "test_storage_bucket/the_destination/folder/b",
+                "test_storage_bucket/the_destination/folder/c",
+            ]
+
+    def test_can_safely_copy_objects_from_unknown_prefix(self) -> None:
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            shared_prefix = "a_shared_prefix"
+
+            for file in ["a", "b", "c"]:
+                file_name = f"{TEST_BUCKET}/{shared_prefix}/{file}"
+                write(file_name, b"my content")
+
+            copied_count = copy_objects(
+                source_prefix=f"nothing_here",
+                target_prefix=f"{TEST_BUCKET}/the_destination/folder",
+            )
+            assert copied_count == 0
+
+            listing = list_objects(prefix=f"{TEST_BUCKET}")
+
+            assert listing == [
+                "test_storage_bucket/a_shared_prefix/a",
+                "test_storage_bucket/a_shared_prefix/b",
+                "test_storage_bucket/a_shared_prefix/c",
+            ]
+
+    def test_read_bytes(self):
+        mock_client = MagicMock()
+        mock_body = MagicMock()
+        mock_body.read.return_value = b"test content"
+        mock_client.get_object.return_value = {"Body": mock_body}
+        storage = ObjectStorage(mock_client)
+
+        result = storage.read_bytes("test-bucket", "test-key")
+        mock_client.get_object.assert_called_with(Bucket="test-bucket", Key="test-key")
+        assert result == b"test content"
+
+    def test_read_bytes_returns_none_for_nosuchkey_when_missing_ok(self):
+        mock_client = MagicMock()
+        error_response = {"Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."}}
+        mock_client.get_object.side_effect = ClientError(error_response, "GetObject")  # type: ignore[arg-type]
+        storage = ObjectStorage(mock_client)
+
+        result = storage.read_bytes("test-bucket", "nonexistent-key", missing_ok=True)
+        assert result is None
+
+    def test_read_bytes_raises_for_nosuchkey_by_default(self):
+        mock_client = MagicMock()
+        error_response = {"Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."}}
+        mock_client.get_object.side_effect = ClientError(error_response, "GetObject")  # type: ignore[arg-type]
+        storage = ObjectStorage(mock_client)
+
+        with self.assertRaises(ObjectStorageError):
+            storage.read_bytes("test-bucket", "nonexistent-key")
+
+    def test_read_bytes_raises_for_other_client_errors(self):
+        mock_client = MagicMock()
+        error_response = {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}}
+        mock_client.get_object.side_effect = ClientError(error_response, "GetObject")  # type: ignore[arg-type]
+        storage = ObjectStorage(mock_client)
+
+        with self.assertRaises(ObjectStorageError):
+            storage.read_bytes("test-bucket", "test-key")
+
+    @parameterized.expand(
+        [
+            ("part_copy_fails", "upload_part_copy", b"", 1),
+            ("completion_response_lost", "complete_multipart_upload", b"\nnew", 0),
+        ]
+    )
+    def test_append_rewrites_the_object_only_when_part_copy_did_not_land(
+        self, _name: str, failing_call: str, landed_suffix: bytes, expected_rewrites: int
+    ) -> None:
+        existing_content = b"x" * MULTIPART_MIN_PART_BYTES
+        closed_stream = {"ContentLength": len(existing_content), "Body": MagicMock(read=MagicMock(return_value=b""))}
+        reread_stream = {
+            "ContentLength": len(existing_content),
+            "Body": MagicMock(read=MagicMock(return_value=existing_content)),
+        }
+        mock_client = MagicMock()
+        mock_client.get_object.side_effect = [closed_stream, reread_stream]
+        mock_client.head_object.return_value = {"ContentLength": len(existing_content) + len(landed_suffix)}
+        error_response = {"Error": {"Code": "InternalError", "Message": "We encountered an internal error"}}
+        getattr(mock_client, failing_call).side_effect = ClientError(error_response, failing_call)  # type: ignore[arg-type]
+        storage = ObjectStorage(mock_client)
+
+        created = storage.append("test-bucket", "test-key", b"new", separator=b"\n")
+
+        assert not created
+        mock_client.abort_multipart_upload.assert_called_once()
+        rewritten_bodies = [put.kwargs["Body"] for put in mock_client.put_object.call_args_list]
+        assert [body == existing_content + b"\nnew" for body in rewritten_bodies] == [True] * expected_rewrites
+
+    def test_delete_objects_batches_keys_and_returns_failures(self) -> None:
+        mock_client = MagicMock()
+        mock_client.delete_objects.side_effect = [
+            {"Errors": [{"Key": "key-2"}]},
+            {},
+        ]
+        storage = ObjectStorage(mock_client)
+
+        failed_keys = storage.delete_objects("test-bucket", [f"key-{index}" for index in range(1001)])
+
+        assert failed_keys == ["key-2"]
+        assert mock_client.delete_objects.call_count == 2
+        assert len(mock_client.delete_objects.call_args_list[0].kwargs["Delete"]["Objects"]) == 1000
+        assert len(mock_client.delete_objects.call_args_list[1].kwargs["Delete"]["Objects"]) == 1
+
+
+class TestObjectStorageStrictHead(SimpleTestCase):
+    def test_returns_none_only_for_missing_objects(self) -> None:
+        mock_client = MagicMock()
+        error_response = {
+            "Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        }
+        mock_client.head_object.side_effect = ClientError(error_response, "HeadObject")  # type: ignore[arg-type]
+        storage = ObjectStorage(mock_client)
+
+        assert storage.head_object_strict("test-bucket", "missing-key") is None
+
+    def test_raises_for_transient_errors(self) -> None:
+        mock_client = MagicMock()
+        mock_client.head_object.side_effect = TimeoutError("object storage timed out")
+        storage = ObjectStorage(mock_client)
+
+        with self.assertRaises(ObjectStorageError):
+            storage.head_object_strict("test-bucket", "test-key")
+
+
+class TestObjectStorageListObjectSummaries(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("empty_prefix", [{"KeyCount": 0, "IsTruncated": False}], []),
+            (
+                "paginated",
+                [
+                    {
+                        "Contents": [{"Key": "p/a.md", "ETag": '"aa"', "Size": 1}],
+                        "IsTruncated": True,
+                        "NextContinuationToken": "page-2",
+                    },
+                    {"Contents": [{"Key": "p/b.md", "ETag": '"bb"', "Size": 2}], "IsTruncated": False},
+                ],
+                [
+                    StoredObjectSummary(key="p/a.md", etag='"aa"', size=1),
+                    StoredObjectSummary(key="p/b.md", etag='"bb"', size=2),
+                ],
+            ),
+        ]
+    )
+    def test_lists_every_page(self, _name: str, responses: list[dict], expected: list[StoredObjectSummary]) -> None:
+        mock_client = MagicMock()
+        mock_client.list_objects_v2.side_effect = responses
+        storage = ObjectStorage(mock_client)
+
+        assert storage.list_object_summaries("test-bucket", "p/") == expected
+        if len(responses) > 1:
+            assert mock_client.list_objects_v2.call_args_list[1].kwargs["ContinuationToken"] == "page-2"
+
+    def test_stops_paginating_at_the_limit(self) -> None:
+        mock_client = MagicMock()
+        mock_client.list_objects_v2.side_effect = [
+            {
+                "Contents": [{"Key": f"p/{name}.md", "ETag": '"aa"', "Size": 1} for name in ("a", "b", "c")],
+                "IsTruncated": True,
+                "NextContinuationToken": "page-2",
+            },
+        ]
+        storage = ObjectStorage(mock_client)
+
+        summaries = storage.list_object_summaries("test-bucket", "p/", limit=2)
+
+        assert [summary.key for summary in summaries] == ["p/a.md", "p/b.md"]
+        assert mock_client.list_objects_v2.call_count == 1
+
+    def test_raises_instead_of_reporting_an_empty_prefix_on_failure(self) -> None:
+        mock_client = MagicMock()
+        mock_client.list_objects_v2.side_effect = TimeoutError("object storage timed out")
+        storage = ObjectStorage(mock_client)
+
+        with self.assertRaises(ObjectStorageError):
+            storage.list_object_summaries("test-bucket", "p/")
+
+
+class TestObjectStorageClientFactory(SimpleTestCase):
+    def setUp(self) -> None:
+        object_storage_module._client = UnavailableStorage()
+        self.addCleanup(setattr, object_storage_module, "_client", UnavailableStorage())
+
+    @parameterized.expand(
+        [
+            ("valid_http", "http://objectstorage:19000", True),
+            ("valid_https", "https://s3.amazonaws.com", True),
+            ("unsubstituted_placeholder", "https://${POSTHOG_DOMAIN}", False),
+            ("placeholder_in_path", "https://example.com/${BUCKET}", False),
+            ("missing_scheme", "objectstorage:19000", False),
+            ("empty", "", False),
+            ("none", None, False),
+        ]
+    )
+    def test_is_usable_endpoint(self, _name: str, endpoint: str | None, expected: bool) -> None:
+        assert is_usable_endpoint(endpoint) is expected
+
+    @patch("posthog.storage.object_storage.capture_exception")
+    @patch("boto3.client")
+    def test_bad_public_endpoint_does_not_crash_read_path(self, patched_client, patched_capture) -> None:
+        # A bad public endpoint must never raise out of the factory — readers route through it.
+        with self.settings(
+            OBJECT_STORAGE_ENABLED=True,
+            OBJECT_STORAGE_ENDPOINT="http://objectstorage:19000",
+            OBJECT_STORAGE_PUBLIC_ENDPOINT="https://${POSTHOG_DOMAIN}",
+        ):
+            storage = object_storage_client()
+
+        assert isinstance(storage, ObjectStorage)
+        # Only the internal client is built; presigned degrades to the internal client.
+        patched_client.assert_called_once()
+        assert storage.presigned_client is storage.aws_client
+        # The bad config is surfaced to Sentry even though the read path stays up.
+        patched_capture.assert_called_once()
+
+    @patch("posthog.storage.object_storage.capture_exception")
+    @patch("boto3.client")
+    def test_boto_failure_building_presigned_client_degrades(self, patched_client, patched_capture) -> None:
+        internal_client = MagicMock()
+        patched_client.side_effect = [internal_client, ValueError("Invalid endpoint")]
+
+        with self.settings(
+            OBJECT_STORAGE_ENABLED=True,
+            OBJECT_STORAGE_ENDPOINT="http://objectstorage:19000",
+            OBJECT_STORAGE_PUBLIC_ENDPOINT="https://public.example.com",
+        ):
+            storage = object_storage_client()
+
+        assert isinstance(storage, ObjectStorage)
+        assert storage.aws_client is internal_client
+        assert storage.presigned_client is internal_client
+        patched_capture.assert_called_once()
+
+    @patch("boto3.client")
+    def test_valid_public_endpoint_builds_separate_presigned_client(self, patched_client) -> None:
+        internal_client = MagicMock()
+        presigned_client = MagicMock()
+        patched_client.side_effect = [internal_client, presigned_client]
+
+        with self.settings(
+            OBJECT_STORAGE_ENABLED=True,
+            OBJECT_STORAGE_ENDPOINT="http://objectstorage:19000",
+            OBJECT_STORAGE_PUBLIC_ENDPOINT="https://public.example.com",
+        ):
+            storage = object_storage_client()
+
+        assert isinstance(storage, ObjectStorage)
+        assert storage.aws_client is internal_client
+        assert storage.presigned_client is presigned_client

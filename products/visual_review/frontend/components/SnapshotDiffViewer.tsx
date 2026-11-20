@@ -1,0 +1,716 @@
+import { useActions, useValues } from 'kea'
+import { useMemo, useState } from 'react'
+
+import { IconGithub } from '@posthog/icons'
+import { LemonButton, LemonSkeleton, LemonTag, Link } from '@posthog/lemon-ui'
+
+import { VisualImageDiffViewer, type VisualDiffResult } from 'lib/components/VisualImageDiffViewer'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture'
+import { pluralize } from 'lib/utils/strings'
+import { urls } from 'scenes/urls'
+
+import type {
+    QuarantineLiftEntryApi,
+    QuarantinedIdentifierEntryApi,
+    SnapshotApi,
+    ToleratedHashEntryApi,
+} from '../generated/api.schemas'
+import { automaticQuarantineLabel } from '../lib/quarantineAuthor'
+import { QUARANTINE_NUDGE_WINDOW_DAYS, type RecentTolerations, shouldSuggestQuarantine } from '../lib/quarantineNudge'
+import { splitRepoFullName } from '../lib/repoPaths'
+import { visualReviewPreferencesLogic } from '../scenes/visualReviewPreferencesLogic'
+import { QuarantineAction } from './QuarantineAction'
+import { QuarantineLiftOnMerge } from './QuarantineLiftOnMerge'
+import { QuarantineModal, type OnQuarantine } from './QuarantineModal'
+import { SnapshotChangeBadge, hasSnapshotChangeBadge } from './SnapshotChangeBadge'
+import { SnapshotClusterPanel } from './SnapshotClusterPanel'
+import { SnapshotShiftSummary } from './SnapshotShiftSummary'
+import { SnapshotStatusIndicator } from './SnapshotStatusIndicator'
+
+// A toleration the diff pipeline minted for sub-threshold jitter reads very
+// differently from one somebody chose, so the two never share a label.
+const TOLERATION_REASON_LABELS: Record<string, string> = {
+    human: 'manual',
+    agent: 'agent',
+    auto_threshold: 'auto',
+}
+
+function describeRecentTolerations(counts: RecentTolerations): string {
+    const total = counts.manual + counts.agent + counts.auto
+    const parts = [
+        counts.manual > 0 && `${counts.manual} manual`,
+        counts.agent > 0 && `${counts.agent} by an agent`,
+        counts.auto > 0 && `${counts.auto} automatic`,
+    ].filter(Boolean)
+    return `Tolerated ${pluralize(total, 'time')} in the last ${QUARANTINE_NUDGE_WINDOW_DAYS} days (${parts.join(', ')}).`
+}
+
+function DiffMinimap({ url, onClick }: { url: string; onClick?: () => void }): JSX.Element {
+    const [loaded, setLoaded] = useState(false)
+    return (
+        <div>
+            <h4 className="text-xs font-semibold text-muted mb-2">Diff map</h4>
+            <button
+                type="button"
+                className="relative rounded border border-border overflow-hidden bg-bg-3000 w-full cursor-pointer hover:border-primary transition-colors"
+                onClick={onClick}
+                data-attr="visual-review-diff-minimap"
+            >
+                {!loaded && <LemonSkeleton className="absolute inset-0" />}
+                <img
+                    src={url}
+                    alt="Diff heatmap"
+                    className={`w-full object-contain transition-opacity duration-150 ${loaded ? 'opacity-100' : 'opacity-0'}`}
+                    onLoad={() => setLoaded(true)}
+                    onError={() => setLoaded(true)}
+                />
+            </button>
+        </div>
+    )
+}
+
+interface SnapshotDiffViewerProps {
+    snapshot: SnapshotApi
+    toleratedHashes?: ToleratedHashEntryApi[]
+    toleratedHashesLoading?: boolean
+    recentTolerations?: RecentTolerations | null
+    onApprove?: () => void
+    isApproving?: boolean
+    onMarkTolerated?: () => void
+    quarantineEntry?: QuarantinedIdentifierEntryApi | null
+    onQuarantine?: OnQuarantine
+    onUnquarantine?: () => void
+    liftRequest?: QuarantineLiftEntryApi | null
+    liftOnMergeDisabledReason?: string | null
+    isRequestingLift?: boolean
+    isCancellingLift?: boolean
+    onRequestLiftOnMerge?: () => void
+    onCancelLiftOnMerge?: (requestId: string) => void
+    commitSha?: string
+    prNumber?: number | null
+    repoFullName?: string | null
+    runType?: string
+    githubRunId?: string | null
+    isReportingOnly?: boolean
+    isRecomputing?: boolean
+    onRecompute?: () => void
+    recomputeDisabledReason?: string
+}
+
+export function SnapshotDiffViewer({
+    snapshot,
+    toleratedHashes,
+    toleratedHashesLoading,
+    recentTolerations,
+    onApprove,
+    isApproving,
+    onMarkTolerated,
+    quarantineEntry,
+    onQuarantine,
+    onUnquarantine,
+    liftRequest,
+    liftOnMergeDisabledReason,
+    isRequestingLift,
+    isCancellingLift,
+    onRequestLiftOnMerge,
+    onCancelLiftOnMerge,
+    commitSha,
+    prNumber,
+    repoFullName,
+    runType,
+    githubRunId,
+    isReportingOnly,
+    isRecomputing,
+    onRecompute,
+    recomputeDisabledReason,
+}: SnapshotDiffViewerProps): JSX.Element {
+    const { comparisonMode } = useValues(visualReviewPreferencesLogic)
+    const { setComparisonMode } = useActions(visualReviewPreferencesLogic)
+    const baselineUrl = snapshot.baseline_artifact?.download_url
+    const currentUrl = snapshot.current_artifact?.download_url
+
+    const width = snapshot.current_artifact?.width || snapshot.baseline_artifact?.width
+    const height = snapshot.current_artifact?.height || snapshot.baseline_artifact?.height
+
+    const [highlightedClusterIndex, setHighlightedClusterIndex] = useState<number | null>(null)
+    // The identifier the nudge opened for. Hotkeys can move to another snapshot while the dialog is open.
+    const [nudgedIdentifier, setNudgedIdentifier] = useState<string | null>(null)
+
+    // When a single (post-merge) cluster covers most of the image, the
+    // bbox overlay adds no information beyond the diff% tag — full
+    // inversions or wholesale changes show as "1 region · 99%". Skip
+    // the overlay and panel in that regime so the user sees the
+    // underlying diff cleanly. Use `items.length` (post-merge count),
+    // not `total` — total is the pre-merge raw count so it can be 21
+    // even after pixelhog merged everything into one regional cluster.
+    const DOMINANT_CLUSTER_PCT_THRESHOLD = 80
+    const clusterSummary = snapshot.cluster_summary
+    const isClusterDominant =
+        !!clusterSummary &&
+        clusterSummary.items.length === 1 &&
+        snapshot.diff_percentage != null &&
+        snapshot.diff_percentage >= DOMINANT_CLUSTER_PCT_THRESHOLD
+    const visibleClusterSummary = useMemo(
+        () => (isClusterDominant ? null : clusterSummary),
+        [clusterSummary, isClusterDominant]
+    )
+    const overlayBoxes = useMemo(
+        () =>
+            visibleClusterSummary?.items.map((c) => ({
+                x: c.x,
+                y: c.y,
+                width: c.width,
+                height: c.height,
+            })),
+        [visibleClusterSummary]
+    )
+    const rowShift = snapshot.row_shift ?? null
+    const diffPixelTotal =
+        snapshot.diff_artifact?.width && snapshot.diff_artifact?.height
+            ? snapshot.diff_artifact.width * snapshot.diff_artifact.height
+            : null
+
+    const isApproved = snapshot.review_state === 'approved'
+    const isTolerated = snapshot.review_state === 'tolerated'
+    const isQuarantined = !!quarantineEntry
+    const hasChanges = snapshot.result === 'changed' || snapshot.result === 'new' || snapshot.result === 'removed'
+    // Default-branch (tracking-only) runs are never approvable — don't offer accept/reject/tolerate.
+    const needsAction = hasChanges && !isApproved && !isTolerated && !isQuarantined && !isReportingOnly
+    // A quarantined change never blocks the PR, so it needs no action. It still needs an approval
+    // before a lift on merge can name its picture, so accepting it stays available here.
+    const canAcceptQuarantined =
+        isQuarantined &&
+        (snapshot.result === 'changed' || snapshot.result === 'new') &&
+        !isApproved &&
+        !isReportingOnly &&
+        !!onApprove
+
+    // A snapshot that keeps needing a toleration is flaky, and one more toleration
+    // only covers this exact rendering. While the history loads, fall back to the
+    // plain confirm so the nudge never delays the click.
+    const openTolerateDialog = (): void => {
+        if (recentTolerations && onQuarantine && shouldSuggestQuarantine(recentTolerations)) {
+            const identifier = snapshot.identifier
+            LemonDialog.open({
+                title: 'This snapshot keeps changing',
+                description:
+                    `${describeRecentTolerations(recentTolerations)} A toleration only covers this exact rendering, so the next variation blocks PRs again. ` +
+                    'If this change is unrelated to your PR, quarantine the snapshot. It stops blocking PRs until someone fixes it.',
+                primaryButton: {
+                    children: 'Quarantine…',
+                    onClick: () => setNudgedIdentifier(identifier),
+                    'data-attr': 'visual-review-tolerate-nudge-quarantine',
+                },
+                secondaryButton: {
+                    children: 'Tolerate anyway',
+                    onClick: onMarkTolerated,
+                    'data-attr': 'visual-review-tolerate-nudge-tolerate',
+                },
+            })
+            return
+        }
+        LemonDialog.open({
+            title: 'Does this snapshot really render correctly?',
+            description:
+                'Only tolerate slight rendering noise above the difference threshold. Confirm there are no visible errors or missing elements. ' +
+                'Otherwise, quarantine this snapshot.',
+            primaryButton: {
+                children: 'Tolerate',
+                onClick: onMarkTolerated,
+            },
+            secondaryButton: { children: 'Cancel' },
+        })
+    }
+
+    // Accepting writes this picture into the baseline for every branch. On a pull request that does
+    // not touch the story, the picture is usually the flake the quarantine is hiding.
+    const openAcceptQuarantinedDialog = (): void => {
+        // The dialog stays clickable during its close transition, so a double click would approve twice.
+        let submitted = false
+        LemonDialog.open({
+            title: 'Accept a change to a quarantined snapshot?',
+            description: (
+                <div className="flex flex-col gap-2">
+                    <code className="break-all">{snapshot.identifier}</code>
+                    <p className="m-0">
+                        This snapshot is quarantined because it renders inconsistently, so its change does not block
+                        your pull request. Accept it only if your pull request changes this story. Otherwise leave it as
+                        it is: accepting it makes this picture the baseline for everyone.
+                    </p>
+                </div>
+            ),
+            primaryButton: {
+                children: 'Accept change',
+                onClick: () => {
+                    if (!submitted) {
+                        submitted = true
+                        onApprove?.()
+                    }
+                },
+                'data-attr': 'visual-review-snapshot-accept-quarantined-confirm',
+            },
+            secondaryButton: { children: 'Cancel' },
+        })
+    }
+
+    // Parse identifier for display (e.g., "Feature-Flags-settings--e2e-test--dark--1440x900")
+    const parts = snapshot.identifier.split('--')
+    const pageName = parts[0]?.replace(/-/g, ' ') || snapshot.identifier
+    const variant = parts.slice(1).join(' · ')
+
+    return (
+        <div className="@container/snapshot-review w-full min-w-0">
+            {/* Title + status + actions — full width above content+sidebar */}
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                <div className="flex min-w-0 flex-wrap items-baseline gap-2">
+                    <h3 className="text-lg font-semibold capitalize break-words min-w-0">{pageName}</h3>
+                    {variant && (
+                        <span className="text-sm text-muted break-all">
+                            @ {variant}
+                            {width && height && ` · ${width}×${height}`}
+                        </span>
+                    )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                    <SnapshotStatusIndicator
+                        result={snapshot.result || 'unchanged'}
+                        reviewState={snapshot.review_state}
+                        classificationReason={snapshot.classification_reason}
+                    />
+
+                    {needsAction && (
+                        <>
+                            <LemonButton
+                                type="secondary"
+                                size="small"
+                                disabledReason="Leaving a snapshot unreviewed already blocks the PR. To fix it, update your code and rerun CI."
+                                data-attr="visual-review-snapshot-reject"
+                            >
+                                Reject
+                            </LemonButton>
+                            {snapshot.result === 'changed' && (
+                                <LemonButton
+                                    type="secondary"
+                                    size="small"
+                                    onClick={openTolerateDialog}
+                                    data-attr="visual-review-snapshot-tolerate"
+                                >
+                                    Tolerate
+                                </LemonButton>
+                            )}
+                            <LemonButton
+                                type="primary"
+                                size="small"
+                                onClick={onApprove}
+                                loading={isApproving}
+                                disabledReason={
+                                    snapshot.result === 'removed'
+                                        ? 'A removed snapshot has no new image to accept. Finalize the run to remove it from the baseline.'
+                                        : undefined
+                                }
+                                data-attr="visual-review-snapshot-accept"
+                            >
+                                Accept change
+                            </LemonButton>
+                        </>
+                    )}
+                    {canAcceptQuarantined && (
+                        <LemonButton
+                            type="secondary"
+                            size="small"
+                            onClick={openAcceptQuarantinedDialog}
+                            loading={isApproving}
+                            tooltip="This change does not block the pull request because the story is quarantined. Accept it only if your pull request changes this story."
+                            data-attr="visual-review-snapshot-accept-quarantined"
+                        >
+                            Accept change
+                        </LemonButton>
+                    )}
+                </div>
+            </div>
+
+            {/* Content + sidebar */}
+            <div className="flex flex-col gap-4 @4xl/snapshot-review:flex-row">
+                <div className="flex-1 min-w-0 overflow-hidden">
+                    {isQuarantined && quarantineEntry && (
+                        <div className="bg-warning-highlight border border-warning rounded px-3 py-2 mb-4 text-sm text-muted-alt flex items-center gap-1.5">
+                            <span>
+                                Quarantined — {quarantineEntry.reason}
+                                {quarantineEntry.expires_at &&
+                                    ` · until ${new Date(quarantineEntry.expires_at).toLocaleDateString()}`}
+                            </span>
+                            {quarantineEntry.created_by && (
+                                <>
+                                    <span>·</span>
+                                    <ProfilePicture user={quarantineEntry.created_by} size="xs" showName />
+                                </>
+                            )}
+                            {automaticQuarantineLabel(quarantineEntry) && (
+                                <>
+                                    <span>·</span>
+                                    <span>{automaticQuarantineLabel(quarantineEntry)}</span>
+                                </>
+                            )}
+                        </div>
+                    )}
+
+                    <VisualImageDiffViewer
+                        key={snapshot.id}
+                        baselineUrl={baselineUrl || null}
+                        currentUrl={currentUrl || null}
+                        diffUrl={snapshot.diff_artifact?.download_url || null}
+                        diffPercentage={snapshot.diff_percentage ?? null}
+                        result={(snapshot.result || 'unchanged') as VisualDiffResult}
+                        imageWidth={width ?? undefined}
+                        imageHeight={height ?? undefined}
+                        baselineWidth={snapshot.baseline_artifact?.width ?? undefined}
+                        baselineHeight={snapshot.baseline_artifact?.height ?? undefined}
+                        currentWidth={snapshot.current_artifact?.width ?? undefined}
+                        currentHeight={snapshot.current_artifact?.height ?? undefined}
+                        mode={comparisonMode}
+                        onModeChange={setComparisonMode}
+                        className="min-h-[200px]"
+                        diffOverlayBoxes={overlayBoxes}
+                        diffOverlayBands={rowShift?.bands}
+                        diffOverlayWidth={snapshot.diff_artifact?.width ?? undefined}
+                        diffOverlayHeight={snapshot.diff_artifact?.height ?? undefined}
+                        highlightedOverlayIndex={highlightedClusterIndex}
+                        onOverlayHover={setHighlightedClusterIndex}
+                    />
+                </div>
+
+                {/* Right sidebar */}
+                <div className="w-full min-w-0 border-t pt-4 space-y-4 @4xl/snapshot-review:w-64 @4xl/snapshot-review:shrink-0 @4xl/snapshot-review:border-t-0 @4xl/snapshot-review:border-l @4xl/snapshot-review:pt-0 @4xl/snapshot-review:pl-4">
+                    {/* === Diff minimap === */}
+                    {snapshot.diff_artifact?.download_url && (
+                        <DiffMinimap
+                            url={snapshot.diff_artifact.download_url}
+                            onClick={() => setComparisonMode('diff')}
+                        />
+                    )}
+
+                    {/* === Row shift === */}
+                    {rowShift && <SnapshotShiftSummary rowShift={rowShift} />}
+
+                    {/* === Change clusters === */}
+                    {visibleClusterSummary && visibleClusterSummary.items.length > 0 && (
+                        <SnapshotClusterPanel
+                            clusterSummary={visibleClusterSummary}
+                            totalPixels={diffPixelTotal}
+                            highlightedIndex={highlightedClusterIndex}
+                            onHighlight={setHighlightedClusterIndex}
+                        />
+                    )}
+
+                    {/* === Run section === */}
+                    {(runType || commitSha || prNumber) && (
+                        <div>
+                            <h4 className="text-xs font-semibold text-muted mb-2">Run</h4>
+                            <div className="space-y-2">
+                                {runType && (
+                                    <div className="flex items-center justify-between text-xs">
+                                        <span className="text-muted">Type</span>
+                                        <LemonTag type="muted" size="small" className="uppercase">
+                                            {runType}
+                                        </LemonTag>
+                                    </div>
+                                )}
+                                {commitSha && (
+                                    <div className="flex items-center justify-between text-xs">
+                                        <span className="text-muted">Commit</span>
+                                        {repoFullName ? (
+                                            <Link
+                                                to={`https://github.com/${repoFullName}/commit/${commitSha}`}
+                                                target="_blank"
+                                                className="flex items-center gap-1 font-mono hover:text-primary"
+                                            >
+                                                {commitSha.substring(0, 7)}
+                                                <IconGithub className="text-xs" />
+                                            </Link>
+                                        ) : (
+                                            <span className="font-mono">{commitSha.substring(0, 7)}</span>
+                                        )}
+                                    </div>
+                                )}
+                                {prNumber && (
+                                    <div className="flex items-center justify-between text-xs">
+                                        <span className="text-muted">PR</span>
+                                        {repoFullName ? (
+                                            <Link
+                                                to={`https://github.com/${repoFullName}/pull/${prNumber}`}
+                                                target="_blank"
+                                                className="flex items-center gap-1 hover:text-primary"
+                                            >
+                                                #{prNumber}
+                                                <IconGithub className="text-xs" />
+                                            </Link>
+                                        ) : (
+                                            <span>#{prNumber}</span>
+                                        )}
+                                    </div>
+                                )}
+                                {isApproved && snapshot.reviewed_at && (
+                                    <div className="flex items-center justify-between text-xs">
+                                        <span className="text-muted">Approved</span>
+                                        <div className="flex items-center gap-1">
+                                            {snapshot.reviewed_by && (
+                                                <ProfilePicture user={snapshot.reviewed_by} size="xs" />
+                                            )}
+                                            <span className="text-success">
+                                                {new Date(snapshot.reviewed_at).toLocaleDateString()}
+                                            </span>
+                                        </div>
+                                    </div>
+                                )}
+                                {isTolerated && snapshot.reviewed_at && (
+                                    <div className="flex items-center justify-between text-xs">
+                                        <span className="text-muted">Tolerated</span>
+                                        <div className="flex items-center gap-1">
+                                            {snapshot.reviewed_by && (
+                                                <ProfilePicture user={snapshot.reviewed_by} size="xs" />
+                                            )}
+                                            <span>{new Date(snapshot.reviewed_at).toLocaleDateString()}</span>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* === CI section === */}
+                    {(githubRunId || onRecompute) && (
+                        <div>
+                            <h4 className="text-xs font-semibold text-muted mb-2">CI</h4>
+                            <div className="space-y-2">
+                                {githubRunId && (
+                                    <div className="flex items-center justify-between text-xs">
+                                        <span className="text-muted">Run</span>
+                                        {repoFullName ? (
+                                            <Link
+                                                to={`https://github.com/${repoFullName}/actions/runs/${githubRunId}`}
+                                                target="_blank"
+                                                className="flex items-center gap-1 hover:text-primary"
+                                            >
+                                                {githubRunId}
+                                                <IconGithub className="text-xs" />
+                                            </Link>
+                                        ) : (
+                                            <span>{githubRunId}</span>
+                                        )}
+                                    </div>
+                                )}
+                                {onRecompute && (
+                                    <LemonButton
+                                        type="secondary"
+                                        size="xsmall"
+                                        loading={isRecomputing}
+                                        disabledReason={recomputeDisabledReason}
+                                        data-attr="visual-review-snapshot-recompute"
+                                        onClick={() => {
+                                            LemonDialog.open({
+                                                title: 'Re-trigger CI job?',
+                                                description: githubRunId
+                                                    ? `Re-evaluate quarantine rules, update snapshot counts and commit status, and re-trigger CI run ${githubRunId} so the gate reflects the current state.`
+                                                    : 'Re-evaluate quarantine rules and update snapshot counts and commit status. The CI job cannot be re-triggered automatically — upgrade the CLI to enable this.',
+                                                primaryButton: {
+                                                    children: githubRunId ? `Re-trigger ${githubRunId}` : 'Recompute',
+                                                    onClick: onRecompute,
+                                                },
+                                                secondaryButton: {
+                                                    children: 'Cancel',
+                                                },
+                                            })
+                                        }}
+                                    >
+                                        Re-trigger
+                                    </LemonButton>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* === Identifier section === */}
+                    <div>
+                        <h4 className="text-xs font-semibold text-muted mb-2">Identifier</h4>
+                        <div className="space-y-2">
+                            <div className="text-xs">
+                                {repoFullName && runType ? (
+                                    <Link
+                                        to={urls.visualReviewSnapshotHistory(
+                                            ...splitRepoFullName(repoFullName),
+                                            runType,
+                                            snapshot.identifier
+                                        )}
+                                        className="font-mono text-default break-all"
+                                        title="View history"
+                                    >
+                                        {snapshot.identifier}
+                                    </Link>
+                                ) : (
+                                    <span className="font-mono break-all">{snapshot.identifier}</span>
+                                )}
+                            </div>
+                            {width && height && (
+                                <div className="flex items-center justify-between text-xs">
+                                    <span className="text-muted">Resolution</span>
+                                    <span className="font-mono">
+                                        {width}×{height}
+                                    </span>
+                                </div>
+                            )}
+                            {hasSnapshotChangeBadge(snapshot) && (
+                                <div className="flex items-center justify-between text-xs">
+                                    <span className="text-muted">Change</span>
+                                    <SnapshotChangeBadge snapshot={snapshot} />
+                                </div>
+                            )}
+                            {snapshot.baseline_artifact?.content_hash && (
+                                <div className="flex items-center justify-between text-xs">
+                                    <span className="text-muted">Before</span>
+                                    {repoFullName && runType ? (
+                                        <Link
+                                            to={urls.visualReviewSnapshotHistory(
+                                                ...splitRepoFullName(repoFullName),
+                                                runType,
+                                                snapshot.identifier
+                                            )}
+                                            className="font-mono"
+                                            title="View history"
+                                        >
+                                            {snapshot.baseline_artifact.content_hash.slice(0, 10)}…
+                                        </Link>
+                                    ) : (
+                                        <span className="font-mono">
+                                            {snapshot.baseline_artifact.content_hash.slice(0, 10)}…
+                                        </span>
+                                    )}
+                                </div>
+                            )}
+                            {snapshot.current_artifact?.content_hash && (
+                                <div className="flex items-center justify-between text-xs">
+                                    <span className="text-muted">After</span>
+                                    {repoFullName && runType ? (
+                                        <Link
+                                            to={urls.visualReviewSnapshotHistory(
+                                                ...splitRepoFullName(repoFullName),
+                                                runType,
+                                                snapshot.identifier
+                                            )}
+                                            className="font-mono"
+                                            title="View history"
+                                        >
+                                            {snapshot.current_artifact.content_hash.slice(0, 10)}…
+                                        </Link>
+                                    ) : (
+                                        <span className="font-mono">
+                                            {snapshot.current_artifact.content_hash.slice(0, 10)}…
+                                        </span>
+                                    )}
+                                </div>
+                            )}
+                            {repoFullName && runType && (
+                                <div className="pt-1">
+                                    <Link
+                                        to={urls.visualReviewSnapshotHistory(
+                                            ...splitRepoFullName(repoFullName),
+                                            runType,
+                                            snapshot.identifier
+                                        )}
+                                        className="text-xs"
+                                    >
+                                        View history →
+                                    </Link>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Tolerated hashes */}
+                    <div>
+                        <h4 className="text-xs font-semibold text-muted mb-2">Tolerated hashes</h4>
+                        {toleratedHashesLoading ? (
+                            <div className="space-y-2">
+                                <LemonSkeleton className="h-4 w-full" />
+                                <LemonSkeleton className="h-4 w-3/4" />
+                            </div>
+                        ) : toleratedHashes && toleratedHashes.length > 0 ? (
+                            <div className="space-y-1.5">
+                                {toleratedHashes.map((entry) => (
+                                    <div key={entry.id} className="flex items-center justify-between text-xs">
+                                        <span className="font-mono text-muted">
+                                            {entry.alternate_hash.slice(0, 10)}…
+                                        </span>
+                                        <LemonTag type="muted" size="small">
+                                            {TOLERATION_REASON_LABELS[entry.reason] ?? 'auto'}
+                                        </LemonTag>
+                                    </div>
+                                ))}
+                            </div>
+                        ) : (
+                            <p className="text-xs text-muted">None</p>
+                        )}
+                    </div>
+
+                    {/* Quarantine */}
+                    {hasChanges && !isQuarantined && onQuarantine && (
+                        <QuarantineAction
+                            identifier={snapshot.identifier}
+                            onQuarantine={onQuarantine}
+                            runType={runType}
+                        />
+                    )}
+                    {nudgedIdentifier && onQuarantine && (
+                        <QuarantineModal
+                            isOpen
+                            onClose={() => setNudgedIdentifier(null)}
+                            identifier={nudgedIdentifier}
+                            onQuarantine={onQuarantine}
+                            initialReason="Keeps changing in unrelated PRs"
+                            runType={runType}
+                        />
+                    )}
+                    {isQuarantined && onUnquarantine && (
+                        <div>
+                            <LemonButton
+                                type="secondary"
+                                status="danger"
+                                size="small"
+                                data-attr="visual-review-unquarantine"
+                                onClick={() => {
+                                    LemonDialog.open({
+                                        title: 'Unquarantine this identifier?',
+                                        description:
+                                            'This identifier will be gated on again in future runs. ' +
+                                            'Branches that haven\u2019t merged the fix may get blocked.',
+                                        primaryButton: {
+                                            children: 'Unquarantine',
+                                            status: 'danger',
+                                            onClick: onUnquarantine,
+                                        },
+                                        secondaryButton: { children: 'Cancel' },
+                                    })
+                                }}
+                            >
+                                Unquarantine
+                            </LemonButton>
+                        </div>
+                    )}
+                    {prNumber != null && onRequestLiftOnMerge && onCancelLiftOnMerge && (
+                        <QuarantineLiftOnMerge
+                            prNumber={prNumber}
+                            isQuarantined={isQuarantined}
+                            liftRequest={liftRequest ?? null}
+                            disabledReason={liftOnMergeDisabledReason ?? null}
+                            isRequesting={!!isRequestingLift}
+                            isCancelling={!!isCancellingLift}
+                            onRequest={onRequestLiftOnMerge}
+                            onCancel={onCancelLiftOnMerge}
+                        />
+                    )}
+                </div>
+            </div>
+        </div>
+    )
+}

@@ -1,0 +1,317 @@
+"""Decides when to send a report's inbox Slack notification.
+
+Every actionable report notifies once, ever; the PR is enrichment, not a gate. With an auto-start
+task we wait (bounded by a timeout) for the PR so the card can link it, then notify either way; with
+no task we notify immediately. Research settles again every time a new signal carries the report to
+its next bucket, and every settle starts this workflow, so `SignalReport.inbox_notified_at` is what
+keeps one report to one card. Actionability is enforced downstream (READY status + persisted
+priority). Posting lives in `dispatch_inbox_item_notifications`; this workflow governs timing.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import timedelta
+
+from django.conf import settings
+from django.utils import timezone
+
+import structlog
+import temporalio
+from temporalio import workflow
+from temporalio.common import RetryPolicy
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
+
+from posthog.clickhouse.client.connection import ClickHouseUser
+from posthog.clickhouse.workload import Workload
+from posthog.dataclasses import frozen
+from posthog.errors import CH_TRANSIENT_ERRORS
+from posthog.models import Team
+from posthog.sync import database_sync_to_async
+from posthog.temporal.common.scoped import scoped_temporal
+
+from products.signals.backend.default_owner import assign_default_owner
+from products.signals.backend.github_writeback import post_report_link_to_github_issues
+from products.signals.backend.models import SignalReport, SignalTeamConfig
+from products.signals.backend.signal_metadata import fetch_signals_for_report_sync
+from products.signals.backend.support_writeback import post_report_findings_to_tickets
+from products.signals.backend.task_run_artefacts import SIGNALS_PRODUCT, TASK_RUN_TYPE_IMPLEMENTATION
+from products.tasks.backend.facade import api as tasks_facade
+
+logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class InboxNotificationInput:
+    team_id: int
+    report_id: str
+
+
+@frozen
+class InboxNotificationState:
+    has_implementation_task: bool
+    pr_available: bool
+    task_terminal: bool
+    # Whether the report already notified. Defaults to False so a history written before this field
+    # decodes to the old behavior and replays through the same commands (see
+    # .claude/rules/temporal-workflow-versioning.md, the activity-output gating pattern).
+    already_notified: bool = False
+
+
+def _compute_inbox_notification_state(team_id: int, report_id: str) -> InboxNotificationState:
+    already_notified = SignalReport.objects.filter(
+        id=report_id, team_id=team_id, inbox_notified_at__isnull=False
+    ).exists()
+    if already_notified:
+        # Nothing downstream matters once the card is out, and skipping the task lookups keeps a
+        # re-researched report from paying for the PR wait it will not use.
+        return InboxNotificationState(
+            has_implementation_task=False, pr_available=False, task_terminal=False, already_notified=True
+        )
+    impl_task_ids = [
+        run.task_id
+        for run in SignalReport.associated_task_runs(
+            report_id=report_id, team_id=team_id, product=SIGNALS_PRODUCT, type=TASK_RUN_TYPE_IMPLEMENTATION
+        )
+    ]
+    if not impl_task_ids:
+        return InboxNotificationState(has_implementation_task=False, pr_available=False, task_terminal=False)
+
+    # Resolved from the implementation tasks alone, not the report's surfaced PR: the wait exists to
+    # give the implementation task time to open its PR, so a PR from some other task (a "Discuss"
+    # chat that opened one) must not end it early.
+    from products.signals.backend.implementation_pr import fetch_implementation_prs_for_reports
+
+    pr_available = any(
+        pr.task_id in impl_task_ids
+        for pr in fetch_implementation_prs_for_reports([report_id], team_id=team_id).get(report_id, [])
+    )
+    # Most recent run across the report's implementation task(s).
+    latest_run = max(
+        tasks_facade.get_latest_run_by_task(impl_task_ids).values(),
+        key=lambda run: (run.created_at, run.id),
+        default=None,
+    )
+    task_terminal = bool(latest_run and latest_run.is_terminal) and not pr_available
+    return InboxNotificationState(has_implementation_task=True, pr_available=pr_available, task_terminal=task_terminal)
+
+
+@temporalio.activity.defn
+@scoped_temporal()
+async def get_inbox_notification_state_activity(input: InboxNotificationInput) -> InboxNotificationState:
+    return await database_sync_to_async(_compute_inbox_notification_state, thread_sensitive=False)(
+        input.team_id, input.report_id
+    )
+
+
+def _claim_inbox_notification(team_id: int, report_id: str) -> bool:
+    """Stamp `inbox_notified_at`, returning False when another sender already claimed the report."""
+    return bool(
+        SignalReport.objects.filter(id=report_id, team_id=team_id, inbox_notified_at__isnull=True).update(
+            inbox_notified_at=timezone.now()
+        )
+    )
+
+
+def _release_inbox_notification_claim(team_id: int, report_id: str) -> None:
+    SignalReport.objects.filter(id=report_id, team_id=team_id).update(inbox_notified_at=None)
+
+
+@retry(
+    retry=retry_if_exception_type(CH_TRANSIENT_ERRORS),
+    stop=stop_after_attempt(4),
+    wait=wait_random_exponential(multiplier=2, max=10),
+    reraise=True,
+)
+def _fetch_signals_for_notification(team: Team, report_id: str) -> list[dict]:
+    return fetch_signals_for_report_sync(team, report_id, ch_user=ClickHouseUser.SIGNALS, workload=Workload.OFFLINE)
+
+
+def _send_report_inbox_notifications(team_id: int, report_id: str) -> int:
+    # Guard on status: a deferred wait can outlast the READY state (suppressed/deleted/re-promoted).
+    report = SignalReport.objects.filter(id=report_id, team_id=team_id).only("status").first()
+    if report is None or report.status != SignalReport.Status.READY:
+        logger.info(
+            "inbox notification skipped: report not READY",
+            report_id=report_id,
+            team_id=team_id,
+            status=report.status if report else None,
+        )
+        return 0
+
+    from products.signals.backend.slack_inbox_notifications import dispatch_inbox_item_notifications
+
+    # Team may have been deleted during a long deferred wait — degrade to no-op rather than failing.
+    team = Team.objects.filter(id=team_id).first()
+    if team is None:
+        logger.info("inbox notification skipped: team gone", report_id=report_id, team_id=team_id)
+        return 0
+
+    # Before the card goes out, so the Slack card and "For you" both name the default owner. The
+    # "new report" push is queued on `first_visible_at` instead, when the report still had nobody,
+    # so an assignment queues that push again. Its per-user cooldown stops a second push to anyone
+    # it already reached. Guarded because the fallback is supplementary, the same way as the
+    # support write-back below.
+    try:
+        if assign_default_owner(team, report_id):
+            from products.signals.backend.inbox_push_notifications import schedule_report_visible_push
+
+            schedule_report_visible_push(team_id=team_id, report_id=report_id)
+    except Exception:
+        logger.exception("inbox notification: default owner assignment failed", report_id=report_id, team_id=team_id)
+
+    # Re-fetched at send time so a deferred write-back reflects the current signals.
+    signals = _fetch_signals_for_notification(team, report_id)
+
+    # Point any support ticket that raised this report at it. Shares this function's READY guard.
+    # This runs above the claim, so it also runs on a settle that sends no card. A note is per ticket
+    # and not per report, so a ticket that joins the report after its card still needs one, and the
+    # note's dedupe key stops a repeat from posting twice to the same ticket. Guarded here as well as
+    # inside: the write-back is supplementary, and letting it raise would fail the activity before the
+    # Slack notification below, so a retry loop would drop the notification entirely over a side errand.
+    try:
+        post_report_findings_to_tickets(team, report_id, signals)
+    except Exception:
+        logger.exception("inbox notification: support write-back failed", report_id=report_id, team_id=team_id)
+
+    # Claim the report immediately before the send. One conditional UPDATE, so a concurrent settle that
+    # got past the workflow's already-notified check loses here instead of sending a second card.
+    # Nothing else runs under the claim, because a worker that dies while holding it never reaches the
+    # release below and leaves the report stamped for a card it never sent. Keeping the covered span as
+    # short as the send itself is what bounds that window.
+    if not _claim_inbox_notification(team_id, report_id):
+        logger.info("inbox notification skipped: already notified", report_id=report_id, team_id=team_id)
+        return 0
+
+    try:
+        sent = dispatch_inbox_item_notifications(report_id=report_id, team_id=team_id)
+    except Exception:
+        # Release so a retry or a later settle can still send the card.
+        _release_inbox_notification_claim(team_id, report_id)
+        raise
+    if not sent:
+        # Nothing went out — no channel configured yet, or the report failed the dispatcher's own
+        # actionability check. Releasing lets a later settle try again, so a team that connects Slack
+        # after its first report still gets a card for it.
+        _release_inbox_notification_claim(team_id, report_id)
+    return sent
+
+
+@temporalio.activity.defn
+@scoped_temporal()
+async def send_report_inbox_notifications_activity(input: InboxNotificationInput) -> int:
+    return await database_sync_to_async(_send_report_inbox_notifications, thread_sensitive=False)(
+        input.team_id, input.report_id
+    )
+
+
+def _send_report_github_comments(team_id: int, report_id: str) -> int:
+    if not SignalTeamConfig.objects.filter(team_id=team_id, github_issue_writeback_enabled=True).exists():
+        return 0
+    team = Team.objects.filter(id=team_id).first()
+    if team is None:
+        return 0
+    return post_report_link_to_github_issues(team, report_id, _fetch_signals_for_notification(team, report_id))
+
+
+@temporalio.activity.defn
+@scoped_temporal()
+async def send_report_github_comments_activity(input: InboxNotificationInput) -> int:
+    return await database_sync_to_async(_send_report_github_comments, thread_sensitive=False)(
+        input.team_id, input.report_id
+    )
+
+
+@temporalio.workflow.defn(name="signal-report-inbox-notification")
+class SignalReportInboxNotificationWorkflow:
+    @staticmethod
+    def workflow_id_for(team_id: int, report_id: str) -> str:
+        return f"signals-inbox-notify:{team_id}:{report_id}"
+
+    @temporalio.workflow.run
+    async def run(self, inputs: InboxNotificationInput) -> int:
+        timeout_seconds = settings.SIGNALS_INBOX_PR_NOTIFICATION_TIMEOUT_SECONDS
+        poll_seconds = max(1, settings.SIGNALS_INBOX_PR_NOTIFICATION_POLL_SECONDS)
+
+        log_ctx = {"report_id": inputs.report_id, "team_id": inputs.team_id}
+
+        state = await self._fetch_state(inputs)
+        if state.already_notified:
+            # The card is out, so nothing is left to wait for and the PR wait is skipped. The send
+            # activity still runs, because it also carries the support write-back, which is per ticket
+            # and not per report: a ticket that joined this report after its card still needs its note.
+            # The claim inside that activity is what holds the report to one card.
+            workflow.logger.info("inbox notification: already notified, skipping the PR wait", extra=log_ctx)
+        elif state.has_implementation_task and not state.pr_available and not state.task_terminal:
+            workflow.logger.info(
+                "inbox notification: implementation task present, waiting for its PR",
+                extra={**log_ctx, "timeout_seconds": timeout_seconds},
+            )
+            elapsed = 0
+            while elapsed < timeout_seconds:
+                await workflow.sleep(timedelta(seconds=poll_seconds))
+                elapsed += poll_seconds
+                state = await self._fetch_state(inputs)
+                # `already_notified` ends the wait as well. A concurrent settle that sent the card makes
+                # the state activity report no PR and no terminal task, so without this test the break
+                # condition can never be met again and the wait runs the full timeout for nothing.
+                if state.already_notified or state.pr_available or state.task_terminal:
+                    break
+            if state.already_notified:
+                wait_outcome = "notified_by_another_run"
+            elif state.pr_available:
+                wait_outcome = "pr_opened"
+            elif state.task_terminal:
+                wait_outcome = "task_ended_without_pr"
+            else:
+                wait_outcome = "timed_out_without_pr"
+            workflow.logger.info(
+                "inbox notification: PR wait finished",
+                extra={
+                    **log_ctx,
+                    "outcome": wait_outcome,
+                    "elapsed_seconds": elapsed,
+                    "pr_available": state.pr_available,
+                },
+            )
+        elif not state.has_implementation_task:
+            workflow.logger.info("inbox notification: no implementation task, notifying now", extra=log_ctx)
+        else:
+            workflow.logger.info(
+                "inbox notification: PR already resolved on first check",
+                extra={**log_ctx, "pr_available": state.pr_available},
+            )
+
+        # Transitional shim: keep replaying the now-removed `signals-inbox-skip-any-no-pr` patch so
+        # executions in flight during rollout stay deterministic. Drop once they drain.
+        workflow.deprecate_patch("signals-inbox-skip-any-no-pr")
+
+        sent = await workflow.execute_activity(
+            send_report_inbox_notifications_activity,
+            inputs,
+            start_to_close_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        workflow.logger.info(
+            "inbox notification: dispatch complete",
+            extra={**log_ctx, "messages_sent": sent, "pr_available": state.pr_available},
+        )
+        if workflow.patched("signals-github-writeback-after-notification"):
+            try:
+                await workflow.execute_activity(
+                    send_report_github_comments_activity,
+                    inputs,
+                    start_to_close_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            except temporalio.exceptions.ActivityError:
+                workflow.logger.exception("inbox notification: GitHub write-back failed", extra=log_ctx)
+        return sent
+
+    async def _fetch_state(self, inputs: InboxNotificationInput) -> InboxNotificationState:
+        return await workflow.execute_activity(
+            get_inbox_notification_state_activity,
+            inputs,
+            start_to_close_timeout=timedelta(minutes=1),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )

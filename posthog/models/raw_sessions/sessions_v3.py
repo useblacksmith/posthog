@@ -1,0 +1,910 @@
+from typing import Optional
+
+from django.conf import settings
+
+from posthog.clickhouse.cluster import ON_CLUSTER_CLAUSE
+from posthog.clickhouse.kafka_engine import (
+    CONSUMER_GROUP_RAW_SESSIONS_V3_EVENTS_JSON_WS,
+    kafka_engine,
+    kafka_num_consumers,
+)
+from posthog.clickhouse.table_engines import AggregatingMergeTree, Distributed, ReplicationScheme
+from posthog.kafka_client.topics import KAFKA_EVENTS_JSON
+from posthog.models.event.sql import EVENTS_TABLE_BASE_SQL, EVENTS_TABLE_DYNAMICALLY_MATERIALIZED_COLUMNS
+
+"""Raw sessions table v3
+
+This is a clickhouse materialized view that aggregates events into sessions, based on the session ID.
+
+All events with the same session ID will be aggregated into approximately one row per session ID, which can greatly
+reduce the amount of data that needs to be read from disk for session-based queries.
+
+It's not guaranteed that clickhouse will merge all events for a session into a single row, so any queries against this
+table should always aggregate again on session_id (the HogQL session table will do this automatically, so HogQL users
+don't need to consider this).
+
+Upgrades over v2:
+* Stores lower-tier ad ids as a flat 'key=value' array, making it easier to add new ad ids in the future
+* Stores presence of ad ids separately from the value, so e.g. channel type calculations only need to read 1 bit instead of a gclid string up to 100 chars
+* Parses JSON only once per event rather than once per column per event, saving CPU usage
+* Removes a lot of deprecated fields that are no longer used
+* Has a dedicated column for the channel type properties, reducing the number of times the timestamp needs to be read when calculating channel type
+"""
+
+TABLE_BASE_NAME_V3 = "raw_sessions_v3"
+
+
+def DISTRIBUTED_RAW_SESSIONS_TABLE_V3():
+    return TABLE_BASE_NAME_V3
+
+
+def SHARDED_RAW_SESSIONS_TABLE_V3():
+    return f"sharded_{TABLE_BASE_NAME_V3}"
+
+
+def WRITABLE_RAW_SESSIONS_TABLE_V3():
+    return f"writable_{TABLE_BASE_NAME_V3}"
+
+
+def RAW_SESSIONS_MV_V3():
+    return f"{DISTRIBUTED_RAW_SESSIONS_TABLE_V3()}_mv"
+
+
+def RAW_SESSIONS_MV_RECORDINGS_V3():
+    return f"{DISTRIBUTED_RAW_SESSIONS_TABLE_V3()}_recordings_mv"
+
+
+def TRUNCATE_RAW_SESSIONS_TABLE_SQL_V3():
+    return f"TRUNCATE TABLE IF EXISTS {SHARDED_RAW_SESSIONS_TABLE_V3()}"
+
+
+def DROP_RAW_SESSION_SHARDED_TABLE_SQL_V3():
+    # sync is added when dropping the sharded table, see https://posthog.slack.com/archives/C076R4753Q8/p1760696004214289?thread_ts=1760695175.656789&cid=C076R4753Q8
+    return f"DROP TABLE IF EXISTS {SHARDED_RAW_SESSIONS_TABLE_V3()} SYNC"
+
+
+def DROP_RAW_SESSION_DISTRIBUTED_TABLE_SQL_V3():
+    return f"DROP TABLE IF EXISTS {DISTRIBUTED_RAW_SESSIONS_TABLE_V3()}"
+
+
+def DROP_RAW_SESSION_WRITABLE_TABLE_SQL_V3():
+    return f"DROP TABLE IF EXISTS {WRITABLE_RAW_SESSIONS_TABLE_V3()}"
+
+
+def DROP_RAW_SESSION_MATERIALIZED_VIEW_SQL_V3():
+    return f"DROP TABLE IF EXISTS {RAW_SESSIONS_MV_V3()}"
+
+
+def DROP_RAW_SESSION_MATERIALIZED_VIEW_RECORDINGS_SQL_V3():
+    return f"DROP TABLE IF EXISTS {RAW_SESSIONS_MV_RECORDINGS_V3()}"
+
+
+def DROP_RAW_SESSION_VIEW_SQL_V3():
+    return f"DROP VIEW IF EXISTS {TABLE_BASE_NAME_V3}_v"
+
+
+# if updating these column definitions
+# you'll need to update the explicit column definitions in the materialized view creation statement below
+RAW_SESSIONS_TABLE_BASE_SQL_V3 = """
+CREATE TABLE IF NOT EXISTS {table_name}
+(
+    team_id Int64,
+
+    -- Both UInt128 and UUID are imperfect choices here
+    -- see https://michcioperz.com/wiki/clickhouse-uuid-ordering/
+    -- but also see https://github.com/ClickHouse/ClickHouse/issues/77226 and hope
+    -- right now choose UInt128 as that's the type of events.$session_id_uuid, but in the future we will probably want to switch everything to the new CH UUID type (when it's released)
+    session_id_v7 UInt128,
+    -- Ideally we would not need to store this separately, as the ID *is* the timestamp
+    -- Unfortunately for now, chaining clickhouse functions to extract the timestamp will break indexes / partition pruning, so do this workaround
+    -- again, when the new CH UUID type is released, we should try to switch to that and remove the separate timestamp column
+    session_timestamp DateTime64 {session_timestamp_modifier} fromUnixTimestamp64Milli(toUInt64(bitShiftRight(session_id_v7, 80))),
+
+    -- ClickHouse will pick the latest value of distinct_id for the session
+    -- this is fine since even if the distinct_id changes during a session
+    -- it will still (or should still) map to the same person
+    distinct_id AggregateFunction(argMax, String, DateTime64(6, 'UTC')),
+    distinct_ids AggregateFunction(groupUniqArray, String),
+
+    min_timestamp SimpleAggregateFunction(min, DateTime64(6, 'UTC')),
+    max_timestamp SimpleAggregateFunction(max, DateTime64(6, 'UTC')),
+    max_inserted_at SimpleAggregateFunction(max, DateTime64(6, 'UTC')),
+
+    -- urls
+    urls SimpleAggregateFunction(groupUniqArrayArray(2000), Array(String)),
+    entry_url AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    end_url AggregateFunction(argMax, Nullable(String), DateTime64(6, 'UTC')),
+    last_external_click_url AggregateFunction(argMax, Nullable(String), DateTime64(6, 'UTC')),
+
+    -- device
+    browser AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    browser_version AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    os AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    os_version AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    device_type AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    viewport_width AggregateFunction(argMin, Nullable(Int64), DateTime64(6, 'UTC')),
+    viewport_height AggregateFunction(argMin, Nullable(Int64), DateTime64(6, 'UTC')),
+
+    -- geoip
+    -- only store the properties we actually use, as there's tons, see https://posthog.com/docs/cdp/geoip-enrichment
+    geoip_country_code AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    geoip_subdivision_1_code AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    geoip_subdivision_1_name AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    geoip_subdivision_city_name AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    geoip_time_zone AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+
+    -- attribution
+    entry_referring_domain AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    entry_utm_source AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    entry_utm_campaign AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    entry_utm_medium AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    entry_utm_term AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    entry_utm_content AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    entry_gclid AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    entry_gad_source AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+    entry_fbclid AggregateFunction(argMin, Nullable(String), DateTime64(6, 'UTC')),
+
+    -- for channel type calculation, it's enough to know if these were present
+    entry_has_gclid AggregateFunction(argMin, Boolean, DateTime64(6, 'UTC')),
+    entry_has_fbclid AggregateFunction(argMin, Boolean, DateTime64(6, 'UTC')),
+
+    -- lower-tier ad ids as a flat 'key=value' array - like flag_key_values, a per-key map
+    -- state made merges much more expensive
+    entry_ad_ids_set AggregateFunction(argMin, Array(String), DateTime64(6, 'UTC')),
+
+    -- channel type properties tuple - to reduce redundant reading of the timestamp when loading all of these columns
+    -- utm_source, utm_medium, utm_campaign, referring domain, has_gclid, has_fbclid, gad_source
+    entry_channel_type_properties AggregateFunction(argMin, Tuple(Nullable(String), Nullable(String), Nullable(String), Nullable(String), Boolean, Boolean, Nullable(String)), DateTime64(6, 'UTC')),
+
+    -- Count pageview, autocapture, and screen events for providing totals.
+    -- Use uniq instead of count, so that inserting events can be idempotent. This is necessary as sometimes we see
+    -- events being inserted multiple times to be deduped later, but that can trigger multiple rows here.
+    -- Additionally, idempotency is useful for backfilling, as we can just reinsert the same events without worrying.
+    -- uniq (not uniqExact) keeps the state small; per-session counts are tiny so it is exact in practice.
+    pageview_uniq AggregateFunction(uniq, Nullable(UUID)),
+    autocapture_uniq AggregateFunction(uniq, Nullable(UUID)),
+    screen_uniq AggregateFunction(uniq, Nullable(UUID)),
+
+    -- As a performance optimisation, also keep track of the uniq events for all of these combined.
+    -- This is a much more efficient way of calculating the bounce rate, as >2 means not a bounce
+    page_screen_uniq_up_to AggregateFunction(uniqUpTo(1), Nullable(UUID)),
+    has_autocapture SimpleAggregateFunction(max, Boolean),
+
+    -- Flags - store every seen 'key=value' pair per flag. A flat array instead of a
+    -- groupUniqArrayMap state because per-key sub-aggregators made merges ~8-37x more expensive.
+    -- Key-only searches use the text index below (tokenized on '='), so no separate keys column.
+    flag_key_values SimpleAggregateFunction(groupUniqArrayArray(10000), Array(String)),
+
+    -- Event names - store unique event names seen in this session
+    event_names SimpleAggregateFunction(groupUniqArrayArray(2000), Array(String)),
+
+    -- Hosts - store unique hostnames seen in this session (extracted from $host property)
+    hosts SimpleAggregateFunction(groupUniqArrayArray({max_hosts}), Array(String)),
+
+    -- Emails - store unique emails seen in this session (extracted from person_properties.email)
+    emails SimpleAggregateFunction(groupUniqArrayArray({max_emails}), Array(String)),
+
+    -- Replay
+    has_replay_events SimpleAggregateFunction(max, Boolean)
+) ENGINE = {engine}
+"""
+
+
+def SHARDED_RAW_SESSIONS_DATA_TABLE_ENGINE_V3():
+    return AggregatingMergeTree(TABLE_BASE_NAME_V3, replication_scheme=ReplicationScheme.SHARDED)
+
+
+def SHARDED_RAW_SESSIONS_DATA_TABLE_SETTINGS_V3():
+    # try to make the backfill self-regulating by leaning on insert delays
+    return "parts_to_delay_insert = 250, max_delay_to_insert = 10, parts_to_throw_insert = 1000"
+
+
+def SHARDED_RAW_SESSIONS_TABLE_SQL_V3():
+    # For the sharded table, we need to add the index definition in the column list
+    # Remove the closing parenthesis and ENGINE from base SQL
+    base_sql = RAW_SESSIONS_TABLE_BASE_SQL_V3.replace(
+        ") ENGINE = {engine}",
+        """,
+
+    -- Indexes
+    INDEX event_names_bloom_filter event_names TYPE bloom_filter() GRANULARITY 1,
+    INDEX flag_key_values_text flag_key_values TYPE text(tokenizer = splitByString(['='])),
+    INDEX hosts_bloom_filter hosts TYPE bloom_filter() GRANULARITY 1,
+    INDEX emails_bloom_filter emails TYPE bloom_filter() GRANULARITY 1
+) ENGINE = {engine}""",
+    )
+
+    return (
+        base_sql
+        + """
+PARTITION BY toYYYYMM(session_timestamp)
+ORDER BY (
+    team_id,
+    session_timestamp,
+    session_id_v7
+)
+SETTINGS {settings}
+"""
+    ).format(
+        table_name=SHARDED_RAW_SESSIONS_TABLE_V3(),
+        engine=SHARDED_RAW_SESSIONS_DATA_TABLE_ENGINE_V3(),
+        settings=SHARDED_RAW_SESSIONS_DATA_TABLE_SETTINGS_V3(),
+        session_timestamp_modifier="DEFAULT",
+        max_hosts=SESSION_V3_MAX_HOSTS_PER_SESSION,
+        max_emails=SESSION_V3_MAX_EMAILS_PER_SESSION,
+    )
+
+
+SESSION_V3_MAX_HOSTS_PER_SESSION = 100
+SESSION_V3_MAX_EMAILS_PER_SESSION = 10
+
+
+def ALTER_SHARDED_RAW_SESSIONS_TABLE_SETTINGS_V3():
+    return (
+        f"ALTER TABLE {SHARDED_RAW_SESSIONS_TABLE_V3()} MODIFY SETTING {SHARDED_RAW_SESSIONS_DATA_TABLE_SETTINGS_V3()}"
+    )
+
+
+# Re-exported from the Django-free posthog.raw_sessions_v3_ad_ids module so the HogQL schema can
+# use it without booting Django; kept importable here for existing callers.
+from posthog.raw_sessions_v3_ad_ids import SESSION_V3_LOWER_TIER_AD_IDS, session_ad_id_url_params  # noqa: E402
+
+new_line = "\n"
+
+
+def _ad_id_value_sql(ad_id: str) -> str:
+    # The SDKs only promote a fixed set of URL params to event properties, so fall back to
+    # parsing the event's URL — this is what lets a new ad id apply to backfilled history.
+    # The lookups read _attribution_url, which is empty outside $pageview/$screen, so the
+    # per-event string scans stay off the bulk of the ingestion hot path.
+    # Form decoding, not plain: a query string spells a space as '+', and the SDK decodes it that
+    # way before promoting the property, so plain decoding would split one campaign into two values.
+    # left() caps what a client can pad into the URL; observed click IDs stay under ~120 chars
+    # toValidUTF8 wraps the truncation because both inner steps can emit invalid UTF-8:
+    # decodeURLFormComponent turns '%FF' into a raw byte, and left() counts bytes so it can cut a
+    # multi-byte character in half. Stored bytes then break every reader that expects text.
+    url_lookups = ", ".join(
+        f"nullIf(toValidUTF8(left(decodeURLFormComponent(extractURLParameter(_attribution_url, '{param}')), 2048)), '')"
+        for param in session_ad_id_url_params(ad_id)
+    )
+    return f"coalesce(nullIf(tupleElement(p, '{ad_id}'), ''), {url_lookups}) as {ad_id}"
+
+
+# See https://kb.altinity.com/altinity-kb-queries-and-syntax/jsonextract-to-parse-many-attributes-at-a-time/
+# Or https://posthog.slack.com/archives/C02JQ320FV3/p1721406540313379?thread_ts=1721334861.073739&cid=C02JQ320FV3
+PROPERTIES = f"""
+        JSONExtract(properties, 'Tuple(
+            `$current_url` Nullable(String),
+            `$external_click_url` Nullable(String),
+            `$browser` Nullable(String),
+            `$browser_version` Nullable(String),
+            `$os` Nullable(String),
+            `$os_version` Nullable(String),
+            `$device_type` Nullable(String),
+            `$viewport_width` Nullable(Int64),
+            `$viewport_height` Nullable(Int64),
+            `$geoip_country_code` Nullable(String),
+            `$geoip_subdivision_1_code` Nullable(String),
+            `$geoip_subdivision_1_name` Nullable(String),
+            `$geoip_city_name` Nullable(String),
+            `$geoip_time_zone` Nullable(String),
+            `$referring_domain` Nullable(String),
+            `utm_source` Nullable(String),
+            `utm_campaign` Nullable(String),
+            `utm_medium` Nullable(String),
+            `utm_term` Nullable(String),
+            `utm_content` Nullable(String),
+            `gclid` Nullable(String),
+            `gad_source` Nullable(String),
+            `fbclid` Nullable(String),
+            `$host` Nullable(String),
+{f",{new_line}".join([f"            `{ad_id}` Nullable(String)" for ad_id in SESSION_V3_LOWER_TIER_AD_IDS])}
+        )') as p,
+        JSONExtractString(person_properties, 'email') as _person_email,
+        tupleElement(p, '$current_url') as _current_url,
+        if(event = '$pageview' OR event = '$screen', left(coalesce(_current_url, ''), 16384), '') as _attribution_url,
+        tupleElement(p, '$external_click_url') as _external_click_url,
+        tupleElement(p, '$browser') as _browser,
+        tupleElement(p, '$browser_version') as _browser_version,
+        tupleElement(p, '$os') as _os,
+        tupleElement(p, '$os_version') as _os_version,
+        tupleElement(p, '$device_type') as _device_type,
+        tupleElement(p, '$viewport_width') as _viewport_width,
+        tupleElement(p, '$viewport_height') as _viewport_height,
+        tupleElement(p, '$geoip_country_code') as _geoip_country_code,
+        tupleElement(p, '$geoip_subdivision_1_code') as _geoip_subdivision_1_code,
+        tupleElement(p, '$geoip_subdivision_1_name') as _geoip_subdivision_1_name,
+        tupleElement(p, '$geoip_city_name') as _geoip_subdivision_city_name,
+        tupleElement(p, '$geoip_time_zone') as _geoip_time_zone,
+        tupleElement(p, '$referring_domain') as _referring_domain,
+        tupleElement(p, 'utm_source') as _utm_source,
+        tupleElement(p, 'utm_campaign') as _utm_campaign,
+        tupleElement(p, 'utm_medium') as _utm_medium,
+        tupleElement(p, 'utm_term') as _utm_term,
+        tupleElement(p, 'utm_content') as _utm_content,
+        tupleElement(p, 'gclid') as _gclid,
+        tupleElement(p, 'gad_source') as _gad_source,
+        tupleElement(p, 'fbclid') as _fbclid,
+{f",{new_line}".join([f"        {_ad_id_value_sql(ad_id)}" for ad_id in SESSION_V3_LOWER_TIER_AD_IDS])},
+        CAST(arrayFilter(x -> x IS NOT NULL, [
+{f",{new_line}".join([f"            if({ad_id} IS NOT NULL, concat('{ad_id}=', {ad_id}), NULL)" for ad_id in SESSION_V3_LOWER_TIER_AD_IDS])}
+        ]) AS Array(String)) as ad_ids_set,
+        tupleElement(p, '$host') as _host"""
+
+
+def RAW_SESSION_TABLE_MV_SELECT_SQL_V3(source_table, where="TRUE", include_session_timestamp=False, extra_ctes=""):
+    return """
+WITH
+    {extra_ctes}{PROPERTIES},
+    -- attribution properties from non-pageview/screen events should be deprioritized, so make the timestamp +/- 1 year so they sort last
+    if (event = '$pageview' OR event = '$screen', timestamp, timestamp + toIntervalYear(1)) as pageview_prio_timestamp_min,
+    if (event = '$pageview' OR event = '$screen', timestamp, timestamp - toIntervalYear(1)) as pageview_prio_timestamp_max
+SELECT
+    team_id,
+    `$session_id_uuid` AS session_id_v7,
+    {session_timestamp}
+
+    initializeAggregation('argMaxState', source_table.distinct_id, timestamp) as distinct_id,
+    initializeAggregation('groupUniqArrayState', source_table.distinct_id) as distinct_ids,
+
+    timestamp AS min_timestamp,
+    timestamp AS max_timestamp,
+    inserted_at AS max_inserted_at,
+
+    -- urls - only update if the event is a pageview or screen
+    if(_current_url IS NOT NULL AND (event = '$pageview' OR event = '$screen'), [_current_url], []) AS urls,
+    initializeAggregation('argMinState', _current_url, pageview_prio_timestamp_min) as entry_url,
+    initializeAggregation('argMaxState', _current_url, pageview_prio_timestamp_max) as end_url,
+    initializeAggregation('argMaxState', _external_click_url, timestamp) as last_external_click_url,
+
+    -- device
+    initializeAggregation('argMinState', _browser, timestamp) as browser,
+    initializeAggregation('argMinState', _browser_version, timestamp) as browser_version,
+    initializeAggregation('argMinState', _os, timestamp) as os,
+    initializeAggregation('argMinState', _os_version, timestamp) as os_version,
+    initializeAggregation('argMinState', _device_type, timestamp) as device_type,
+    initializeAggregation('argMinState', _viewport_width, timestamp) as viewport_width,
+    initializeAggregation('argMinState', _viewport_height, timestamp) as viewport_height,
+
+    -- geo ip
+    initializeAggregation('argMinState', _geoip_country_code, timestamp) as geoip_country_code,
+    initializeAggregation('argMinState', _geoip_subdivision_1_code, timestamp) as geoip_subdivision_1_code,
+    initializeAggregation('argMinState', _geoip_subdivision_1_name, timestamp) as geoip_subdivision_1_name,
+    initializeAggregation('argMinState', _geoip_subdivision_city_name, timestamp) as geoip_subdivision_city_name,
+    initializeAggregation('argMinState', _geoip_time_zone, timestamp) as geoip_time_zone,
+
+    -- attribution
+    initializeAggregation('argMinState', _referring_domain, pageview_prio_timestamp_min) as entry_referring_domain,
+    initializeAggregation('argMinState', _utm_source, pageview_prio_timestamp_min) as entry_utm_source,
+    initializeAggregation('argMinState', _utm_campaign, pageview_prio_timestamp_min) as entry_utm_campaign,
+    initializeAggregation('argMinState', _utm_medium, pageview_prio_timestamp_min) as entry_utm_medium,
+    initializeAggregation('argMinState', _utm_term, pageview_prio_timestamp_min) as entry_utm_term,
+    initializeAggregation('argMinState', _utm_content, pageview_prio_timestamp_min) as entry_utm_content,
+    initializeAggregation('argMinState', _gclid, pageview_prio_timestamp_min) as entry_gclid,
+    initializeAggregation('argMinState', _gad_source, pageview_prio_timestamp_min) as entry_gad_source,
+    initializeAggregation('argMinState', _fbclid, pageview_prio_timestamp_min) as entry_fbclid,
+
+    -- has gclid/fbclid for reading fewer bytes when calculating channel type
+    -- clients send "gclid": "" and that is not a click id, so an empty value must not count as present
+    initializeAggregation('argMinState', nullIf(_gclid, '') IS NOT NULL, pageview_prio_timestamp_min) as entry_has_gclid,
+    initializeAggregation('argMinState', nullIf(_fbclid, '') IS NOT NULL, pageview_prio_timestamp_min) as entry_has_fbclid,
+
+    -- other ad ids
+    initializeAggregation('argMinState', ad_ids_set, pageview_prio_timestamp_min) as entry_ad_ids_set,
+
+    -- channel type
+    initializeAggregation('argMinState', tuple(_utm_source, _utm_medium, _utm_campaign, _referring_domain, nullIf(_gclid, '') IS NOT NULL, nullIf(_fbclid, '') IS NOT NULL, _gad_source), pageview_prio_timestamp_min) as entry_channel_type_properties,
+
+
+    -- counts
+    initializeAggregation('uniqState', if(event='$pageview', uuid, NULL)) as pageview_uniq,
+    initializeAggregation('uniqState', if(event='$autocapture', uuid, NULL)) as autocapture_uniq,
+    initializeAggregation('uniqState', if(event='$screen', uuid, NULL)) as screen_uniq,
+
+    -- perf
+    initializeAggregation('uniqUpToState(1)', if(event='$pageview' OR event='$screen', uuid, NULL)) as page_screen_uniq_up_to,
+    event = '$autocapture' as has_autocapture,
+
+    -- flags
+    arrayMap((k, v) -> concat(k, '=', v), mapKeys(properties_group_feature_flags), mapValues(properties_group_feature_flags)) as flag_key_values,
+
+    -- event names
+    [event] as event_names,
+
+    -- hosts
+    if(_host IS NOT NULL AND _host != '', [_host], []) AS hosts,
+
+    -- emails
+    if(_person_email IS NOT NULL AND _person_email != '', [_person_email], []) AS emails,
+
+    false as has_replay_events
+FROM {source_table} AS source_table
+WHERE bitAnd(bitShiftRight(toUInt128(accurateCastOrNull(`$session_id`, 'UUID')), 76), 0xF) == 7 -- has a session id and is valid uuidv7
+-- Clients can send a UUIDv7 session id with a garbage timestamp (1970, year 6339). Each one puts its session in its
+-- own monthly partition, and its events stretch the session duration across months. Keep only events within 31 days
+-- of the session id's timestamp. The bound is symmetric because the client mints the session id with its own clock
+-- while the server corrects event timestamps, so a client clock that runs days ahead is still a real session.
+AND fromUnixTimestamp64Milli(toUInt64(bitShiftRight(`$session_id_uuid`, 80))) BETWEEN timestamp - INTERVAL 31 DAY AND timestamp + INTERVAL 31 DAY
+AND {where}
+    """.format(
+        source_table=source_table,
+        where=where,
+        PROPERTIES=PROPERTIES,
+        extra_ctes=extra_ctes,
+        session_timestamp="fromUnixTimestamp64Milli(toUInt64(bitShiftRight(`$session_id_uuid`, 80))) AS session_timestamp,"
+        if include_session_timestamp
+        else "",
+    )
+
+
+def RAW_SESSIONS_TABLE_MV_SQL_V3(where="TRUE"):
+    return """
+CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name}
+TO {database}.{target_table}
+AS
+{select_sql}
+""".format(
+        table_name=RAW_SESSIONS_MV_V3(),
+        target_table=WRITABLE_RAW_SESSIONS_TABLE_V3(),
+        database=settings.CLICKHOUSE_DATABASE,
+        select_sql=RAW_SESSION_TABLE_MV_SELECT_SQL_V3(
+            where=where,
+            # use sharded_events, this means that the mv MUST be created on every data node
+            source_table=f"{settings.CLICKHOUSE_DATABASE}.sharded_events",
+        ),
+    )
+
+
+def RAW_SESSION_TABLE_MV_UPDATE_SQL_V3(where="TRUE"):
+    return """
+ALTER TABLE {table_name}
+MODIFY QUERY
+{select_sql}
+""".format(
+        table_name=RAW_SESSIONS_MV_V3(),
+        select_sql=RAW_SESSION_TABLE_MV_SELECT_SQL_V3(
+            where=where, source_table=f"{settings.CLICKHOUSE_DATABASE}.sharded_events"
+        ),
+    )
+
+
+# WarpStream ingestion pipeline on the ingestion-events cluster: Kafka table -> MV -> writable.
+# The ws2 names stay clear of the earlier hand-managed pipeline's objects, which hold the
+# unsuffixed names outside repo control.
+
+KAFKA_RAW_SESSIONS_V3_TABLE = "kafka_raw_sessions_v3_events_json_ws2"
+RAW_SESSIONS_V3_EVENTS_WS_MV = "raw_sessions_v3_events_json_ws2_mv"
+
+# The Kafka stream carries raw event JSON, so the columns the select reads from sharded_events
+# as materialized columns are derived here instead. The flags map expression matches the
+# properties_group_feature_flags materializer in posthog/clickhouse/property_groups.py.
+KAFKA_SOURCE_COLUMN_CTES = """JSONExtractString(properties, '$session_id') AS `$session_id`,
+    toUInt128(JSONExtract(properties, '$session_id', 'Nullable(UUID)')) AS `$session_id_uuid`,
+    mapSort(mapFilter((key, _) -> key LIKE '$feature/%', CAST(JSONExtractKeysAndValues(properties, 'String'), 'Map(String, String)'))) AS properties_group_feature_flags,
+    _timestamp AS inserted_at,
+    """
+
+
+def KAFKA_RAW_SESSIONS_V3_TABLE_SQL():
+    return (
+        EVENTS_TABLE_BASE_SQL
+        + """
+    SETTINGS kafka_skip_broken_messages = 100,
+             kafka_num_consumers = {num_consumers},
+             kafka_thread_per_consumer = 1,
+             kafka_poll_timeout_ms = 10000,
+             kafka_max_block_size = 100000
+"""
+    ).format(
+        num_consumers=kafka_num_consumers(1),
+        table_name=KAFKA_RAW_SESSIONS_V3_TABLE,
+        on_cluster_clause=ON_CLUSTER_CLAUSE(False),
+        engine=kafka_engine(
+            topic=KAFKA_EVENTS_JSON,
+            group=CONSUMER_GROUP_RAW_SESSIONS_V3_EVENTS_JSON_WS,
+            named_collection=settings.CLICKHOUSE_KAFKA_WARPSTREAM_INGESTION_NAMED_COLLECTION,
+        ),
+        extra_fields="",
+        dynamically_materialized_columns=EVENTS_TABLE_DYNAMICALLY_MATERIALIZED_COLUMNS(),
+        materialized_columns="",
+        indexes="",
+    )
+
+
+def WRITABLE_RAW_SESSIONS_INGESTION_TABLE_SQL_V3():
+    # On the ingestion layer the writable points at the sessions satellite cluster, where the
+    # live raw_sessions_v3 MergeTree lives.
+    return RAW_SESSIONS_TABLE_BASE_SQL_V3.format(
+        table_name=WRITABLE_RAW_SESSIONS_TABLE_V3(),
+        engine=Distributed(
+            data_table=TABLE_BASE_NAME_V3,
+            sharding_key="cityHash64(session_id_v7)",
+            cluster=settings.CLICKHOUSE_SESSIONS_CLUSTER,
+        ),
+        session_timestamp_modifier="DEFAULT",
+        max_hosts=SESSION_V3_MAX_HOSTS_PER_SESSION,
+        max_emails=SESSION_V3_MAX_EMAILS_PER_SESSION,
+    )
+
+
+def RAW_SESSIONS_V3_EVENTS_WS_MV_SQL():
+    return """
+CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name}
+TO {database}.{target_table}
+AS
+{select_sql}
+""".format(
+        mv_name=RAW_SESSIONS_V3_EVENTS_WS_MV,
+        database=settings.CLICKHOUSE_DATABASE,
+        target_table=WRITABLE_RAW_SESSIONS_TABLE_V3(),
+        select_sql=RAW_SESSION_TABLE_MV_SELECT_SQL_V3(
+            source_table=f"{settings.CLICKHOUSE_DATABASE}.{KAFKA_RAW_SESSIONS_V3_TABLE}",
+            extra_ctes=KAFKA_SOURCE_COLUMN_CTES,
+        ),
+    )
+
+
+def DROP_RAW_SESSIONS_V3_EVENTS_WS_MV_SQL():
+    return f"DROP TABLE IF EXISTS {RAW_SESSIONS_V3_EVENTS_WS_MV}"
+
+
+def DROP_KAFKA_RAW_SESSIONS_V3_TABLE_SQL():
+    return f"DROP TABLE IF EXISTS {KAFKA_RAW_SESSIONS_V3_TABLE}"
+
+
+def RAW_SESSION_TABLE_MV_RECORDINGS_SELECT_SQL_V3(source_table, where="TRUE", include_session_timestamp=False):
+    return """
+WITH
+    min_first_timestamp as timestamp,
+    CAST(fromUnixTimestamp64Milli(9223372036854775), 'DateTime64(6)') as max_ts_64, -- max positive Int64 / 1000
+    CAST(fromUnixTimestamp64Milli(-9223372036854775), 'DateTime64(6)') as min_ts_64, -- max negative Int64 / 1000
+    CAST(NULL, 'Nullable(String)') as null_s,
+    CAST(NULL, 'Nullable(Int64)') as null_i64,
+    CAST(NULL, 'Nullable(UUID)') as null_uuid
+SELECT
+    team_id,
+    toUInt128(accurateCast(session_id, 'UUID')) AS session_id_v7,
+    {session_timestamp}
+    initializeAggregation('argMaxState', source_table.distinct_id, min_ts_64) as distinct_id,
+    initializeAggregation('groupUniqArrayState', source_table.distinct_id) as distinct_ids,
+
+    timestamp AS min_timestamp,
+    timestamp AS max_timestamp,
+    fromUnixTimestamp(0) AS max_inserted_at,
+
+    -- urls - only update if the event is a pageview or screen
+    CAST([], 'Array(String)') AS urls,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_url,
+    initializeAggregation('argMaxState', null_s, min_ts_64) as end_url,
+    initializeAggregation('argMaxState', null_s, min_ts_64) as last_external_click_url,
+
+    -- device
+    initializeAggregation('argMinState', null_s, max_ts_64) as browser,
+    initializeAggregation('argMinState', null_s, max_ts_64) as browser_version,
+    initializeAggregation('argMinState', null_s, max_ts_64) as os,
+    initializeAggregation('argMinState', null_s, max_ts_64) as os_version,
+    initializeAggregation('argMinState', null_s, max_ts_64) as device_type,
+    initializeAggregation('argMinState', null_i64, max_ts_64) as viewport_width,
+    initializeAggregation('argMinState', null_i64, max_ts_64) as viewport_height,
+
+    -- geo ip
+    initializeAggregation('argMinState', null_s, max_ts_64) as geoip_country_code,
+    initializeAggregation('argMinState', null_s, max_ts_64) as geoip_subdivision_1_code,
+    initializeAggregation('argMinState', null_s, max_ts_64) as geoip_subdivision_1_name,
+    initializeAggregation('argMinState', null_s, max_ts_64) as geoip_subdivision_city_name,
+    initializeAggregation('argMinState', null_s, max_ts_64) as geoip_time_zone,
+
+    -- attribution
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_referring_domain,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_utm_source,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_utm_campaign,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_utm_medium,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_utm_term,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_utm_content,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_gclid,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_gad_source,
+    initializeAggregation('argMinState', null_s, max_ts_64) as entry_fbclid,
+
+    -- has gclid/fbclid for reading fewer bytes when calculating channel type
+    initializeAggregation('argMinState', false, max_ts_64) as entry_has_gclid,
+    initializeAggregation('argMinState', false, max_ts_64) as entry_has_fbclid,
+
+    -- other ad ids
+    initializeAggregation('argMinState', CAST([], 'Array(String)'), max_ts_64) as entry_ad_ids_set,
+
+    -- channel type
+    initializeAggregation('argMinState', tuple(null_s, null_s, null_s, null_s, false, false, null_s), max_ts_64) as entry_channel_type_properties,
+
+    -- counts
+    initializeAggregation('uniqState', null_uuid) as pageview_uniq,
+    initializeAggregation('uniqState', null_uuid) as autocapture_uniq,
+    initializeAggregation('uniqState', null_uuid) as screen_uniq,
+
+    -- perf
+    initializeAggregation('uniqUpToState(1)', null_uuid) as page_screen_uniq_up_to,
+    false as has_autocapture,
+
+    -- flags
+    CAST([], 'Array(String)') as flag_key_values,
+
+    -- event names
+    CAST([], 'Array(String)') as event_names,
+
+    -- hosts
+    CAST([], 'Array(String)') as hosts,
+
+    -- emails
+    CAST([], 'Array(String)') as emails,
+
+    -- replay
+    true as has_replay_events
+FROM {source_table} AS source_table
+WHERE bitAnd(bitShiftRight(toUInt128(accurateCastOrNull(session_id, 'UUID')), 76), 0xF) == 7 -- has a session id and is valid uuidv7
+-- same session timestamp guard as the events SELECT. accurateCastOrNull because accurateCast throws on a malformed
+-- session_id, and ClickHouse can evaluate this condition before the uuidv7 check above filters those rows out
+AND fromUnixTimestamp64Milli(toUInt64(bitShiftRight(toUInt128(accurateCastOrNull(session_id, 'UUID')), 80))) BETWEEN min_first_timestamp - INTERVAL 31 DAY AND min_first_timestamp + INTERVAL 31 DAY
+AND {where}
+    """.format(
+        source_table=source_table,
+        where=where,
+        session_timestamp="fromUnixTimestamp64Milli(toUInt64(bitShiftRight(session_id_v7, 80))) AS session_timestamp,"
+        if include_session_timestamp
+        else "",
+    )
+
+
+def RAW_SESSIONS_TABLE_MV_RECORDINGS_SQL_V3(where="TRUE"):
+    return """
+CREATE MATERIALIZED VIEW IF NOT EXISTS {table_name}
+TO {database}.{target_table}
+AS
+{select_sql}
+""".format(
+        table_name=RAW_SESSIONS_MV_RECORDINGS_V3(),
+        target_table=WRITABLE_RAW_SESSIONS_TABLE_V3(),
+        database=settings.CLICKHOUSE_DATABASE,
+        select_sql=RAW_SESSION_TABLE_MV_RECORDINGS_SELECT_SQL_V3(
+            where=where,
+            # use sharded_session_replay_events, this means that the mv MUST be created on every data node
+            source_table=f"{settings.CLICKHOUSE_DATABASE}.sharded_session_replay_events",
+            include_session_timestamp=True,
+        ),
+    )
+
+
+def RAW_SESSION_TABLE_BACKFILL_SQL_V3(
+    where: str,
+    shard_index: Optional[int] = None,
+    num_shards: Optional[int] = None,
+    target_table: Optional[str] = None,
+    include_session_timestamp: bool = True,
+):
+    """
+    Generates SQL to backfill sessions from events.
+
+    Each shard should call this with its own shard_index to only SELECT events
+    that will end up on that shard, then INSERT directly to the local sharded table.
+
+    include_session_timestamp must be True when the target table has session_timestamp
+    as DEFAULT (sharded/writable tables), and False when it is MATERIALIZED (distributed).
+    """
+    if not target_table:
+        target_table = SHARDED_RAW_SESSIONS_TABLE_V3()
+    if shard_index is not None and num_shards is not None:
+        shard_filter = f"modulo(cityHash64(`$session_id_uuid`), {num_shards}) = {shard_index}"
+        combined_where = f"({where}) AND {shard_filter}"
+    else:
+        combined_where = where
+
+    return """
+INSERT INTO {database}.{target_table}
+{select_sql}
+""".format(
+        database=settings.CLICKHOUSE_DATABASE,
+        target_table=target_table,
+        select_sql=RAW_SESSION_TABLE_MV_SELECT_SQL_V3(
+            where=combined_where,
+            source_table=f"{settings.CLICKHOUSE_DATABASE}.events",
+            include_session_timestamp=include_session_timestamp,
+        ),
+    )
+
+
+def RAW_SESSION_TABLE_BACKFILL_RECORDINGS_SQL_V3(
+    where: str,
+    shard_index: Optional[int] = None,
+    num_shards: Optional[int] = None,
+    target_table: Optional[str] = None,
+    include_session_timestamp: bool = True,
+):
+    """
+    Generates SQL to backfill sessions from session replay events.
+
+    Each shard should call this with its own shard_index to only SELECT recordings
+    that will end up on that shard, then INSERT directly to the local sharded table.
+
+    include_session_timestamp must be True when the target table has session_timestamp
+    as DEFAULT (sharded/writable tables), and False when it is MATERIALIZED (distributed).
+    """
+    if not target_table:
+        target_table = SHARDED_RAW_SESSIONS_TABLE_V3()
+    if shard_index is not None and num_shards is not None:
+        shard_filter = f"modulo(cityHash64(toUInt128(accurateCast(session_id, 'UUID'))), {num_shards}) = {shard_index}"
+        combined_where = f"({where}) AND {shard_filter}"
+    else:
+        combined_where = where
+
+    return """
+INSERT INTO {database}.{target_table}
+{select_sql}
+""".format(
+        database=settings.CLICKHOUSE_DATABASE,
+        target_table=target_table,
+        select_sql=RAW_SESSION_TABLE_MV_RECORDINGS_SELECT_SQL_V3(
+            where=combined_where,
+            source_table=f"{settings.CLICKHOUSE_DATABASE}.session_replay_events",
+            include_session_timestamp=include_session_timestamp,
+        ),
+    )
+
+
+# Distributed engine tables are only created if CLICKHOUSE_REPLICATED
+
+# This table is responsible for writing to sharded_sessions based on a sharding key.
+
+
+def WRITABLE_RAW_SESSIONS_TABLE_SQL_V3():
+    return RAW_SESSIONS_TABLE_BASE_SQL_V3.format(
+        table_name=WRITABLE_RAW_SESSIONS_TABLE_V3(),
+        engine=Distributed(
+            data_table=SHARDED_RAW_SESSIONS_TABLE_V3(),
+            # shard via session_id so that all events for a session are on the same shard
+            sharding_key="cityHash64(session_id_v7)",
+        ),
+        session_timestamp_modifier="DEFAULT",
+        max_hosts=SESSION_V3_MAX_HOSTS_PER_SESSION,
+        max_emails=SESSION_V3_MAX_EMAILS_PER_SESSION,
+    )
+
+
+# This table is responsible for reading from sessions on a cluster setting
+
+
+def DISTRIBUTED_RAW_SESSIONS_TABLE_SQL_V3():
+    return RAW_SESSIONS_TABLE_BASE_SQL_V3.format(
+        table_name=DISTRIBUTED_RAW_SESSIONS_TABLE_V3(),
+        engine=Distributed(
+            data_table=SHARDED_RAW_SESSIONS_TABLE_V3(),
+            sharding_key="cityHash64(session_id_v7)",
+        ),
+        session_timestamp_modifier="MATERIALIZED",
+        max_hosts=SESSION_V3_MAX_HOSTS_PER_SESSION,
+        max_emails=SESSION_V3_MAX_EMAILS_PER_SESSION,
+    )
+
+
+# This is the view that can be queried directly, that handles aggregation of potentially multiple rows per session.
+# Most queries won't use this directly as they will want to pre-filter rows before aggregation, but it's useful for
+# debugging
+RAW_SESSIONS_CREATE_OR_REPLACE_VIEW_SQL_V3 = lambda: (
+    f"""
+CREATE OR REPLACE VIEW {TABLE_BASE_NAME_V3}_v AS
+SELECT
+    session_id_v7,
+    session_timestamp,
+    team_id,
+
+    argMaxMerge(distinct_id) as distinct_id,
+    groupUniqArrayMerge(distinct_ids) AS distinct_ids,
+
+    min(min_timestamp) as min_timestamp,
+    max(max_timestamp) as max_timestamp,
+    max(max_inserted_at) as max_inserted_at,
+
+    -- urls
+    groupUniqArrayArray(2000)(urls) AS urls,
+    argMinMerge(entry_url) as entry_url,
+    argMaxMerge(end_url) as end_url,
+    argMaxMerge(last_external_click_url) as last_external_click_url,
+
+    -- device
+    argMinMerge(browser) as browser,
+    argMinMerge(browser_version) as browser_version,
+    argMinMerge(os) as os,
+    argMinMerge(os_version) as os_version,
+    argMinMerge(device_type) as device_type,
+    argMinMerge(viewport_width) as viewport_width,
+    argMinMerge(viewport_height) as viewport_height,
+
+    -- geoip
+    argMinMerge(geoip_country_code) as geoip_country_code,
+    argMinMerge(geoip_subdivision_1_code) as geoip_subdivision_1_code,
+    argMinMerge(geoip_subdivision_1_name) as geoip_subdivision_1_name,
+    argMinMerge(geoip_subdivision_city_name) as geoip_subdivision_city_name,
+    argMinMerge(geoip_time_zone) as geoip_time_zone,
+
+    -- attribution
+    argMinMerge(entry_utm_source) as entry_utm_source,
+    argMinMerge(entry_utm_campaign) as entry_utm_campaign,
+    argMinMerge(entry_utm_medium) as entry_utm_medium,
+    argMinMerge(entry_utm_term) as entry_utm_term,
+    argMinMerge(entry_utm_content) as entry_utm_content,
+    argMinMerge(entry_referring_domain) as entry_referring_domain,
+    argMinMerge(entry_gclid) as entry_gclid,
+    argMinMerge(entry_gad_source) as entry_gad_source,
+    argMinMerge(entry_fbclid) as entry_fbclid,
+
+    argMinMerge(entry_has_gclid) as entry_has_gclid,
+    argMinMerge(entry_has_fbclid) as entry_has_fbclid,
+
+    argMinMerge(entry_ad_ids_set) as entry_ad_ids_set,
+
+    argMinMerge(entry_channel_type_properties) as entry_channel_type_properties,
+
+    -- counts
+    uniqMerge(pageview_uniq) as pageview_uniq,
+    uniqMerge(autocapture_uniq) as autocapture_uniq,
+    uniqMerge(screen_uniq) as screen_uniq,
+
+    -- perf
+    uniqUpToMerge(1)(page_screen_uniq_up_to) as page_screen_uniq_up_to,
+    max(has_autocapture) as has_autocapture,
+
+    -- flags
+    groupUniqArrayArray(10000)(flag_key_values) as flag_key_values,
+
+    -- event names
+    groupUniqArrayArray(2000)(event_names) as event_names,
+
+    -- hosts
+    groupUniqArrayArray({SESSION_V3_MAX_HOSTS_PER_SESSION})(hosts) as hosts,
+
+    -- emails
+    groupUniqArrayArray({SESSION_V3_MAX_EMAILS_PER_SESSION})(emails) as emails,
+
+    -- replay
+    max(has_replay_events) as has_replay_events
+FROM {settings.CLICKHOUSE_DATABASE}.{DISTRIBUTED_RAW_SESSIONS_TABLE_V3()}
+GROUP BY session_id_v7, session_timestamp, team_id
+"""
+)
+
+
+def GET_NUM_RAW_SESSIONS_ACTIVE_PARTS(
+    partitions: list[str],
+    *,
+    table: str | None = None,
+    use_cluster: bool = True,
+) -> str:
+    """Get the maximum number of active parts across specified partitions.
+
+    ClickHouse's parts_to_throw_insert is per-partition, so this checks the max
+    active parts in any single (host, partition) combination.
+
+    Args:
+        partitions: List of partition names in YYYYMM format (e.g., ['202501', '202412'])
+        table: Table name to check. Defaults to the sharded raw sessions table.
+        use_cluster: If True, query across all cluster replicas. If False, query
+            only the local node's system.parts (useful for standalone/experimental nodes).
+    """
+    if not partitions:
+        raise ValueError("partitions list cannot be empty")
+    # Format partitions for SQL IN clause: ('202501', '202412')
+    partitions_sql = ", ".join(f"'{p}'" for p in partitions)
+    table = table or SHARDED_RAW_SESSIONS_TABLE_V3()
+    parts_table = (
+        f"clusterAllReplicas('{settings.CLICKHOUSE_CLUSTER}', system.parts)" if use_cluster else "system.parts"
+    )
+
+    return f"""
+        SELECT coalesce(max(parts_count), 0), argMax(partition, parts_count), argMax(host, parts_count)
+        FROM (
+            SELECT hostName() as host, count() as parts_count, partition
+            FROM {parts_table}
+            WHERE database = currentDatabase()
+              AND table = '{table}'
+              AND partition IN ({partitions_sql})
+              AND active = 1
+            GROUP BY host, partition
+        )
+    """

@@ -1,0 +1,148 @@
+# MCP tool definitions. Tools are opt-in: an operation is exposed only when it has an entry here.
+# List operations without an entry: pnpm --filter=@posthog/mcp run scaffold-yaml -- --candidates --product persons
+# Add one: pnpm --filter=@posthog/mcp run scaffold-yaml -- --add <operationId> --product persons
+# To keep an operation off on purpose, set enabled: false and give a disabled_reason.
+category: Persons
+feature: persons
+url_prefix: /persons
+ui_apps: {}
+tools:
+    persons-bulk-delete:
+        operation: persons_bulk_delete_create
+        enabled: true
+        scopes:
+            - person:write
+        annotations:
+            readOnly: false
+            destructive: true
+            idempotent: false
+        title: Bulk delete persons
+        description: >
+            Delete up to 1000 persons by PostHog person UUIDs or distinct IDs. Optionally delete associated events and
+            recordings. Pass either `ids` (person UUIDs) or `distinct_ids`. Returns 202 Accepted. This operation is
+            irreversible.
+        exclude_params:
+            - format
+    persons-cohorts-retrieve:
+        operation: persons_cohorts_retrieve
+        enabled: true
+        scopes:
+            - person:read
+            - cohort:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get person cohorts
+        description: |
+            Get all cohorts that a specific person belongs to. Requires the person_id query parameter.
+        exclude_params:
+            - format
+    persons-list:
+        operation: persons_list
+        enabled: true
+        scopes:
+            - person:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        list: true
+        title: List persons
+        description: >
+            List persons in the current project. Supports search by email (full text) or distinct ID (exact match), and
+            filtering by email or distinct_id query parameters. Returns paginated results with person properties and
+            distinct IDs.
+        exclude_params:
+            - format
+            - properties
+            - include_matched_fields
+        param_overrides:
+            limit:
+                cast: string-int
+            offset:
+                cast: string-int
+        response:
+            include:
+                - id
+                - uuid
+                - name
+                - distinct_ids
+                - properties.email
+                - properties.$email
+                - properties.$geoip_country_code
+                - created_at
+                - last_seen_at
+    persons-property-delete:
+        operation: persons_delete_property_create
+        enabled: true
+        scopes:
+            - person:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Delete person property
+        description: >
+            Remove a single property from a person by key. The property is deleted asynchronously via the event pipeline
+            ($unset).
+        exclude_params:
+            - format
+        rename_params:
+            $unset: unset
+    persons-property-set:
+        operation: persons_update_property_create
+        enabled: true
+        scopes:
+            - person:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Set person properties
+        description: >
+            Set properties on a person. Pass key and value for one property, or properties for up to 1000 in a single
+            request, which is one call and one $set event instead of one call per property. Properties are updated
+            asynchronously via the event pipeline ($set). Returns 202 Accepted.
+        exclude_params:
+            - format
+    persons-retrieve:
+        operation: persons_retrieve
+        enabled: true
+        scopes:
+            - person:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        enrich_url: '{uuid}'
+        title: Get person
+        description: |
+            Retrieve a single person by numeric ID or UUID. Returns the person's properties, distinct IDs, and metadata.
+        exclude_params:
+            - format
+        response:
+            include:
+                - id
+                - uuid
+                - name
+                - properties
+                - distinct_ids
+                - created_at
+                - last_seen_at
+    persons-values-retrieve:
+        operation: persons_values_retrieve
+        enabled: true
+        scopes:
+            - person:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get person property values
+        description: >
+            Get distinct values for a person property key. Useful for discovering what values exist for properties like
+            'plan', 'role', or 'company'. Provide the property key and optionally a search value to filter results.
+        exclude_params:
+            - format
+            - force_refresh

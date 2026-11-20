@@ -1,0 +1,628 @@
+from datetime import timedelta
+from typing import Optional, cast
+
+import pytest
+
+from django.db import connection
+from django.test import SimpleTestCase, TestCase
+from django.utils import timezone
+
+from parameterized import parameterized
+from rest_framework import serializers
+from rest_framework.exceptions import ErrorDetail
+
+from posthog.helpers.email_utils import (
+    EmailLookupHandler,
+    EmailNormalizer,
+    EmailValidationHelper,
+    reject_lookalike_email_characters,
+    reject_plus_addressed_email,
+    sanitize_display_name,
+    sanitize_email_string,
+    sanitize_message_body,
+    strip_email_alias,
+    validate_display_name,
+    validate_message_body,
+)
+from posthog.models.user import User
+
+
+class TestEmailNormalizer(TestCase):
+    def test_normalize(self):
+        """Test that email normalization works correctly."""
+        test_cases = [
+            ("test@EXAMPLE.COM", "test@example.com"),
+            ("TEST@example.com", "test@example.com"),
+            ("Test@Example.Com", "test@example.com"),
+            ("USER@GMAIL.COM", "user@gmail.com"),
+            ("user@gmail.com", "user@gmail.com"),
+            ("User.Name+Tag@Example.ORG", "user.name+tag@example.org"),
+            ("", ""),
+        ]
+
+        for input_email, expected in test_cases:
+            with self.subTest(input_email=input_email):
+                result = EmailNormalizer.normalize(input_email)
+                self.assertEqual(result, expected)
+
+    @parameterized.expand(
+        [
+            ("dotted_capital_i", "owner@İstanbul.example"),
+            ("dotless_i", "ownerı@example.com"),
+            ("long_s", "owner@ſtrasse.example"),
+            ("kelvin_sign", "owner@Klvin.example"),
+            ("capital_sharp_s", "owner@ẞtrasse.example"),
+            ("accented_capital", "ÖWNER@example.com"),
+            ("plain_ascii", "OWNER@Example.com"),
+        ]
+    )
+    def test_normalizing_does_not_change_what_postgres_folds_the_address_to(self, _name: str, typed: str) -> None:
+        # Every lookup resolves through Postgres LOWER. An address a person types must therefore
+        # still fold onto the row that normalizing wrote, whatever characters it holds.
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT LOWER(%s), LOWER(%s)", [EmailNormalizer.normalize(typed), typed])
+            folded_stored, folded_typed = cursor.fetchone()
+
+        self.assertEqual(folded_stored, folded_typed)
+
+    def test_account_created_with_a_dotted_capital_i_resolves_from_the_typed_address(self) -> None:
+        user = User.objects.create_user(email="Owner@İstanbul.example", password="testpass123", first_name="Owner")
+
+        self.assertEqual(user.email, "owner@İstanbul.example")
+        self.assertEqual(EmailLookupHandler.get_user_by_email("Owner@İstanbul.example"), user)
+        # Postgres folds `İ` onto a plain `i`, so the ASCII spelling reaches the same row.
+        self.assertEqual(EmailLookupHandler.get_user_by_email("owner@istanbul.example"), user)
+
+
+class TestEmailLookupHandler(TestCase):
+    def test_get_user_by_email_no_user(self):
+        """Test getting user by email when none exists."""
+        result = EmailLookupHandler.get_user_by_email("nonexistent@example.com")
+        self.assertIsNone(result)
+
+    def test_get_user_by_email_case_insensitive(self):
+        """Test getting user by email with case variations."""
+        user = User(email="Test@Example.COM", first_name="Test", last_name="User")
+        user.set_password("testpass123")
+        user.save()
+
+        try:
+            test_variations = ["test@example.com", "Test@Example.COM", "TEST@EXAMPLE.COM", "test@EXAMPLE.com"]
+
+            for email_variation in test_variations:
+                with self.subTest(email=email_variation):
+                    found_user = EmailLookupHandler.get_user_by_email(email_variation)
+                    self.assertIsNotNone(found_user)
+                    if found_user is not None:
+                        self.assertEqual(found_user.id, user.id)
+        finally:
+            user.delete()
+
+    def test_owner_finds_their_account_when_python_and_postgres_fold_differently(self) -> None:
+        owner = User(email="owner@İstanbul.example", first_name="Owner", last_name="Account")
+        owner.set_password("testpass123")
+        owner.save()
+
+        found_user = EmailLookupHandler.get_user_by_email("owner@İstanbul.example")
+
+        self.assertIsNotNone(found_user)
+        if found_user is not None:
+            self.assertEqual(found_user.id, owner.id)
+
+    @parameterized.expand(
+        [
+            ("typed_lowercase", "twin@example.com"),
+            ("typed_stored_case", "Twin@Example.com"),
+            ("typed_uppercase", "TWIN@EXAMPLE.COM"),
+        ]
+    )
+    def test_case_variants_resolve_to_the_account_used_most_recently(self, _name: str, typed_email: str) -> None:
+        abandoned = User(email="twin@example.com", first_name="Abandoned", last_name="Twin")
+        abandoned.set_password("testpass123")
+        abandoned.last_login = timezone.now() - timedelta(days=400)
+        abandoned.save()
+
+        in_use = User(email="Twin@Example.com", first_name="In", last_name="Use")
+        in_use.set_password("testpass123")
+        in_use.last_login = timezone.now()
+        in_use.save()
+
+        found_user = EmailLookupHandler.get_user_by_email(typed_email)
+
+        self.assertIsNotNone(found_user)
+        if found_user is not None:
+            self.assertEqual(found_user.id, in_use.id)
+
+    def test_account_that_never_logged_in_does_not_win_the_tie_break(self) -> None:
+        never_used = User(email="never@example.com", first_name="Never", last_name="Used")
+        never_used.set_password("testpass123")
+        never_used.save()
+
+        in_use = User(email="Never@Example.com", first_name="In", last_name="Use")
+        in_use.set_password("testpass123")
+        in_use.last_login = timezone.now()
+        in_use.save()
+
+        found_user = EmailLookupHandler.get_user_by_email("never@example.com")
+
+        self.assertIsNotNone(found_user)
+        if found_user is not None:
+            self.assertEqual(found_user.id, in_use.id)
+
+    @parameterized.expand(
+        [
+            # Postgres `UPPER` folds these onto ASCII but `LOWER` leaves them alone, so signup's
+            # duplicate check accepts them as separate accounts. Resolution has to agree.
+            ("dotless_i", "ceo@ıbm.com", "ceo@ibm.com"),
+            ("long_s", "meſsage@example.com", "message@example.com"),
+        ]
+    )
+    def test_homoglyph_address_does_not_capture_another_account(
+        self, _name: str, homoglyph_email: str, ascii_email: str
+    ) -> None:
+        established = User(email=ascii_email, first_name="Established", last_name="Account")
+        established.set_password("testpass123")
+        established.last_login = timezone.now() - timedelta(days=30)
+        established.save()
+
+        # Signed in more recently, so it would win the tie-break if the two folded together.
+        homoglyph = User(email=homoglyph_email, first_name="Homoglyph", last_name="Account")
+        homoglyph.set_password("testpass123")
+        homoglyph.last_login = timezone.now()
+        homoglyph.save()
+
+        found_ascii = EmailLookupHandler.get_user_by_email(ascii_email)
+        found_homoglyph = EmailLookupHandler.get_user_by_email(homoglyph_email)
+
+        self.assertIsNotNone(found_ascii)
+        self.assertIsNotNone(found_homoglyph)
+        if found_ascii is not None and found_homoglyph is not None:
+            self.assertEqual(found_ascii.id, established.id)
+            self.assertEqual(found_homoglyph.id, homoglyph.id)
+
+
+class TestEmailValidationHelper(TestCase):
+    def test_user_exists_no_user(self):
+        """Test checking if user exists when none exists."""
+        result = EmailValidationHelper.user_exists("nonexistent@example.com")
+        self.assertFalse(result)
+
+    def test_user_exists_with_user(self):
+        """Test checking if user exists when user exists."""
+        user = User.objects.create_user(email="TestExists@Example.COM", password="testpass123", first_name="Test")
+
+        try:
+            test_variations = [
+                "testexists@example.com",
+                "TestExists@Example.COM",
+                "TESTEXISTS@EXAMPLE.COM",
+                "testexists@EXAMPLE.com",
+            ]
+
+            for email_variation in test_variations:
+                with self.subTest(email=email_variation):
+                    result = EmailValidationHelper.user_exists(email_variation)
+                    self.assertTrue(result)
+        finally:
+            user.delete()
+
+
+class TestStripEmailAlias(SimpleTestCase):
+    def test_strip_email_alias(self):
+        test_cases = [
+            ("someuser+someprefix@domain.com", "someuser@domain.com"),
+            ("someuser@domain.com", "someuser@domain.com"),
+            ("Someuser+Tag@Domain.com", "Someuser@Domain.com"),
+            ("a+b+c@domain.com", "a@domain.com"),
+            ("", ""),
+        ]
+
+        for input_email, expected in test_cases:
+            with self.subTest(input_email=input_email):
+                self.assertEqual(strip_email_alias(input_email), expected)
+
+
+class TestRejectPlusAddressedEmail(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("plain", "someuser+alias@domain.com"),
+            ("quoted_local_part_holding_an_at", '"some@user+alias"@domain.com'),
+        ]
+    )
+    def test_rejects_plus_in_local_part(self, _name: str, email: str) -> None:
+        with self.assertRaises(serializers.ValidationError) as ctx:
+            reject_plus_addressed_email(email)
+        self.assertEqual(ctx.exception.get_codes(), ["plus_addressing_not_allowed"])
+
+    def test_allows_email_without_plus(self):
+        # Should not raise.
+        reject_plus_addressed_email("someuser@domain.com")
+
+
+class TestRejectLookalikeEmailCharacters(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("ideographic_full_stop", "user@ph\u3002example.com"),
+            ("fullwidth_full_stop", "user@ph\uff0eexample.com"),
+            ("small_full_stop", "user@ph\ufe52example.com"),
+            ("one_dot_leader", "user@ph\u2024example.com"),
+            ("halfwidth_ideographic_full_stop", "user@ph\uff61example.com"),
+            ("zero_width_space", "user@example\u200b.com"),
+            ("zero_width_joiner_in_local_part", "us\u200der@example.com"),
+            ("word_joiner", "user@exam\u2060ple.com"),
+            ("byte_order_mark", "\ufeffuser@example.com"),
+            ("soft_hyphen", "user@exa\u00admple.com"),
+            ("right_to_left_mark", "user@example.com\u200f"),
+            ("right_to_left_override", "user@\u202eexample.com"),
+        ]
+    )
+    def test_rejects_lookalike_dots_and_hidden_characters(self, _name: str, email: str) -> None:
+        with self.assertRaises(serializers.ValidationError) as ctx:
+            reject_lookalike_email_characters(email)
+        self.assertEqual(ctx.exception.get_codes(), ["lookalike_characters_not_allowed"])
+
+    @parameterized.expand(
+        [
+            ("ascii", "user@example.com"),
+            ("idn_domain", "user@ex\u00e4mple.com"),
+            ("non_latin_domain", "user@\u4f8b\u3048.jp"),
+            ("vietnamese", "nguy\u1ec5n@v\u00ed-d\u1ee5.vn"),
+            ("polish", "\u0142ukasz@\u017c\u00f3\u0142w.pl"),
+            ("russian", "\u0438\u0432\u0430\u043d@\u043f\u0440\u0438\u043c\u0435\u0440.\u0440\u0444"),
+            (
+                "greek",
+                "user@\u03c0\u03b1\u03c1\u03ac\u03b4\u03b5\u03b9\u03b3\u03bc\u03b1.\u03b4\u03bf\u03ba\u03b9\u03bc\u03ae",
+            ),
+        ]
+    )
+    def test_allows_addresses_without_lookalike_characters(self, _name: str, email: str) -> None:
+        reject_lookalike_email_characters(email)
+
+
+class TestUserExistsWithStrippedAlias(TestCase):
+    def test_no_match(self):
+        self.assertFalse(EmailValidationHelper.user_exists_with_stripped_alias("nobody@example.com"))
+
+    def test_matches_existing_plain_email(self):
+        user = User.objects.create_user(email="based@example.com", password=None, first_name="Base")
+        try:
+            self.assertTrue(EmailValidationHelper.user_exists_with_stripped_alias("based+new@example.com"))
+        finally:
+            user.delete()
+
+    def test_matches_existing_aliased_email(self):
+        user = User.objects.create_user(email="based+old@example.com", password=None, first_name="Base")
+        try:
+            self.assertTrue(EmailValidationHelper.user_exists_with_stripped_alias("based@example.com"))
+        finally:
+            user.delete()
+
+    def test_does_not_match_different_local_part(self):
+        user = User.objects.create_user(email="based@example.com", password=None, first_name="Base")
+        try:
+            self.assertFalse(EmailValidationHelper.user_exists_with_stripped_alias("basedxyz@example.com"))
+        finally:
+            user.delete()
+
+    @parameterized.expand(
+        [
+            # Guards the SQL side: the stored column is lowercased before stripping, so a legacy
+            # mixed-case row still matches.
+            ("stored_mixed_case", "Based+Old@Example.COM", "based@example.com"),
+            # Guards the input side: the compared value is lowercased too. An equality match
+            # against the lowercased expression silently returns False without it.
+            ("looked_up_mixed_case", "based+old@example.com", "Based@Example.COM"),
+            # Guards the fold: Postgres lowercases `İ` (U+0130) to `i`, so login resolves this address
+            # to the stored one, and signup and email change must treat it as taken.
+            ("looked_up_dotted_capital_i", "bill@victim.example", "bill@vİctim.example"),
+        ]
+    )
+    def test_matches_regardless_of_case(self, _name, stored_email, looked_up_email):
+        # create() rather than create_user() so the stored value keeps its original casing.
+        user = User.objects.create(email=stored_email, first_name="Base")
+        try:
+            self.assertTrue(EmailValidationHelper.user_exists_with_stripped_alias(looked_up_email))
+        finally:
+            user.delete()
+
+
+class TestUserExistsWithGmailCanonical(TestCase):
+    @parameterized.expand(
+        [
+            ("dotted_lookup_plain_stored", "someone@gmail.com", "some.one@gmail.com", True),
+            ("plain_lookup_dotted_stored", "s.o.m.e.one@gmail.com", "someone@gmail.com", True),
+            ("alias_and_dots_stored", "some.one+old@gmail.com", "someone@gmail.com", True),
+            ("alias_and_dots_looked_up", "someone@gmail.com", "s.o.m.e.one+new@gmail.com", True),
+            ("googlemail_is_gmail", "someone@googlemail.com", "some.one@gmail.com", True),
+            ("mixed_case_stored", "Some.One@Gmail.com", "someone@gmail.com", True),
+            ("other_domain_keeps_dots", "someone@example.com", "some.one@example.com", False),
+            ("different_mailbox", "someone@gmail.com", "someone2@gmail.com", False),
+        ]
+    )
+    def test_collapses_dots_and_alias_only_for_gmail(
+        self, _name: str, stored_email: str, looked_up_email: str, expected: bool
+    ) -> None:
+        user = User.objects.create(email=stored_email, first_name="Base")
+        try:
+            self.assertEqual(EmailValidationHelper.user_exists_with_gmail_canonical(looked_up_email), expected)
+        finally:
+            user.delete()
+
+
+class TestValidateDisplayName(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("plain", "Marius", "Marius"),
+            ("two_part", "Marius Andra", "Marius Andra"),
+            ("emoji", "Marius 🦔", "Marius 🦔"),
+            ("apostrophe", "O'Brien", "O'Brien"),
+            ("hyphen", "Jean-Luc", "Jean-Luc"),
+            ("unicode", "Михаил", "Михаил"),
+            ("amp", "Ben & Jerry's", "Ben & Jerry's"),
+            ("www_midword", "Wwwilliam", "Wwwilliam"),
+            ("dot_acronym", "St. John's, Inc.", "St. John's, Inc."),
+            ("trims", "   Marius   ", "Marius"),
+            ("empty", "", ""),
+            ("whitespace_only", "   ", ""),
+            # Bare domains are allowed — users legitimately set org names like
+            # `google.com`. Render-time defang in `sanitize_email_string` neutralizes
+            # mail-client auto-linking.
+            ("bare_domain_org", "google.com", "google.com"),
+            ("bare_domain_titlecase", "Acme.com", "Acme.com"),
+            ("bare_domain_io", "mycompany.io", "mycompany.io"),
+            ("bare_domain_subdomain", "sub.example.com", "sub.example.com"),
+            ("bare_domain_embedded", "join evil.com now", "join evil.com now"),
+        ]
+    )
+    def test_accepts(self, _name: str, value: str, expected: str) -> None:
+        self.assertEqual(validate_display_name(value), expected)
+
+    def test_none_passes_through(self) -> None:
+        self.assertIsNone(validate_display_name(None))
+
+    @parameterized.expand(
+        [
+            ("https", "Visit https://evil.com", "invalid_url"),
+            ("http", "http://phish.me", "invalid_url"),
+            ("ftp", "grab ftp://phish.me", "invalid_url"),
+            ("file", "see file:///etc/passwd", "invalid_url"),
+            ("custom_scheme", "go slack://hack", "invalid_url"),
+            ("www", "www.scam.io", "invalid_url"),
+            ("full_payload", "GET A GIFT https://hicerento.reamaze.com", "invalid_url"),
+            ("newline", "Line1\nLine2", "invalid_control_char"),
+            ("carriage_return", "foo\rbar", "invalid_control_char"),
+            ("tab", "foo\tbar", "invalid_control_char"),
+            ("null", "foo\x00bar", "invalid_control_char"),
+            ("del", "foo\x7fbar", "invalid_control_char"),
+            ("line_separator", "foo\u2028bar", "invalid_control_char"),
+            ("paragraph_separator", "foo\u2029bar", "invalid_control_char"),
+            ("next_line", "foo\u0085bar", "invalid_control_char"),
+            ("www_embedded", "myname www.scam.io", "invalid_url"),
+            ("javascript_scheme", "click javascript:alert(1)", "invalid_url"),
+            ("data_scheme", "see data:text/html,x", "invalid_url"),
+            ("vbscript_scheme", "run vbscript:msgbox", "invalid_url"),
+            ("fullwidth_url", "go \uff48\uff54\uff54\uff50\uff1a\uff0f\uff0fevil.com", "invalid_url"),
+            ("lt", "foo<bar", "invalid_bracket"),
+            ("gt", "link > here", "invalid_bracket"),
+            ("zero_width", "foo\u200bbar", "invalid_invisible_char"),
+            ("rtl_override", "foo\u202ebar", "invalid_invisible_char"),
+        ]
+    )
+    def test_rejects(self, _name: str, value: str, expected_code: str) -> None:
+        with self.assertRaises(serializers.ValidationError) as cm:
+            validate_display_name(value)
+        detail = cast(list[ErrorDetail], cm.exception.detail)
+        self.assertEqual(detail[0].code, expected_code)
+
+
+class TestValidateMessageBody(SimpleTestCase):
+    def test_allows_newlines(self) -> None:
+        value = "Hey!\nWelcome to the team.\nCheers."
+        self.assertEqual(validate_message_body(value), value)
+
+    @parameterized.expand(
+        [
+            ("bare_domain_filename", "check the foo.py file"),
+            ("bare_domain_doc", "see README.md"),
+            ("acronym", "contact us at St. John's"),
+        ]
+    )
+    def test_allows_bare_domains(self, _name: str, value: str) -> None:
+        self.assertEqual(validate_message_body(value), value)
+
+    @parameterized.expand(
+        [
+            ("url", "Check https://evil.com", "invalid_url"),
+            ("www", "Visit www.scam.io", "invalid_url"),
+            ("javascript_scheme", "click javascript:alert(1)", "invalid_url"),
+            ("data_scheme", "see data:text/html,x", "invalid_url"),
+            ("fullwidth_url", "go \uff48\uff54\uff54\uff50\uff1a\uff0f\uff0fevil.com", "invalid_url"),
+            ("bracket", "hello <there>", "invalid_bracket"),
+            ("invisible", "foo\u200bbar", "invalid_invisible_char"),
+            ("rtl_override", "foo\u202ebar", "invalid_invisible_char"),
+            ("lone_surrogate", "foo\ud83dbar", "invalid_invisible_char"),
+            ("long_scheme_of_digits", "a" + "1" * 40 + "://x", "invalid_url"),
+            ("non_newline_control", "foo\x01bar", "invalid_control_char"),
+            ("carriage_return", "foo\rbar", "invalid_control_char"),
+            ("del", "foo\x7fbar", "invalid_control_char"),
+            ("line_separator", "foo\u2028bar", "invalid_control_char"),
+        ]
+    )
+    def test_rejects(self, _name: str, value: str, expected_code: str) -> None:
+        with self.assertRaises(serializers.ValidationError) as cm:
+            validate_message_body(value)
+        detail = cast(list[ErrorDetail], cm.exception.detail)
+        self.assertEqual(detail[0].code, expected_code)
+
+    def test_allows_tab(self) -> None:
+        value = "Indented:\n\tline"
+        self.assertEqual(validate_message_body(value), value)
+
+    def test_blank_passes_through(self) -> None:
+        self.assertIsNone(validate_message_body(None))
+        self.assertEqual(validate_message_body(""), "")
+        self.assertEqual(validate_message_body("   "), "   ")
+        self.assertEqual(validate_message_body("   \n\t  "), "   \n\t  ")
+
+
+class TestSanitizeDisplayName(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("plain", "Acme Inc", "Acme Inc"),
+            ("strips_whitespace", "  Acme Inc  ", "Acme Inc"),
+            ("unicode_name", "\u00c9mile", "\u00c9mile"),
+            # Bare-domain org names round-trip; the defang happens later in
+            # `sanitize_email_properties` at render time.
+            ("bare_domain", "acme.com", "acme.com"),
+        ]
+    )
+    def test_returns_validated_value(self, _name: str, value: str, expected: str) -> None:
+        self.assertEqual(sanitize_display_name(value, fallback="fallback"), expected)
+
+    @parameterized.expand(
+        [
+            ("url", "https://acme.example.com"),
+            ("www", "www.scam.io"),
+            ("javascript_scheme", "javascript:alert(1)"),
+            ("bracket", "<acme>"),
+            ("zero_width", "foo\u200bbar"),
+            ("newline", "line1\nline2"),
+        ]
+    )
+    def test_returns_fallback_when_invalid(self, _name: str, value: str) -> None:
+        self.assertEqual(
+            sanitize_display_name(value, fallback="their organization"),
+            "their organization",
+        )
+
+    @parameterized.expand(
+        [
+            ("none", None),
+            ("empty", ""),
+            ("whitespace_only", "   "),
+        ]
+    )
+    def test_returns_fallback_when_blank(self, _name: str, value: Optional[str]) -> None:
+        self.assertEqual(sanitize_display_name(value, fallback="Someone"), "Someone")
+
+    def test_context_is_logged_but_does_not_raise(self) -> None:
+        # The context kwarg is purely diagnostic — it should never affect the return value.
+        result = sanitize_display_name(
+            "https://evil.example.com",
+            fallback="their organization",
+            context={"task": "unit_test", "organization_id": "abc"},
+        )
+        self.assertEqual(result, "their organization")
+
+
+class TestSanitizeMessageBody(SimpleTestCase):
+    def test_returns_validated_value(self) -> None:
+        value = "Hey!\nWelcome aboard."
+        self.assertEqual(sanitize_message_body(value), value)
+
+    @parameterized.expand(
+        [
+            ("url", "Check https://evil.com"),
+            ("www", "Visit www.scam.io"),
+            ("bracket", "hello <there>"),
+            ("non_newline_control", "foo\x01bar"),
+        ]
+    )
+    def test_returns_fallback_when_invalid(self, _name: str, value: str) -> None:
+        self.assertEqual(sanitize_message_body(value), "")
+        self.assertEqual(sanitize_message_body(value, fallback="--"), "--")
+
+    def test_passes_through_none_and_blank_via_fallback(self) -> None:
+        # None / empty pass through validate_message_body but the helper still returns the
+        # fallback so callers can rely on getting a non-None string back.
+        self.assertEqual(sanitize_message_body(None), "")
+        self.assertEqual(sanitize_message_body(""), "")
+
+
+class TestSanitizeEmailString(SimpleTestCase):
+    @parameterized.expand(
+        [
+            # Plain text passes through (with html.escape only).
+            ("plain", "Marius", "Marius"),
+            ("apostrophe", "O'Brien", "O&#x27;Brien"),
+            ("emoji", "Marius 🦔", "Marius 🦔"),
+            ("hello_world", "Hello, world.", "Hello, world."),
+            # Numeric / punctuation strings without a TLD aren't defanged.
+            ("ip_v4", "192.168.1.1", "192.168.1.1"),
+            ("time", "12:34", "12:34"),
+            ("version", "v1.2.3", "v1.2.3"),
+            # HTML is escaped — preserves existing sanitize_email_properties behavior.
+            ("script_tag", "<script>x</script>", "&lt;script&gt;x&lt;/script&gt;"),
+            ("ampersand", "Ben & Jerry's", "Ben &amp; Jerry&#x27;s"),
+            # URL-shaped substrings are defanged so mail clients don't auto-link.
+            # `​` is a zero-width space — invisible to the recipient but breaks the
+            # `\w+\.\w+` / `[a-z]+://` patterns auto-linkers scan for. Chosen over HTML
+            # entities because template engines can decode entities on output, which
+            # defeats an entity-based defang.
+            ("https_url", "Visit https://evil.com today", "Visit https:​//evil.​com today"),
+            ("http_url", "see http://phish.me/", "see http:​//phish.​me/"),
+            ("www_only", "go www.scam.io", "go www.​scam.​io"),
+            ("bare_domain", "join evil.com now", "join evil.​com now"),
+            ("subdomain_domain", "join sub.evil.com today", "join sub.​evil.​com today"),
+            ("deep_subdomain", "see a.b.c.example.io", "see a.​b.​c.​example.​io"),
+            ("tld_only_legit_org", "Acme.com", "Acme.​com"),
+            ("javascript_scheme", "click javascript:alert(1)", "click javascript:​alert(1)"),
+            ("data_scheme", "see data:text/html,x", "see data:​text/html,x"),
+            ("ftp_scheme", "grab ftp://x.io", "grab ftp:​//x.​io"),
+            # Fullwidth / compatibility characters are NFKC-folded then defanged so
+            # `ｈｔｔｐ：／／evil.com` cannot bypass the URL regex.
+            (
+                "fullwidth_url",
+                "go ｈｔｔｐ：／／evil.com",
+                "go http:​//evil.​com",
+            ),
+            # Attacker-supplied zero-width / direction-override characters are stripped
+            # before defang runs, so they can't hide URL structure (`evil​.com` ->
+            # `evil.com` -> defanged). Our defang then re-inserts ZWSPs.
+            ("zero_width_in_domain", "evil​.com", "evil.​com"),
+            ("rtl_override", "foo‮bar", "foobar"),
+            # Combined: HTML-escape an injected attribute that smuggles a URL scheme,
+            # the scheme is then defanged (regression for the existing
+            # `javascript:alert(1)` test in test_sanitize_email_properties).
+            (
+                "escaped_then_defanged",
+                '<img src="x" onerror="javascript:alert(1)">',
+                "&lt;img src=&quot;x&quot; onerror=&quot;javascript:​alert(1)&quot;&gt;",
+            ),
+            ("uppercase_domain", "join EVIL.COM now", "join EVIL.\u200bCOM now"),
+            ("long_domain_chain", "pad." * 200 + "evil.com", "pad.\u200b" * 200 + "evil.\u200bcom"),
+            ("long_scheme", "a" * 100 + "://x", "a" * 100 + ":\u200b//x"),
+            ("long_scheme_of_digits", "a" + "1" * 40 + "://x", "a" + "1" * 40 + ":\u200b//x"),
+            ("dotless_i_in_label", "paypa\u0131.com", "paypa\u0131.\u200bcom"),
+            ("dotless_i_only_label", "\u0131\u0131.com", "\u0131\u0131.\u200bcom"),
+            ("dotted_capital_i_in_tld", "evil.\u0130\u0130", "evil.\u200b\u0130\u0130"),
+            ("cjk_before_keyword", "\u65e5data:x", "\u65e5data:x"),
+            ("accented_letter_before_domain", "\u00e9vil.com", "\u00e9vil.\u200bcom"),
+            ("lone_surrogate", "evil.com \ud83d", "evil.\u200bcom "),
+        ]
+    )
+    def test_sanitizes(self, _name: str, value: str, expected: str) -> None:
+        self.assertEqual(sanitize_email_string(value), expected)
+
+    def test_empty_string(self) -> None:
+        self.assertEqual(sanitize_email_string(""), "")
+
+    def test_does_not_double_encode_already_escaped(self) -> None:
+        # `&amp;` survives a second pass — html.escape would re-encode the `&` in
+        # the entity, which is the existing trade-off of running sanitize_email_string
+        # over already-sanitized data. Documented as a guardrail.
+        self.assertEqual(sanitize_email_string("&amp;"), "&amp;amp;")
+
+
+# A regex that backtracks quadratically cannot finish these inputs inside this limit.
+@pytest.mark.timeout(60)
+class TestEmailTextChecksOnLongInput(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("dotted_run", "a." * 500_000),
+            ("letter_run", "a" * 1_000_000 + "."),
+        ]
+    )
+    def test_returns_long_input_unchanged(self, _name: str, value: str) -> None:
+        self.assertTrue(sanitize_email_string(value) == value)
+        self.assertTrue(validate_message_body(value) == value)

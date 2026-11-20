@@ -1,0 +1,533 @@
+import { Meta, StoryObj } from '@storybook/react'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { App } from 'scenes/App'
+import { urls } from 'scenes/urls'
+
+import { mswDecorator } from '~/mocks/browser'
+import organizationCurrent from '~/mocks/fixtures/api/organizations/@current/@current.json'
+import { ActivityScope, RawBatchExportBackfill, RawBatchExportRun } from '~/types'
+
+import batchExports from '../__mocks__/batchExports.json'
+
+const EXISTING_EXPORT = {
+    ...batchExports.results[0],
+    model: 'events',
+    filters: [],
+}
+
+const EXISTING_LEGACY_S3_PARQUET_EXPORT = {
+    ...batchExports.results[2],
+    id: '018a6fab-2c21-0001-d451-724c2995e2c1',
+    model: 'events',
+    filters: [],
+    destination: {
+        ...batchExports.results[2].destination,
+        config: {
+            ...batchExports.results[2].destination.config,
+            file_format: 'Parquet',
+        },
+    },
+}
+
+const EXISTING_HOGQL_EXPORT = {
+    ...batchExports.results[0],
+    id: '018a6fab-2c21-0002-d451-724c2995e2c1',
+    name: 'Signups to BigQuery',
+    interval: 'hour',
+    model: 'hogql',
+    hogql_query: `SELECT
+    distinct_id,
+    timestamp,
+    properties.$current_url AS url,
+    properties.plan AS plan
+FROM events
+WHERE event = 'signed_up'
+    AND timestamp >= {data_interval_start}
+    AND timestamp < {data_interval_end}`,
+    filters: [],
+}
+
+const HOGQL_EXPORT_PREVIEW_RESULTS = {
+    columns: ['distinct_id', 'timestamp', 'url', 'plan'],
+    types: [
+        ['distinct_id', 'String'],
+        ['timestamp', 'DateTime64(6, UTC)'],
+        ['url', 'Nullable(String)'],
+        ['plan', 'Nullable(String)'],
+    ],
+    results: [
+        ['user-1', '2024-01-14T23:12:03Z', 'https://example.com/signup', 'free'],
+        ['user-2', '2024-01-14T23:31:47Z', 'https://example.com/pricing', 'teams'],
+        ['user-3', '2024-01-14T23:58:10Z', 'https://example.com/signup', 'free'],
+    ],
+    hasMore: false,
+}
+
+const meta: Meta = {
+    component: App,
+    title: 'Scenes-App/BatchExports',
+    parameters: {
+        layout: 'fullscreen',
+        viewMode: 'story',
+        mockDate: '2024-01-15',
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/environments/:team_id/batch_exports/': batchExports,
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/`]: EXISTING_EXPORT,
+                '/api/environments/:team_id/batch_exports/test/': { steps: [] },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/runs/`]: { results: [] },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/backfills/`]: { results: [] },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_LEGACY_S3_PARQUET_EXPORT.id}/`]:
+                    EXISTING_LEGACY_S3_PARQUET_EXPORT,
+                [`/api/environments/:team_id/batch_exports/${EXISTING_LEGACY_S3_PARQUET_EXPORT.id}/runs/`]: {
+                    results: [],
+                },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_LEGACY_S3_PARQUET_EXPORT.id}/backfills/`]: {
+                    results: [],
+                },
+                // Integration-backed destinations (Databricks, AzureBlob, BigQuery) render IntegrationChoice.
+                '/api/projects/:team_id/integrations': { results: [] },
+            },
+        }),
+    ],
+}
+export default meta
+
+type Story = StoryObj<{}>
+
+// One new-export story per destination so visual regression covers each destination's
+// edit form (the per-destination `Fields` components in destinations/). The default
+// configuration drives any conditional UI: Redshift defaults to COPY, which shows the
+// S3 staging section.
+export const NewAwsS3Export: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('awss3'),
+    },
+}
+
+export const NewS3CompatibleExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('s3compatible'),
+    },
+}
+
+export const NewSnowflakeExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('snowflake'),
+    },
+}
+
+export const NewPostgresExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('postgres'),
+    },
+}
+
+export const NewRedshiftExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('redshift'),
+    },
+}
+
+export const NewHTTPExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('http'),
+    },
+}
+
+export const NewDatabricksExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('databricks'),
+    },
+}
+
+export const NewAzureBlobExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('azureblob'),
+    },
+}
+
+export const NewBigQueryExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExportNew('bigquery'),
+    },
+}
+
+export const ExistingBigQueryExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExport(EXISTING_EXPORT.id),
+    },
+}
+
+export const ExistingHogQLExport: Story = {
+    parameters: {
+        pageUrl: urls.batchExport(EXISTING_HOGQL_EXPORT.id),
+        featureFlags: [FEATURE_FLAGS.HOGQL_BATCH_EXPORTS],
+        testOptions: { waitForSelector: '.monaco-editor' },
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                [`/api/environments/:team_id/batch_exports/${EXISTING_HOGQL_EXPORT.id}/`]: EXISTING_HOGQL_EXPORT,
+                [`/api/environments/:team_id/batch_exports/${EXISTING_HOGQL_EXPORT.id}/runs/`]: { results: [] },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_HOGQL_EXPORT.id}/backfills/`]: { results: [] },
+            },
+            post: {
+                '/api/environments/:team_id/query/:kind': async ({ request }) => {
+                    const body = (await request.json()) as Record<string, any>
+                    const kind = body?.query?.kind
+                    if (kind === 'DatabaseSchemaQuery') {
+                        return [200, { tables: {} }]
+                    }
+                    if (kind === 'HogQLMetadata') {
+                        return [200, { errors: [], warnings: [], notices: [], isValid: true }]
+                    }
+                    if (kind === 'HogQLAutocomplete') {
+                        return [200, { suggestions: [], incomplete_list: false }]
+                    }
+                    return [200, HOGQL_EXPORT_PREVIEW_RESULTS]
+                },
+            },
+        }),
+    ],
+}
+
+export const ExistingAwsS3ExportWithLegacyParquetExtension: Story = {
+    parameters: {
+        pageUrl: urls.batchExport(EXISTING_LEGACY_S3_PARQUET_EXPORT.id),
+    },
+}
+
+const MOCK_BACKFILLS: RawBatchExportBackfill[] = [
+    {
+        id: 'backfill-001',
+        status: 'Running',
+        created_at: '2024-01-15T10:00:00Z',
+        start_at: '2024-01-10T00:00:00Z',
+        end_at: '2024-01-15T00:00:00Z',
+        last_updated_at: '2024-01-15T10:05:00Z',
+        total_records_count: 142500,
+        progress: { progress: 0.35, finished_runs: 42, total_runs: 120 },
+    },
+    {
+        id: 'backfill-002',
+        status: 'Completed',
+        created_at: '2024-01-14T08:00:00Z',
+        finished_at: '2024-01-14T09:30:00Z',
+        start_at: '2024-01-01T00:00:00Z',
+        end_at: '2024-01-10T00:00:00Z',
+        last_updated_at: '2024-01-14T09:30:00Z',
+        total_records_count: 89200,
+        progress: { progress: 1, finished_runs: 216, total_runs: 216 },
+    },
+    {
+        id: 'backfill-003',
+        status: 'Failed',
+        created_at: '2024-01-13T12:00:00Z',
+        finished_at: '2024-01-13T12:15:00Z',
+        start_at: '2023-12-01T00:00:00Z',
+        end_at: '2024-01-01T00:00:00Z',
+        last_updated_at: '2024-01-13T12:15:00Z',
+        total_records_count: 350000,
+        progress: { progress: 0.05, finished_runs: 12, total_runs: 240 },
+    },
+    {
+        id: 'backfill-004',
+        status: 'Starting',
+        created_at: '2024-01-15T11:00:00Z',
+        start_at: '2024-01-14T00:00:00Z',
+        end_at: '2024-01-15T00:00:00Z',
+        last_updated_at: '2024-01-15T11:00:00Z',
+    },
+]
+
+export const BackfillsWithEstimates: Story = {
+    parameters: {
+        pageUrl: `${urls.batchExport(EXISTING_EXPORT.id)}?tab=backfills`,
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/environments/:team_id/batch_exports/': batchExports,
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/`]: EXISTING_EXPORT,
+                '/api/environments/:team_id/batch_exports/test/': { steps: [] },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/runs/`]: { results: [] },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/backfills/`]: {
+                    results: MOCK_BACKFILLS,
+                    next: null,
+                },
+            },
+        }),
+    ],
+}
+
+export const BackfillsEmpty: Story = {
+    parameters: {
+        pageUrl: `${urls.batchExport(EXISTING_EXPORT.id)}?tab=backfills`,
+    },
+}
+
+const MOCK_RUNS: RawBatchExportRun[] = [
+    {
+        id: 'run-001',
+        status: 'Completed',
+        created_at: '2024-01-15T10:01:00Z',
+        data_interval_start: '2024-01-15T09:00:00Z',
+        data_interval_end: '2024-01-15T10:00:00Z',
+        last_updated_at: '2024-01-15T10:03:00Z',
+        records_completed: 48230,
+        bytes_exported: 12_582_912,
+    },
+    {
+        id: 'run-002',
+        status: 'Running',
+        created_at: '2024-01-15T11:01:00Z',
+        data_interval_start: '2024-01-15T10:00:00Z',
+        data_interval_end: '2024-01-15T11:00:00Z',
+        last_updated_at: '2024-01-15T11:02:00Z',
+    },
+    {
+        id: 'run-003',
+        status: 'Failed',
+        created_at: '2024-01-15T09:01:00Z',
+        data_interval_start: '2024-01-15T08:00:00Z',
+        data_interval_end: '2024-01-15T09:00:00Z',
+        last_updated_at: '2024-01-15T09:04:00Z',
+        latest_error:
+            'NotFound: 404 POST https://bigquery.googleapis.com/bigquery/v2/projects/posthog-301601/datasets/BatchExports/tables?prettyPrint=false: Not found: Dataset posthog-301601:BatchExports',
+    },
+    {
+        id: 'run-004',
+        status: 'Starting',
+        created_at: '2024-01-15T12:00:30Z',
+        data_interval_start: '2024-01-15T11:00:00Z',
+        data_interval_end: '2024-01-15T12:00:00Z',
+        last_updated_at: '2024-01-15T12:00:30Z',
+    },
+    {
+        id: 'run-005',
+        status: 'Cancelled',
+        created_at: '2024-01-15T08:01:00Z',
+        data_interval_start: '2024-01-15T07:00:00Z',
+        data_interval_end: '2024-01-15T08:00:00Z',
+        last_updated_at: '2024-01-15T08:02:00Z',
+    },
+]
+
+export const RunsWithData: Story = {
+    parameters: {
+        pageUrl: `${urls.batchExport(EXISTING_EXPORT.id)}?tab=runs`,
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/environments/:team_id/batch_exports/': batchExports,
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/`]: EXISTING_EXPORT,
+                '/api/environments/:team_id/batch_exports/test/': { steps: [] },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/runs/`]: ({ request }) => {
+                    const statuses = new URL(request.url).searchParams.getAll('status')
+                    const results = statuses.length
+                        ? MOCK_RUNS.filter((run) => statuses.includes(run.status))
+                        : MOCK_RUNS
+                    return { results, next: null }
+                },
+                [`/api/environments/:team_id/batch_exports/${EXISTING_EXPORT.id}/backfills/`]: { results: [] },
+            },
+        }),
+    ],
+}
+
+export const RunsEmpty: Story = {
+    parameters: {
+        pageUrl: `${urls.batchExport(EXISTING_EXPORT.id)}?tab=runs`,
+    },
+}
+
+const MOCK_LOG_RESULTS = {
+    results: [
+        [
+            'run-aaa-bbb-ccc',
+            '2024-01-15 10:00:00.000001',
+            'INFO',
+            'Batch exporting range 2024-01-15T09:00:00Z - 2024-01-15T10:00:00Z to BigQuery: posthog-301601.BatchExports.events',
+        ],
+        [
+            'run-aaa-bbb-ccc',
+            '2024-01-15 10:00:02.000003',
+            'INFO',
+            'Batch export for range 2024-01-15T09:00:00Z - 2024-01-15T10:00:00Z finished successfully with 48230 records exported',
+        ],
+        [
+            'run-ddd-eee-fff',
+            '2024-01-15 10:05:00.000001',
+            'INFO',
+            'Batch exporting range 2024-01-15T10:00:00Z - 2024-01-15T11:00:00Z to BigQuery: posthog-301601.BatchExports.events',
+        ],
+        ['run-ddd-eee-fff', '2024-01-15 10:05:01.000002', 'WARN', 'Retrying after transient error'],
+        [
+            'run-ddd-eee-fff',
+            '2024-01-15 10:05:05.000003',
+            'ERROR',
+            'Batch export for range 2024-01-15T10:00:00Z - 2024-01-15T11:00:00Z failed with a non-recoverable error: NotFound: 404 POST https://bigquery.googleapis.com/bigquery/v2/projects/posthog-301601/datasets/BatchExports/tables?prettyPrint=false: Not found: Dataset posthog-301601:BatchExports',
+        ],
+    ],
+}
+
+export const Logs: Story = {
+    parameters: {
+        pageUrl: `${urls.batchExport(EXISTING_EXPORT.id)}?tab=logs`,
+    },
+    decorators: [
+        mswDecorator({
+            post: {
+                '/api/environments/:team_id/query/HogQLQuery/': MOCK_LOG_RESULTS,
+            },
+        }),
+    ],
+}
+
+export const Metrics: Story = {
+    parameters: {
+        pageUrl: `${urls.batchExport(EXISTING_EXPORT.id)}?tab=metrics`,
+    },
+}
+
+const EXPORT_DETAIL_NAME = `'${EXISTING_EXPORT.name}' (${EXISTING_EXPORT.destination.type})`
+
+const MOCK_ACTIVITY_LOGS = {
+    results: [
+        {
+            id: 'activity-005',
+            user: { first_name: 'Max', last_name: 'Hog', email: 'max@posthog.com' },
+            activity: 'updated',
+            created_at: '2024-01-14T18:00:00Z',
+            scope: ActivityScope.BATCH_EXPORT,
+            item_id: EXISTING_EXPORT.id,
+            detail: {
+                name: EXPORT_DETAIL_NAME,
+                merge: null,
+                trigger: null,
+                changes: [
+                    { type: 'BatchExport', action: 'changed', field: 'interval_offset', before: 0, after: 7200 },
+                    { type: 'BatchExport', action: 'changed', field: 'timezone', before: 'UTC', after: 'US/Pacific' },
+                ],
+            },
+        },
+        {
+            id: 'activity-004',
+            user: { first_name: 'Max', last_name: 'Hog', email: 'max@posthog.com' },
+            activity: 'updated',
+            created_at: '2024-01-14T16:00:00Z',
+            scope: ActivityScope.BATCH_EXPORT,
+            item_id: EXISTING_EXPORT.id,
+            detail: {
+                name: EXPORT_DETAIL_NAME,
+                merge: null,
+                trigger: null,
+                changes: [{ type: 'BatchExport', action: 'changed', field: 'enabled', before: true, after: false }],
+            },
+        },
+        {
+            id: 'activity-003',
+            user: { first_name: 'Mix', last_name: 'Hog', email: 'mix@posthog.com' },
+            activity: 'updated',
+            created_at: '2024-01-14T14:00:00Z',
+            scope: ActivityScope.BATCH_EXPORT,
+            item_id: EXISTING_EXPORT.id,
+            detail: {
+                name: EXPORT_DETAIL_NAME,
+                merge: null,
+                trigger: null,
+                changes: [
+                    {
+                        type: 'BatchExport',
+                        action: 'changed',
+                        field: 'name',
+                        before: 'Old Export Name',
+                        after: EXISTING_EXPORT.name,
+                    },
+                ],
+            },
+        },
+        {
+            id: 'activity-002',
+            user: { first_name: 'Mix', last_name: 'Hog', email: 'mix@posthog.com' },
+            activity: 'updated',
+            created_at: '2024-01-14T12:00:00Z',
+            scope: ActivityScope.BATCH_EXPORT,
+            item_id: EXISTING_EXPORT.id,
+            detail: {
+                name: `'Old Export Name' (${EXISTING_EXPORT.destination.type})`,
+                merge: null,
+                trigger: null,
+                changes: [{ type: 'BatchExport', action: 'changed', field: 'interval', before: 'hour', after: 'day' }],
+            },
+        },
+        {
+            id: 'activity-001',
+            user: { first_name: 'Mix', last_name: 'Hog', email: 'mix@posthog.com' },
+            activity: 'created',
+            created_at: '2024-01-14T10:00:00Z',
+            scope: ActivityScope.BATCH_EXPORT,
+            item_id: EXISTING_EXPORT.id,
+            detail: {
+                name: `'Old Export Name' (${EXISTING_EXPORT.destination.type})`,
+                merge: null,
+                trigger: null,
+                changes: null,
+            },
+        },
+    ],
+    total_count: 5,
+}
+
+export const HistoryWithActivity: Story = {
+    parameters: {
+        pageUrl: `${urls.batchExport(EXISTING_EXPORT.id)}?tab=history`,
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/users/@me': () => [
+                    200,
+                    {
+                        email: 'test@posthog.com',
+                        first_name: 'Test',
+                        organization: {
+                            ...organizationCurrent,
+                            available_product_features: [{ key: 'audit_logs', name: 'Audit logs' }],
+                        },
+                    },
+                ],
+                '/api/projects/:team_id/activity_log/': MOCK_ACTIVITY_LOGS,
+            },
+        }),
+    ],
+}
+
+export const HistoryEmpty: Story = {
+    parameters: {
+        pageUrl: `${urls.batchExport(EXISTING_EXPORT.id)}?tab=history`,
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/users/@me': () => [
+                    200,
+                    {
+                        email: 'test@posthog.com',
+                        first_name: 'Test',
+                        organization: {
+                            ...organizationCurrent,
+                            available_product_features: [{ key: 'audit_logs', name: 'Audit logs' }],
+                        },
+                    },
+                ],
+                '/api/projects/:team_id/activity_log/': { results: [], total_count: 0 },
+            },
+        }),
+    ],
+}

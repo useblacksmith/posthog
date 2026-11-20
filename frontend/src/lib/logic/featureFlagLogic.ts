@@ -1,0 +1,180 @@
+import { MakeLogicType, actions, afterMount, kea, path, reducers } from 'kea'
+import posthog from 'posthog-js'
+
+import { FEATURE_FLAGS, FeatureFlagKey } from 'lib/constants'
+import { getAppContext } from 'lib/utils/getAppContext'
+
+import { AppContext, PreflightStatus } from '~/types'
+
+export type FeatureFlagsSet = {
+    [flag in FeatureFlagKey]?: boolean | string
+}
+
+/**
+ * Whether `posthog-js`-resolved flag values actually reach `featureFlagLogic.featureFlags` (see
+ * `spyOnFeatureFlags` below). On self-hosted, non-debug instances they're discarded in favor of
+ * the server-configured `PERSISTED_FEATURE_FLAGS` baseline, so anything that enrolls a user into
+ * a flag client-side (e.g. early access feature enrollment) has no visible effect there. A
+ * self-capturing instance is the exception: its flags come from its own project, not PostHog's.
+ */
+export function areClientFeatureFlagsHonored(preflight: Pick<PreflightStatus, 'cloud' | 'is_debug'> | null): boolean {
+    return !!preflight?.cloud || !!preflight?.is_debug || !!window.JS_POSTHOG_SELF_CAPTURE
+}
+
+export const FEATURE_PREVIEW_SELF_HOSTED_DISABLED_REASON =
+    'This toggle has no effect on self-hosted instances. Feature previews here are controlled by the PERSISTED_FEATURE_FLAGS environment variable.'
+
+const eventsNotified: Record<string, boolean> = {}
+function notifyFlagIfNeeded(flag: string, flagState: string | boolean | undefined): void {
+    if (!eventsNotified[flag]) {
+        posthog.capture('$feature_flag_called', {
+            $feature_flag: flag,
+            $feature_flag_response: flagState === undefined ? false : flagState,
+        })
+        eventsNotified[flag] = true
+    }
+}
+
+export function getPersistedFeatureFlags(appContext: AppContext | undefined = getAppContext()): FeatureFlagsSet {
+    const persistedFeatureFlags = appContext?.persisted_feature_flags || []
+    // The server sends a list of enabled flag keys (each maps to `true`). Storybook can
+    // instead supply a record so a story can pin a multivariate variant (e.g. an
+    // experiment arm) — those values ride this always-merged baseline and survive the
+    // empty `onFeatureFlags` callback that posthog-js fires on load.
+    if (!Array.isArray(persistedFeatureFlags)) {
+        return { ...persistedFeatureFlags }
+    }
+    return Object.fromEntries(persistedFeatureFlags.map((f) => [f, true]))
+}
+
+let cachedFlagsSerialized: string | null = null
+// Set when the server refuses PostHog AI 2.0 to a page that still shows it. It overrides the server-rendered
+// decision, and it also works in an OAuth session, which never reads that decision.
+let posthogAiAccessRevoked = false
+
+export function revokePostHogAIAccess(): void {
+    posthogAiAccessRevoked = true
+}
+let cachedFlagsProxy: FeatureFlagsSet | null = null
+
+function spyOnFeatureFlags(featureFlags: FeatureFlagsSet): FeatureFlagsSet {
+    const appContext = getAppContext()
+    const persistedFlags = getPersistedFeatureFlags(appContext)
+    const availableFlags =
+        areClientFeatureFlagsHonored(appContext?.preflight ?? null) || process.env.NODE_ENV === 'test'
+            ? { ...persistedFlags, ...featureFlags }
+            : persistedFlags
+    // PostHog AI 2.0 follows the server's access gate, which also admits beta orgs, so a denied user never sees 2.0 UI.
+    const posthogAiAccess = posthogAiAccessRevoked ? false : appContext?.posthog_ai_access
+    if (posthogAiAccess !== undefined) {
+        availableFlags[FEATURE_FLAGS.PHAI_SANDBOX_MODE] = posthogAiAccess
+    }
+    // The nav switch changes `today-rail-nav` locally, before the server re-evaluates `scene-menu-bar`.
+    if (availableFlags[FEATURE_FLAGS.TODAY_RAIL_NAV]) {
+        availableFlags[FEATURE_FLAGS.SCENE_MENU_BAR] = true
+    }
+
+    const serialized = JSON.stringify(availableFlags)
+    if (serialized === cachedFlagsSerialized && cachedFlagsProxy) {
+        return cachedFlagsProxy
+    }
+    cachedFlagsSerialized = serialized
+
+    if (typeof window.Proxy !== 'undefined') {
+        cachedFlagsProxy = new Proxy(
+            {},
+            {
+                get(_, flag) {
+                    if (flag === 'toJSON') {
+                        return () => availableFlags
+                    }
+                    const flagString = flag.toString()
+                    const flagState = availableFlags[flagString as FeatureFlagKey]
+                    notifyFlagIfNeeded(flagString, flagState)
+                    return flagState
+                },
+            }
+        )
+        return cachedFlagsProxy
+    }
+    // Fallback for IE11. Won't track "false" results. ¯\_(ツ)_/¯
+    const flags: FeatureFlagsSet = {}
+    for (const flag of Object.keys(availableFlags)) {
+        Object.defineProperty(flags, flag, {
+            get: function () {
+                if (flag === 'toJSON') {
+                    return () => availableFlags
+                }
+                notifyFlagIfNeeded(flag, true)
+                return true
+            },
+        })
+    }
+    cachedFlagsProxy = flags
+    return flags
+}
+
+export function peekFeatureFlag(featureFlags: FeatureFlagsSet, flag: FeatureFlagKey): boolean | string | undefined {
+    const raw = (featureFlags as { toJSON?: () => FeatureFlagsSet }).toJSON?.() ?? featureFlags
+    return raw[flag]
+}
+
+export function reportFeatureFlagExposure(featureFlags: FeatureFlagsSet, flag: FeatureFlagKey): void {
+    notifyFlagIfNeeded(flag, peekFeatureFlag(featureFlags, flag))
+}
+
+export function getFeatureFlagPayload(flag: FeatureFlagKey): any {
+    return posthog.getFeatureFlagResult(flag, { send_event: false })?.payload
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface featureFlagLogicValues {
+    featureFlags: FeatureFlagsSet
+    receivedFeatureFlags: boolean
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface featureFlagLogicActions {
+    setFeatureFlags: (
+        flags: string[],
+        variants: Record<string, boolean | string>
+    ) => {
+        flags: string[]
+        variants: Record<string, boolean | string>
+    }
+}
+
+export type featureFlagLogicType = MakeLogicType<featureFlagLogicValues, featureFlagLogicActions>
+
+export const featureFlagLogic = kea<featureFlagLogicType>([
+    path(['lib', 'logic', 'featureFlagLogic']),
+    actions({
+        setFeatureFlags: (flags: string[], variants: Record<string, string | boolean>) => ({ flags, variants }),
+    }),
+    reducers({
+        featureFlags: [
+            getPersistedFeatureFlags(),
+            { persist: true },
+            {
+                setFeatureFlags: (_, { variants }) => spyOnFeatureFlags(variants),
+            },
+        ],
+        receivedFeatureFlags: [
+            false,
+            {
+                setFeatureFlags: () => true,
+            },
+        ],
+    }),
+    afterMount(({ actions }) => {
+        // The app shell keeps this logic mounted for the page lifetime, so a new mount is a new page that
+        // starts from the server decision again.
+        posthogAiAccessRevoked = false
+        posthog.onFeatureFlags(actions.setFeatureFlags)
+        if (posthog.config?.advanced_disable_flags) {
+            // posthog-js never calls back when flags are off, and the app holds its first render
+            // until this arrives. A page with no project key has no flags to wait for.
+            actions.setFeatureFlags([], {})
+        }
+    }),
+])

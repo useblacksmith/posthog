@@ -1,0 +1,258 @@
+# Weekly Digest
+
+The weekly digest is an email sent to all customers summarizing activity in their PostHog projects over the past week.
+
+## Architecture Overview
+
+The digest is generated and sent via two Temporal workflows:
+
+1. **GenerateDigestDataWorkflow** - Generates all digest data and stores it in Redis
+2. **SendWeeklyDigestWorkflow** - Reads from Redis and sends personalized emails
+
+Team-level generation keeps at most 100 activities pending per workflow to stay below Temporal's pending-activity limit.
+Activities are sync bodies wrapped in `@asyncify`, so each one runs on its own worker thread with its own database connection.
+Django's async ORM and `database_sync_to_async` default to one shared thread per process, which serializes every database call across all concurrent activities.
+Cancelling an activity cancels only the coroutine that awaits the thread, so the send loop checks the cancellation event before each organization and recipient.
+A body that runs on the event loop also trips Django's async-unsafe guard as soon as a helper such as `should_send_notification` queries the database.
+Every team range and report generator must finish before organization aggregation starts.
+A Temporal patch marker preserves the activity scheduling behavior when replaying older histories.
+
+Generation has a 15-hour run timeout and a 15-hour execution timeout shared across its two allowed attempts.
+A healthy run can use the full generation budget without restarting and regenerating completed batches after six hours.
+Sending starts only after generation succeeds and has separate six-hour run and 15-hour execution timeouts.
+
+### Delivery
+
+The send activity posts each recipient's digest to the webhook of the digest workflow in the US project, with the recipient address in `to`.
+Both regions post to that webhook. `WEEKLY_DIGEST_WORKFLOW_WEBHOOK_URL` and `WEEKLY_DIGEST_WORKFLOW_WEBHOOK_SECRET` configure it.
+When either one is unset, the send activity sends no digest, logs which setting is missing, counts the run in `weekly_digest_workflows_send_failed` with the reason `not_configured`, and fails without a retry.
+A dry run sends nothing, so it runs without them.
+The secret goes in the `Authorization` header, so only the digest send can start the workflow.
+Each post carries an `Idempotency-Key` made from the digest key, the organization UUID and the user UUID, so a retried post starts no second run. The webhook drops any repeat of a key, so a member of two organizations needs a key per organization to get both digests.
+An organization stays unsent when a post fails after its retries, so the next attempt resends it.
+All send batches share one token bucket in the digest Redis that keeps posts to about 3,000 a minute, and the send waits when that Redis can't answer.
+The webhook refuses a body above 512,000 bytes, and a project can create thousands of events in a week. The Workflows payload carries the first six new event definitions and their total in `new_event_definitions_count`, which is what the email shows.
+The workflow paces the emails themselves with its own sending rate limit.
+
+### Resending
+
+`python manage.py resend_weekly_digest --digest-key <key> --org <uuid>` resends a digest to the listed organizations, in the region where it runs.
+It skips generation and reads the data the scheduled run left in the digest Redis, so it works only within `redis_ttl` (3 days) of that run.
+It sends to the listed organizations even when they are marked sent, so members who already got the digest get a second copy.
+`--dry-run` logs who would get the digest.
+The period in the email comes from the digest key, not from the day of the resend.
+
+## Redis Storage Structure
+
+Data is stored with keys prefixed by `{digest_key}` (e.g., `weekly-digest-2024-01`).
+
+**Important:** All Redis keys are generated via helper functions in `keys.py`. Never hardcode key strings - use the typed enums and generator functions instead.
+
+### Team-level data
+
+Generated via `team_data_key(digest_key, TeamDataKey.*, team_id)`.
+Each Postgres-backed generator reads a team id range with two queries, one for the eligible teams and one for the data, and writes its keys in one Redis pipeline.
+A team with no data of a kind gets no key for it; organization aggregation substitutes an empty default for a missing key.
+The two ClickHouse-backed generators work per range too: expiring recordings are counted for the whole range in one grouped query, and usage trends first find the teams with events in the window in one query, then run the per-team HogQL query for those teams only.
+New error issues come from one range-wide Postgres query, which finds the teams with new issues. For each of those teams, the error tracking digest query then ranks and counts the new issues. A team whose count query fails keeps its Postgres issues without counts.
+
+| `TeamDataKey` enum      | Key Pattern                                    | Contents                                       |
+| ----------------------- | ---------------------------------------------- | ---------------------------------------------- |
+| `DASHBOARDS`            | `{digest_key}-dashboards-{team_id}`            | New dashboards created                         |
+| `EVENT_DEFINITIONS`     | `{digest_key}-event-definitions-{team_id}`     | New event definitions                          |
+| `EXPERIMENTS_LAUNCHED`  | `{digest_key}-experiments-launched-{team_id}`  | Experiments started                            |
+| `EXPERIMENTS_COMPLETED` | `{digest_key}-experiments-completed-{team_id}` | Experiments finished                           |
+| `EXTERNAL_DATA_SOURCES` | `{digest_key}-external-data-sources-{team_id}` | New data sources                               |
+| `FEATURE_FLAGS`         | `{digest_key}-feature-flags-{team_id}`         | New feature flags                              |
+| `SAVED_FILTERS`         | `{digest_key}-saved-filters-{team_id}`         | Interesting replay filters                     |
+| `EXPIRING_RECORDINGS`   | `{digest_key}-expiring-recordings-{team_id}`   | Count of soon-to-expire recordings             |
+| `SURVEYS_LAUNCHED`      | `{digest_key}-surveys-launched-{team_id}`      | Surveys launched                               |
+| `USAGE_TRENDS`          | `{digest_key}-usage-trends-{team_id}`          | Event volume + active users, WoW, daily counts |
+| `ERROR_ISSUES`          | `{digest_key}-error-issues-{team_id}`          | New error-tracking issues, daily occurrences   |
+
+### Organization-level data
+
+Generated via `org_digest_key(digest_key, org_id)`:
+
+| Key Pattern             | Contents                                                      |
+| ----------------------- | ------------------------------------------------------------- |
+| `{digest_key}-{org_id}` | `OrganizationDigest` containing all team digests for that org |
+
+### User-level data
+
+Generated via `user_data_key(digest_key, UserDataKey.*, user_id)`:
+
+| `UserDataKey` enum   | Key Pattern                                 | Contents                                                        |
+| -------------------- | ------------------------------------------- | --------------------------------------------------------------- |
+| `NOTIFY_TEAMS`       | `{digest_key}-user-notify-{user_id}`        | Redis SET of team IDs the user should receive notifications for |
+| `PRODUCT_SUGGESTION` | `{digest_key}-product-suggestion-{user_id}` | Single `DigestProductSuggestion` for product recommendations    |
+
+## Data Flow
+
+```plaintext
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        GenerateDigestDataWorkflow                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. Cut teams and orgs into id-range batches                                │
+│                                                                             │
+│  2. Generate team-level data (parallel per batch):                          │
+│     ├── generate_dashboard_lookup                                           │
+│     ├── generate_event_definition_lookup                                    │
+│     ├── generate_experiment_launched_lookup                                 │
+│     ├── generate_experiment_completed_lookup                                │
+│     ├── generate_external_data_source_lookup                                │
+│     ├── generate_feature_flag_lookup                                        │
+│     ├── generate_survey_lookup                                              │
+│     ├── generate_filter_lookup                                              │
+│     ├── generate_recording_lookup                                           │
+│     ├── generate_user_notification_lookup                                   │
+│     └── generate_product_suggestion_lookup                                  │
+│                                                                             │
+│  3. Aggregate into org digests:                                             │
+│     └── generate_organization_digest_batch                                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                              Redis Storage
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SendWeeklyDigestWorkflow                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  For each organization (batched by id range):                               │
+│    1. Load OrganizationDigest from Redis                                    │
+│    2. For each org member:                                                  │
+│       a. Load user's notification team set                                  │
+│       b. Load user's product suggestion                                     │
+│       c. Create UserSpecificDigest via org_digest.for_user()                │
+│       d. Render payload and post it to the digest workflow's webhook        │
+│    3. Stamp the org's MessagingRecord as sent                               │
+│       (a failed or oversized post leaves the org unsent)                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Key Types
+
+### OrganizationDigest
+
+The base digest containing all team data for an organization. Stored in Redis.
+
+### UserDigestContext
+
+Container for all user-specific data. This is where you add new user-specific fields:
+
+```python
+class UserDigestContext(BaseModel):
+    product_suggestion: DigestProductSuggestion | None = None
+    # Add new user-specific fields here
+```
+
+### UserSpecificDigest
+
+A personalized view created at send time by calling `OrganizationDigest.for_user(user_teams, context)`. Contains:
+
+- Filtered team digests (only teams user has notifications enabled for)
+- `context`: A `UserDigestContext` with user-specific data
+
+This is **not stored on Redis** - it's computed on-the-fly during the send phase.
+
+### DigestProductSuggestion
+
+A product recommendation for a user, containing:
+
+- `team_id`: Which project the suggestion is for
+- `product_path`: The product name (e.g., "Session replay")
+- `reason`: Why it was suggested (enum value)
+- `reason_text`: Human-readable explanation for the email
+
+## Adding New Team-Level Fields
+
+Team-level fields are data that belongs to a project/team (dashboards, feature flags, etc.). Each field type should have its own activity method to keep concerns separated and allow parallel execution.
+
+1. **Add a new enum value to `TeamDataKey`** in `keys.py`:
+
+   ```python
+   class TeamDataKey(StrEnum):
+       # ... existing keys ...
+       ALERTS = "alerts"  # new
+   ```
+
+2. **Create a Pydantic model** in `types.py` for the new data type (e.g., `DigestAlert`, `AlertList`)
+
+3. **Add a query function** in `queries.py` to fetch the data from the database
+
+4. **Create a new activity** in `activities.py`:
+
+   ```python
+   @activity.defn(name="generate-alert-lookup")
+   async def generate_alert_lookup(input: GenerateDigestDataBatchInput) -> None:
+       return await generate_digest_data_lookup(
+           input,
+           key_kind=TeamDataKey.ALERTS,
+           query_func=query_new_alerts,
+           resource_type=AlertList,
+       )
+   ```
+
+5. **Register the activity** in `workflows.py` by adding it to the `generators` list in `GenerateDigestDataWorkflow`
+
+6. **Add the field to `TeamDigest`** in `types.py` and update `generate_organization_digest_batch` to load it from Redis (the key order in `all_team_data_keys` matches `TeamDataKey` enum order)
+
+7. **Update `TeamDigest.render_payload()`** to include the new field in the email payload
+
+## Adding New User-Specific Fields
+
+User-specific fields are data personalized per user (product suggestions, notification preferences, etc.). Each field type should have its own activity method for loading data during the generate phase.
+
+1. **Add a new enum value to `UserDataKey`** in `keys.py`:
+
+   ```python
+   class UserDataKey(StrEnum):
+       # ... existing keys ...
+       RECOMMENDATIONS = "recommendations"  # new
+   ```
+
+2. **Create a Pydantic model** in `types.py` for the new data type
+
+3. **Add a query function** in `queries.py` to fetch the data
+
+4. **Create a new activity** in `activities.py` to generate and store the data in Redis:
+
+   ```python
+   @activity.defn(name="generate-user-recommendations-lookup")
+   async def generate_user_recommendations_lookup(input: GenerateDigestDataBatchInput) -> None:
+       # Iterate through teams/users, query data, store in Redis using:
+       key = user_data_key(input.digest.key, UserDataKey.RECOMMENDATIONS, user.id)
+   ```
+
+5. **Register the activity** in `workflows.py` by adding it to the `generators` list
+
+6. **Add the field to `UserDigestContext`** in `types.py`:
+
+   ```python
+   class UserDigestContext(BaseModel):
+       product_suggestion: DigestProductSuggestion | None = None
+       recommendations: UserRecommendations | None = None  # new field
+   ```
+
+7. **Load the data in `send_weekly_digest_batch`** and set it on the context:
+
+   ```python
+   raw_recommendations = await r.get(
+       user_data_key(input.digest.key, UserDataKey.RECOMMENDATIONS, user.id)
+   )
+   recommendations = UserRecommendations.model_validate_json(raw_recommendations) if raw_recommendations else None
+
+   user_context = UserDigestContext(
+       product_suggestion=product_suggestion,
+       recommendations=recommendations,
+   )
+   ```
+
+8. **Use it in `UserSpecificDigest.render_payload()`** to include in the email payload
+
+The `for_user()` signature never changes - all user-specific data flows through `UserDigestContext`.

@@ -1,0 +1,491 @@
+import type { Meta, StoryObj } from '@storybook/react'
+import { BindLogic } from 'kea'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+
+import { mswDecorator } from '~/mocks/browser'
+import { EMPTY_PAGINATED_RESPONSE } from '~/mocks/handlers'
+import { dataNodeLogic } from '~/queries/nodes/DataNode/dataNodeLogic'
+import { insightVizDataNodeKey } from '~/queries/nodes/InsightViz/insightVizKeys'
+import { isInsightVizNode } from '~/queries/schema/node-guards'
+import {
+    AlertCalculationInterval,
+    AlertConditionType,
+    AlertState,
+    InsightThresholdType,
+    NodeKind,
+} from '~/queries/schema/schema-general'
+
+import type { AlertCheck, AlertType } from '../types'
+import { EditAlertModal } from './EditAlertModal'
+
+const createdBy = {
+    id: 1,
+    uuid: '018f59f3-4f2f-7c89-b389-73b99b91f442',
+    distinct_id: 'storybook-user',
+    first_name: 'Hedge Hog',
+    email: 'hedge@example.com',
+    hedgehog_config: null,
+}
+
+function makeChecks(values: number[]): AlertCheck[] {
+    return values.map((calculatedValue, index) => ({
+        id: `check-${index}`,
+        created_at: `2026-07-16T${String(12 + index).padStart(2, '0')}:00:00Z`,
+        calculated_value: calculatedValue,
+        state: AlertState.NOT_FIRING,
+        targets_notified: false,
+        deliveries: null,
+    }))
+}
+
+const makeAlert = (overrides: Partial<AlertType>): AlertType =>
+    ({
+        id: 'alert-trends',
+        name: 'Large file uploads',
+        enabled: true,
+        state: AlertState.NOT_FIRING,
+        calculation_interval: AlertCalculationInterval.HOURLY,
+        last_checked_at: '2026-07-16T16:45:00Z',
+        last_notified_at: '2026-07-14T13:30:00Z',
+        created_at: '2026-06-01T09:00:00Z',
+        created_by: createdBy,
+        subscribed_users: [createdBy],
+        checks: makeChecks([4200000, 5100000, 4800000, 6700000, 7200000, 6100000, 8300000, 9400000]),
+        config: {
+            type: 'TrendsAlertConfig',
+            series_index: 0,
+            check_ongoing_interval: false,
+        },
+        threshold: {
+            configuration: {
+                type: InsightThresholdType.ABSOLUTE,
+                bounds: { lower: 1, upper: 10000000 },
+            },
+        },
+        condition: { type: AlertConditionType.ABSOLUTE_VALUE },
+        insight: {
+            id: 104,
+            short_id: 'large-file-uploads',
+            name: 'Large file uploads',
+            derived_name: 'Large file uploads',
+            query: {
+                kind: NodeKind.InsightVizNode,
+                source: {
+                    kind: NodeKind.TrendsQuery,
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            event: 'file uploaded',
+                            math: 'avg',
+                            math_property: 'file_size_b',
+                        },
+                    ],
+                },
+            },
+        },
+        ...overrides,
+    }) as AlertType
+
+const trendsAlert = makeAlert({})
+// Shows the delivery details tooltip on the History tab's "Targets notified" cell.
+trendsAlert.checks![trendsAlert.checks!.length - 1].targets_notified = true
+trendsAlert.checks![trendsAlert.checks!.length - 1].deliveries = [
+    {
+        channel: 'email',
+        target: 'alerts@example.com',
+        status: 'accepted',
+        at: '2026-07-16T14:00:00Z',
+        display_label: 'Email: alerts@example.com',
+    },
+    {
+        channel: 'hog_function',
+        target: 'Slack #eng-alerts',
+        template: 'slack',
+        status: 'accepted',
+        at: '2026-07-16T14:00:00Z',
+        display_label: 'Slack #eng-alerts',
+    },
+]
+// A check recorded before delivery receipts existed: a bare "Yes", no receipt list.
+trendsAlert.checks![trendsAlert.checks!.length - 2].targets_notified = true
+
+const funnelAlert = makeAlert({
+    id: 'alert-funnel',
+    name: 'Checkout conversion below 40%',
+    checks: makeChecks([0.52, 0.49, 0.47, 0.44, 0.42, 0.39, 0.37, 0.35]),
+    config: {
+        type: 'FunnelsAlertConfig',
+        funnel_step: 1,
+        metric: 'conversion_from_start',
+        check_ongoing_interval: false,
+    },
+    insight: {
+        id: 105,
+        short_id: 'checkout-funnel',
+        name: 'Checkout funnel',
+        derived_name: 'Checkout funnel',
+        query: {
+            kind: NodeKind.InsightVizNode,
+            source: {
+                kind: NodeKind.FunnelsQuery,
+                series: [
+                    { kind: NodeKind.EventsNode, event: 'checkout started', name: 'Checkout started' },
+                    { kind: NodeKind.EventsNode, event: 'order completed', name: 'Order completed' },
+                ],
+            },
+        },
+    } as unknown as AlertType['insight'],
+    threshold: {
+        configuration: {
+            type: InsightThresholdType.PERCENTAGE,
+            bounds: { lower: 0.4 },
+        },
+    },
+})
+
+const hogQLAlert = makeAlert({
+    id: 'alert-hogql',
+    name: 'Queue depth above 1,000',
+    checks: makeChecks([720, 810, 760, 880, 920, 1050, 980, 1200]),
+    config: {
+        type: 'HogQLAlertConfig',
+        column: 'queue_depth',
+        evaluation: 'last_row',
+        label_column: 'recorded_at',
+    },
+    insight: {
+        id: 106,
+        short_id: 'queue-depth',
+        name: 'Queue depth',
+        derived_name: 'Queue depth',
+        query: {
+            kind: NodeKind.InsightVizNode,
+            source: {
+                kind: NodeKind.HogQLQuery,
+                query: 'SELECT recorded_at, queue_depth FROM queue_metrics ORDER BY recorded_at',
+            },
+        },
+    } as unknown as AlertType['insight'],
+    threshold: {
+        configuration: {
+            type: InsightThresholdType.ABSOLUTE,
+            bounds: { upper: 1000 },
+        },
+    },
+})
+
+// The AI detector: no threshold bounds, its own instructions field, and a rationale on each check.
+const llmDetectorAlert = makeAlert({
+    id: 'alert-llm',
+    name: 'Watch signups',
+    calculation_interval: AlertCalculationInterval.DAILY,
+    detector_config: { type: 'llm', instructions: 'Only tell me about drops.' },
+    threshold: undefined,
+    checks: makeChecks([980, 1010, 960, 1030, 990, 1020, 640]).map((check, index, checks) =>
+        index === checks.length - 1
+            ? {
+                  ...check,
+                  state: AlertState.FIRING,
+                  anomaly_scores: [0.91],
+                  triggered_metadata: {
+                      rationale: 'Signups fell to 640, well below the 960-1030 range of the previous week.',
+                      kind: 'drop',
+                      model: 'claude-haiku-5-5',
+                  },
+              }
+            : check
+    ),
+    insight: {
+        id: 107,
+        short_id: 'daily-signups',
+        name: 'Daily signups',
+        derived_name: 'Daily signups',
+        query: {
+            kind: NodeKind.InsightVizNode,
+            source: {
+                kind: NodeKind.TrendsQuery,
+                interval: 'day',
+                series: [{ kind: NodeKind.EventsNode, event: 'signed_up', math: 'dau' }],
+            },
+        },
+    } as unknown as AlertType['insight'],
+})
+
+// The forecast detector: a different rule for spikes and drops, and the forecast on each check.
+const forecastDetectorAlert = makeAlert({
+    ...llmDetectorAlert,
+    id: 'alert-forecast',
+    detector_config: {
+        type: 'forecast',
+        above: { quantile: 0.99, min_relative_change: 0.2 },
+        below: { quantile: 0.05, min_absolute_change: 100 },
+    },
+    checks: makeChecks([980, 1010, 960, 1030, 990, 1020, 640]).map((check, index, checks) => ({
+        ...check,
+        state: index === checks.length - 1 ? AlertState.FIRING : AlertState.NOT_FIRING,
+        triggered_metadata: {
+            detector_type: 'forecast',
+            expected: 1000,
+            lower: 900,
+            upper: 1100,
+            lower_quantile: 0.05,
+            upper_quantile: 0.99,
+            actual: check.calculated_value,
+            ...(index === checks.length - 1 ? { side: 'below' } : {}),
+        },
+    })),
+})
+
+const meta: Meta<typeof EditAlertModal> = {
+    component: EditAlertModal,
+    title: 'Products/Alerts/Alert modal',
+    parameters: {
+        layout: 'fullscreen',
+        viewMode: 'story',
+        mockDate: '2026-07-16',
+        featureFlags: [FEATURE_FLAGS.ALERTS_INLINE_NOTIFICATIONS],
+        testOptions: { viewport: { width: 1300, height: 900 } },
+    },
+}
+
+export default meta
+
+type StoryInsightType = 'trends' | 'funnel' | 'hogql'
+
+interface AlertTypeStoryProps {
+    insightType: StoryInsightType
+}
+
+const storyAlerts: Record<StoryInsightType, AlertType> = {
+    trends: trendsAlert,
+    funnel: funnelAlert,
+    hogql: hogQLAlert,
+}
+
+const alertsById = Object.fromEntries(
+    [...Object.values(storyAlerts), llmDetectorAlert, forecastDetectorAlert].map((alert) => [alert.id, alert])
+)
+
+function EditAlertStory({ insightType }: AlertTypeStoryProps): JSX.Element {
+    const alert = storyAlerts[insightType]
+    return (
+        <EditAlertModal
+            isOpen
+            alertId={alert.id}
+            insightId={alert.insight.id}
+            insightShortId={alert.insight.short_id}
+            insightLogicProps={{
+                dashboardItemId: alert.insight.short_id,
+                cachedInsight: alert.insight,
+            }}
+            onEditSuccess={() => {}}
+            onClose={() => {}}
+            useAlertCheckPreview
+        />
+    )
+}
+
+type EditAlertVariant = StoryObj<AlertTypeStoryProps>
+
+export const EditAlert: EditAlertVariant = {
+    args: { insightType: 'trends' },
+    argTypes: {
+        insightType: {
+            control: 'select',
+            options: ['trends', 'funnel', 'hogql'],
+        },
+    },
+    render: ({ insightType }) => <EditAlertStory insightType={insightType} />,
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/environments/:team_id/alerts/:alert_id/': (request) => [
+                    200,
+                    alertsById[request.params.alert_id as string],
+                ],
+                '/api/projects/:team_id/hog_functions/': EMPTY_PAGINATED_RESPONSE,
+            },
+        }),
+    ],
+}
+
+export const EditAlertWithLLMDetector: StoryObj<typeof EditAlertModal> = {
+    parameters: {
+        featureFlags: [FEATURE_FLAGS.ALERTS_INLINE_NOTIFICATIONS, FEATURE_FLAGS.ALERTS_LLM_DETECTOR],
+    },
+    render: () => (
+        <EditAlertModal
+            isOpen
+            alertId={llmDetectorAlert.id}
+            insightId={llmDetectorAlert.insight.id}
+            insightShortId={llmDetectorAlert.insight.short_id}
+            insightLogicProps={{
+                dashboardItemId: llmDetectorAlert.insight.short_id,
+                cachedInsight: llmDetectorAlert.insight,
+            }}
+            onEditSuccess={() => {}}
+            onClose={() => {}}
+            useAlertCheckPreview
+        />
+    ),
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/environments/:team_id/alerts/:alert_id/': (request) => [
+                    200,
+                    alertsById[request.params.alert_id as string],
+                ],
+                '/api/projects/:team_id/hog_functions/': EMPTY_PAGINATED_RESPONSE,
+            },
+        }),
+    ],
+}
+
+export const EditAlertWithForecastDetector: StoryObj<typeof EditAlertModal> = {
+    parameters: {
+        featureFlags: [FEATURE_FLAGS.ALERTS_INLINE_NOTIFICATIONS, FEATURE_FLAGS.ALERTS_FORECAST_DETECTOR],
+        testOptions: { viewport: { width: 1300, height: 900 }, snapshotBrowsers: [] },
+    },
+    render: () => (
+        <EditAlertModal
+            isOpen
+            alertId={forecastDetectorAlert.id}
+            insightId={forecastDetectorAlert.insight.id}
+            insightShortId={forecastDetectorAlert.insight.short_id}
+            insightLogicProps={{
+                dashboardItemId: forecastDetectorAlert.insight.short_id,
+                cachedInsight: forecastDetectorAlert.insight,
+            }}
+            onEditSuccess={() => {}}
+            onClose={() => {}}
+            useAlertCheckPreview
+        />
+    ),
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/environments/:team_id/alerts/:alert_id/': (request) => [
+                    200,
+                    alertsById[request.params.alert_id as string],
+                ],
+                '/api/projects/:team_id/hog_functions/': EMPTY_PAGINATED_RESPONSE,
+            },
+        }),
+    ],
+}
+
+export const MissingAlert: EditAlertVariant = {
+    args: { insightType: 'trends' },
+    render: ({ insightType }) => {
+        const alert = storyAlerts[insightType]
+        return (
+            <EditAlertModal
+                isOpen
+                alertId="missing-alert"
+                insightId={alert.insight.id}
+                insightShortId={alert.insight.short_id}
+                insightLogicProps={{
+                    dashboardItemId: alert.insight.short_id,
+                    cachedInsight: alert.insight,
+                }}
+                onEditSuccess={() => {}}
+                onClose={() => {}}
+            />
+        )
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/environments/:team_id/alerts/:alert_id/': [404, { detail: 'Not found.' }],
+                '/api/projects/:team_id/hog_functions/': EMPTY_PAGINATED_RESPONSE,
+            },
+        }),
+    ],
+}
+
+interface CreateWizardStoryProps {
+    insightType: StoryInsightType
+}
+
+const wizardCachedResults: Record<StoryInsightType, Record<string, unknown>> = {
+    trends: {
+        results: [
+            {
+                data: [4200000, 5100000, 4800000, 6700000, 7200000, 6100000, 8300000, 9400000],
+                labels: ['09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00'],
+            },
+        ],
+    },
+    funnel: {
+        results: [
+            { name: 'Checkout started', count: 1000 },
+            { name: 'Order completed', count: 350 },
+        ],
+    },
+    hogql: {
+        results: [
+            ['2026-07-15 12:00:00', 850],
+            ['2026-07-16 12:00:00', 1200],
+        ],
+        columns: ['recorded_at', 'queue_depth'],
+        types: [
+            ['recorded_at', 'DateTime'],
+            ['queue_depth', 'UInt64'],
+        ],
+    },
+}
+
+function CreateWizardStory({ insightType }: CreateWizardStoryProps): JSX.Element {
+    const selectedAlert = storyAlerts[insightType]
+    const query = selectedAlert.insight.query
+    if (!isInsightVizNode(query)) {
+        throw new Error('Create wizard story requires an insight visualization query')
+    }
+    const insightLogicProps = {
+        dashboardItemId: selectedAlert.insight.short_id,
+        cachedInsight: selectedAlert.insight,
+    }
+
+    return (
+        <BindLogic
+            logic={dataNodeLogic}
+            props={{
+                key: insightVizDataNodeKey(insightLogicProps),
+                query: query.source,
+                cachedResults: wizardCachedResults[insightType],
+                doNotLoad: true,
+            }}
+        >
+            <EditAlertModal
+                isOpen
+                insightId={selectedAlert.insight.id}
+                insightShortId={selectedAlert.insight.short_id}
+                insightName={selectedAlert.insight.name}
+                insightLogicProps={insightLogicProps}
+                onEditSuccess={() => {}}
+                onClose={() => {}}
+            />
+        </BindLogic>
+    )
+}
+
+type CreateWizardVariant = StoryObj<CreateWizardStoryProps>
+
+export const CreateWizard: CreateWizardVariant = {
+    args: { insightType: 'trends' },
+    argTypes: {
+        insightType: {
+            control: 'select',
+            options: ['trends', 'funnel', 'hogql'],
+        },
+    },
+    render: ({ insightType }) => <CreateWizardStory insightType={insightType} />,
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/projects/:team_id/hog_functions/': EMPTY_PAGINATED_RESPONSE,
+            },
+        }),
+    ],
+}

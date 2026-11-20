@@ -1,0 +1,456 @@
+import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+import type {
+    AlertApi,
+    AlertCreateDestinationApi,
+    AlertCreatePagerDutyDestinationApi,
+    AlertCreateUrlDestinationApi,
+    AlertCreatedDestinationResponseApi,
+    AlertCustomizeDestinationApi,
+    AlertDeleteDestinationApi,
+    AlertDestinationListItemApi,
+    AlertDestinationResponseApi,
+    AlertPagerDutyAvailabilityApi,
+    AlertResetDestinationApi,
+    AlertResetDestinationResponseApi,
+    AlertSimulateApi,
+    AlertSimulateResponseApi,
+    AlertTestDeliveryResponseApi,
+    AlertTransferOwnershipApi,
+    AlertsListParams,
+    AlertsPagerdutyAvailabilityRetrieveParams,
+    AlertsRetrieveParams,
+    InsightsThresholdsListParams,
+    PaginatedAlertListApi,
+    PaginatedThresholdWithAlertListApi,
+    PatchedAlertApi,
+    ThresholdWithAlertApi,
+} from './api.schemas'
+
+// https://stackoverflow.com/questions/49579094/typescript-conditional-types-filter-out-readonly-properties-pick-only-requir/49579497#49579497
+type IfEquals<X, Y, A = X, B = never> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? A : B
+
+type WritableKeys<T> = {
+    [P in keyof T]-?: IfEquals<{ [Q in P]: T[P] }, { -readonly [Q in P]: T[P] }, P>
+}[keyof T]
+
+type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (k: infer I) => void ? I : never
+type DistributeReadOnlyOverUnions<T> = T extends any ? NonReadonly<T> : never
+
+type Writable<T> = Pick<T, WritableKeys<T>>
+type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
+    ? {
+          [P in keyof Writable<T>]: T[P] extends object ? NonReadonly<NonNullable<T[P]>> : T[P]
+      }
+    : DistributeReadOnlyOverUnions<T>
+
+export const getAlertsListUrl = (projectId: string, params?: AlertsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/alerts/?${stringifiedParams}`
+        : `/api/projects/${projectId}/alerts/`
+}
+
+export const alertsList = async (
+    projectId: string,
+    params?: AlertsListParams,
+    options?: RequestInit
+): Promise<PaginatedAlertListApi> => {
+    return apiMutator<PaginatedAlertListApi>(getAlertsListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getAlertsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/alerts/`
+}
+
+export const alertsCreate = async (
+    projectId: string,
+    alertApi: NonReadonly<AlertApi>,
+    options?: RequestInit
+): Promise<AlertApi> => {
+    return apiMutator<AlertApi>(getAlertsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertApi),
+    })
+}
+
+export const getAlertsRetrieveUrl = (projectId: string, id: string, params?: AlertsRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/alerts/${id}/?${stringifiedParams}`
+        : `/api/projects/${projectId}/alerts/${id}/`
+}
+
+export const alertsRetrieve = async (
+    projectId: string,
+    id: string,
+    params?: AlertsRetrieveParams,
+    options?: RequestInit
+): Promise<AlertApi> => {
+    return apiMutator<AlertApi>(getAlertsRetrieveUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getAlertsUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/`
+}
+
+export const alertsUpdate = async (
+    projectId: string,
+    id: string,
+    alertApi: NonReadonly<AlertApi>,
+    options?: RequestInit
+): Promise<AlertApi> => {
+    return apiMutator<AlertApi>(getAlertsUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertApi),
+    })
+}
+
+export const getAlertsPartialUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/`
+}
+
+export const alertsPartialUpdate = async (
+    projectId: string,
+    id: string,
+    patchedAlertApi?: NonReadonly<PatchedAlertApi>,
+    options?: RequestInit
+): Promise<AlertApi> => {
+    return apiMutator<AlertApi>(getAlertsPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedAlertApi),
+    })
+}
+
+export const getAlertsDestroyUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/`
+}
+
+export const alertsDestroy = async (projectId: string, id: string, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getAlertsDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getAlertsDestinationsListUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/destinations/`
+}
+
+/**
+ * This alert's notification destinations, one entry per destination, with credential-bearing URL components removed. Subscribers are listed on the alert instead.
+ */
+export const alertsDestinationsList = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<AlertDestinationListItemApi[]> => {
+    return apiMutator<AlertDestinationListItemApi[]>(getAlertsDestinationsListUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getAlertsDestinationsCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/destinations/`
+}
+
+/**
+ * Send this alert to a Slack channel as well as by email. The workspace must already be connected to the project. The returned `id` identifies the destination.
+ */
+export const alertsDestinationsCreate = async (
+    projectId: string,
+    id: string,
+    alertCreateDestinationApi: AlertCreateDestinationApi,
+    options?: RequestInit
+): Promise<AlertCreatedDestinationResponseApi> => {
+    return apiMutator<AlertCreatedDestinationResponseApi>(getAlertsDestinationsCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertCreateDestinationApi),
+    })
+}
+
+export const getAlertsDestinationsCustomizeCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/destinations/customize/`
+}
+
+/**
+ * Make a destination's message editable. A destination that sends the standard message from the alerts platform gets HogFunctions with that message and stops sending from the platform. A destination that already has HogFunctions keeps them. Returns the HogFunction IDs to edit.
+ */
+export const alertsDestinationsCustomizeCreate = async (
+    projectId: string,
+    id: string,
+    alertCustomizeDestinationApi?: AlertCustomizeDestinationApi,
+    options?: RequestInit
+): Promise<AlertDestinationResponseApi> => {
+    return apiMutator<AlertDestinationResponseApi>(getAlertsDestinationsCustomizeCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertCustomizeDestinationApi),
+    })
+}
+
+export const getAlertsDestinationsDeleteCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/destinations/delete/`
+}
+
+/**
+ * Stop sending this alert to a destination. The alert keeps its email recipients.
+ */
+export const alertsDestinationsDeleteCreate = async (
+    projectId: string,
+    id: string,
+    alertDeleteDestinationApi?: AlertDeleteDestinationApi,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getAlertsDestinationsDeleteCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertDeleteDestinationApi),
+    })
+}
+
+export const getAlertsDestinationsPagerdutyCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/destinations/pagerduty/`
+}
+
+/**
+ * Open a PagerDuty incident when this alert starts firing, and resolve it when the alert stops. Only an alert whose pagerduty_available is true can take one. The returned `id` identifies the destination.
+ */
+export const alertsDestinationsPagerdutyCreate = async (
+    projectId: string,
+    id: string,
+    alertCreatePagerDutyDestinationApi: AlertCreatePagerDutyDestinationApi,
+    options?: RequestInit
+): Promise<AlertCreatedDestinationResponseApi> => {
+    return apiMutator<AlertCreatedDestinationResponseApi>(getAlertsDestinationsPagerdutyCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertCreatePagerDutyDestinationApi),
+    })
+}
+
+export const getAlertsDestinationsResetCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/destinations/reset/`
+}
+
+/**
+ * Send a customized destination's standard message again. Its HogFunctions are deleted, with their edits, and the alerts platform sends it from then on. Only an alert the alerts platform checks can be reset.
+ */
+export const alertsDestinationsResetCreate = async (
+    projectId: string,
+    id: string,
+    alertResetDestinationApi: AlertResetDestinationApi,
+    options?: RequestInit
+): Promise<AlertResetDestinationResponseApi> => {
+    return apiMutator<AlertResetDestinationResponseApi>(getAlertsDestinationsResetCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertResetDestinationApi),
+    })
+}
+
+export const getAlertsDestinationsWebhookCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/destinations/webhook/`
+}
+
+/**
+ * Send this alert's firings to a Discord or Microsoft Teams channel, or to any webhook. The returned `id` identifies the destination.
+ */
+export const alertsDestinationsWebhookCreate = async (
+    projectId: string,
+    id: string,
+    alertCreateUrlDestinationApi: AlertCreateUrlDestinationApi,
+    options?: RequestInit
+): Promise<AlertCreatedDestinationResponseApi> => {
+    return apiMutator<AlertCreatedDestinationResponseApi>(getAlertsDestinationsWebhookCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertCreateUrlDestinationApi),
+    })
+}
+
+export const getAlertsTakeOwnershipCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/take_ownership/`
+}
+
+/**
+ * Take ownership of this alert and enable it. Only organization admins can assign another member. The new owner needs access to its content. Checks run with the owner's access, so this is how an alert continues after its owner left.
+ */
+export const alertsTakeOwnershipCreate = async (
+    projectId: string,
+    id: string,
+    alertTransferOwnershipApi?: AlertTransferOwnershipApi,
+    options?: RequestInit
+): Promise<AlertApi> => {
+    return apiMutator<AlertApi>(getAlertsTakeOwnershipCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertTransferOwnershipApi),
+    })
+}
+
+export const getAlertsTestDeliveryCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/alerts/${id}/test-delivery/`
+}
+
+/**
+ * Send a synthetic test notification to subscribed users and every active destination on this alert.
+ */
+export const alertsTestDeliveryCreate = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<AlertTestDeliveryResponseApi> => {
+    return apiMutator<AlertTestDeliveryResponseApi>(getAlertsTestDeliveryCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getAlertsPagerdutyAvailabilityRetrieveUrl = (
+    projectId: string,
+    params: AlertsPagerdutyAvailabilityRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/alerts/pagerduty_availability/?${stringifiedParams}`
+        : `/api/projects/${projectId}/alerts/pagerduty_availability/`
+}
+
+/**
+ * Whether a new alert with these settings could open PagerDuty incidents once it is created.
+ */
+export const alertsPagerdutyAvailabilityRetrieve = async (
+    projectId: string,
+    params: AlertsPagerdutyAvailabilityRetrieveParams,
+    options?: RequestInit
+): Promise<AlertPagerDutyAvailabilityApi> => {
+    return apiMutator<AlertPagerDutyAvailabilityApi>(getAlertsPagerdutyAvailabilityRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getAlertsSimulateCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/alerts/simulate/`
+}
+
+/**
+ * Simulate a detector on an insight's historical data. No AlertCheck records are created. The AI and forecast detectors make real model calls, so those modes need the 'alert:write' scope. The forecast detector scores every point with a one-step forecast from the points before it.
+ */
+export const alertsSimulateCreate = async (
+    projectId: string,
+    alertSimulateApi: AlertSimulateApi,
+    options?: RequestInit
+): Promise<AlertSimulateResponseApi> => {
+    return apiMutator<AlertSimulateResponseApi>(getAlertsSimulateCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(alertSimulateApi),
+    })
+}
+
+export const getInsightsThresholdsListUrl = (
+    projectId: string,
+    insightId: number,
+    params?: InsightsThresholdsListParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/${insightId}/thresholds/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/${insightId}/thresholds/`
+}
+
+export const insightsThresholdsList = async (
+    projectId: string,
+    insightId: number,
+    params?: InsightsThresholdsListParams,
+    options?: RequestInit
+): Promise<PaginatedThresholdWithAlertListApi> => {
+    return apiMutator<PaginatedThresholdWithAlertListApi>(getInsightsThresholdsListUrl(projectId, insightId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsThresholdsRetrieveUrl = (projectId: string, insightId: number, id: string) => {
+    return `/api/projects/${projectId}/insights/${insightId}/thresholds/${id}/`
+}
+
+export const insightsThresholdsRetrieve = async (
+    projectId: string,
+    insightId: number,
+    id: string,
+    options?: RequestInit
+): Promise<ThresholdWithAlertApi> => {
+    return apiMutator<ThresholdWithAlertApi>(getInsightsThresholdsRetrieveUrl(projectId, insightId, id), {
+        ...options,
+        method: 'GET',
+    })
+}

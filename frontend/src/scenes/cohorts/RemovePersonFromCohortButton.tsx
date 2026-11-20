@@ -1,0 +1,66 @@
+import { useActions } from 'kea'
+
+import { IconTrash } from '@posthog/icons'
+
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+
+import { cohortEditLogic } from '~/scenes/cohorts/cohortEditLogic'
+
+export interface PersonDisplayNameType {
+    display_name: string
+    id: string
+}
+
+interface RemovePersonFromCohortButtonProps {
+    person: PersonDisplayNameType | null
+}
+
+export function RemovePersonFromCohortButton({ person }: RemovePersonFromCohortButtonProps): JSX.Element {
+    const { removePersonFromCohort } = useActions(cohortEditLogic)
+
+    const handleRemoveClick = (): void => {
+        if (!person) {
+            return
+        }
+        LemonDialog.open({
+            title: 'Remove person from cohort',
+            description: (
+                <>
+                    <p className="mt-4">
+                        Are you sure you want to remove{' '}
+                        <strong>{person.display_name === person.id ? 'Anonymous' : person.display_name}</strong> from
+                        this cohort?
+                    </p>
+                    <p>This action cannot be undone.</p>
+                </>
+            ),
+            primaryButton: {
+                type: 'primary',
+                status: 'danger',
+                children: 'Remove',
+                onClick: () => {
+                    if (!person.id) {
+                        return
+                    }
+                    removePersonFromCohort(person.id)
+                },
+            },
+            secondaryButton: {
+                children: 'Cancel',
+            },
+        })
+    }
+
+    return (
+        <LemonButton
+            onClick={handleRemoveClick}
+            disabledReason={person ? undefined : 'Add the Person or ID column to remove this person'}
+            icon={<IconTrash />}
+            status="danger"
+            size="small"
+            data-attr="remove-person-from-cohort"
+            tooltip="Remove from cohort"
+        />
+    )
+}

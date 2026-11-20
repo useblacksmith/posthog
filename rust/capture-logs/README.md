@@ -1,0 +1,253 @@
+# PostHog Log Capture Service
+
+A service that receives OpenTelemetry Protocol (OTLP) logs via HTTP and processes them based on team authentication.
+
+## Features
+
+- Receives OTLP logs via HTTP on `/v1/logs` and `/i/v1/logs` endpoints
+- Supports Protobuf and JSON formats
+- Supports JSONL (JSON Lines) format for multiple log batches
+- Authenticates clients using Bearer tokens or query parameters
+- Associates logs with specific team IDs
+- Health check endpoints
+- Prometheus metrics
+
+## Configuration
+
+The service is configured using environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| BIND_HOST | :: | Host to bind the HTTP server |
+| BIND_PORT | 4318 | Port for the HTTP server |
+| MANAGEMENT_BIND_HOST | :: | Host to bind the health check and metrics server |
+| MANAGEMENT_BIND_PORT | 8080 | Port for the health check and metrics server |
+| MAX_REQUEST_BODY_SIZE_BYTES | 2097152 | Rejects larger request bodies, before and after gzip decompression |
+| FIREHOSE_MAX_REQUEST_BODY_SIZE_BYTES | 8388608 | Body cap for the Amazon Data Firehose route only |
+| MAX_EXPANDED_REQUEST_BYTES | 268435456 | Rejects a logs, traces, metrics, Datadog or Firehose request with 413 when the rows it builds would pass this estimated size. Each row copies its resource, scope or common attributes, so the body cap does not bound this |
+| DROP_EVENTS_BY_TOKEN | (none) | Comma-separated tokens to drop |
+| UNKNOWN_TOKEN_MODE | off | `off`, `shadow` or `reject`. Tokens that the ingestion consumer found to belong to no team are counted in `capture_logs_unknown_token_total` (`shadow`) or answered 401 (`reject`). Off while `UNKNOWN_TOKEN_REDIS_URL` is unset |
+| UNKNOWN_TOKEN_REDIS_URL | (none) | Redis holding the `capture_logs:unknown_tokens` sorted set the consumer writes. Connected lazily, so it being down never blocks ingestion |
+| UNKNOWN_TOKEN_REFRESH_INTERVAL_SECS | 30 | How often the in-memory copy of that set is refreshed |
+| UNKNOWN_TOKEN_FAIL_OPEN_AFTER_SECS | 600 | A snapshot older than this is ignored, so a long Redis outage stops blocking tokens |
+| MAX_BACKFILL_DAYS | 0 | How far back a request may ask to keep its own timestamps. `0` refuses every `backfill_days` request |
+
+## Authentication
+
+Clients must authenticate by sending a valid token either:
+
+1. In the Authorization header:
+
+```http
+Authorization: Bearer your-project-api-key
+```
+
+2. As a query parameter:
+
+```http
+POST /v1/logs?token=your-project-token
+```
+
+The token is your PostHog project token.
+
+## Backdated logs
+
+A log record whose timestamp is more than 24 hours behind the ingest time is normally replaced
+with the ingest time, and the original is kept on the `posthog.original_timestamp` attribute. That guard
+protects every query range on the team from one client with a broken clock.
+
+A historical import needs the original timestamps. Widen the past bound for one request with the
+`backfill_days` query parameter, on `POST /v1/logs` and `POST /i/v1/logs` only. The Datadog and
+Prometheus routes do not accept it, because the Datadog agent cannot send a query string at all.
+Traces and metrics do not accept it either.
+
+```http
+POST /i/v1/logs?backfill_days=540
+```
+
+The value must be between 1 and `MAX_BACKFILL_DAYS`. A request outside that range is answered 400,
+rather than being narrowed to the default, because an import whose timestamps are quietly replaced
+looks successful and writes most of its records onto the ingest time.
+
+`MAX_BACKFILL_DAYS` is per-deployment. Which teams may use it is decided by the logs consumer's
+`LOGS_BACKFILL_ENABLED_TEAMS` list, which is empty in production by default. This service has no team
+ID, so it marks each message from a `backfill_days` request with a `backfill_days` header, and the
+logs consumer drops the whole message when the team is not on the list. That drop also happens
+after a 200, and is counted per team in the `records_dropped_backfill_not_enabled` usage metric.
+Row age cannot replace the header, because a backfill request can carry recent records.
+
+The future bound stays at 24 hours whatever `backfill_days` says. A timestamp ahead of the
+ingest time is a client clock error in every case, and accepting one would let a single client
+write rows past the end of every other query range on the team.
+
+A backfill keeps only the records that are still inside the team's retention. A record whose
+timestamp plus its retention is already in the past is dropped by the logs consumer before it is
+written, even though this service answered the request with a 200. Dropped records are counted
+per team in the `records_dropped_retention_expired` usage metric. A record that is kept expires
+`retention_days` after it is imported, not after its own timestamp.
+
+Each message carries a `min_timestamp` header, the earliest record timestamp in it, so the
+consumer only decodes and checks the messages that can hold an expired record.
+
+## Response codes
+
+| Status | Meaning | Client behavior |
+|--------|---------|-----------------|
+| 200 | Accepted | — |
+| 400 | Body could not be decoded as OTLP protobuf or JSON, or `backfill_days` was rejected | Permanent |
+| 401 | No token, or a token that cannot be a project API key (for example a `phx_` personal API key) | Permanent, so the client stops and surfaces the misconfiguration |
+| 413 | Body over `MAX_REQUEST_BODY_SIZE_BYTES` | Permanent |
+
+The 401 covers shape only: empty, over 64 characters, non-ASCII, containing a null byte, or
+prefixed `phx_`. None of those can be a project API key, so answering 200 and dropping the
+records downstream only hides the misconfiguration from whoever is sending the data. This is
+the same check, and the same status, that event capture applies to the same input.
+
+One misconfiguration is still answered 200: a well-formed token that belongs to no project.
+Resolving a token to a team needs Postgres, which this service does not have, so those records
+are still dropped by the ingestion consumer. Event capture does not validate this at the edge
+either.
+
+A project over its billing quota is also still answered 200 and dropped by the consumer.
+
+Rejections are counted on `capture_logs_requests_rejected_total{reason, signal}`, where `reason`
+is one of `missing_token`, `dropped_token` or `invalid_token`.
+
+## Running the Service
+
+### From Source
+
+```bash
+cargo run --bin capture_logs
+```
+
+### With Docker
+
+```bash
+docker build -t posthog/capture-logs .
+docker run -p 8000:8000 posthog/capture-logs
+```
+
+## Sending Logs
+
+You can configure any OpenTelemetry-compatible client to send logs to this service. The service accepts:
+
+### Single JSON Format
+
+Standard OTLP ExportLogsServiceRequest as JSON:
+
+```bash
+curl -X POST http://localhost:8000/v1/logs \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"logRecords":[{"body":{"stringValue":"Hello World"}}]}]}]}'
+```
+
+### JSONL Format (JSON Lines)
+
+Multiple ExportLogsServiceRequest objects, one per line:
+
+```bash
+curl -X POST http://localhost:8000/v1/logs \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d $'{"resourceLogs":[{"resource":{},"scopeLogs":[{"logRecords":[{"body":{"stringValue":"Log 1"}}]}]}]}\n{"resourceLogs":[{"resource":{},"scopeLogs":[{"logRecords":[{"body":{"stringValue":"Log 2"}}]}]}]}'
+```
+
+### Protobuf Format
+
+Standard OTLP protobuf encoding is also supported.
+
+Requirements:
+
+1. Set the HTTP endpoint to `http://your-service-host:8000/v1/logs`
+2. Include your PostHog project token in the Authorization header or as a query parameter
+3. Use standard OTLP log format (JSON, JSONL, or Protobuf)
+
+## Amazon Data Firehose (CloudWatch Logs)
+
+`POST /i/v1/logs/aws/firehose` implements the [Firehose HTTP endpoint destination contract](https://docs.aws.amazon.com/firehose/latest/dev/httpdeliveryrequestresponse.html).
+A customer creates a Firehose stream with this URL as its HTTP endpoint and the project API key as the stream's access key, then subscribes CloudWatch log groups to the stream.
+
+- Auth: the project API key in `X-Amz-Firehose-Access-Key`, or a Bearer `Authorization` header for manual testing.
+  A pasted `Bearer` prefix in the access key field is tolerated.
+  The same shape check as every other route applies.
+- Each Firehose record is one CloudWatch subscription batch (base64, usually gzip).
+  Every `logEvents` entry becomes a log row.
+  `CONTROL_MESSAGE` records are acknowledged and skipped.
+  A record that is not a CloudWatch envelope (VPC flow logs, WAF) is split on newlines.
+  A record that cannot be decoded at all is skipped and counted, so one bad record does not make Firehose retry the good ones.
+- Row mapping: `body` = message; `timestamp` = the event timestamp; `service.name` is inferred from the log group (`/aws/lambda/<fn>` → `<fn>`, `/aws/rds/instance/<id>/...` → `<id>`, else the group name) unless a Firehose common attribute `service.name` is set.
+  Resource attributes are `cloud.provider=aws`, `cloud.account.id`, `cloud.region` (from `X-Amz-Firehose-Source-Arn`), `aws.log.group.name`, `aws.log.stream.name`, plus any common attributes; the AWS facts win over a common attribute of the same name.
+  Severity comes from a JSON `level`/`severity` key or a leading `ERROR`/`WARN`/`INFO`/`DEBUG` token, else `info`.
+- Rows are chunked into Kafka messages sized at half the producer's `message.max.bytes`, because a decoded Firehose request can be far larger than one message.
+  Batches are produced concurrently.
+  Delivery is at-least-once: a Kafka failure returns 500, Firehose redelivers the whole request with the same request id, and the batches already produced are duplicated.
+- Size limits: the request body is capped by `FIREHOSE_MAX_REQUEST_BODY_SIZE_BYTES` (default 8 MiB, above the 2 MiB used by the other routes because Firehose buffers whole MiB and base64 adds a third), and the decoded records of one request are capped at eight times that.
+  Either limit answers 413, which Firehose treats as permanent, so the failed batch lands in the customer's S3 backup bucket.
+- Every response carries the contract body: `{"requestId", "timestamp"}` on 200, plus `"errorMessage"` on 400 (unparseable body, no decodable record), 401 (missing or invalid access key), 413 and 500 (Kafka).
+  Rejections raised by the body-size and decompression layers are re-shaped into the same body.
+- Recommended stream settings: buffer 1 MB / 60 s, GZIP content encoding, retry 300 s, S3 backup for failed data only.
+
+Metrics: `capture_logs_firehose_records_total{kind}` (`data`, `control`, `raw`, `invalid`) and `capture_logs_firehose_events_total`.
+Request outcomes are on the shared `http_requests_total{path,status}` and rejected tokens on `capture_logs_requests_rejected_total`.
+
+## Vercel log drains
+
+`POST /i/v1/logs/vercel[/<token>]` accepts a [Vercel log drain](https://vercel.com/docs/drains/reference/logs) with a custom endpoint.
+A customer creates a log drain with this URL and the project API key, in either drain format.
+
+- Auth: the project API key in an `Authorization: Bearer <token>` custom header on the drain.
+  The path and `?token=` forms also work, but they put the key in proxy access logs, so prefer the header.
+  The same shape check as every other route applies.
+  The drain's `x-vercel-signature` is not verified, so, as on the other routes, anyone with the project key can write rows.
+- Body: a JSON array, one object, or NDJSON, gzip or plain. The drain sends at most 1 MB per request, inside the shared `MAX_REQUEST_BODY_SIZE_BYTES` cap.
+  Every valid line becomes a log row.
+  A line that is not a JSON object, or an object with no `id`, `message` or `proxy`, is skipped and counted, so one bad line does not make the drain retry the batch.
+  A delivery with more than 10,000 lines gets 413.
+  A delivery with lines but no valid line gets 400, so the drain does not treat a malformed batch as stored.
+  A field with an unexpected type is left out of the row instead of failing the line.
+  An empty body is acknowledged with 200, which covers the test request the drain sends when it is created.
+- Row mapping: `body` = `message`, or `<method> <path> <status>` for a request line that has no message; `timestamp` = the line's `timestamp` in milliseconds; `service.name` = the project name, else the project ID.
+  Severity comes from `level` (`fatal`, `error`, `warning`, else `info`).
+  Request fields use OpenTelemetry semantic conventions (`http.request.method`, `server.address`, `url.path`, `url.query`, `http.response.status_code` (only real HTTP statuses; Vercel's `-1` sentinels stay in `vercel.proxy.status_code` and `vercel.status_code`), `client.address`, `user_agent.original`, `tls.client.ja3`); other drain fields keep a `vercel.*` name (`vercel.source`, `vercel.cache`, `vercel.path_type`, `vercel.waf.action`, and so on).
+  Resource attributes are `service.name`, `vercel.project.id`, `vercel.project.name`, `vercel.deployment.id`, `deployment.environment.name` and `vcs.ref.head.name`.
+  `traceId`/`spanId` (hex) become the row's trace and span IDs.
+- Delivery is at-least-once: a Kafka failure returns 500 and the drain sends the request again.
+  The logs table keeps every copy of a redelivered line. A line's row `uuid` derives from the project key and the drain's log `id`, so queries can find the copies by `uuid`.
+
+Metrics: `capture_logs_vercel_records_total{kind}` (`valid` after the Kafka write; `invalid` per attempt, so a retried bad batch counts again; `no_timestamp` for lines stored at ingest time) and `capture_logs_vercel_requests_rejected_total{reason}` (`too_many_lines`).
+Request outcomes are on the shared `http_requests_total{path,status}`.
+
+## Endpoints
+
+### Log Ingestion
+
+- `POST /v1/logs` - Accept OTLP logs (JSON, JSONL, or Protobuf)
+- `POST /i/v1/logs` - Alternative endpoint for OTLP logs
+- `POST /i/v1/logs/datadog[/<token>]` - Datadog agent intake
+- `POST /i/v1/logs/aws/firehose` - Amazon Data Firehose HTTP endpoint destination
+- `POST /i/v1/logs/vercel[/<token>]` - Vercel log drain (JSON or NDJSON)
+- `OPTIONS /v1/logs` - CORS preflight support
+- `OPTIONS /i/v1/logs` - CORS preflight support
+
+### Management
+
+- `/` - Basic information page
+- `/_readiness` - Readiness probe for Kubernetes
+- `/_liveness` - Liveness probe for Kubernetes
+- `/metrics` - Prometheus metrics
+
+## Development
+
+### Running Tests
+
+```bash
+cargo test
+```
+
+### Building in Release Mode
+
+```bash
+cargo build --release
+```

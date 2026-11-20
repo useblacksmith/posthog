@@ -1,0 +1,367 @@
+import {
+    insertNotebookAIFollowUpPromptAfterResponse,
+    preserveNotebookAIQuestion,
+    rebaseNotebookAIResponseRange,
+    replaceNotebookAIResponseMarkdown,
+    streamNotebookAIResponseMarkdown,
+} from './notebookAI'
+
+function replaceMarkdown(
+    markdown: string,
+    responseNodeIndex: number,
+    replacementMarkdown: string,
+    replacedNodeCount: number = 1
+): string {
+    return replaceNotebookAIResponseMarkdown(markdown, responseNodeIndex, replacementMarkdown, replacedNodeCount, [
+        'Query',
+        'SQLV2',
+        'PythonV2',
+        'Widget',
+    ]).markdown
+}
+
+describe('notebookAI', () => {
+    it.each([true, false])('preserves the prompt in a full artifact only when requested: %s', (keepQuestion) => {
+        const content = '# Chart notes\n\n---\n\n<SQLV2 code="SELECT 1" />\n\n<Widget prompt="Plot the results" />'
+        const question = '**You:** Add a chart section'
+        const result = preserveNotebookAIQuestion(content, keepQuestion ? question : undefined)
+        expect(result).toBe(keepQuestion ? content.replace('# Chart notes', `# Chart notes\n\n${question}`) : content)
+        expect(preserveNotebookAIQuestion(result, keepQuestion ? question : undefined)).toBe(result)
+        expect(result).not.toContain('Thinking...')
+    })
+    it.each([
+        ['SQLV2', ['Widget'], false],
+        ['PythonV2', ['Widget'], false],
+        ['Widget', ['SQLV2', 'PythonV2'], false],
+        ['SQLV2', ['SQLV2', 'PythonV2'], true],
+        ['PythonV2', ['SQLV2', 'PythonV2'], true],
+        ['Widget', ['Widget'], true],
+        ['Comment', ['Comment'], true],
+        ['Comment', ['Widget'], false],
+    ])('only unwraps enabled %s cells with %j enabled', (tag, enabledTags, enabled) => {
+        const component = `<${tag} title="Example" />`
+        const fenced = `\`\`\`mdx\n${component}\n\`\`\``
+        for (const insert of [replaceNotebookAIResponseMarkdown, streamNotebookAIResponseMarkdown]) {
+            expect(insert('Thinking...', 0, fenced, 1, enabledTags as string[]).markdown).toBe(
+                enabled ? (tag === 'Comment' ? '<!--  -->' : component) : fenced
+            )
+        }
+    })
+
+    it.each(['', 'mdx', 'jsx'])('inserts a fenced %s component as a live notebook cell', (language) => {
+        const tag = '<PythonV2 title="Revenue table" code="sales.head()" returnVariable="summary_df" />'
+        expect(replaceMarkdown('Thinking...', 0, `\`\`\`${language}\n${tag}\n\`\`\``)).toBe(tag)
+    })
+
+    it.each([
+        '```python\nprint(42)\n```',
+        '```html\n<PythonV2 code="print(42)" />\n```',
+        '```\n<CustomExample />\n```',
+        '```\n<PythonV2 code="unterminated />\n```',
+    ])('preserves source examples and incomplete tags: %s', (example) => {
+        expect(replaceMarkdown('Thinking...', 0, example)).toBe(example)
+    })
+    it('replaces the AI response row with assistant markdown', () => {
+        const markdown = '# Notebook\n\nThinking...'
+
+        expect(replaceMarkdown(markdown, 1, 'Here is the answer.\n\n- First\n- Second')).toEqual(
+            '# Notebook\n\nHere is the answer.\n\n- First\n- Second'
+        )
+    })
+
+    it('strips echoed notebook context before replacing the AI response row', () => {
+        const markdown = "# This is a new notebook\n\nLet's write some text\n\nThinking..."
+
+        expect(
+            replaceMarkdown(
+                markdown,
+                2,
+                "# This is a new notebook\n\nLet's write some text\n\nThinking...\n\nJoke setup.\n\nPunchline."
+            )
+        ).toEqual("# This is a new notebook\n\nLet's write some text\n\nJoke setup.\n\nPunchline.")
+    })
+
+    it('strips echoed notebook context when the AI leaves the response placeholder at the end', () => {
+        const markdown = '# New notebook\n\nThis is a random notebook\n\nThinking...'
+
+        expect(
+            replaceMarkdown(
+                markdown,
+                2,
+                '# New notebook\n\nThis is a random notebook\n\nJames Hawkins co-founded PostHog.\n\nThinking...'
+            )
+        ).toEqual('# New notebook\n\nThis is a random notebook\n\nJames Hawkins co-founded PostHog.')
+    })
+
+    it('strips stale echoed context when the user edits before the AI response while streaming', () => {
+        const markdown =
+            "# Hello world\n\nlet's talk..... if i type here while it's thinking, things get duplicated...\n\nThinking..."
+
+        expect(
+            replaceMarkdown(markdown, 2, "# Hello world\n\nlet's talk.....\n\nJames Hawkins co-founded PostHog.")
+        ).toEqual(
+            "# Hello world\n\nlet's talk..... if i type here while it's thinking, things get duplicated...\n\nJames Hawkins co-founded PostHog."
+        )
+    })
+
+    it('keeps assistant markdown that does not echo the AI response placeholder', () => {
+        const markdown = '# Notebook\n\nThinking...'
+
+        expect(replaceMarkdown(markdown, 1, '# Notebook\n\nA generated answer.')).toEqual(
+            '# Notebook\n\n# Notebook\n\nA generated answer.'
+        )
+    })
+
+    it('ignores an assistant response that only echoes the notebook context', () => {
+        const markdown = '# Notebook\n\nThinking...'
+
+        expect(replaceMarkdown(markdown, 1, '# Notebook\n\nThinking...')).toEqual(markdown)
+    })
+
+    it('replaces a previously streamed multi-block AI response', () => {
+        const markdown = '# Notebook\n\nFirst paragraph\n\nSecond paragraph'
+
+        expect(replaceMarkdown(markdown, 2, 'First paragraph\n\nSecond paragraph\n\nThird paragraph', 2)).toEqual(
+            '# Notebook\n\nFirst paragraph\n\nSecond paragraph\n\nThird paragraph'
+        )
+    })
+
+    it('returns the updated response row index for streamed replacements', () => {
+        const firstResult = replaceNotebookAIResponseMarkdown(
+            '# Notebook\n\nThinking...',
+            1,
+            'First paragraph\n\nSecond paragraph'
+        )
+
+        expect(firstResult).toEqual({
+            markdown: '# Notebook\n\nFirst paragraph\n\nSecond paragraph',
+            responseNodeIndex: 2,
+        })
+
+        const secondResult = replaceNotebookAIResponseMarkdown(
+            firstResult.markdown,
+            firstResult.responseNodeIndex,
+            'First paragraph\n\nSecond paragraph\n\nThird paragraph',
+            2
+        )
+
+        expect(secondResult).toEqual({
+            markdown: '# Notebook\n\nFirst paragraph\n\nSecond paragraph\n\nThird paragraph',
+            responseNodeIndex: 3,
+        })
+    })
+
+    it('preserves edited previous AI blocks while streaming the active tail block', () => {
+        const result = streamNotebookAIResponseMarkdown(
+            '# Notebook\n\nHuman edited first paragraph\n\nSecond paragraph still writing',
+            2,
+            'First paragraph\n\nSecond paragraph finished\n\nThird paragraph still writing',
+            2
+        )
+
+        expect(result).toEqual({
+            markdown:
+                '# Notebook\n\nHuman edited first paragraph\n\nSecond paragraph finished\n\nThird paragraph still writing',
+            responseNodeIndex: 3,
+            responseNodeCount: 3,
+        })
+    })
+
+    it('continues streaming when an earlier generated AI block was deleted', () => {
+        const result = streamNotebookAIResponseMarkdown(
+            '# Notebook\n\nSecond paragraph\n\nThird paragraph still writing',
+            3,
+            'First paragraph\n\nSecond paragraph\n\nThird paragraph finished\n\nFourth paragraph still writing',
+            3
+        )
+
+        expect(result).toEqual({
+            markdown: '# Notebook\n\nSecond paragraph\n\nThird paragraph finished\n\nFourth paragraph still writing',
+            responseNodeIndex: 3,
+            responseNodeCount: 3,
+        })
+    })
+
+    it('continues streaming when a middle generated AI block was deleted', () => {
+        const result = streamNotebookAIResponseMarkdown(
+            '# Notebook\n\nFirst paragraph\n\nThird paragraph still writing',
+            3,
+            'First paragraph\n\nSecond paragraph\n\nThird paragraph finished\n\nFourth paragraph still writing',
+            3
+        )
+
+        expect(result).toEqual({
+            markdown: '# Notebook\n\nFirst paragraph\n\nThird paragraph finished\n\nFourth paragraph still writing',
+            responseNodeIndex: 3,
+            responseNodeCount: 3,
+        })
+    })
+
+    it.each([
+        {
+            change: 'deleting an earlier generated block',
+            previousMarkdown: '# Notebook\n\nFirst paragraph\n\nSecond paragraph\n\nThird paragraph still writing',
+            nextMarkdown: '# Notebook\n\nSecond paragraph\n\nThird paragraph still writing',
+            responseNodeIndex: 3,
+            responseNodeCount: 3,
+            expectedRange: { responseNodeIndex: 2, responseNodeCount: 2 },
+        },
+        {
+            change: 'editing the retained question before the response',
+            previousMarkdown: '# Notebook\n\n**Avery:** What is PostHog?\n\nAnswer still writing',
+            nextMarkdown: '# Notebook\n\n**Avery:** What does PostHog do?\n\nAnswer still writing',
+            responseNodeIndex: 2,
+            responseNodeCount: 1,
+            expectedRange: { responseNodeIndex: 2, responseNodeCount: 1 },
+        },
+        {
+            change: 'inserting a response-equivalent block before the active response',
+            previousMarkdown: '# Notebook\n\n**Avery:** What is PostHog?\n\nAnswer still writing\n\nAfter the answer',
+            nextMarkdown:
+                '# Notebook\n\n**Avery:** What does PostHog do?\n\nAnswer still writing\n\nAnswer still writing\n\nAfter the answer',
+            responseNodeIndex: 2,
+            responseNodeCount: 1,
+            expectedRange: { responseNodeIndex: 3, responseNodeCount: 1 },
+        },
+    ])('rebases the streamed AI response range after $change', (testCase) => {
+        expect(
+            rebaseNotebookAIResponseRange(
+                testCase.previousMarkdown,
+                testCase.nextMarkdown,
+                testCase.responseNodeIndex,
+                testCase.responseNodeCount
+            )
+        ).toEqual(testCase.expectedRange)
+    })
+
+    it('replaces the active streamed block when the AI has only written one block so far', () => {
+        const result = streamNotebookAIResponseMarkdown(
+            '# Notebook\n\nFirst paragraph still writing',
+            1,
+            'First paragraph finished\n\nSecond paragraph still writing',
+            1
+        )
+
+        expect(result).toEqual({
+            markdown: '# Notebook\n\nFirst paragraph finished\n\nSecond paragraph still writing',
+            responseNodeIndex: 2,
+            responseNodeCount: 2,
+        })
+    })
+
+    it.each([
+        ['saved insight', '<insight>uONk</insight>', '<Query query={{"kind":"SavedInsightNode","shortId":"uONk"}} />'],
+        ['bare widget', '<Widget prompt="Draw a compass" />', '<Widget prompt="Draw a compass" />'],
+        ['fenced widget', '```\n<Widget prompt="Draw a compass" />\n```', '<Widget prompt="Draw a compass" />'],
+        [
+            'markdown widget',
+            '```markdown\n<Widget prompt="Draw a compass" />\n```',
+            '<Widget prompt="Draw a compass" />',
+        ],
+        ['md widget', '```md\n<Widget prompt="Draw a compass" />\n```', '<Widget prompt="Draw a compass" />'],
+        [
+            'literal widget example',
+            '```text\n<Widget prompt="Draw a compass" />\n```',
+            '```text\n<Widget prompt="Draw a compass" />\n```',
+        ],
+        ['ordinary code', '```\nprint("hello")\n```', '```\nprint("hello")\n```'],
+        [
+            'mixed code',
+            '```\n<Widget prompt="Draw a compass" />\nextra text\n```',
+            '```\n<Widget prompt="Draw a compass" />\nextra text\n```',
+        ],
+        ['incomplete widget', '```\n<Widget prompt="Draw a compass\n```', '```\n<Widget prompt="Draw a compass\n```'],
+    ])('normalizes %s from AI output before insertion', (_name, input, expected) => {
+        const markdown = '# Notebook\n\nThinking...'
+
+        expect(replaceMarkdown(markdown, 1, `## Result\n\n${input}\n\nNext steps.`)).toEqual(
+            `# Notebook\n\n## Result\n\n${expected}\n\nNext steps.`
+        )
+    })
+
+    it('keeps one widget while its fenced AI response streams into follow-up text', () => {
+        const widget = '<Widget title="Compass" prompt="Draw a compass" />'
+        let result = { markdown: '# Notebook\n\nThinking...', responseNodeIndex: 1, responseNodeCount: 1 }
+
+        for (const response of [
+            '```\n<Widget title="Compass" prompt="Draw a compass',
+            `\`\`\`\n${widget}`,
+            `\`\`\`\n${widget}\n\`\`\``,
+            `\`\`\`\n${widget}\n\`\`\`\n\nGenerate it in the widget settings.`,
+        ]) {
+            result = streamNotebookAIResponseMarkdown(
+                result.markdown,
+                result.responseNodeIndex,
+                response,
+                result.responseNodeCount,
+                ['Widget']
+            )
+        }
+
+        expect(result).toEqual({
+            markdown: `# Notebook\n\n${widget}\n\nGenerate it in the widget settings.`,
+            responseNodeIndex: 2,
+            responseNodeCount: 2,
+        })
+    })
+
+    it('defaults AI-inserted query components to results only', () => {
+        const markdown = '# Notebook\n\nThinking...'
+
+        expect(
+            replaceMarkdown(
+                markdown,
+                1,
+                '<Query query={{"kind":"InsightVizNode","source":{"kind":"TrendsQuery","series":[]}}} />'
+            )
+        ).toEqual(
+            '# Notebook\n\n<Query query={{"kind":"InsightVizNode","source":{"kind":"TrendsQuery","series":[]}}} />'
+        )
+    })
+
+    it('defaults AI-inserted query components with edit props to results only', () => {
+        const markdown = '# Notebook\n\nThinking...'
+
+        expect(
+            replaceMarkdown(
+                markdown,
+                1,
+                '<Query edit={false} query={{"kind":"InsightVizNode","source":{"kind":"TrendsQuery","series":[]}}} />'
+            )
+        ).toEqual(
+            '# Notebook\n\n<Query query={{"kind":"InsightVizNode","source":{"kind":"TrendsQuery","series":[]}}} />'
+        )
+    })
+
+    it('inserts a follow-up prompt after the AI response row', () => {
+        const markdown = '# Notebook\n\nAnswer text'
+
+        expect(insertNotebookAIFollowUpPromptAfterResponse(markdown, 1, '<Prompt question="" />')).toEqual(
+            '# Notebook\n\nAnswer text\n\n<Prompt question="" />'
+        )
+    })
+
+    it('does not treat a prompt inside a code block as an existing follow-up prompt', () => {
+        const markdown = '# Notebook\n\n```md\n<Prompt question="" />\n```\n\nAnswer text'
+
+        expect(insertNotebookAIFollowUpPromptAfterResponse(markdown, 2, '<Prompt question="" />')).toEqual(
+            '# Notebook\n\n```md\n<Prompt question="" />\n```\n\nAnswer text\n\n<Prompt question="" />'
+        )
+    })
+
+    it('inserts another empty follow-up prompt when one is already open', () => {
+        const markdown = '# Notebook\n\n<Prompt question="" />\n\nAnswer text'
+
+        expect(insertNotebookAIFollowUpPromptAfterResponse(markdown, 2, '<Prompt question="" />')).toEqual(
+            '# Notebook\n\n<Prompt question="" />\n\nAnswer text\n\n<Prompt question="" />'
+        )
+    })
+
+    it('keeps the AI response anchored on the final list item before a follow-up prompt', () => {
+        const markdown = '# Notebook\n\n- First\n- Second'
+
+        expect(insertNotebookAIFollowUpPromptAfterResponse(markdown, 1, '<Prompt question="" />')).toEqual(
+            '# Notebook\n\n- First\n- Second\n\n<Prompt question="" />'
+        )
+    })
+})

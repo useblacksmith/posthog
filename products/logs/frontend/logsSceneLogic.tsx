@@ -1,0 +1,844 @@
+import { deepEqual as equal } from 'fast-equals'
+import { MakeLogicType, actions, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { router, urlToAction } from 'kea-router'
+
+import { lemonToast } from '@posthog/lemon-ui'
+import { syncSearchParams, updateSearchParams } from '@posthog/products-error-tracking/frontend/utils'
+
+import { DEFAULT_UNIVERSAL_GROUP_FILTER } from 'lib/components/UniversalFilters/constants'
+import { trackedActionToUrl } from 'lib/logic/scenes/trackedActionToUrl'
+import { parseTagsFilter } from 'lib/utils/url'
+import { sqlEditorLogic } from 'scenes/data-warehouse/editor/sqlEditorLogic'
+import { SQLEditorMode } from 'scenes/data-warehouse/editor/sqlEditorModes'
+import { Params, Scene } from 'scenes/sceneTypes'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { TodayMonitorRecent } from '~/layout/today/todayMonitor'
+import { TODAY_RECENT_KEY } from '~/layout/today/todayRecents'
+import { Breadcrumb } from '~/types'
+
+import { DEFAULT_LOGS_COLUMNS, LogsColumnConfig } from 'products/logs/frontend/components/LogsViewer/config/columns'
+import {
+    DEFAULT_ORDER_BY,
+    DEFAULT_VIEW_MODE,
+    logsViewerConfigLogic,
+    LogsViewerGroupBy,
+    LogsViewerViewMode,
+    MAX_GROUP_BY_DIMENSIONS,
+    PatternsBaselineMode,
+} from 'products/logs/frontend/components/LogsViewer/config/logsViewerConfigLogic'
+import { LogsViewerFilters } from 'products/logs/frontend/components/LogsViewer/config/types'
+import {
+    DEFAULT_INITIAL_LOGS_LIMIT,
+    logsViewerDataLogic,
+} from 'products/logs/frontend/components/LogsViewer/data/logsViewerDataLogic'
+import {
+    FacetFilterTarget,
+    SERVICE_NAME_FILTER,
+    SEVERITY_LEVEL_FILTER,
+    facetSelection,
+} from 'products/logs/frontend/components/LogsViewer/FacetRail/facetFilters'
+import { facetRailLogic } from 'products/logs/frontend/components/LogsViewer/FacetRail/facetRailLogic'
+import { logsFilterHistoryLogic } from 'products/logs/frontend/components/LogsViewer/Filters/logsFilterHistoryLogic'
+import {
+    DEFAULT_DATE_RANGE,
+    isValidSeverityLevel,
+    logsViewerFiltersLogic,
+} from 'products/logs/frontend/components/LogsViewer/Filters/logsViewerFiltersLogic'
+import { GROUPABLE_COLUMN_KEYS } from 'products/logs/frontend/components/LogsViewer/groupBySource'
+import { logDetailsModalLogic } from 'products/logs/frontend/components/LogsViewer/LogDetailsModal/logDetailsModalLogic'
+import { logsViewerLogic } from 'products/logs/frontend/components/LogsViewer/logsViewerLogic'
+import { logsViewsRetrieve } from 'products/logs/frontend/generated/api'
+import { LogsGroupBySourceEnumApi, LogsViewApi } from 'products/logs/frontend/generated/api.schemas'
+import { DEFAULT_ANOMALIES_DATE_RANGE, logsAnomaliesLogic } from 'products/logs/frontend/logsAnomaliesLogic'
+
+import type { DateRange, LogMessage } from '../../../frontend/src/queries/schema/schema-general'
+import type { LogsOrderBy } from './types'
+
+export const getLogsSqlEditorTabId = (id: string): string => `logs-sql-editor-${id}`
+
+// Scope the viewer id (and so its persisted state: pinned logs, filters, config) per project.
+// A static id would persist across projects in the same browser, leaking one project's pinned log payloads into another.
+export const LOGS_SCENE_VIEWER_ID = `logs-scene-${window.POSTHOG_APP_CONTEXT?.current_team?.id ?? 'unknown'}`
+
+const VALID_VIEW_MODES: LogsViewerViewMode[] = ['logs', 'patterns', 'group']
+
+const VALID_BASELINE_MODES: PatternsBaselineMode[] = ['preceding', 'lastWeek']
+
+const VALID_GROUP_BY_SOURCES = Object.values(LogsGroupBySourceEnumApi)
+
+// A groupBys URL param is a JSON array of { key, source }. Returns null on any malformed shape so
+// a bad link leaves the live grouping alone rather than clearing it. Caps at the API's dimension
+// limit — the same guard the picker enforces — so a hand-edited URL can't build a combination the
+// endpoint would reject.
+const parseGroupBysParam = (raw: unknown): LogsViewerGroupBy[] | null => {
+    let value: unknown = raw
+    if (typeof value === 'string') {
+        try {
+            value = JSON.parse(value)
+        } catch {
+            return null
+        }
+    }
+    if (!Array.isArray(value)) {
+        return null
+    }
+    const parsed: LogsViewerGroupBy[] = []
+    for (const entry of value) {
+        if (typeof entry !== 'object' || entry === null) {
+            return null
+        }
+        const { key, source } = entry as LogsViewerGroupBy
+        if (typeof key !== 'string' || key === '' || !VALID_GROUP_BY_SOURCES.includes(source)) {
+            return null
+        }
+        // A "column" dimension only groups by a top-level log field, so a link naming anything
+        // else there is a combination the endpoint rejects.
+        if (source === 'column' && !GROUPABLE_COLUMN_KEYS.has(key)) {
+            return null
+        }
+        // Duplicates are dropped rather than rejected, matching what addGroupBy does with a
+        // dimension already in the list.
+        if (parsed.some((d) => d.key === key && d.source === source)) {
+            continue
+        }
+        parsed.push({ key, source })
+    }
+    return parsed.slice(0, MAX_GROUP_BY_DIMENSIONS)
+}
+
+export type LogsSceneActiveTab =
+    | 'viewer'
+    | 'services'
+    | 'alerts'
+    | 'anomalies'
+    | 'sql'
+    | 'transformations'
+    | 'configuration'
+const VALID_ACTIVE_TABS: LogsSceneActiveTab[] = [
+    'viewer',
+    'services',
+    'alerts',
+    'anomalies',
+    'sql',
+    'transformations',
+    'configuration',
+]
+export const DEFAULT_ACTIVE_TAB: LogsSceneActiveTab = 'viewer'
+
+// pinned: URL search param. Pins and recents of saved views link with it.
+export const SAVED_VIEW_PARAM = 'savedView'
+
+const SAVED_VIEW_ID_PATTERN = /^[A-Za-z0-9_-]+$/
+
+const SAVED_VIEW_FILTER_PARAMS = ['dateRange', 'filterGroup', 'searchTerm']
+
+/** The saved view a link opens, or the one the person loaded, so the shell can list it in Monitor. */
+export type LogsOpenSavedView = Pick<LogsViewApi, 'short_id' | 'name'>
+
+// The Anomalies tab needs its own two params. `dateRange` below is written from the viewer's
+// filters and `serviceNames` is deleted outright, so a shared name would let one tab reframe
+// the other tab's logs.
+const ANOMALIES_SERVICE_PARAM = 'anomaliesService'
+const ANOMALIES_DATE_RANGE_PARAM = 'anomaliesDateRange'
+
+const isDateRangeBound = (value: unknown): boolean => value === undefined || value === null || typeof value === 'string'
+
+// kea-router hands the param back as an object, but a hand-written link can carry the JSON string.
+// Anything that is not a pair of date bounds is dropped, so a stale or edited URL falls back to
+// the default window instead of reaching the picker and the series-bands request.
+const parseDateRangeParam = (raw: unknown): DateRange | null => {
+    let candidate: unknown = raw
+    if (typeof raw === 'string') {
+        try {
+            candidate = JSON.parse(raw)
+        } catch {
+            // Ignore malformed dateRange JSON in URL
+            return null
+        }
+    }
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+        return null
+    }
+    const { date_from, date_to } = candidate as Record<string, unknown>
+    return isDateRangeBound(date_from) && isDateRangeBound(date_to) ? (candidate as DateRange) : null
+}
+
+const resolveActiveTabFromParams = (params: Params): LogsSceneActiveTab | null => {
+    if (typeof params.alertId === 'string' && params.alertId.length > 0) {
+        return 'alerts'
+    }
+    if (typeof params.activeTab === 'string' && VALID_ACTIVE_TABS.includes(params.activeTab as LogsSceneActiveTab)) {
+        return params.activeTab as LogsSceneActiveTab
+    }
+    return null
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsSceneLogicValues {
+    facetNameSearch: string // facetRailLogic
+    anomaliesDateRange: DateRange // logsAnomaliesLogic
+    anomaliesService: string | null // logsAnomaliesLogic
+    baselineMode: PatternsBaselineMode // logsViewerConfigLogic
+    compareEnabled: boolean // logsViewerConfigLogic
+    groupBys: LogsViewerGroupBy[] // logsViewerConfigLogic
+    orderBy: LogsOrderBy // logsViewerConfigLogic
+    viewMode: LogsViewerViewMode // logsViewerConfigLogic
+    initialLogsLimit: number | null // logsViewerDataLogic
+    filters: LogsViewerFilters // logsViewerFiltersLogic
+    utcDateRange: {
+        date_from: string | null | undefined
+        date_to: string | null | undefined
+        explicitDate: boolean | null | undefined
+    } // logsViewerFiltersLogic
+    linkToLogId: string | null // logsViewerLogic
+    currentProjectId: number | string // teamLogic
+    activeTab: LogsSceneActiveTab
+    breadcrumbs: Breadcrumb[]
+    expandedAttributeBreaksdowns: string[]
+    openSavedView: LogsOpenSavedView | null
+    todayRecent: TodayMonitorRecent | null
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsSceneLogicActions {
+    setFacetNameSearch: (search: string) => {
+        search: string
+    } // facetRailLogic
+    closeLogDetails: () => {
+        value: true
+    } // logDetailsModalLogic
+    setAnomaliesDateRange: (dateRange: DateRange) => {
+        dateRange: DateRange
+    } // logsAnomaliesLogic
+    setAnomaliesService: (serviceName: string | null) => {
+        serviceName: string | null
+    } // logsAnomaliesLogic
+    pushToFilterHistory: (filters: LogsViewerFilters) => {
+        filters: LogsViewerFilters
+    } // logsFilterHistoryLogic
+    addGroupBy: (groupBy: LogsViewerGroupBy) => {
+        groupBy: LogsViewerGroupBy
+    } // logsViewerConfigLogic
+    removeGroupByAt: (index: number) => {
+        index: number
+    } // logsViewerConfigLogic
+    replaceGroupByAt: (
+        index: number,
+        groupBy: LogsViewerGroupBy
+    ) => {
+        groupBy: LogsViewerGroupBy
+        index: number
+    } // logsViewerConfigLogic
+    setBaselineMode: (mode: PatternsBaselineMode) => {
+        mode: PatternsBaselineMode
+    } // logsViewerConfigLogic
+    setColumns: (columns: LogsColumnConfig[]) => {
+        columns: LogsColumnConfig[]
+    } // logsViewerConfigLogic
+    setCompareEnabled: (enabled: boolean) => {
+        enabled: boolean
+    } // logsViewerConfigLogic
+    setGroupBys: (groupBys: LogsViewerGroupBy[]) => {
+        groupBys: LogsViewerGroupBy[]
+    } // logsViewerConfigLogic
+    setOrderBy: (
+        orderBy: LogsOrderBy,
+        source?: 'header' | 'toolbar' | undefined
+    ) => {
+        orderBy: LogsOrderBy
+        source: 'header' | 'toolbar'
+    } // logsViewerConfigLogic
+    setViewMode: (viewMode: LogsViewerViewMode) => {
+        viewMode: LogsViewerViewMode
+    } // logsViewerConfigLogic
+    fetchLogsSuccess: (
+        logs: LogMessage[],
+        payload?: import('products/logs/frontend/generated/api.schemas').LogsQueryTriggerEnumApi | undefined
+    ) => {
+        logs: LogMessage[]
+        payload?: import('products/logs/frontend/generated/api.schemas').LogsQueryTriggerEnumApi
+    } // logsViewerDataLogic
+    handleQueryChange: (
+        filterType: string,
+        extraProps?: Record<string, unknown> | undefined
+    ) => {
+        extraProps: Record<string, unknown> | undefined
+        filterType: string
+    } // logsViewerDataLogic
+    setInitialLogsLimit: (initialLogsLimit: number | null) => {
+        initialLogsLimit: number | null
+    } // logsViewerDataLogic
+    setFilters: (
+        filters: Partial<LogsViewerFilters>,
+        pushToHistory?: boolean | undefined
+    ) => {
+        filters: Partial<LogsViewerFilters>
+        pushToHistory: boolean
+    } // logsViewerFiltersLogic
+    clearLinkToLogId: () => {
+        value: true
+    } // logsViewerLogic
+    setLinkToLogId: (linkToLogId: string | null) => {
+        linkToLogId: string | null
+    } // logsViewerLogic
+    applySavedView: (
+        view: LogsViewApi,
+        keepFilters?: boolean
+    ) => {
+        keepFilters: boolean
+        view: LogsViewApi
+    }
+    keepSqlEditorMounted: (editorTabId: string) => {
+        editorTabId: string
+    }
+    openSavedViewById: (
+        shortId: string,
+        keepFilters?: boolean
+    ) => {
+        keepFilters: boolean
+        shortId: string
+    }
+    setActiveTab: (activeTab: LogsSceneActiveTab) => {
+        activeTab: LogsSceneActiveTab
+    }
+    setExpandedAttributeBreaksdowns: (expandedAttributeBreaksdowns: string[]) => {
+        expandedAttributeBreaksdowns: string[]
+    }
+    setOpenSavedView: (view: LogsOpenSavedView | null) => {
+        view: LogsOpenSavedView | null
+    }
+    syncUrl: () => {
+        value: true
+    }
+    toggleAttributeBreakdown: (key: string) => {
+        key: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsSceneLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        breadcrumbs: (openSavedView: LogsOpenSavedView | null) => Breadcrumb[]
+        todayRecent: (openSavedView: LogsOpenSavedView | null) => TodayMonitorRecent | null
+    }
+}
+
+export type logsSceneLogicType = MakeLogicType<
+    logsSceneLogicValues,
+    logsSceneLogicActions,
+    Record<string, any>,
+    logsSceneLogicMeta
+>
+
+export const logsSceneLogic = kea<logsSceneLogicType>([
+    path(['products', 'logs', 'frontend', 'logsSceneLogic']),
+    connect(() => ({
+        actions: [
+            logsViewerFiltersLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['setFilters'],
+            logsFilterHistoryLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['pushToFilterHistory'],
+            logsViewerConfigLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            [
+                'setOrderBy',
+                'setViewMode',
+                'setGroupBys',
+                'addGroupBy',
+                'removeGroupByAt',
+                'replaceGroupByAt',
+                'setCompareEnabled',
+                'setBaselineMode',
+                'setColumns',
+            ],
+            logsViewerDataLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['setInitialLogsLimit', 'fetchLogsSuccess', 'handleQueryChange'],
+            logsViewerLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['setLinkToLogId', 'clearLinkToLogId'],
+            logDetailsModalLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['closeLogDetails'],
+            facetRailLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['setFacetNameSearch'],
+            logsAnomaliesLogic,
+            ['setServiceName as setAnomaliesService', 'setDateRange as setAnomaliesDateRange'],
+        ],
+        values: [
+            logsViewerFiltersLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['filters', 'utcDateRange'],
+            logsViewerConfigLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['orderBy', 'viewMode', 'groupBys', 'compareEnabled', 'baselineMode'],
+            logsViewerDataLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['initialLogsLimit'],
+            logsViewerLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['linkToLogId'],
+            facetRailLogic({ id: LOGS_SCENE_VIEWER_ID }),
+            ['facetNameSearch'],
+            logsAnomaliesLogic,
+            ['serviceName as anomaliesService', 'dateRange as anomaliesDateRange'],
+            teamLogic,
+            ['currentProjectId'],
+        ],
+    })),
+    urlToAction(({ actions, values, cache }) => {
+        // An absent or unrecognised param turns compare off. Set the baseline first, so that
+        // turning compare on loads one diff, against the linked baseline.
+        const applyCompareParam = (raw: unknown): void => {
+            const baseline = VALID_BASELINE_MODES.find((mode) => mode === raw) ?? null
+            if (baseline && baseline !== values.baselineMode) {
+                actions.setBaselineMode(baseline)
+            }
+            if (!!baseline !== values.compareEnabled) {
+                actions.setCompareEnabled(!!baseline)
+            }
+        }
+
+        // The view's own link, opened again after its filters changed, restores them.
+        const restoreOpenedView = (savedView: string): void => {
+            const view: LogsViewApi | undefined = cache.openedView
+            const viewFilters = view?.short_id === savedView ? (view.filters ?? {}) : {}
+            if (view && SAVED_VIEW_FILTER_PARAMS.some((key) => viewFilters[key as keyof typeof viewFilters])) {
+                actions.applySavedView(view)
+            }
+        }
+
+        const applySavedViewParam = (params: Params): void => {
+            const raw = params[SAVED_VIEW_PARAM]
+            // The id goes into the API path, so anything but a short id is ignored rather than requested.
+            const savedView = typeof raw === 'string' && SAVED_VIEW_ID_PATTERN.test(raw) ? raw : null
+            // A link edited after the view opened carries its own filters, which win over the view's.
+            const linkHasFilters = SAVED_VIEW_FILTER_PARAMS.some((key) => params[key])
+            if (!savedView) {
+                if (values.openSavedView) {
+                    actions.setOpenSavedView(null)
+                }
+            } else if (savedView !== values.openSavedView?.short_id) {
+                actions.openSavedViewById(savedView, linkHasFilters)
+            } else if (!linkHasFilters) {
+                restoreOpenedView(savedView)
+            }
+        }
+
+        const urlToAction = (_: any, params: Params): void => {
+            if (cache.isSyncingUrl) {
+                return
+            }
+            const requestedTab = resolveActiveTabFromParams(params)
+            if (requestedTab && requestedTab !== values.activeTab) {
+                actions.setActiveTab(requestedTab)
+            }
+
+            const filtersFromUrl: Partial<LogsViewerFilters> = {}
+            let hasFilterChanges = false
+
+            if (params.dateRange) {
+                try {
+                    const dateRange =
+                        typeof params.dateRange === 'string' ? JSON.parse(params.dateRange) : params.dateRange
+                    if (!equal(dateRange, values.filters.dateRange)) {
+                        filtersFromUrl.dateRange = dateRange
+                        hasFilterChanges = true
+                    }
+                } catch {
+                    // Ignore malformed dateRange JSON in URL
+                }
+            }
+            if (params.filterGroup) {
+                try {
+                    const filterGroup =
+                        typeof params.filterGroup === 'string' ? JSON.parse(params.filterGroup) : params.filterGroup
+                    if (!equal(filterGroup, values.filters.filterGroup)) {
+                        filtersFromUrl.filterGroup = filterGroup
+                        hasFilterChanges = true
+                    }
+                } catch {
+                    // Ignore malformed filterGroup JSON in URL
+                }
+            } else if (!equal(DEFAULT_UNIVERSAL_GROUP_FILTER, values.filters.filterGroup)) {
+                filtersFromUrl.filterGroup = DEFAULT_UNIVERSAL_GROUP_FILTER
+                hasFilterChanges = true
+            }
+            if (params.searchTerm) {
+                if (!equal(params.searchTerm, values.filters.searchTerm)) {
+                    filtersFromUrl.searchTerm = params.searchTerm
+                    hasFilterChanges = true
+                }
+            } else if (values.filters.searchTerm !== '') {
+                filtersFromUrl.searchTerm = ''
+                hasFilterChanges = true
+            }
+            // `filterGroup` holds the level and service selections, so these two params are read but
+            // never written: reading them keeps legacy links working, along with hand-written ones
+            // like the services table's deep link, and `setFilters` folds a param into the group.
+            // Their absent-param case needs no reset branch: clearing `filterGroup` already clears
+            // these selections with it.
+            //
+            // A `filterGroup` in the same URL is the whole selection, so a param naming a facet that
+            // group already selects is residue from a link minted in the dedicated-field shape, and
+            // folding it would narrow the group's selection to the param's values. Without a group in
+            // the URL there is nothing to defer to, so the param is compared against the live
+            // selection, which also stops it re-applying on every URL change.
+            const legacyFacetParam = <T extends string>(
+                raw: T[] | null | undefined,
+                target: FacetFilterTarget
+            ): T[] | undefined => {
+                if (!raw?.length) {
+                    return undefined
+                }
+                const selected = facetSelection(
+                    filtersFromUrl.filterGroup ?? values.filters.filterGroup,
+                    target
+                ).included
+                if (filtersFromUrl.filterGroup !== undefined && selected.length > 0) {
+                    return undefined
+                }
+                return equal(raw, selected) ? undefined : raw
+            }
+            if (params.severityLevels) {
+                const parsed = parseTagsFilter(params.severityLevels)
+                const levels = parsed && legacyFacetParam(parsed.filter(isValidSeverityLevel), SEVERITY_LEVEL_FILTER)
+                if (levels) {
+                    filtersFromUrl.severityLevels = levels
+                    hasFilterChanges = true
+                }
+            }
+            if (params.serviceNames) {
+                const names = legacyFacetParam(parseTagsFilter(params.serviceNames), SERVICE_NAME_FILTER)
+                if (names) {
+                    filtersFromUrl.serviceNames = names
+                    hasFilterChanges = true
+                }
+            }
+
+            if (hasFilterChanges) {
+                actions.setFilters(filtersFromUrl, false)
+            }
+
+            // Non-filter params handled separately
+            if (params.orderBy && !equal(params.orderBy, values.orderBy)) {
+                actions.setOrderBy(params.orderBy)
+            }
+            // The Logs⇄Patterns⇄Group lens. Absent or unrecognised param means the default —
+            // a shared link with a flag-gated lens stays safe because the viewer double-gates
+            // rendering on the flag, so an unreachable mode just shows the Logs table.
+            const viewMode: LogsViewerViewMode = VALID_VIEW_MODES.includes(params.viewMode as LogsViewerViewMode)
+                ? (params.viewMode as LogsViewerViewMode)
+                : DEFAULT_VIEW_MODE
+            if (viewMode !== values.viewMode) {
+                actions.setViewMode(viewMode)
+            }
+            // Grouping dimensions travel in the URL so a Group-lens link opens on the same
+            // grouping. Absent param means no grouping (reset); a malformed one is left alone so
+            // a broken link can't silently drop a live grouping.
+            const groupBys = params.groupBys != null ? parseGroupBysParam(params.groupBys) : []
+            if (groupBys && !equal(groupBys, values.groupBys)) {
+                actions.setGroupBys(groupBys)
+            }
+            applyCompareParam(params.compare)
+            if (params.initialLogsLimit != null && +params.initialLogsLimit !== values.initialLogsLimit) {
+                actions.setInitialLogsLimit(+params.initialLogsLimit)
+            }
+
+            applySavedViewParam(params)
+
+            const linkToLogId = params.linkToLogId as string | undefined
+            if (linkToLogId && linkToLogId !== values.linkToLogId) {
+                actions.setLinkToLogId(linkToLogId)
+            }
+
+            // Facet-name search: a plain string param. Absent param resets the field to empty.
+            const facetNameSearch = typeof params.facetNameSearch === 'string' ? params.facetNameSearch : ''
+            if (facetNameSearch !== values.facetNameSearch) {
+                actions.setFacetNameSearch(facetNameSearch)
+            }
+
+            // The Anomalies params are read only while that tab is the one shown. Picking a
+            // service fetches its band charts, so an ungated read would fire that request from
+            // any URL change made on the viewer or the SQL tab. The tab resolved above is
+            // already applied, so this reads the tab the URL asked for.
+            if (values.activeTab === 'anomalies') {
+                // An absent window param means the default, not "leave the picker alone", so
+                // stepping back past the change that wrote it returns to the default week.
+                const anomaliesDateRange =
+                    parseDateRangeParam(params[ANOMALIES_DATE_RANGE_PARAM]) ?? DEFAULT_ANOMALIES_DATE_RANGE
+                if (!equal(anomaliesDateRange, values.anomaliesDateRange)) {
+                    actions.setAnomaliesDateRange(anomaliesDateRange)
+                }
+                const serviceParam = params[ANOMALIES_SERVICE_PARAM]
+                const anomaliesService = typeof serviceParam === 'string' && serviceParam ? serviceParam : null
+                if (anomaliesService !== values.anomaliesService) {
+                    actions.setAnomaliesService(anomaliesService)
+                }
+            }
+        }
+        return {
+            '*': urlToAction,
+        }
+    }),
+
+    trackedActionToUrl(({ values, cache }) => {
+        // Guard to prevent infinite loops between actionToUrl and urlToAction.
+        // Uses setTimeout (macrotask) so the flag stays set until the router has
+        // fully processed the URL change, even in test environments with
+        // synchronously-resolving mocks.
+        const withUrlSyncGuard = <T,>(fn: () => T): T => {
+            cache.isSyncingUrl = true
+            const result = fn()
+            setTimeout(() => {
+                cache.isSyncingUrl = false
+            }, 0)
+            return result
+        }
+
+        const syncUrl = (): [
+            string,
+            Params,
+            Record<string, any>,
+            {
+                replace: boolean
+            },
+        ] => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    updateSearchParams(params, 'searchTerm', values.filters.searchTerm, '')
+                    updateSearchParams(
+                        params,
+                        'filterGroup',
+                        values.filters.filterGroup,
+                        DEFAULT_UNIVERSAL_GROUP_FILTER
+                    )
+                    updateSearchParams(params, 'dateRange', values.filters.dateRange, DEFAULT_DATE_RANGE)
+                    // No writer sets these two, so they have to be deleted rather than left alone:
+                    // syncSearchParams only removes keys it is told about, and a param still in the
+                    // URL is read again on the next URL change, folding a selection back in on top of
+                    // whatever the rail did to it since.
+                    delete params.severityLevels
+                    delete params.serviceNames
+                    updateSearchParams(params, 'orderBy', values.orderBy, DEFAULT_ORDER_BY)
+                    updateSearchParams(params, 'facetNameSearch', values.facetNameSearch, '')
+                    return params
+                })
+            )
+        }
+
+        const clearLinkToLogId = (): ReturnType<typeof syncSearchParams> => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    delete params.linkToLogId
+                    return params
+                })
+            )
+        }
+
+        const clearInitialLogsLimit = (): [
+            string,
+            Params,
+            Record<string, any>,
+            {
+                replace: boolean
+            },
+        ] => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    updateSearchParams(params, 'initialLogsLimit', null, DEFAULT_INITIAL_LOGS_LIMIT)
+                    return params
+                })
+            )
+        }
+
+        // The two params belong to the Anomalies tab, so they leave the URL with it. Written on
+        // the tab switch as well, because a bucket deep link drops them on the way to the viewer
+        // and the selection they describe is still there when the user comes back.
+        const writeAnomaliesParams = (params: Params): void => {
+            const onAnomaliesTab = values.activeTab === 'anomalies'
+            updateSearchParams(params, ANOMALIES_SERVICE_PARAM, onAnomaliesTab ? values.anomaliesService : null, null)
+            updateSearchParams(
+                params,
+                ANOMALIES_DATE_RANGE_PARAM,
+                onAnomaliesTab ? values.anomaliesDateRange : DEFAULT_ANOMALIES_DATE_RANGE,
+                DEFAULT_ANOMALIES_DATE_RANGE
+            )
+        }
+
+        const syncAnomalies = (): ReturnType<typeof syncSearchParams> => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    writeAnomaliesParams(params)
+                    return params
+                })
+            )
+        }
+
+        const syncActiveTab = (): ReturnType<typeof syncSearchParams> => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    updateSearchParams(params, 'activeTab', values.activeTab, DEFAULT_ACTIVE_TAB)
+                    writeAnomaliesParams(params)
+                    return params
+                })
+            )
+        }
+
+        const syncSavedView = (): ReturnType<typeof syncSearchParams> => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    updateSearchParams(params, SAVED_VIEW_PARAM, values.openSavedView?.short_id ?? null, null)
+                    return params
+                })
+            )
+        }
+
+        const syncViewMode = (): ReturnType<typeof syncSearchParams> => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    updateSearchParams(params, 'viewMode', values.viewMode, DEFAULT_VIEW_MODE)
+                    return params
+                })
+            )
+        }
+
+        const syncCompare = (): ReturnType<typeof syncSearchParams> => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    updateSearchParams(params, 'compare', values.compareEnabled ? values.baselineMode : null, null)
+                    return params
+                })
+            )
+        }
+
+        const syncGroupBys = (): ReturnType<typeof syncSearchParams> => {
+            return withUrlSyncGuard(() =>
+                syncSearchParams(router, (params: Params) => {
+                    // Empty grouping is the default, so it drops the param instead of pinning an
+                    // empty array into every copied URL.
+                    updateSearchParams(params, 'groupBys', values.groupBys, [])
+                    return params
+                })
+            )
+        }
+
+        return {
+            // initialLogsLimit is a one-shot override from "copy link to log" URLs.
+            // It ensures the first fetch loads enough logs to include the linked log,
+            // then resets to null so subsequent queries use the default page size.
+            fetchLogsSuccess: () => clearInitialLogsLimit(),
+            closeLogDetails: () => clearLinkToLogId(),
+            clearLinkToLogId: () => clearLinkToLogId(),
+            syncUrl: () => syncUrl(),
+            setActiveTab: () => syncActiveTab(),
+            setViewMode: () => syncViewMode(),
+            setOpenSavedView: () => syncSavedView(),
+            setAnomaliesService: () => syncAnomalies(),
+            setAnomaliesDateRange: () => syncAnomalies(),
+            setGroupBys: () => syncGroupBys(),
+            addGroupBy: () => syncGroupBys(),
+            removeGroupByAt: () => syncGroupBys(),
+            replaceGroupByAt: () => syncGroupBys(),
+            setCompareEnabled: () => syncCompare(),
+            setBaselineMode: () => syncCompare(),
+        }
+    }),
+
+    actions({
+        setActiveTab: (activeTab: LogsSceneActiveTab) => ({ activeTab }),
+        syncUrl: true,
+        toggleAttributeBreakdown: (key: string) => ({ key }),
+        setExpandedAttributeBreaksdowns: (expandedAttributeBreaksdowns: string[]) => ({ expandedAttributeBreaksdowns }),
+        keepSqlEditorMounted: (editorTabId: string) => ({ editorTabId }),
+        openSavedViewById: (shortId: string, keepFilters: boolean = false) => ({ shortId, keepFilters }),
+        applySavedView: (view: LogsViewApi, keepFilters: boolean = false) => ({ view, keepFilters }),
+        setOpenSavedView: (view: LogsOpenSavedView | null) => ({ view }),
+    }),
+
+    reducers({
+        activeTab: [
+            DEFAULT_ACTIVE_TAB as LogsSceneActiveTab,
+            {
+                setActiveTab: (_, { activeTab }) => activeTab,
+            },
+        ],
+        expandedAttributeBreaksdowns: [
+            [] as string[],
+            {
+                setExpandedAttributeBreaksdowns: (_, { expandedAttributeBreaksdowns }) => expandedAttributeBreaksdowns,
+            },
+        ],
+        openSavedView: [
+            null as LogsOpenSavedView | null,
+            {
+                setOpenSavedView: (_, { view }) => (view ? { short_id: view.short_id, name: view.name } : null),
+            },
+        ],
+    }),
+
+    selectors({
+        breadcrumbs: [
+            (s) => [s.openSavedView],
+            (openSavedView: LogsOpenSavedView | null): Breadcrumb[] =>
+                openSavedView
+                    ? [
+                          { key: Scene.Logs, name: 'Logs', path: urls.logs(), iconType: 'logs' },
+                          { key: [Scene.Logs, openSavedView.short_id], name: openSavedView.name, iconType: 'logs' },
+                      ]
+                    : [{ key: Scene.Logs, name: 'Logs', iconType: 'logs' }],
+        ],
+        [TODAY_RECENT_KEY]: [
+            (s) => [s.openSavedView],
+            (openSavedView: LogsOpenSavedView | null): TodayMonitorRecent | null =>
+                openSavedView
+                    ? { type: 'logs_view', name: openSavedView.name, href: urls.logsSavedView(openSavedView.short_id) }
+                    : null,
+        ],
+    }),
+
+    listeners(({ values, actions, cache }) => ({
+        toggleAttributeBreakdown: ({ key }) => {
+            const breakdowns = [...values.expandedAttributeBreaksdowns]
+            const index = breakdowns.indexOf(key)
+            index >= 0 ? breakdowns.splice(index, 1) : breakdowns.push(key)
+            actions.setExpandedAttributeBreaksdowns(breakdowns)
+        },
+        handleQueryChange: () => {
+            actions.pushToFilterHistory(values.filters)
+            actions.syncUrl()
+        },
+        setOrderBy: () => {
+            actions.syncUrl()
+        },
+        setFacetNameSearch: () => {
+            actions.syncUrl()
+        },
+        openSavedViewById: async ({ shortId, keepFilters }, breakpoint) => {
+            let view: LogsViewApi
+            try {
+                view = await logsViewsRetrieve(String(values.currentProjectId), shortId)
+            } catch {
+                lemonToast.error('Couldn’t open the saved view. It may have been deleted.')
+                return
+            }
+            // A link opened while this one loaded wins, so a slower earlier response is dropped.
+            breakpoint()
+            actions.applySavedView(view, keepFilters)
+        },
+        applySavedView: ({ view, keepFilters }) => {
+            cache.openedView = view
+            // A null `columns` means the view has no column preference, so it opens with the default set.
+            actions.setColumns(view.columns ?? DEFAULT_LOGS_COLUMNS)
+            if (!keepFilters) {
+                actions.setFilters(view.filters || {})
+            }
+            actions.setActiveTab(DEFAULT_ACTIVE_TAB)
+            actions.setOpenSavedView(view)
+        },
+        keepSqlEditorMounted: ({ editorTabId }) => {
+            if (cache.sqlEditorTabId === editorTabId) {
+                return
+            }
+            cache.unmountSqlEditor?.()
+            cache.sqlEditorTabId = editorTabId
+            // Intentionally not cleaned up in beforeUnmount: keeps the embedded sqlEditorLogic
+            // alive across navigation so the user's query survives leaving and re-entering /logs.
+            cache.unmountSqlEditor = sqlEditorLogic({ tabId: editorTabId, mode: SQLEditorMode.Embedded }).mount()
+        },
+    })),
+])

@@ -1,0 +1,1260 @@
+import {
+    MAX_CATEGORY_LABEL_WIDTH,
+    type Series,
+    type TooltipContext,
+    type TrendLineConfig,
+    type ValueLabelContext,
+    type ValueLabelsConfig,
+    type YAxisConfig,
+} from '@posthog/quill-charts'
+
+import { compactNumber } from 'lib/utils/numbers'
+
+import { ChartSettings, GoalLine } from '~/queries/schema/schema-general'
+import { ChartDisplayType } from '~/types'
+
+import { AxisSeries, AxisSeriesSettings } from '../../dataVisualizationLogic'
+import { AxisBreakdownSeries, EmptyBreakdownSeries } from '../seriesBreakdownLogic'
+import { SqlChartProps } from './SqlChart'
+import {
+    AREA_FILL_OPACITY,
+    MAX_SERIES,
+    type SqlLineYSeries,
+    barLayoutForDisplay,
+    buildBarChartConfig,
+    buildBarValueChartConfig,
+    buildComboChartConfig,
+    buildLineChartConfig,
+    buildSeries,
+    buildSqlTooltipConfig,
+    buildTrendLineConfigs,
+    capYSeriesData,
+    comboBarLayoutForDisplay,
+    exceedsMaxSeries,
+    formatSqlSeriesValue,
+    hasAxisTickFormatting,
+    hasMixedSeriesTypes,
+    seriesDisplayType,
+    sqlChartData,
+    sqlChartKind,
+} from './sqlLineGraphAdapter'
+
+const numericColumn = (name: string, dataIndex: number): AxisSeries<number | null>['column'] => ({
+    name,
+    type: { name: 'INTEGER', isNumerical: true },
+    label: name,
+    dataIndex,
+})
+
+const ySeries = (
+    name: string,
+    data: (number | null)[],
+    settings: AxisSeries<number | null>['settings'] = {}
+): AxisSeries<number | null> => ({ column: numericColumn(name, 1), data, settings })
+
+const breakdownSeries = (
+    breakdownValue: string,
+    data: (number | null)[],
+    settings: AxisBreakdownSeries<number | null>['settings'] = {}
+): AxisBreakdownSeries<number | null> => ({ name: breakdownValue, breakdownValue, data, settings })
+
+const baseProps = (overrides: Partial<SqlChartProps>): SqlChartProps => ({
+    xData: null,
+    yData: [],
+    visualizationType: ChartDisplayType.ActionsLineGraph,
+    chartSettings: {},
+    ...overrides,
+})
+
+describe('sqlLineGraphAdapter', () => {
+    describe('sqlChartKind', () => {
+        // Explicit line + bar so the mix holds regardless of the base chart type's auto resolution.
+        const mixed = [
+            ySeries('a', [1], { display: { displayType: 'line' } }),
+            ySeries('b', [2], { display: { displayType: 'bar' } }),
+        ]
+
+        it.each([
+            ['line graph', ChartDisplayType.ActionsLineGraph, 'line'],
+            ['area graph', ChartDisplayType.ActionsAreaGraph, 'line'],
+            ['bar graph', ChartDisplayType.ActionsBar, 'bar'],
+            ['horizontal bar graph', ChartDisplayType.ActionsBarValue, 'bar'],
+            ['stacked bar graph', ChartDisplayType.ActionsStackedBar, 'bar'],
+            // Pie never reaches dispatch — PieChart wraps it separately.
+            ['pie graph', ChartDisplayType.ActionsPie, 'line'],
+        ])('follows the chart type for a %s with no series', (_name, visualizationType, expected) => {
+            expect(sqlChartKind(baseProps({ visualizationType }))).toBe(expected)
+        })
+
+        it.each([
+            ['line graph', ChartDisplayType.ActionsLineGraph],
+            ['area graph', ChartDisplayType.ActionsAreaGraph],
+            ['bar graph', ChartDisplayType.ActionsBar],
+            ['stacked bar graph', ChartDisplayType.ActionsStackedBar],
+        ])('picks combo for mixed series on a %s', (_name, visualizationType) => {
+            expect(sqlChartKind(baseProps({ visualizationType, yData: mixed }))).toBe('combo')
+        })
+
+        it('does not pick combo for an unsupported chart type', () => {
+            expect(sqlChartKind(baseProps({ visualizationType: ChartDisplayType.ActionsPie, yData: mixed }))).toBe(
+                'line'
+            )
+        })
+
+        it.each([
+            ['line', 'line' as const],
+            ['area', 'area' as const],
+        ])('picks line when every column on a bar graph is overridden to %s', (_name, displayType) => {
+            const yData = [
+                ySeries('a', [1], { display: { displayType } }),
+                ySeries('b', [2], { display: { displayType } }),
+            ]
+            expect(sqlChartKind(baseProps({ visualizationType: ChartDisplayType.ActionsBar, yData }))).toBe('line')
+        })
+
+        // Regression: the per-column setting is more specific than the chart-level type, so an
+        // all-bar line chart must draw bars. It used to fall through to the line renderer, which
+        // ignores per-series type and drew them as lines.
+        it.each([
+            ['line graph', ChartDisplayType.ActionsLineGraph],
+            ['area graph', ChartDisplayType.ActionsAreaGraph],
+        ])('picks bar when every column on a %s is overridden to bar', (_name, visualizationType) => {
+            const yData = [
+                ySeries('a', [1], { display: { displayType: 'bar' } }),
+                ySeries('b', [2], { display: { displayType: 'bar' } }),
+            ]
+            expect(sqlChartKind(baseProps({ visualizationType, yData }))).toBe('bar')
+        })
+
+        // Trend lines and right-axis series render natively on every path — they never change the kind.
+        it.each([
+            ['a plain series', [ySeries('a', [1], { display: { trendLine: true } })]],
+            ['a breakdown series', [breakdownSeries('chrome', [1], { display: { trendLine: true } })]],
+        ])('keeps the bar kind when %s has a trend line', (_name, yData) => {
+            expect(sqlChartKind(baseProps({ visualizationType: ChartDisplayType.ActionsBar, yData }))).toBe('bar')
+        })
+
+        it('keeps the bar kind when a series targets the right y-axis', () => {
+            const yData = [ySeries('a', [1], { display: { yAxisPosition: 'right' } })]
+            expect(sqlChartKind(baseProps({ visualizationType: ChartDisplayType.ActionsBar, yData }))).toBe('bar')
+        })
+
+        it('keeps the line kind for trend-line and right-axis series on a line graph', () => {
+            const yData = [
+                ySeries('a', [1], { display: { trendLine: true } }),
+                ySeries('b', [2], { display: { yAxisPosition: 'right' } }),
+            ]
+            expect(sqlChartKind(baseProps({ yData }))).toBe('line')
+        })
+
+        it('picks combo when a series has a trend line alongside the mix', () => {
+            const yData = [
+                ySeries('a', [1], { display: { displayType: 'bar' } }),
+                ySeries('b', [2], { display: { displayType: 'line', trendLine: true } }),
+            ]
+            expect(sqlChartKind(baseProps({ visualizationType: ChartDisplayType.ActionsBar, yData }))).toBe('combo')
+        })
+
+        it('picks combo for percent-stacked bars when the line is on the right axis', () => {
+            const yData = [
+                ySeries('a', [1], { display: { displayType: 'line', yAxisPosition: 'right' } }),
+                ySeries('b', [2], { display: { displayType: 'bar' } }),
+            ]
+            expect(
+                sqlChartKind(
+                    baseProps({
+                        visualizationType: ChartDisplayType.ActionsStackedBar,
+                        yData,
+                        chartSettings: { stackBars100: true },
+                    })
+                )
+            ).toBe('combo')
+        })
+
+        // Regression: the bars' axis clamps to [0, 1] in percent mode, so a line on that same axis
+        // can't be reconciled with it. Degrade to a plain percent stack — this used to fall through
+        // to the line renderer, which dropped the stacking entirely.
+        it("picks bar for percent-stacked bars when a line shares the bars' axis", () => {
+            expect(
+                sqlChartKind(
+                    baseProps({
+                        visualizationType: ChartDisplayType.ActionsStackedBar,
+                        yData: mixed,
+                        chartSettings: { stackBars100: true },
+                    })
+                )
+            ).toBe('bar')
+        })
+
+        // Regression: TimeSeriesBarChart percent-stacks every series it's given regardless of
+        // series.type, so degrading to bar here would force the right-axis line into the same [0, 1]
+        // stack as the left-axis bar/line pair and render it as a constant 100% bar.
+        it("picks combo for percent-stacked bars when a line shares the bars' axis and another line is on the right axis", () => {
+            const yData = [
+                ySeries('a', [1], { display: { displayType: 'bar' } }),
+                ySeries('b', [2], { display: { displayType: 'line' } }),
+                ySeries('c', [3], { display: { displayType: 'line', yAxisPosition: 'right' } }),
+            ]
+            expect(
+                sqlChartKind(
+                    baseProps({
+                        visualizationType: ChartDisplayType.ActionsStackedBar,
+                        yData,
+                        chartSettings: { stackBars100: true },
+                    })
+                )
+            ).toBe('combo')
+        })
+    })
+
+    describe('seriesDisplayType', () => {
+        it.each<[string, ChartDisplayType, AxisSeries<number | null>['settings'], string]>([
+            ['bar override wins', ChartDisplayType.ActionsLineGraph, { display: { displayType: 'bar' } }, 'bar'],
+            ['line override wins', ChartDisplayType.ActionsBar, { display: { displayType: 'line' } }, 'line'],
+            ['area override wins', ChartDisplayType.ActionsBar, { display: { displayType: 'area' } }, 'area'],
+            ['auto on a line graph is a line', ChartDisplayType.ActionsLineGraph, {}, 'line'],
+            ['auto on an area graph is an area', ChartDisplayType.ActionsAreaGraph, {}, 'area'],
+            ['auto on a bar graph is a bar', ChartDisplayType.ActionsBar, {}, 'bar'],
+            ['auto on a horizontal bar graph is a bar', ChartDisplayType.ActionsBarValue, {}, 'bar'],
+            ['auto on a stacked bar graph is a bar', ChartDisplayType.ActionsStackedBar, {}, 'bar'],
+            [
+                "the 'auto' display type defers to the chart type",
+                ChartDisplayType.ActionsBar,
+                { display: { displayType: 'auto' } },
+                'bar',
+            ],
+        ])('derives %s', (_name, visualizationType, settings, expected) => {
+            expect(seriesDisplayType(visualizationType, settings)).toBe(expected)
+        })
+    })
+
+    describe('hasMixedSeriesTypes', () => {
+        it.each<[string, ChartDisplayType, AxisSeries<number | null>[], boolean]>([
+            [
+                'bar + line on a line graph',
+                ChartDisplayType.ActionsLineGraph,
+                [ySeries('a', [1]), ySeries('b', [2], { display: { displayType: 'bar' } })],
+                true,
+            ],
+            [
+                'line + bar on a bar graph',
+                ChartDisplayType.ActionsBar,
+                [ySeries('a', [1]), ySeries('b', [2], { display: { displayType: 'line' } })],
+                true,
+            ],
+            [
+                'bar + area on a stacked bar graph',
+                ChartDisplayType.ActionsStackedBar,
+                [ySeries('a', [1]), ySeries('b', [2], { display: { displayType: 'area' } })],
+                true,
+            ],
+            [
+                'all lines on a line graph',
+                ChartDisplayType.ActionsLineGraph,
+                [ySeries('a', [1]), ySeries('b', [2])],
+                false,
+            ],
+            ['all bars on a bar graph', ChartDisplayType.ActionsBar, [ySeries('a', [1]), ySeries('b', [2])], false],
+            [
+                'line + area is line-like, not mixed',
+                ChartDisplayType.ActionsLineGraph,
+                [ySeries('a', [1]), ySeries('b', [2], { display: { displayType: 'area' } })],
+                false,
+            ],
+        ])('detects %s', (_name, visualizationType, yData, expected) => {
+            expect(hasMixedSeriesTypes(yData, visualizationType)).toBe(expected)
+        })
+    })
+
+    describe('comboBarLayoutForDisplay', () => {
+        it.each([
+            ['stacked for a stacked bar graph', ChartDisplayType.ActionsStackedBar, {}, 'stacked'],
+            ['grouped for a bar graph', ChartDisplayType.ActionsBar, {}, 'grouped'],
+            ['grouped for a line graph', ChartDisplayType.ActionsLineGraph, {}, 'grouped'],
+            [
+                'percent for a stacked bar graph when stackBars100 is on',
+                ChartDisplayType.ActionsStackedBar,
+                { stackBars100: true },
+                'percent',
+            ],
+        ])('returns %s', (_name, visualizationType, chartSettings, expected) => {
+            expect(comboBarLayoutForDisplay(visualizationType, chartSettings as ChartSettings)).toBe(expected)
+        })
+    })
+
+    describe('barLayoutForDisplay', () => {
+        it.each([
+            ['grouped bars for a bar graph', ChartDisplayType.ActionsBar, {}, 'grouped'],
+            ['stacked bars for a stacked bar graph', ChartDisplayType.ActionsStackedBar, {}, 'stacked'],
+            [
+                'percent bars when stackBars100 is on for a stacked bar graph',
+                ChartDisplayType.ActionsStackedBar,
+                { stackBars100: true },
+                'percent',
+            ],
+        ])('returns %s', (_name, visualizationType, chartSettings, expected) => {
+            expect(barLayoutForDisplay(visualizationType, chartSettings as ChartSettings)).toBe(expected)
+        })
+    })
+
+    describe('exceedsMaxSeries', () => {
+        const tooMany = Array.from({ length: MAX_SERIES + 1 }, (_, i) => ySeries(`s${i}`, [i]))
+
+        it('is true above the cap outside a dashboard', () => {
+            expect(exceedsMaxSeries(tooMany, undefined)).toBe(true)
+        })
+
+        it('is false above the cap on a dashboard', () => {
+            expect(exceedsMaxSeries(tooMany, 'dash-1')).toBe(false)
+        })
+
+        it('is false at or below the cap', () => {
+            expect(exceedsMaxSeries([ySeries('a', [1])], undefined)).toBe(false)
+        })
+    })
+
+    describe('sqlChartData', () => {
+        const xData = (data: string[]): AxisSeries<string> => ({
+            column: { name: 'week', type: { name: 'DATE', isNumerical: false }, label: 'week', dataIndex: 0 },
+            data,
+        })
+
+        it('sums rows that share an x value so they do not overlap in one slot', () => {
+            const result = sqlChartData(
+                EmptyBreakdownSeries,
+                xData(['2026-10-05', '2026-10-05', '2026-10-12', '2026-10-12']),
+                [ySeries('rows_written', [100, 300, null, 400])],
+                ChartDisplayType.ActionsBar
+            )
+            expect(result.xData?.data).toEqual(['2026-10-05', '2026-10-12'])
+            expect(result.yData.map((series) => series.data)).toEqual([[400, 400]])
+        })
+
+        it('keeps the data unchanged when x values are unique', () => {
+            const x = xData(['2026-10-05', '2026-10-12'])
+            const yData = [ySeries('rows_written', [100, 300])]
+            expect(sqlChartData(EmptyBreakdownSeries, x, yData, ChartDisplayType.ActionsBar)).toEqual({
+                xData: x,
+                yData,
+            })
+        })
+
+        it('keeps one bar per row on a bar value chart', () => {
+            const x = xData(['a', 'a'])
+            const yData = [ySeries('count', [1, 2])]
+            expect(sqlChartData(EmptyBreakdownSeries, x, yData, ChartDisplayType.ActionsBarValue).xData).toBe(x)
+        })
+    })
+
+    describe('capYSeriesData', () => {
+        it('returns null for missing data', () => {
+            expect(capYSeriesData(undefined as unknown as SqlChartProps['yData'])).toBeNull()
+        })
+
+        it('returns the data unchanged at or below the cap', () => {
+            const yData = [ySeries('a', [1]), ySeries('b', [2])]
+            expect(capYSeriesData(yData)).toBe(yData)
+        })
+
+        it('slices to the cap when exceeded', () => {
+            const yData = Array.from({ length: MAX_SERIES + 5 }, (_, i) => ySeries(`s${i}`, [i]))
+            expect(capYSeriesData(yData)).toHaveLength(MAX_SERIES)
+        })
+    })
+
+    describe('buildSeries', () => {
+        it('maps nulls to NaN so quill draws gaps', () => {
+            const [series] = buildSeries([ySeries('a', [1, null, 3])], ChartDisplayType.ActionsLineGraph)
+            expect(series.data).toEqual([1, NaN, 3])
+        })
+
+        it('keeps percent-styled columns out of the tooltip total, leaving other columns summable', () => {
+            const [percent, plain] = buildSeries(
+                [ySeries('growth', [2.4], { formatting: { style: 'percent' } }), ySeries('count', [10])],
+                ChartDisplayType.ActionsLineGraph
+            )
+            expect(percent.visibility).toEqual({ total: false })
+            expect(plain.visibility).toEqual({})
+        })
+
+        it.each<[string, AxisSeries<number | null>['settings'], Series['visibility']]>([
+            ['keeps an excluded series out of the total', { display: { excludeFromTotal: true } }, { total: false }],
+            ['hides value labels for the series', { display: { valueLabels: 'hide' } }, { valueLabel: false }],
+            [
+                'combines both flags',
+                { display: { excludeFromTotal: true, valueLabels: 'hide' } },
+                { total: false, valueLabel: false },
+            ],
+        ])('%s', (_name, settings, expected) => {
+            const [series] = buildSeries([ySeries('target', [5], settings)], ChartDisplayType.ActionsStackedBar, true)
+            expect(series.visibility).toEqual(expected)
+        })
+
+        it('labels only the series that opted in when the chart setting is off', () => {
+            const [bars, target] = buildSeries(
+                [ySeries('bars', [1]), ySeries('target', [5], { display: { valueLabels: 'show' } })],
+                ChartDisplayType.ActionsStackedBar,
+                false
+            )
+            expect(bars.visibility).toEqual({ valueLabel: false })
+            expect(target.visibility).toEqual({})
+        })
+
+        it('only pins an explicit color, leaving palette assignment to quill otherwise', () => {
+            const [withColor, withoutColor] = buildSeries(
+                [ySeries('a', [1], { display: { color: '#abcdef' } }), ySeries('b', [2])],
+                ChartDisplayType.ActionsLineGraph
+            )
+            expect(withColor.color).toBe('#abcdef')
+            expect(withoutColor.color).toBeUndefined()
+        })
+
+        it('adds an area fill for area graphs', () => {
+            const [series] = buildSeries([ySeries('a', [1])], ChartDisplayType.ActionsAreaGraph)
+            expect(series.fill).toEqual({ opacity: AREA_FILL_OPACITY })
+        })
+
+        it('adds an area fill when a series opts into area display', () => {
+            const [series] = buildSeries(
+                [ySeries('a', [1], { display: { displayType: 'area' } })],
+                ChartDisplayType.ActionsLineGraph
+            )
+            expect(series.fill).toEqual({ opacity: AREA_FILL_OPACITY })
+        })
+
+        it('omits the fill for plain line graphs', () => {
+            const [series] = buildSeries([ySeries('a', [1])], ChartDisplayType.ActionsLineGraph)
+            expect(series.fill).toBeUndefined()
+        })
+
+        it('omits the area fill for a bar-override series on an area graph', () => {
+            const [series] = buildSeries(
+                [ySeries('a', [1], { display: { displayType: 'bar' } })],
+                ChartDisplayType.ActionsAreaGraph
+            )
+            expect(series.type).toBe('bar')
+            expect(series.fill).toBeUndefined()
+        })
+
+        it('keeps measures with the same breakdown value distinct, including their trend lines', () => {
+            const yData = [
+                { ...breakdownSeries('chrome', [1], { display: { trendLine: true } }), name: 'count - chrome' },
+                { ...breakdownSeries('chrome', [2]), name: 'revenue - chrome' },
+            ]
+            const series = buildSeries(yData, ChartDisplayType.ActionsStackedBar)
+            expect(new Set(series.map(({ key }) => key)).size).toBe(2)
+            expect(Object.fromEntries(series.map(({ key, data }) => [key, data]))).toEqual({
+                '["count - chrome","chrome"]': [1],
+                '["revenue - chrome","chrome"]': [2],
+            })
+            expect(buildTrendLineConfigs(yData)).toEqual([{ seriesKey: series[0].key, kind: 'linear' }])
+        })
+
+        it('honors a custom display label, falling back to the column name', () => {
+            const [custom, fallback] = buildSeries(
+                [ySeries('revenue', [1], { display: { label: 'Total revenue' } }), ySeries('count', [2])],
+                ChartDisplayType.ActionsLineGraph
+            )
+            expect(custom.label).toBe('Total revenue')
+            expect(fallback.label).toBe('count')
+        })
+
+        it('honors a custom display label on a breakdown series, falling back to the breakdown value', () => {
+            const [custom, fallback] = buildSeries(
+                [
+                    breakdownSeries('chrome', [1], { display: { label: 'Chrome browser' } }),
+                    breakdownSeries('safari', [2]),
+                ],
+                ChartDisplayType.ActionsLineGraph
+            )
+            expect(custom.label).toBe('Chrome browser')
+            expect(fallback.label).toBe('safari')
+        })
+
+        it('derives each series quill type from its displayType', () => {
+            const [bar, line, area] = buildSeries(
+                [
+                    ySeries('a', [1], { display: { displayType: 'bar' } }),
+                    ySeries('b', [2]),
+                    ySeries('c', [3], { display: { displayType: 'area' } }),
+                ],
+                ChartDisplayType.ActionsLineGraph
+            )
+            expect([bar.type, line.type, area.type]).toEqual(['bar', 'line', 'area'])
+        })
+
+        it.each<[string, AxisSeries<number | null>['settings'], string | undefined]>([
+            ['right when the series targets the right axis', { display: { yAxisPosition: 'right' } }, 'right'],
+            ['unset when the series targets the left axis', { display: { yAxisPosition: 'left' } }, undefined],
+            ['unset when no axis is specified', {}, undefined],
+        ])('assigns yAxisId %s', (_name, settings, expected) => {
+            const [series] = buildSeries([ySeries('a', [1], settings)], ChartDisplayType.ActionsLineGraph)
+            expect(series.yAxisId).toBe(expected)
+        })
+
+        it('threads each series settings through meta for the tooltip', () => {
+            const usd: AxisSeries<number | null>['settings'] = { formatting: { prefix: '$' } }
+            const [withSettings, plain] = buildSeries(
+                [ySeries('revenue', [1], usd), ySeries('count', [2])],
+                ChartDisplayType.ActionsLineGraph
+            )
+            expect(withSettings.meta).toEqual({ settings: usd })
+            expect(plain.meta).toEqual({ settings: {} })
+        })
+    })
+
+    describe('buildTrendLineConfigs', () => {
+        it.each<[string, SqlLineYSeries[] | null | undefined, TrendLineConfig[]]>([
+            [
+                'one linear config per opting-in series, keyed by original index',
+                [
+                    ySeries('a', [1], { display: { trendLine: true } }),
+                    ySeries('b', [2]),
+                    ySeries('c', [3], { display: { trendLine: true } }),
+                ],
+                [
+                    { seriesKey: 'a-0', kind: 'linear' },
+                    { seriesKey: 'c-2', kind: 'linear' },
+                ],
+            ],
+            ['none when no series opts in', [ySeries('a', [1]), ySeries('b', [2])], []],
+            ['none for missing data', undefined, []],
+            ['none for null data', null, []],
+            [
+                'breakdown trend lines keyed by breakdown value',
+                [breakdownSeries('chrome', [1], { display: { trendLine: true } })],
+                [{ seriesKey: '["chrome","chrome"]', kind: 'linear' }],
+            ],
+        ])('builds %s', (_name, ySeriesData, expected) => {
+            expect(buildTrendLineConfigs(ySeriesData)).toEqual(expected)
+        })
+
+        it('keys each trend line to the series buildSeries assigns', () => {
+            const yData = [
+                ySeries('a', [1]),
+                ySeries('b', [2], { display: { trendLine: true } }),
+                breakdownSeries('chrome', [3], { display: { trendLine: true } }),
+            ]
+            const seriesKeys = buildSeries(yData, ChartDisplayType.ActionsLineGraph).map((s) => s.key)
+            const trendLineKeys = buildTrendLineConfigs(yData).map((t) => t.seriesKey)
+            // Both derive from getSeriesKey on the same array, so the trend lines are the opt-in subset.
+            expect(seriesKeys).toEqual(['a-0', 'b-1', '["chrome","chrome"]'])
+            expect(trendLineKeys).toEqual(['b-1', '["chrome","chrome"]'])
+        })
+
+        it('uses array-position indexing, so keys stay aligned with buildSeries however the cap slices', () => {
+            const yData = [
+                ySeries('a', [1]),
+                ySeries('b', [2], { display: { trendLine: true } }),
+                ySeries('c', [3]),
+                ySeries('d', [4], { display: { trendLine: true } }),
+            ]
+            const seriesKeys = buildSeries(yData, ChartDisplayType.ActionsLineGraph).map((s) => s.key)
+            const trendLineKeys = buildTrendLineConfigs(yData).map((t) => t.seriesKey)
+            expect(trendLineKeys).toEqual([seriesKeys[1], seriesKeys[3]])
+        })
+    })
+
+    describe('formatSqlSeriesValue', () => {
+        it('applies the column settings and stringifies the result', () => {
+            expect(formatSqlSeriesValue(1200, { formatting: { prefix: '$' } })).toBe('$1200')
+        })
+
+        it('falls back to the raw value when formatting yields null', () => {
+            expect(formatSqlSeriesValue(NaN)).toBe('NaN')
+        })
+
+        it.each<[string, number, AxisSeriesSettings | undefined, string]>([
+            ['caps an unformatted float at 3 fraction digits', 22.222222222222, undefined, '22.222'],
+            ['keeps unformatted integers untouched', 1234567, undefined, '1234567'],
+            ['trims trailing zeros after capping', 0.30000000000000004, undefined, '0.3'],
+            [
+                'caps a prefix-only column too (prefix does not round)',
+                22.222222222222,
+                { formatting: { prefix: '$' } },
+                '$22.222',
+            ],
+            [
+                'leaves rounding to an explicit decimalPlaces',
+                22.222222222222,
+                { formatting: { decimalPlaces: 5 } },
+                '22.22222',
+            ],
+            ['honors an explicit zero decimalPlaces', 22.222222222222, { formatting: { decimalPlaces: 0 } }, '22'],
+        ])('%s', (_name, value, settings, expected) => {
+            expect(formatSqlSeriesValue(value, settings)).toBe(expected)
+        })
+    })
+
+    describe('hasAxisTickFormatting', () => {
+        it.each<[string, AxisSeries<number | null>['settings'], boolean]>([
+            ['undefined settings', undefined, false],
+            ['no formatting block', { display: { color: '#abc' } }, false],
+            ['default empty prefix/suffix', { formatting: { prefix: '', suffix: '' } }, false],
+            ['style none', { formatting: { style: 'none' } }, false],
+            ['style number', { formatting: { style: 'number' } }, true],
+            ['style short', { formatting: { style: 'short' } }, true],
+            ['style percent', { formatting: { style: 'percent' } }, true],
+            ['prefix', { formatting: { prefix: '$' } }, true],
+            ['suffix', { formatting: { suffix: ' req' } }, true],
+            ['decimal places', { formatting: { decimalPlaces: 2 } }, true],
+        ])('returns %s -> %s', (_name, settings, expected) => {
+            expect(hasAxisTickFormatting(settings)).toBe(expected)
+        })
+    })
+
+    describe('buildSqlTooltipConfig', () => {
+        const entry = (settings: AxisSeries<number | null>['settings']): TooltipContext['seriesData'][number] => ({
+            series: { key: 'r', label: 'Revenue', data: [1200], meta: { settings } },
+            value: 1200,
+            color: '#000000',
+        })
+
+        it('enables a pinnable tooltip', () => {
+            const config = buildSqlTooltipConfig({}, [ySeries('a', [1])])
+            expect(config.enabled).toBe(true)
+            expect(config.pinnable).toBe(true)
+        })
+
+        it('formats each row with its own column settings from series.meta', () => {
+            const config = buildSqlTooltipConfig({}, [ySeries('a', [1])])
+            const format = config.valueFormatter!
+            expect(format(1200, entry({ formatting: { prefix: '$' } }))).toBe('$1200')
+        })
+
+        it.each([
+            ['shows the total row by default', {}, true],
+            ['shows the total row when showTotalRow is true', { showTotalRow: true }, true],
+            ['hides the total row when showTotalRow is false', { showTotalRow: false }, false],
+        ])('%s', (_name, chartSettings, expected) => {
+            expect(buildSqlTooltipConfig(chartSettings as ChartSettings, []).showTotal).toBe(expected)
+        })
+
+        it('formats the total with the first series settings', () => {
+            const config = buildSqlTooltipConfig({}, [ySeries('revenue', [1], { formatting: { prefix: '$' } })])
+            const formatTotal = config.totalFormatter!
+            expect(formatTotal(5000)).toBe('$5000')
+        })
+
+        it('formats the total with the first non-percent column, not a leading percent column', () => {
+            // A percent column is excluded from the total sum, so borrowing its style would render
+            // a sum of counts as e.g. "15,061.4%".
+            const config = buildSqlTooltipConfig({}, [
+                ySeries('growth', [2.4], { formatting: { style: 'percent' } }),
+                ySeries('revenue', [1], { formatting: { prefix: '$' } }),
+            ])
+            expect(config.totalFormatter!(15059)).toBe('$15059')
+        })
+
+        it('formats the total with the first column in the sum, skipping an excluded column', () => {
+            const config = buildSqlTooltipConfig({}, [
+                ySeries('target', [1], { display: { excludeFromTotal: true }, formatting: { suffix: ' goal' } }),
+                ySeries('revenue', [1], { formatting: { prefix: '$' } }),
+            ])
+            expect(config.totalFormatter!(15059)).toBe('$15059')
+        })
+    })
+
+    describe('buildLineChartConfig', () => {
+        const dateXData: AxisSeries<string> = {
+            column: { name: 'day', type: { name: 'DATE', isNumerical: false }, label: 'day', dataIndex: 0 },
+            data: ['2024-01-01', '2024-01-02'],
+        }
+        const stringXData: AxisSeries<string> = {
+            column: { name: 'name', type: { name: 'STRING', isNumerical: false }, label: 'name', dataIndex: 0 },
+            data: ['a', 'b'],
+        }
+
+        it('passes the timezone for date axes', () => {
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings: {}, timezone: 'UTC' })
+            expect(config.xAxis?.timezone).toBe('UTC')
+        })
+
+        it.each(['YYYY-MM-DD', 'MMM YYYY', 'DD/MM/YYYY'])(
+            'formats date ticks with %s without changing their values',
+            (format) => {
+                const config = buildLineChartConfig({
+                    xData: dateXData,
+                    chartSettings: { xAxisDateFormat: format },
+                    timezone: 'America/Los_Angeles',
+                })
+                const expected = { 'YYYY-MM-DD': '2026-01-01', 'MMM YYYY': 'Jan 2026', 'DD/MM/YYYY': '01/01/2026' }
+                expect(config.xAxis?.tickFormatter?.('2026-01-01', 0)).toBe(expected[format as keyof typeof expected])
+                const hidden = buildLineChartConfig({
+                    xData: dateXData,
+                    chartSettings: { xAxisLabel: 'Date', showXAxisTicks: false, xAxisDateFormat: format },
+                    timezone: 'UTC',
+                })
+                expect(hidden.xAxis?.label).toBe('Date')
+                expect(hidden.xAxis?.hide).toBe(false)
+                expect(hidden.xAxis?.tickFormatter?.('2026-01-01', 0)).toBe('')
+            }
+        )
+
+        it('omits the timezone for non-date axes', () => {
+            const config = buildLineChartConfig({ xData: stringXData, chartSettings: {}, timezone: 'UTC' })
+            expect(config.xAxis?.timezone).toBeUndefined()
+            expect(config.xAxis?.tickLabelRotation).toBeUndefined()
+        })
+
+        it('maps logarithmic scale and y-axis settings', () => {
+            const chartSettings: ChartSettings = {
+                leftYAxisSettings: { label: 'Count', scale: 'logarithmic', showGridLines: false, showTicks: false },
+            }
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings, timezone: 'UTC' })
+            expect(config.yAxis).toMatchObject({ label: 'Count', scale: 'log', showGrid: false, hide: false })
+        })
+
+        it('defaults to a linear scale with grid shown', () => {
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings: {}, timezone: 'UTC' })
+            expect(config.yAxis).toMatchObject({ scale: 'linear', showGrid: true })
+        })
+
+        it('keeps a single-object yAxis when no series targets the right axis', () => {
+            const ySeriesData = [ySeries('a', [1, 2]), ySeries('b', [3, 4])]
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings: {}, timezone: 'UTC', ySeriesData })
+            expect(Array.isArray(config.yAxis)).toBe(false)
+        })
+
+        it.each([
+            ['leaves showAxisLines unset when both borders are on (app style default applies)', {}, undefined],
+            [
+                'turns off the x axis line when showXAxisBorder is off',
+                { showXAxisBorder: false },
+                { x: false, y: true },
+            ],
+            [
+                'turns off the y axis line when showYAxisBorder is off',
+                { showYAxisBorder: false },
+                { x: true, y: false },
+            ],
+        ])('%s', (_name, chartSettings, expected) => {
+            const config = buildLineChartConfig({
+                xData: dateXData,
+                chartSettings: chartSettings as ChartSettings,
+                timezone: 'UTC',
+            })
+            expect(config.showAxisLines).toEqual(expected)
+        })
+
+        it('emits a per-axis array honoring each column settings when a series targets the right axis', () => {
+            const ySeriesData = [ySeries('a', [1, 2]), ySeries('b', [3, 4], { display: { yAxisPosition: 'right' } })]
+            const chartSettings: ChartSettings = {
+                leftYAxisSettings: { label: 'Left', scale: 'logarithmic' },
+                rightYAxisSettings: { label: 'Right', showGridLines: false },
+            }
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings, timezone: 'UTC', ySeriesData })
+            expect(config.yAxis).toEqual([
+                // Left is logarithmic, so startAtZero is omitted (no zero baseline on a log scale).
+                { id: 'left', position: 'left', label: 'Left', scale: 'log', showGrid: true, hide: false },
+                {
+                    id: 'right',
+                    position: 'right',
+                    label: 'Right',
+                    scale: 'linear',
+                    showGrid: false,
+                    hide: false,
+                    startAtZero: true,
+                },
+            ])
+        })
+
+        it('formats each gutter from a series on that axis and starts linear axes at zero', () => {
+            const config = buildLineChartConfig({
+                xData: dateXData,
+                chartSettings: {},
+                timezone: 'UTC',
+                ySeriesData: [
+                    ySeries('revenue', [1200, 1400], { formatting: { prefix: '$' } }),
+                    ySeries('conversion', [12, 18], {
+                        formatting: { suffix: '%' },
+                        display: { yAxisPosition: 'right' },
+                    }),
+                ],
+            })
+            const yAxis = config.yAxis as YAxisConfig[]
+            expect(Array.isArray(yAxis)).toBe(true)
+            expect(yAxis[0].tickFormatter?.(1200)).toBe('$1200')
+            expect(yAxis[1].tickFormatter?.(18)).toBe('18%')
+            expect(yAxis[0].startAtZero).toBe(true)
+        })
+
+        it('formats single-axis ticks from the first series column and defaults startAtZero on', () => {
+            const config = buildLineChartConfig({
+                xData: dateXData,
+                chartSettings: {},
+                timezone: 'UTC',
+                ySeriesData: [ySeries('revenue', [1200], { formatting: { prefix: '$', style: 'short' } })],
+            })
+            const yAxis = config.yAxis as YAxisConfig
+            // Same path the tooltip uses, so ticks and tooltip read identically.
+            expect(yAxis.tickFormatter?.(1200)).toBe(`$${compactNumber(1200)}`)
+            expect(yAxis.startAtZero).toBe(true)
+        })
+
+        it.each([
+            ['honors an explicit startAtZero=false', { leftYAxisSettings: { startAtZero: false } }, false],
+            ['falls back to the deprecated yAxisAtZero', { yAxisAtZero: false }, false],
+        ])('%s on the left axis', (_name, chartSettings, expected) => {
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings, timezone: 'UTC' })
+            expect((config.yAxis as YAxisConfig).startAtZero).toBe(expected)
+        })
+
+        it('leaves startAtZero unset on a logarithmic axis (no zero baseline to drop)', () => {
+            const config = buildLineChartConfig({
+                xData: dateXData,
+                chartSettings: { leftYAxisSettings: { scale: 'logarithmic' } },
+                timezone: 'UTC',
+            })
+            expect((config.yAxis as YAxisConfig).startAtZero).toBeUndefined()
+        })
+
+        it.each([
+            ['shows', true, true],
+            ['hides', false, false],
+            ['hides by default', undefined, false],
+        ])('%s the built-in legend from showLegend', (_name, showLegend, expected) => {
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings: { showLegend }, timezone: 'UTC' })
+            expect(config.legend).toEqual({ show: expected, position: 'top', interactive: true })
+        })
+
+        it.each([
+            ['defaults to the top', undefined, 'top'],
+            ['follows legendPosition', 'bottom', 'bottom'],
+        ] as const)('%s for the legend position', (_name, legendPosition, expected) => {
+            const config = buildLineChartConfig({
+                xData: dateXData,
+                chartSettings: { showLegend: true, legendPosition },
+                timezone: 'UTC',
+            })
+            expect(config.legend?.position).toBe(expected)
+        })
+
+        it('forwards legendRenderItem, which carries the row right-click menu', () => {
+            const legendRenderItem = jest.fn()
+            const config = buildLineChartConfig({
+                xData: dateXData,
+                chartSettings: { showLegend: true },
+                timezone: 'UTC',
+                legendRenderItem,
+            })
+            expect(config.legend?.renderItem).toBe(legendRenderItem)
+        })
+
+        it('wires goalLines through schemaGoalLinesToConfigs', () => {
+            const goalLines: GoalLine[] = [{ label: 'Target', value: 100 }]
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings: {}, timezone: 'UTC', goalLines })
+            expect(config.goalLines).toHaveLength(1)
+            expect(config.goalLines?.[0]).toMatchObject({ value: 100, label: 'Target' })
+        })
+
+        it.each<[string, SqlLineYSeries[] | undefined, boolean]>([
+            ['no series opts in', [ySeries('a', [1])], false],
+            ['a series opts in', [ySeries('a', [1], { display: { valueLabels: 'show' } })], true],
+        ])('with showValuesOnSeries off, builds value labels only when %s', (_name, ySeriesData, enabled) => {
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings: {}, timezone: 'UTC', ySeriesData })
+            expect(config.valueLabels !== undefined).toBe(enabled)
+        })
+
+        it('formats each value label from its own series column when showValuesOnSeries is set', () => {
+            const config = buildLineChartConfig({
+                xData: dateXData,
+                chartSettings: {
+                    showValuesOnSeries: true,
+                    valueLabelColor: '#111827',
+                    valueLabelBackgroundColor: '#fde68a',
+                },
+                timezone: 'UTC',
+                ySeriesData: [
+                    ySeries('revenue', [1200], { formatting: { prefix: '$' } }),
+                    ySeries('conversion', [12], { formatting: { suffix: '%' } }),
+                ],
+            })
+            expect(config.valueLabels).toEqual(
+                expect.objectContaining({
+                    formatter: expect.any(Function),
+                    color: '#111827',
+                    backgroundColor: '#fde68a',
+                })
+            )
+            const formatter = (config.valueLabels as ValueLabelsConfig).formatter!
+            const ctx = (rawValue: number): ValueLabelContext => ({
+                rawValue,
+                bandValues: [rawValue],
+                previousBandValues: [],
+                isPercent: false,
+            })
+            // The label reads context.rawValue (not the percent-fraction `value` arg) with each series' settings.
+            expect(formatter(0, 0, 0, ctx(1200))).toBe('$1200')
+            expect(formatter(0, 1, 0, ctx(12))).toBe('12%')
+        })
+
+        it.each<[string, SqlLineYSeries[], TrendLineConfig[]]>([
+            [
+                'wires trend lines from series that opt in, keyed to match buildSeries',
+                [ySeries('a', [1, 2], { display: { trendLine: true } }), ySeries('b', [3, 4])],
+                [{ seriesKey: 'a-0', kind: 'linear' }],
+            ],
+            ['omits trend lines when no series opts in', [ySeries('a', [1, 2]), ySeries('b', [3, 4])], []],
+        ])('%s', (_name, ySeriesData, expected) => {
+            const config = buildLineChartConfig({ xData: dateXData, chartSettings: {}, timezone: 'UTC', ySeriesData })
+            expect(config.trendLines).toEqual(expected)
+        })
+    })
+
+    describe('buildBarChartConfig', () => {
+        const dateXData: AxisSeries<string> = {
+            column: { name: 'day', type: { name: 'DATE', isNumerical: false }, label: 'day', dataIndex: 0 },
+            data: ['2024-01-01', '2024-01-02'],
+        }
+        const datetimeXData: AxisSeries<string> = {
+            column: {
+                name: 'timestamp',
+                type: { name: 'DATETIME', isNumerical: false },
+                label: 'timestamp',
+                dataIndex: 0,
+            },
+            data: ['2024-01-01T00:00:00Z', '2024-01-02T00:00:00Z'],
+        }
+        const stringXData: AxisSeries<string> = {
+            column: { name: 'path', type: { name: 'STRING', isNumerical: false }, label: 'path', dataIndex: 0 },
+            data: ['/api/projects/alpha', '/api/projects/beta'],
+        }
+
+        it.each([
+            ['non-date', stringXData, -45],
+            ['date', dateXData, undefined],
+            ['datetime', datetimeXData, undefined],
+        ])('sets fixed tick rotation only for %s category axes', (_name, xData, expected) => {
+            const config = buildBarChartConfig({
+                xData,
+                chartSettings: {},
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+            })
+
+            expect(config.xAxis?.tickLabelRotation).toBe(expected)
+            expect(config.maxCategoryLabelWidth).toBe(MAX_CATEGORY_LABEL_WIDTH)
+        })
+
+        it('forces a linear y-axis scale for percent-stacked bars', () => {
+            const chartSettings: ChartSettings = {
+                stackBars100: true,
+                leftYAxisSettings: { scale: 'logarithmic' },
+            }
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings,
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsStackedBar,
+            })
+            expect((config.yAxis as YAxisConfig)?.scale).toBe('linear')
+        })
+
+        it.each<[string, ChartDisplayType, ChartSettings, boolean]>([
+            [
+                'enables divergingStack for stacked bars so negatives render below zero',
+                ChartDisplayType.ActionsStackedBar,
+                {},
+                true,
+            ],
+            [
+                'disables divergingStack for percent-stacked bars',
+                ChartDisplayType.ActionsStackedBar,
+                { stackBars100: true },
+                false,
+            ],
+            ['disables divergingStack for grouped bars', ChartDisplayType.ActionsBar, {}, false],
+        ])('%s', (_name, visualizationType, chartSettings, expected) => {
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings,
+                timezone: 'UTC',
+                visualizationType,
+                ySeriesData: [ySeries('a', [1, -2])],
+            })
+            expect(config.divergingStack).toBe(expected)
+        })
+
+        it('formats y-axis ticks with the first series column settings for plain bars', () => {
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings: {},
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+                ySeriesData: [ySeries('revenue', [1200], { formatting: { prefix: '$' } })],
+            })
+            expect((config.yAxis as YAxisConfig)?.tickFormatter?.(1200)).toBe('$1200')
+        })
+
+        it('skips the column tick formatter for percent-stacked bars (the axis is 0–100%)', () => {
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings: { stackBars100: true },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsStackedBar,
+                ySeriesData: [ySeries('revenue', [1200], { formatting: { prefix: '$' } })],
+            })
+            expect((config.yAxis as YAxisConfig)?.tickFormatter).toBeUndefined()
+        })
+
+        it('emits trend line config so TrendLineOverlay can render it', () => {
+            const ySeriesData = [ySeries('a', [1, 2], { display: { trendLine: true } })]
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings: {},
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+                ySeriesData,
+            })
+            expect(config.trendLines?.length).toBeGreaterThan(0)
+        })
+
+        it('skips trend lines for percent-stacked bars, where they would render off-scale', () => {
+            const ySeriesData = [ySeries('a', [1, 2], { display: { trendLine: true } })]
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings: { stackBars100: true },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsStackedBar,
+                ySeriesData,
+            })
+            expect(config.trendLines).toEqual([])
+        })
+
+        it('maps the axis-border toggles to per-edge showAxisLines for bars', () => {
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings: { showXAxisBorder: false },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+            })
+            expect(config.showAxisLines).toEqual({ x: false, y: true })
+        })
+
+        it('builds the shared SQL tooltip so bars honor showTotalRow and per-column formatting', () => {
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings: { showTotalRow: false },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+                ySeriesData: [ySeries('a', [1]), ySeries('b', [2])],
+            })
+            expect(config.tooltip).toMatchObject({ showTotal: false })
+            expect(config.tooltip!.valueFormatter).toBeInstanceOf(Function)
+        })
+
+        it('emits a per-axis array with forceLinear threaded through both gutters when a series targets the right axis', () => {
+            const ySeriesData = [ySeries('a', [1, 2]), ySeries('b', [3, 4], { display: { yAxisPosition: 'right' } })]
+            const config = buildBarChartConfig({
+                xData: dateXData,
+                chartSettings: { stackBars100: true, leftYAxisSettings: { scale: 'logarithmic' } },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsStackedBar,
+                ySeriesData,
+            })
+            // forceLinear (percent layout) overrides the logarithmic setting on both gutters.
+            expect(config.yAxis).toMatchObject([
+                { id: 'left', position: 'left', scale: 'linear' },
+                { id: 'right', position: 'right', scale: 'linear' },
+            ])
+        })
+    })
+
+    describe('buildBarValueChartConfig', () => {
+        const xData: AxisSeries<string> = {
+            column: { name: 'path', type: { name: 'STRING', isNumerical: false }, label: 'path', dataIndex: 0 },
+            data: ['/pricing', '/signup'],
+        }
+
+        it('maps SQL category and value settings onto horizontal chart axes', () => {
+            const config = buildBarValueChartConfig({
+                xData,
+                chartSettings: {
+                    xAxisLabel: 'Page',
+                    showXAxisTicks: false,
+                    showXAxisBorder: false,
+                    leftYAxisSettings: { label: 'Revenue', showTicks: false },
+                },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBarValue,
+                ySeriesData: [ySeries('revenue', [1200, 1800], { formatting: { prefix: '$' } })],
+                goalLines: [{ label: 'Target', value: 2000 }],
+                series: buildSeries(
+                    [ySeries('revenue', [1200, 1800], { formatting: { prefix: '$' } })],
+                    ChartDisplayType.ActionsBarValue
+                ),
+                embedded: true,
+            })
+
+            expect(config).toMatchObject({
+                axisOrientation: 'horizontal',
+                barLayout: 'grouped',
+                hideXAxis: false,
+                hideYAxis: false,
+                xAxisLabel: 'Revenue',
+                yAxisLabel: 'Page',
+                showAxisLines: { x: true, y: false },
+                maxCategoryLabelWidth: MAX_CATEGORY_LABEL_WIDTH,
+                bars: { fitToHeight: true, valueDomain: { include: [2000] } },
+            })
+            expect(config.xTickFormatter!('0', 0)).toBe('')
+            expect(config.yTickFormatter!(1200)).toBe('')
+            expect(config.tooltip!.labelFormatter!('1')).toBe('/signup')
+            expect(config.referenceLines).toEqual([
+                expect.objectContaining({ label: 'Target', value: 2000, axisOrientation: 'horizontal' }),
+            ])
+        })
+
+        it.each([true, false])('keeps custom date tooltip headings with ticks %s', (showXAxisTicks) => {
+            const config = buildBarValueChartConfig({
+                xData: {
+                    column: { name: 'date', type: { name: 'DATE', isNumerical: false }, label: 'date', dataIndex: 0 },
+                    data: ['2024-01-01'],
+                },
+                chartSettings: { showXAxisTicks, xAxisDateFormat: 'MMM YYYY' },
+                timezone: 'America/Los_Angeles',
+                visualizationType: ChartDisplayType.ActionsBarValue,
+            })
+            expect(config.xTickFormatter!('0', 0)).toBe(showXAxisTicks ? 'Jan 2024' : '')
+            expect(config.tooltip!.labelFormatter!('0')).toBe('Jan 2024')
+        })
+
+        it.each([
+            { category: null, label: '0', expected: '[No value]' },
+            { category: undefined, label: '0', expected: '[No value]' },
+            { category: 42, label: '0', expected: '42' },
+            { category: '/pricing', label: 'invalid', expected: 'invalid' },
+        ])('formats $expected when a category is $category', ({ category, label, expected }) => {
+            const config = buildBarValueChartConfig({
+                xData: { ...xData, data: [category] as unknown as string[] },
+                chartSettings: {},
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBarValue,
+            })
+
+            expect(config.xTickFormatter!(label, 0)).toBe(expected)
+            expect(config.tooltip!.labelFormatter!(label)).toBe(expected)
+        })
+    })
+
+    describe('buildComboChartConfig', () => {
+        const dateXData: AxisSeries<string> = {
+            column: { name: 'day', type: { name: 'DATE', isNumerical: false }, label: 'day', dataIndex: 0 },
+            data: ['2024-01-01', '2024-01-02'],
+        }
+
+        it.each([
+            ['grouped bars for a bar graph', ChartDisplayType.ActionsBar, 'grouped'],
+            ['stacked bars for a stacked bar graph', ChartDisplayType.ActionsStackedBar, 'stacked'],
+            ['grouped bars for a line graph', ChartDisplayType.ActionsLineGraph, 'grouped'],
+        ])('uses %s', (_name, visualizationType, expected) => {
+            const config = buildComboChartConfig({
+                xData: dateXData,
+                chartSettings: {},
+                timezone: 'UTC',
+                visualizationType,
+            })
+            expect(config.barLayout).toBe(expected)
+        })
+
+        it.each<[string, ChartDisplayType, ChartSettings, boolean]>([
+            [
+                'enables divergingStack for stacked bars so negatives render below zero',
+                ChartDisplayType.ActionsStackedBar,
+                {},
+                true,
+            ],
+            [
+                'disables divergingStack for percent-stacked bars',
+                ChartDisplayType.ActionsStackedBar,
+                { stackBars100: true },
+                false,
+            ],
+            ['disables divergingStack for grouped bars', ChartDisplayType.ActionsBar, {}, false],
+        ])('%s', (_name, visualizationType, chartSettings, expected) => {
+            const config = buildComboChartConfig({
+                xData: dateXData,
+                chartSettings,
+                timezone: 'UTC',
+                visualizationType,
+                ySeriesData: [ySeries('a', [1, -2])],
+            })
+            expect(config.divergingStack).toBe(expected)
+        })
+
+        it('maps the axis-border toggles to per-edge showAxisLines for combo', () => {
+            const config = buildComboChartConfig({
+                xData: dateXData,
+                chartSettings: { showYAxisBorder: false },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+            })
+            expect(config.showAxisLines).toEqual({ x: true, y: false })
+        })
+
+        it('wires goal lines, legend, and the date x-axis timezone', () => {
+            const config = buildComboChartConfig({
+                xData: dateXData,
+                chartSettings: { showLegend: true },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+                goalLines: [{ label: 'Target', value: 100 }],
+            })
+            expect(config.xAxis?.timezone).toBe('UTC')
+            expect(config.goalLines).toHaveLength(1)
+            expect(config.legend).toEqual({ show: true, position: 'top', interactive: true })
+            expect(config.tooltip).toMatchObject({ enabled: true, pinnable: true })
+        })
+
+        it('emits trendLines config (TrendLineOverlay renders them on combo charts)', () => {
+            const config = buildComboChartConfig({
+                xData: dateXData,
+                chartSettings: {},
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+            })
+            expect('trendLines' in config).toBe(true)
+        })
+
+        it('skips trend lines for percent-stacked bars, where they would render off-scale', () => {
+            const ySeriesData = [ySeries('a', [1, 2], { display: { trendLine: true } })]
+            const config = buildComboChartConfig({
+                xData: dateXData,
+                chartSettings: { stackBars100: true },
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsStackedBar,
+                ySeriesData,
+            })
+            expect(config.trendLines).toEqual([])
+        })
+
+        it('honors leftYAxisSettings for the single y-axis', () => {
+            const chartSettings: ChartSettings = {
+                leftYAxisSettings: { label: 'Combo Left', scale: 'logarithmic', showGridLines: false },
+            }
+            const config = buildComboChartConfig({
+                xData: dateXData,
+                chartSettings,
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+            })
+            expect(config.yAxis).toEqual({ label: 'Combo Left', scale: 'log', showGrid: false, hide: false })
+        })
+
+        it('emits a per-axis array when a series targets the right axis', () => {
+            const ySeriesData = [ySeries('a', [1, 2]), ySeries('b', [3, 4], { display: { yAxisPosition: 'right' } })]
+            const config = buildComboChartConfig({
+                xData: dateXData,
+                chartSettings: {},
+                timezone: 'UTC',
+                visualizationType: ChartDisplayType.ActionsBar,
+                ySeriesData,
+            })
+            expect(config.yAxis).toMatchObject([
+                { id: 'left', position: 'left' },
+                { id: 'right', position: 'right' },
+            ])
+        })
+    })
+})

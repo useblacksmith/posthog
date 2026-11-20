@@ -1,0 +1,166 @@
+# Team Scoping
+
+Fail-closed team scoping for Django models. Queries without team context raise `TeamScopeError` instead of silently returning all rows.
+
+This is a defense-in-depth convenience layer, not a complete security boundary. Django's `_base_manager` bypasses custom managers for related-object access, and raw SQL bypasses the ORM entirely. Use this alongside explicit team checks at the API layer.
+
+Related: [#47073](https://github.com/PostHog/posthog/pull/47073), [#50899](https://github.com/PostHog/posthog/pull/50899)
+
+## The contract
+
+A ContextVar holds the **canonical** team_id — the parent team's id when the team is a child environment, the team's own id otherwise. Reads filter by it. Writes through `ProductTeamModel.save()` rewrite child team_ids to canonical (mirror of `RootTeamMixin.save()` for main-DB models). No context = exception.
+
+`team_scope()` / `with_team_scope()` / `for_team()` auto-resolve to canonical by default — one Team lookup per scope entry, much cheaper than per-query resolution and removes the silent-zero-rows footgun where `with team_scope(child_id):` would scope reads to a child id with no data. Pass `canonical=True` to skip resolution when the caller already has the canonical id (or in tests with synthetic ids).
+
+## Where context gets set
+
+- **DRF nested views** — `TeamAndOrgViewSetMixin.initial()` sets it from the URL `self.team_id` (the team being acted on, not the user's "current" team). Reuses `self.team.parent_team_id` if cached by permission checks for free.
+  The scope then remembers that it was resolved from the URL team id, so `resolve_effective_team_id()` returns the canonical id for that id without a query. `for_team()`, `team_scope()` and `ProductTeamModel.save()` all go through it.
+- **Celery tasks** — `@with_team_scope()` decorator extracts a `team_id` parameter from the task signature.
+- **Management commands / ad-hoc scripts** — `with team_scope(team_id):` block.
+
+There is no middleware fallback. The original POC (#46874) had one defaulting to `user.current_team_id`, but that value is a UI preference and can drift from the team being acted on — using it as a silent default is exactly the bug class this framework is meant to prevent. Non-DRF code paths must opt in.
+
+## Usage
+
+```python
+# DRF view — context set automatically from the URL
+Repo.objects.all()                       # filtered to canonical team
+
+# no context — raises TeamScopeError
+Repo.objects.all()                       # ← boom
+
+# explicit cross-team escape hatch (queryset method)
+Repo.objects.unscoped().all()            # no filtering, no error
+
+# explicit scope to one team (auto-resolves to canonical)
+Repo.objects.for_team(team_id)
+
+# bulk over many teams — pre-resolve once, skip per-call lookup
+canonical_ids = [resolve_effective_team_id(t.id) for t in teams]
+for cid in canonical_ids:
+    Repo.objects.for_team(cid, canonical=True).count()
+
+# background scope block (auto-resolves)
+with team_scope(team_id):
+    Repo.objects.all()
+
+# celery task — same auto-resolve, applied via decorator
+from celery import shared_task
+from posthog.models.scoping import with_team_scope
+
+@shared_task
+@with_team_scope()
+def my_task(team_id: int):
+    Repo.objects.all()
+```
+
+## Fetch mode
+
+Scoped querysets use `FETCH_RELATION_PEERS`, a variant of Django's `FETCH_PEERS` fetch mode.
+When code reads a relation that a row has not loaded, Django loads it for every row from the same query, in one query.
+A loop that reads `run.repo` on each of N rows costs 2 queries, not N + 1.
+The batch covers every row the query returned, so a loop that reads one row and stops still loads the relation for all of them.
+Slice the queryset when you only need the first rows.
+
+Deferred fields from `.only()` and `.defer()` still load one row at a time.
+Django's batched load of a deferred field overwrites values already assigned on other rows, and fails when another row has been deleted.
+
+`.iterator()` and `.aiterator()` use `FETCH_ONE`.
+A streamed query shares one peer list across all its rows, so `FETCH_PEERS` would scan a growing list on each read.
+Use `select_related()` in a streamed loop that reads a relation.
+
+To opt out, call `.fetch_mode(models.FETCH_ONE)` on the queryset.
+
+### In tests
+
+Under pytest, scoped querysets use `FETCH_RAISE_ON_PEERS` instead.
+A lazy load on a row from a multi-row query raises `FieldFetchBlocked`, because without the batch it costs one query per row.
+The error names the model, the field, and the fix: `select_related()` or `prefetch_related()` for a relation, `only()` for a deferred field.
+A row from `.get()`, `.first()` or a one-row result still loads lazily.
+
+Django fetch modes cover forward foreign keys, one-to-one fields in both directions, generic foreign keys and deferred fields.
+They do not cover reverse foreign key or many-to-many managers such as `flag.experiments.all()`, so use `prefetch_related()` and an `assertNumQueries` test for those.
+
+If app code catches the `FieldFetchBlocked`, the root `conftest.py` still fails the test that made the load.
+
+Fix a failure with `select_related()`, `prefetch_related()` or `only()`.
+To keep production batching on purpose, set `.fetch_mode(FETCH_RELATION_PEERS)` on the queryset that loads the rows.
+
+## Adoption
+
+### New main-DB model
+
+Use `TeamScopedRootMixin` as the abstract base. It bundles `RootTeamMixin` (canonical-team save() rewrite) with `objects = TeamScopedManager()`. Subclasses still declare their own `team` FK so cascade behavior stays per-model.
+
+```python
+from posthog.models.scoping.root_mixin import TeamScopedRootMixin
+
+class Campaign(TeamScopedRootMixin):
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE)
+    name = models.CharField(max_length=255)
+```
+
+`hogli product:bootstrap` scaffolds new products with the correct fail-closed base automatically — `ProductTeamModel` for separate-DB products, `TeamScopedRootMixin` for main-DB products. CI enforces it: any new team-scoped model on a non-fail-closed manager (i.e., not in `posthog/models/scoping/baseline_unmigrated.txt`) fails `check-idor-model-coverage.py`.
+
+### New product on a separate database
+
+Use `ProductTeamModel` as the abstract base. It declares `team_id` as a `BigIntegerField` (no FK, since cross-DB FKs aren't supported), wires `objects = TeamScopedManager()`, and overrides `save()` to rewrite to canonical.
+
+```python
+from posthog.models.scoping.product_mixin import ProductTeamModel
+
+class Repo(ProductTeamModel):
+    repo_name = models.CharField(max_length=255)
+    # team_id inherited — BigIntegerField, indexed, no FK
+```
+
+### Migrating an existing main-DB model
+
+Existing models on plain `RootTeamMixin` are tracked in `baseline_unmigrated.txt`. To migrate one:
+
+```python
+class FeatureFlag(TeamScopedRootMixin):          # was RootTeamMixin — adds enforcement
+    team = models.ForeignKey("posthog.Team", ...)
+```
+
+Then audit every call site to either be inside team scope or use `.unscoped()`, and regenerate the baseline:
+
+```bash
+python .github/scripts/check-idor-model-coverage.py --regenerate-baseline
+```
+
+The migrated model drops out of `baseline_unmigrated.txt` automatically (introspection sees the new manager). The manager class is the same for both worlds — `TeamScopedRootMixin`, `ProductTeamModel`, and ad-hoc `objects = TeamScopedManager()` declarations all read the same ContextVar.
+
+### Celery tasks against models still on RootTeamManager
+
+`RootTeamManager`-backed models don't read the ContextVar, so `@with_team_scope` adds nothing — but the semgrep rule `celery-task-team-scope-audit` flags any unscoped `Model.objects.X` in a Celery task. For tasks that legitimately don't need scope (model still on the older manager, or genuinely cross-team), tag the task with the no-op marker:
+
+```python
+from posthog.scoping_audit import skip_team_scope_audit
+
+@shared_task
+@skip_team_scope_audit  # FeatureFlag still uses RootTeamManager
+def my_task():
+    FeatureFlag.objects.filter(...).delete()
+```
+
+Remove the marker once the underlying model migrates to `TeamScopedManager`. The decorator lives at `posthog.scoping_audit` (not `posthog.models.scoping`) so it can be imported at module load by Celery task files without triggering Django's app registry — see the file's docstring for the load-order story.
+
+## Bypass managers
+
+Two surfaces to opt out of scoping, named distinctly to avoid an autocomplete trap:
+
+- `Model.objects.unscoped()` — queryset method on the scoped manager. Returns a fresh `TeamScopedQuerySet` with no filter applied. Use this for "I want to query across teams in this one place" within normal request lifecycle code.
+- `Model.all_teams` — second plain `Manager` declared on `ProductTeamModel`. Use this for code that runs _outside_ the request lifecycle (admin classes, migrations, manage.py commands) where setting context with `team_scope(...)` is awkward.
+
+The two are deliberately not the same name. A future contributor autocompleting `Model.unscoped.filter(...)` thinking they're being explicit about scoping would otherwise silently get every team's rows back.
+
+## Known limitations
+
+- **Django framework managers (`_default_manager` and `_base_manager`)**: admin queryset, `ForeignKeyRawIdWidget` label rendering, related-object access (e.g. `repo.runs.all()`), generic relations, `prefetch_related`, and DRF default querysets all go through these.
+  Per Django's contract they expect an unfiltered manager — `TeamScopedManager` would raise on missing context.
+  `ProductTeamModel.Meta.default_manager_name = "all_teams"` redirects `_default_manager` (and `_base_manager`, which inherits from `_default_manager` when `base_manager_name` is unset) to the unscoped `all_teams` manager so the framework just works.
+  `Model.objects` (the explicit attribute) stays bound to `TeamScopedManager` — user code that types it explicitly stays fail-closed.
+  The `team_id` filter is not applied on these framework paths; related-object traversal stays correct because the FK already constrains the result set, but anything reading through `_default_manager` is genuinely cross-team.
+- **Raw SQL**: `cursor.execute()` and `QuerySet.raw()` bypass managers entirely.

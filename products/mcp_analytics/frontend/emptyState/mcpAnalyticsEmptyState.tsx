@@ -1,0 +1,60 @@
+import * as puzzlePng from '@posthog/brand/hoggies/png/puzzle'
+import { IconMCP } from '@posthog/icons'
+
+import { pngHoggie } from 'lib/brand/hoggies'
+import type { SceneProductEmptyState } from 'lib/components/ProductEmptyState/types'
+import { FEATURE_FLAGS } from 'lib/constants'
+
+import { ProductKey } from '~/queries/schema/schema-general'
+
+import { mcpAnalyticsOnboardingLogic } from '../mcpAnalyticsOnboardingLogic'
+import { MCP_ANALYTICS_DOCS_URL, MCPListeningIndicator } from '../onboarding/MCPAnalyticsInstall'
+import { MCPAnalyticsSetupActions } from './MCPAnalyticsSetupActions'
+import { MCPSetupCard } from './MCPSetupCard'
+import { MCPSetupSidebar } from './MCPSetupSidebar'
+import { MCPToolCallPreview } from './MCPToolCallPreview'
+
+const HedgehogPuzzle = pngHoggie(puzzlePng)
+
+export const mcpAnalyticsEmptyState: SceneProductEmptyState = {
+    statusLogic: mcpAnalyticsOnboardingLogic,
+    config: {
+        productKey: ProductKey.MCP_ANALYTICS,
+        productName: 'MCP analytics',
+        icon: <IconMCP />,
+        accentColor: 'var(--color-product-mcp-analytics-light)',
+        accentColorDark: 'var(--color-product-mcp-analytics-dark)',
+        hedgehog: HedgehogPuzzle,
+        text: {
+            'needs-setup': {
+                headline: 'Know how agents actually use your tools',
+                lead: 'Capture every MCP tool call, argument and result, so you can see which tools agents reach for, where they fail, and how long each call takes.',
+                hint: 'Run Wizard in the repository containing your MCP server. The setup agent installs analytics for you:',
+            },
+            'waiting-for-data': {
+                headline: "You're connected. Now make a tool call",
+                lead: "We've seen your MCP server connect, but it hasn't handled a tool call yet. Trigger a tool from your agent and this page fills in on its own.",
+                hint: 'Instrumenting another server? Re-run setup:',
+            },
+        },
+        wizard: { slug: 'mcp-analytics', pinProjectId: true },
+        SetupActions: MCPAnalyticsSetupActions,
+        docsUrl: MCP_ANALYTICS_DOCS_URL,
+        manualSetupUrl: 'https://posthog.com/docs/mcp-analytics/installation',
+        previewLabel: 'Tool calls, once connected',
+        Preview: MCPToolCallPreview,
+        statusIndicator: <MCPListeningIndicator />,
+        featureFlagOverrides: {
+            [FEATURE_FLAGS.MCP_ANALYTICS_SETUP_MODE]: {
+                // The how-it-works sidebar already has its hedgehog.
+                hedgehog: undefined,
+                SetupActions: undefined,
+                SetupCard: MCPSetupCard,
+                // The setup card renders the indicator itself, as its footer.
+                statusIndicator: undefined,
+                previewLabel: undefined,
+                Preview: MCPSetupSidebar,
+            },
+        },
+    },
+}

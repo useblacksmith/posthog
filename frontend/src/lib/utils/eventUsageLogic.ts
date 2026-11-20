@@ -1,0 +1,2627 @@
+import { MakeLogicType, actions, connect, kea, listeners, path } from 'kea'
+import posthog from 'posthog-js'
+
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import type { IntegrationConnectSurface, IntegrationLinkExistingCounts } from 'lib/integrations/utils'
+import { TimeToSeeDataPayload } from 'lib/internalMetrics'
+import { preflightLogic } from 'lib/logic/preflightLogic'
+import { objectClean } from 'lib/utils/objects'
+import { retryImport } from 'lib/utils/retryImport'
+import { BillingUsageInteractionProps } from 'scenes/billing/types'
+import type { ExperimentWizardStepNavigation } from 'scenes/experiments/ExperimentWizard/experimentWizardLogic'
+import type { ExposureSource } from 'scenes/experiments/exposureContract'
+import { SharedMetric } from 'scenes/experiments/SharedMetrics/sharedMetricLogic'
+import { ProductTourEvent } from 'scenes/product-tours/constants'
+import { SURVEY_CREATED_SOURCE } from 'scenes/surveys/constants'
+import { userLogic } from 'scenes/userLogic'
+
+import {
+    getBreakdown,
+    getCompareFilter,
+    getDisplay,
+    getFormula,
+    getInterval,
+    getSeries,
+    queryUsesDataWarehouse,
+} from '~/queries/schema/node-accessors'
+import {
+    isBIVisualizationNode,
+    isActionsNode,
+    isAnyDataWarehouseNode,
+    isEventsNode,
+    isFunnelsQuery,
+    isInsightQueryNode,
+    isInsightVizNode,
+    isMetricsQuery,
+    isNodeWithSource,
+    isStickinessQuery,
+    isTrendsQuery,
+} from '~/queries/schema/node-guards'
+import {
+    Breakdown,
+    ExperimentFunnelsQuery,
+    ExperimentMetric,
+    ExperimentExposureNode,
+    ExperimentMetricSource,
+    ExperimentRetentionMetric,
+    ExperimentTrendsQuery,
+    InsightQueryNode,
+    isExperimentExposureNode,
+    isExperimentFunnelMetric,
+    isExperimentMeanMetric,
+    isExperimentQuantileMetric,
+    isExperimentRatioMetric,
+    isExperimentRetentionMetric,
+    Node,
+    NodeKind,
+} from '~/queries/schema/schema-general'
+import {
+    ChartDisplayType,
+    CohortType,
+    Experiment,
+    ExperimentHoldoutType,
+    ExperimentIdType,
+    ExperimentStatsMethod,
+    ProductTour,
+    PropertyFilterType,
+    InsightModel,
+    type SDK,
+} from '~/types'
+
+import { getExperimentStatus } from 'products/experiments/frontend/experimentStatus'
+
+import type { ExperimentMetricUnion } from '../../queries/schema/schema-general'
+import type { Realm, UserType } from '../../types'
+
+export enum DashboardEventSource {
+    LongPress = 'long_press',
+    MoreDropdown = 'more_dropdown',
+    DashboardHeaderDiscardChanges = 'dashboard_header_discard_changes',
+    DashboardHeaderExitFullscreen = 'dashboard_header_exit_fullscreen',
+    Hotkey = 'hotkey',
+    InputEnter = 'input_enter',
+    Toast = 'toast',
+    Browser = 'browser',
+    AddDescription = 'add_dashboard_description',
+    MainNavigation = 'main_nav',
+    DashboardsList = 'dashboards_list',
+    SceneCommonButtons = 'scene_common_buttons',
+    DashboardFilters = 'dashboard_filters',
+    DashboardInsightColorsModal = 'dashboard_insight_colors_modal',
+    DashboardVariableOverride = 'dashboard_variable_override',
+}
+
+export enum InsightEventSource {
+    LongPress = 'long_press',
+    MoreDropdown = 'more_dropdown',
+    InsightHeader = 'insight_header',
+    Hotkey = 'hotkey',
+    InputEnter = 'input_enter',
+    Toast = 'toast',
+    Browser = 'browser',
+    AddDescription = 'add_insight_description',
+}
+
+export enum GraphSeriesAddedSource {
+    Default = 'default',
+    Duplicate = 'duplicate',
+}
+
+/**
+ * How much of the experiment's recordings tab works for this viewer, captured once the session
+ * linkability and in-session availability checks have resolved. The exposure population is
+ * resolved server-side per person, so the list itself always has a source; an empty
+ * selectable-metric list is what still makes the tab a weaker page, and these numbers say how
+ * often that happens rather than how often the tab is opened. The scope and availability fields
+ * live here and not only on the opened-recording context, because a session whose list came back
+ * empty opens nothing, and empty lists are the outcome the in-session scope most affects.
+ */
+export interface ExperimentRecordingsTabContext {
+    /**
+     * What put the tab in the state it opened in, when it was not the viewer: 'results_button' or
+     * 'results_menu' for a results-table link. Null when the viewer opened the tab themselves,
+     * which is the ordinary case, so this is what separates the two populations in a report.
+     */
+    entry_point: string | null
+    /**
+     * Why the results row that opened this visit could not hand its metric to the tab, so the list
+     * shows every recording of the variant instead. Null on every other visit. Kept as a string
+     * rather than the scene's union so telemetry doesn't import from the scene.
+     */
+    metric_unavailable_reason: string | null
+    /**
+     * The experiment's status as the scene reads it, kept as a string rather than the scene's enum
+     * so telemetry doesn't import from the scene. A draft experiment never mounts the list at all,
+     * so without this a draft visit cannot be told from a visit whose list failed to arrive.
+     */
+    experiment_status: string
+    /**
+     * Why the tab stated the list was unavailable instead of mounting it, null when it mounted the
+     * list. One of the tab's `ExperimentRecordingsListUnavailableReason` codes, as a string for the
+     * same reason the other codes here are.
+     */
+    list_unavailable_reason: string | null
+    variant_count: number
+    metric_count: number
+    linkable_metric_count: number
+    /** Kept as a string rather than the tab's union so telemetry doesn't import from the scene. */
+    exposure_scope: string
+    /** Null when the availability check failed, so a transient error never reads as unavailable. */
+    in_session_available: boolean | null
+    in_session_unavailable_reason: string | null
+    in_session_uses_stamped_fallback: boolean | null
+    /** Whether the "What to watch" toggle was on the tab at all: the denominator for opening it. */
+    behavior_comparison_available: boolean
+    /** Why the toggle was shown disabled, null when it was usable. */
+    behavior_comparison_unavailable_reason: string | null
+}
+
+/** The facets the recordings list was narrowed by when a recording was opened from it. */
+export interface ExperimentRecordingsFilterContext {
+    variant: string | null
+    /** Kept as a string rather than the tab's union so telemetry doesn't import from the scene. */
+    exposure_scope: string
+    /** Kept as a string rather than the tab's union so telemetry doesn't import from the scene. */
+    metric_filter_mode: string
+    selected_metric_count: number
+    /** True when the list is a server-computed session set rather than client-side event filters. */
+    is_bucketed: boolean
+    /** The kind of the watch card whose recordings the list was narrowed to, null when none was.
+     * This is the success metric for the behavior comparison: opens it drove versus opens the
+     * plain list drove. */
+    watch_card_kind: string | null
+    /**
+     * What set these facets, when it was not the viewer: 'results_button' or 'results_menu' for a
+     * results-table link. Null once the viewer moves a facet themselves, so an empty list that a
+     * results row produced can be told from one somebody narrowed into by hand.
+     */
+    entry_point: string | null
+    /**
+     * Why the results row that opened this visit could not hand its metric to the tab, so the list
+     * shows every recording of the variant instead. Null on every other visit, and null once the
+     * viewer moves a facet themselves, for the same reason `entry_point` is. Kept as a string
+     * rather than the scene's union so telemetry doesn't import from the scene.
+     */
+    metric_unavailable_reason: string | null
+}
+
+/**
+ * What the recordings list came back with, and — when it came back with nothing — the cause the tab
+ * can name from what it already holds. A large share of tab visits show an empty list and nothing
+ * says why, so the facets are carried alongside `empty_reason` to tell a project with replay off
+ * apart from an experiment too young to have recordings, or a filter that matched nothing.
+ * Carries the same facets as `experiment recording opened`, so an empty list and an opened recording
+ * are comparable per facet.
+ */
+export interface ExperimentRecordingsListRenderedContext extends ExperimentRecordingsFilterContext {
+    result_count: number
+    /** Null when the list has rows. One of the tab's `ExperimentReplayListEmptyReason` values. */
+    empty_reason: string | null
+    /**
+     * The way out the empty state offered, null when its banner offered none. This follows
+     * `empty_reason` rather than the state of the tab: four reasons carry a way out of a narrowing,
+     * and the rest carry a link or nothing, so a variant that still narrows the list is not
+     * reported here when replay is off or the window expired. Null on a list with rows too, for the
+     * same reason `empty_reason` is. The values match `action` on `experiment recordings empty
+     * state action clicked`, so the two together size how often a viewer takes the way out against
+     * how often it is offered.
+     */
+    narrowing_action: string | null
+    /** Null when the experiment has not launched. */
+    days_since_start: number | null
+    /** Null while the experiment runs. */
+    days_since_end: number | null
+    /**
+     * The project's current replay retention setting, null when it has none. A recording expires on
+     * the period it was stored under, so this is the assumption `ended_past_retention` was decided
+     * on rather than proof of what expired.
+     */
+    retention_period: string | null
+    replay_opt_in: boolean
+    /**
+     * Whether any duration filter was applied. Replay applies a default floor to every list, so
+     * this is true on nearly every render and separates almost nothing. A dashboard tile reads it,
+     * so its meaning is frozen; the four properties below are what answers whether the floor is
+     * why the list came back empty.
+     */
+    duration_filter_active: boolean
+    /** Which duration the floor measures: `active_seconds`, `duration`, or `inactive_seconds`. */
+    duration_filter_key: string | null
+    /** The floor's threshold in seconds. */
+    duration_filter_seconds: number | null
+    /** `gt` for a floor, `lt` for a ceiling. The viewer can flip it in the playlist filter bar. */
+    duration_filter_operator: string | null
+    /**
+     * How many duration filters were applied. The three properties above describe the first, so a
+     * count above one says they describe part of the set rather than all of it.
+     */
+    duration_filter_count: number
+    /**
+     * Whether the applied filter differs from replay's default floor, which counts removing the
+     * filter as a difference. The three properties above are null when the viewer removed it.
+     */
+    duration_filter_customized: boolean
+    /**
+     * Whether the viewer narrowed the list past the tab's own scoping through the filter bar. This
+     * is the input that decides `filters_narrowed`, and the only filter-bar signal the rest of this
+     * event lacks.
+     */
+    filters_customized: boolean
+    /**
+     * Whose already-watched recordings the viewer hides, and `off` when the viewer hides none. The
+     * server removes the recordings this setting hides before it answers, so the setting can empty
+     * a list on its own, and no `empty_reason` names it.
+     */
+    hide_viewed_recordings: 'off' | 'current-user' | 'any-user'
+    /** Whether the exposure event is ever seen with a session id. Null while the check is out. */
+    exposure_linkable: boolean | null
+}
+
+/**
+ * A first page of the recordings list the tab asked for and did not get. The backend states its
+ * refusals as a 400 carrying a message the tab shows, so `error_detail` is what separates a refusal
+ * no retry can change from a transient failure. Carries the same facets as `experiment recordings
+ * list rendered`, so a failed visit and a rendered one are comparable facet for facet. A page that
+ * scrolling added is not reported here: it fails a list that already has rows.
+ */
+export interface ExperimentRecordingsListFailedContext extends ExperimentRecordingsFilterContext {
+    /** The HTTP status, null when the request failed before it reached a response. */
+    status: number | null
+    /**
+     * The backend's own message, truncated. These messages are fixed strings that name an
+     * experiment id or a variant key at most, so they carry no user data.
+     */
+    error_detail: string
+    /** Null when the experiment has not launched. */
+    days_since_start: number | null
+}
+
+/**
+ * A visit that left the tab before its first page of recordings either arrived or failed. The list
+ * load waits out a debounce and then a request, so a viewer who clicks through to another tab in a
+ * second or two leaves before either outcome, and the playlist drops the load without reporting
+ * one. These visits are the largest part of "tab viewed, list never rendered", and this event is
+ * what accounts for them. A browser tab closed outright does not unmount React, so those visits
+ * still report no outcome at all.
+ */
+export interface ExperimentRecordingsListAbandonedContext extends ExperimentRecordingsFilterContext {
+    /** How long the tab stayed mounted, in milliseconds. */
+    ms_on_tab: number
+    /** Whether the playlist was still held for the tab's own checks, so no list request went out. */
+    held_for_checks: boolean
+    /** Whether the metric filter's session set was still loading, which holds the list empty. */
+    bucket_loading: boolean
+}
+
+/**
+ * What the behavior comparison found, captured each time the shelf loads. The card counts are what
+ * say whether the feature finds anything in the wild: all zeros on most experiments would mean the
+ * evidence floors are set too high to ever show a card. The compared-population fields are what
+ * `empty_reason` has to be read against, because the same reason asks for a different answer over a
+ * few dozen people than over thousands. They count session-linked people, not enrollment, which the
+ * response does not carry.
+ */
+export interface ExperimentWatchShelfContext {
+    too_early: boolean
+    /** Why the shelf carried no cards, null when it carried some. */
+    empty_reason: string | null
+    behavior_cards: number
+    friction_cards: number
+    variant_only_cards: number
+    metric_cards: number
+    /** Cards removed for restating another card's recordings; what the dedupe threshold is tuned from. */
+    dropped_duplicate_cards: number
+    used_exposure_fallback: boolean
+    /** Wall-clock time of the request, which is the heaviest read on the tab. */
+    duration_ms: number
+    /** Exposed people the comparison found a session for, over every variant. The denominator the
+     * card counts are missing on their own. Zero on every 'no_session_linked_exposures' shelf,
+     * because that reason means no session was found for anyone, so it cannot size the enrollment
+     * behind that reason. */
+    compared_persons: number
+    /** Variants with enough of those people to be compared at all. One means the comparison had
+     * nothing to compare that variant against, and zero means no variant had a session-linked
+     * person. */
+    compared_variants: number
+    /** Hours of enrollment the comparison covered, from its oldest compared exposure to its newest.
+     * A span rather than the time the scan read, because a gap between enrolling minutes costs the
+     * day budget nothing, so sparse enrollment reports more hours than the budget allows. Read
+     * sessions_truncated for whether a cap bound. Fractional, so an experiment that enrolled a
+     * whole comparison inside one hour does not read the same as one that enrolled nobody. */
+    compared_enrollment_hours: number
+    /** More people were exposed than one comparison covers, so the oldest enrollees were left out.
+     * How often a cap binds at all, and on a 'too_early' shelf, that more time alone will not fill it. */
+    sessions_truncated: boolean
+    /** The project has more event names than one comparison ranks, so some were never considered. */
+    events_truncated: boolean
+    /** Whether the experiment has stopped enrolling, so waiting cannot fill an empty shelf. */
+    experiment_ended: boolean
+    /** Whole days from the launch to this load, null when the experiment has not launched. */
+    days_since_start: number | null
+}
+
+/** The comparison could not be loaded, and how: a request failure or a backend refusal. */
+export interface ExperimentWatchLoadFailedContext {
+    duration_ms: number
+    /** HTTP status of the response, null when there was none. */
+    status: number | null
+    /** True for a 400 the backend raises on purpose (not launched, one variant, unmatchable exposure). */
+    unavailable: boolean
+}
+
+/** A link on an empty state was followed. Which reason showed it says which fix people go looking for. */
+export interface ExperimentWatchEmptyActionContext {
+    empty_reason: string | null
+    /** 'exposure_docs' or 'replay_settings'. */
+    action: string
+}
+
+/**
+ * An action on the empty recordings list was taken. Joined to `empty_reason` on
+ * `experiment recordings list rendered`, this says which explanations people act on.
+ */
+export interface ExperimentRecordingsEmptyActionContext {
+    /** One of the tab's `ExperimentReplayListEmptyReason` values. */
+    empty_reason: string | null
+    /** One of the tab's `ExperimentRecordingsEmptyAction` values. */
+    action: string
+    /**
+     * Whole days from the launch to the click, null when the experiment has not launched. The same
+     * count `experiment recordings list rendered` carries, so an action on a young experiment reads
+     * apart from one on a run that has had time to collect recordings.
+     */
+    days_since_start: number | null
+}
+
+/**
+ * The card, without its event name: an event name is the customer's own taxonomy, which this
+ * telemetry must not carry.
+ */
+export interface ExperimentWatchCardContext {
+    kind: string
+    strength: string | null
+    /** True when one of the experiment's metrics counts the card's event. */
+    metric_backed: boolean
+    recording_count: number
+    highlight_count: number
+    /** The card's rank in the backend's order (findings strongest first, then metric shortcuts),
+     * 0 first; -1 when the card is not on the loaded response. Not its on-screen position: the UI
+     * splits the cards into shelves by kind. */
+    rank: number
+    /** Every card on the response, across all shelves. */
+    card_count: number
+}
+
+export interface ExperimentWatchHighlightContext {
+    card_kind: string
+    /** Position of the highlight in the card's strip, 0 first. */
+    position: number
+}
+
+/** A server-computed session set for the recordings tab: how big, how long, how clamped. */
+export interface ExperimentRecordingsBucketLoadedContext {
+    bucket: string
+    metric_count: number
+    session_count: number
+    truncated: boolean
+    considered_metric_count: number
+    excluded_metric_count: number
+    duration_ms: number
+}
+
+export interface ExperimentRecordingsBucketFailedContext {
+    bucket: string
+    metric_count: number
+    duration_ms: number
+    error: string
+}
+
+/** Where a reader picked an SDK in the setup snippets, so selection can be compared across surfaces. */
+export type SDKSetupInstructionsSurface =
+    | 'settings_sdk_setup'
+    | 'settings_reverse_proxy_setup'
+    | 'onboarding_ai_observability'
+
+function retentionWindowDays(metric: ExperimentRetentionMetric): number | undefined {
+    const unitToDays: Record<string, number> = { day: 1, week: 7, month: 30 }
+    const multiplier = unitToDays[metric.retention_window_unit]
+    return multiplier ? (metric.retention_window_end - metric.retention_window_start) * multiplier : undefined
+}
+
+function getSourceProperties(source: ExperimentMetricSource | ExperimentExposureNode): {
+    source_kind: string
+    is_data_warehouse: boolean
+    property_filter_count: number
+    math_type: string | undefined
+    has_math_hogql: boolean
+} {
+    if (isExperimentExposureNode(source)) {
+        return {
+            source_kind: source.kind,
+            is_data_warehouse: false,
+            property_filter_count: 0,
+            math_type: undefined,
+            has_math_hogql: false,
+        }
+    }
+    if (source.kind === NodeKind.ExperimentWarehouseNativeNode) {
+        return {
+            source_kind: source.kind,
+            is_data_warehouse: false,
+            property_filter_count: 0,
+            math_type: source.math,
+            has_math_hogql: false,
+        }
+    }
+    return {
+        source_kind: source.kind,
+        is_data_warehouse: source.kind === NodeKind.ExperimentDataWarehouseNode,
+        property_filter_count: (source.properties?.length ?? 0) + (source.fixedProperties?.length ?? 0),
+        math_type: source.math,
+        has_math_hogql: !!source.math_hogql,
+    }
+}
+
+export function getEventPropertiesForMetric(
+    metric: ExperimentMetric | ExperimentTrendsQuery | ExperimentFunnelsQuery
+): object {
+    if (metric.kind === NodeKind.ExperimentMetric) {
+        const base = {
+            kind: NodeKind.ExperimentMetric,
+            metric_type: metric.metric_type,
+            has_breakdown: !!metric.breakdownFilter,
+        }
+
+        if (isExperimentFunnelMetric(metric)) {
+            const totalFilterCount = metric.series.reduce(
+                (sum, step) => sum + (step.properties?.length ?? 0) + (step.fixedProperties?.length ?? 0),
+                0
+            )
+            return {
+                ...base,
+                funnel_steps_count: metric.series.length,
+                funnel_order_type: metric.funnel_order_type,
+                property_filter_count: totalFilterCount,
+            }
+        }
+
+        if (isExperimentMeanMetric(metric)) {
+            return {
+                ...base,
+                ...getSourceProperties(metric.source),
+            }
+        }
+
+        if (isExperimentQuantileMetric(metric)) {
+            return {
+                ...base,
+                ...getSourceProperties(metric.source),
+                quantile: metric.quantile,
+            }
+        }
+
+        if (isExperimentRatioMetric(metric)) {
+            const numeratorProps = getSourceProperties(metric.numerator)
+            const denominatorProps = getSourceProperties(metric.denominator)
+            return {
+                ...base,
+                numerator_source_kind: numeratorProps.source_kind,
+                denominator_source_kind: denominatorProps.source_kind,
+                is_data_warehouse: numeratorProps.is_data_warehouse || denominatorProps.is_data_warehouse,
+                property_filter_count: numeratorProps.property_filter_count + denominatorProps.property_filter_count,
+                numerator_math_type: numeratorProps.math_type,
+                denominator_math_type: denominatorProps.math_type,
+                has_math_hogql: numeratorProps.has_math_hogql || denominatorProps.has_math_hogql,
+            }
+        }
+
+        if (isExperimentRetentionMetric(metric)) {
+            const startProps = getSourceProperties(metric.start_event)
+            const completionProps = getSourceProperties(metric.completion_event)
+            return {
+                ...base,
+                is_data_warehouse: startProps.is_data_warehouse || completionProps.is_data_warehouse,
+                property_filter_count: startProps.property_filter_count + completionProps.property_filter_count,
+                retention_window_days: retentionWindowDays(metric),
+            }
+        }
+
+        return base
+    }
+    return { kind: metric.kind }
+}
+
+/**
+ * The GET projection still echoes flag config into `parameters` (retired in a later cleanup phase).
+ * Keep those flag keys out of telemetry so events carry only experiment-own metadata.
+ */
+function experimentOwnParameters(parameters: Experiment['parameters']): Experiment['parameters'] {
+    const {
+        feature_flag_variants,
+        rollout_percentage,
+        aggregation_group_type_index,
+        feature_flag_payloads,
+        ensure_experience_continuity,
+        ...own
+    } = (parameters ?? {}) as Record<string, unknown>
+    return own as Experiment['parameters']
+}
+
+export function getEventPropertiesForExperiment(experiment: Experiment): object {
+    const allMetrics = [
+        ...experiment.metrics,
+        ...experiment.saved_metrics.filter((m) => m.metadata.type === 'primary').map((m) => m.query),
+    ]
+    const allSecondaryMetrics = [
+        ...experiment.metrics_secondary,
+        ...experiment.saved_metrics.filter((m) => m.metadata.type === 'secondary').map((m) => m.query),
+    ]
+
+    return {
+        id: experiment.id,
+        name: experiment.name,
+        type: experiment.type,
+        parameters: experimentOwnParameters(experiment.parameters),
+        metrics: allMetrics.map((m) => getEventPropertiesForMetric(m)),
+        secondary_metrics: allSecondaryMetrics.map((m) => getEventPropertiesForMetric(m)),
+        metrics_count: allMetrics.length,
+        secondary_metrics_count: allSecondaryMetrics.length,
+        saved_metrics_count: experiment.saved_metrics.length,
+        stats_method: experiment.stats_config?.method || ExperimentStatsMethod.Bayesian,
+    }
+}
+
+// Metric variable definitions hold queries and option lists, which do not belong in analytics.
+export function filtersForAnalytics(filters: Record<string, any>): Record<string, any> {
+    const { metricVariables, ...rest } = filters
+    return metricVariables ? { ...rest, metric_variable_count: metricVariables.length } : rest
+}
+
+export function sanitizeInsight(insight: Partial<InsightModel> | null): object | undefined {
+    if (!insight) {
+        return undefined
+    }
+
+    // Remove results
+    const { result, ...rest } = insight
+    const context = rest.filter_override_context
+    const sanitizedInsight = context
+        ? {
+              ...rest,
+              filter_override_context: {
+                  ...context,
+                  dashboard: context.dashboard ? filtersForAnalytics(context.dashboard) : context.dashboard,
+                  overridden_dashboard: context.overridden_dashboard
+                      ? filtersForAnalytics(context.overridden_dashboard)
+                      : context.overridden_dashboard,
+              },
+          }
+        : rest
+
+    if (sanitizedInsight.query) {
+        return {
+            ...sanitizedInsight,
+            query: sanitizeQuery(sanitizedInsight.query),
+        }
+    }
+
+    return sanitizedInsight
+}
+
+function countBehavioralFilters(value: unknown): number {
+    if (Array.isArray(value)) {
+        return value.reduce((count, item) => count + countBehavioralFilters(item), 0)
+    }
+    if (!value || typeof value !== 'object') {
+        return 0
+    }
+
+    const record = value as Record<string, unknown>
+    return (
+        Number(record.type === PropertyFilterType.Behavioral) +
+        Object.values(record).reduce<number>((count, item) => count + countBehavioralFilters(item), 0)
+    )
+}
+
+type SanitizedQuery = Record<string, string | number | boolean | undefined>
+
+function insightQuerySource(query: Node | null): InsightQueryNode | undefined {
+    if (isInsightVizNode(query)) {
+        return query.source
+    }
+    return isInsightQueryNode(query) ? query : undefined
+}
+
+function dateRangeAndSamplingProperties(querySource: InsightQueryNode): SanitizedQuery {
+    return {
+        date_from: querySource.dateRange?.date_from || undefined,
+        date_to: querySource.dateRange?.date_to || undefined,
+        interval: getInterval(querySource),
+        samplingFactor: ('samplingFactor' in querySource ? querySource.samplingFactor : undefined) || undefined,
+    }
+}
+
+function seriesProperties(querySource: InsightQueryNode): SanitizedQuery {
+    const series = getSeries(querySource)
+    return {
+        series_length: series?.length,
+        event_entity_count: series?.filter((e) => isEventsNode(e)).length,
+        action_entity_count: series?.filter((e) => isActionsNode(e)).length,
+        data_warehouse_entity_count: series?.filter((e) => isAnyDataWarehouseNode(e)).length,
+        has_properties: !!querySource.properties,
+        behavioral_filter_count: countBehavioralFilters(querySource),
+        filter_test_accounts: querySource.filterTestAccounts,
+    }
+}
+
+function breakdownProperties(querySource: InsightQueryNode): SanitizedQuery {
+    const breakdown = getBreakdown(querySource)
+    return {
+        breakdown_type: breakdown?.breakdown_type || undefined,
+        breakdown_limit: breakdown?.breakdown_limit || undefined,
+        breakdown_hide_other_aggregation: breakdown?.breakdown_hide_other_aggregation || undefined,
+    }
+}
+
+function trendsLikeProperties(querySource: InsightQueryNode): SanitizedQuery {
+    const defaultDisplay =
+        isTrendsQuery(querySource) || isStickinessQuery(querySource) ? ChartDisplayType.ActionsLineGraph : undefined
+    return {
+        has_formula: !!getFormula(querySource),
+        display: getDisplay(querySource) ?? defaultDisplay,
+        compare: getCompareFilter(querySource)?.compare,
+        compare_to: getCompareFilter(querySource)?.compare_to,
+    }
+}
+
+function funnelProperties(querySource: InsightQueryNode): SanitizedQuery {
+    if (!isFunnelsQuery(querySource)) {
+        return {}
+    }
+    return {
+        funnel_viz_type: querySource.funnelsFilter?.funnelVizType,
+        funnel_order_type: querySource.funnelsFilter?.funnelOrderType,
+        funnel_summary_on_dashboards: querySource.funnelsFilter?.showSummaryOnDashboards === true,
+    }
+}
+
+/** Takes a query and returns an object with "useful" properties that don't contain sensitive data. */
+export function sanitizeQuery(query: Node | null): SanitizedQuery {
+    const payload: SanitizedQuery = {
+        query_kind: query?.kind,
+        query_source_kind: isNodeWithSource(query) ? query.source.kind : undefined,
+        // Whether this insight/query reads from a connector-synced data warehouse source (series-level
+        // detection). Raw SQL/HogQL warehouse usage is flagged from the query response in performQuery.
+        uses_data_warehouse_source: queryUsesDataWarehouse(query),
+    }
+
+    if (isMetricsQuery(query)) {
+        Object.assign(payload, {
+            metrics_query_mode: 'builder',
+            metrics_clause_count: query.clauses.length,
+            metrics_has_formula: !!query.formula,
+            metrics_interval: query.interval ?? 'auto',
+            metrics_display_type: query.display?.type ?? 'line',
+        })
+    }
+
+    const querySource = insightQuerySource(query)
+    if (querySource) {
+        Object.assign(
+            payload,
+            dateRangeAndSamplingProperties(querySource),
+            seriesProperties(querySource),
+            breakdownProperties(querySource),
+            trendsLikeProperties(querySource),
+            funnelProperties(querySource)
+        )
+    }
+
+    return objectClean(payload)
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface eventUsageLogicValues {
+    realm: Realm | null // preflightLogic
+    user: UserType | null // userLogic
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface eventUsageLogicActions {
+    reportAccountOwnerClicked: ({ name, email }: { email: string; name: string }) => {
+        email: string
+        name: string
+    }
+    reportActivityLogSettingToggled: (receive_org_level_activity_logs: boolean | null) => {
+        receive_org_level_activity_logs: boolean | null
+    }
+    reportAutocaptureExceptionsToggled: (autocapture_opt_in: boolean) => {
+        autocapture_opt_in: boolean
+    }
+    reportAutocaptureToggled: (autocapture_opt_out: boolean) => {
+        autocapture_opt_out: boolean
+    }
+    reportAxisUnitsChanged: (properties: Record<string, any>) => {
+        [x: string]: any
+    }
+    reportBillingCTAShown: () => {
+        value: true
+    }
+    reportBillingSpendInteraction: (properties: BillingUsageInteractionProps) => {
+        properties: BillingUsageInteractionProps
+    }
+    reportBillingUsageInteraction: (properties: BillingUsageInteractionProps) => {
+        properties: BillingUsageInteractionProps
+    }
+    reportBounceRatePageViewModeUpdated: (mode: string) => {
+        mode: string
+    }
+    reportCreatedDashboardFromModal: () => {
+        value: true
+    }
+    reportCustomChannelTypeRulesUpdated: (numRules: number) => {
+        numRules: number
+    }
+    reportCustomerAnalyticsAddJoinButtonClicked: ({ table }: any) => {
+        table: any
+    }
+    reportCustomerAnalyticsDashboardBusinessModeChanged: ({ business_mode }: any) => {
+        business_mode: any
+    }
+    reportCustomerAnalyticsDashboardConfigurationButtonClicked: () => boolean
+    reportCustomerAnalyticsDashboardConfigurationViewed: () => boolean
+    reportCustomerAnalyticsDashboardConfigureEventWithAIClicked: ({ event }: any) => {
+        event: any
+    }
+    reportCustomerAnalyticsDashboardDateFilterApplied: ({ filter }: any) => {
+        filter: any
+    }
+    reportCustomerAnalyticsDashboardEventsSaved: () => boolean
+    reportCustomerAnalyticsViewed: (delay?: number) => {
+        delay: number | undefined
+    }
+    reportCustomerJourneyBuilderStepAdded: (
+        stepIndex: number,
+        stepCount: number
+    ) => {
+        stepCount: number
+        stepIndex: number
+    }
+    reportCustomerJourneyBuilderStepRemoved: (
+        stepIndex: number,
+        stepCount: number
+    ) => {
+        stepCount: number
+        stepIndex: number
+    }
+    reportCustomerJourneyCreated: (
+        journeyName: string,
+        stepCount: number,
+        creationSource: string | null
+    ) => {
+        creationSource: string | null
+        journeyName: string
+        stepCount: number
+    }
+    reportCustomerJourneyDeleted: (journeyId: string) => {
+        journeyId: string
+    }
+    reportCustomerJourneyExistingFunnelSelected: (insightId: number) => {
+        insightId: number
+    }
+    reportCustomerJourneyStepAddedFromPath: (
+        eventName: string,
+        pathType: string,
+        stepIndex: number
+    ) => {
+        eventName: string
+        pathType: string
+        stepIndex: number
+    }
+    reportCustomerJourneyStepsSavedFromEditor: (
+        stepsAdded: number,
+        journeyId: string | null
+    ) => {
+        journeyId: string | null
+        stepsAdded: number
+    }
+    reportCustomerJourneyTemplateSelected: (templateKey: string) => {
+        templateKey: string
+    }
+    reportCustomerJourneyUpdated: (
+        journeyId: string,
+        journeyName: string,
+        stepCount: number
+    ) => {
+        journeyId: string
+        journeyName: string
+        stepCount: number
+    }
+    reportCustomerJourneyViewed: (
+        journeyId: string,
+        journeyName: string,
+        stepCount: number,
+        delay?: number
+    ) => {
+        delay: number | undefined
+        journeyId: string
+        journeyName: string
+        stepCount: number
+    }
+    reportDataManagementDefinitionClickEdit: (type: TaxonomicFilterGroupType) => {
+        type: TaxonomicFilterGroupType
+    }
+    reportDataManagementDefinitionClickView: (type: TaxonomicFilterGroupType) => {
+        type: TaxonomicFilterGroupType
+    }
+    reportDataTableColumnsUpdated: (context_type: string) => {
+        context_type: string
+    }
+    reportExperimentAiSummaryRequested: (experiment: Experiment) => {
+        experiment: Experiment
+    }
+    reportExperimentBehaviorComparisonFailed: (
+        experimentId: ExperimentIdType,
+        context: ExperimentWatchLoadFailedContext
+    ) => {
+        context: ExperimentWatchLoadFailedContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentBehaviorComparisonLoaded: (
+        experimentId: ExperimentIdType,
+        context: ExperimentWatchShelfContext
+    ) => {
+        context: ExperimentWatchShelfContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentBehaviorComparisonToggled: (
+        experimentId: ExperimentIdType,
+        opened: boolean
+    ) => {
+        experimentId: ExperimentIdType
+        opened: boolean
+    }
+    reportExperimentDashboardCreated: (
+        experiment: Experiment,
+        dashboardId: number
+    ) => {
+        dashboardId: number
+        experiment: Experiment
+    }
+    reportExperimentExposureCohortCreated: (
+        experiment: Experiment,
+        cohort: CohortType
+    ) => {
+        cohort: CohortType
+        experiment: Experiment
+    }
+    reportExperimentExposureCohortEdited: (
+        existingCohort: CohortType,
+        newCohort: CohortType
+    ) => {
+        existingCohort: CohortType
+        newCohort: CohortType
+    }
+    reportExperimentFeatureFlagModalOpened: () => {}
+    reportExperimentHoldoutAssigned: ({
+        experimentId,
+        holdoutId,
+    }: {
+        experimentId: ExperimentIdType
+        holdoutId: ExperimentHoldoutType['id']
+    }) => {
+        experimentId: ExperimentIdType
+        holdoutId: number | null
+    }
+    reportExperimentHoldoutCreated: (holdout: ExperimentHoldoutType) => {
+        holdout: ExperimentHoldoutType
+    }
+    reportExperimentMetricBreakdownAdded: (
+        experiment: Experiment,
+        metricUuid: string,
+        breakdown: Breakdown,
+        isPrimary: boolean
+    ) => {
+        breakdown: Breakdown
+        experiment: Experiment
+        isPrimary: boolean
+        metricUuid: string
+    }
+    reportExperimentMetricBreakdownRemoved: (
+        experiment: Experiment,
+        metricUuid: string,
+        breakdown: Breakdown,
+        index: number,
+        isPrimary: boolean
+    ) => {
+        breakdown: Breakdown
+        experiment: Experiment
+        index: number
+        isPrimary: boolean
+        metricUuid: string
+    }
+    reportExperimentRecordingOpened: (
+        experimentId: ExperimentIdType,
+        context: ExperimentRecordingsFilterContext
+    ) => {
+        context: ExperimentRecordingsFilterContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentRecordingsBucketFailed: (
+        experimentId: ExperimentIdType,
+        context: ExperimentRecordingsBucketFailedContext
+    ) => {
+        context: ExperimentRecordingsBucketFailedContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentRecordingsBucketLoaded: (
+        experimentId: ExperimentIdType,
+        context: ExperimentRecordingsBucketLoadedContext
+    ) => {
+        context: ExperimentRecordingsBucketLoadedContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentRecordingsEmptyActionClicked: (
+        experimentId: ExperimentIdType,
+        context: ExperimentRecordingsEmptyActionContext
+    ) => {
+        context: ExperimentRecordingsEmptyActionContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentRecordingsListAbandoned: (
+        experimentId: ExperimentIdType,
+        context: ExperimentRecordingsListAbandonedContext
+    ) => {
+        context: ExperimentRecordingsListAbandonedContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentRecordingsListFailed: (
+        experimentId: ExperimentIdType,
+        context: ExperimentRecordingsListFailedContext
+    ) => {
+        context: ExperimentRecordingsListFailedContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentRecordingsListRendered: (
+        experimentId: ExperimentIdType,
+        context: ExperimentRecordingsListRenderedContext
+    ) => {
+        context: ExperimentRecordingsListRenderedContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentReleaseConditionsViewed: (experimentId: ExperimentIdType) => {
+        experimentId: ExperimentIdType
+    }
+    reportExperimentSharedMetricAssigned: (
+        experimentId: ExperimentIdType,
+        sharedMetric: SharedMetric
+    ) => {
+        experimentId: ExperimentIdType
+        sharedMetric: SharedMetric
+    }
+    reportExperimentSharedMetricCreated: (sharedMetric: SharedMetric) => {
+        sharedMetric: SharedMetric
+    }
+    reportExperimentTimeseriesRecalculated: (
+        experimentId: ExperimentIdType,
+        metric: ExperimentMetric
+    ) => {
+        experimentId: ExperimentIdType
+        metric: ExperimentMetricUnion
+    }
+    reportExperimentTimeseriesViewed: (
+        experimentId: ExperimentIdType,
+        metric: ExperimentMetric
+    ) => {
+        experimentId: ExperimentIdType
+        metric: ExperimentMetricUnion
+    }
+    reportExperimentVariantScreenshotUploaded: (experimentId: ExperimentIdType) => {
+        experimentId: ExperimentIdType
+    }
+    reportExperimentViewed: (
+        experiment: Experiment,
+        duration: number | null
+    ) => {
+        duration: number | null
+        experiment: Experiment
+    }
+    reportExperimentWatchCardSelected: (
+        experimentId: ExperimentIdType,
+        context: ExperimentWatchCardContext
+    ) => {
+        context: ExperimentWatchCardContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentWatchEmptyActionClicked: (
+        experimentId: ExperimentIdType,
+        context: ExperimentWatchEmptyActionContext
+    ) => {
+        context: ExperimentWatchEmptyActionContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentWatchHighlightOpened: (
+        experimentId: ExperimentIdType,
+        context: ExperimentWatchHighlightContext
+    ) => {
+        context: ExperimentWatchHighlightContext
+        experimentId: ExperimentIdType
+    }
+    reportExperimentWizardAskAiClicked: (currentStep: string) => {
+        currentStep: string
+    }
+    reportExperimentWizardExposureSourceSelected: (exposureSource: ExposureSource) => {
+        exposureSource: ExposureSource
+    }
+    reportExperimentWizardStarted: () => {
+        value: true
+    }
+    reportExperimentWizardStepViewed: (
+        step: string,
+        stepNumber: number,
+        previousStep: string | null,
+        navigation: ExperimentWizardStepNavigation
+    ) => {
+        navigation: ExperimentWizardStepNavigation
+        previousStep: string | null
+        step: string
+        stepNumber: number
+    }
+    reportExperimentsListAiBadgeClicked: () => {
+        value: true
+    }
+    reportExperimentsListViewed: (listView: {
+        archived: boolean
+        experimentsShown: number
+        hasSearch: boolean
+        page: number
+        statusFilter: string
+    }) => {
+        archived: boolean
+        experimentsShown: number
+        hasSearch: boolean
+        page: number
+        statusFilter: string
+    }
+    reportExperimentsSettingChanged: (
+        setting: string,
+        value: unknown
+    ) => {
+        setting: string
+        value: unknown
+    }
+    reportExperimentsSettingsViewed: () => {
+        value: true
+    }
+    reportFeatureFlagBulkCopy: (
+        flagCount: number,
+        projectCount: number,
+        failedCount: number
+    ) => {
+        failedCount: number
+        flagCount: number
+        projectCount: number
+    }
+    reportFeatureFlagsBulkArchived: (
+        archivedCount: number,
+        pendingApprovalCount: number,
+        failedCount: number
+    ) => {
+        archivedCount: number
+        failedCount: number
+        pendingApprovalCount: number
+    }
+    reportFeatureFlagsBulkRestored: (
+        restoredCount: number,
+        failedCount: number
+    ) => {
+        failedCount: number
+        restoredCount: number
+    }
+    reportFlagsCodeExampleInteraction: (optionType: string) => {
+        optionType: string
+    }
+    reportFlagsCodeExampleLanguage: (language: string) => {
+        language: string
+    }
+    reportFunnelStepReordered: () => {
+        value: true
+    }
+    reportGithubInstallationSelected: (
+        surface: string,
+        discoveryId?: string,
+        installationId?: string,
+        responseAgeMs?: number
+    ) => {
+        discoveryId: string | undefined
+        installationId: string | undefined
+        responseAgeMs: number | undefined
+        surface: string
+    }
+    reportGroupProfileViewed: (delay?: number) => {
+        delay: number | undefined
+    }
+    reportGroupTypeDetailDashboardCreated: () => {}
+    reportHeatmapsToggled: (heatmaps_opt_in: boolean) => {
+        heatmaps_opt_in: boolean
+    }
+    reportInsightDateExclusionsChanged: (
+        queryKind: string | undefined,
+        excludeIncompletePeriods: boolean,
+        excludedDaysOfWeekCount: number
+    ) => {
+        excludedDaysOfWeekCount: number
+        excludeIncompletePeriods: boolean
+        queryKind: string | undefined
+    }
+    reportInsightDatePickerOpened: (queryKind: string | undefined) => {
+        queryKind: string | undefined
+    }
+    reportInsightDraftDiscarded: (draftAgeSeconds: number) => {
+        draftAgeSeconds: number
+    }
+    reportInsightDraftRestored: (
+        surface: 'insight_editor' | 'saved_insights',
+        draftAgeSeconds: number
+    ) => {
+        draftAgeSeconds: number
+        surface: 'insight_editor' | 'saved_insights'
+    }
+    reportInsightFilterAdded: (
+        newLength: number,
+        source: GraphSeriesAddedSource
+    ) => {
+        newLength: number
+        source: GraphSeriesAddedSource
+    }
+    reportInsightOpenedFromRecentInsightList: () => {
+        value: true
+    }
+    reportInsightResultsCopiedToClipboard: (
+        format: string,
+        insightId: number | null,
+        dashboardId: number | null
+    ) => {
+        dashboardId: number | null
+        format: string
+        insightId: number | null
+    }
+    reportInsightsTableCalcToggled: (mode: string) => {
+        mode: string
+    }
+    reportIntegrationConnectClicked: (
+        integration: string,
+        kind: string,
+        surface: IntegrationConnectSurface
+    ) => {
+        integration: string
+        kind: string
+        surface: IntegrationConnectSurface
+    }
+    reportIntegrationConnectRejected: (
+        kind: string,
+        error: string
+    ) => {
+        error: string
+        kind: string
+    }
+    reportIntegrationLinkExistingOffered: (
+        kind: string,
+        surface: IntegrationConnectSurface,
+        counts: IntegrationLinkExistingCounts
+    ) => {
+        counts: IntegrationLinkExistingCounts
+        kind: string
+        surface: IntegrationConnectSurface
+    }
+    reportIntegrationScopeShortfallShown: (
+        kind: string,
+        missingScopes: string[]
+    ) => {
+        kind: string
+        missingScopes: string[]
+    }
+    reportInviteMembersButtonClicked: () => {
+        value: true
+    }
+    reportMCPHintShown: (surfaceKey: string) => {
+        surfaceKey: string
+    }
+    reportMarketingAnalyticsDataSourceConnected: (sourceType: string) => {
+        sourceType: string
+    }
+    reportMarketingAnalyticsOnboardingCompleted: (hasSources: boolean) => {
+        hasSources: boolean
+    }
+    reportMarketingAnalyticsOnboardingViewed: () => {}
+    reportMediaPreviewUploaded: (source: string) => {
+        source: string
+    }
+    reportNavItemClicked: (
+        item: string,
+        section: string,
+        itemType?: string | null
+    ) => {
+        item: string
+        itemType: string | null | undefined
+        section: string
+    }
+    reportPersonOpenedFromNewlySeenPersonsList: () => {
+        value: true
+    }
+    reportPersonProfileViewed: (delay?: number) => {
+        delay: number | undefined
+    }
+    reportPersonsJoinModeUpdated: (mode: string) => {
+        mode: string
+    }
+    reportPersonsModalSearched: (params: { actorType?: string; teamId?: number | null }) => {
+        params: {
+            actorType?: string | undefined
+            teamId?: number | null | undefined
+        }
+    }
+    reportPersonsModalViewed: (params: any) => {
+        params: any
+    }
+    reportPoEModeUpdated: (mode: string) => {
+        mode: string
+    }
+    reportProductTourCreated: (
+        tour: ProductTour,
+        creationSource?: 'app' | 'toolbar'
+    ) => {
+        creationSource: 'app' | 'toolbar' | undefined
+        tour: ProductTour
+    }
+    reportProductTourListViewed: () => {
+        value: true
+    }
+    reportProductTourViewed: (tour: ProductTour) => {
+        tour: ProductTour
+    }
+    reportProductUnsubscribed: (product: string) => {
+        product: string
+    }
+    reportProjectCreationSubmitted: (
+        projectCount: number,
+        nameLength: number
+    ) => {
+        nameLength: number
+        projectCount: number
+    }
+    reportProjectNoticeDismissed: (key: string) => {
+        key: string
+    }
+    reportProjectNoticeShown: (variant: string) => {
+        variant: string
+    }
+    reportRemovedInsightFromDashboard: (
+        insight: Partial<InsightModel> | null,
+        dashboardId: number | null
+    ) => {
+        dashboardId: number | null
+        insight: Partial<InsightModel<Node<Record<string, any>>>> | null
+    }
+    reportRevenueAnalyticsDataSourceDisabled: (sourceType: string) => {
+        sourceType: string
+    }
+    reportRevenueAnalyticsDataSourceEnabled: (sourceType: string) => {
+        sourceType: string
+    }
+    reportRevenueAnalyticsEventCreated: (eventName: string) => {
+        eventName: string
+    }
+    reportRevenueAnalyticsEventDeleted: (eventName: string) => {
+        eventName: string
+    }
+    reportRevenueAnalyticsEventEdited: (eventName: string) => {
+        eventName: string
+    }
+    reportRevenueAnalyticsSettingsViewed: () => {}
+    reportRevenueAnalyticsTestAccountFilterUpdated: (filterTestAccounts: boolean) => {
+        filterTestAccounts: boolean
+    }
+    reportSDKSelected: (sdk: SDK) => {
+        sdk: SDK
+    }
+    reportSDKSetupInstructionsSDKSelected: (
+        sdkKey: string,
+        surface: SDKSetupInstructionsSurface
+    ) => {
+        sdkKey: string
+        surface: SDKSetupInstructionsSurface
+    }
+    reportSavedInsightNewInsightClicked: (
+        insightType: string,
+        presetKey?: string
+    ) => {
+        insightType: string
+        presetKey: string | undefined
+    }
+    reportSavedInsightToDashboard: (
+        insight: Partial<InsightModel> | null,
+        dashboardId: number | null
+    ) => {
+        dashboardId: number | null
+        insight: Partial<InsightModel<Node<Record<string, any>>>> | null
+    }
+    reportSessionTableVersionUpdated: (version: string) => {
+        version: string
+    }
+    reportTaxonomicFilterCategorySelected: (
+        groupType: TaxonomicFilterGroupType,
+        eventName?: string
+    ) => {
+        eventName: string | undefined
+        groupType: TaxonomicFilterGroupType
+    }
+    reportTestAccountFiltersUpdated: (filters: Record<string, any>[]) => {
+        filters: Record<string, any>[]
+    }
+    reportTimeToSeeData: (payload: TimeToSeeDataPayload) => {
+        payload: TimeToSeeDataPayload
+    }
+    reportTimezoneComponentViewed: (
+        component: 'indicator' | 'label',
+        project_timezone?: string,
+        device_timezone?: string | null
+    ) => {
+        component: 'indicator' | 'label'
+        device_timezone: string | null | undefined
+        project_timezone: string | undefined
+    }
+    reportUsageMetricCreated: () => boolean
+    reportUsageMetricDeleted: () => boolean
+    reportUsageMetricUpdated: () => boolean
+    reportUsageMetricsCreateButtonClicked: () => boolean
+    reportUsageMetricsSettingsViewed: () => boolean
+    reportUsageMetricsUpdateButtonClicked: () => boolean
+    reportUserFeedbackButtonClicked: (
+        source: SURVEY_CREATED_SOURCE,
+        meta: Record<string, any>
+    ) => {
+        meta: Record<string, any>
+        source: SURVEY_CREATED_SOURCE
+    }
+    reportWebAnalyticsCompareToggled: (props: { enabled: boolean }) => {
+        props: {
+            enabled: boolean
+        }
+    }
+    reportWebAnalyticsFilterApplied: (props: {
+        filter_type: string
+        property_filter_category?: PropertyFilterType
+        total_filter_count: number
+    }) => {
+        props: {
+            filter_type: string
+            property_filter_category?: PropertyFilterType | undefined
+            total_filter_count: number
+        }
+    }
+    reportWebAnalyticsFilterRemoved: (props: {
+        filter_type: string
+        property_filter_category?: PropertyFilterType
+        total_filter_count: number
+    }) => {
+        props: {
+            filter_type: string
+            property_filter_category?: PropertyFilterType | undefined
+            total_filter_count: number
+        }
+    }
+    reportWebAnalyticsHealthActionClicked: (props: {
+        category: string
+        check_id: string
+        is_urgent: boolean
+        status: string
+    }) => {
+        props: {
+            category: string
+            check_id: string
+            is_urgent: boolean
+            status: string
+        }
+    }
+    reportWebAnalyticsHealthRefreshed: (props: { overall_status: string; passed_count: number }) => {
+        props: {
+            overall_status: string
+            passed_count: number
+        }
+    }
+    reportWebAnalyticsHealthSectionToggled: (props: { category: string; is_expanded: boolean }) => {
+        props: {
+            category: string
+            is_expanded: boolean
+        }
+    }
+    reportWebAnalyticsHealthStatus: (props: {
+        has_authorized_urls: boolean
+        has_pageleaves: boolean
+        has_pageviews: boolean
+        has_reverse_proxy: boolean
+        has_scroll_depth: boolean
+        has_web_vitals: boolean
+        overall_status: string
+    }) => {
+        props: {
+            has_authorized_urls: boolean
+            has_pageleaves: boolean
+            has_pageviews: boolean
+            has_reverse_proxy: boolean
+            has_scroll_depth: boolean
+            has_web_vitals: boolean
+            overall_status: string
+        }
+    }
+    reportWebAnalyticsHealthTabViewed: (props: {
+        error_count: number
+        overall_status: string
+        passed_count: number
+        warning_count: number
+    }) => {
+        props: {
+            error_count: number
+            overall_status: string
+            passed_count: number
+            warning_count: number
+        }
+    }
+    reportWebAnalyticsPathCleaningToggled: (props: { enabled: boolean }) => {
+        props: {
+            enabled: boolean
+        }
+    }
+}
+
+export type eventUsageLogicType = MakeLogicType<eventUsageLogicValues, eventUsageLogicActions>
+
+export const eventUsageLogic = kea<eventUsageLogicType>([
+    path(['lib', 'utils', 'eventUsageLogic']),
+    connect(() => ({
+        values: [preflightLogic, ['realm'], userLogic, ['user']],
+    })),
+    actions({
+        // persons related
+        reportPersonsModalViewed: (params: any) => ({
+            params,
+        }),
+        reportPersonsModalSearched: (params: { teamId?: number | null; actorType?: string }) => ({ params }),
+        // timing
+        reportTimeToSeeData: (payload: TimeToSeeDataPayload) => ({ payload }),
+        reportGroupTypeDetailDashboardCreated: () => ({}),
+        reportIntegrationConnectClicked: (integration: string, kind: string, surface: IntegrationConnectSurface) => ({
+            integration,
+            kind,
+            surface,
+        }),
+        reportIntegrationLinkExistingOffered: (
+            kind: string,
+            surface: IntegrationConnectSurface,
+            counts: IntegrationLinkExistingCounts
+        ) => ({ kind, surface, counts }),
+        reportGithubInstallationSelected: (
+            surface: string,
+            discoveryId?: string,
+            installationId?: string,
+            responseAgeMs?: number
+        ) => ({ surface, discoveryId, installationId, responseAgeMs }),
+        reportIntegrationConnectRejected: (kind: string, error: string) => ({ kind, error }),
+        reportIntegrationScopeShortfallShown: (kind: string, missingScopes: string[]) => ({ kind, missingScopes }),
+        // insights
+        reportDataTableColumnsUpdated: (context_type: string) => ({ context_type }),
+        // insight filters
+        reportFunnelStepReordered: true,
+        reportInsightFilterAdded: (newLength: number, source: GraphSeriesAddedSource) => ({ newLength, source }),
+        reportInsightsTableCalcToggled: (mode: string) => ({ mode }),
+        reportInsightDateExclusionsChanged: (
+            queryKind: string | undefined,
+            excludeIncompletePeriods: boolean,
+            excludedDaysOfWeekCount: number
+        ) => ({ queryKind, excludeIncompletePeriods, excludedDaysOfWeekCount }),
+        reportInsightDatePickerOpened: (queryKind: string | undefined) => ({ queryKind }),
+        reportProjectCreationSubmitted: (projectCount: number, nameLength: number) => ({ projectCount, nameLength }),
+        reportProjectNoticeDismissed: (key: string) => ({ key }),
+        reportProjectNoticeShown: (variant: string) => ({ variant }),
+        reportTimezoneComponentViewed: (
+            component: 'label' | 'indicator',
+            project_timezone?: string,
+            device_timezone?: string | null
+        ) => ({ component, project_timezone, device_timezone }),
+        reportTestAccountFiltersUpdated: (filters: Record<string, any>[]) => ({ filters }),
+        reportPoEModeUpdated: (mode: string) => ({ mode }),
+        reportPersonsJoinModeUpdated: (mode: string) => ({ mode }),
+        reportBounceRatePageViewModeUpdated: (mode: string) => ({ mode }),
+        reportSessionTableVersionUpdated: (version: string) => ({ version }),
+        reportCustomChannelTypeRulesUpdated: (numRules: number) => ({ numRules }),
+        reportCreatedDashboardFromModal: true,
+        /** Dashboard created via PostHog web app from a template (new dashboard modal / template chooser). */
+        reportSavedInsightToDashboard: (insight: Partial<InsightModel> | null, dashboardId: number | null) => ({
+            insight,
+            dashboardId,
+        }),
+        reportRemovedInsightFromDashboard: (insight: Partial<InsightModel> | null, dashboardId: number | null) => ({
+            insight,
+            dashboardId,
+        }),
+        reportInsightResultsCopiedToClipboard: (
+            format: string,
+            insightId: number | null,
+            dashboardId: number | null
+        ) => ({ format, insightId, dashboardId }),
+        reportSavedInsightNewInsightClicked: (insightType: string, presetKey?: string) => ({
+            insightType,
+            presetKey,
+        }),
+        reportInsightDraftRestored: (surface: 'saved_insights' | 'insight_editor', draftAgeSeconds: number) => ({
+            surface,
+            draftAgeSeconds,
+        }),
+        reportInsightDraftDiscarded: (draftAgeSeconds: number) => ({ draftAgeSeconds }),
+        reportExperimentWizardStarted: true,
+        reportExperimentWizardAskAiClicked: (currentStep: string) => ({ currentStep }),
+        reportExperimentWizardExposureSourceSelected: (exposureSource: ExposureSource) => ({ exposureSource }),
+        reportExperimentsListAiBadgeClicked: true,
+        reportExperimentsListViewed: (listView: {
+            experimentsShown: number
+            statusFilter: string
+            page: number
+            hasSearch: boolean
+            archived: boolean
+        }) => listView,
+        reportExperimentsSettingsViewed: true,
+        reportExperimentsSettingChanged: (setting: string, value: unknown) => ({ setting, value }),
+        reportExperimentViewed: (experiment: Experiment, duration: number | null) => ({ experiment, duration }),
+        reportExperimentMetricBreakdownAdded: (
+            experiment: Experiment,
+            metricUuid: string,
+            breakdown: Breakdown,
+            isPrimary: boolean
+        ) => ({
+            experiment,
+            metricUuid,
+            breakdown,
+            isPrimary,
+        }),
+        reportExperimentWizardStepViewed: (
+            step: string,
+            stepNumber: number,
+            previousStep: string | null,
+            navigation: ExperimentWizardStepNavigation
+        ) => ({ step, stepNumber, previousStep, navigation }),
+        reportExperimentMetricBreakdownRemoved: (
+            experiment: Experiment,
+            metricUuid: string,
+            breakdown: Breakdown,
+            index: number,
+            isPrimary: boolean
+        ) => ({
+            experiment,
+            metricUuid,
+            breakdown,
+            index,
+            isPrimary,
+        }),
+        reportExperimentExposureCohortCreated: (experiment: Experiment, cohort: CohortType) => ({ experiment, cohort }),
+        reportExperimentExposureCohortEdited: (existingCohort: CohortType, newCohort: CohortType) => ({
+            existingCohort,
+            newCohort,
+        }),
+        reportExperimentVariantScreenshotUploaded: (experimentId: ExperimentIdType) => ({ experimentId }),
+        reportExperimentReleaseConditionsViewed: (experimentId: ExperimentIdType) => ({ experimentId }),
+        reportExperimentHoldoutCreated: (holdout: ExperimentHoldoutType) => ({ holdout }),
+        reportExperimentHoldoutAssigned: ({
+            experimentId,
+            holdoutId,
+        }: {
+            experimentId: ExperimentIdType
+            holdoutId: ExperimentHoldoutType['id']
+        }) => ({ experimentId, holdoutId }),
+        reportExperimentSharedMetricCreated: (sharedMetric: SharedMetric) => ({ sharedMetric }),
+        reportExperimentSharedMetricAssigned: (experimentId: ExperimentIdType, sharedMetric: SharedMetric) => ({
+            experimentId,
+            sharedMetric,
+        }),
+        reportExperimentDashboardCreated: (experiment: Experiment, dashboardId: number) => ({
+            experiment,
+            dashboardId,
+        }),
+        reportExperimentFeatureFlagModalOpened: () => ({}),
+        reportExperimentTimeseriesViewed: (experimentId: ExperimentIdType, metric: ExperimentMetric) => ({
+            experimentId,
+            metric,
+        }),
+        reportExperimentTimeseriesRecalculated: (experimentId: ExperimentIdType, metric: ExperimentMetric) => ({
+            experimentId,
+            metric,
+        }),
+        reportExperimentAiSummaryRequested: (experiment: Experiment) => ({ experiment }),
+        reportExperimentRecordingsBucketLoaded: (
+            experimentId: ExperimentIdType,
+            context: ExperimentRecordingsBucketLoadedContext
+        ) => ({ experimentId, context }),
+        reportExperimentRecordingsBucketFailed: (
+            experimentId: ExperimentIdType,
+            context: ExperimentRecordingsBucketFailedContext
+        ) => ({ experimentId, context }),
+        reportExperimentRecordingsListRendered: (
+            experimentId: ExperimentIdType,
+            context: ExperimentRecordingsListRenderedContext
+        ) => ({ experimentId, context }),
+        reportExperimentRecordingsListFailed: (
+            experimentId: ExperimentIdType,
+            context: ExperimentRecordingsListFailedContext
+        ) => ({ experimentId, context }),
+        reportExperimentRecordingsListAbandoned: (
+            experimentId: ExperimentIdType,
+            context: ExperimentRecordingsListAbandonedContext
+        ) => ({ experimentId, context }),
+        reportExperimentRecordingsEmptyActionClicked: (
+            experimentId: ExperimentIdType,
+            context: ExperimentRecordingsEmptyActionContext
+        ) => ({ experimentId, context }),
+        reportExperimentRecordingOpened: (
+            experimentId: ExperimentIdType,
+            context: ExperimentRecordingsFilterContext
+        ) => ({ experimentId, context }),
+        reportExperimentBehaviorComparisonToggled: (experimentId: ExperimentIdType, opened: boolean) => ({
+            experimentId,
+            opened,
+        }),
+        reportExperimentBehaviorComparisonLoaded: (
+            experimentId: ExperimentIdType,
+            context: ExperimentWatchShelfContext
+        ) => ({ experimentId, context }),
+        reportExperimentBehaviorComparisonFailed: (
+            experimentId: ExperimentIdType,
+            context: ExperimentWatchLoadFailedContext
+        ) => ({ experimentId, context }),
+        reportExperimentWatchEmptyActionClicked: (
+            experimentId: ExperimentIdType,
+            context: ExperimentWatchEmptyActionContext
+        ) => ({ experimentId, context }),
+        reportExperimentWatchCardSelected: (experimentId: ExperimentIdType, context: ExperimentWatchCardContext) => ({
+            experimentId,
+            context,
+        }),
+        reportExperimentWatchHighlightOpened: (
+            experimentId: ExperimentIdType,
+            context: ExperimentWatchHighlightContext
+        ) => ({ experimentId, context }),
+        // Taxonomic Filter
+        reportTaxonomicFilterCategorySelected: (groupType: TaxonomicFilterGroupType, eventName?: string) => ({
+            groupType,
+            eventName,
+        }),
+        // Definition Popover
+        reportMediaPreviewUploaded: (source: string) => ({ source }),
+        reportDataManagementDefinitionClickView: (type: TaxonomicFilterGroupType) => ({ type }),
+        reportDataManagementDefinitionClickEdit: (type: TaxonomicFilterGroupType) => ({ type }),
+        // Group view Shortcuts
+        // Data Management Pages
+        reportInsightOpenedFromRecentInsightList: true,
+        reportPersonOpenedFromNewlySeenPersonsList: true,
+        reportAutocaptureToggled: (autocapture_opt_out: boolean) => ({ autocapture_opt_out }),
+        reportAutocaptureExceptionsToggled: (autocapture_opt_in: boolean) => ({ autocapture_opt_in }),
+        reportHeatmapsToggled: (heatmaps_opt_in: boolean) => ({ heatmaps_opt_in }),
+        reportActivityLogSettingToggled: (receive_org_level_activity_logs: boolean | null) => ({
+            receive_org_level_activity_logs,
+        }),
+        reportFeatureFlagBulkCopy: (flagCount: number, projectCount: number, failedCount: number) => ({
+            flagCount,
+            projectCount,
+            failedCount,
+        }),
+        reportFeatureFlagsBulkArchived: (archivedCount: number, pendingApprovalCount: number, failedCount: number) => ({
+            archivedCount,
+            pendingApprovalCount,
+            failedCount,
+        }),
+        reportFeatureFlagsBulkRestored: (restoredCount: number, failedCount: number) => ({
+            restoredCount,
+            failedCount,
+        }),
+        reportInviteMembersButtonClicked: true,
+        reportAxisUnitsChanged: (properties: Record<string, any>) => ({ ...properties }),
+        reportFlagsCodeExampleInteraction: (optionType: string) => ({
+            optionType,
+        }),
+        reportFlagsCodeExampleLanguage: (language: string) => ({
+            language,
+        }),
+        reportUserFeedbackButtonClicked: (source: SURVEY_CREATED_SOURCE, meta: Record<string, any>) => ({
+            source,
+            meta,
+        }),
+        reportProductTourViewed: (tour: ProductTour) => ({ tour }),
+        reportProductTourCreated: (tour: ProductTour, creationSource?: 'app' | 'toolbar') => ({
+            tour,
+            creationSource,
+        }),
+        reportProductTourListViewed: true,
+        reportProductUnsubscribed: (product: string) => ({ product }),
+        reportBillingCTAShown: true,
+        reportBillingUsageInteraction: (properties: BillingUsageInteractionProps) => ({ properties }),
+        reportBillingSpendInteraction: (properties: BillingUsageInteractionProps) => ({ properties }),
+        reportSDKSelected: (sdk: SDK) => ({ sdk }),
+        reportSDKSetupInstructionsSDKSelected: (sdkKey: string, surface: SDKSetupInstructionsSurface) => ({
+            sdkKey,
+            surface,
+        }),
+        reportAccountOwnerClicked: ({ name, email }: { name: string; email: string }) => ({ name, email }),
+        // revenue analytics
+        reportRevenueAnalyticsSettingsViewed: () => ({}),
+        reportRevenueAnalyticsEventCreated: (eventName: string) => ({ eventName }),
+        reportRevenueAnalyticsEventDeleted: (eventName: string) => ({ eventName }),
+        reportRevenueAnalyticsEventEdited: (eventName: string) => ({ eventName }),
+        reportRevenueAnalyticsDataSourceEnabled: (sourceType: string) => ({ sourceType }),
+        reportRevenueAnalyticsDataSourceDisabled: (sourceType: string) => ({ sourceType }),
+        reportRevenueAnalyticsTestAccountFilterUpdated: (filterTestAccounts: boolean) => ({ filterTestAccounts }),
+        // marketing analytics
+        reportMarketingAnalyticsOnboardingViewed: () => ({}),
+        reportMarketingAnalyticsOnboardingCompleted: (hasSources: boolean) => ({
+            hasSources,
+        }),
+        reportMarketingAnalyticsDataSourceConnected: (sourceType: string) => ({ sourceType }),
+        reportWebAnalyticsHealthStatus: (props: {
+            has_pageviews: boolean
+            has_pageleaves: boolean
+            has_scroll_depth: boolean
+            has_web_vitals: boolean
+            has_authorized_urls: boolean
+            has_reverse_proxy: boolean
+            overall_status: string
+        }) => ({ props }),
+        reportWebAnalyticsHealthTabViewed: (props: {
+            overall_status: string
+            passed_count: number
+            warning_count: number
+            error_count: number
+        }) => ({ props }),
+        reportWebAnalyticsHealthSectionToggled: (props: { category: string; is_expanded: boolean }) => ({ props }),
+        reportWebAnalyticsHealthActionClicked: (props: {
+            check_id: string
+            category: string
+            status: string
+            is_urgent: boolean
+        }) => ({ props }),
+        reportWebAnalyticsHealthRefreshed: (props: { overall_status: string; passed_count: number }) => ({ props }),
+        reportWebAnalyticsFilterApplied: (props: {
+            filter_type: string
+            property_filter_category?: PropertyFilterType
+            total_filter_count: number
+        }) => ({ props }),
+        reportWebAnalyticsFilterRemoved: (props: {
+            filter_type: string
+            property_filter_category?: PropertyFilterType
+            total_filter_count: number
+        }) => ({ props }),
+        reportWebAnalyticsCompareToggled: (props: { enabled: boolean }) => ({ props }),
+        reportWebAnalyticsPathCleaningToggled: (props: { enabled: boolean }) => ({ props }),
+        // Customer Analytics
+        reportCustomerAnalyticsDashboardBusinessModeChanged: ({ business_mode }) => ({ business_mode }),
+        reportCustomerAnalyticsDashboardConfigurationButtonClicked: () => true,
+        reportCustomerAnalyticsDashboardConfigurationViewed: () => true,
+        reportCustomerAnalyticsDashboardConfigureEventWithAIClicked: ({ event }) => ({ event }),
+        reportCustomerAnalyticsDashboardDateFilterApplied: ({ filter }) => ({ filter }),
+        reportCustomerAnalyticsAddJoinButtonClicked: ({ table }) => ({ table }),
+        reportCustomerAnalyticsDashboardEventsSaved: () => true,
+        reportCustomerAnalyticsViewed: (delay?: number) => ({ delay }),
+        // Customer Journeys
+        reportCustomerJourneyViewed: (journeyId: string, journeyName: string, stepCount: number, delay?: number) => ({
+            journeyId,
+            journeyName,
+            stepCount,
+            delay,
+        }),
+        reportCustomerJourneyCreated: (journeyName: string, stepCount: number, creationSource: string | null) => ({
+            journeyName,
+            stepCount,
+            creationSource,
+        }),
+        reportCustomerJourneyUpdated: (journeyId: string, journeyName: string, stepCount: number) => ({
+            journeyId,
+            journeyName,
+            stepCount,
+        }),
+        reportCustomerJourneyDeleted: (journeyId: string) => ({ journeyId }),
+        reportCustomerJourneyTemplateSelected: (templateKey: string) => ({ templateKey }),
+        reportCustomerJourneyExistingFunnelSelected: (insightId: number) => ({ insightId }),
+        reportCustomerJourneyStepAddedFromPath: (eventName: string, pathType: string, stepIndex: number) => ({
+            eventName,
+            pathType,
+            stepIndex,
+        }),
+        reportCustomerJourneyStepsSavedFromEditor: (stepsAdded: number, journeyId: string | null) => ({
+            stepsAdded,
+            journeyId,
+        }),
+        reportCustomerJourneyBuilderStepAdded: (stepIndex: number, stepCount: number) => ({ stepIndex, stepCount }),
+        reportCustomerJourneyBuilderStepRemoved: (stepIndex: number, stepCount: number) => ({ stepIndex, stepCount }),
+        reportGroupProfileViewed: (delay?: number) => ({ delay }),
+        reportPersonProfileViewed: (delay?: number) => ({ delay }),
+        reportUsageMetricsSettingsViewed: () => true,
+        reportUsageMetricsCreateButtonClicked: () => true,
+        reportUsageMetricsUpdateButtonClicked: () => true,
+        reportUsageMetricCreated: () => true,
+        reportUsageMetricUpdated: () => true,
+        reportUsageMetricDeleted: () => true,
+        // left nav
+        reportNavItemClicked: (item: string, section: string, itemType?: string | null) => ({
+            item,
+            section,
+            itemType,
+        }),
+        // navbar starred
+        // MCP hints
+        reportMCPHintShown: (surfaceKey: string) => ({ surfaceKey }),
+    }),
+    listeners(() => ({
+        reportBillingCTAShown: () => {
+            posthog.capture('billing CTA shown')
+        },
+        reportBillingUsageInteraction: ({ properties }) => {
+            posthog.capture('billing usage interaction', properties)
+        },
+        reportBillingSpendInteraction: ({ properties }) => {
+            posthog.capture('billing spend interaction', properties)
+        },
+        reportAxisUnitsChanged: (properties) => {
+            posthog.capture('axis units changed', properties)
+        },
+        reportIntegrationConnectClicked: ({ integration, kind, surface }) => {
+            posthog.capture('integration_connect_clicked', {
+                integration,
+                integration_kind: kind,
+                surface,
+            })
+        },
+        // The banner offering an existing installation is where an unfamiliar account name is read,
+        // so it reports what it offered: without this, neither the label nor its source is recorded
+        // anywhere, and a confusing entry only shows up as a support ticket.
+        reportGithubInstallationSelected: ({ surface, discoveryId, installationId, responseAgeMs }) => {
+            posthog.capture('integration_link_existing_selected', {
+                integration_kind: 'github',
+                surface,
+                discovery_id: discoveryId,
+                installation_id: installationId,
+                response_age_ms: responseAgeMs,
+            })
+        },
+        reportIntegrationLinkExistingOffered: ({ kind, surface, counts }) => {
+            posthog.capture('integration_link_existing_offered', {
+                integration_kind: kind,
+                surface,
+                discovery_id: counts.discoveryId,
+                displayed_installation_ids: counts.installationIds,
+                response_age_ms: counts.responseAgeMs,
+                installation_count: counts.total,
+                sibling_installation_count: counts.sibling,
+                orphan_installation_count: counts.orphan,
+                unnamed_installation_count: counts.unnamed,
+            })
+        },
+        // Counts connect attempts the provider sent back without a code. `integration_connect_clicked`
+        // only says the user started, so without this the drop-off is invisible outside session
+        // recordings — and `access_denied` in particular hides a workspace waiting on an admin.
+        reportIntegrationConnectRejected: ({ kind, error }) => {
+            posthog.capture('integration_connect_rejected', {
+                integration_kind: kind,
+                error,
+            })
+        },
+        // A provider can grant fewer scopes than PostHog asked for, e.g. when a workspace admin has to
+        // approve the app. The connect still succeeds, so this is the only record of the shortfall.
+        reportIntegrationScopeShortfallShown: ({ kind, missingScopes }) => {
+            posthog.capture('integration_scope_shortfall_shown', {
+                integration_kind: kind,
+                missing_scopes: missingScopes,
+                missing_scope_count: missingScopes.length,
+            })
+        },
+        reportTimeToSeeData: async ({ payload }) => {
+            posthog.capture('time to see data', { ...payload, $update_person_last_seen_at: false })
+        },
+        reportGroupTypeDetailDashboardCreated: async () => {
+            posthog.capture('group type detail dashboard created')
+        },
+        reportPersonsModalViewed: async ({ params }) => {
+            posthog.capture('insight person modal viewed', params)
+        },
+        reportPersonsModalSearched: async ({ params }) => {
+            posthog.capture('insight person modal searched', params)
+        },
+        reportProjectCreationSubmitted: async ({
+            projectCount,
+            nameLength,
+        }: {
+            projectCount?: number
+            nameLength: number
+        }) => {
+            posthog.capture('project create submitted', {
+                current_project_count: projectCount,
+                name_length: nameLength,
+            })
+        },
+        reportProjectNoticeDismissed: async ({ key }) => {
+            // ProjectNotice was previously called DemoWarning
+            posthog.capture('demo warning dismissed', { warning_key: key })
+        },
+        reportProjectNoticeShown: async ({ variant }) => {
+            posthog.capture('project notice shown', { variant })
+        },
+        reportFunnelStepReordered: async () => {
+            posthog.capture('funnel step reordered')
+        },
+        reportDataTableColumnsUpdated: async ({ context_type }) => {
+            posthog.capture('data table columns updated', { context_type })
+        },
+        reportTimezoneComponentViewed: async (payload) => {
+            posthog.capture('timezone component viewed', payload)
+        },
+        reportTestAccountFiltersUpdated: async ({ filters }) => {
+            const payload = {
+                filters_count: filters.length,
+                filters: filters.map((filter) => {
+                    return { key: filter.key, operator: filter.operator, value_length: filter.value.length }
+                }),
+            }
+            posthog.capture('test account filters updated', payload)
+        },
+        reportPoEModeUpdated: async ({ mode }) => {
+            posthog.capture('persons on events mode updated', { mode })
+        },
+        reportPersonJoinModeUpdated: async ({ mode }) => {
+            posthog.capture('persons join mode updated', { mode })
+        },
+        reportBounceRatePageViewModeUpdated: async ({ mode }) => {
+            posthog.capture('bounce rate page view mode updated', { mode })
+        },
+        reportSessionTableVersionUpdated: async ({ version }) => {
+            posthog.capture('session table version updated', { version })
+        },
+        reportCustomChannelTypeRulesUpdated: async ({ numRules }) => {
+            posthog.capture('custom channel type rules updated', { numRules })
+        },
+        reportInsightFilterAdded: async ({ newLength }) => {
+            posthog.capture('filter added', { newLength })
+        },
+        reportCreatedDashboardFromModal: async () => {
+            posthog.capture('created new dashboard from modal')
+        },
+        reportSavedInsightToDashboard: async ({ insight, dashboardId }) => {
+            posthog.capture('saved insight to dashboard', {
+                insight: sanitizeInsight(insight),
+                dashboard_id: dashboardId,
+            })
+            if (isBIVisualizationNode(insight?.query)) {
+                // Dynamic import keeps the BI editor runtime out of the eager shell bundle
+                const biEditorAnalytics = await retryImport(
+                    () => import('products/business_intelligence/frontend/biEditorAnalytics')
+                ).catch(() => null)
+                if (biEditorAnalytics) {
+                    biEditorAnalytics.captureBIWorksheetAction('added_to_dashboard', insight.query.config, {
+                        insight_id: insight.id,
+                    })
+                } else {
+                    posthog.capture('bi-worksheet-action', { action: 'added_to_dashboard', insight_id: insight.id })
+                }
+            }
+        },
+        reportRemovedInsightFromDashboard: async ({ insight, dashboardId }) => {
+            posthog.capture('removed insight from dashboard', {
+                insight: sanitizeInsight(insight),
+                dashboard_id: dashboardId,
+            })
+        },
+        reportInsightResultsCopiedToClipboard: async ({ format, insightId, dashboardId }) => {
+            posthog.capture('insight results copied to clipboard', {
+                format,
+                insight_id: insightId,
+                dashboard_id: dashboardId,
+            })
+        },
+        reportInsightsTableCalcToggled: async (payload) => {
+            posthog.capture('insights table calc toggled', payload)
+        },
+        reportInsightDraftRestored: ({ surface, draftAgeSeconds }) => {
+            posthog.capture('insight draft restored', { surface, draft_age_seconds: draftAgeSeconds })
+        },
+        reportInsightDraftDiscarded: ({ draftAgeSeconds }) => {
+            posthog.capture('insight draft discarded', { draft_age_seconds: draftAgeSeconds })
+        },
+        reportSavedInsightNewInsightClicked: ({ insightType, presetKey }) => {
+            posthog.capture('saved insights new insight clicked', {
+                insight_type: insightType,
+                ...(presetKey ? { preset_key: presetKey } : {}),
+            })
+        },
+        reportExperimentWizardStarted: () => {
+            posthog.capture('experiment wizard started')
+        },
+        reportExperimentWizardAskAiClicked: ({ currentStep }) => {
+            posthog.capture('experiment wizard ask ai clicked', { current_step: currentStep })
+        },
+        reportExperimentWizardExposureSourceSelected: ({ exposureSource }) => {
+            posthog.capture('experiment wizard exposure source selected', { exposure_source: exposureSource })
+        },
+        reportExperimentsListAiBadgeClicked: () => {
+            posthog.capture('experiments list ai badge clicked')
+        },
+        reportExperimentsListViewed: ({ experimentsShown, statusFilter, page, hasSearch, archived }) => {
+            posthog.capture('experiments list viewed', {
+                experiments_shown: experimentsShown,
+                status_filter: statusFilter,
+                page,
+                has_search: hasSearch,
+                archived,
+            })
+        },
+        reportExperimentsSettingsViewed: () => {
+            posthog.capture('experiments settings viewed')
+        },
+        reportExperimentsSettingChanged: ({ setting, value }) => {
+            posthog.capture('experiments setting changed', { setting, value })
+        },
+        reportExperimentViewed: ({ experiment, duration }) => {
+            posthog.capture('experiment viewed', {
+                ...getEventPropertiesForExperiment(experiment),
+                experiment_id: experiment.id,
+                experiment_status: getExperimentStatus(experiment),
+                duration,
+            })
+        },
+        reportExperimentMetricBreakdownAdded: ({ experiment, metricUuid, breakdown, isPrimary }) => {
+            posthog.capture('experiment metric breakdown added', {
+                ...getEventPropertiesForExperiment(experiment),
+                metric_uuid: metricUuid,
+                breakdown_type: breakdown.type,
+                breakdown_property: breakdown.property,
+                is_primary_metric: isPrimary,
+            })
+        },
+        reportExperimentWizardStepViewed: ({ step, stepNumber, previousStep, navigation }) => {
+            posthog.capture('experiment wizard step viewed', {
+                step,
+                step_number: stepNumber,
+                previous_step: previousStep,
+                navigation,
+            })
+        },
+        reportExperimentMetricBreakdownRemoved: ({ experiment, metricUuid, breakdown, index, isPrimary }) => {
+            posthog.capture('experiment metric breakdown removed', {
+                ...getEventPropertiesForExperiment(experiment),
+                metric_uuid: metricUuid,
+                breakdown_type: breakdown.type,
+                breakdown_property: breakdown.property,
+                breakdown_index: index,
+                is_primary_metric: isPrimary,
+            })
+        },
+        reportExperimentExposureCohortCreated: ({ experiment, cohort }) => {
+            posthog.capture('experiment exposure cohort created', {
+                experiment_id: experiment.id,
+                cohort_filters: cohort.filters,
+            })
+        },
+        reportExperimentExposureCohortEdited: ({ existingCohort, newCohort }) => {
+            posthog.capture('experiment exposure cohort edited', {
+                existing_filters: existingCohort.filters,
+                new_filters: newCohort.filters,
+                id: newCohort.id,
+            })
+        },
+        reportExperimentVariantScreenshotUploaded: ({ experimentId }) => {
+            posthog.capture('experiment variant screenshot uploaded', {
+                experiment_id: experimentId,
+            })
+        },
+        reportExperimentReleaseConditionsViewed: ({ experimentId }) => {
+            posthog.capture('experiment release conditions viewed', {
+                experiment_id: experimentId,
+            })
+        },
+        reportExperimentHoldoutCreated: ({ holdout }) => {
+            posthog.capture('experiment holdout created', {
+                name: holdout.name,
+                holdout_id: holdout.id,
+                filters: holdout.filters,
+            })
+        },
+        reportExperimentHoldoutAssigned: ({ experimentId, holdoutId }) => {
+            posthog.capture('experiment holdout assigned', {
+                experiment_id: experimentId,
+                holdout_id: holdoutId,
+            })
+        },
+        reportExperimentSharedMetricCreated: ({ sharedMetric }) => {
+            posthog.capture('experiment shared metric created', {
+                name: sharedMetric.name,
+                id: sharedMetric.id,
+                ...getEventPropertiesForMetric(sharedMetric.query as ExperimentMetric),
+            })
+        },
+        reportExperimentSharedMetricAssigned: ({ experimentId, sharedMetric }) => {
+            posthog.capture('experiment shared metric assigned', {
+                experiment_id: experimentId,
+                name: sharedMetric.name,
+                id: sharedMetric.id,
+                ...getEventPropertiesForMetric(sharedMetric.query as ExperimentMetric),
+            })
+        },
+        reportExperimentDashboardCreated: ({ experiment, dashboardId }) => {
+            posthog.capture('experiment dashboard created', {
+                experiment_name: experiment.name,
+                experiment_id: experiment.id,
+                dashboard_id: dashboardId,
+            })
+        },
+        reportExperimentFeatureFlagModalOpened: () => {
+            posthog.capture('experiment feature flag modal opened')
+        },
+        reportExperimentTimeseriesViewed: ({
+            experimentId,
+            metric,
+        }: {
+            experimentId: ExperimentIdType
+            metric: ExperimentMetric
+        }) => {
+            posthog.capture('experiment timeseries viewed', { experiment_id: experimentId, metric })
+        },
+        reportExperimentTimeseriesRecalculated: ({
+            experimentId,
+            metric,
+        }: {
+            experimentId: ExperimentIdType
+            metric: ExperimentMetric
+        }) => {
+            posthog.capture('experiment timeseries recalculated', { experiment_id: experimentId, metric })
+        },
+        reportExperimentAiSummaryRequested: ({ experiment }) => {
+            posthog.capture('experiment ai summary requested', {
+                ...getEventPropertiesForExperiment(experiment),
+            })
+        },
+        // The recordings-tab events below carry the experiment id alone rather than
+        // `getEventPropertiesForExperiment`, which serializes every metric definition. These fire on
+        // tab switches and recording clicks, so that payload would be sent many times per visit.
+        reportExperimentRecordingsBucketLoaded: ({ experimentId, context }) => {
+            posthog.capture('experiment recordings bucket loaded', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentRecordingsBucketFailed: ({ experimentId, context }) => {
+            posthog.capture('experiment recordings bucket failed', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentRecordingsListRendered: ({ experimentId, context }) => {
+            posthog.capture('experiment recordings list rendered', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentRecordingsListFailed: ({ experimentId, context }) => {
+            posthog.capture('experiment recordings list failed', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentRecordingsListAbandoned: ({ experimentId, context }) => {
+            posthog.capture('experiment recordings list abandoned', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentRecordingsEmptyActionClicked: ({ experimentId, context }) => {
+            posthog.capture('experiment recordings empty state action clicked', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentRecordingOpened: ({ experimentId, context }) => {
+            posthog.capture('experiment recording opened', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentBehaviorComparisonToggled: ({ experimentId, opened }) => {
+            posthog.capture('experiment behavior comparison toggled', {
+                experiment_id: experimentId,
+                opened,
+            })
+        },
+        reportExperimentBehaviorComparisonLoaded: ({ experimentId, context }) => {
+            posthog.capture('experiment behavior comparison loaded', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentBehaviorComparisonFailed: ({ experimentId, context }) => {
+            posthog.capture('experiment behavior comparison failed', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentWatchEmptyActionClicked: ({ experimentId, context }) => {
+            posthog.capture('experiment watch empty state action clicked', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentWatchCardSelected: ({ experimentId, context }) => {
+            posthog.capture('experiment watch card selected', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportExperimentWatchHighlightOpened: ({ experimentId, context }) => {
+            posthog.capture('experiment watch highlight opened', {
+                experiment_id: experimentId,
+                ...context,
+            })
+        },
+        reportInsightDateExclusionsChanged: ({ queryKind, excludeIncompletePeriods, excludedDaysOfWeekCount }) => {
+            posthog.capture('insight date exclusions changed', {
+                query_kind: queryKind,
+                exclude_incomplete_periods: excludeIncompletePeriods,
+                excluded_days_of_week_count: excludedDaysOfWeekCount,
+            })
+        },
+        reportInsightDatePickerOpened: ({ queryKind }) => {
+            posthog.capture('insight date picker opened', { query_kind: queryKind })
+        },
+        reportTaxonomicFilterCategorySelected: ({ groupType, eventName }) => {
+            posthog.capture('taxonomic filter category selected', { groupType, eventName })
+        },
+        reportMediaPreviewUploaded: ({ source }) => {
+            posthog.capture('media preview uploaded', { source })
+        },
+        reportDataManagementDefinitionClickView: ({ type }) => {
+            posthog.capture('definition click view', { type })
+        },
+        reportDataManagementDefinitionClickEdit: ({ type }) => {
+            posthog.capture('definition click edit', { type })
+        },
+        reportInsightOpenedFromRecentInsightList: () => {
+            posthog.capture('insight opened from recent insight list')
+        },
+        reportPersonOpenedFromNewlySeenPersonsList: () => {
+            posthog.capture('person opened from newly seen persons list')
+        },
+        reportAutocaptureToggled: ({ autocapture_opt_out }) => {
+            posthog.capture('autocapture toggled', {
+                autocapture_opt_out,
+            })
+        },
+        reportAutocaptureExceptionsToggled: ({ autocapture_opt_in }) => {
+            posthog.capture('autocapture exceptions toggled', {
+                autocapture_opt_in,
+            })
+        },
+        reportHeatmapsToggled: ({ heatmaps_opt_in }) => {
+            posthog.capture('heatmaps toggled', {
+                heatmaps_opt_in,
+            })
+        },
+        reportActivityLogSettingToggled: ({ receive_org_level_activity_logs }) => {
+            posthog.capture('activity log org level setting toggled', {
+                receive_org_level_activity_logs,
+            })
+        },
+        reportFeatureFlagBulkCopy: ({ flagCount, projectCount, failedCount }) => {
+            posthog.capture('feature flags bulk copied', {
+                flag_count: flagCount,
+                project_count: projectCount,
+                failed_count: failedCount,
+            })
+        },
+        reportFeatureFlagsBulkArchived: ({ archivedCount, pendingApprovalCount, failedCount }) => {
+            posthog.capture('feature flags bulk archived', {
+                archived_count: archivedCount,
+                pending_approval_count: pendingApprovalCount,
+                failed_count: failedCount,
+            })
+        },
+        reportFeatureFlagsBulkRestored: ({ restoredCount, failedCount }) => {
+            posthog.capture('feature flags bulk restored', {
+                restored_count: restoredCount,
+                failed_count: failedCount,
+            })
+        },
+        reportInviteMembersButtonClicked: () => {
+            posthog.capture('invite members button clicked')
+        },
+        reportResourceAccessLevelUpdated: ({ resourceType, roleName, accessLevel }) => {
+            posthog.capture('resource access level updated', {
+                resource_type: resourceType,
+                role_name: roleName,
+                access_level: accessLevel,
+            })
+        },
+        reportRoleCustomAddedToAResource: ({ resourceType, rolesLength }) => {
+            posthog.capture('role custom added to a resource', {
+                resource_type: resourceType,
+                roles_length: rolesLength,
+            })
+        },
+        reportFlagsCodeExampleInteraction: ({ optionType }) => {
+            posthog.capture('flags code example option selected', {
+                option_type: optionType,
+            })
+        },
+        reportFlagsCodeExampleLanguage: ({ language }) => {
+            posthog.capture('flags code example language selected', {
+                language,
+            })
+        },
+        reportProductTourViewed: ({ tour }) => {
+            posthog.capture(ProductTourEvent.VIEWED, {
+                tour_id: tour.id,
+                tour_name: tour.name,
+                tour_type: tour.content?.type ?? 'tour',
+                step_count: tour.content?.steps?.length ?? 0,
+                start_date: tour.start_date,
+                end_date: tour.end_date,
+            })
+        },
+        reportProductTourCreated: ({ tour, creationSource }) => {
+            posthog.capture(ProductTourEvent.CREATED, {
+                tour_id: tour.id,
+                tour_name: tour.name,
+                tour_type: tour.content?.type ?? 'tour',
+                step_count: tour.content?.steps?.length ?? 0,
+                has_targeting: !!tour.internal_targeting_flag,
+                auto_launch: tour.auto_launch,
+                creation_source: creationSource ?? 'app',
+            })
+        },
+        reportProductTourListViewed: () => {
+            posthog.capture(ProductTourEvent.LIST_VIEWED)
+        },
+        reportUserFeedbackButtonClicked: ({ source, meta }) => {
+            posthog.capture('feedback button clicked', {
+                source,
+                ...meta,
+            })
+        },
+        reportProductUnsubscribed: ({ product }) => {
+            const property_key = `unsubscribed_from_${product}`
+            posthog.capture('product unsubscribed', {
+                product,
+                $set: { [property_key]: true },
+            })
+        },
+        reportSDKSelected: ({ sdk }) => {
+            posthog.capture('sdk selected', {
+                sdk: sdk.key,
+            })
+        },
+        reportSDKSetupInstructionsSDKSelected: ({ sdkKey, surface }) => {
+            posthog.capture('sdk setup instructions sdk selected', {
+                sdk: sdkKey,
+                surface,
+            })
+        },
+        // command bar
+        reportCommandBarStatusChanged: ({ status }) => {
+            posthog.capture('command bar status changed', { status })
+        },
+        reportCommandBarSearch: ({ queryLength }) => {
+            posthog.capture('command bar search', { queryLength })
+        },
+        reportCommandBarSearchResultOpened: ({ type }) => {
+            posthog.capture('command bar search result opened', { type })
+        },
+        reportCommandBarActionSearch: ({ query }) => {
+            posthog.capture('command bar action search', { query })
+        },
+        reportCommandBarActionResultExecuted: ({ resultDisplay }) => {
+            posthog.capture('command bar search result executed', { resultDisplay })
+        },
+        reportAccountOwnerClicked: ({ name, email }) => {
+            posthog.capture('account owner clicked', { name, email })
+        },
+        // revenue analytics
+        reportRevenueAnalyticsSettingsViewed: () => {
+            posthog.capture('revenue analytics settings viewed')
+        },
+        reportRevenueAnalyticsEventCreated: ({ eventName }) => {
+            posthog.capture('revenue analytics event created', { event_name: eventName })
+        },
+        reportRevenueAnalyticsEventDeleted: ({ eventName }) => {
+            posthog.capture('revenue analytics event deleted', { event_name: eventName })
+        },
+        reportRevenueAnalyticsEventEdited: ({ eventName }) => {
+            posthog.capture('revenue analytics event edited', { event_name: eventName })
+        },
+        reportRevenueAnalyticsDataSourceEnabled: ({ sourceType }) => {
+            posthog.capture('revenue analytics data source enabled', { source_type: sourceType })
+        },
+        reportRevenueAnalyticsDataSourceDisabled: ({ sourceType }) => {
+            posthog.capture('revenue analytics data source disabled', { source_type: sourceType })
+        },
+        reportRevenueAnalyticsTestAccountFilterUpdated: ({ filterTestAccounts }) => {
+            posthog.capture('revenue analytics test account filter updated', {
+                filter_test_accounts: filterTestAccounts,
+            })
+        },
+        reportMarketingAnalyticsOnboardingViewed: () => {
+            posthog.capture('marketing analytics onboarding viewed')
+        },
+        reportMarketingAnalyticsOnboardingCompleted: ({ hasSources }) => {
+            posthog.capture('marketing analytics onboarding completed', {
+                has_sources: hasSources,
+            })
+        },
+        reportMarketingAnalyticsDataSourceConnected: ({ sourceType }) => {
+            posthog.capture('marketing analytics data source connected', { source_type: sourceType })
+        },
+        reportWebAnalyticsHealthStatus: ({ props }) => {
+            posthog.capture('web analytics health status', props)
+        },
+        reportWebAnalyticsHealthTabViewed: ({ props }) => {
+            posthog.capture('web analytics health tab viewed', props)
+        },
+        reportWebAnalyticsHealthSectionToggled: ({ props }) => {
+            posthog.capture('web analytics health section toggled', props)
+        },
+        reportWebAnalyticsHealthActionClicked: ({ props }) => {
+            posthog.capture('web analytics health action clicked', props)
+        },
+        reportWebAnalyticsHealthRefreshed: ({ props }) => {
+            posthog.capture('web analytics health refreshed', props)
+        },
+        reportWebAnalyticsFilterApplied: ({ props }) => {
+            posthog.capture('web analytics filter applied', props)
+        },
+        reportWebAnalyticsFilterRemoved: ({ props }) => {
+            posthog.capture('web analytics filter removed', props)
+        },
+        reportWebAnalyticsCompareToggled: ({ props }) => {
+            posthog.capture('web analytics compare toggled', props)
+        },
+        reportWebAnalyticsPathCleaningToggled: ({ props }) => {
+            posthog.capture('web analytics path cleaning toggled', props)
+        },
+        // Customer Analytics
+        reportCustomerAnalyticsDashboardBusinessModeChanged: async ({ business_mode }) => {
+            posthog.capture('customer analytics dashboard business mode changed', { business_mode })
+        },
+        reportCustomerAnalyticsDashboardConfigurationButtonClicked: async () => {
+            posthog.capture('customer analytics dashboard configuration button clicked')
+        },
+        reportCustomerAnalyticsDashboardConfigurationViewed: async (_, breakpoint) => {
+            await breakpoint(500)
+            posthog.capture('customer analytics dashboard configuration viewed')
+        },
+        reportCustomerAnalyticsDashboardDateFilterApplied: async ({ filter }) => {
+            posthog.capture('customer analytics dashboard date filter applied', { filter })
+        },
+        reportCustomerAnalyticsDashboardConfigureEventWithAIClicked: async ({ event }) => {
+            posthog.capture('customer analytics dashboard configure event with AI clicked', { event })
+        },
+        reportCustomerAnalyticsAddJoinButtonClicked: async ({ table }) => {
+            posthog.capture('customer analytics add join button clicked', { table })
+        },
+        reportCustomerAnalyticsDashboardEventsSaved: async () => {
+            posthog.capture('customer analytics dashboard events saved')
+        },
+        reportUsageMetricsSettingsViewed: async (_, breakpoint) => {
+            await breakpoint(500)
+            posthog.capture('usage metrics settings viewed')
+        },
+        reportUsageMetricsCreateButtonClicked: async () => {
+            posthog.capture('usage metrics create button clicked')
+        },
+        reportUsageMetricsUpdateButtonClicked: async () => {
+            posthog.capture('usage metrics update button clicked')
+        },
+        reportUsageMetricCreated: async () => {
+            posthog.capture('usage metric created')
+        },
+        reportUsageMetricUpdated: async () => {
+            posthog.capture('usage metric updated')
+        },
+        reportUsageMetricDeleted: async () => {
+            posthog.capture('usage metric deleted')
+        },
+        reportCustomerAnalyticsViewed: async ({ delay }, breakpoint) => {
+            if (!delay) {
+                await breakpoint(500)
+            }
+            const eventName = delay ? 'customer analytics analyzed' : 'customer analytics viewed'
+            posthog.capture(eventName, { delay })
+        },
+        // Customer Journeys
+        reportCustomerJourneyViewed: async ({ journeyId, journeyName, stepCount, delay }, breakpoint) => {
+            if (!delay) {
+                await breakpoint(500)
+            }
+            const eventName = delay ? 'customer journey analyzed' : 'customer journey viewed'
+            posthog.capture(eventName, {
+                journey_id: journeyId,
+                journey_name: journeyName,
+                step_count: stepCount,
+                delay,
+            })
+        },
+        reportCustomerJourneyCreated: async ({ journeyName, stepCount, creationSource }) => {
+            posthog.capture('customer journey created', {
+                journey_name: journeyName,
+                step_count: stepCount,
+                creation_source: creationSource,
+            })
+        },
+        reportCustomerJourneyUpdated: async ({ journeyId, journeyName, stepCount }) => {
+            posthog.capture('customer journey updated', {
+                journey_id: journeyId,
+                journey_name: journeyName,
+                step_count: stepCount,
+            })
+        },
+        reportCustomerJourneyDeleted: async ({ journeyId }) => {
+            posthog.capture('customer journey deleted', { journey_id: journeyId })
+        },
+        reportCustomerJourneyTemplateSelected: async ({ templateKey }) => {
+            posthog.capture('customer journey template selected', { template_key: templateKey })
+        },
+        reportCustomerJourneyExistingFunnelSelected: async ({ insightId }) => {
+            posthog.capture('customer journey existing funnel selected', { insight_id: insightId })
+        },
+        reportCustomerJourneyStepAddedFromPath: async ({ eventName, pathType, stepIndex }) => {
+            posthog.capture('customer journey step added from path', {
+                event_name: eventName,
+                path_type: pathType,
+                step_index: stepIndex,
+            })
+        },
+        reportCustomerJourneyStepsSavedFromEditor: async ({ stepsAdded, journeyId }) => {
+            posthog.capture('customer journey steps saved from editor', {
+                steps_added: stepsAdded,
+                journey_id: journeyId,
+            })
+        },
+        reportCustomerJourneyBuilderStepAdded: async ({ stepIndex, stepCount }) => {
+            posthog.capture('customer journey builder step added', {
+                step_index: stepIndex,
+                step_count: stepCount,
+            })
+        },
+        reportCustomerJourneyBuilderStepRemoved: async ({ stepIndex, stepCount }) => {
+            posthog.capture('customer journey builder step removed', {
+                step_index: stepIndex,
+                step_count: stepCount,
+            })
+        },
+        reportGroupProfileViewed: async ({ delay }, breakpoint) => {
+            if (!delay) {
+                await breakpoint(500)
+            }
+            const eventName = delay ? 'group profile analyzed' : 'group profile viewed'
+            posthog.capture(eventName, { delay })
+        },
+        reportPersonProfileViewed: async ({ delay }, breakpoint) => {
+            if (!delay) {
+                await breakpoint(500)
+            }
+            const eventName = delay ? 'person profile analyzed' : 'person profile viewed'
+            posthog.capture(eventName, { delay })
+        },
+        reportNavItemClicked: ({ item, section, itemType }) => {
+            posthog.capture('nav item clicked', {
+                item,
+                section,
+                item_type: itemType ?? null,
+            })
+        },
+        reportMCPHintShown: ({ surfaceKey }) => {
+            posthog.capture('mcp hint shown', {
+                surface_key: surfaceKey,
+            })
+        },
+    })),
+])

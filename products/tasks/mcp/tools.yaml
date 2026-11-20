@@ -1,0 +1,537 @@
+# MCP tool definitions. Tools are opt-in: an operation is exposed only when it has an entry here.
+# List operations without an entry: pnpm --filter=@posthog/mcp run scaffold-yaml -- --candidates --product tasks
+# Add one: pnpm --filter=@posthog/mcp run scaffold-yaml -- --add <operationId> --product tasks
+# To keep an operation off on purpose, set enabled: false and give a disabled_reason.
+category: Tasks
+feature: tasks
+url_prefix: /tasks
+ui_apps: {}
+tools:
+    channel-create:
+        operation: task_channels_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: false
+        title: Create a channel
+        description: >
+            Create a channel. The default `channel_type` is public. Public names use lowercase letters and hyphens. If a
+            public channel has that name, return it. Use channel-list to find an existing channel's ID. Set
+            `channel_type` to "private" to create a private channel with the requester and the users in `member_ids`.
+            Users in `member_ids` must have project access. Private channels always get a new ID, so a retry creates
+            another channel.
+    channel-instructions-retrieve:
+        operation: task_channels_instructions_retrieve
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Read channel instructions
+        description: >
+            Read a channel's CONTEXT.md instructions (versioned markdown describing the channel's context). Returns the
+            latest `content` and its `version` — pass that version as `base_version` when publishing an update. A
+            channel with no instructions yet reads as a blank version 0.
+        param_overrides:
+            id:
+                description: ID of the channel whose instructions to read.
+        feature_flag: context-layer
+        feature_flag_behavior: disable
+        superseded_by:
+            - context-wiki-page-retrieve
+    channel-instructions-update:
+        operation: task_channels_instructions_update
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: true
+            idempotent: false
+        title: Update channel instructions
+        description: >
+            Publish a complete replacement for a channel's CONTEXT.md. Read the current version with
+            channel-instructions-retrieve first. Pass its version as base_version. This guard returns a conflict if
+            another update changes the document.
+        param_overrides:
+            id:
+                description: ID of the channel whose instructions to update.
+            base_version:
+                input_schema: ChannelInstructionsBaseVersionSchema
+        feature_flag: context-layer
+        feature_flag_behavior: disable
+        superseded_by:
+            - context-wiki-page-update
+    channel-list:
+        operation: task_channels_list
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: List channels
+        description: >
+            List channels the requester can access: public channels, their personal #me channel, and private channels
+            they belong to. Use a channel ID to create or list canvases or read instructions. Private channels can have
+            the same name, so identify them by ID. Send `limit` and `offset` to get a page with `count`, `next`,
+            `previous`, and `results`. Without `limit`, the response is an array of all accessible channels.
+    channel-retrieve:
+        operation: task_channels_retrieve
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get a channel
+        description: "Get a single PostHog Tasks channel by id, returning its name and type. Channels are the project's
+            workspace channels that group tasks and canvases (public channels plus each member's #me channel)."
+        param_overrides:
+            id:
+                description: ID of the channel to read.
+    inbox-repo-routing-rules-create:
+        operation: tasks_repo_routing_rules_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: false
+        title: Add a repo routing rule
+        description: >
+            Add a repo routing rule that sends a kind of request to a repository. Call inbox-repo-routing-rules-list
+            first: if a rule already covers the same requests, update it with inbox-repo-routing-rules-update. The new
+            rule gets the lowest priority, so an existing rule that matches the same requests still wins. The API cannot
+            change a priority. To move a rule ahead of other rules, delete those rules and add them again after it. A
+            rule can only point at a repository: there is no rule that stops the selection of a repository. Set
+            `repository` to a repository that is connected to the project, because the selector ignores other rules.
+            Keep `rule_text` short and specific (at most 300 characters). The call fails when the project has reached
+            its rule limit. Task agents in a sandbox cannot add rules.
+    inbox-repo-routing-rules-delete:
+        operation: tasks_repo_routing_rules_destroy
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: true
+            idempotent: true
+        title: Delete a repo routing rule
+        description: >
+            Delete a repo routing rule. The selector stops using the rule for new repository selections. Get the rule
+            `id` from inbox-repo-routing-rules-list. Task agents in a sandbox cannot delete rules.
+        param_overrides:
+            id:
+                description: ID of the routing rule to delete, from inbox-repo-routing-rules-list.
+    inbox-repo-routing-rules-list:
+        operation: tasks_repo_routing_rules_list
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: List repo routing rules
+        description: >
+            List the project's repo routing rules in `priority` order, lowest first. A rule maps a kind of request
+            (`rule_text`) to a `repository`. The agent that selects a repository for a task or an Inbox report weighs a
+            matching rule as strong evidence, not as a hard constraint. When more than one rule matches, the earlier
+            rule wins. The selector ignores a rule whose repository is not connected to the project, and reads at most
+            the first 20 rules that remain. Read this list before you add or change a rule, so that you do not add a
+            duplicate or shadow an existing rule.
+    inbox-repo-routing-rules-update:
+        operation: tasks_repo_routing_rules_partial_update
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Update a repo routing rule
+        description: >
+            Change the `rule_text` or the `repository` of a repo routing rule. Send only the fields to change. The rule
+            keeps its priority. Get the rule `id` from inbox-repo-routing-rules-list. Task agents in a sandbox cannot
+            change rules.
+        param_overrides:
+            id:
+                description: ID of the routing rule to update, from inbox-repo-routing-rules-list.
+    tasks-config-agent-instructions-create:
+        operation: tasks_config_agent_instructions_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Set project agent instructions
+        description: >
+            Set the project's agent instructions: markdown that PostHog cloud agents load as their user-level AGENTS.md
+            in every eligible Tasks run on the project, including internal Self-driving research, implementation, and
+            scout runs. Requires project admin. Sandbox agents cannot rewrite these instructions. Replaces the stored
+            text; send an empty string to clear. Read tasks-config-list first, and send the full new text, not a diff.
+            Use inbox-steering-instructions-update for instructions that apply to only one Self-driving agent role.
+    tasks-config-create:
+        operation: tasks_config_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Set project task run defaults
+        description: >
+            Set the project-wide default AI run preferences (runtime adapter, model, reasoning effort) applied to task
+            runs created without an explicit runtime selection. Requires project admin. `runtime_adapter` and `model`
+            must be set together; send all three fields as null to clear the project default. Use tasks-models-retrieve
+            to list valid model identifiers.
+        feature_flag: tasks
+    tasks-config-list:
+        operation: tasks_config_list
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get project task run defaults
+        description: >
+            Get the project-wide default AI run preferences (runtime adapter, model, reasoning effort) applied to task
+            runs created without an explicit runtime selection. All fields are null when no project default is stored.
+            Also returns the project's agent instructions (`agent_instructions`), empty when unset.
+    tasks-create:
+        operation: tasks_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: false
+        enrich_url: '{id}'
+        title: Create task
+        description: >
+            Create a task without starting a run. Set `description` to the agent's instructions. For code tasks, set
+            `repository` to `organization/repo`. A person can start the task at the returned URL. Use
+            `tasks-create-and-run` to start a run immediately when that tool is available.
+        include_params:
+            - title
+            - description
+            - repository
+        param_overrides:
+            description:
+                description: >
+                    The task for the agent to carry out, written as a direct prompt (e.g. "Investigate the spike in
+                    $exception events on the checkout page and open a PR with a fix"). Passed verbatim to the agent as
+                    its instructions, so be specific.
+                required: true
+        feature_flag: tasks
+        response:
+            include:
+                - id
+                - task_number
+                - title
+                - description
+                - origin_product
+                - repository
+                - internal
+                - latest_run.id
+                - latest_run.stage
+                - latest_run.status
+                - run_error
+                - created_at
+                - updated_at
+    tasks-create-and-run:
+        operation: tasks_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: false
+        input_schema: TaskAgentCreateSchema
+        enrich_url: '{id}'
+        title: Create task and start or schedule run
+        description: >
+            Create a task and start its first background run, or set `scheduled_at` for a one-off run within 30 days.
+            Times without an offset use UTC. Confirm the returned time; execution starts at or after that time. Omit
+            model fields to use saved defaults. Use `tasks-models-retrieve` before an explicit model choice. Set
+            `description` to the agent's instructions. For code tasks, set `repository` to `organization/repo`. Omit
+            `branch` to use the default branch. Check `run_error` if the run does not start. Poll `tasks-runs-list` or
+            `tasks-runs-retrieve` for progress. If the response is lost, search for the task before you retry. A
+            repeated call can create another task.
+        feature_flag: tasks-mcp-agent-run-start
+        response:
+            include:
+                - id
+                - task_number
+                - title
+                - description
+                - repository
+                - latest_run.id
+                - latest_run.stage
+                - latest_run.status
+                - run_error
+                - latest_run.scheduled_at
+                - latest_run.model
+                - latest_run.reasoning_effort
+    tasks-list:
+        operation: tasks_list
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        enrich_url: '{id}'
+        list: true
+        title: Search and list tasks
+        description: >
+            Search agent tasks before starting related work. Use `search` to match task titles and descriptions, and
+            `channel` to limit results to the current space. The results identify who created each task and whether its
+            latest run is active. Supports additional filtering by status, repository, creator, origin product, and
+            archived or internal state. Requires the calling token's organization to have Tasks access enabled. To
+            inspect failures in a space, set channel, status=failed, internal=all, and archived=all. For workflow-backed
+            loops, also set hog_flow_id. The latest_run includes the stored error and completion time even if the run
+            stopped before writing canvas state. Use tasks-runs-list for earlier runs of a task.
+        feature_flag: tasks
+        response:
+            include:
+                - id
+                - task_number
+                - title
+                - description
+                - origin_product
+                - repository
+                - internal
+                - channel
+                - created_by.first_name
+                - created_by.last_name
+                - status
+                - status_reason
+                - status_detail
+                - latest_run.id
+                - latest_run.status
+                - latest_run.error_message
+                - latest_run.created_at
+                - latest_run.completed_at
+                - created_at
+                - updated_at
+    tasks-me-config-agent-instructions-create:
+        operation: tasks_me_config_agent_instructions_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Set my agent instructions
+        description: >
+            Set the caller's personal agent instructions: markdown that PostHog cloud agents load after the project
+            instructions in Tasks runs the caller starts. Autonomous runs never load them. Anyone who continues a task
+            the caller started can see them, so they must not hold anything private. Replaces the stored text; send an
+            empty string to clear. Read the current text with tasks-me-config-list first, and send the full new text,
+            not a diff.
+        feature_flag: tasks
+    tasks-me-config-create:
+        operation: tasks_me_config_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Set my task run defaults
+        description: >
+            Set the caller's per-project default AI run preferences (runtime adapter, model, reasoning effort). They
+            override the project default wholesale. `runtime_adapter` and `model` must be set together; send all three
+            fields as null to clear and inherit the project default. Returns the stored preferences plus the resolved
+            defaults a new run will use. Use tasks-models-retrieve to list valid model identifiers.
+        feature_flag: tasks
+    tasks-me-config-list:
+        operation: tasks_me_config_list
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get my task run defaults
+        description: >
+            Get the caller's per-project default AI run preferences, plus the resolved defaults a new run will use when
+            no explicit runtime selection is sent (the caller's preference wins over the project default; `source` says
+            which level supplied it). Also returns the caller's personal agent instructions (`agent_instructions`),
+            empty when unset.
+        feature_flag: tasks
+    tasks-models-retrieve:
+        operation: tasks_models_retrieve
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: List available task run models
+        description: >
+            List the models a task run may use, each with its runtime adapter and the reasoning efforts it supports. Use
+            the returned identifiers when setting task run default preferences or creating a run. An empty list means
+            the model catalogue is temporarily unavailable, not that no models exist.
+        feature_flag: tasks
+    tasks-retrieve:
+        operation: tasks_retrieve
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        enrich_url: '{id}'
+        title: Get task
+        description: >
+            Get a specific task by ID, including its description, repository, origin product, current stage, and latest
+            run summary. Sandbox connection credentials and the presigned log URL are omitted from the embedded
+            `latest_run`. Use tasks-runs-list or tasks-runs-retrieve to inspect past executions.
+        feature_flag: tasks
+        response:
+            exclude:
+                - latest_run.log_url
+                - latest_run.state.sandbox_connect_token
+                - latest_run.state.sandbox_url
+    tasks-run-create:
+        operation: tasks_run_create
+        enabled: true
+        scopes:
+            - task:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: false
+        input_schema: TaskAgentRunCreateSchema
+        enrich_url: '{id}'
+        title: Start or schedule task run
+        description: >
+            Start a cloud run for an existing task, or set `scheduled_at` for a one-off run within 30 days. Times
+            without an offset use UTC. Confirm the returned time; execution starts at or after that time. Omit model
+            fields to use saved defaults, or the previous run's model on resume. Use `tasks-models-retrieve` before an
+            explicit model choice. Use `pending_user_message` for follow-up work and `resume_from_run_id` to continue a
+            prior run. The created run is the top-level `run`; read `run.id` for run-scoped calls — the top-level `id`
+            is the task's. Poll `tasks-runs-list` or `tasks-runs-retrieve` for progress. Check `run_error` for a start
+            failure. If the response is lost, check the runs before you retry. A repeated call can start another run.
+        feature_flag: tasks-mcp-agent-run-start
+        response:
+            include:
+                - run_error
+                - id
+                - task_number
+                - title
+                - description
+                - repository
+                - run.id
+                - run.stage
+                - run.status
+                - run.scheduled_at
+                - run.model
+                - run.reasoning_effort
+                - latest_run.id
+                - latest_run.stage
+                - latest_run.status
+                - latest_run.scheduled_at
+                - latest_run.model
+                - latest_run.reasoning_effort
+    tasks-runs-artifacts-finalize-upload-create:
+        operation: tasks_runs_artifacts_finalize_upload_create
+        enabled: false
+        disabled_reason: Its prepare step, tasks-runs-artifacts-prepare-upload-create, is not exposed
+        description: >
+            Finalize a task run artifact uploaded through a prepared form. Before revising a file under the same name,
+            read its latest version because an interactive user may have edited it since the agent's last upload.
+    tasks-runs-list:
+        operation: tasks_runs_list
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        list: true
+        title: List task runs
+        description: >
+            List all runs for a specific task. Returns lightweight run metadata only — call tasks-runs-retrieve for full
+            run detail including state, output, and artifacts.
+        feature_flag: tasks
+        response:
+            include:
+                - id
+                - task
+                - stage
+                - branch
+                - status
+                - environment
+                - error_message
+                - state.sandbox_environment_id
+                - scheduled_at
+                - model
+                - reasoning_effort
+                - created_at
+                - updated_at
+                - completed_at
+    tasks-runs-retrieve:
+        operation: tasks_runs_retrieve
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get task run
+        description: >
+            Get full details for a specific task run including status, stage, environment, branch, artifacts summary,
+            state, error message, and timestamps. Sandbox connection credentials (`state.sandbox_connect_token`,
+            `state.sandbox_url`) and the presigned `log_url` are omitted from the response.
+        feature_flag: tasks
+        response:
+            exclude:
+                - log_url
+                - state.sandbox_connect_token
+                - state.sandbox_url
+    tasks-runs-session-logs-retrieve:
+        operation: tasks_runs_session_logs_retrieve
+        enabled: true
+        scopes:
+            - task:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get task run session logs
+        description: >
+            Fetch session log events emitted by the agent for a specific run. Supports filtering by `event_types`,
+            `exclude_types`, pagination with `limit`/`offset`, and `after` cursor. Use this instead of the streaming
+            endpoint when invoking from an MCP client.
+        param_overrides:
+            limit:
+                description: Maximum number of entries to return (default 100, max 5000)
+                default: 100
+        feature_flag: tasks

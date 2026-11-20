@@ -1,0 +1,194 @@
+import {
+    AlertCalculationInterval,
+    AlertCondition,
+    AlertScheduleRestriction,
+    AlertScheduleRestrictionWindow,
+    AlertState,
+    DetectorConfig,
+    FunnelsAlertConfig,
+    HogQLAlertConfig,
+    InsightThreshold,
+    InsightsThresholdBounds,
+    MetricsAlertConfig,
+    TrendsAlertConfig,
+} from '~/queries/schema/schema-general'
+import { InsightModel, UserBasicType } from '~/types'
+
+import type {
+    AlertApi,
+    AlertDeliveryApi,
+    AlertSimulateResponseApi,
+    ForecastSimulationApi,
+} from './generated/api.schemas'
+
+export type AlertCheckDelivery = AlertDeliveryApi
+
+export type AlertConfig = TrendsAlertConfig | HogQLAlertConfig | FunnelsAlertConfig | MetricsAlertConfig
+
+export const isTrendsAlertConfig = (config: AlertConfig | null | undefined): config is TrendsAlertConfig =>
+    config?.type === 'TrendsAlertConfig'
+
+export const isHogQLAlertConfig = (config: AlertConfig | null | undefined): config is HogQLAlertConfig =>
+    config?.type === 'HogQLAlertConfig'
+
+export const isFunnelsAlertConfig = (config: AlertConfig | null | undefined): config is FunnelsAlertConfig =>
+    config?.type === 'FunnelsAlertConfig'
+
+export const isMetricsAlertConfig = (config: AlertConfig | null | undefined): config is MetricsAlertConfig =>
+    config?.type === 'MetricsAlertConfig'
+
+/** SQL alert in any-row mode: every result row is checked (one entity per row), which changes
+ * row labeling and history rendering versus the single-value modes. */
+export const isAnyRowHogQLConfig = (config: AlertConfig | null | undefined): boolean =>
+    isHogQLAlertConfig(config) && config.evaluation === 'any_row'
+
+// Capability helpers — read at call sites instead of bare `isTrendsAlertConfig`/`isHogQLAlertConfig`
+// checks, so the intent ("does this alert kind support X") is explicit. Kept separate even where
+// they coincide today (all trends-only) because the capabilities are independent and may diverge.
+
+/** Trends alerts, historical-trend funnels, and metrics alerts evaluate a time-bucketed series, so
+ * they can check the current (incomplete) interval. SQL alerts evaluate whatever the query returns —
+ * no partial interval. Type guard so call sites can read `check_ongoing_interval` after the check.
+ * This is config-level: a steps funnel also matches (it carries the field), so the UI additionally
+ * gates the funnel case on whether it's a trends funnel — only those are a time series. */
+export const supportsOngoingInterval = (
+    config: AlertConfig | null | undefined
+): config is TrendsAlertConfig | FunnelsAlertConfig | MetricsAlertConfig =>
+    isTrendsAlertConfig(config) || isFunnelsAlertConfig(config) || isMetricsAlertConfig(config)
+
+/** Trends and funnel alerts evaluate over the insight's time window/interval; SQL alerts own their
+ * own window inside the query, so there's no interval to echo in the UI. */
+export const supportsTimeWindow = (config: AlertConfig | null | undefined): boolean => !isHogQLAlertConfig(config)
+
+/** Anomaly detection needs a time series to score: trends, or SQL in last/first-row mode (an
+ * any-row SQL alert's rows are unrelated entities, not a time axis, so there's nothing to score). */
+export const supportsAnomalyDetection = (config: AlertConfig | null | undefined): boolean =>
+    isTrendsAlertConfig(config) || (isHogQLAlertConfig(config) && !isAnyRowHogQLConfig(config))
+
+export type BlockedWindow = AlertScheduleRestrictionWindow
+
+/** Quiet hours / blocked local periods; times are HH:MM in the project timezone. */
+export type ScheduleRestriction = AlertScheduleRestriction
+
+export interface SubDetectorScores {
+    type: string
+    scores: (number | null)[]
+}
+
+export interface BreakdownSimulationResult {
+    label: string
+    data: number[]
+    dates: string[]
+    scores: (number | null)[]
+    triggered_indices: number[]
+    triggered_dates: string[]
+    total_points: number
+    anomaly_count: number
+    sub_detector_scores?: SubDetectorScores[]
+    forecast?: ForecastSimulationApi
+}
+
+export interface AlertSimulationResult extends Pick<
+    AlertSimulateResponseApi,
+    'evaluation_delay_intervals' | 'evaluated_interval_start' | 'evaluated_interval_end' | 'evaluated_interval_timezone'
+> {
+    data: number[]
+    dates: string[]
+    scores: (number | null)[]
+    triggered_indices: number[]
+    triggered_dates: string[]
+    interval: string | null
+    total_points: number
+    anomaly_count: number
+    sub_detector_scores?: SubDetectorScores[]
+    breakdown_results?: BreakdownSimulationResult[]
+    /** Forecast detector only: the one-step forecast of each point. */
+    forecast?: ForecastSimulationApi
+    /** AI detector only: the model's reason for its verdict on the latest point. */
+    rationale?: string
+    /** AI detector only: the shape the model saw at the latest point. */
+    kind?: string | null
+}
+
+export interface AnomalyPoint {
+    index: number
+    date: string
+    score: number | null
+    seriesIndex: number
+}
+
+export type InvestigationInconclusiveAction = 'notify' | 'suppress'
+
+export type AlertThreshold = Omit<InsightThreshold, 'bounds'> & {
+    bounds?: InsightsThresholdBounds | null
+}
+
+export interface AlertTypeBase extends Pick<AlertApi, 'evaluation_delay_intervals'> {
+    name: string
+    condition: AlertCondition
+    threshold: { configuration: AlertThreshold }
+    enabled: boolean
+    insight: InsightModel
+    config: AlertConfig
+    skip_weekend?: boolean
+    schedule_restriction?: ScheduleRestriction | null
+    schedule_start_time?: string | null
+    detector_config?: DetectorConfig | null
+    investigation_agent_enabled?: boolean
+    investigation_gates_notifications?: boolean
+    investigation_inconclusive_action?: InvestigationInconclusiveAction
+}
+
+export interface AlertTypeWrite extends Omit<AlertTypeBase, 'insight'> {
+    subscribed_users: number[]
+    insight: number
+    snoozed_until?: string | null
+    detector_config?: DetectorConfig | null
+}
+
+export type InvestigationStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+export type InvestigationVerdict = 'true_positive' | 'false_positive' | 'inconclusive'
+
+export interface AlertCheck {
+    id: string
+    created_at: string
+    calculated_value: number | null
+    state: AlertState
+    error?: { code?: string; message?: string } | null
+    targets_notified: boolean
+    anomaly_scores?: (number | null)[] | null
+    triggered_points?: number[] | null
+    triggered_dates?: string[] | null
+    interval?: string | null
+    triggered_metadata?: Record<string, unknown> | null
+    investigation_status?: InvestigationStatus | null
+    investigation_verdict?: InvestigationVerdict | null
+    investigation_summary?: string | null
+    investigation_notebook_short_id?: string | null
+    notification_sent_at?: string | null
+    notification_suppressed_by_agent?: boolean
+    deliveries: AlertCheckDelivery[] | null
+}
+
+export interface AlertType extends AlertTypeBase {
+    id: string
+    subscribed_users: UserBasicType[]
+    condition: AlertCondition
+    created_by: UserBasicType
+    created_at: string
+    state: AlertState
+    last_notified_at: string
+    last_checked_at: string
+    next_check_at?: string | null
+    checks_total?: number
+    checks?: AlertCheck[]
+    /** Whether the alert's creator can use the AI detector. Only set when a single alert was retrieved. */
+    llm_detector_available?: boolean | null
+    /** Whether the alert can open PagerDuty incidents, which only the alerts platform sends. */
+    pagerduty_available?: boolean
+    /** How many active notification destinations the alert sends to, each counted once. Subscribers are not included. */
+    destination_count?: number
+    calculation_interval: AlertCalculationInterval
+    snoozed_until?: string
+    last_value?: number
+}

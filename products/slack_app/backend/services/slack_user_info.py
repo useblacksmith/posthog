@@ -1,0 +1,434 @@
+"""Slack user/profile lookup with DB caching.
+
+`users.info` and `users.lookupByEmail` are the only sources of truth for
+display names, email-to-user-id mappings, and the `is_bot` flag — and both
+are rate-limited. Every lookup goes through `SlackUserProfileCache` in
+Postgres so repeated requests don't burn the Slack API quota.
+
+The bot's own user id (from `auth_test()`) is folded into the shared
+per-integration auth-state cache in `slack_auth`, so a successful
+``auth.test`` doubles as proof the bot token works — no separate cache
+shape for the bot user id alone.
+
+These helpers used to live in `api.py` alongside the HTTP-facing code,
+which forced every service-layer caller (`slack_messages.py`,
+`integration_resolver.py`) into a deferred import to dodge the circular
+dependency. Living in `services/` lets all of them import normally and
+keeps `api.py` focused on routes.
+"""
+
+import re
+from collections.abc import Iterable
+from datetime import timedelta
+from typing import Any
+from uuid import UUID
+
+from django.core.cache import cache
+from django.db.utils import DatabaseError
+from django.utils import timezone
+
+import structlog
+from slack_sdk.errors import SlackApiError
+
+from posthog.integrations import IntegrationManager, IntegrationRecord
+from posthog.models.integration import SLACK_INTEGRATION_KINDS, SlackIntegration
+from posthog.models.organization import OrganizationMembership
+from posthog.models.user import User
+
+from products.slack_app.backend.models import SlackUserProfileCache
+from products.slack_app.backend.services.slack_auth import (
+    SLACK_AUTH_STATE_CACHE_TTL_SECONDS,
+    classify_slack_api_error,
+    get_cached_auth_state,
+    write_auth_state_broken,
+    write_auth_state_ok,
+)
+from products.slack_app.backend.services.workspace_integrations import workspace_integrations
+
+logger = structlog.get_logger(__name__)
+
+SLACK_USER_PROFILE_TTL = timedelta(hours=1)
+
+
+def _format_slack_user_info_payload(
+    *,
+    email: str | None,
+    display_name: str,
+    real_name: str,
+    is_admin: bool,
+    is_owner: bool,
+    is_bot: bool,
+    tz: str,
+) -> dict[str, Any]:
+    return {
+        "user": {
+            "is_admin": is_admin,
+            "is_owner": is_owner,
+            "is_bot": is_bot,
+            "tz": tz,
+            "profile": {
+                "email": email,
+                "display_name": display_name,
+                "real_name": real_name,
+            },
+        }
+    }
+
+
+def normalize_slack_response(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+
+    data = getattr(payload, "data", None)
+    if isinstance(data, dict):
+        return data
+
+    return {}
+
+
+def _get_slack_user_info_from_db(integration: IntegrationRecord, slack_user_id: str) -> dict[str, Any] | None:
+    try:
+        profile = SlackUserProfileCache.objects.filter(
+            integration_id=integration.id, slack_user_id=slack_user_id
+        ).first()
+    except DatabaseError:
+        logger.warning("slack_app_slack_user_cache_db_unavailable", integration_id=integration.id)
+        return None
+    if not profile or not profile.refreshed_at or timezone.now() - profile.refreshed_at >= SLACK_USER_PROFILE_TTL:
+        return None
+
+    return _format_slack_user_info_payload(
+        email=profile.email,
+        display_name=profile.display_name,
+        real_name=profile.real_name,
+        is_admin=profile.is_admin,
+        is_owner=profile.is_owner,
+        is_bot=profile.is_bot,
+        tz=profile.tz,
+    )
+
+
+def persist_slack_user_info(integration: IntegrationRecord, slack_user_id: str, user_info: dict[str, Any]) -> None:
+    user = user_info.get("user", {})
+    profile = user.get("profile", {})
+    try:
+        SlackUserProfileCache.objects.update_or_create(
+            integration_id=integration.id,
+            slack_user_id=slack_user_id,
+            defaults={
+                "email": profile.get("email") or None,
+                "display_name": profile.get("display_name") or "",
+                "real_name": profile.get("real_name") or "",
+                "is_admin": bool(user.get("is_admin")),
+                "is_owner": bool(user.get("is_owner")),
+                "is_bot": bool(user.get("is_bot")),
+                "tz": str(user.get("tz") or "")[:64],
+                "refreshed_at": timezone.now(),
+            },
+        )
+    except DatabaseError:
+        logger.warning("slack_app_slack_user_cache_db_unavailable", integration_id=integration.id)
+
+
+def get_slack_user_info(slack: SlackIntegration, integration: IntegrationRecord, slack_user_id: str) -> dict[str, Any]:
+    cached_db = _get_slack_user_info_from_db(integration, slack_user_id)
+    if isinstance(cached_db, dict):
+        return cached_db
+
+    user_info = normalize_slack_response(slack.client.users_info(user=slack_user_id))
+    if user_info:
+        persist_slack_user_info(integration, slack_user_id, user_info)
+        return user_info
+    return {}
+
+
+def is_slack_workspace_admin(slack: SlackIntegration, integration: IntegrationRecord, slack_user_id: str) -> bool:
+    """Whether the Slack user is a workspace admin or owner."""
+    user_info = get_slack_user_info(slack, integration, slack_user_id)
+    slack_user = user_info.get("user", {}) if isinstance(user_info, dict) else {}
+    return bool(slack_user.get("is_admin") or slack_user.get("is_owner"))
+
+
+def _get_slack_user_id_by_email_from_db(integration: IntegrationRecord, normalized_email: str) -> str | None:
+    try:
+        profile = SlackUserProfileCache.objects.filter(
+            integration_id=integration.id,
+            email__iexact=normalized_email,
+        ).first()
+    except DatabaseError:
+        logger.warning("slack_app_slack_user_cache_db_unavailable", integration_id=integration.id)
+        return None
+    if not profile or not profile.refreshed_at or timezone.now() - profile.refreshed_at >= SLACK_USER_PROFILE_TTL:
+        return None
+    return profile.slack_user_id
+
+
+def lookup_slack_user_id_by_email(
+    slack: SlackIntegration,
+    integration: IntegrationRecord,
+    email: str,
+) -> str | None:
+    """Resolve a Slack user ID from a PostHog user email.
+
+    Uses ``SlackUserProfileCache`` (populated by ``resolve_slack_user`` and prior lookups),
+    then ``users.lookupByEmail``.
+    """
+    normalized_email = email.strip().lower()
+    if not normalized_email:
+        return None
+
+    slack_user_id = _get_slack_user_id_by_email_from_db(integration, normalized_email)
+    if slack_user_id:
+        return slack_user_id
+
+    try:
+        user_info = normalize_slack_response(slack.client.users_lookupByEmail(email=email))
+    except SlackApiError as exc:
+        error_code = exc.response.get("error") if exc.response else None
+        if error_code != "users_not_found":
+            logger.warning(
+                "slack_user_id_by_email_lookup_failed",
+                integration_id=integration.id,
+                email=email,
+                error=error_code,
+            )
+        return None
+
+    if not user_info.get("ok"):
+        return None
+
+    user = user_info.get("user")
+    if not isinstance(user, dict) or not user.get("id"):
+        return None
+
+    slack_user_id = str(user["id"])
+    persist_slack_user_info(integration, slack_user_id, user_info)
+    _purge_stale_email_rows(integration, normalized_email, slack_user_id)
+    return slack_user_id
+
+
+def _purge_stale_email_rows(integration: IntegrationRecord, normalized_email: str, keep_slack_user_id: str) -> None:
+    """Drop rows that share an email with the authoritative Slack user ID we just resolved.
+
+    Without this, an orphan row (same email, older Slack user ID) can outrank the fresh one
+    in ``_get_slack_user_id_by_email_from_db`` and trigger a fresh ``users.lookupByEmail`` call
+    on every request.
+    """
+    try:
+        SlackUserProfileCache.objects.filter(
+            integration_id=integration.id,
+            email__iexact=normalized_email,
+        ).exclude(slack_user_id=keep_slack_user_id).delete()
+    except DatabaseError:
+        logger.warning("slack_app_slack_user_cache_db_unavailable", integration_id=integration.id)
+
+
+def find_member_by_cached_slack_email(
+    *, slack_team_id: str, slack_user_id: str, candidate_org_ids: Iterable[UUID]
+) -> User | None:
+    """The active member of ``candidate_org_ids`` whose email matches the cached Slack profile.
+
+    The fallback for a Slack identity without an OAuth link. It reads only the profile cache,
+    so it costs no ``users.info`` call. Any install of the workspace may have cached the
+    profile, so the lookup is scoped to the Slack team and not to one integration row.
+    """
+    org_ids = set(candidate_org_ids)
+    if not slack_team_id or not slack_user_id or not org_ids:
+        return None
+    profile = (
+        SlackUserProfileCache.objects.filter(
+            integration_id__in=[row.id for row in workspace_integrations(slack_team_id)],
+            slack_user_id=slack_user_id,
+        )
+        .exclude(email__isnull=True)
+        .exclude(email="")
+        .order_by("-updated_at")
+        .first()
+    )
+    if profile is None:
+        return None
+    membership = (
+        OrganizationMembership.objects.filter(
+            organization_id__in=org_ids,
+            user__email__iexact=profile.email,
+            user__is_active=True,
+        )
+        .select_related("user")
+        .first()
+    )
+    return membership.user if membership else None
+
+
+def clear_workspace_profile_cache(slack_team_id: str) -> int:
+    """Delete every cached Slack profile for the workspace, returning the row count.
+
+    Called when the app is uninstalled, so a reinstall resolves users from fresh
+    ``users.info`` data instead of emails cached under the previous install.
+
+    A transient database failure is logged and swallowed (returning 0): raising would
+    500 the webhook, and since Slack retries are acked without reprocessing, the event
+    would be lost — along with the cross-region fan-out that follows the clear. Rows
+    that survive a failed clear age out via the cache TTL.
+    """
+    try:
+        integration_ids = [
+            row.id
+            for row in IntegrationManager.kinds(*SLACK_INTEGRATION_KINDS, auth_types="any").list_by_external_id(
+                slack_team_id
+            )
+        ]
+        deleted, _ = SlackUserProfileCache.objects.filter(integration_id__in=integration_ids).delete()
+    except DatabaseError:
+        logger.warning("slack_app_uninstall_profile_cache_clear_failed", slack_team_id=slack_team_id, exc_info=True)
+        return 0
+    return deleted
+
+
+def _workspace_bot_user_cache_key(slack_team_id: str) -> str:
+    return f"slack_app:workspace_bot_user_id:{slack_team_id}"
+
+
+def get_cached_workspace_bot_user_id(slack_team_id: str) -> str | None:
+    """The workspace's bot user id, if some install resolved it recently. Cheap.
+
+    One Slack install serves every integration row a workspace has, in both regions, so
+    the id is workspace-level data. Written as a side effect of ``get_cached_bot_user_id``,
+    which is what lets a surface that has not loaded an integration yet (the reaction
+    router) reject a reaction on a non-bot message before its first database query. A miss
+    proves nothing: callers fall through to the integration-scoped path, which is also why
+    a cache outage degrades to that path rather than raising into a webhook.
+    """
+    try:
+        value = cache.get(_workspace_bot_user_cache_key(slack_team_id))
+    except Exception:
+        logger.warning("slack_app_workspace_bot_user_cache_read_failed", slack_team_id=slack_team_id)
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def cache_workspace_bot_user_id(slack_team_id: str, bot_user_id: str) -> None:
+    """Best-effort: this cache only saves work, so a write failure must not fail the
+    caller, which sits on the mention pipeline's hot path."""
+    try:
+        cache.set(_workspace_bot_user_cache_key(slack_team_id), bot_user_id, SLACK_AUTH_STATE_CACHE_TTL_SECONDS)
+    except Exception:
+        logger.warning("slack_app_workspace_bot_user_cache_write_failed", slack_team_id=slack_team_id)
+
+
+def invalidate_workspace_bot_user_id(slack_team_id: str) -> None:
+    """Drop the workspace-level bot id so the next resolution re-derives it.
+
+    Called on OAuth reconnect: a reinstall can mint a new bot user, and the reaction
+    router's author gate must not keep rejecting the new bot's replies against the old id
+    for the cache TTL.
+    """
+    try:
+        cache.delete(_workspace_bot_user_cache_key(slack_team_id))
+    except Exception:
+        logger.warning("slack_app_workspace_bot_user_cache_delete_failed", slack_team_id=slack_team_id)
+
+
+def get_cached_bot_user_id(slack: SlackIntegration, integration: IntegrationRecord) -> str | None:
+    """Return the bot's Slack user id for ``integration``, populating the
+    shared auth-state cache as a side effect.
+
+    Terminal paths:
+
+    - **Cache hit, healthy with bot_user_id** — return it. No Slack call.
+    - **Cache hit, broken** — known dead token; return ``None`` without
+      attempting ``auth.test``. Caller treats this the same as an API failure.
+    - **Cache miss or healthy-without-bot-id** — run ``auth.test``. On success,
+      refresh the cache as ``ok=true`` carrying the bot user id. On an
+      auth-class ``SlackApiError``, mark the cache ``ok=false`` so subsequent
+      mentions skip this install for the TTL. Transient/network errors leave
+      the cache alone — a Slack 5xx shouldn't brick the workspace for 6 hours.
+    """
+    cached = get_cached_auth_state(integration.id)
+    if cached is not None:
+        if cached.ok and cached.bot_user_id is not None:
+            if integration.integration_id:
+                cache_workspace_bot_user_id(integration.integration_id, cached.bot_user_id)
+            return cached.bot_user_id
+        if not cached.ok:
+            return None
+        # ``ok=True`` without ``bot_user_id`` is rare (auth.test returned ok
+        # without a user_id field). Fall through to ``auth.test`` and refill.
+
+    try:
+        response = slack.client.auth_test()
+    except SlackApiError as exc:
+        error_code, token_broken = classify_slack_api_error(exc)
+        if token_broken and error_code is not None:
+            write_auth_state_broken(integration.id, error_code)
+        logger.warning(
+            "slack_app_bot_user_id_lookup_failed",
+            integration_id=integration.id,
+            error_code=error_code,
+            exc_info=True,
+        )
+        return None
+    except Exception:
+        logger.warning(
+            "slack_app_bot_user_id_lookup_failed",
+            integration_id=integration.id,
+            error_code=None,
+            exc_info=True,
+        )
+        return None
+
+    bot_user_id = response.get("user_id")
+    if not isinstance(bot_user_id, str) or not bot_user_id:
+        return None
+    write_auth_state_ok(integration.id, bot_user_id)
+    if integration.integration_id:
+        cache_workspace_bot_user_id(integration.integration_id, bot_user_id)
+    return bot_user_id
+
+
+_USER_MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+
+
+def find_addressed_bot_user_id(slack: SlackIntegration, integration: IntegrationRecord, text: str) -> str | None:
+    """The user id of a bot other than ours that this message tags, or ``None``.
+
+    Callers ask this to tell a message addressed to another app from one addressed to us.
+    Other apps work in the same channels and threads we do, and a message that tags one is
+    that app's to answer. Nothing in the text says so by the time an agent reads it:
+    ``resolve_user_mentions_text`` strips bot mentions, which leaves a bare instruction to
+    whoever is listening.
+
+    Wire format cannot answer it either. A bot user id and a human's are both
+    ``U…``-prefixed, so the ``is_bot`` flag is the only authoritative signal, and it comes
+    from ``users.info`` through the same cache every other lookup here uses.
+
+    A message that tags our own bot answers ``None``, whoever else it tags. Somebody typed
+    our name, so the message is ours to answer even when it names another app in the same
+    breath.
+
+    Answers ``None`` when a lookup fails as well as when the message tags no bot. An
+    unresolved mention is no evidence the message was meant for someone else. That covers
+    our own id too: without it our bot's mention is indistinguishable from another app's,
+    and a message that tagged us is the worse one to get wrong.
+    """
+    mentioned_ids = dict.fromkeys(_USER_MENTION_RE.findall(text))
+    if not mentioned_ids:
+        return None
+
+    our_bot_user_id = get_cached_bot_user_id(slack, integration)
+    if not our_bot_user_id or our_bot_user_id in mentioned_ids:
+        return None
+
+    for user_id in mentioned_ids:
+        try:
+            user_info = get_slack_user_info(slack, integration, user_id)
+        except Exception:
+            logger.warning(
+                "slack_app_mention_bot_lookup_failed",
+                integration_id=integration.id,
+                mentioned_user_id=user_id,
+                exc_info=True,
+            )
+            continue
+        if user_info.get("user", {}).get("is_bot"):
+            return user_id
+    return None

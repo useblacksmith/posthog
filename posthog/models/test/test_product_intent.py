@@ -1,0 +1,955 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
+import time_machine
+from posthog.test.base import BaseTest
+from unittest.mock import patch
+
+from django.core.cache import cache
+
+from parameterized import parameterized
+
+from posthog.schema import ProductIntentContext, ProductKey
+
+from posthog.models.file_system.file_system_shortcut import FileSystemShortcut
+from posthog.models.product_intent.product_intent import (
+    ProductIntent,
+    _fetch_product_intents,
+    _team_product_intents_cache_key,
+    cached_product_intents_for_team,
+    calculate_product_activation,
+    enqueue_product_activation_calc_debounced,
+)
+from posthog.models.team.team import Team
+from posthog.session_recordings.models.session_recording import SessionRecording
+from posthog.utils import get_instance_realm
+
+from products.dashboards.backend.models.dashboard import Dashboard
+from products.event_definitions.backend.models.event_definition import EventDefinition
+from products.experiments.backend.facade.testing import create_experiment
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.product_analytics.backend.facade.models import Insight
+from products.surveys.backend.models import Survey
+from products.workflows.backend.facade.testing import create_workflow_for_test
+
+
+class TestProductIntent(BaseTest):
+    def setUp(self):
+        super().setUp()
+        # Joining the org stars the default products. These tests assert on the stars that
+        # product intents add, so they start without any.
+        FileSystemShortcut.objects.filter(user=self.user, team=self.team).delete()
+        self.product_intent = ProductIntent.objects.create(team=self.team, product_type=ProductKey.DATA_WAREHOUSE)
+
+    def test_str_representation(self):
+        self.assertEqual(str(self.product_intent), f"{self.team.name} - data_warehouse")
+
+    def test_unique_constraint(self):
+        # Test that we can't create duplicate product intents for same team/product
+        with pytest.raises(Exception):
+            ProductIntent.objects.create(team=self.team, product_type=ProductKey.DATA_WAREHOUSE)
+
+    def test_can_create_intent_with_register(self):
+        ProductIntent.register(
+            self.team, ProductKey.SESSION_REPLAY, ProductIntentContext.QUICK_START_PRODUCT_SELECTED, self.user
+        )
+        intent = ProductIntent.objects.filter(team=self.team, product_type=ProductKey.SESSION_REPLAY).first()
+        assert intent is not None
+        assert intent.contexts == {ProductIntentContext.QUICK_START_PRODUCT_SELECTED: 1}
+
+        ProductIntent.register(
+            self.team, ProductKey.SESSION_REPLAY, ProductIntentContext.QUICK_START_PRODUCT_SELECTED, self.user
+        )
+        intent.refresh_from_db()
+        assert intent is not None
+        assert intent.contexts == {ProductIntentContext.QUICK_START_PRODUCT_SELECTED: 2}
+
+    @time_machine.travel("2024-01-01T12:00:00Z", tick=False)
+    def test_register_with_onboarding_sets_onboarding_completed_at(self):
+        ProductIntent.register(
+            team=self.team,
+            product_type=ProductKey.PRODUCT_ANALYTICS,
+            context=ProductIntentContext.ONBOARDING_PRODUCT_SELECTED___PRIMARY,
+            user=self.user,
+            is_onboarding=True,
+        )
+
+        intent = ProductIntent.objects.get(team=self.team, product_type=ProductKey.PRODUCT_ANALYTICS)
+        assert intent.onboarding_completed_at == datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+        assert intent.contexts == {ProductIntentContext.ONBOARDING_PRODUCT_SELECTED___PRIMARY: 1}
+
+    @time_machine.travel("2024-01-01T12:00:00Z", tick=False)
+    def test_register_without_onboarding_does_not_set_onboarding_completed_at(self):
+        ProductIntent.register(
+            team=self.team,
+            product_type=ProductKey.PRODUCT_ANALYTICS,
+            context=ProductIntentContext.TAXONOMIC_FILTER_EMPTY_STATE,
+            user=self.user,
+            is_onboarding=False,
+        )
+
+        intent = ProductIntent.objects.get(team=self.team, product_type=ProductKey.PRODUCT_ANALYTICS)
+        assert intent.onboarding_completed_at is None
+        assert intent.contexts == {ProductIntentContext.TAXONOMIC_FILTER_EMPTY_STATE: 1}
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_has_activated_data_warehouse_with_valid_query(self):
+        Insight.objects.create(
+            team=self.team, query={"kind": "DataVisualizationNode", "source": {"query": "SELECT * FROM custom_table"}}
+        )
+
+        self.assertTrue(self.product_intent.has_activated_data_warehouse())
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_has_activated_data_warehouse_with_excluded_table(self):
+        Insight.objects.create(
+            team=self.team, query={"kind": "DataVisualizationNode", "source": {"query": "SELECT * FROM events"}}
+        )
+
+        self.assertFalse(self.product_intent.has_activated_data_warehouse())
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_has_activated_data_warehouse_with_old_insight(self):
+        with time_machine.travel("2024-05-15T12:00:00Z", tick=False):  # Before June 1st, 2024
+            Insight.objects.create(
+                team=self.team,
+                query={"kind": "DataVisualizationNode", "source": {"query": "SELECT * FROM custom_table"}},
+            )
+
+        self.assertFalse(self.product_intent.has_activated_data_warehouse())
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_check_and_update_activation_sets_activated_at(self):
+        Insight.objects.create(
+            team=self.team, query={"kind": "DataVisualizationNode", "source": {"query": "SELECT * FROM custom_table"}}
+        )
+
+        self.assertIsNone(self.product_intent.activated_at)
+        self.product_intent.check_and_update_activation()
+        self.product_intent.refresh_from_db()
+        assert self.product_intent.activated_at == datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_calculate_product_activation_task(self):
+        # Create an insight that should trigger activation
+        Insight.objects.create(
+            team=self.team, query={"kind": "DataVisualizationNode", "source": {"query": "SELECT * FROM custom_table"}}
+        )
+
+        calculate_product_activation(self.team.id)
+
+        self.product_intent.refresh_from_db()
+        assert self.product_intent.activated_at == datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+
+    def test_calculate_product_activation_respects_check_interval(self):
+        # Set last checked time to recent
+        self.product_intent.activation_last_checked_at = datetime.now(tz=UTC)
+        self.product_intent.save()
+
+        calculate_product_activation(self.team.id, only_calc_if_days_since_last_checked=1)
+
+        self.product_intent.refresh_from_db()
+        self.assertIsNone(self.product_intent.activated_at)
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_calculate_product_activation_skips_activated_products(self):
+        # Set product as already activated
+        self.product_intent.activated_at = datetime.now(tz=UTC)
+        self.product_intent.save()
+
+        with time_machine.travel(datetime.now(tz=UTC) + timedelta(days=2), tick=False):
+            calculate_product_activation(self.team.id)
+            self.product_intent.refresh_from_db()
+            assert self.product_intent.activated_at == datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+
+    def test_has_activated_experiments_with_launched_experiment(self):
+        self.product_intent.product_type = "experiments"
+        self.product_intent.save()
+
+        # Create a feature flag for the experiment
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="test-flag",
+            name="Test Flag",
+            filters={"groups": [{"properties": []}]},
+        )
+
+        # Create an experiment without a start date (not launched)
+        create_experiment(team_id=self.team.id, name="Not launched", feature_flag_id=feature_flag.id)
+        self.assertFalse(self.product_intent.has_activated_experiments())
+
+        # Create another feature flag for the launched experiment
+        launched_flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="launched-flag",
+            name="Launched Flag",
+            filters={"groups": [{"properties": []}]},
+        )
+
+        # Create an experiment with a start date (launched)
+        create_experiment(
+            team_id=self.team.id, name="Launched", start_date=datetime.now(tz=UTC), feature_flag_id=launched_flag.id
+        )
+        self.assertTrue(self.product_intent.has_activated_experiments())
+
+    def test_has_activated_feature_flags(self):
+        self.product_intent.product_type = "feature_flags"
+        self.product_intent.save()
+
+        # Create a feature flag with one filter group
+        FeatureFlag.objects.create(
+            team=self.team,
+            key="flag-1",
+            name="Flag 1",
+            filters={"groups": [{"properties": [{"key": "email", "value": "test@test.com"}]}]},
+        )
+        self.assertFalse(self.product_intent.has_activated_feature_flags())
+
+        # Create a feature flag with another filter group
+        FeatureFlag.objects.create(
+            team=self.team,
+            key="flag-2",
+            name="Flag 2",
+            filters={"groups": [{"properties": [{"key": "country", "value": "US"}]}]},
+        )
+        self.assertTrue(self.product_intent.has_activated_feature_flags())
+
+    def test_has_activated_feature_flags_ignores_flags_in_another_config_format(self):
+        self.product_intent.product_type = "feature_flags"
+        self.product_intent.save()
+        FeatureFlag.objects.create(
+            team=self.team,
+            key="other-format",
+            filters={"version": 2, "return_type": "boolean", "default_value": False, "rules": []},
+        )
+        for index in (1, 2):
+            FeatureFlag.objects.create(
+                team=self.team,
+                key=f"flag-{index}",
+                filters={"groups": [{"properties": [{"key": "email", "value": "test@test.com"}]}]},
+            )
+
+        self.assertTrue(self.product_intent.has_activated_feature_flags())
+
+    def test_has_activated_feature_flags_excludes_experiment_and_survey_flags(self):
+        self.product_intent.product_type = "feature_flags"
+        self.product_intent.save()
+
+        # Create excluded feature flags
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="feature-flag-for-experiment-test",
+            name="Feature Flag for Experiment Test",
+            filters={"groups": [{"properties": [{"key": "email", "value": "test@test.com"}]}]},
+        )
+        create_experiment(team_id=self.team.id, name="Experiment Test", feature_flag_id=feature_flag.id)
+        survey_flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="targeting-flag-for-survey-test",
+            name="Targeting flag for survey Test",
+            filters={"groups": [{"properties": [{"key": "country", "value": "US"}]}]},
+        )
+        Survey.objects.create(team=self.team, name="Survey Test", targeting_flag=survey_flag)
+
+        self.assertFalse(self.product_intent.has_activated_feature_flags())
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_has_activated_session_replay_with_five_recordings_viewed_and_filters_set(self):
+        # Create 5 recordings and mark them as viewed
+        for i in range(5):
+            recording = SessionRecording.objects.create(
+                team=self.team,
+                session_id=f"session-{i}",
+            )
+
+            recording.check_viewed_for_user(self.user, save_viewed=True)
+
+        # Create a product intent with the filters set
+        ProductIntent.objects.create(
+            team=self.team,
+            product_type=ProductKey.SESSION_REPLAY,
+            contexts={ProductIntentContext.SESSION_REPLAY_SET_FILTERS: 1},
+        )
+
+        self.assertTrue(self.product_intent.has_activated_session_replay())
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_has_not_activated_session_replay_with_less_than_five_recordings(self):
+        # Create a product intent with the filters set
+        ProductIntent.objects.create(
+            team=self.team,
+            product_type=ProductKey.SESSION_REPLAY,
+            contexts={ProductIntentContext.SESSION_REPLAY_SET_FILTERS: 1},
+        )
+
+        # Create only 4 recordings and mark them as viewed
+        for i in range(4):
+            recording = SessionRecording.objects.create(
+                team=self.team,
+                session_id=f"session-{i}",
+            )
+
+            recording.check_viewed_for_user(self.user, save_viewed=True)
+
+        assert self.product_intent.has_activated_session_replay() is False
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_has_not_activated_session_replay_with_unviewed_recordings(self):
+        # Create a product intent with the filters set
+        ProductIntent.objects.create(
+            team=self.team,
+            product_type=ProductKey.SESSION_REPLAY,
+            contexts={ProductIntentContext.SESSION_REPLAY_SET_FILTERS: 1},
+        )
+
+        for i in range(3):
+            recording = SessionRecording.objects.create(
+                team=self.team,
+                session_id=f"session-{i}",
+            )
+
+            recording.check_viewed_for_user(self.user, save_viewed=True)
+
+        for i in range(4, 6):
+            recording = SessionRecording.objects.create(
+                team=self.team,
+                session_id=f"session-{i}",
+            )
+
+            recording.check_viewed_for_user(self.user, save_viewed=False)
+
+        assert self.product_intent.has_activated_session_replay() is False
+
+    def test_has_not_activated_session_replay_without_filters_set(self):
+        ProductIntent.objects.create(team=self.team, product_type=ProductKey.SESSION_REPLAY)
+
+        assert self.product_intent.has_activated_session_replay() is False
+
+        # Create 5 recordings and mark them as viewed
+        for i in range(5):
+            recording = SessionRecording.objects.create(
+                team=self.team,
+                session_id=f"session-{i}",
+            )
+
+            recording.check_viewed_for_user(self.user, save_viewed=True)
+
+        assert self.product_intent.has_activated_session_replay() is False
+
+    @time_machine.travel("2024-01-01T12:00:00Z", tick=False)
+    @patch("posthog.event_usage.report_user_action")
+    def test_register_reports_correct_user_action_for_onboarding(self, mock_report_user_action):
+        ProductIntent.register(
+            team=self.team,
+            product_type=ProductKey.PRODUCT_ANALYTICS,
+            context=ProductIntentContext.ONBOARDING_PRODUCT_SELECTED___PRIMARY,
+            user=self.user,
+            metadata={"extra": "data"},
+            is_onboarding=True,
+        )
+
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "user showed product intent",
+            {
+                "extra": "data",
+                "product_key": ProductKey.PRODUCT_ANALYTICS,
+                "$set_once": {"first_onboarding_product_selected": ProductKey.PRODUCT_ANALYTICS},
+                "intent_context": ProductIntentContext.ONBOARDING_PRODUCT_SELECTED___PRIMARY,
+                "is_first_intent_for_product": True,
+                "intent_created_at": datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+                "intent_updated_at": datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+                "realm": get_instance_realm(),
+            },
+            team=self.team,
+        )
+
+    @time_machine.travel("2024-01-01T12:00:00Z", tick=False)
+    @patch("posthog.event_usage.report_user_action")
+    def test_register_reports_correct_user_action_for_non_onboarding(self, mock_report_user_action):
+        ProductIntent.register(
+            team=self.team,
+            product_type=ProductKey.PRODUCT_ANALYTICS,
+            context=ProductIntentContext.QUICK_START_PRODUCT_SELECTED,
+            user=self.user,
+            metadata={"extra": "data"},
+            is_onboarding=False,
+        )
+
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "user showed product intent",
+            {
+                "extra": "data",
+                "product_key": ProductKey.PRODUCT_ANALYTICS,
+                "$set_once": {},
+                "intent_context": ProductIntentContext.QUICK_START_PRODUCT_SELECTED,
+                "is_first_intent_for_product": True,
+                "intent_created_at": datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+                "intent_updated_at": datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+                "realm": get_instance_realm(),
+            },
+            team=self.team,
+        )
+
+    @time_machine.travel("2024-01-01T12:00:00Z", tick=False)
+    @patch("posthog.event_usage.report_user_action")
+    def test_register_managed_warehouse_intent(self, mock_report_user_action):
+        # Managed warehouse is a distinct product from data_warehouse imports. Provisioning is the
+        # intent; there is no activation criterion yet (it depends on a per-org usage signal that
+        # isn't available in production), so registering intent never auto-activates.
+        ProductIntent.register(
+            team=self.team,
+            product_type=ProductKey.MANAGED_WAREHOUSE,
+            context=ProductIntentContext.MANAGED_WAREHOUSE_PROVISIONED,
+            user=self.user,
+        )
+
+        intent = ProductIntent.objects.filter(team=self.team, product_type=ProductKey.MANAGED_WAREHOUSE).first()
+        assert intent is not None
+        assert intent.contexts == {ProductIntentContext.MANAGED_WAREHOUSE_PROVISIONED: 1}
+        assert intent.activated_at is None
+        assert intent.check_and_update_activation() is False
+
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "user showed product intent",
+            {
+                "product_key": ProductKey.MANAGED_WAREHOUSE,
+                "$set_once": {},
+                "intent_context": ProductIntentContext.MANAGED_WAREHOUSE_PROVISIONED,
+                "is_first_intent_for_product": True,
+                "intent_created_at": datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+                "intent_updated_at": datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+                "realm": get_instance_realm(),
+            },
+            team=self.team,
+        )
+
+    def test_has_activated_product_analytics_with_all_criteria(self):
+        self.product_intent.product_type = ProductKey.PRODUCT_ANALYTICS
+        self.product_intent.save()
+
+        for i in range(3):
+            Insight.objects.create(team=self.team, name=f"Insight {i}", created_by=self.user)
+
+        Dashboard.objects.create(team=self.team, name="Test Dashboard", created_by=self.user)
+
+        self.team.ingested_event = True
+        self.team.save()
+
+        assert self.product_intent.has_activated_product_analytics() is True
+
+    def test_has_not_activated_product_analytics_without_enough_insights(self):
+        self.product_intent.product_type = ProductKey.PRODUCT_ANALYTICS
+        self.product_intent.save()
+
+        for i in range(2):
+            Insight.objects.create(team=self.team, name=f"Insight {i}", created_by=self.user)
+
+        Dashboard.objects.create(team=self.team, name="Dashboard", created_by=self.user)
+        self.team.ingested_event = True
+        self.team.save()
+
+        assert self.product_intent.has_activated_product_analytics() is False
+
+        Insight.objects.create(team=self.team, name=f"Insight 3", created_by=self.user)
+
+        assert self.product_intent.has_activated_product_analytics() is True
+
+    def test_has_not_activated_product_analytics_without_dashboard(self):
+        self.product_intent.product_type = ProductKey.PRODUCT_ANALYTICS
+        self.product_intent.save()
+
+        for i in range(3):
+            Insight.objects.create(team=self.team, name=f"Insight {i}", created_by=self.user)
+
+        self.team.ingested_event = True
+        self.team.save()
+
+        assert self.product_intent.has_activated_product_analytics() is False
+
+        Dashboard.objects.create(team=self.team, name="Test Dashboard", created_by=self.user)
+
+        assert self.product_intent.has_activated_product_analytics() is True
+
+    def test_has_not_activated_product_analytics_with_default_dashboard(self):
+        self.product_intent.product_type = ProductKey.PRODUCT_ANALYTICS
+        self.product_intent.save()
+
+        for i in range(3):
+            Insight.objects.create(team=self.team, name=f"Insight {i}", created_by=self.user)
+
+        self.team.ingested_event = True
+        self.team.save()
+
+        Dashboard.objects.create(team=self.team, name="My App Dashboard")
+
+        assert self.product_intent.has_activated_product_analytics() is False
+
+        Dashboard.objects.create(team=self.team, name="My App Dashboard", created_by=self.user)
+
+        assert self.product_intent.has_activated_product_analytics() is True
+
+    def test_has_not_activated_product_analytics_with_default_insights(self):
+        self.product_intent.product_type = ProductKey.PRODUCT_ANALYTICS
+        self.product_intent.save()
+
+        Dashboard.objects.create(team=self.team, name="Dashboard", created_by=self.user)
+        self.team.ingested_event = True
+        self.team.save()
+
+        for i in range(3):
+            Insight.objects.create(team=self.team, name=f"Insight {i}")
+
+        assert self.product_intent.has_activated_product_analytics() is False
+
+        for i in range(3):
+            Insight.objects.create(team=self.team, name=f"Insight {i}", created_by=self.user)
+
+        assert self.product_intent.has_activated_product_analytics() is True
+
+    def test_has_not_activated_product_analytics_without_ingested_events(self):
+        self.product_intent.product_type = ProductKey.PRODUCT_ANALYTICS
+        self.product_intent.save()
+
+        for i in range(3):
+            Insight.objects.create(team=self.team, name=f"Insight {i}", created_by=self.user)
+
+        Dashboard.objects.create(team=self.team, name="Dashboard", created_by=self.user)
+
+        self.team.ingested_event = False
+        self.team.save()
+
+        assert self.product_intent.has_activated_product_analytics() is False
+
+        self.team.ingested_event = True
+        self.team.save()
+
+        assert self.product_intent.has_activated_product_analytics() is True
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    @patch("posthog.event_usage.report_user_action")
+    def test_register_tracks_intent_even_when_already_activated(self, mock_report_user_action):
+        # Create an insight that should trigger activation for data_warehouse
+        Insight.objects.create(
+            team=self.team, query={"kind": "DataVisualizationNode", "source": {"query": "SELECT * FROM custom_table"}}
+        )
+
+        # Register intent which should activate immediately
+        ProductIntent.register(
+            team=self.team,
+            product_type=ProductKey.DATA_WAREHOUSE,
+            context=ProductIntentContext.ONBOARDING_PRODUCT_SELECTED___PRIMARY,
+            user=self.user,
+        )
+
+        # Verify the intent was activated
+        intent = ProductIntent.objects.get(team=self.team, product_type=ProductKey.DATA_WAREHOUSE)
+        assert intent.activated_at is not None
+
+        # Clear the mock to count only subsequent calls
+        mock_report_user_action.reset_mock()
+
+        # Register intent again with a different context
+        ProductIntent.register(
+            team=self.team,
+            product_type=ProductKey.DATA_WAREHOUSE,
+            context=ProductIntentContext.ONBOARDING_PRODUCT_SELECTED___SECONDARY,
+            user=self.user,
+            metadata={"source": "dashboard"},
+        )
+
+        # Verify that report_user_action was called even though the intent was already activated
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "user showed product intent",
+            {
+                "source": "dashboard",
+                "product_key": ProductKey.DATA_WAREHOUSE,
+                "$set_once": {},
+                "intent_context": ProductIntentContext.ONBOARDING_PRODUCT_SELECTED___SECONDARY,
+                "is_first_intent_for_product": False,
+                "intent_created_at": intent.created_at,
+                "intent_updated_at": intent.updated_at,
+                "realm": get_instance_realm(),
+            },
+            team=self.team,
+        )
+
+    def test_has_activated_surveys_with_launched(self):
+        self.product_intent.product_type = ProductKey.SURVEYS
+        self.product_intent.save()
+
+        Survey.objects.create(team=self.team, name="Survey Test", start_date=datetime.now(tz=UTC))
+        assert self.product_intent.has_activated_surveys() is True
+
+    def test_has_not_activated_surveys_with_no_surveys(self):
+        self.product_intent.product_type = ProductKey.SURVEYS
+        self.product_intent.save()
+
+        assert self.product_intent.has_activated_surveys() is False
+
+    def test_has_not_activated_surveys_with_unlaunched_survey(self):
+        self.product_intent.product_type = ProductKey.SURVEYS
+        self.product_intent.save()
+
+        Survey.objects.create(team=self.team, name="Survey Test")
+        assert self.product_intent.has_activated_surveys() is False
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_check_and_update_activation_skips_if_already_activated(self):
+        # First activate it
+        Insight.objects.create(
+            team=self.team, query={"kind": "DataVisualizationNode", "source": {"query": "SELECT * FROM custom_table"}}
+        )
+        self.product_intent.check_and_update_activation()
+        initial_activated_at = self.product_intent.activated_at
+        initial_last_checked = self.product_intent.activation_last_checked_at
+
+        # Move time forward and check again
+        with time_machine.travel("2024-06-16T12:00:00Z", tick=False):
+            result = self.product_intent.check_and_update_activation()
+            self.product_intent.refresh_from_db()
+
+            assert result is True  # Returns True for already activated
+            assert self.product_intent.activated_at == initial_activated_at  # Activation time unchanged
+            assert self.product_intent.activation_last_checked_at == initial_last_checked  # Last checked unchanged
+
+    @time_machine.travel("2024-06-15T12:00:00Z", tick=False)
+    def test_check_and_update_activation_updates_last_checked_for_non_activated(self):
+        initial_last_checked = self.product_intent.activation_last_checked_at
+        result = self.product_intent.check_and_update_activation()
+        self.product_intent.refresh_from_db()
+
+        assert result is False  # Not activated
+        assert self.product_intent.activated_at is None  # Still not activated
+        assert self.product_intent.activation_last_checked_at == datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+        assert self.product_intent.activation_last_checked_at != initial_last_checked
+
+    def _starred_paths(self) -> set[str]:
+        return set(FileSystemShortcut.objects.filter(user=self.user, team=self.team).values_list("path", flat=True))
+
+    @parameterized.expand(
+        [
+            ("single_product", ProductKey.SESSION_REPLAY, None, {"Session replay"}),
+            ("several_products", ProductKey.PRODUCT_ANALYTICS, None, {"Dashboards", "Product analytics"}),
+            ("no_products", ProductKey.ANNOTATIONS, None, set()),
+            ("suggestions_on", ProductKey.SURVEYS, True, {"Surveys"}),
+            ("suggestions_off", ProductKey.SURVEYS, False, set()),
+        ]
+    )
+    def test_register_stars_the_products_of_a_new_intent(
+        self, _name: str, product_key: ProductKey, allow_sidebar_suggestions: bool | None, expected: set[str]
+    ) -> None:
+        self.user.allow_sidebar_suggestions = allow_sidebar_suggestions
+        self.user.save()
+
+        ProductIntent.register(self.team, product_key, ProductIntentContext.QUICK_START_PRODUCT_SELECTED, self.user)
+
+        assert self._starred_paths() == expected
+
+    def test_register_does_not_star_again_once_the_intent_exists(self) -> None:
+        ProductIntent.register(
+            self.team, ProductKey.SESSION_REPLAY, ProductIntentContext.ONBOARDING_PRODUCT_SELECTED___PRIMARY, self.user
+        )
+        FileSystemShortcut.objects.filter(user=self.user, team=self.team, path="Session replay").delete()
+
+        ProductIntent.register(
+            self.team, ProductKey.SESSION_REPLAY, ProductIntentContext.QUICK_START_PRODUCT_SELECTED, self.user
+        )
+
+        assert self._starred_paths() == set()
+
+    def _make_ai_generation_event_definition(self) -> EventDefinition:
+        return EventDefinition.objects.create(team=self.team, name="$ai_generation")
+
+    def _make_llm_intent(self, contexts: dict) -> ProductIntent:
+        ProductIntent.objects.filter(team=self.team, product_type=ProductKey.LLM_ANALYTICS).delete()
+        return ProductIntent.objects.create(
+            team=self.team,
+            product_type=ProductKey.LLM_ANALYTICS,
+            contexts=contexts,
+        )
+
+    def test_has_activated_llm_analytics_with_ingestion_and_dashboard_viewed(self):
+        self._make_ai_generation_event_definition()
+        intent = self._make_llm_intent({"llm_analytics_viewed": 1})
+
+        assert intent.has_activated_llm_analytics() is True
+
+    def test_has_activated_llm_analytics_with_ingestion_and_trace_viewed(self):
+        self._make_ai_generation_event_definition()
+        intent = self._make_llm_intent({"llm_analytics_trace_viewed": 1})
+
+        assert intent.has_activated_llm_analytics() is True
+
+    def test_has_not_activated_llm_analytics_without_ingestion(self):
+        intent = self._make_llm_intent({"llm_analytics_viewed": 5})
+
+        assert intent.has_activated_llm_analytics() is False
+
+    def test_has_not_activated_llm_analytics_with_ingestion_but_no_engagement(self):
+        self._make_ai_generation_event_definition()
+        intent = self._make_llm_intent({})
+
+        assert intent.has_activated_llm_analytics() is False
+
+    def test_has_not_activated_llm_analytics_without_intent(self):
+        self._make_ai_generation_event_definition()
+        ProductIntent.objects.filter(team=self.team, product_type=ProductKey.LLM_ANALYTICS).delete()
+
+        assert self.product_intent.has_activated_llm_analytics() is False
+
+    def _make_mcp_tool_call_event_definition(self) -> EventDefinition:
+        return EventDefinition.objects.create(team=self.team, name="$mcp_tool_call")
+
+    def _make_mcp_intent(self, contexts: dict) -> ProductIntent:
+        ProductIntent.objects.filter(team=self.team, product_type=ProductKey.MCP_ANALYTICS).delete()
+        return ProductIntent.objects.create(
+            team=self.team,
+            product_type=ProductKey.MCP_ANALYTICS,
+            contexts=contexts,
+        )
+
+    def test_has_activated_mcp_analytics_with_tool_calls_and_dashboard_viewed(self):
+        self._make_mcp_tool_call_event_definition()
+        intent = self._make_mcp_intent({"mcp_analytics_viewed": 1})
+
+        assert intent.has_activated_mcp_analytics() is True
+
+    def test_has_not_activated_mcp_analytics_without_tool_calls(self):
+        intent = self._make_mcp_intent({"mcp_analytics_viewed": 5})
+
+        assert intent.has_activated_mcp_analytics() is False
+
+    def test_has_not_activated_mcp_analytics_with_tool_calls_but_no_engagement(self):
+        self._make_mcp_tool_call_event_definition()
+        intent = self._make_mcp_intent({})
+
+        assert intent.has_activated_mcp_analytics() is False
+
+    def test_has_not_activated_mcp_analytics_without_intent(self):
+        self._make_mcp_tool_call_event_definition()
+        ProductIntent.objects.filter(team=self.team, product_type=ProductKey.MCP_ANALYTICS).delete()
+
+        assert self.product_intent.has_activated_mcp_analytics() is False
+
+    def _make_metrics_intent(self, contexts: dict) -> ProductIntent:
+        ProductIntent.objects.filter(team=self.team, product_type=ProductKey.METRICS).delete()
+        return ProductIntent.objects.create(
+            team=self.team,
+            product_type=ProductKey.METRICS,
+            contexts=contexts,
+        )
+
+    @parameterized.expand(
+        [
+            # Charting or querying is only possible once metrics have reached the team,
+            # so any engagement signal is itself proof of ingestion + activation.
+            ("charted", {"metrics_viewer_query_run": 1}, False, True),
+            ("queried in sql", {"metrics_sql_query_run": 2}, False, True),
+            (
+                "first-ingested recorded then charted",
+                {"metrics_first_ingested": 1, "metrics_viewer_query_run": 1},
+                False,
+                True,
+            ),
+            # Pre-existing-metrics teams never record the transition-only first-ingested
+            # context, so engagement alone must still activate them.
+            ("charted without first-ingested intent", {"metrics_viewer_query_run": 3}, False, True),
+            # Data flowing activates without any engagement: sending does not require the
+            # viewer, so ingestion alone is the product outcome.
+            ("ingesting but never looked at", {"metrics_first_ingested": 1}, True, True),
+            ("ingesting with no contexts at all", {}, True, True),
+            # No engagement and no data is not activation.
+            ("first-ingested context but no data found", {"metrics_first_ingested": 1}, False, False),
+            ("no engagement at all", {}, False, False),
+            # Derived series are computed from spans and logs, so charting them is not metrics use.
+            ("charted only derived series", {"metrics_derived_query_run": 4}, False, False),
+        ]
+    )
+    def test_has_activated_metrics(self, _name: str, contexts: dict, has_data: bool, expected: bool) -> None:
+        intent = self._make_metrics_intent(contexts)
+
+        with patch(
+            "products.metrics.backend.facade.api.team_has_metrics",
+            return_value=has_data,
+        ):
+            assert intent.has_activated_metrics() is expected
+
+    def test_check_and_update_activation_activates_metrics(self) -> None:
+        # Guards the registration, not the criterion: an unregistered check never runs.
+        intent = self._make_metrics_intent({"metrics_first_ingested": 1, "metrics_viewer_query_run": 1})
+
+        assert intent.check_and_update_activation(skip_reporting=True) is True
+        intent.refresh_from_db()
+        assert intent.activated_at is not None
+
+    @parameterized.expand(
+        [
+            ("no_steps", None, True),
+            ("automation_only", ["function"], True),
+            ("sandbox_email_only", ["email_sandbox"], False),
+            ("sandbox_email_with_automation", ["email_sandbox", "function"], False),
+            ("sandbox_email_with_own_email", ["email_sandbox", "function_email"], True),
+        ]
+    )
+    def test_has_activated_workflows_with_active_workflow(
+        self, _name: str, step_types: list[str] | None, expected: bool
+    ) -> None:
+        self.product_intent.product_type = ProductKey.WORKFLOWS
+        self.product_intent.save()
+        actions = None if step_types is None else [{"id": t, "type": t} for t in ["trigger", *step_types]]
+        create_workflow_for_test(team_id=self.team.id, name="Test workflow", status="active", actions=actions)
+
+        assert self.product_intent.has_activated_workflows() is expected
+
+    def test_has_not_activated_workflows_with_draft_workflow_only(self):
+        self.product_intent.product_type = ProductKey.WORKFLOWS
+        self.product_intent.save()
+        create_workflow_for_test(team_id=self.team.id, name="Test workflow", status="draft")
+
+        assert self.product_intent.has_activated_workflows() is False
+
+    def test_has_not_activated_workflows_with_archived_workflow_only(self):
+        self.product_intent.product_type = ProductKey.WORKFLOWS
+        self.product_intent.save()
+        create_workflow_for_test(team_id=self.team.id, name="Test workflow", status="archived")
+
+        assert self.product_intent.has_activated_workflows() is False
+
+    def test_has_not_activated_workflows_without_any_workflows(self):
+        self.product_intent.product_type = ProductKey.WORKFLOWS
+        self.product_intent.save()
+
+        assert self.product_intent.has_activated_workflows() is False
+
+
+class TestEnqueueProductActivationCalcDebounced(BaseTest):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+
+    @parameterized.expand(
+        [
+            # name, team_id_offsets (called as self.team.id + offset), expected_returns, expected_delay_calls
+            ("first call enqueues", [0], [True], 1),
+            ("second call same team debounced", [0, 0], [True, False], 1),
+            ("third call same team still debounced", [0, 0, 0], [True, False, False], 1),
+            ("different team is not debounced", [0, 9999], [True, True], 2),
+            ("same team twice then different team", [0, 0, 9999], [True, False, True], 2),
+        ]
+    )
+    def test_debounce_behaviour(
+        self, _name: str, team_id_offsets: list[int], expected_returns: list[bool], expected_delay_calls: int
+    ):
+        with patch("posthog.models.product_intent.product_intent.calculate_product_activation.delay") as mock_delay:
+            results = [enqueue_product_activation_calc_debounced(self.team.id + offset) for offset in team_id_offsets]
+        assert results == expected_returns
+        assert mock_delay.call_count == expected_delay_calls
+
+    def test_cache_failure_falls_open_logs_and_still_enqueues(self):
+        # Redis blip must not 500 the team list endpoint. The helper falls open:
+        # treat a cache exception as "we haven't enqueued recently" and proceed.
+        # We also log + capture so a chronic Redis problem still shows up rather
+        # than silently degrading to "every render enqueues".
+        with (
+            patch("posthog.models.product_intent.product_intent.cache.add", side_effect=Exception("redis is sad")),
+            patch("posthog.models.product_intent.product_intent.calculate_product_activation.delay") as mock_delay,
+            patch("posthog.models.product_intent.product_intent.logger.warning") as mock_log,
+            patch("posthog.models.product_intent.product_intent.capture_exception") as mock_capture,
+        ):
+            assert enqueue_product_activation_calc_debounced(self.team.id) is True
+
+        mock_delay.assert_called_once_with(self.team.id, only_calc_if_days_since_last_checked=1)
+        mock_log.assert_called_once()
+        assert mock_log.call_args.args == ("product_activation_debounce_cache_failure",)
+        assert mock_log.call_args.kwargs == {"team_id": self.team.id, "exc_info": True}
+        mock_capture.assert_called_once()
+
+    def test_broker_failure_falls_open_and_does_not_raise(self):
+        # A broker outage (e.g. kombu.OperationalError) on .delay() must not 500 the
+        # team/project retrieve endpoints that call this on every render. The helper
+        # swallows the error and returns False instead of propagating.
+        with (
+            patch(
+                "posthog.models.product_intent.product_intent.calculate_product_activation.delay",
+                side_effect=Exception("broker is unavailable"),
+            ),
+            patch("posthog.models.product_intent.product_intent.logger.warning") as mock_log,
+            patch("posthog.models.product_intent.product_intent.capture_exception") as mock_capture,
+        ):
+            assert enqueue_product_activation_calc_debounced(self.team.id) is False
+
+        assert mock_log.call_args.args == ("product_activation_enqueue_failure",)
+        mock_capture.assert_called_once()
+
+
+class TestCachedProductIntentsForTeam(BaseTest):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+
+    def test_caches_results(self):
+        ProductIntent.objects.create(team=self.team, product_type=ProductKey.SURVEYS)
+
+        with patch(
+            "posthog.models.product_intent.product_intent._fetch_product_intents",
+            wraps=_fetch_product_intents,
+        ) as spy:
+            first = cached_product_intents_for_team(self.team.id)
+            second = cached_product_intents_for_team(self.team.id)
+        assert spy.call_count == 1
+        assert first == second
+        assert {row["product_type"] for row in first} == {"surveys"}
+
+    @parameterized.expand(
+        [
+            (
+                "create",
+                lambda self: ProductIntent.objects.create(team=self.team, product_type=ProductKey.FEATURE_FLAGS),
+            ),
+            (
+                "delete",
+                lambda self: ProductIntent.objects.get(team=self.team, product_type=ProductKey.EXPERIMENTS).delete(),
+            ),
+        ]
+    )
+    def test_invalidates_on_signal(self, _name, mutate):
+        # Seed an existing intent so the delete path has something to remove and both
+        # cases share the same starting point.
+        ProductIntent.objects.create(team=self.team, product_type=ProductKey.EXPERIMENTS)
+        cached_product_intents_for_team(self.team.id)
+        assert cache.get(_team_product_intents_cache_key(self.team.id)) is not None
+
+        with self.captureOnCommitCallbacks(execute=True):
+            mutate(self)
+
+        assert cache.get(_team_product_intents_cache_key(self.team.id)) is None
+
+    def test_invalidates_both_teams_on_reassignment(self):
+        # Codex P2: when an intent's team_id changes, the previous team's cache must
+        # also be evicted, otherwise its /api/users/@me/ payload returns the moved
+        # intent for up to PRODUCT_INTENTS_CACHE_TTL_SECONDS.
+        other_team = Team.objects.create(organization=self.organization, name="Other")
+        intent = ProductIntent.objects.create(team=self.team, product_type=ProductKey.SURVEYS)
+        cached_product_intents_for_team(self.team.id)
+        cached_product_intents_for_team(other_team.id)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            intent.team = other_team
+            intent.save()
+
+        assert cache.get(_team_product_intents_cache_key(self.team.id)) is None
+        assert cache.get(_team_product_intents_cache_key(other_team.id)) is None
+
+    def test_isolates_per_team(self):
+        other_team = Team.objects.create(organization=self.organization, name="Other")
+        ProductIntent.objects.create(team=self.team, product_type=ProductKey.SURVEYS)
+        ProductIntent.objects.create(team=other_team, product_type=ProductKey.EXPERIMENTS)
+
+        team_a = cached_product_intents_for_team(self.team.id)
+        team_b = cached_product_intents_for_team(other_team.id)
+        assert {row["product_type"] for row in team_a} == {"surveys"}
+        assert {row["product_type"] for row in team_b} == {"experiments"}
