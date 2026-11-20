@@ -1,0 +1,551 @@
+import FuseClass from 'fuse.js'
+import { MakeLogicType, actions, afterMount, connect, kea, listeners, path, props, reducers, selectors } from 'kea'
+import { urlToAction } from 'kea-router'
+import posthog from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import { FEATURE_FLAGS, FeatureFlagKey } from 'lib/constants'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { createFuse } from 'lib/utils/fuseSearch'
+import { objectsEqual } from 'lib/utils/objects'
+import { getSourceDisplayStatus } from 'scenes/data-pipelines/utils/nonHogFunctionTemplatesLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { type ExternalDataSourceType, HogFunctionTemplateStatus } from '~/types'
+
+import {
+    DataWarehouseSourceCategoryApi,
+    SourceConfigResponseApi,
+} from 'products/warehouse_sources/frontend/generated/api.schemas'
+
+import type { PaginatedResponse } from '../../../../../frontend/src/lib/api'
+import type { FeatureFlagsSet } from '../../../../../frontend/src/lib/logic/featureFlagLogic'
+import type { ExternalDataSource, UserType } from '../../../../../frontend/src/types'
+import { sourcesDataLogic } from '../../shared/logics/sourcesDataLogic'
+import { availableSourcesLogic } from './availableSourcesLogic'
+import {
+    FILE_UPLOAD_FORMATS,
+    FILE_UPLOAD_SOURCE_CONFIG,
+    FILE_UPLOAD_SOURCE_NAME,
+    fileUploadSourceType,
+    fileUploadSourceUrl,
+} from './fileUploadSource'
+import {
+    ALL_SOURCES_CATEGORY,
+    CATEGORY_SEARCH_PARAM,
+    SourceCategoryFilter,
+    isSourceCategoryFilter,
+} from './sourceCategories'
+
+// Helps kea-typegen reference the Fuse type without a bad `import { Fuse } from 'fuse.js'`.
+export interface Fuse extends FuseClass<CatalogItem> {}
+
+// File upload doesn't flow through SourceConfigResponseApi, so place it in a sensible catalog
+// bucket explicitly.
+const MANUAL_SOURCE_CATEGORY: DataWarehouseSourceCategoryApi = 'File storage'
+
+// The catalog matches a source against its label, name, keywords and category. That finds the
+// Databases category for "database", but "warehouse" matches nothing at all, even though it is
+// the word in this product's own name. Attach the words people type for the category itself.
+const DATABASE_CATEGORY_KEYWORDS = ['warehouse', 'data warehouse', 'dwh']
+
+// A "Coming soon" tile for a service we already connect under another tile is a dead end: the user
+// registers interest and leaves without the connector that works today. Each key is hidden while
+// its value is in the catalog and connectable.
+const LIVE_ALTERNATIVE_TO_COMING_SOON: Partial<Record<string, string>> = {
+    MicrosoftAdvertising: 'BingAds',
+}
+
+// "Request a data warehouse source" survey. We render our own modal and submit the answer
+// directly as a `survey sent` event rather than using the posthog-js survey popover.
+export const SOURCE_REQUEST_SURVEY_ID = '0190ff15-5032-0000-722a-e13933c140ac'
+
+export interface SourceCatalogLogicProps {
+    /** When set, only managed sources whose name is in this list are shown. */
+    allowedSources?: ExternalDataSourceType[]
+}
+
+export interface CatalogItem {
+    /** The source kind passed to the new-source URL (e.g. "Stripe"). */
+    name: string
+    label: string
+    /** One line under the label, for entries whose name alone doesn't say what they do. */
+    description?: string
+    iconType: string
+    iconClassName?: string
+    category: DataWarehouseSourceCategoryApi
+    keywords: string[]
+    status: HogFunctionTemplateStatus
+    releaseStatus?: SourceConfigResponseApi['releaseStatus']
+    url: string
+    disabledReason?: string | null
+    existingSource?: boolean
+    /** The sources most people connect (Stripe, Postgres, the ad platforms, ...). Led with when browsing. */
+    featured?: boolean
+}
+
+// PostHog's own event sources aren't warehouse connectors, so they never reach this catalog
+// through `availableSources` — but it's where people look for them, and the only other entry point
+// is the sources list. Gated on the same preview flag as that list's section.
+const EVENT_SOURCE_CATALOG_ITEMS: CatalogItem[] = [
+    {
+        name: 'event-webhook',
+        label: 'Incoming webhook',
+        description: 'Turn HTTP requests from any service into events.',
+        iconType: 'PostHog',
+        category: 'Engineering & monitoring',
+        keywords: ['webhook', 'webhooks', 'http', 'https', 'endpoint', 'events', 'incoming', 'custom', 'real time'],
+        status: 'stable',
+        releaseStatus: 'beta',
+        url: urls.hogFunctionNew('template-source-webhook'),
+    },
+    {
+        name: 'event-tracking-pixel',
+        label: 'Tracking pixel',
+        description: 'Capture an event each time an email or page loads a 1x1 image.',
+        iconType: 'PostHog',
+        category: 'Engineering & monitoring',
+        keywords: ['pixel', 'tracking pixel', 'image', 'gif', 'email', 'open tracking', 'beacon', 'events'],
+        status: 'stable',
+        releaseStatus: 'beta',
+        url: urls.hogFunctionNew('template-source-webhook-pixel'),
+    },
+]
+
+export interface CatalogCategory {
+    category: SourceCategoryFilter
+    label: string
+    count: number
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sourceCatalogLogicValues {
+    availableSources: Record<string, SourceConfigResponseApi> | null // availableSourcesLogic
+    featureFlags: FeatureFlagsSet // featureFlagLogic
+    dataWarehouseSources: PaginatedResponse<ExternalDataSource> | null // sourcesDataLogic
+    user: UserType | null // userLogic
+    catalogFuse: Fuse
+    catalogItems: CatalogItem[]
+    categoriesWithCounts: CatalogCategory[]
+    customSourceItem: CatalogItem | null
+    filteredItems: CatalogItem[]
+    hasCrossCategoryMatches: boolean
+    registeredInterestSources: string[]
+    search: string
+    selectedCategory: SourceCategoryFilter
+    selectedCategoryLabel: string
+    sourceRequestModalOpen: boolean
+    sourceRequestText: string
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sourceCatalogLogicActions {
+    loadSources: () => {
+        value: true
+    } // sourcesDataLogic
+    hideSourceRequest: () => {
+        value: true
+    }
+    registerInterest: (item: CatalogItem) => {
+        item: CatalogItem
+    }
+    selectSourceType: (item: CatalogItem) => {
+        item: CatalogItem
+    }
+    setSearch: (search: string) => {
+        search: string
+    }
+    setSelectedCategory: (category: SourceCategoryFilter) => {
+        category: SourceCategoryFilter
+    }
+    setSourceRequestText: (text: string) => {
+        text: string
+    }
+    showSourceRequest: () => {
+        value: true
+    }
+    submitSourceRequest: () => {
+        value: true
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sourceCatalogLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        catalogItems: (
+            availableSources: Record<string, SourceConfigResponseApi> | null,
+            featureFlags: FeatureFlagsSet,
+            dataWarehouseSources: PaginatedResponse<ExternalDataSource> | null,
+            arg: string[] | undefined
+        ) => CatalogItem[]
+        categoriesWithCounts: (catalogItems: CatalogItem[]) => CatalogCategory[]
+        selectedCategoryLabel: (
+            categoriesWithCounts: CatalogCategory[],
+            selectedCategory: SourceCategoryFilter
+        ) => string
+        catalogFuse: (catalogItems: CatalogItem[]) => Fuse
+        filteredItems: (
+            catalogItems: CatalogItem[],
+            catalogFuse: Fuse,
+            search: string,
+            selectedCategory: SourceCategoryFilter
+        ) => CatalogItem[]
+        hasCrossCategoryMatches: (catalogFuse: Fuse, search: string, selectedCategory: SourceCategoryFilter) => boolean
+        customSourceItem: (catalogItems: CatalogItem[]) => CatalogItem | null
+    }
+}
+
+export type sourceCatalogLogicType = MakeLogicType<
+    sourceCatalogLogicValues,
+    sourceCatalogLogicActions,
+    SourceCatalogLogicProps,
+    sourceCatalogLogicMeta
+>
+
+// Fuse matches the whole search term as one pattern, so an extra word buries a term that would
+// match on its own: "csv" finds every file-storage connector, "csv files" finds nothing. Retry the
+// individual words when the whole term matches nothing, ranking an item by how many words it
+// matches, so a term that already works keeps its relevance order untouched.
+function searchCatalog(catalogFuse: Fuse, term: string): CatalogItem[] {
+    const whole = catalogFuse.search(term).map((r) => r.item)
+    // Capped: the retry costs one index lookup per word and runs on every keystroke.
+    const words = term
+        .split(/\s+/)
+        .filter((word) => word.length > 1)
+        .slice(0, 5)
+    if (whole.length > 0 || words.length < 2) {
+        return whole
+    }
+    const matchCounts = new Map<CatalogItem, number>()
+    for (const word of words) {
+        for (const { item } of catalogFuse.search(word)) {
+            matchCounts.set(item, (matchCounts.get(item) ?? 0) + 1)
+        }
+    }
+    return [...matchCounts.keys()].sort((a, b) => (matchCounts.get(b) ?? 0) - (matchCounts.get(a) ?? 0))
+}
+
+function matchesCategory(item: CatalogItem, category: SourceCategoryFilter): boolean {
+    return category === ALL_SOURCES_CATEGORY || item.category === category
+}
+
+export const sourceCatalogLogic = kea<sourceCatalogLogicType>([
+    path(['products', 'dataWarehouse', 'sourceCatalogLogic']),
+    props({} as SourceCatalogLogicProps),
+    connect(() => ({
+        values: [
+            // Read the managed connector list straight from the /wizard loader rather than
+            // sourceWizardLogic.connectors — the latter derives from sourceWizardLogic's
+            // `availableSources` prop, which isn't reliably populated when the catalog is
+            // mounted outside the wizard (e.g. the pipeline new-source page).
+            availableSourcesLogic,
+            ['availableSources'],
+            featureFlagLogic,
+            ['featureFlags'],
+            userLogic,
+            ['user'],
+            // Which source types the project already has, so a tile can say so before the user
+            // works through OAuth and table selection for a connection that then needs a prefix.
+            sourcesDataLogic,
+            ['dataWarehouseSources'],
+        ],
+        actions: [sourcesDataLogic, ['loadSources']],
+    })),
+    actions({
+        setSearch: (search: string) => ({ search }),
+        setSelectedCategory: (category: SourceCategoryFilter) => ({ category }),
+        registerInterest: (item: CatalogItem) => ({ item }),
+        selectSourceType: (item: CatalogItem) => ({ item }),
+        showSourceRequest: true,
+        hideSourceRequest: true,
+        setSourceRequestText: (text: string) => ({ text }),
+        submitSourceRequest: true,
+    }),
+    reducers({
+        search: ['', { setSearch: (_, { search }) => search }],
+        selectedCategory: [
+            ALL_SOURCES_CATEGORY as SourceCategoryFilter,
+            { setSelectedCategory: (_, { category }) => category },
+        ],
+        // Which "Coming soon" tiles this visit already asked to be told about, so the tile can
+        // confirm it rather than offering the same action again.
+        registeredInterestSources: [
+            [] as string[],
+            {
+                registerInterest: (state, { item }) => (state.includes(item.name) ? state : [...state, item.name]),
+            },
+        ],
+        sourceRequestModalOpen: [
+            false,
+            {
+                showSourceRequest: () => true,
+                hideSourceRequest: () => false,
+                submitSourceRequest: () => false,
+            },
+        ],
+        sourceRequestText: [
+            '',
+            {
+                setSourceRequestText: (_, { text }) => text,
+                // Reset on open/close, but NOT on submit — the submit listener reads it first.
+                showSourceRequest: () => '',
+                hideSourceRequest: () => '',
+            },
+        ],
+    }),
+    selectors({
+        catalogItems: [
+            (s) => [
+                s.availableSources,
+                s.featureFlags,
+                s.dataWarehouseSources,
+                (_, p: SourceCatalogLogicProps) => p.allowedSources,
+            ],
+            (
+                availableSources: Record<string, SourceConfigResponseApi> | null,
+                featureFlags: import('lib/logic/featureFlagLogic').FeatureFlagsSet,
+                dataWarehouseSources: PaginatedResponse<ExternalDataSource> | null,
+                allowedSources: ExternalDataSourceType[] | undefined
+            ): CatalogItem[] => {
+                // SourceConfigResponseApi declares `existingSource`, but the /wizard payload this
+                // selector reads never populates it, so derive it from the project's source list.
+                const connectedTypes = new Set(
+                    (dataWarehouseSources?.results ?? []).map((source: ExternalDataSource) => source.source_type)
+                )
+                const managed = Object.values(availableSources ?? {})
+                    .filter((c) => !allowedSources || allowedSources.includes(c.name))
+                    .flatMap((connector: SourceConfigResponseApi): CatalogItem[] => {
+                        // Mirror nonHogFunctionTemplatesLogic: a declared-but-absent flag reads as
+                        // off (featureFlagLogic only exposes truthy flags), so flag-gated sources
+                        // render as coming-soon ("Notify me") until the user is in the rollout.
+                        const featureFlagDefined = !!connector.featureFlag
+                        const featureFlagRaw = featureFlags[connector.featureFlag as FeatureFlagKey]
+                        const featureFlagValue: boolean | undefined = featureFlagDefined ? !!featureFlagRaw : undefined
+                        const { status } = getSourceDisplayStatus(!!connector.unreleasedSource, featureFlagValue)
+                        // Only surface beta while the source is actually connectable.
+                        const releaseStatus =
+                            status === 'stable' && connector.releaseStatus && connector.releaseStatus !== 'ga'
+                                ? connector.releaseStatus
+                                : undefined
+
+                        return [
+                            {
+                                iconType: connector.name,
+                                iconClassName: connector.iconClassName ?? undefined,
+                                category: connector.category ?? MANUAL_SOURCE_CATEGORY,
+                                status,
+                                releaseStatus,
+                                disabledReason: connector.disabledReason,
+                                existingSource: connectedTypes.has(connector.name) || undefined,
+                                name: connector.name,
+                                label: connector.label ?? connector.name,
+                                keywords:
+                                    connector.category === DataWarehouseSourceCategoryApi.Databases
+                                        ? [...(connector.keywords ?? []), ...DATABASE_CATEGORY_KEYWORDS]
+                                        : (connector.keywords ?? []),
+                                featured: connector.featured ?? undefined,
+                                url: urls.dataWarehouseSourceNew(connector.name),
+                            },
+                        ]
+                    })
+
+                // File upload has three tiles, one per format, since users search for "CSV" rather
+                // than "File upload".
+                const fileUpload = FILE_UPLOAD_FORMATS.map(
+                    ({ format, label, keywords }): CatalogItem => ({
+                        name: fileUploadSourceType(format),
+                        label,
+                        iconType: FILE_UPLOAD_SOURCE_NAME,
+                        category: MANUAL_SOURCE_CATEGORY,
+                        keywords,
+                        status: 'stable',
+                        releaseStatus: FILE_UPLOAD_SOURCE_CONFIG.releaseStatus,
+                        url: fileUploadSourceUrl(format),
+                    })
+                )
+
+                // `allowedSources` restricts the catalog to warehouse connectors, so event sources have
+                // no place in it.
+                const eventSources =
+                    !allowedSources && featureFlags[FEATURE_FLAGS.CDP_HOG_SOURCES] ? EVENT_SOURCE_CATALOG_ITEMS : []
+
+                const items = [...managed, ...fileUpload, ...eventSources]
+                const connectableNames = new Set(
+                    items.filter((item) => item.status !== 'coming_soon').map((item) => item.name)
+                )
+                return items.filter((item) => {
+                    const liveAlternative = LIVE_ALTERNATIVE_TO_COMING_SOON[item.name]
+                    return !(item.status === 'coming_soon' && liveAlternative && connectableNames.has(liveAlternative))
+                })
+            },
+            // featureFlags is a broad dependency that changes identity on every flag refresh;
+            // keeping the previous array when the derived catalog is unchanged stops the Fuse
+            // index and every tile from re-deriving on unrelated flag updates.
+            { resultEqualityCheck: objectsEqual },
+        ],
+
+        categoriesWithCounts: [
+            (s) => [s.catalogItems],
+            (catalogItems: CatalogItem[]): CatalogCategory[] => {
+                const counts = new Map<DataWarehouseSourceCategoryApi, number>()
+                for (const item of catalogItems) {
+                    counts.set(item.category, (counts.get(item.category) ?? 0) + 1)
+                }
+                const present = Object.values(DataWarehouseSourceCategoryApi)
+                    .filter((category) => counts.has(category))
+                    .map(
+                        (category): CatalogCategory => ({
+                            category,
+                            label: category,
+                            count: counts.get(category) ?? 0,
+                        })
+                    )
+                    // Most-populated categories first; fall back to taxonomy order on a tie.
+                    .sort((a, b) => b.count - a.count)
+                return [
+                    { category: ALL_SOURCES_CATEGORY, label: 'All sources', count: catalogItems.length },
+                    ...present,
+                ]
+            },
+        ],
+
+        // The empty state names the active filter. A real category's value is already its label
+        // ("File storage"), but `all` is a slug, so read the label off the sidebar.
+        selectedCategoryLabel: [
+            (s) => [s.categoriesWithCounts, s.selectedCategory],
+            (categoriesWithCounts: CatalogCategory[], selectedCategory: SourceCategoryFilter): string =>
+                categoriesWithCounts.find((cat) => cat.category === selectedCategory)?.label ?? selectedCategory,
+        ],
+
+        catalogFuse: [
+            (s) => [s.catalogItems],
+            (catalogItems: CatalogItem[]): Fuse =>
+                createFuse(catalogItems, {
+                    keys: ['label', 'name', 'keywords', 'category'],
+                }),
+        ],
+
+        filteredItems: [
+            (s) => [s.catalogItems, s.catalogFuse, s.search, s.selectedCategory],
+            (
+                catalogItems: CatalogItem[],
+                catalogFuse: Fuse,
+                search: string,
+                selectedCategory: SourceCategoryFilter
+            ): CatalogItem[] => {
+                const trimmed = search.trim()
+                const base = trimmed ? searchCatalog(catalogFuse, trimmed) : catalogItems
+                const filtered = base.filter((item) => matchesCategory(item, selectedCategory))
+                // Keep fuzzy-search relevance order when searching. When browsing, lead with the
+                // featured sources people connect most (Stripe, Postgres, the ad platforms, ...),
+                // then the rest of the connectable sources, then "Coming soon" ones — all
+                // alphabetical within a tier — so the catalog doesn't open on a wall of obscure or
+                // unavailable tiles.
+                if (trimmed) {
+                    // Keep fuzzy-search relevance order, but sink "Coming soon" sources below the
+                    // connectable matches so a search never leads with a tile the user can't act on.
+                    return [
+                        ...filtered.filter((item) => item.status !== 'coming_soon'),
+                        ...filtered.filter((item) => item.status === 'coming_soon'),
+                    ]
+                }
+                const browseRank = (item: CatalogItem): number => {
+                    if (item.status === 'coming_soon') {
+                        return 2
+                    }
+                    return item.featured ? 0 : 1
+                }
+                return [...filtered].sort((a, b) => {
+                    const rankDiff = browseRank(a) - browseRank(b)
+                    if (rankDiff !== 0) {
+                        return rankDiff
+                    }
+                    return a.label.localeCompare(b.label)
+                })
+            },
+        ],
+
+        // With a category selected, a search that only matches sources in other categories leaves
+        // filteredItems empty even though the source exists. This flags that case so the empty
+        // state can offer an all-categories search instead of dead-ending on "no sources match".
+        hasCrossCategoryMatches: [
+            (s) => [s.catalogFuse, s.search, s.selectedCategory],
+            (catalogFuse: Fuse, search: string, selectedCategory: SourceCategoryFilter): boolean => {
+                const trimmed = search.trim()
+                if (!trimmed || selectedCategory === ALL_SOURCES_CATEGORY) {
+                    return false
+                }
+                return searchCatalog(catalogFuse, trimmed).some(
+                    (item) => item.status !== 'coming_soon' && !matchesCategory(item, selectedCategory)
+                )
+            },
+        ],
+
+        // A search that finds nothing is usually for a tool we have no connector for. Any tool with
+        // a REST API can still connect through the Custom REST source, so the empty state offers it.
+        customSourceItem: [
+            (s) => [s.catalogItems],
+            (catalogItems: CatalogItem[]): CatalogItem | null =>
+                catalogItems.find((item) => item.name === 'Custom' && item.status !== 'coming_soon') ?? null,
+        ],
+    }),
+    listeners(({ values, actions }) => ({
+        registerInterest: ({ item }) => {
+            posthog.capture('notify_me_pipeline', {
+                name: item.label,
+                type: 'source',
+                template_id: `managed-${item.name}`,
+                email: values.user?.email,
+            })
+            lemonToast.success('Thank you for your interest! We will notify you when this source is available.')
+        },
+        selectSourceType: ({ item }) => {
+            posthog.capture('selected source type', {
+                name: item.label,
+                type: item.name,
+                category: item.category,
+                release_status: item.releaseStatus,
+            })
+        },
+        showSourceRequest: () => {
+            posthog.capture('survey shown', { $survey_id: SOURCE_REQUEST_SURVEY_ID })
+            // Seed the request with whatever the user just searched, so a "searched for X →
+            // no results → request X" flow doesn't make them retype the same term.
+            const seed = values.search.trim()
+            if (seed) {
+                actions.setSourceRequestText(seed)
+            }
+        },
+        submitSourceRequest: () => {
+            const response = values.sourceRequestText.trim()
+            if (!response) {
+                return
+            }
+            // Submit straight to the survey behind the scenes — no posthog-js survey popover.
+            posthog.capture('survey sent', {
+                $survey_id: SOURCE_REQUEST_SURVEY_ID,
+                $survey_response: response,
+            })
+            lemonToast.success('Thanks! Your source request has been submitted.')
+        },
+    })),
+    // A link can open the catalog with a category already chosen.
+    urlToAction(({ actions, values }) => ({
+        '*': (_, searchParams) => {
+            const category = searchParams[CATEGORY_SEARCH_PARAM]
+            if (!isSourceCategoryFilter(category) || category === values.selectedCategory) {
+                return
+            }
+            actions.setSelectedCategory(category)
+        },
+    })),
+    afterMount(({ actions, values }) => {
+        // The catalog can be opened without passing the sources list first (a deep link, or the
+        // pipeline new-source page), and nothing else on those pages loads it.
+        if (values.dataWarehouseSources === null) {
+            actions.loadSources()
+        }
+    }),
+])

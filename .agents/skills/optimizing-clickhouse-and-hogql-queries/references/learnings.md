@@ -1,0 +1,252 @@
+# Optimization learnings log
+
+Append-only record of optimization experiments and surprising findings, so future agents (and humans) don't relearn the same lessons. Each entry is a small case study: where the question came up, what we tried, the numbers, and the takeaway. New entries go on top.
+
+When you find something that surprised you, add it here, especially if it contradicts the smell descriptions in `SKILL.md`. Real numbers from the Test Cluster or production beat plausible-sounding rules of thumb.
+
+> **⚠️ This file is in a public OSS repo. Do not include customer data.**
+>
+> No raw person / group / distinct_id UUIDs, no custom property names or values, no team or org names, no row samples, no precise customer-specific operational scale (exact row counts, durations tied to a specific team). Use placeholders (`<bound_uuid>`, `<custom_property>`, `<team_id>`) or describe the shape (`a 1M-person slice picked by sort offset`, `tens of millions of persons`). PostHog's own team 2 is fine to name as the canonical Test Cluster target; redact other team IDs. PostHog-standard properties prefixed with `$` (`$browser`, `$os`, `$current_url`) are safe; customer-defined properties are not.
+
+Suggested entry format:
+
+```markdown
+## YYYY-MM-DD: <short title>
+
+**Context.** Where the question came up (file, query type, why we were looking).
+
+**Question.** What were we trying to learn.
+
+**What we tried.** Variants compared, with the relevant SQL fragments.
+
+**Numbers.** Median of N from `system.query_log`, with read_bytes and memory_usage.
+
+**Caveats.** What the measurement environment couldn't show.
+
+**Takeaway.** One or two sentences a future reader can act on.
+```
+
+---
+
+## 2026-10-06: Single-person event lookups under override-based person IDs: prefilter on stored person ID or override distinct IDs, keep the resolved check
+
+**Context.** The related groups panel on person pages (`products/groups/backend/logic/related_actors_query.py`, `_query_related_groups`): `SELECT DISTINCT` group keys `FROM events WHERE person_id = {person} AND timestamp` in the last 90 days. Under the override-based persons-on-events modes, HogQL resolves `events.person_id` through `person_distinct_id_overrides` for every row in the window before the person filter can apply. On team 2 a large share of loads failed with `MEMORY_LIMIT_EXCEEDED` after ~40s.
+
+**Question.** Can the lookup stop resolving identity for the whole team's window without changing which groups come back for merged, detached or squashed persons?
+
+**What we tried.** In production, in two steps:
+
+- (A) Baseline.
+- (B) [#107324](https://github.com/PostHog/posthog/pull/107324): read the group key columns (`$group_N`, or `_$group_N_raw` when the group type has a `created_at`) instead of group keys from JSON `properties`.
+- (C) [#109931](https://github.com/PostHog/posthog/pull/109931): B plus a `PREWHERE` that narrows to candidate rows, while the resolved `person_id = {person}` filter stays in `WHERE` as the correctness check:
+
+```sql
+PREWHERE events.team_id = {team_id} AND timestamp > {after} AND timestamp < {before}
+  AND (events.event_person_id = {person}
+       OR events.distinct_id IN (SELECT distinct_id FROM raw_person_distinct_id_overrides WHERE person_id = {person}))
+```
+
+The candidate set is a superset: a row resolves to the person either through its stored `event_person_id` (no override) or through an override row for its `distinct_id`. A stale override that now points elsewhere passes the prefilter and fails the `WHERE`. The `IN` is local, not `GLOBAL IN`, so candidates and resolution read the same shard's snapshot; a replica ahead of the initiator could otherwise miss overrides.
+
+**Numbers.** Team 2 production, initial queries from `system.query_log`, split by `lc_plan_fingerprint`, relative to A. A and B cover a few hours each on the same day; C covers the ~24h after its deploy:
+
+| Variant                    | p50 duration, successful | Read bytes | Median peak memory | Worst-case peak memory   |
+| -------------------------- | ------------------------ | ---------- | ------------------ | ------------------------ |
+| A baseline                 | 1.0x                     | 1.0x       | 1.0x               | at the per-query limit   |
+| B group key columns        | ~1.0x                    | ~0.95x     | ~0.95x             | at the per-query limit   |
+| C B + candidate `PREWHERE` | ~0.95x                   | ~0.5x      | ~0.05x             | under 1 GB, far below it |
+
+C ended the memory-limit failures. Rows read did not change: every query still read the whole window.
+
+**Caveats.** Team 2 only. B's effect depends on the events table: its PR benchmark showed the win on the native-JSON events table, and team 2 showed none. Under cluster-wide load a few C queries still took 15-60s with unchanged memory and reads.
+
+**Takeaways.**
+
+- **The win was memory, not wall time.** Distinct ID filtering can't use the events sort key without an `event` filter, so every row in the window is still read. Removing the per-row override resolution removed the memory that grew with the team's event volume. Judge a fix like this on failure rate and peak memory, not successful-query p50.
+- **Prove equivalence on real persons before shipping.** Run old and new SQL over the same fixed window, with the query as a subquery, and compare `count()` plus `cityHash64(arrayStringConcat(arraySort(groupArray(...))))` computed in the outer query. Aggregating inside ClickHouse matters: HogQL adds a default `LIMIT 100` to an outer query without one, and with no `ORDER BY` the two plans can return different subsets of a larger result. Include persons whose events sit under an older `event_person_id`, so the override path runs. Run the two halves as separate queries: in one `UNION ALL`, the old half can hit the memory limit on its own.
+- **Split before and after by plan fingerprint, not merge time.** `lc_plan_fingerprint` changes when the generated SQL shape changes, so the first new fingerprint marks the moment the deploy reached production. Each variant then gets its own rows even within one day.
+- **Check a fix that seems to land.** B merged and looked done, but team 2's failure rate did not move. Measure each step separately instead of crediting the series.
+
+---
+
+## 2026-07-02: GROUP BY elements_chain is scan-bound; URL filters prune by granule-spread, not row-selectivity; OFFSET re-runs the whole aggregation
+
+**Context.** The toolbar clickmap endpoint (`/api/element/stats/`, `GET_ELEMENTS` in `posthog/models/element/sql.py`): raw single-team SQL grouping `events.elements_chain` by chain and event type over a team + date range + `$current_url` filter, ordered by count. Production p50 is fine (~250ms) but wide date ranges on pages whose URL is dense in the team's own traffic read hundreds of GiB and take seconds; the toolbar also paginates this with LIMIT/OFFSET.
+
+**Question.** Can the wide-range tail be fixed per-query — PREWHERE, cheaper GROUP BY keys, memory bounds, or pagination — or is the scan irreducible?
+
+**What we tried.** On the Test Cluster (team 2, 90-day window, `use_uncompressed_cache=0`): (A) the production shape — `match("mat_$current_url", '^…/project/.*/home$')`, `GROUP BY elements_chain, event`, `LIMIT 5001`; (B) the same with team/event/date/url moved to an explicit `PREWHERE`; (C) `GROUP BY cityHash64(elements_chain)` + `any(elements_chain)`; (S) the same range with an exact `has([...])` match on a URL that is rare in the range; (X) A plus `max_bytes_before_external_group_by = 4GiB`; (L) A with `LIMIT 50001`.
+
+**Numbers.** Medians from `system.query_log` (A/S: 5 runs; B/C: 3; X: 4; L: 3):
+
+| Variant                           | Duration (ms) | Read bytes | Memory   |
+| --------------------------------- | ------------- | ---------- | -------- |
+| A dense-URL wildcard, LIMIT 5001  | 5,185         | 134.9 GiB  | 12.2 GiB |
+| B explicit PREWHERE               | 5,710         | 143.9 GiB  | 12.1 GiB |
+| C cityHash64 GROUP BY keys        | 5,467         | 138.9 GiB  | 11.6 GiB |
+| S sparse exact URL, same range    | 525           | 1.0 GiB    | 126 MiB  |
+| X external-group-by bound (4 GiB) | 5,272         | 134.4 GiB  | 11.9 GiB |
+| L LIMIT 50001                     | ~10,900\*     | 134.1 GiB  | 16.1 GiB |
+
+\* L was cancelled at ~11s all three runs by Metabase aborting the ~100MB result download (`QUERY_WAS_CANCELLED`), not by ClickHouse — the scan and memory numbers before cancellation are the signal.
+
+**Caveats.** Single-tenant snapshot, no noisy neighbors; X's threshold may simply not have been crossed by the aggregation state alone, so it is inconclusive rather than negative; L's duration is a client artifact.
+
+**Takeaways.**
+
+- **Automatic PREWHERE is already optimal here; the URL predicate prunes by granule-spread, not row-selectivity.** A URL that is sparse across granules collapses the scan 134x (S) with no index at all, while a URL dense in the team's own traffic (their homepage) has a match in essentially every granule, so the fat `elements_chain` column is read for the entire range and neither explicit PREWHERE (B) nor any skip index can help — there is nothing to skip. The per-query floor is the dense-URL wide-range scan; the structural fix is pre-aggregation (a daily chain rollup), not query tuning.
+- **Hashing the GROUP BY key buys only ~7%** (C): aggregation memory is dominated by the chain _values_ (needed for output), not the key hash table.
+- **LIMIT size does not change the scan** (L reads what A reads) but grows the ORDER BY/LIMIT heap (+4 GiB at 50k rows of multi-KB strings), **and LIMIT/OFFSET pagination over a live GROUP BY re-runs the full aggregation per page** — and can silently _miss_ rows that shift across a page boundary between scans (deduping catches duplicates, nothing catches gaps). A client that wants more rows should re-fetch from offset 0 with a bigger limit — one extra scan, no gaps — rather than paginate.
+
+---
+
+## 2026-06-10: A minmax skip index on a mixed-content string column does not rescue unbounded point lookups; UUIDv7 ids carry their own time bound
+
+**Context.** Replay capture diagnostics (`frontend/src/scenes/session-recordings/components/replayCaptureDiagnosticsPanelLogic.ts`): `SELECT properties FROM events WHERE $session_id = {sid} ORDER BY timestamp DESC LIMIT 1` with no timestamp predicate. `$session_id` is a materialized column with `INDEX minmax_$session_id ... TYPE minmax GRANULARITY 1`, and session ids are UUIDv7 (time-ordered), so on paper the skip index should prune almost everything even without a timestamp bound.
+
+**Question.** Does the minmax skip index make the unbounded single-session lookup cheap, or does it still need a timestamp bound?
+
+**Numbers.** Median of 5, Test Cluster, team 2 (history back to 2020), a real high-volume session id, `use_query_condition_cache=0`:
+
+| Variant                     | Duration (ms) | Read rows | Read bytes |
+| --------------------------- | ------------- | --------- | ---------- |
+| no timestamp bound          | 16,485        | 2.44B     | 76.8 GB    |
+| `timestamp >=` 90d          | 4,993         | 452M      | 20.8 GB    |
+| UUIDv7-derived window (~7d) | 503           | 35.7M     | 10.4 GB    |
+
+**Caveats.** The exact pruning loss depends on the team's mix of `$session_id` values; a team with only UUIDv7 ids might see better index behavior. Not measured per-mix.
+
+**Takeaway.** The minmax index did not save the unbounded query: the column also holds the literal string `'null'` (millions of rows/day on team 2) and other non-UUID values, so each granule's `[min, max]` range is wide enough to contain any UUIDv7 and almost nothing is excluded. Minmax on strings only prunes when values correlate tightly with insertion order across the _whole_ column, not just the subset you care about. The structural fix is the same as any single-entity lookup: carry a timestamp bound. When the id is a UUIDv7, the client can derive that bound from the id's embedded 48-bit ms timestamp (plus clock-skew slack and a fallback window for non-parsing ids): 33x faster and 68x fewer rows than the unbounded form here.
+
+---
+
+## 2026-06-10: Pre-filtering a window-function scan with an IN-subquery doubled the cost; JSON parsing dominates, window sorts are cheap
+
+**Context.** MCP analytics "neighbors before/after" queries (`products/mcp_analytics/frontend/mcpAnalyticsToolDetailLogic.ts`): a CTE scans all 7 days of a team's `mcp_tool_call` events, computes `lagInFrame`/`leadInFrame` over every conversation, then filters to one target tool. Looked like wasted work: most conversations don't contain the target tool.
+
+**Question.** Does adding `AND conv_id IN (SELECT DISTINCT conv_id ... WHERE tool = '<target>')` to shrink the window input make the query faster?
+
+**What we tried.** Original shape vs the IN-subquery pre-filter, on the Test Cluster, team 2, over a ~253k-event `mcp_tool_call` slice, for both a rare tool (~2% of calls) and the dominant tool (~48% of calls). All property access via `JSONExtractString(properties, ...)` (no materialized columns for these on the Test Cluster).
+
+**Numbers.** Median of 5 from `system.query_log`, `use_uncompressed_cache=0, use_query_condition_cache=0`:
+
+| Variant                     | Duration (ms) | Read rows | Read bytes |
+| --------------------------- | ------------- | --------- | ---------- |
+| original, rare tool         | 355           | 322k      | 2.87 GB    |
+| pre-filtered, rare tool     | 607           | 651k      | 5.73 GB    |
+| original, dominant tool     | 387           | 322k      | 2.87 GB    |
+| pre-filtered, dominant tool | 721           | 739k      | 5.74 GB    |
+
+The "optimization" was ~1.8× slower and read ~2× the bytes for both tool shares.
+
+**Caveats.** With materialized columns for the filtered property, the second scan would be much cheaper and the trade-off could flip; not measured.
+
+**Takeaway.** The scan (decompress + JSON-parse `properties`) dominates; the window sort it was meant to shrink is trivial by comparison. An IN-subquery over the same events table is a second full scan, so it roughly doubles the dominant cost for zero win. Don't pre-filter partitions of a window function when the filter requires re-scanning the same table you're windowing over.
+
+Also learned while measuring: ClickHouse 26.x's **query condition cache** makes repeat runs of the same query read only the granules that matched last time (we saw 13.1M rows drop to 816 on run 2). Disable it with `use_query_condition_cache=0` when measuring, and don't credit it for production point-lookups whose predicate changes per request (e.g. per-session lookups); each new predicate is a cold run. And Metabase caches identical native queries entirely: add a changing comment/nonce per run or your "5 runs" are 1 run.
+
+---
+
+## 2026-06-10: Single-session lookups without a timestamp bound scan boundary granules across the team's whole history
+
+**Context.** MCP analytics session-detail queries (`products/mcp_analytics/backend/logic.py` `_MCP_TOOL_CALLS_SQL`, `intent_generation.py` `_SESSION_INTENTS_SQL`): `WHERE event = 'mcp_tool_call' AND properties.$mcp_session_id = {sid}` with no timestamp predicate.
+
+**Question.** How much does an unbounded single-session point lookup cost vs the same query bounded to 30 days, given `event` is in the sort key after `toDate(timestamp)`?
+
+**Numbers.** Median of 5, Test Cluster, team 2 (history back to 2020, the event itself only present in a recent 5-day slice), `use_query_condition_cache=0`:
+
+| Variant            | Duration (ms) | Read rows | Read bytes |
+| ------------------ | ------------- | --------- | ---------- |
+| no timestamp bound | 647           | 13.1M     | 3.11 GB    |
+| `timestamp >=` 30d | 474           | 1.03M     | 2.90 GB    |
+
+**Caveats.** The snapshot only held 5 days of this event, so both variants read the same event payload bytes; the 12M extra rows are sort-key boundary granules across ~6 years of partitions (index work + narrow columns, few bytes). In production the gap widens structurally: the unbounded query also re-reads the entire ever-growing event history's `properties` on every lookup.
+
+**Takeaway.** Even when the `event` filter looks selective, with `toDate(timestamp)` unconstrained the primary index leaves ~1 boundary granule per (date, part) range, which adds up to millions of rows over years of partitions. Single-entity lookups (session, trace, etc.) should always carry a timestamp bound derived from how far back the entity can realistically be referenced.
+
+---
+
+## 2026-05-28: Dropping `FROM person FINAL` via `argMax` is worse than the original; materialization is the actual win
+
+**Context.** A now-deleted precalculated-person-properties backfill workflow built a raw ClickHouse query that did `SELECT id, JSONExtract(properties, '<key>', 'String'), ... FROM person FINAL WHERE team_id = ... AND id BETWEEN ... AND is_deleted = 0 ORDER BY id FORMAT JSONEachRow`. We flagged the `FINAL` as a smell.
+
+**Question.** Does dropping `FINAL` via the textbook `argMax(properties, version) GROUP BY id` rewrite actually make the query faster?
+
+**What we tried.** Three variants on the Test Cluster, team 2, an `id <= <bound_uuid>` slice picked at the 1-millionth-row sort offset (so the WHERE prefix covers exactly the team_id + id sort key for ~1M persons), all returning the same small set of distinct `$browser` values:
+
+- **A**: `FROM person FINAL` + `JSONExtract(properties, '$browser', 'String')`
+- **B**: `argMax(properties, version) GROUP BY id HAVING argMax(is_deleted, version) = 0` + `JSONExtract` over the winning blob
+- **C**: `argMax(pmat_$browser, version) GROUP BY id HAVING argMax(is_deleted, version) = 0` (materialized column)
+
+**Numbers.** Median of 5 from `system.query_log`, `use_uncompressed_cache=0`:
+
+| Variant                                 | Duration (ms) | Read bytes  | Peak memory |
+| --------------------------------------- | ------------- | ----------- | ----------- |
+| A: `FINAL` + `JSONExtract`              | 107           | 1.27 GB     | 308 MB      |
+| B: `argMax(properties)` + `JSONExtract` | 156           | 1.27 GB     | **3.0 GB**  |
+| C: `argMax(pmat_$browser)`              | **23**        | **37.9 MB** | 238 MB      |
+
+B was 46% slower than A and used ~10× the memory. C was 4.6× faster than A and read 33× fewer bytes.
+
+**Caveats.** Team 2's snapshot has `count() == countDistinct(id)` (tens of millions of each), meaning background merges had already deduplicated the table before we measured. `FINAL` therefore had no actual merge work to do, only the planner overhead and the no-parallel-reads cost. On a team with active person updates, A's wall-clock and memory would shift up; B would shift even more (argMax over more rows per group). The relative ordering of "materialization dominates" should hold.
+
+**Takeaway.** The blanket "FINAL bad, argMax good" framing is wrong in at least one important case: argMax over a wide column (`properties` blobs) buffers the winning value per group in the GROUP BY hash table, which can blow memory up by 10× while making the query slower than just letting `FINAL` stream. The safe rewrite hierarchy for moving off `FROM ... FINAL` is: (1) use a materialized column if one exists, (2) argMax over a narrow column you actually need, (3) only fall back to argMax over the wide column as a last resort. If none of those apply, `FINAL` may genuinely be the cheapest option.
+
+---
+
+## 2026-06-24: ClickHouse prunes unused `argMax(content)`; the real win is bounding the dedup, not dropping columns
+
+**Context.** `products/signals/backend/temporal/signal_queries.py::fetch_source_products_for_reports` runs on every inbox report-list load (`signals.reports.list.fetch_source_products`, APM 7d p50 ~155ms / p95 ~1.4s). It deduped the team's whole signal history with `_deduped_signals_subquery()` (`argMax(content), argMax(metadata), argMax(timestamp) GROUP BY document_id` over `document_embeddings`) then filtered `report_id IN (<~25 page reports>)` on the OUTER query. `document_embeddings` is model-routed `ReplacingMergeTree`, `ORDER BY (team_id, toDate(timestamp), product, document_type, rendering, cityHash64(document_id))`, 3-month TTL; `report_id` lives in the `metadata` JSON, so nothing prunes — every load scans ~3 months of the team's signals.
+
+**The proposed smell was partly wrong.** The hypothesis was "it `argMax`'s the big `content` string for every document, then throws it away." Measured against local synthetic single-team data (incompressible 3KB `content`), `read_bytes` for the original was **identical** to a variant that never selects content — ClickHouse's analyzer drops the `argMax(content)`/`argMax(timestamp)` because the outer query never references those aliases. Dead-column elimination already handled it; "drop the unused content argMax" buys ~0 at the ClickHouse layer.
+
+**What actually costs.** The `argMax(metadata) GROUP BY document_id` over the _whole history_ — its hash table holds metadata per distinct document, so peak memory scales with the team's total signal count.
+
+**Three shapes, local synthetic data (median of 5 from `system.query_log`), 360k rows / 360k docs, 600 reports, page = 25 reports:**
+
+| Shape                                                                                                       | dur_ms | read_rows | read_bytes | peak_mem     |
+| ----------------------------------------------------------------------------------------------------------- | ------ | --------- | ---------- | ------------ |
+| CURRENT (dedup-all, filter after)                                                                           | 192    | 360k      | 39.5 MiB   | 174 MiB      |
+| CANDIDATE (`document_id IN (SELECT DISTINCT ... WHERE report_id IN page)`, then argMax, filter still after) | 157    | 720k      | 76 MiB     | **14.3 MiB** |
+| LEAN (single scan, `argMax(JSONExtract(...scalars))` instead of full metadata blob)                         | 309    | 360k      | 39.5 MiB   | 171 MiB      |
+
+At 180k docs CURRENT peak*mem was 96 MiB; at 360k it was 174 MiB — memory grows ~linearly with team history. CANDIDATE went 2.6 MiB -> 14.3 MiB over the same doubling: bounded by signals in the \_displayed page's reports*, not the whole history. The wall-clock crossover (CANDIDATE faster) lands exactly on the signal-heavy teams that drive the p95 tail. CANDIDATE's cost is 2x metadata I/O (a second full-history `JSONExtract(report_id)` scan to build the candidate set) — cheap and parallel relative to the memory it saves. LEAN (drop the blob, argMax narrow scalars, single scan) was no better than CURRENT on memory at scale and noisier, so it was rejected.
+
+**Correctness trap (same as the reverse-lookup sibling).** The `report_id IN (...)` filter must stay AFTER the `argMax`: a signal re-grouped from report A to B is matched by the candidate scan (it once carried A) but must be excluded because its _latest_ metadata points to B. Pushing the report_id predicate before the argMax would resurface the stale attribution. Verified identical results between all three shapes including the re-grouped case.
+
+**Takeaway.** Before assuming a wide-column `argMax` is the cost, check whether the analyzer already prunes it (compare `read_bytes` against a content-free variant). When an `argMax ... GROUP BY high_cardinality_id` runs over a whole-history scan just to keep a small slice, bounding the group set with a `key IN (SELECT DISTINCT id WHERE <page predicate>)` prefilter trades a second (cheap, narrow) scan for an aggregation whose memory is bounded by the request page — the right lever for a memory/heavy-tenant-driven p95, even when it reads more bytes.
+
+**Follow-up — the same shape where the wide column _is_ consumed (sibling `_signals_for_report_query`).** The neighbouring query dedups the whole history then filters to a single report, and its outer SELECT _keeps_ `content`, so the analyzer can't prune the `argMax(content)` — the original genuinely reads and buffers content for every document. Same candidate-bound fix, measured at 180k docs / 600 reports / one target report (~300 of its docs):
+
+| Shape                              | dur_ms | read_rows | read_bytes | peak_mem   |
+| ---------------------------------- | ------ | --------- | ---------- | ---------- |
+| Original (dedup-all, filter after) | 583    | 180k      | 536 MiB    | 943 MiB    |
+| Candidate-bounded                  | 88     | 210k      | **30 MiB** | **11 MiB** |
+
+~18x fewer bytes, ~84x less memory, ~6.6x faster — far larger than the pruned-content case above, and on every axis (the extra DISTINCT scan reads only `document_id` + `metadata`, so total bytes still collapses because `content` is now read for one report's docs, not the team's). Lesson: the candidate-bound win scales with how much per-document data the post-filter throws away — biggest when the dedup buffers a wide column (`content`/`embedding`) that downstream actually needs.
+
+## 2026-09-08: counting persons on big teams: stream it, or better, sample it
+
+Context: the workflows blast radius (count persons matching filters). The person table stores multiple rows per person (one per update), so every "how many persons" query first collapses them to one row per person (`GROUP BY id`). By default ClickHouse does that with an in-memory hash table holding one entry per person. At 87M persons that is 18.6 GiB and the query gets killed.
+
+Three ways to run the same count, measured on team 2 (~87M persons):
+
+| approach                          | memory           | time   |
+| --------------------------------- | ---------------- | ------ |
+| hash table (default)              | 18.6 GiB, killed | 0.8 s  |
+| `optimize_aggregation_in_order=1` | 604 MiB          | 9.1 s  |
+| sample 1 in 64, multiply by 64    | 245 MiB          | 0.09 s |
+
+- `optimize_aggregation_in_order=1`: the table is sorted by `(team_id, id)`, so ClickHouse can walk it in order and drop each person's state once all their rows went by. Bounded memory, but ~11x slower: the parallel streams funnel through one thread to keep the order. Use it when the result must be exact.
+- Sampling: add `WHERE modulo(cityHash64(id), 64) = 0`, count, multiply by 64. The hash puts every person in one of 64 buckets and you count only bucket 0. Because the bucket comes from `id` (the thing you GROUP BY), all rows of a person land in the same bucket, so the dedup stays exact inside the sample. Only the multiply is an estimate.
+- How wrong the estimate gets: about `sqrt(63 / matched)`. ~1% at 640k matches, 17-32% worst case below ~20k. So fall back to the exact query when the sample has few matches (we cut at 10,000 sampled matches), which is exactly where exact is cheap anyway.
+
+Traps we hit:
+
+- Write the sample condition as `modulo(cityHash64(id), 64) = 0`, not `cityHash64(id) % 64 = 0`. Same meaning, but the persons lazy table only pushes function calls into the inner scan; with the `%` operator the pushdown is dropped and the query silently scans the whole team again. Pin the pushdown with a test on the generated SQL.
+- Counting distinct groups instead of persons (we count unique emails for send dedup): hash the group key, not the person. Sampling persons makes a 2-person email twice as likely to land in the sample, so the estimate drifts back toward a person count. `cityHash64(lower(trim(email)))` gives every email exactly a 1/64 chance. Worst draw at 87M email groups: 0.2% off.
+- Don't put `optimize_aggregation_in_order` on the sampled query. The sample already made the hash table small, so the setting only made it 40% slower with 2.4x the memory (measured).
+- `count(DISTINCT id)` on the persons table is a waste when nothing joins: the dedup already returns one row per person, plain `count()` is the same result without holding every id. But a filter that adds a join needs the DISTINCT back, e.g. a `distinct_id` filter joins one row per alias and plain `count()` counts that person once per alias.
+- The `id IN (prefilter)` set the persons table builds stays in memory no matter what (it is a set, not a GROUP BY, so the spill setting can't touch it). ~1 GiB per ~6M matched ids. Sampling shrinks it; exact queries on huge broad audiences keep paying it, which is where precalculated audiences eventually win.
+
+Applied in `products/workflows/backend/services/audience_v2.py`.

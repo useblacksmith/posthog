@@ -1,0 +1,60 @@
+import { parseSigningKeys } from '@/lib/client-ip-signature'
+import type { Env } from '@/tools/types'
+
+export const MCP_EXEC_SKILLS_FEATURE_FLAG = 'mcp-exec-skills'
+export const MCP_INBOX_FIRST_FLAG = 'mcp-inbox-first'
+export const MCP_CURSOR_EXEC_MODE_FLAG = 'mcp-cursor-exec-mode'
+export const MCP_TIME_SERIES_CHARTS_FLAG = 'mcp-time-series-charts'
+
+export {
+    USER_AGENT,
+    type GetUserAgentOptions,
+    getUserAgent,
+    POSTHOG_US_BASE_URL,
+    POSTHOG_EU_BASE_URL,
+    toCloudRegion,
+    getBaseUrlForRegion,
+    getCustomApiBaseUrl,
+    getPublicBaseUrl,
+    getAuthorizationServerUrl,
+    MCP_DOCS_URL,
+    OAUTH_SCOPES_SUPPORTED,
+} from '@/lib/constants'
+
+export function getEdgeClientIpSigningKeys(): string[] {
+    return parseSigningKeys(process.env.MCP_EDGE_CLIENT_IP_SIGNING_KEYS)
+}
+
+export function getClientIpSigningKeys(): string[] {
+    return parseSigningKeys(process.env.MCP_CLIENT_IP_SIGNING_KEYS)
+}
+
+export function getEnv(): Env {
+    const extras: Record<string, string | undefined> = {}
+    if (process.env.TEST) {
+        extras.TEST = process.env.TEST
+    }
+    return {
+        POSTHOG_API_BASE_URL: process.env.POSTHOG_API_BASE_URL || undefined,
+        POSTHOG_PUBLIC_URL: process.env.POSTHOG_PUBLIC_URL || undefined,
+        MCP_APPS_BASE_URL: process.env.MCP_APPS_BASE_URL || undefined,
+        POSTHOG_MCP_APPS_ANALYTICS_BASE_URL: process.env.POSTHOG_MCP_APPS_ANALYTICS_BASE_URL || undefined,
+        POSTHOG_UI_APPS_TOKEN: process.env.POSTHOG_UI_APPS_TOKEN || undefined,
+        POSTHOG_ANALYTICS_API_KEY: process.env.POSTHOG_ANALYTICS_API_KEY || undefined,
+        POSTHOG_ANALYTICS_HOST: process.env.POSTHOG_ANALYTICS_HOST || undefined,
+        POSTHOG_MCP_SKILLS_URL: process.env.POSTHOG_MCP_SKILLS_URL || undefined,
+        POSTHOG_MCP_SKILLS_SHA256: process.env.POSTHOG_MCP_SKILLS_SHA256 || undefined,
+        POSTHOG_MCP_OMNIBUS_SKILLS: process.env.POSTHOG_MCP_OMNIBUS_SKILLS || undefined,
+        POSTHOG_MCP_LOCAL_SKILLS_URL: process.env.POSTHOG_MCP_LOCAL_SKILLS_URL || undefined,
+        ...extras,
+    }
+}
+
+export const AUTH_REDIRECT_PATHS = [
+    '/.well-known/oauth-authorization-server',
+    '/.well-known/jwks.json',
+    '/oauth/*',
+    '/register',
+    '/authorize',
+    '/token',
+] as const

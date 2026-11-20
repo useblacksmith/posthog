@@ -1,0 +1,1163 @@
+import io
+import uuid
+import base64
+import zipfile
+from typing import Any
+
+from posthog.test.base import APIBaseTest
+from unittest.mock import MagicMock, patch
+
+from django.db import IntegrityError
+from django.test import SimpleTestCase
+from django.utils import timezone
+
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.models import Organization, OrganizationMembership
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.scoping import team_scope
+
+from products.streamlit_apps.backend.facade import api as streamlit_api
+from products.streamlit_apps.backend.facade.api import MAX_FILE_COUNT
+from products.streamlit_apps.backend.facade.contracts import UpdateAppInput
+from products.streamlit_apps.backend.models import StreamlitApp, StreamlitAppSandbox, StreamlitAppVersion
+from products.streamlit_apps.backend.presentation.serializers import (
+    CreateVersionFromSourceInputSerializer,
+    EditVersionSourceInputSerializer,
+)
+
+
+def _make_zip(files: dict[str, str | bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+VALID_ZIP = _make_zip({"app.py": "import streamlit as st\nst.title('Hello')"})
+ZIP_WITH_REQUIREMENTS = _make_zip(
+    {
+        "app.py": "import streamlit as st",
+        "requirements.txt": "pandas\nnumpy\n",
+    }
+)
+
+
+class _StreamlitAppsFlagMixin:
+    """Shared test setup that mocks the `streamlit-apps` feature flag.
+
+    StreamlitAppsAccessPermission hides the whole viewset behind the flag,
+    so every test class that talks to the viewset needs to opt in. Default
+    every test to "flag enabled" so the existing assertions keep working;
+    the one flag-gating test flips it back off explicitly.
+    """
+
+    _flag_patcher: Any
+
+    def setUp(self):
+        super().setUp()  # type: ignore[misc]
+        self._set_streamlit_apps_flag(True)
+
+    def tearDown(self):
+        if hasattr(self, "_flag_patcher"):
+            self._flag_patcher.stop()
+        super().tearDown()  # type: ignore[misc]
+
+    def _set_streamlit_apps_flag(self, enabled: bool) -> None:
+        if hasattr(self, "_flag_patcher"):
+            self._flag_patcher.stop()
+        self._flag_patcher = patch("posthoganalytics.feature_enabled")
+        mock = self._flag_patcher.start()
+
+        def check_flag(flag_name, *_args, **_kwargs):
+            # Match ONLY the streamlit-apps flag: returning True for all flag
+            # names would spuriously enable unrelated flags that other code
+            # in the stack evaluates during the same request.
+            if flag_name == "streamlit-apps":
+                return enabled
+            return False
+
+        mock.side_effect = check_flag
+
+
+class TestStreamlitAppAPI(_StreamlitAppsFlagMixin, APIBaseTest):
+    # The viewset is registered under /projects/ via the product's routes.py.
+    def _url(self, suffix: str = "") -> str:
+        base = f"/api/projects/{self.team.id}/streamlit_apps"
+        if suffix:
+            return f"{base}/{suffix}"
+        return f"{base}/"
+
+    def _create_app(self, **kwargs) -> StreamlitApp:
+        defaults = {"team": self.team, "name": "Test App", "created_by": self.user}
+        defaults.update(kwargs)
+        return StreamlitApp.objects.create(**defaults)
+
+    def _create_version(self, app: StreamlitApp, version_number: int = 1, **kwargs) -> StreamlitAppVersion:
+        defaults = {
+            "app": app,
+            "version_number": version_number,
+            "zip_file": f"streamlit_apps/{app.team_id}/{app.id}/v{version_number}.zip",
+            "zip_hash": "abc123",
+            "created_by": self.user,
+        }
+        defaults.update(kwargs)
+        return StreamlitAppVersion.objects.create(**defaults)
+
+    def test_list_apps_empty(self):
+        response = self.client.get(self._url())
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["results"] == []
+
+    def test_list_apps(self):
+        self._create_app(name="App A")
+        self._create_app(name="App B")
+        response = self.client.get(self._url())
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()["results"]) == 2
+
+    def test_list_excludes_deleted(self):
+        self._create_app(name="Visible")
+        self._create_app(name="Deleted", deleted=True)
+        response = self.client.get(self._url())
+        assert len(response.json()["results"]) == 1
+        assert response.json()["results"][0]["name"] == "Visible"
+
+    def test_list_excludes_other_teams(self):
+        from posthog.models import Organization, Team
+
+        other_org = Organization.objects.create(name="Other Org")
+        other_team = Team.objects.create(organization=other_org, name="Other Team")
+        self._create_app(name="My App")
+        StreamlitApp.objects.create(team=other_team, name="Other App")
+
+        response = self.client.get(self._url())
+        assert len(response.json()["results"]) == 1
+        assert response.json()["results"][0]["name"] == "My App"
+
+    def test_list_has_status(self):
+        app = self._create_app()
+        version = self._create_version(app)
+        StreamlitAppSandbox.objects.create(app=app, version=version, sandbox_id="sb_123", status="running")
+        response = self.client.get(self._url())
+        result = response.json()["results"][0]
+        assert result["status"] == "running"
+
+    def test_list_returns_403_when_feature_flag_disabled(self):
+        # StreamlitAppsAccessPermission hides the whole viewset behind the
+        # `streamlit-apps` PostHog flag; when the flag is off, even listing
+        # should 403 regardless of team membership.
+        self._set_streamlit_apps_flag(False)
+        response = self.client.get(self._url())
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_list_stopped_status_when_no_sandbox(self):
+        self._create_app()
+        response = self.client.get(self._url())
+        result = response.json()["results"][0]
+        assert result["status"] == "stopped"
+
+    def test_create_app(self):
+        response = self.client.post(self._url(), data={"name": "New App", "description": "A new app"})
+        assert response.status_code == status.HTTP_201_CREATED
+        data = response.json()
+        assert data["name"] == "New App"
+        assert data["description"] == "A new app"
+        assert data["short_id"]
+        assert data["created_by"]["id"] == self.user.id
+
+    def test_create_app_name_required(self):
+        response = self.client.post(self._url(), data={"description": "No name"})
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @parameterized.expand(
+        [
+            ("custom_cpu", {"name": "App", "cpu_cores": 2.0}, "cpu_cores", 2.0),
+            ("custom_memory", {"name": "App", "memory_gb": 4.0}, "memory_gb", 4.0),
+            ("default_cpu", {"name": "App"}, "cpu_cores", 0.5),
+            ("default_memory", {"name": "App"}, "memory_gb", 1.0),
+        ]
+    )
+    def test_create_app_resource_config(self, _name, data, field, expected):
+        response = self.client.post(self._url(), data=data)
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()[field] == expected
+
+    def test_retrieve_app(self):
+        app = self._create_app(name="Detail App", description="Details here")
+        response = self.client.get(self._url(f"{app.short_id}/"))
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["name"] == "Detail App"
+        assert data["description"] == "Details here"
+        assert "active_version" in data
+        assert "sandbox" in data
+
+    def test_retrieve_deleted_app_404(self):
+        app = self._create_app(deleted=True)
+        response = self.client.get(self._url(f"{app.short_id}/"))
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_update_app(self):
+        app = self._create_app(name="Old Name")
+        response = self.client.patch(self._url(f"{app.short_id}/"), data={"name": "New Name"})
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["name"] == "New Name"
+        app.refresh_from_db()
+        assert app.name == "New Name"
+
+    def test_update_cannot_change_short_id(self):
+        app = self._create_app()
+        original_short_id = app.short_id
+        self.client.patch(self._url(f"{app.short_id}/"), data={"short_id": "hacked"})
+        app.refresh_from_db()
+        assert app.short_id == original_short_id
+
+    def test_delete_app_soft_deletes(self):
+        app = self._create_app()
+        response = self.client.delete(self._url(f"{app.short_id}/"))
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        app.refresh_from_db()
+        assert app.deleted is True
+        assert app.deleted_at is not None
+
+    def test_deleted_app_not_in_list(self):
+        app = self._create_app()
+        self.client.delete(self._url(f"{app.short_id}/"))
+        response = self.client.get(self._url())
+        assert len(response.json()["results"]) == 0
+
+
+class TestStreamlitAppVersionAPI(_StreamlitAppsFlagMixin, APIBaseTest):
+    def _url(self, short_id: str, suffix: str = "") -> str:
+        base = f"/api/projects/{self.team.id}/streamlit_apps/{short_id}"
+        if suffix:
+            return f"{base}/{suffix}"
+        return f"{base}/"
+
+    def _create_app(self, **kwargs) -> StreamlitApp:
+        defaults = {"team": self.team, "name": "Test App", "created_by": self.user}
+        defaults.update(kwargs)
+        return StreamlitApp.objects.create(**defaults)
+
+    def _create_version(self, app: StreamlitApp, version_number: int = 1) -> StreamlitAppVersion:
+        return StreamlitAppVersion.objects.create(
+            app=app,
+            version_number=version_number,
+            zip_file=f"test/{app.id}/v{version_number}.zip",
+            zip_hash="abc",
+            created_by=self.user,
+        )
+
+    def test_list_versions_empty(self):
+        app = self._create_app()
+        response = self.client.get(self._url(app.short_id, "versions/"))
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["results"] == []
+
+    def test_list_versions_ordered_by_version_number_desc(self):
+        app = self._create_app()
+        self._create_version(app, 1)
+        self._create_version(app, 2)
+        self._create_version(app, 3)
+        response = self.client.get(self._url(app.short_id, "versions/"))
+        versions = response.json()["results"]
+        assert [v["version_number"] for v in versions] == [3, 2, 1]
+
+    @patch("posthog.storage.object_storage.write")
+    def test_upload_version_with_requirements_silently_accepted(self, mock_storage_write):
+        app = self._create_app()
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        zip_file = SimpleUploadedFile("app.zip", ZIP_WITH_REQUIREMENTS, content_type="application/zip")
+        response = self.client.post(
+            self._url(app.short_id, "upload_version/"),
+            data={"file": zip_file},
+            format="multipart",
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+        data = response.json()
+        assert data["version_number"] == 1
+        mock_storage_write.assert_called_once()
+
+        app.refresh_from_db()
+        assert app.active_version_id == uuid.UUID(data["id"])
+
+    @patch("posthog.storage.object_storage.write")
+    def test_upload_version_increments_number(self, mock_storage_write):
+        app = self._create_app()
+        self._create_version(app, 1)
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        zip_file = SimpleUploadedFile("app.zip", VALID_ZIP, content_type="application/zip")
+        response = self.client.post(
+            self._url(app.short_id, "upload_version/"),
+            data={"file": zip_file},
+            format="multipart",
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()["version_number"] == 2
+        mock_storage_write.assert_called_once()
+
+    def test_upload_version_no_file_400(self):
+        app = self._create_app()
+        response = self.client.post(self._url(app.short_id, "upload_version/"))
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "No file" in response.json()["detail"]
+
+    def test_upload_invalid_zip_400(self):
+        app = self._create_app()
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        bad_zip = SimpleUploadedFile("app.zip", b"not a zip", content_type="application/zip")
+        response = self.client.post(
+            self._url(app.short_id, "upload_version/"),
+            data={"file": bad_zip},
+            format="multipart",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "Invalid zip" in response.json()["detail"]
+
+    def test_upload_zip_missing_app_py_400(self):
+        app = self._create_app()
+        zip_bytes = _make_zip({"readme.txt": "no app.py here"})
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        zip_file = SimpleUploadedFile("app.zip", zip_bytes, content_type="application/zip")
+        response = self.client.post(
+            self._url(app.short_id, "upload_version/"),
+            data={"file": zip_file},
+            format="multipart",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthog.storage.object_storage.write")
+    def test_upload_version_stops_live_sandbox(self, _mock_storage_write):
+        """Uploading a new version implicitly activates it, so any running
+        sandbox is now serving stale code and must be stopped."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        app = self._create_app()
+        v1 = self._create_version(app, 1)
+        app.active_version = v1
+        app.save()
+        StreamlitAppSandbox.objects.create(
+            app=app, version=v1, sandbox_id="sb_old", status=StreamlitAppSandbox.Status.RUNNING
+        )
+
+        zip_file = SimpleUploadedFile("app.zip", VALID_ZIP, content_type="application/zip")
+        with patch("products.streamlit_apps.backend.facade.api.AppRuntimeService") as runtime_cls:
+            response = self.client.post(
+                self._url(app.short_id, "upload_version/"),
+                data={"file": zip_file},
+                format="multipart",
+            )
+
+        assert response.status_code == status.HTTP_201_CREATED
+        runtime_cls.return_value.stop_app.assert_called_once_with(app)
+
+    def test_activate_version_returns_new_active_version(self):
+        app = self._create_app()
+        v1 = self._create_version(app, 1)
+        v2 = self._create_version(app, 2)
+        app.active_version = v2
+        app.save()
+
+        response = self.client.post(
+            self._url(app.short_id, "activate_version/"),
+            data={"version_number": 1},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["active_version"]["version_number"] == 1
+        # The server now stops the sandbox itself, so callers no longer need a
+        # `requires_restart` hint.
+        assert "requires_restart" not in data
+        app.refresh_from_db()
+        assert app.active_version_id == v1.id
+
+    @parameterized.expand(
+        [
+            (StreamlitAppSandbox.Status.RUNNING, True),
+            (StreamlitAppSandbox.Status.STARTING, True),
+            (StreamlitAppSandbox.Status.STOPPED, False),
+            (StreamlitAppSandbox.Status.STOPPING, False),
+            (StreamlitAppSandbox.Status.ERROR, False),
+        ]
+    )
+    def test_activate_version_stops_live_sandbox(self, sandbox_status, should_stop):
+        app = self._create_app()
+        self._create_version(app, 1)
+        v2 = self._create_version(app, 2)
+        app.active_version = v2
+        app.save()
+        StreamlitAppSandbox.objects.create(app=app, version=v2, sandbox_id="sb_old", status=sandbox_status)
+
+        with patch("products.streamlit_apps.backend.facade.api.AppRuntimeService") as runtime_cls:
+            response = self.client.post(
+                self._url(app.short_id, "activate_version/"),
+                data={"version_number": 1},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        if should_stop:
+            runtime_cls.return_value.stop_app.assert_called_once_with(app)
+        else:
+            runtime_cls.return_value.stop_app.assert_not_called()
+
+    def test_activate_version_swallows_stop_failure(self):
+        """Stop is best-effort: a Modal/runtime hiccup must not break activation."""
+        app = self._create_app()
+        v1 = self._create_version(app, 1)
+        v2 = self._create_version(app, 2)
+        app.active_version = v2
+        app.save()
+        StreamlitAppSandbox.objects.create(
+            app=app, version=v2, sandbox_id="sb_old", status=StreamlitAppSandbox.Status.RUNNING
+        )
+
+        with patch("products.streamlit_apps.backend.facade.api.AppRuntimeService") as runtime_cls:
+            runtime_cls.return_value.stop_app.side_effect = RuntimeError("Modal down")
+            response = self.client.post(
+                self._url(app.short_id, "activate_version/"),
+                data={"version_number": 1},
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        app.refresh_from_db()
+        assert app.active_version_id == v1.id
+
+    def test_activate_nonexistent_version_404(self):
+        app = self._create_app()
+        response = self.client.post(
+            self._url(app.short_id, "activate_version/"),
+            data={"version_number": 999},
+        )
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_activate_version_requires_version_number(self):
+        app = self._create_app()
+        response = self.client.post(self._url(app.short_id, "activate_version/"))
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @parameterized.expand([("string", "abc"), ("float", 1.5), ("bool", True)])
+    def test_activate_version_rejects_non_integer(self, _name, version_number):
+        # A non-integer would otherwise hit the ORM and raise a 500 rather than a 400.
+        app = self._create_app()
+        self._create_version(app, 1)
+        response = self.client.post(
+            self._url(app.short_id, "activate_version/"),
+            data={"version_number": version_number},
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthog.storage.object_storage.write")
+    def test_upload_version_too_large_413(self, mock_storage_write):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        from products.streamlit_apps.backend.logic.zip_validator import MAX_ZIP_SIZE
+
+        app = self._create_app()
+        oversized = SimpleUploadedFile("app.zip", b"\0" * (MAX_ZIP_SIZE + 1), content_type="application/zip")
+        response = self.client.post(
+            self._url(app.short_id, "upload_version/"),
+            data={"file": oversized},
+            format="multipart",
+        )
+        assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+        # The body is rejected by size before it is ever read or persisted.
+        mock_storage_write.assert_not_called()
+
+
+class TestStreamlitAppActivityLog(_StreamlitAppsFlagMixin, APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        other_organization = Organization.objects.create(name="Other org")
+        OrganizationMembership.objects.create(organization=other_organization, user=self.user)
+        self.user.current_organization = other_organization
+        self.user.save()
+        self.app = StreamlitApp.objects.create(team=self.team, name="Test App", created_by=self.user)
+        self.version = StreamlitAppVersion.objects.create(
+            app=self.app, version_number=1, zip_file="test/v1.zip", zip_hash="abc", created_by=self.user
+        )
+
+    def _new_rows(self, after_id: int) -> list[ActivityLog]:
+        return list(ActivityLog.objects.filter(scope="StreamlitApp", id__gt=after_id).order_by("id"))
+
+    @parameterized.expand(
+        [
+            ("create", "post", "", {"name": "New App"}, "created", "New App", None),
+            ("update", "patch", "{short_id}/", {"name": "Renamed"}, "updated", "Renamed", "name"),
+            ("delete", "delete", "{short_id}/", None, "deleted", "Test App", None),
+            (
+                "activate_version",
+                "post",
+                "{short_id}/activate_version/",
+                {"version_number": 1},
+                "activated_version",
+                "Test App v1",
+                None,
+            ),
+            (
+                "create_version_from_source",
+                "post",
+                "{short_id}/create_version_from_source/",
+                {"source": "import streamlit as st"},
+                "uploaded_version",
+                "Test App v2",
+                None,
+            ),
+        ]
+    )
+    @patch("posthog.storage.object_storage.write")
+    def test_write_logs_one_row_under_the_team_organization(
+        self, _name, method, path, data, expected_activity, expected_name, expected_changed_field, _mock_write
+    ):
+        last_id = ActivityLog.objects.order_by("-id").values_list("id", flat=True).first() or 0
+        url = f"/api/projects/{self.team.id}/streamlit_apps/{path.format(short_id=self.app.short_id)}"
+
+        response = getattr(self.client, method)(url, data=data, format="json")
+
+        assert response.status_code < 300, response.content
+        rows = self._new_rows(last_id)
+        assert [row.activity for row in rows] == [expected_activity]
+        row = rows[0]
+        assert row.organization_id == self.team.organization_id
+        assert row.user_id == self.user.id
+        assert row.detail is not None
+        assert row.detail["name"] == expected_name
+        changed_fields = [change["field"] for change in row.detail["changes"] or []]
+        assert changed_fields == ([] if expected_changed_field is None else [expected_changed_field])
+
+    def test_write_outside_a_request_logs_a_system_row(self):
+        last_id = ActivityLog.objects.order_by("-id").values_list("id", flat=True).first() or 0
+
+        streamlit_api.update_app(self.team.id, self.app.short_id, UpdateAppInput(name="Renamed by a job"))
+
+        rows = self._new_rows(last_id)
+        assert [(row.activity, row.user_id, row.is_system) for row in rows] == [("updated", None, True)]
+        assert rows[0].organization_id == self.team.organization_id
+
+
+class TestStreamlitAppSandboxControlAPI(_StreamlitAppsFlagMixin, APIBaseTest):
+    def _url(self, short_id: str, suffix: str = "") -> str:
+        base = f"/api/projects/{self.team.id}/streamlit_apps/{short_id}"
+        if suffix:
+            return f"{base}/{suffix}"
+        return f"{base}/"
+
+    def _create_app_with_version(self) -> StreamlitApp:
+        app = StreamlitApp.objects.create(team=self.team, name="Test App", created_by=self.user)
+        version = StreamlitAppVersion.objects.create(
+            app=app, version_number=1, zip_file="test.zip", zip_hash="abc", created_by=self.user
+        )
+        app.active_version = version
+        app.save()
+        return app
+
+    def test_status_no_sandbox(self):
+        app = self._create_app_with_version()
+        response = self.client.get(self._url(app.short_id, "status/"))
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["status"] == "stopped"
+
+    def test_status_with_sandbox(self):
+        app = self._create_app_with_version()
+        StreamlitAppSandbox.objects.create(
+            app=app,
+            version=app.active_version,
+            sandbox_id="sb_123",
+            status="running",
+        )
+        response = self.client.get(self._url(app.short_id, "status/"))
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["status"] == "running"
+
+    @patch("products.streamlit_apps.backend.tasks.run_streamlit_app_lifecycle.delay")
+    def test_start_app_dispatches_task(self, mock_delay):
+        app = self._create_app_with_version()
+
+        response = self.client.post(self._url(app.short_id, "start/"))
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        mock_delay.assert_called_once_with(str(app.id), "start", team_id=app.team_id)
+
+    def test_start_app_no_version_400(self):
+        app = StreamlitApp.objects.create(team=self.team, name="No Version", created_by=self.user)
+        response = self.client.post(self._url(app.short_id, "start/"))
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "No active version" in response.json()["detail"]
+
+    @patch("products.streamlit_apps.backend.facade.api.AppRuntimeService")
+    def test_stop_app(self, mock_runtime_cls):
+        mock_runtime = MagicMock()
+        mock_runtime_cls.return_value = mock_runtime
+        app = self._create_app_with_version()
+
+        response = self.client.post(self._url(app.short_id, "stop/"))
+        assert response.status_code == status.HTTP_200_OK
+        mock_runtime.stop_app.assert_called_once_with(app)
+
+    @patch("products.streamlit_apps.backend.tasks.run_streamlit_app_lifecycle.delay")
+    def test_restart_app_dispatches_task(self, mock_delay):
+        app = self._create_app_with_version()
+
+        response = self.client.post(self._url(app.short_id, "restart/"))
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        mock_delay.assert_called_once_with(str(app.id), "restart", team_id=app.team_id)
+
+    @patch("products.streamlit_apps.backend.facade.api.AppRuntimeService")
+    def test_connect_info_returns_iframe_url_with_tokens(self, mock_runtime_cls):
+        mock_runtime = MagicMock()
+        mock_runtime.get_connect_url.return_value = {"url": "https://abc.modal.run", "token": "tok_123"}
+        mock_runtime_cls.return_value = mock_runtime
+
+        app = self._create_app_with_version()
+        StreamlitAppSandbox.objects.create(app=app, version=app.active_version, sandbox_id="sb_1", status="running")
+
+        response = self.client.get(self._url(app.short_id, "connect_info/"))
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert "iframe_url" in data
+        assert "expires_in" in data
+        assert "https://abc.modal.run" in data["iframe_url"]
+        assert "_posthog_token=" in data["iframe_url"]
+        assert "_modal_connect_token=tok_123" in data["iframe_url"]
+        # expires_in is the REAL remaining lifetime of the minted iframe token
+        # (max 3600s for a freshly minted token, strictly less once clock drifts).
+        # Allow a small tolerance because the token is minted and then the expires
+        # datetime is recomputed a few ms later in the view.
+        assert 3590 <= data["expires_in"] <= 3600
+
+    @patch("products.streamlit_apps.backend.facade.api.AppRuntimeService")
+    def test_connect_info_omits_modal_token_when_none(self, mock_runtime_cls):
+        # Docker sandboxes have no Modal connect token (token=None). The iframe
+        # URL must not embed the literal string "None" as a token.
+        mock_runtime = MagicMock()
+        mock_runtime.get_connect_url.return_value = {"url": "http://localhost:49153", "token": None}
+        mock_runtime_cls.return_value = mock_runtime
+
+        app = self._create_app_with_version()
+        StreamlitAppSandbox.objects.create(app=app, version=app.active_version, sandbox_id="sb_1", status="running")
+
+        response = self.client.get(self._url(app.short_id, "connect_info/"))
+        assert response.status_code == status.HTTP_200_OK
+        iframe_url = response.json()["iframe_url"]
+        assert "None" not in iframe_url
+        assert "_modal_connect_token=None" not in iframe_url
+        assert "_posthog_token=" in iframe_url
+
+    def test_connect_info_not_running_returns_503(self):
+        app = self._create_app_with_version()
+        response = self.client.get(self._url(app.short_id, "connect_info/"))
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @patch("products.streamlit_apps.backend.facade.api.AppRuntimeService")
+    def test_connect_info_updates_last_activity(self, mock_runtime_cls):
+        mock_runtime = MagicMock()
+        mock_runtime.get_connect_url.return_value = {"url": "https://x.modal.run", "token": "tok"}
+        mock_runtime_cls.return_value = mock_runtime
+
+        app = self._create_app_with_version()
+        sandbox_record = StreamlitAppSandbox.objects.create(
+            app=app, version=app.active_version, sandbox_id="sb_1", status="running"
+        )
+        assert sandbox_record.last_activity_at is None
+
+        self.client.get(self._url(app.short_id, "connect_info/"))
+        sandbox_record.refresh_from_db()
+        assert sandbox_record.last_activity_at is not None
+
+    @patch("products.streamlit_apps.backend.facade.api.AppRuntimeService")
+    def test_connect_info_debounces_last_activity_writes(self, mock_runtime_cls):
+        """connect_info is polled every ~2 seconds by the frontend token
+        refresher; writing last_activity_at on every call used to translate
+        to a per-sandbox row update every 2 seconds per active viewer. The
+        write is now debounced to once per _LAST_ACTIVITY_DEBOUNCE_SECONDS."""
+        from datetime import timedelta
+
+        mock_runtime = MagicMock()
+        mock_runtime.get_connect_url.return_value = {"url": "https://x.modal.run", "token": "tok"}
+        mock_runtime_cls.return_value = mock_runtime
+
+        app = self._create_app_with_version()
+        recent = timezone.now() - timedelta(seconds=5)
+        sandbox_record = StreamlitAppSandbox.objects.create(
+            app=app,
+            version=app.active_version,
+            sandbox_id="sb_1",
+            status="running",
+            last_activity_at=recent,
+        )
+
+        self.client.get(self._url(app.short_id, "connect_info/"))
+        sandbox_record.refresh_from_db()
+        # last_activity_at is still the old value — the second call was
+        # within the debounce window and skipped the UPDATE.
+        assert sandbox_record.last_activity_at == recent
+
+        # Rewind the last_activity_at past the debounce window and retry.
+        stale = timezone.now() - timedelta(seconds=120)
+        StreamlitAppSandbox.objects.filter(id=sandbox_record.id).update(last_activity_at=stale)
+        self.client.get(self._url(app.short_id, "connect_info/"))
+        sandbox_record.refresh_from_db()
+        assert sandbox_record.last_activity_at > stale
+
+    @patch("products.streamlit_apps.backend.facade.api.AppRuntimeService")
+    def test_connect_info_runtime_failure_returns_502(self, mock_runtime_cls):
+        mock_runtime = MagicMock()
+        mock_runtime.get_connect_url.return_value = None
+        mock_runtime_cls.return_value = mock_runtime
+
+        app = self._create_app_with_version()
+        StreamlitAppSandbox.objects.create(app=app, version=app.active_version, sandbox_id="sb_1", status="running")
+
+        response = self.client.get(self._url(app.short_id, "connect_info/"))
+        assert response.status_code == status.HTTP_502_BAD_GATEWAY
+
+    @patch("products.streamlit_apps.backend.facade.api.AppRuntimeService")
+    def test_connect_info_creates_oauth_token(self, mock_runtime_cls):
+        mock_runtime = MagicMock()
+        mock_runtime.get_connect_url.return_value = {"url": "https://abc.modal.run", "token": "tok"}
+        mock_runtime_cls.return_value = mock_runtime
+
+        app = self._create_app_with_version()
+        StreamlitAppSandbox.objects.create(app=app, version=app.active_version, sandbox_id="sb_1", status="running")
+
+        from posthog.models.oauth import OAuthAccessToken
+
+        initial_count = OAuthAccessToken.objects.filter(user=self.user).count()
+
+        self.client.get(self._url(app.short_id, "connect_info/"))
+
+        assert OAuthAccessToken.objects.filter(user=self.user).count() == initial_count + 1
+        token = OAuthAccessToken.objects.filter(user=self.user).order_by("-id").first()
+        assert token.scoped_teams == [self.team.id]
+        # Iframe-scoped — must NOT be a bridge token, so a stolen iframe URL
+        # can't be replayed against the streamlit bridge endpoint.
+        assert token.scope == "streamlit:iframe"
+
+    @patch("products.streamlit_apps.backend.facade.api.AppRuntimeService")
+    def test_connect_info_reuses_existing_token(self, mock_runtime_cls):
+        """A second connect_info call within the reuse window should reuse
+        the existing token rather than minting a fresh one — this is what
+        keeps the OAuth token table from growing on every iframe poll."""
+        mock_runtime = MagicMock()
+        mock_runtime.get_connect_url.return_value = {"url": "https://abc.modal.run", "token": "tok"}
+        mock_runtime_cls.return_value = mock_runtime
+
+        app = self._create_app_with_version()
+        StreamlitAppSandbox.objects.create(app=app, version=app.active_version, sandbox_id="sb_1", status="running")
+
+        from posthog.models.oauth import OAuthAccessToken
+
+        self.client.get(self._url(app.short_id, "connect_info/"))
+        first_count = OAuthAccessToken.objects.filter(user=self.user).count()
+
+        self.client.get(self._url(app.short_id, "connect_info/"))
+        second_count = OAuthAccessToken.objects.filter(user=self.user).count()
+
+        assert first_count == second_count, "expected token reuse, but a new token was minted"
+
+
+class TestCreateVersionFromSource(_StreamlitAppsFlagMixin, APIBaseTest):
+    def _url(self, short_id: str, suffix: str = "") -> str:
+        base = f"/api/projects/{self.team.id}/streamlit_apps/{short_id}"
+        return f"{base}/{suffix}" if suffix else f"{base}/"
+
+    def _create_app(self, **kwargs) -> StreamlitApp:
+        defaults = {"team": self.team, "name": "Source App", "created_by": self.user}
+        defaults.update(kwargs)
+        return StreamlitApp.objects.create(**defaults)
+
+    @patch("posthog.storage.object_storage.write")
+    def test_create_version_from_source(self, mock_storage_write):
+        app = self._create_app()
+        source = "import streamlit as st\nst.title('Hi')"
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={"source": source},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()["version_number"] == 1
+        mock_storage_write.assert_called_once()
+
+        # The stored object must be a valid zip with the source at app.py in the root.
+        stored_bytes = mock_storage_write.call_args[0][1]
+        with zipfile.ZipFile(io.BytesIO(stored_bytes)) as zf:
+            assert zf.read("app.py").decode() == source
+
+        app.refresh_from_db()
+        assert app.active_version_id == uuid.UUID(response.json()["id"])
+
+    @parameterized.expand([("missing", {}), ("blank", {"source": ""}), ("whitespace_only", {"source": "  \n  "})])
+    def test_create_version_from_source_rejects_empty_source(self, _name, payload):
+        app = self._create_app()
+        response = self.client.post(self._url(app.short_id, "create_version_from_source/"), data=payload, format="json")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthog.storage.object_storage.write")
+    def test_create_version_from_source_packs_files_and_assets(self, mock_storage_write):
+        app = self._create_app()
+        parquet_bytes = b"PAR1\x00\x01\x02\xff"
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={
+                "source": "import streamlit as st",
+                "files": {"utils.py": "def helper():\n    return 1\n", "data/empty.txt": ""},
+                "assets": {"data/events.parquet": base64.b64encode(parquet_bytes).decode()},
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+
+        stored_bytes = mock_storage_write.call_args[0][1]
+        with zipfile.ZipFile(io.BytesIO(stored_bytes)) as zf:
+            assert sorted(zf.namelist()) == ["app.py", "data/empty.txt", "data/events.parquet", "utils.py"]
+            assert zf.read("utils.py").decode() == "def helper():\n    return 1\n"
+            assert zf.read("data/events.parquet") == parquet_bytes
+
+    @patch("posthog.storage.object_storage.write")
+    @patch("products.streamlit_apps.backend.facade.api.MAX_ZIP_SIZE", 64)
+    def test_create_version_from_source_oversized_archive_413(self, mock_storage_write):
+        # The serializer's budget counts raw bytes, so an archive that only goes over once
+        # zip overhead is added reaches the facade and must not surface as a 500.
+        app = self._create_app()
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={"source": "import streamlit as st\n" * 20},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+        mock_storage_write.assert_not_called()
+
+
+class TestVersionSourceAPI(_StreamlitAppsFlagMixin, APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.storage: dict[str, bytes] = {}
+        for target, fake in (
+            ("write", lambda path, content: self.storage.__setitem__(path, content)),
+            ("read_bytes", lambda path, missing_ok=False: self.storage.get(path)),
+        ):
+            patcher = patch(f"posthog.storage.object_storage.{target}", side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.app = StreamlitApp.objects.create(team=self.team, name="Source App", created_by=self.user)
+
+    def _url(self, suffix: str, app: StreamlitApp | None = None) -> str:
+        return f"/api/projects/{self.team.id}/streamlit_apps/{(app or self.app).short_id}/{suffix}"
+
+    def _add_version(self, version_number: int, files: dict[str, str | bytes]) -> StreamlitAppVersion:
+        zip_path = f"test/{self.app.id}/v{version_number}.zip"
+        self.storage[zip_path] = _make_zip(files)
+        version = StreamlitAppVersion.objects.create(
+            app=self.app, version_number=version_number, zip_file=zip_path, zip_hash="abc", created_by=self.user
+        )
+        self.app.active_version = version
+        self.app.save()
+        return version
+
+    def _stored_files(self, version_number: int) -> dict[str, bytes]:
+        version = self.app.versions.get(version_number=version_number)
+        with zipfile.ZipFile(io.BytesIO(self.storage[version.zip_file])) as zf:
+            return {name: zf.read(name) for name in zf.namelist()}
+
+    def test_source_defaults_to_active_version_and_reads_older_versions(self):
+        self._add_version(1, {"app.py": "v1"})
+        self._add_version(2, {"app.py": "v2", "data/x.bin": b"\x00\xff"})
+
+        active = self.client.get(self._url("source/")).json()
+        older = self.client.get(self._url("source/"), {"version_number": 1}).json()
+
+        assert active["version_number"] == 2
+        assert {f["path"]: f["content"] for f in active["files"]} == {"app.py": "v2", "data/x.bin": None}
+        assert older["version_number"] == 1
+        assert [f["content"] for f in older["files"]] == ["v1"]
+
+    @parameterized.expand([("no_active_version", {}), ("unknown_version", {"version_number": 9})])
+    def test_source_missing_version_404(self, _name, query):
+        response = self.client.get(self._url("source/"), query)
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_source_of_other_team_app_404(self):
+        other_team = self.organization.teams.create(name="Other")
+        with team_scope(other_team.id):
+            other_app = StreamlitApp.objects.create(team=other_team, name="Other", created_by=self.user)
+        response = self.client.get(self._url("source/", other_app))
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_edit_source_creates_active_version_and_keeps_untouched_files(self):
+        self._add_version(
+            1, {"app.py": "st.title('Old')", "utils.py": "x = 1", "empty.py": "", "data/x.bin": b"\x00\xff"}
+        )
+
+        response = self.client.post(
+            self._url("edit_source/"),
+            data={
+                "base_version": 1,
+                "file_edits": [
+                    {"path": "app.py", "edits": [{"old": "Old", "new": "New"}]},
+                    {"path": "empty.py", "edits": [{"old": "", "new": "z = 3"}]},
+                ],
+                "create_files": {"helpers.py": "y = 2"},
+            },
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        assert response.json()["version_number"] == 2
+        self.app.refresh_from_db()
+        assert self.app.active_version is not None and self.app.active_version.version_number == 2
+        assert self._stored_files(2) == {
+            "app.py": b"st.title('New')",
+            "utils.py": b"x = 1",
+            "empty.py": b"z = 3",
+            "data/x.bin": b"\x00\xff",
+            "helpers.py": b"y = 2",
+        }
+
+    @parameterized.expand([("newer_version_shipped", 2, 1, 2), ("rolled_back_to_older_version", 1, 2, 1)])
+    def test_edit_source_with_stale_base_409(self, _name, active_version, base_version, expected_current):
+        v1 = self._add_version(1, {"app.py": "v1"})
+        v2 = self._add_version(2, {"app.py": "v2"})
+        self.app.active_version = v1 if active_version == 1 else v2
+        self.app.save()
+
+        response = self.client.post(
+            self._url("edit_source/"),
+            data={
+                "base_version": base_version,
+                "file_edits": [{"path": "app.py", "edits": [{"old": f"v{base_version}", "new": "v3"}]}],
+            },
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.json()["current_version"] == expected_current
+        assert self.app.versions.count() == 2
+
+    def test_edit_source_after_rollback_builds_on_the_active_version(self):
+        v1 = self._add_version(1, {"app.py": "st.title('One')"})
+        self._add_version(2, {"app.py": "st.title('Two')"})
+        self.app.active_version = v1
+        self.app.save()
+
+        response = self.client.post(
+            self._url("edit_source/"),
+            data={"base_version": 1, "file_edits": [{"path": "app.py", "edits": [{"old": "One", "new": "Three"}]}]},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        assert response.json()["version_number"] == 3
+        assert self._stored_files(3) == {"app.py": b"st.title('Three')"}
+
+    def test_edit_source_409_when_a_rollback_lands_during_the_edit(self):
+        v1 = self._add_version(1, {"app.py": "v1"})
+        self._add_version(2, {"app.py": "v2"})
+
+        def write_then_roll_back(path, content):
+            self.storage[path] = content
+            self.app.active_version = v1
+            self.app.save()
+
+        with (
+            patch("posthog.storage.object_storage.write", side_effect=write_then_roll_back),
+            patch("posthog.storage.object_storage.delete"),
+        ):
+            response = self.client.post(
+                self._url("edit_source/"),
+                data={"base_version": 2, "file_edits": [{"path": "app.py", "edits": [{"old": "v2", "new": "v3"}]}]},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.json()["current_version"] == 1
+        assert self.app.versions.count() == 2
+        self.app.refresh_from_db()
+        assert self.app.active_version_id == v1.id
+
+    def test_edit_source_that_loses_the_version_number_race_409(self):
+        self._add_version(1, {"app.py": "v1"})
+
+        with (
+            patch.object(StreamlitAppVersion.objects, "create", side_effect=IntegrityError),
+            patch("posthog.storage.object_storage.delete"),
+        ):
+            response = self.client.post(
+                self._url("edit_source/"),
+                data={"base_version": 1, "file_edits": [{"path": "app.py", "edits": [{"old": "v1", "new": "v2"}]}]},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.json() | {"detail": None} == {"detail": None, "current_version": 1}
+
+    @parameterized.expand(
+        [
+            ("failed_edit", {"app.py": "v1"}, "app.py", "nope", "app.py", 0),
+            ("invalid_result_zip", {"main.py": "x = 1"}, "main.py", "1", None, None),
+        ]
+    )
+    def test_edit_source_invalid_change_400(self, _name, base_files, path, old, error_path, error_index):
+        self._add_version(1, base_files)
+
+        response = self.client.post(
+            self._url("edit_source/"),
+            data={"base_version": 1, "file_edits": [{"path": path, "edits": [{"old": old, "new": "x"}]}]},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json() | {"detail": None} == {"detail": None, "path": error_path, "edit_index": error_index}
+        assert self.app.versions.count() == 1
+
+
+class TestEditVersionSourceInputSerializer(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("no_changes", {}),
+            ("empty_edits", {"file_edits": [{"path": "app.py", "edits": []}]}),
+            ("unsafe_create_path", {"create_files": {"../x.py": ""}}),
+            ("same_path_twice", {"create_files": {"x.py": ""}, "delete_files": ["x.py"]}),
+            ("too_many_deletes", {"delete_files": [f"f{i}.py" for i in range(MAX_FILE_COUNT + 1)]}),
+            (
+                "too_many_edits_across_files",
+                {
+                    "file_edits": [
+                        {"path": "app.py", "edits": [{"old": "a", "new": "b"}] * 60},
+                        {"path": "utils.py", "edits": [{"old": "a", "new": "b"}] * 41},
+                    ]
+                },
+            ),
+        ]
+    )
+    def test_rejects_invalid_input(self, _name, extra):
+        serializer = EditVersionSourceInputSerializer(data={"base_version": 1, **extra})
+        assert not serializer.is_valid()
+
+
+class TestCreateVersionFromSourceInputSerializer(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("traversal", {"files": {"../x.py": ""}}, "files"),
+            ("absolute", {"files": {"/etc/x": ""}}, "files"),
+            ("dot_segment", {"files": {"./x.py": ""}}, "files"),
+            ("trailing_slash", {"files": {"data/": ""}}, "files"),
+            ("backslash", {"files": {"data\\x.csv": ""}}, "files"),
+            ("root_app_file", {"files": {"app.py": "print(1)"}}, "files"),
+            ("asset_traversal", {"assets": {"../x.bin": "AAAA"}}, "assets"),
+            ("asset_not_base64", {"assets": {"x.bin": "not base64!"}}, "assets"),
+            ("same_path_in_both", {"files": {"x.txt": "a"}, "assets": {"x.txt": "AAAA"}}, "assets"),
+            ("nul_in_path", {"files": {"bad\x00.txt": "a"}}, "files"),
+            ("file_and_directory", {"files": {"data": "a"}, "assets": {"data/events.csv": "AAAA"}}, "non_field_errors"),
+            ("under_app_py", {"files": {"app.py/helper.py": "a"}}, "non_field_errors"),
+            ("too_many_entries", {"files": {f"f{i}.txt": "a" for i in range(500)}}, "non_field_errors"),
+            ("overlong_segment", {"files": {"data/" + "a" * 256: "a"}}, "files"),
+            ("overlong_path", {"files": {"/".join(["d"] * 600) + "/x.txt": "a"}}, "files"),
+        ]
+    )
+    def test_rejects_bad_attachments(self, _name, extra, error_field):
+        serializer = CreateVersionFromSourceInputSerializer(data={"source": "import streamlit as st", **extra})
+        assert not serializer.is_valid()
+        assert error_field in serializer.errors
+
+    @parameterized.expand([("fits", 40, True), ("over_budget", 48, False)])
+    def test_raw_size_budget_counts_decoded_assets(self, _name, asset_bytes, expected_valid):
+        asset = base64.b64encode(b"x" * asset_bytes).decode()
+        with patch("products.streamlit_apps.backend.presentation.serializers.MAX_ZIP_SIZE", 64):
+            serializer = CreateVersionFromSourceInputSerializer(
+                data={"source": "import streamlit as st", "assets": {"d.bin": asset}}
+            )
+            assert serializer.is_valid() is expected_valid, serializer.errors
+
+
+class TestStreamlitAppPersonalAPIKeyAccess(_StreamlitAppsFlagMixin, APIBaseTest):
+    """Custom actions are invisible to the default CRUD scope derivation; these
+    guard the explicit scope_object_*_actions lists that make PAK/MCP calls work,
+    and the query:read requirement on code-shipping/executing actions (the sandbox
+    bridge runs HogQL, so a streamlit_app-only key must not reach it)."""
+
+    def _make_key(self, label: str, scopes: list[str]) -> str:
+        from posthog.models.personal_api_key import PersonalAPIKey
+        from posthog.models.utils import generate_random_token_personal, hash_key_value
+
+        raw = generate_random_token_personal()
+        PersonalAPIKey.objects.create(label=label, user=self.user, secure_value=hash_key_value(raw), scopes=scopes)
+        return raw
+
+    def setUp(self):
+        super().setUp()
+        self._write_query_key = self._make_key("streamlit-write-query", ["streamlit_app:write", "query:read"])
+        self._write_only_key = self._make_key("streamlit-write-only", ["streamlit_app:write"])
+        self._read_key = self._make_key("streamlit-read", ["streamlit_app:read"])
+        self.client.logout()
+
+    def _url(self, short_id: str = "", suffix: str = "") -> str:
+        base = f"/api/projects/{self.team.id}/streamlit_apps"
+        if short_id:
+            base = f"{base}/{short_id}"
+        return f"{base}/{suffix}" if suffix else f"{base}/"
+
+    def _auth(self, key: str) -> dict:
+        return {"HTTP_AUTHORIZATION": f"Bearer {key}"}
+
+    @patch("posthog.storage.object_storage.write")
+    def test_set_source_allowed_with_write_and_query_scopes(self, _mock_storage_write):
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={"source": "import streamlit as st"},
+            format="json",
+            **self._auth(self._write_query_key),
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+
+    @parameterized.expand(["create_version_from_source", "edit_source", "activate_version", "start", "restart"])
+    def test_code_executing_actions_refused_without_query_read(self, action: str):
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.post(
+            self._url(app.short_id, f"{action}/"),
+            data={"source": "import streamlit as st"},
+            format="json",
+            **self._auth(self._write_only_key),
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert "query:read" in response.json()["detail"]
+
+    def test_set_source_refused_with_read_scope(self):
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={"source": "import streamlit as st"},
+            format="json",
+            **self._auth(self._read_key),
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_non_query_custom_action_allowed_with_write_only_scope(self):
+        """`stop` ships no code and runs none, so it stays streamlit-scoped only —
+        and unlike partial_update it is a custom action, so dropping it from
+        scope_object_write_actions would refuse every key with no other test noticing."""
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.post(
+            self._url(app.short_id, "stop/"),
+            format="json",
+            **self._auth(self._write_only_key),
+        )
+        assert response.status_code == status.HTTP_200_OK
+
+    @parameterized.expand([("versions/", status.HTTP_200_OK), ("source/", status.HTTP_404_NOT_FOUND)])
+    def test_custom_read_action_allowed_with_read_scope(self, suffix: str, expected_status: int):
+        # source/ answers 404 because the app has no version yet; a scope refusal would be 403.
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.get(self._url(app.short_id, suffix), **self._auth(self._read_key))
+        assert response.status_code == expected_status

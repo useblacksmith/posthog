@@ -1,0 +1,373 @@
+from typing import TYPE_CHECKING, Optional, cast
+
+from psycopg import OperationalError
+from sshtunnel import BaseSSHTunnelForwarderError
+
+from posthog.exceptions_capture import capture_exception
+from posthog.psycopg_helpers import HOST_RESOLUTION_TIMEOUT_ERROR, TEMPORARY_HOST_RESOLUTION_ERROR
+
+from products.data_warehouse.backend.facade.api import reconcile_redshift_schemas
+from products.warehouse_sources.backend.facade.codebase_detection import detect
+from products.warehouse_sources.backend.facade.source_config import (
+    DataWarehouseSourceCategory,
+    ReleaseStatus,
+    SourceConfig,
+    SourceFieldInputConfig,
+    SourceFieldInputConfigType,
+    SourceFieldSSHTunnelConfig,
+)
+from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.mixins import (
+    HOST_RESOLUTION_EXHAUSTED_MESSAGE,
+    HostNotAllowedError,
+    SSHTunnelMixin,
+    TemporaryHostResolutionError,
+    ValidateDatabaseHostMixin,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.base import SQLSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.tls import (
+    CERTIFICATE_ERRORS,
+    ca_certificate_field,
+    verify_server_certificate_field,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.redshift import (
+    RedshiftSourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.redshift.redshift import (
+    _TRANSIENT_CONNECTION_DROP_SUBSTRINGS,
+    REDSHIFT_READ_TIMEOUT_ERROR,
+    RedshiftImplementation,
+    get_connection_metadata as get_connection_metadata_redshift,
+)
+from products.warehouse_sources.backend.types import ExternalDataSourceType
+
+if TYPE_CHECKING:
+    from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+
+_REDSHIFT_IMPLEMENTATION = RedshiftImplementation()
+
+# sshtunnel raises BaseSSHTunnelForwarderError("Could not establish session to SSH gateway") when it
+# can't open a session to the bastion — the SSH host/port is wrong or unreachable, the bastion is
+# down, or its firewall blocks PostHog's IPs. The raw message tells the user nothing actionable, so
+# replace it with concrete guidance (the sibling SQL sources already do the same).
+_SSH_GATEWAY_SESSION_ERROR = "Could not establish session to SSH gateway"
+_SSH_GATEWAY_UNREACHABLE_MESSAGE = (
+    "Could not connect to your SSH tunnel. Check that the SSH host, port, and credentials are "
+    "correct, the bastion host is running and reachable, and that PostHog's IP addresses are "
+    "allowed through its firewall."
+)
+
+# Shared with the Postgres source, which speaks the same libpq wordings: a DNS failure and a
+# connection the network refused or dropped both used to end on a message with no next step.
+_DNS_RESOLUTION_VALIDATION_ERROR = (
+    "Could not resolve the database host. Check that the host is spelled correctly and reachable "
+    "from the public internet."
+)
+_HOST_UNREACHABLE_VALIDATION_ERROR = (
+    "Could not connect to the database on the host and port given. Check the host and port are "
+    "correct, and that PostHog's IP addresses are allowed through your firewall."
+)
+
+# psycopg raises `ConnectionTimeout` with this text when `connect_timeout` runs out before the
+# cluster answers. A paused, resizing or briefly overloaded cluster gives the same result as a
+# blocked network path, so a later attempt can succeed.
+_CONNECT_TIMEOUT_ERROR = "connection timeout expired"
+
+# `_TRANSIENT_CONNECTION_DROP_SUBSTRINGS` (redshift.py) already retries a connection drop in-process
+# during sync setup, but once `_stream_arrow_batches` has yielded a batch it can no longer safely
+# replay the query, so the same drop mid-stream propagates all the way up to this activity. Temporal
+# then retries the whole activity and the failure is transient and self-recovering, so classify it
+# here too — otherwise `_handle_import_error` logs it at `exception` on every occurrence, flooding
+# error tracking with a self-recovering network blip. Mirrors the equivalent Postgres source.
+_CONNECTION_DROPPED_EXHAUSTED_MESSAGE = (
+    "PostHog's connection to your Redshift cluster kept closing before the sync could finish, and "
+    "reconnecting didn't help. Check that the cluster is not paused, resizing, or dropping idle "
+    "connections (a firewall or load balancer in front of it can do this too). This sync is still "
+    "enabled and will run again on its next schedule."
+)
+
+RedshiftErrors = {
+    **CERTIFICATE_ERRORS,
+    "password authentication failed for user": "Invalid user or password",
+    "could not translate host name": _DNS_RESOLUTION_VALIDATION_ERROR,
+    "Is the server running on that host and accepting TCP/IP connections": _HOST_UNREACHABLE_VALIDATION_ERROR,
+    'database "': "Database does not exist",
+    "timeout expired": "Connection timed out. Check that your database is reachable from the public internet and that PostHog's egress IP addresses are allowed through your firewall (see the docs). For a database that can't be exposed publicly, use the SSH tunnel option.",
+    "SSL connection has been closed unexpectedly": "SSL connection error. Please check your SSL settings.",
+    "server does not support SSL": "The server does not support SSL, which we require for Redshift. Please check the host and port point to your Redshift cluster.",
+    "Connection refused": "Connection refused. Please check the host and port.",
+    # Through an SSH tunnel libpq connects to 127.0.0.1, so a bastion that can't reach the cluster
+    # shows up as the local forward closing the connection during the startup handshake.
+    "server closed the connection unexpectedly": (
+        "Redshift closed the connection before PostHog could sign in. Check the host and port, and if you "
+        "use an SSH tunnel, check that the bastion can reach the cluster."
+    ),
+}
+
+
+@SourceRegistry.register
+class RedshiftSource(SQLSource[RedshiftSourceConfig], SSHTunnelMixin, ValidateDatabaseHostMixin):
+    codebase_detection = detect(
+        env=("^REDSHIFT_",),
+        npm=("node-redshift", "@aws-sdk/client-redshift-data"),
+        pypi=("redshift-connector", "sqlalchemy-redshift"),
+        go=("github.com/aws/aws-sdk-go-v2/service/redshiftdata",),
+        maven=("com.amazon.redshift:redshift-jdbc42",),
+    )
+
+    def __init__(self, source_name: str = "Redshift"):
+        super().__init__()
+        self.source_name = source_name
+
+    @property
+    def get_implementation(self) -> RedshiftImplementation:
+        return _REDSHIFT_IMPLEMENTATION
+
+    @property
+    def source_type(self) -> ExternalDataSourceType:
+        return ExternalDataSourceType.REDSHIFT
+
+    @property
+    def credential_kind(self) -> str | None:
+        return "aws-redshift"
+
+    @property
+    def get_source_config(self) -> SourceConfig:
+        return SourceConfig(
+            name=ExternalDataSourceType.REDSHIFT,
+            category=DataWarehouseSourceCategory.DATABASES,
+            keywords=["aws redshift", "amazon redshift", "sql"],
+            caption="Enter your Redshift credentials to automatically pull your Redshift data into the PostHog Data warehouse",
+            iconPath="/static/services/redshift.png",
+            docsUrl="https://posthog.com/docs/cdp/sources/redshift",
+            releaseStatus=ReleaseStatus.GA,
+            fields=cast(
+                list[FieldType],
+                [
+                    SourceFieldInputConfig(
+                        name="connection_string",
+                        label="Connection string (optional)",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=False,
+                        placeholder="redshift://user:password@my-cluster.abc123xyz.us-east-1.redshift.amazonaws.com:5439/dev",
+                        secret=True,
+                    ),
+                    SourceFieldInputConfig(
+                        name="host",
+                        label="Host",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=True,
+                        placeholder="my-cluster.abc123xyz.us-east-1.redshift.amazonaws.com",
+                        caption=(
+                            "Must be reachable from the public internet. Add PostHog's egress IP addresses to your "
+                            "firewall allowlist (see the docs above) and use a public host. `localhost` and private "
+                            "IPs (10.x, 172.16-31.x, 192.168.x) can't be reached. For a database that can't be "
+                            "exposed publicly, enable the SSH tunnel below."
+                        ),
+                        secret=False,
+                    ),
+                    SourceFieldInputConfig(
+                        name="port",
+                        label="Port",
+                        type=SourceFieldInputConfigType.NUMBER,
+                        required=True,
+                        placeholder="5439",
+                        secret=False,
+                    ),
+                    SourceFieldInputConfig(
+                        name="database",
+                        label="Database",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=True,
+                        placeholder="dev",
+                        secret=False,
+                    ),
+                    SourceFieldInputConfig(
+                        name="user",
+                        label="User",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=True,
+                        placeholder="awsuser",
+                        secret=False,
+                    ),
+                    SourceFieldInputConfig(
+                        name="password",
+                        label="Password",
+                        type=SourceFieldInputConfigType.PASSWORD,
+                        required=True,
+                        placeholder="",
+                        secret=True,
+                    ),
+                    SourceFieldInputConfig(
+                        name="schema",
+                        sync_setting=True,
+                        label="Schema",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=False,
+                        placeholder="Leave blank to import all schemas",
+                        secret=False,
+                    ),
+                    verify_server_certificate_field(),
+                    ca_certificate_field(),
+                    SourceFieldSSHTunnelConfig(name="ssh_tunnel", label="Use SSH tunnel?"),
+                ],
+            ),
+        )
+
+    def get_retryable_errors(self) -> set[str]:
+        # The bounded lookup in front of every connect raises these when the resolver stalls or
+        # answers "try again". Neither is a verdict on the host, so a fresh attempt recovers.
+        #
+        # `REDSHIFT_READ_TIMEOUT_ERROR` is the client-side limit on the wait for one batch of rows.
+        # The cluster was reachable and then sent nothing, so a later attempt can succeed.
+        return {
+            HOST_RESOLUTION_TIMEOUT_ERROR,
+            TEMPORARY_HOST_RESOLUTION_ERROR,
+            REDSHIFT_READ_TIMEOUT_ERROR,
+            _CONNECT_TIMEOUT_ERROR,
+            *_TRANSIENT_CONNECTION_DROP_SUBSTRINGS,
+        }
+
+    def get_retry_exhausted_errors(self) -> dict[str, str]:
+        return {
+            HOST_RESOLUTION_TIMEOUT_ERROR: HOST_RESOLUTION_EXHAUSTED_MESSAGE,
+            TEMPORARY_HOST_RESOLUTION_ERROR: HOST_RESOLUTION_EXHAUSTED_MESSAGE,
+            REDSHIFT_READ_TIMEOUT_ERROR: (
+                "Your Redshift cluster stopped sending rows in the middle of the sync, and it did so again "
+                "on every retry. Check that the cluster is not paused or resizing and that it has capacity "
+                "for the read. This sync is still enabled and will run again on its next schedule."
+            ),
+            _CONNECT_TIMEOUT_ERROR: (
+                "PostHog couldn't connect to your Redshift cluster before the connection timed out, and it "
+                "did so again on every retry. Check that the cluster is running and not paused, and that "
+                "PostHog's IP addresses are allowed through its security group. If you connect through an "
+                "SSH tunnel, check that the bastion host can reach the cluster. This sync is still enabled "
+                "and will run again on its next schedule."
+            ),
+            **dict.fromkeys(_TRANSIENT_CONNECTION_DROP_SUBSTRINGS, _CONNECTION_DROPPED_EXHAUSTED_MESSAGE),
+        }
+
+    def get_non_retryable_errors(self) -> dict[str, str | None]:
+        return {
+            **self.default_non_retryable_errors(),
+            **CERTIFICATE_ERRORS,
+            "NoSuchTableError": None,
+            "is not permitted to log in": None,
+            "could not translate host name": None,
+            "timeout expired connection to server at": None,
+            "password authentication failed for user": None,
+            "No primary key defined for table": (
+                "This table needs a primary key to sync incrementally, but none is set. Choose a primary "
+                "key for the table in its sync settings, or switch it to full table replication, then "
+                "re-enable the sync."
+            ),
+            "failed: timeout expired": None,
+            "SSL connection has been closed unexpectedly": None,
+            "server does not support SSL": None,
+            "does not exist": None,
+            "QueryTimeoutException": None,
+            # `QueryTimeoutException` above only matches once Temporal's `ApplicationError` wraps
+            # the failure with the class name (workflow layer) — the activity-level check matches
+            # `str(e)` on the raw exception, which is just the message with no class name. Match
+            # the stable prefix too (not the incremental field name, which varies per table) so a
+            # table missing the SORTKEY stops retrying at the activity layer instead of burning a
+            # full retry budget on a 10-minute query that will time out identically every time.
+            "10 min timeout statement reached": None,
+            "TemporaryFileSizeExceedsLimitException": None,
+            "Name or service not known": None,
+            "Network is unreachable": None,
+            # `InsufficientPrivilege` is the psycopg exception class name. It only appears once
+            # Temporal wraps the activity failure (`ApplicationError` stringifies as
+            # "InsufficientPrivilege: ..."), so it matches at the workflow layer but NOT in the
+            # activity-level check, where `error_msg = str(e)` is the raw psycopg message —
+            # Redshift's SQLSTATE 42501 text "permission denied for ...". Match that message
+            # substring too so the role-lacks-SELECT case (including a materialized view whose
+            # base relation isn't separately granted) is caught at both layers instead of burning
+            # the activity's full retry budget on a denial that can't resolve itself.
+            "InsufficientPrivilege": None,
+            "permission denied for": (
+                "PostHog's database role isn't allowed to read one or more of the tables you selected to sync "
+                '(Redshift reported "permission denied"). If this is a materialized view, Redshift also '
+                "requires the connecting role to have SELECT on its underlying base table(s), not just the "
+                "view. Grant the connecting role SELECT on those tables, then re-enable the sync."
+            ),
+            "No route to host": None,
+            "password authentication failed connection": None,
+            "Connection refused": None,
+        }
+
+    def validate_credentials(
+        self,
+        config: RedshiftSourceConfig,
+        team_id: int,
+        schema_name: Optional[str] = None,
+        api_version: str | None = None,
+    ) -> tuple[bool, str | None]:
+        is_ssh_valid, ssh_valid_errors = self.ssh_tunnel_is_valid(config, team_id)
+        if not is_ssh_valid:
+            return is_ssh_valid, ssh_valid_errors
+
+        valid_host, host_errors = self.is_database_host_valid(
+            config.host, team_id, using_ssh_tunnel=config.ssh_tunnel.enabled if config.ssh_tunnel else False
+        )
+        if not valid_host:
+            return valid_host, host_errors
+
+        try:
+            self.get_schemas(config, team_id, api_version=api_version)
+        except (HostNotAllowedError, TemporaryHostResolutionError) as e:
+            # The host policy refused the host, or its lookup never answered. Both carry their own
+            # user-facing wording and neither is a PostHog defect, so they are not captured.
+            return False, str(e)
+        except OperationalError as e:
+            error_msg = " ".join(str(n) for n in e.args)
+            for key, value in RedshiftErrors.items():
+                if key in error_msg:
+                    return False, value
+
+            capture_exception(e)
+            return False, f"Could not connect to {self.source_name}. Please check all connection details are valid."
+        except BaseSSHTunnelForwarderError as e:
+            raw = e.value or ""
+            if _SSH_GATEWAY_SESSION_ERROR in raw:
+                return False, _SSH_GATEWAY_UNREACHABLE_MESSAGE
+            return (
+                False,
+                raw
+                or f"Could not connect to {self.source_name} via the SSH tunnel. Please check all connection details are valid.",
+            )
+        except Exception as e:
+            capture_exception(e)
+            return False, f"Could not connect to {self.source_name}. Please check all connection details are valid."
+
+        return True, None
+
+    def source_for_pipeline(self, config: RedshiftSourceConfig, inputs: SourceInputs) -> SourceResponse:
+        # Resolve `chunk_size_override` (stored on
+        # `ExternalDataSchema.sync_type_config`) here so the driver
+        # implementation in `redshift.py` stays free of Django ORM
+        # imports.
+        schema_row = ExternalDataSchema.objects.get(id=inputs.schema_id)
+        return self.get_implementation.build_pipeline(
+            config, inputs, chunk_size_override=schema_row.chunk_size_override
+        )
+
+    def reconcile_schema_metadata(
+        self,
+        source: "ExternalDataSource",
+        source_schemas: list[SourceSchema],
+        team_id: int,
+    ) -> list[str]:
+        """Delegates to `reconcile_redshift_schemas` so direct-query mode also rebuilds DWH tables."""
+        return reconcile_redshift_schemas(source=source, source_schemas=source_schemas, team_id=team_id)
+
+    def get_connection_metadata(
+        self, config: RedshiftSourceConfig, team_id: int, require_ssl: bool = False
+    ) -> dict[str, str | None]:
+        # `require_ssl` keeps signature parity with Postgres/MySQL; the metadata is static
+        # (the engine follows from the source type), so no live connection is needed.
+        return get_connection_metadata_redshift(config)

@@ -1,0 +1,231 @@
+import type { CanonicalProvider } from './providers/canonical-providers'
+import type { ModelCost, ModelCostByProvider, ResolvedModelCost } from './providers/types'
+
+/**
+ * Provider aliases allow incoming provider names to map to canonical provider keys
+ * used in the cost model.
+ *
+ * Format: { "alias": "canonical-provider-key" }
+ *
+ * When a provider name comes in, we check if it matches any alias and resolve it
+ * to the canonical key before attempting to find costs.
+ *
+ * TypeScript enforces that all values are valid CanonicalProvider types.
+ */
+export const PROVIDER_ALIASES: Record<string, CanonicalProvider> = {
+    // Anthropic / Claude
+    claude: 'anthropic',
+    'anthropic-claude': 'anthropic',
+
+    // OpenAI
+    oai: 'openai',
+    'openai-api': 'openai',
+    'open-ai': 'openai',
+
+    // Google / Gemini
+    google: 'google-ai-studio',
+    gemini: 'google-ai-studio',
+    'google-gemini': 'google-ai-studio',
+    'google-ai': 'google-ai-studio',
+    vertex: 'google-vertex',
+    'vertex-ai': 'google-vertex',
+    'vertex-us': 'google-vertex-us',
+    'vertex-europe': 'google-vertex-europe',
+    'vertex-global': 'google-vertex-global',
+
+    // Amazon
+    amazon: 'amazon-bedrock',
+    bedrock: 'amazon-bedrock',
+    aws: 'amazon-bedrock',
+    'aws-bedrock': 'amazon-bedrock',
+
+    // Azure
+    'azure-openai': 'azure',
+    'azure-ai': 'azure',
+
+    // Cohere
+    'cohere-ai': 'cohere',
+
+    // Mistral
+    mistralai: 'mistral',
+    'mistral-ai': 'mistral',
+
+    // xAI / Grok
+    grok: 'xai',
+    'x-ai': 'xai',
+    'grok-fast': 'xai',
+    'xai-turbo': 'xai',
+
+    // DeepSeek
+    'deep-seek': 'deepseek',
+
+    // Fireworks
+    'fireworks-ai': 'fireworks',
+
+    // Groq
+    'groq-cloud': 'groq',
+
+    // Perplexity
+    'perplexity-ai': 'perplexity',
+    pplx: 'perplexity',
+
+    // Cloudflare
+    'cloudflare-workers': 'cloudflare',
+    'cf-workers': 'cloudflare',
+
+    // OpenRouter (maps to default pricing)
+    openrouter: 'default',
+    or: 'default',
+}
+
+/**
+ * Normalizes a provider key by lowercasing and replacing non-alphanumeric characters
+ * with hyphens.
+ */
+export const normalizeProviderKey = (provider: string): string =>
+    provider
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+
+/**
+ * Resolves a provider name to a canonical provider key using the alias map.
+ *
+ * @param provider - The provider name from the event
+ * @returns The canonical provider key, or the normalized provider name if no alias exists
+ */
+export const resolveProviderAliases = (provider: string): string => {
+    const normalizedProvider = normalizeProviderKey(provider)
+
+    return PROVIDER_ALIASES[normalizedProvider] ?? normalizedProvider
+}
+
+/**
+ * Attempts to find a matching provider in the cost model.
+ *
+ * First checks for exact matches using alias resolution, then falls back to
+ * partial matching, and finally to the default provider.
+ *
+ * @param providerCosts - The cost model with provider-specific pricing
+ * @param provider - The provider name from the event (optional)
+ * @param model - The model name for the resolved cost
+ * @returns The resolved model cost, or undefined if no valid cost is found
+ */
+// Tier-key suffixes per served service tier, in probe order. Naming is per-provider:
+// google-ai-studio-priority and xai-priority are literal, while openai-fast and
+// anthropic-fast are those providers' names for their priority tier.
+const SERVICE_TIER_KEY_SUFFIXES: Record<string, string[]> = {
+    flex: ['-flex'],
+    priority: ['-priority', '-fast'],
+}
+
+export const resolveModelCostForProvider = (
+    providerCosts: ModelCostByProvider,
+    provider: string | undefined,
+    model: string,
+    serviceTier?: unknown
+): ResolvedModelCost | undefined => {
+    if (!providerCosts || Object.keys(providerCosts).length === 0) {
+        return undefined
+    }
+
+    // A served tier resolves by its own provider key, as direct checks: the cascade below
+    // falls back to the `default` key, which can carry promotional pricing.
+    // Object.hasOwn: the tier is customer-controlled, and "__proto__"/"constructor" would
+    // otherwise return inherited non-array values that throw below.
+    const tierSuffixes =
+        typeof serviceTier === 'string' && Object.hasOwn(SERVICE_TIER_KEY_SUFFIXES, serviceTier)
+            ? SERVICE_TIER_KEY_SUFFIXES[serviceTier]
+            : undefined
+    if (provider && tierSuffixes) {
+        const canonical = resolveProviderAliases(provider)
+        for (const suffix of tierSuffixes) {
+            const tierCost = providerCosts[canonical + suffix]
+            if (tierCost) {
+                return { model, provider: canonical + suffix, cost: tierCost }
+            }
+        }
+    }
+
+    const findProviderMatch = (providerKey: string): ResolvedModelCost | undefined => {
+        const cost: ModelCost | undefined = providerCosts[providerKey]
+
+        if (!cost) {
+            return undefined
+        }
+
+        return {
+            model,
+            provider: providerKey,
+            cost,
+        }
+    }
+
+    if (provider) {
+        // Try alias resolution first
+        const canonicalKey: string = resolveProviderAliases(provider)
+        const match: ResolvedModelCost | undefined = findProviderMatch(canonicalKey)
+
+        if (match) {
+            return match
+        }
+
+        // Try provider variations
+        const normalizedProvider: string = normalizeProviderKey(provider)
+
+        const providerCandidates: string[] = [normalizedProvider, provider.toLowerCase(), provider]
+
+        for (const candidate of providerCandidates) {
+            const candidateMatch: ResolvedModelCost | undefined = findProviderMatch(candidate)
+
+            if (candidateMatch) {
+                return candidateMatch
+            }
+        }
+
+        // Search against the canonical key too so regional-only cost records
+        // (e.g. `google-ai-studio-global`) still match when the event uses an alias like `gemini`.
+        const partialMatchSearches: string[] =
+            canonicalKey === normalizedProvider ? [normalizedProvider] : [canonicalKey, normalizedProvider]
+
+        for (const search of partialMatchSearches) {
+            const partialMatchKey: string | undefined = Object.keys(providerCosts).find((key: string) =>
+                key.includes(search)
+            )
+
+            if (partialMatchKey) {
+                const partialMatch: ResolvedModelCost | undefined = findProviderMatch(partialMatchKey)
+
+                if (partialMatch) {
+                    return partialMatch
+                }
+            }
+        }
+    }
+
+    // Fall back to default provider
+    const defaultMatch: ResolvedModelCost | undefined = findProviderMatch('default')
+
+    if (defaultMatch) {
+        return defaultMatch
+    }
+
+    // Fall back to first available cost
+    const firstEntry = Object.entries(providerCosts).find(([, value]) => value !== undefined)
+
+    if (!firstEntry) {
+        return undefined
+    }
+
+    const [firstProvider, firstCost] = firstEntry
+
+    if (!firstCost) {
+        return undefined
+    }
+
+    return {
+        model,
+        provider: firstProvider,
+        cost: firstCost,
+    }
+}

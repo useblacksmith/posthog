@@ -1,0 +1,222 @@
+# Annotations are lazy (PEP 563) so the dlt import below can stay type-only — dlt is heavy and this
+# module is reachable from warehouse_sources models at django.setup().
+from __future__ import annotations
+
+import datetime
+import dataclasses
+from collections.abc import AsyncIterable, Callable, Iterable
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Optional, Protocol, TypeVar
+
+from structlog.types import FilteringBoundLogger
+
+from posthog.dataclasses import frozen
+
+from products.warehouse_sources.backend.types import ExternalDataSchemaSyncType, IncrementalFieldType
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+    from dlt.common.data_types.typing import TDataType
+
+    from products.warehouse_sources.backend.temporal.data_imports.sources.common.cursor import SourceCursorManager
+    from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.predicates import (
+        ValidatedRowFilter,
+    )
+else:
+    # Runtime stubs so get_type_hints() on the dataclasses below resolves without importing dlt or the
+    # predicates module. Deliberately not `str` — nothing should rely on the runtime value, and a named
+    # stub makes accidental use obvious rather than silently passing as a plausible type. The real,
+    # mypy-visible types come from the TYPE_CHECKING branch.
+    class TDataType:
+        def __repr__(self) -> str:
+            return "<TDataType: type-checking-only stub for dlt.common.data_types.typing.TDataType>"
+
+    class ValidatedRowFilter:
+        def __repr__(self) -> str:
+            return "<ValidatedRowFilter: type-checking-only stub>"
+
+    class SourceCursorManager:
+        def __class_getitem__(cls, item: Any) -> type:
+            return cls
+
+        def __repr__(self) -> str:
+            return "<SourceCursorManager: type-checking-only stub>"
+
+
+SortMode = Literal["asc", "desc"]
+PartitionMode = Literal["md5", "numerical", "datetime"]
+PartitionFormat = Literal["month", "week", "day", "hour"]
+
+
+class _Dataclass(Protocol):
+    __dataclass_fields__: ClassVar[dict[str, Any]]
+
+
+ResumableData = TypeVar("ResumableData", bound=_Dataclass)
+
+
+@dataclasses.dataclass(frozen=False)
+class OutputLane:
+    """One table a response's item stream feeds.
+
+    A source whose single stream lands in more than one table — a change stream feeding both a
+    merged table and its append-only history — declares one lane per table. The pipeline writes
+    every lane from the same read, so the source reads its origin once however many tables it
+    keeps.
+    """
+
+    name: str
+    cdc_write_mode: Optional[str] = None
+    billable: bool = True
+    """Whether this lane's rows count towards the team's synced-row usage. A source feeding two
+    tables from one stream bills the stream once."""
+    transform: Optional[Callable[[pa.Table], pa.Table]] = None
+    """Applied to each batch before this lane writes it. May drop rows and add columns; the lane's
+    own writer tracks the schema it ends up with."""
+
+
+@frozen
+class ReplaceScope:
+    """The destination rows that one incremental run replaces, named by the value of one column.
+
+    The source names each row's origin (for example the file it came from) in `column`. Before the
+    run's first batch loads, the loader deletes every row whose value is in `replaced` or is not in
+    `retained`. The run's batches then load as appends. So a run replaces the rows of each origin it
+    reads again, and removes the rows of each origin that is gone. A row with no value in `column`
+    is outside the scope and stays.
+    """
+
+    column: str
+    replaced: frozenset[str]
+    """The origins this run reads again: changed or new. Their old rows go before the new rows load."""
+    retained: frozenset[str]
+    """Every origin that is live now. The rows of any other origin go."""
+
+
+@dataclasses.dataclass(frozen=False)  # callers mutate `primary_keys` after construction
+class SourceResponse:
+    name: str
+    items: Callable[[], Iterable[Any] | AsyncIterable[Any]]
+    primary_keys: list[str] | None
+    column_hints: dict[str, TDataType | None] | None = None  # Legacy support for DLT sources
+    partition_count: Optional[int] = None
+    partition_size: Optional[int] = None
+    partition_keys: Optional[list[str]] = None
+    """Override partition keys at a source level"""
+    partition_mode: Optional[PartitionMode] = None
+    """Override partition mode at a source level"""
+    partition_format: Optional[PartitionFormat] = None
+    """Override partition format at a source level"""
+    sort_mode: Optional[SortMode] = None
+    """The order in which the rows of an incremental or append read arrive.
+
+    - `"asc"`: ascending order of the incremental field, from the first row of the run to the last.
+    - `"desc"`: descending order of the incremental field.
+    - `None`: no order.
+
+    The watermark is the largest value the run read, with or without an order. `"asc"` is a promise
+    the pipeline acts on: after a worker shutdown, the next attempt reads only the rows after the
+    last value the pipeline queued, so a later row with a lower value is lost. Set it per run, and
+    only on a read whose query or API contract proves the order. A full refresh has no incremental
+    field, so the value has no effect there."""
+    rows_to_sync: Optional[int] = None
+    has_duplicate_primary_keys: Optional[bool] = None
+    """Whether incremental tables have non-unique primary keys"""
+    verified_primary_keys: Optional[list[str]] = None
+    """The key this run proved unique across the whole table, persisted so later runs only have to
+    prove the rows they bring in."""
+    webhook_only: bool = False
+    """Webhook-fed resource whose poll path does no backfill: after a wipe the poll cannot
+    rebuild the table, so a requested pipeline reset preserves the Delta table and resumes
+    webhook ingestion instead."""
+    cdc_write_mode: Optional[str] = None
+    """Set by a source serving change events, naming the lane the loader writes
+    (`incremental_merge`). Drives the loader's CDC enrichment and position resolution, and marks the
+    run incremental — a change stream must never write as a full_refresh overwrite."""
+    chunk_size: Optional[int] = None
+    """Override the batcher's rows-per-chunk (defaults to DEFAULT_CHUNK_SIZE)."""
+    chunk_size_bytes: Optional[int] = None
+    """Override the batcher's per-chunk byte cap (defaults to DEFAULT_CHUNK_SIZE_BYTES). Lower it for
+    sources whose rows are large (e.g. whole documents) so the source->Arrow conversion doesn't
+    materialise an oversized table and OOM the worker."""
+    supports_resume: bool = True
+    """Whether *this run* can cheaply resume after a bail (source checkpoints, or an ascending
+    incremental watermark). Gated by the pipeline together with a non-None resumable-source manager,
+    so a resumable-source class whose current table isn't actually resumable (e.g. a SQL full load
+    with no orderable primary key) sets this False and is treated as non-resumable for shutdown."""
+    on_complete: Optional[Callable[[], None]] = None
+    """Called after every yielded row has been durably written or staged. Sources use this to remove
+    a final checkpoint without opening a crash window before the pipeline flushes its last batch."""
+    destination_reset_required: bool = False
+    """Whether source metadata discovered during setup requires rebuilding the destination table."""
+    reset_handed_over: bool = False
+    """Whether the source passed this run's reset to another process, so this run must not delete the
+    destination table. Wins over `destination_reset_required` and the reset the run was asked for."""
+    lanes: Optional[list[OutputLane]] = None
+    """Tables this response's items feed, when it feeds more than the one `name` alone describes.
+    None means the single lane built from `name` and `cdc_write_mode`."""
+    replace_scope: Optional[ReplaceScope] = None
+    """Set by an incremental source that replaces rows by origin instead of merging on a primary key
+    (see `ReplaceScope`). The run loads as appends and needs no primary key. A first sync or a reset
+    ignores it, because the table starts empty."""
+    preserve_column_names: bool = False
+    """Write the column names as the source yields them instead of normalizing them to snake_case.
+    Set for a table whose existing queries name its columns as they were before the import."""
+
+
+# Not frozen: nothing mutates it in place today, so freezing it is plausible, but every source
+# reads it and that migration is its own change to make and verify.
+@dataclasses.dataclass(frozen=False)
+class SourceInputs:
+    """Contextual info required by a source to actually run"""
+
+    schema_name: str
+    schema_id: str
+    source_id: str
+    team_id: int
+    should_use_incremental_field: bool
+    db_incremental_field_last_value: Optional[Any]
+    db_incremental_field_earliest_value: Optional[Any]
+    incremental_field: Optional[str]
+    incremental_field_type: Optional[IncrementalFieldType]
+    job_id: str
+    logger: FilteringBoundLogger
+    reset_pipeline: bool
+    # `db_incremental_field_last_value` as stored, before the lookback shifted it back. Rows at or
+    # before it are overlap the table already holds rather than new ground.
+    db_incremental_field_last_value_before_lookback: Optional[Any] = None
+    # Resolved from the schema for a source that declares a `history_lookback`; `None` means
+    # unbounded. See `sources/common/history_window.py`.
+    history_start: Optional[datetime.datetime] = None
+    # Start of the previous successful sync (the job's created_at), so a safe lower bound for "seen".
+    last_synced_at: Optional[datetime.datetime] = None
+    # Sync history survives cursor resets and table deletion.
+    schema_has_ever_synced: bool = False
+    enabled_columns: Optional[list[str]] = None
+    row_filters: Optional[list[ValidatedRowFilter]] = None
+    # The schema's stored primary key and the key a full probe last proved unique. A source that
+    # merges on an unenforced key needs both: the first is the key it will merge on, the second
+    # says whether that key still has to be proven against the whole table.
+    primary_keys: Optional[list[str]] = None
+    verified_primary_keys: Optional[list[str]] = None
+    # Multi-schema import context, read by `resolve_source_location`.
+    schema_metadata: Optional[dict[str, Any]] = None
+    s3_folder_name: Optional[str] = None
+    # Effective vendor API version: the source instance's pin resolved through the source's
+    # `default_version`. Sources with a versioned vendor API thread it to their request layer.
+    api_version: Optional[str] = None
+    # True when this schema is a fan-out child whose parents are all readable from the
+    # warehouse. Evaluated once by the run-time gate in `import_data_activity_sync`.
+    fanout_warehouse_reuse: bool = False
+    # Temporal's attempt number for this activity, starting at 1. A source can read a retry
+    # differently from a first run, because the first run has already shown what fails.
+    activity_attempt: int = 1
+    # Times a worker died on this run without raising, which is what a page too large for its
+    # memory looks like. A source that pages can read smaller pages after one.
+    worker_deaths: int = 0
+    # Set for a source that implements `CursorSource`. It holds the cursor stored by the last
+    # successful run, or no cursor when this run rebuilds the table.
+    source_cursor: Optional[SourceCursorManager[Any]] = None
+    sync_type: ExternalDataSchemaSyncType | None = None
+    # Set when a webhook-synced schema keeps a history table. Its webhook read then yields every event,
+    # with the event columns, where the source declares `WebhookSource.webhook_events`.
+    webhook_history: bool = False

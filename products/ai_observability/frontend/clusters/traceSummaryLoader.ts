@@ -1,0 +1,214 @@
+import api from 'lib/api'
+import { hogql } from 'lib/utils/hogql'
+
+import { ClusteringLevel, TraceSummary } from './types'
+
+/**
+ * Load summaries for a list of item IDs (traces or generations) — or, for
+ * evaluation-level clusters, load the underlying $ai_evaluation events and
+ * adapt them into the same TraceSummary shape the UI renders.
+ *
+ * Filters out IDs that already exist in existingSummaries to avoid redundant fetches.
+ */
+export async function loadTraceSummaries(
+    itemIds: string[],
+    existingSummaries: Record<string, TraceSummary>,
+    windowStart: string,
+    windowEnd: string,
+    level: ClusteringLevel,
+    detectorEvaluationIds: string[]
+): Promise<Record<string, TraceSummary>> {
+    const missingItemIds = itemIds.filter((id) => !existingSummaries[id])
+
+    if (missingItemIds.length === 0) {
+        return {}
+    }
+
+    if (level === 'evaluation') {
+        return loadEvaluationSummaries(missingItemIds, windowStart, windowEnd, detectorEvaluationIds)
+    }
+
+    const eventName = level === 'generation' ? '$ai_generation_summary' : '$ai_trace_summary'
+    const idExpression = level === 'generation' ? 'properties.$ai_generation_id' : 'properties.$ai_trace_id'
+
+    const response = await api.queryHogQL(
+        hogql`
+            SELECT
+                ${hogql.raw(idExpression)} as item_id,
+                argMax(properties.$ai_summary_title, timestamp) as title,
+                argMax(properties.$ai_summary_flow_diagram, timestamp) as flow_diagram,
+                argMax(properties.$ai_summary_bullets, timestamp) as bullets,
+                argMax(properties.$ai_summary_interesting_notes, timestamp) as interesting_notes,
+                max(timestamp) as latest_timestamp,
+                argMax(properties.$ai_trace_id, timestamp) as trace_id
+            FROM events
+            WHERE event = ${eventName}
+                AND timestamp >= parseDateTimeBestEffort(${windowStart})
+                AND timestamp <= parseDateTimeBestEffort(${windowEnd})
+                AND ${hogql.raw(idExpression)} IN ${missingItemIds}
+            GROUP BY item_id
+            LIMIT ${missingItemIds.length}
+        `,
+        { productKey: 'llm_analytics', scene: 'AIObservabilityClusters' },
+        // Window bounds are in UTC (from backend), so compare timestamps in UTC
+        { queryParams: { modifiers: { convertToProjectTimezone: false } } }
+    )
+
+    const summaries: Record<string, TraceSummary> = {}
+    for (const row of response.results || []) {
+        const r = row as string[]
+        const itemId = r[0]
+        const traceId = r[6] || itemId // Fall back to item_id for trace-level
+
+        summaries[itemId] = {
+            traceId: traceId,
+            generationId: level === 'generation' ? itemId : undefined,
+            title: r[1] || (level === 'generation' ? 'Untitled Generation' : 'Untitled Trace'),
+            flowDiagram: r[2] || '',
+            bullets: r[3] || '',
+            interestingNotes: r[4] || '',
+            timestamp: r[5],
+        }
+    }
+
+    return summaries
+}
+
+/**
+ * Eval cluster members don't have $ai_*_summary events — the cluster item ids
+ * are the $ai_evaluation event UUIDs themselves. Fetch those rows directly and
+ * render them into the TraceSummary shape so `ClusterTraceList` can reuse the
+ * same rendering pipeline: title = "{evaluator_name}: {verdict}", reasoning
+ * goes in the expandable bullets slot, generationId points at the linked
+ * generation so the "View generation" link works.
+ */
+async function loadEvaluationSummaries(
+    evalIds: string[],
+    windowStart: string,
+    windowEnd: string,
+    detectorEvaluationIds: string[]
+): Promise<Record<string, TraceSummary>> {
+    // Cluster members can include eval events from Stage B's embedding lookback,
+    // which extends a few days past the UI's run-day window. Widen by 7 days on
+    // the leading edge so we catch all members while still pruning partitions.
+    const response = await api.queryHogQL(
+        hogql`
+            SELECT
+                toString(uuid) as eval_id,
+                properties.$ai_evaluation_name as name,
+                properties.$ai_evaluation_result as result,
+                properties.$ai_evaluation_applicable as applicable,
+                properties.$ai_evaluation_reasoning as reasoning,
+                properties.$ai_evaluation_runtime as runtime,
+                properties.$ai_target_event_id as target_generation_id,
+                properties.$ai_trace_id as trace_id,
+                timestamp,
+                properties.$ai_evaluation_id as evaluation_id
+            FROM events
+            WHERE event = '$ai_evaluation'
+                AND timestamp >= parseDateTimeBestEffort(${windowStart}) - INTERVAL 7 DAY
+                AND timestamp <= parseDateTimeBestEffort(${windowEnd}) + INTERVAL 1 DAY
+                AND uuid IN ${evalIds}
+            ORDER BY timestamp DESC
+            LIMIT 1 BY uuid
+            LIMIT ${evalIds.length}
+        `,
+        { productKey: 'llm_analytics', scene: 'AIObservabilityClusters' },
+        { queryParams: { modifiers: { convertToProjectTimezone: false } } }
+    )
+
+    const summaries: Record<string, TraceSummary> = {}
+    for (const row of response.results || []) {
+        const r = row as (string | null)[]
+        const evalId = r[0] as string
+        if (!evalId) {
+            continue
+        }
+        const verdict = deriveVerdict(r[2], r[3], detectorEvaluationIds.includes(r[9] || ''))
+        const name = r[1] || 'Evaluation'
+        summaries[evalId] = {
+            traceId: r[7] || '',
+            generationId: canonicalGenerationId(r[6]),
+            // Title is just the evaluator name — the display components render
+            // the verdict separately as a LemonTag and don't need it duplicated
+            // in the title.
+            title: name,
+            flowDiagram: '',
+            // Put the reasoning text in the "bullets" slot so the existing toggle renders it.
+            bullets: r[4] ? `- ${r[4]}` : '',
+            interestingNotes: '',
+            timestamp: (r[8] as string) ?? '',
+            evaluationVerdict: verdict,
+            evaluationReasoning: r[4] || undefined,
+            evaluationRuntime: r[5] || undefined,
+        }
+    }
+    return summaries
+}
+
+function canonicalGenerationId(value: unknown): string | undefined {
+    if (typeof value !== 'string') {
+        return undefined
+    }
+    const compact = value
+        .trim()
+        .replace(/^urn:uuid:/i, '')
+        .replace(/^\{(.*)\}$/, '$1')
+        .replaceAll('-', '')
+    return /^[0-9a-f]{32}$/i.test(compact)
+        ? compact.toLowerCase().replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5')
+        : undefined
+}
+
+export type EvaluationVerdict = 'pass' | 'fail' | 'n/a' | 'unknown'
+
+export interface EvaluationItemAttributes {
+    evaluatorName: string
+    verdict: EvaluationVerdict
+}
+
+/**
+ * Render a short, scannable title for an eval cluster member: "{evaluator} — {reasoning preview}".
+ * Falls back to just the evaluator name when there's no reasoning, and to null when the summary
+ * hasn't loaded at all (callers can substitute their own "Loading..." placeholder).
+ *
+ * Trace/generation summaries ship with a real LLM-authored title; eval summaries don't (the only
+ * natural title is "{name}: {verdict}", and the verdict sits in its own tag). A reasoning preview
+ * makes each row visually distinct — otherwise long clusters read as "Accuracy" repeated N times.
+ */
+export function formatEvalTitle(summary: TraceSummary | undefined, maxReasoningChars: number): string | null {
+    if (!summary) {
+        return null
+    }
+    // Strip the trailing "{sep}{verdict}" suffix the backend appends to eval titles.
+    // Case-insensitive so a backend casing change doesn't silently pass through
+    // ("Accuracy: PASS" would otherwise leak into the rendered row).
+    const name = summary.title?.replace(/:\s*(pass|fail|n\/a|unknown)\s*$/i, '') || 'Evaluation'
+    const reasoning = summary.evaluationReasoning?.trim()
+    if (!reasoning) {
+        return name
+    }
+    const preview =
+        reasoning.length > maxReasoningChars ? reasoning.slice(0, maxReasoningChars).trimEnd() + '…' : reasoning
+    return `${name}: ${preview}`
+}
+
+// HogQL returns these properties as text or as booleans, depending on how the column is typed.
+function toVerdictText(value: string | boolean | null): string {
+    return String(value ?? '').toLowerCase()
+}
+
+export function deriveVerdict(
+    result: string | boolean | null,
+    applicable: string | boolean | null,
+    trueIsFailure: boolean
+): 'pass' | 'fail' | 'n/a' | 'unknown' {
+    if (toVerdictText(applicable) === 'false') {
+        return 'n/a'
+    }
+    const v = toVerdictText(result)
+    if (v !== 'true' && v !== 'false') {
+        return 'unknown'
+    }
+    return (v === 'true') === trueIsFailure ? 'fail' : 'pass'
+}

@@ -1,0 +1,1151 @@
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
+
+import time_machine
+from posthog.test.base import APIBaseTest
+from unittest.mock import MagicMock, patch
+
+from django.test import SimpleTestCase
+from django.utils import timezone
+
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.models.activity_logging.activity_log import ActivityLog
+
+from products.business_knowledge.backend import logic
+from products.business_knowledge.backend.api.serializers import _derive_scope_globs
+from products.business_knowledge.backend.constants import CLASSIFY_MAX_ATTEMPTS
+from products.business_knowledge.backend.models import (
+    KnowledgeChunk,
+    KnowledgeDocument,
+    KnowledgeLibrary,
+    KnowledgeLibraryRepository,
+    KnowledgeLibrarySource,
+    KnowledgeRunCitation,
+    KnowledgeSource,
+    KnowledgeUsageKey,
+    KnowledgeUsageRecord,
+    SafetyVerdict,
+    SourceStatus,
+    SourceType,
+)
+
+
+@patch("posthoganalytics.feature_enabled", return_value=True)
+class TestKnowledgeSourceAPI(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.url = f"/api/projects/{self.team.id}/business_knowledge/sources/"
+
+    def _create_generated_source(self, *, source_team_id: int | None = None) -> str:
+        result = logic.create_generated_knowledge_document(
+            logic.CreateGeneratedKnowledgeDocument(
+                team_id=self.team.id,
+                provider="conversations",
+                ticket_id=UUID("10000000-0000-0000-0000-000000000001"),
+                ticket_number=42,
+                source_team_id=source_team_id if source_team_id is not None else self.team.id,
+                resolution_comment_id=UUID("20000000-0000-0000-0000-000000000002"),
+                analysis_version="post_resolution_v1",
+                title="Refund policy",
+                content="Refunds are available within 30 days.",
+                evidence_revision_at=timezone.now(),
+            )
+        )
+        return str(result.source_id)
+
+    def test_create_text_source_and_chunks(self, _ff) -> None:
+        response = self.client.post(
+            self.url,
+            {"name": "Docs", "text": "Intro paragraph.\n\nSecond paragraph covers pricing."},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+        body = response.json()
+        assert body["name"] == "Docs"
+        assert body["source_type"] == "text"
+        assert body["status"] == "ready"
+        assert body["document_count"] == 1
+        assert body["chunk_count"] >= 1
+        assert body["learned_from_ticket_number"] is None
+        assert body["learned_from_ticket_url"] is None
+        # Denormalized team_id landed on child rows.
+        source = KnowledgeSource.objects.unscoped().get(id=body["id"])
+        assert KnowledgeDocument.objects.unscoped().filter(source=source, team=self.team).count() == 1
+        assert KnowledgeChunk.objects.unscoped().filter(source=source, team=self.team).count() >= 1
+
+    def test_list_only_returns_own_team(self, _ff) -> None:
+        from posthog.models.team import Team
+
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        # Create in THIS team via API.
+        self.client.post(self.url, {"name": "Mine", "text": "hello"}, format="json")
+        # Create directly in the other team — unscoped to bypass TeamScopedManager.
+        KnowledgeSource.objects.unscoped().create(team=other_team, name="Theirs", source_type="text", status="ready")
+
+        response = self.client.get(self.url)
+        assert response.status_code == status.HTTP_200_OK
+        names = [row["name"] for row in response.json()["results"]]
+        assert names == ["Mine"]
+
+    def test_list_applies_search_and_type_filters(self, _ff) -> None:
+        from posthog.models.team import Team
+
+        KnowledgeSource.objects.unscoped().create(team=self.team, name="Alpha docs", source_type="text", status="ready")
+        KnowledgeSource.objects.unscoped().create(
+            team=self.team,
+            name="Beta guide",
+            source_type="url",
+            status="ready",
+            source_url="https://example.com/beta-handbook",
+        )
+        KnowledgeSource.objects.unscoped().create(
+            team=self.team, name="Gamma report", source_type="file", status="ready"
+        )
+        KnowledgeSource.objects.unscoped().create(
+            team=self.team, name="Learned policy", source_type="text", status="ready", is_generated=True
+        )
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        KnowledgeSource.objects.unscoped().create(
+            team=other_team, name="Alpha secrets", source_type="text", status="ready"
+        )
+
+        def names(query: str) -> list[str]:
+            resp = self.client.get(f"{self.url}?{query}")
+            assert resp.status_code == status.HTTP_200_OK, resp.content
+            return sorted(row["name"] for row in resp.json()["results"])
+
+        # Search matches the name case-insensitively and never leaks another team's row.
+        assert names("search=alpha") == ["Alpha docs"]
+        assert names("search=ALPHA") == ["Alpha docs"]
+        # Search also matches source_url, not just the name.
+        assert names("search=beta-handbook") == ["Beta guide"]
+        # Type filter narrows to a single source_type.
+        assert names("source_type=url") == ["Beta guide"]
+        # Search and type combine as AND.
+        assert names("source_type=file&search=gamma") == ["Gamma report"]
+        assert names("source_type=text&search=beta") == []
+        # added_by splits sources you created from ones learned from support tickets.
+        assert names("added_by=human") == ["Alpha docs", "Beta guide", "Gamma report"]
+        assert names("added_by=learned") == ["Learned policy"]
+        assert names("added_by=learned&source_type=text&search=policy") == ["Learned policy"]
+        assert names("added_by=human&search=policy") == []
+
+    def test_list_pages_do_not_skip_or_repeat_sources_with_equal_timestamps(self, _ff) -> None:
+        created_ids = sorted(
+            str(
+                KnowledgeSource.objects.unscoped()
+                .create(team=self.team, name=f"Tied {index}", source_type="text", status="ready")
+                .id
+            )
+            for index in range(4)
+        )
+        sources = KnowledgeSource.objects.unscoped().filter(team=self.team)
+        sources.update(created_at=timezone.now())
+
+        def page(offset: int) -> list[str]:
+            resp = self.client.get(f"{self.url}?limit=2&offset={offset}")
+            assert resp.status_code == status.HTTP_200_OK, resp.content
+            return [row["id"] for row in resp.json()["results"]]
+
+        first_page = page(0)
+        # An edit between the two reads rewrites the row, which moves it in the
+        # database's own tie order. Only the id tie-breaker keeps the pages aligned.
+        sources.filter(id=first_page[0]).update(name="Edited between pages")
+        paged_ids = first_page + page(2)
+
+        assert paged_ids == created_ids
+
+    def test_list_rejects_unknown_source_type(self, _ff) -> None:
+        response = self.client.get(f"{self.url}?source_type=bogus")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        response = self.client.get(f"{self.url}?added_by=robot")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_cannot_read_other_team_source_via_id(self, _ff) -> None:
+        from posthog.models.team import Team
+
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        theirs = KnowledgeSource.objects.unscoped().create(
+            team=other_team, name="Theirs", source_type="text", status="ready"
+        )
+        response = self.client.get(f"{self.url}{theirs.id}/")
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_cannot_delete_other_team_source(self, _ff) -> None:
+        from posthog.models.team import Team
+
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        theirs = KnowledgeSource.objects.unscoped().create(
+            team=other_team, name="Theirs", source_type="text", status="ready"
+        )
+        response = self.client.delete(f"{self.url}{theirs.id}/")
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        # Untouched.
+        assert KnowledgeSource.objects.unscoped().filter(id=theirs.id).exists()
+
+    def test_delete_cascades_and_fires_activity_log(self, _ff) -> None:
+        create = self.client.post(self.url, {"name": "Docs", "text": "body"}, format="json").json()
+        source_id = create["id"]
+        assert KnowledgeDocument.objects.unscoped().filter(source_id=source_id).exists()
+        assert KnowledgeChunk.objects.unscoped().filter(source_id=source_id).exists()
+
+        response = self.client.delete(f"{self.url}{source_id}/")
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert not KnowledgeSource.objects.unscoped().filter(id=source_id).exists()
+        assert not KnowledgeDocument.objects.unscoped().filter(source_id=source_id).exists()
+        assert not KnowledgeChunk.objects.unscoped().filter(source_id=source_id).exists()
+        # Activity logging hook ran.
+        assert ActivityLog.objects.filter(scope="KnowledgeSource", item_id=source_id, activity="deleted").exists()
+
+    def test_rejects_empty_text(self, _ff) -> None:
+        response = self.client.post(self.url, {"name": "Docs", "text": "   "}, format="json")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        body = response.json()
+        # drf-exceptions-hog normalizes single-field errors into a flat
+        # {type, code, detail, attr} shape; we assert the offending field
+        # lands in `attr` so UX code can still target it.
+        assert body.get("attr") == "text"
+
+    def test_rejects_oversized_text(self, _ff) -> None:
+        response = self.client.post(self.url, {"name": "Docs", "text": "x" * 1_000_001}, format="json")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json().get("attr") == "text"
+
+    def test_create_defaults_source_type_to_text(self, _ff) -> None:
+        # Stage 2a dispatches on `source_type`. Omitting it must still land
+        # on the text path so Stage 1 clients keep working unchanged.
+        response = self.client.post(self.url, {"name": "Docs", "text": "hello"}, format="json")
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()["source_type"] == "text"
+
+    def test_create_text_source_with_always_include(self, _ff) -> None:
+        response = self.client.post(
+            self.url,
+            {"name": "Tone guide", "text": "Be friendly.", "always_include": True},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+        assert response.json()["always_include"] is True
+
+    def test_patch_always_include_without_text(self, _ff) -> None:
+        create_resp = self.client.post(
+            self.url,
+            {"name": "Policy", "text": "Be nice."},
+            format="json",
+        )
+        source_id = create_resp.json()["id"]
+        patch_resp = self.client.patch(
+            f"{self.url}{source_id}/",
+            {"always_include": True},
+            format="json",
+        )
+        assert patch_resp.status_code == status.HTTP_200_OK, patch_resp.content
+        assert patch_resp.json()["always_include"] is True
+
+    def test_generated_source_is_marked_in_list(self, _ff) -> None:
+        source_id = self._create_generated_source()
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == status.HTTP_200_OK
+        results = response.json()["results"]
+        assert len(results) == 1
+        assert results[0]["id"] == source_id
+        assert results[0]["source_type"] == "text"
+        assert results[0]["is_generated"] is True
+        assert results[0]["name"] == "Refund policy"
+        assert results[0]["learned_from_ticket_number"] == 42
+        assert results[0]["learned_from_ticket_url"].endswith(f"/project/{self.team.id}/support/tickets/42")
+
+    def test_generated_source_ticket_url_uses_the_ticket_environment(self, _ff) -> None:
+        from posthog.models.team import Team
+
+        child_team = Team.objects.create(
+            organization=self.organization,
+            parent_team=self.team,
+            project=self.team.project,
+            name="Child environment",
+        )
+        self._create_generated_source(source_team_id=child_team.id)
+
+        response = self.client.get(self.url)
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["results"][0]["learned_from_ticket_url"].endswith(
+            f"/project/{child_team.id}/support/tickets/42"
+        )
+
+    def test_generated_source_text_can_be_read_and_updated(self, _ff) -> None:
+        source_id = self._create_generated_source()
+
+        text_response = self.client.get(f"{self.url}{source_id}/text/")
+        patch_response = self.client.patch(
+            f"{self.url}{source_id}/",
+            {"name": "Refund policy", "text": "Updated refund window."},
+            format="json",
+        )
+
+        assert text_response.status_code == status.HTTP_200_OK
+        assert text_response.json()["text"] == "Refunds are available within 30 days."
+        assert patch_response.status_code == status.HTTP_200_OK, patch_response.content
+        assert patch_response.json()["name"] == "Refund policy"
+        document = KnowledgeDocument.objects.unscoped().get(source_id=source_id)
+        assert document.content == "Updated refund window."
+        assert document.metadata["edited_by_user"] is True
+
+    def test_generated_source_update_without_document_is_rejected(self, _ff) -> None:
+        source_id = self._create_generated_source()
+        KnowledgeDocument.objects.unscoped().filter(source_id=source_id).delete()
+
+        text_response = self.client.get(f"{self.url}{source_id}/text/")
+        response = self.client.patch(
+            f"{self.url}{source_id}/",
+            {"text": "Updated refund window."},
+            format="json",
+        )
+
+        assert text_response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_generated_source_with_multiple_documents_cannot_be_updated(self, _ff) -> None:
+        source_id = self._create_generated_source()
+        source = KnowledgeSource.objects.unscoped().get(id=source_id)
+        extra_id = UUID("30000000-0000-0000-0000-000000000003")
+        KnowledgeDocument.objects.unscoped().create(
+            id=extra_id,
+            team_id=self.team.id,
+            source=source,
+            stable_id=str(extra_id),
+            title="Second topic",
+            content="Second topic body.",
+            content_hash="abc",
+        )
+
+        text_response = self.client.get(f"{self.url}{source_id}/text/")
+        patch_response = self.client.patch(
+            f"{self.url}{source_id}/",
+            {"text": "Updated refund window."},
+            format="json",
+        )
+
+        assert text_response.status_code == status.HTTP_400_BAD_REQUEST
+        assert text_response.json()["detail"] == logic.GENERATED_SOURCE_MULTIPLE_DOCUMENTS_MESSAGE
+        assert patch_response.status_code == status.HTTP_400_BAD_REQUEST
+        assert patch_response.json()["detail"] == logic.GENERATED_SOURCE_MULTIPLE_DOCUMENTS_MESSAGE
+        assert KnowledgeDocument.objects.unscoped().filter(source_id=source_id).count() == 2
+        assert KnowledgeDocument.objects.unscoped().get(id=extra_id).content == "Second topic body."
+
+    def test_generated_source_can_be_deleted(self, _ff) -> None:
+        source_id = self._create_generated_source()
+
+        response = self.client.delete(f"{self.url}{source_id}/")
+
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert not KnowledgeSource.objects.unscoped().filter(id=source_id).exists()
+
+    def test_generated_refresh_is_rejected_before_processing_source_checks(self, _ff) -> None:
+        source_id = self._create_generated_source()
+        KnowledgeSource.objects.unscoped().create(
+            team=self.team,
+            name="Refreshing URL",
+            source_type="url",
+            status="processing",
+        )
+
+        response = self.client.post(f"{self.url}{source_id}/refresh/")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_generated_source_cannot_be_created_through_api(self, _ff) -> None:
+        response = self.client.post(
+            self.url,
+            {"is_generated": True, "name": "Spoofed", "text": "Content"},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_deleting_a_library_keeps_the_source(self, _ff) -> None:
+        created = self.client.post(self.url, {"name": "Docs", "text": "Pricing is public."}, format="json")
+        assert created.status_code == status.HTTP_201_CREATED, created.content
+        source_id = created.json()["id"]
+        library = self.client.post(self._libraries_url(), {"name": "Docs"}, format="json")
+        assert library.status_code == status.HTTP_201_CREATED, library.content
+        library_id = library.json()["id"]
+        patched = self.client.patch(f"{self.url}{source_id}/", {"library_ids": [library_id]}, format="json")
+        assert patched.status_code == status.HTTP_200_OK, patched.content
+        assert patched.json()["library_ids"] == [library_id]
+
+        deleted = self.client.delete(f"{self._libraries_url()}{library_id}/")
+
+        assert deleted.status_code == status.HTTP_204_NO_CONTENT
+        assert KnowledgeSource.objects.unscoped().filter(id=source_id).exists()
+        assert KnowledgeDocument.objects.unscoped().filter(source_id=source_id).exists()
+        assert KnowledgeChunk.objects.unscoped().filter(source_id=source_id).exists()
+        assert not KnowledgeLibrary.objects.unscoped().filter(id=library_id).exists()
+        assert not KnowledgeLibrarySource.objects.unscoped().filter(source_id=source_id).exists()
+
+    def test_library_ids_patch_succeeds_while_a_url_source_is_refreshing(self, _ff) -> None:
+        created = self.client.post(self.url, {"name": "Docs", "text": "Pricing is public."}, format="json")
+        source_id = created.json()["id"]
+        KnowledgeSource.objects.unscoped().filter(id=source_id).update(
+            source_type=SourceType.URL, status=SourceStatus.PROCESSING
+        )
+        library = self.client.post(self._libraries_url(), {"name": "Docs"}, format="json")
+        library_id = library.json()["id"]
+
+        patched = self.client.patch(f"{self.url}{source_id}/", {"library_ids": [library_id]}, format="json")
+
+        assert patched.status_code == status.HTTP_200_OK, patched.content
+        assert patched.json()["library_ids"] == [library_id]
+
+    @parameterized.expand([("source",), ("library",)])
+    def test_a_rejected_patch_keeps_the_old_name(self, _ff, target: str) -> None:
+        created = self.client.post(self.url, {"name": "Docs", "text": "Pricing is public."}, format="json")
+        library = self.client.post(self._libraries_url(), {"name": "Docs"}, format="json")
+        unknown_id = "11111111-1111-1111-1111-111111111111"
+        if target == "source":
+            url = f"{self.url}{created.json()['id']}/"
+            payload = {"name": "Renamed", "library_ids": [unknown_id]}
+        else:
+            url = f"{self._libraries_url()}{library.json()['id']}/"
+            payload = {"name": "Renamed", "source_ids": [unknown_id]}
+
+        response = self.client.patch(url, payload, format="json")
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST, response.content
+        assert self.client.get(url).json()["name"] == "Docs"
+
+    def test_list_rejects_library_and_unfiled_together(self, _ff) -> None:
+        response = self.client.get(self.url, {"library_id": "11111111-1111-1111-1111-111111111111", "unfiled": "true"})
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_library_from_another_team_is_not_found(self, _ff) -> None:
+        from posthog.models.organization import Organization
+        from posthog.models.project import Project
+        from posthog.models.team import Team
+
+        from products.business_knowledge.backend.libraries import create_library
+
+        other_org = Organization.objects.create(name="other_org")
+        other_project = Project.objects.create(id=Team.objects.increment_id_sequence(), organization=other_org)
+        other_team = Team.objects.create(id=other_project.id, project=other_project, organization=other_org)
+        library = create_library(other_team.id, "Theirs")
+
+        retrieve = self.client.get(f"{self._libraries_url()}{library.id}/")
+        search = self.client.get(
+            f"/api/projects/{self.team.id}/business_knowledge/documents/search/",
+            {"query": "pricing", "library_id": str(library.id)},
+        )
+
+        assert retrieve.status_code == status.HTTP_404_NOT_FOUND
+        assert search.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_parent_repo_replace_keeps_a_child_only_link(self, _ff) -> None:
+        from posthog.models.integration import Integration
+        from posthog.models.scoping import team_scope
+        from posthog.models.team import Team
+        from posthog.models.team.extensions import get_or_create_team_extension
+
+        from products.business_knowledge.backend.models import TeamBusinessKnowledgeConfig
+
+        integration = Integration.objects.create(
+            team=self.team,
+            kind="github",
+            integration_id="inst-parent",
+            config={"account": {"name": "Acme"}},
+            created_by=self.user,
+        )
+        parent_config = get_or_create_team_extension(self.team, TeamBusinessKnowledgeConfig)
+        parent_config.github_integration_id = integration.id
+        parent_config.github_repos = ["acme/parent", "acme/shared"]
+        parent_config.save(update_fields=["github_integration_id", "github_repos"])
+        child = Team.objects.create(
+            organization=self.organization,
+            parent_team=self.team,
+            project=self.team.project,
+            name="Child environment",
+        )
+        child_config = get_or_create_team_extension(child, TeamBusinessKnowledgeConfig)
+        child_config.github_repos = ["acme/child-only"]
+        child_config.save(update_fields=["github_repos"])
+        library = self.client.post(self._libraries_url(), {"name": "Repos"}, format="json")
+        library_id = library.json()["id"]
+        with team_scope(self.team.id, canonical=True):
+            KnowledgeLibraryRepository.objects.create(
+                team_id=self.team.id, library_id=library_id, repo="acme/child-only"
+            )
+
+        replaced = self.client.patch(
+            f"{self._libraries_url()}{library_id}/",
+            {"repos": ["acme/parent"]},
+            format="json",
+        )
+
+        assert replaced.status_code == status.HTTP_200_OK, replaced.content
+        assert replaced.json()["repos"] == ["acme/parent"]
+        assert set(
+            KnowledgeLibraryRepository.objects.unscoped().filter(library_id=library_id).values_list("repo", flat=True)
+        ) == {"acme/parent", "acme/child-only"}
+
+    def _libraries_url(self) -> str:
+        return f"/api/projects/{self.team.id}/business_knowledge/libraries/"
+
+    def test_lists_live_indexed_urls(self, _ff) -> None:
+        from posthog.models.team import Team
+
+        source = KnowledgeSource.objects.unscoped().create(
+            team=self.team,
+            name="Docs",
+            source_type="url",
+            status="ready",
+            source_url="https://docs.example.com",
+        )
+        KnowledgeDocument.objects.unscoped().create(
+            team=self.team,
+            source=source,
+            stable_id="https://docs.example.com/b",
+            title="Beta",
+            content="secret page body",
+            url="https://docs.example.com/b",
+            safety_verdict=SafetyVerdict.SAFE,
+        )
+        KnowledgeDocument.objects.unscoped().create(
+            team=self.team,
+            source=source,
+            stable_id="https://docs.example.com/a",
+            title="Alpha",
+            content="another secret body",
+            url="https://docs.example.com/a",
+            safety_verdict=SafetyVerdict.UNKNOWN,
+        )
+        KnowledgeDocument.objects.unscoped().create(
+            team=self.team,
+            source=source,
+            stable_id="https://docs.example.com/gone",
+            title="Gone",
+            content="removed page",
+            url="https://docs.example.com/gone",
+            safety_verdict=SafetyVerdict.SAFE,
+            tombstoned_at=timezone.now(),
+        )
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        other_source = KnowledgeSource.objects.unscoped().create(
+            team=other_team,
+            name="Theirs",
+            source_type="url",
+            status="ready",
+            source_url="https://other.example.com",
+        )
+        KnowledgeDocument.objects.unscoped().create(
+            team=other_team,
+            source=other_source,
+            stable_id="https://other.example.com/secret",
+            title="Secret",
+            content="other team",
+            url="https://other.example.com/secret",
+        )
+
+        response = self.client.get(f"{self.url}{source.id}/documents/?limit=500")
+        assert response.status_code == status.HTTP_200_OK, response.content
+        rows = response.json()["results"]
+        assert [row["url"] for row in rows] == [
+            "https://docs.example.com/a",
+            "https://docs.example.com/b",
+        ]
+        assert rows[0]["title"] == "Alpha"
+        assert rows[0]["safety_verdict"] == "unknown"
+        assert "content" not in rows[0]
+        assert self.client.get(f"{self.url}{other_source.id}/documents/").status_code == status.HTTP_404_NOT_FOUND
+        assert self.client.get(f"{self.url}not-a-uuid/documents/").status_code == status.HTTP_404_NOT_FOUND
+
+
+@patch("posthoganalytics.feature_enabled", return_value=True)
+class TestEmbeddingStatusAPI(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.url = f"/api/projects/{self.team.id}/business_knowledge/sources/"
+
+    def _create_source(self) -> str:
+        response = self.client.post(self.url, {"name": "Docs", "text": "Some content."}, format="json")
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+        return response.json()["id"]
+
+    def test_fresh_source_is_pending(self, _ff) -> None:
+        # The doc starts UNKNOWN — classification + embedding are still ahead,
+        # and that must be visible from the create response already.
+        response = self.client.post(self.url, {"name": "Docs", "text": "Some content."}, format="json")
+        assert response.json()["embedding_status"] == "pending"
+
+    @parameterized.expand(
+        [
+            ("awaiting_classification", SafetyVerdict.UNKNOWN, 0, False, "pending"),
+            # Past the attempt cap the coordinator stops re-queuing — the doc
+            # will never embed, so the source must not look pending forever.
+            ("classification_gave_up", SafetyVerdict.UNKNOWN, CLASSIFY_MAX_ATTEMPTS, False, "completed"),
+            ("awaiting_embedding_emit", SafetyVerdict.SAFE, 0, False, "pending"),
+            ("embedded", SafetyVerdict.SAFE, 0, True, "completed"),
+            ("unsafe_never_embeds", SafetyVerdict.UNSAFE, 0, False, "completed"),
+        ]
+    )
+    def test_embedding_status_reflects_document_state(self, _ff, name, verdict, attempts, emitted, expected) -> None:
+        source_id = self._create_source()
+        KnowledgeDocument.objects.unscoped().filter(source_id=source_id).update(
+            safety_verdict=verdict,
+            classification_attempts=attempts,
+            embeddings_emitted_at=timezone.now() if emitted else None,
+        )
+        retrieve = self.client.get(f"{self.url}{source_id}/").json()
+        assert retrieve["embedding_status"] == expected, name
+        listed = self.client.get(self.url).json()["results"]
+        assert listed[0]["embedding_status"] == expected, name
+
+    @parameterized.expand([("declined", False), ("undecided", None)])
+    def test_disabled_when_org_has_not_approved_ai_processing(self, _ff, _name, approved) -> None:
+        source_id = self._create_source()
+        self.organization.is_ai_data_processing_approved = approved
+        self.organization.save()
+        response = self.client.get(f"{self.url}{source_id}/").json()
+        assert response["embedding_status"] == "disabled"
+
+
+@patch("posthoganalytics.feature_enabled", return_value=True)
+class TestKnowledgeDocumentWindowAPI(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.base = f"/api/projects/{self.team.id}/business_knowledge/documents"
+
+    def _ready_safe_document(self, *, paragraphs: int = 10, team=None) -> KnowledgeDocument:
+        """Create a READY text source with exactly `paragraphs` chunks, all SAFE."""
+        team = team or self.team
+        # Each paragraph is padded past CHUNK_TARGET_CHARS (1200) but under
+        # CHUNK_HARD_MAX_CHARS (1600) so the chunker emits one chunk per
+        # paragraph — giving deterministic ordinals to window around.
+        filler = "lorem ipsum dolor sit amet " * 50
+        text = "\n\n".join(f"Paragraph {i}: {filler}" for i in range(paragraphs))
+        source = logic.create_text_source(team_id=team.id, created_by_id=self.user.id, name="Docs", text=text)
+        # create_text_source leaves the doc UNKNOWN (excluded from search/drill-down)
+        # until the classifier clears it — mark SAFE so the window returns chunks.
+        KnowledgeDocument.objects.unscoped().filter(source_id=source.id).update(safety_verdict=SafetyVerdict.SAFE)
+        return KnowledgeDocument.objects.unscoped().get(source_id=source.id)
+
+    def test_window_returns_contiguous_span(self, _ff) -> None:
+        doc = self._ready_safe_document(paragraphs=10)
+        response = self.client.get(f"{self.base}/{doc.id}/window/?around_ordinal=5&radius=2")
+        assert response.status_code == status.HTTP_200_OK, response.content
+        body = response.json()
+        ordinals = [row["ordinal"] for row in body]
+        assert ordinals == [3, 4, 5, 6, 7]
+        first = body[0]
+        assert set(first.keys()) == {
+            "chunk_id",
+            "ordinal",
+            "content",
+            "heading_path",
+            "source_name",
+            "document_title",
+            "url",
+        }
+        assert first["source_name"] == "Docs"
+        assert first["url"] == ""
+
+    def test_window_defaults_radius(self, _ff) -> None:
+        doc = self._ready_safe_document(paragraphs=20)
+        response = self.client.get(f"{self.base}/{doc.id}/window/?around_ordinal=10")
+        assert response.status_code == status.HTTP_200_OK
+        # Default radius is 5 -> ordinals 5..15.
+        ordinals = [row["ordinal"] for row in response.json()]
+        assert ordinals == list(range(5, 16))
+
+    def test_window_requires_around_ordinal(self, _ff) -> None:
+        doc = self._ready_safe_document()
+        response = self.client.get(f"{self.base}/{doc.id}/window/")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json().get("attr") == "around_ordinal"
+
+    def test_window_rejects_non_integer_params(self, _ff) -> None:
+        doc = self._ready_safe_document()
+        response = self.client.get(f"{self.base}/{doc.id}/window/?around_ordinal=abc")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json().get("attr") == "around_ordinal"
+
+    def test_window_unknown_document_is_404(self, _ff) -> None:
+        import uuid
+
+        response = self.client.get(f"{self.base}/{uuid.uuid4()}/window/?around_ordinal=0")
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_window_invalid_uuid_is_404(self, _ff) -> None:
+        response = self.client.get(f"{self.base}/not-a-uuid/window/?around_ordinal=0")
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_window_cross_team_document_is_404(self, _ff) -> None:
+        from posthog.models.team import Team
+
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        theirs = self._ready_safe_document(team=other_team)
+        response = self.client.get(f"{self.base}/{theirs.id}/window/?around_ordinal=0")
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_window_excludes_unsafe_document(self, _ff) -> None:
+        # A document that exists in the team but is not SAFE has no readable
+        # chunks, so the window comes back empty (200, []), never leaking content.
+        doc = self._ready_safe_document(paragraphs=5)
+        KnowledgeDocument.objects.unscoped().filter(id=doc.id).update(safety_verdict=SafetyVerdict.UNSAFE)
+        response = self.client.get(f"{self.base}/{doc.id}/window/?around_ordinal=2")
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == []
+
+    def test_window_feature_flag_gated(self, _ff) -> None:
+        doc = self._ready_safe_document()
+        _ff.return_value = False
+        response = self.client.get(f"{self.base}/{doc.id}/window/?around_ordinal=0")
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+@patch("posthoganalytics.feature_enabled", return_value=True)
+class TestKnowledgeDocumentWindowScopes(APIBaseTest):
+    """The window endpoint is the BK MCP surface; MCP authenticates with a
+    personal API key / OAuth token, so the custom action must enforce
+    `business_knowledge:read` (not silently 403 every programmatic caller)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        text = "\n\n".join(f"Paragraph {i}: {'lorem ipsum dolor sit amet ' * 50}" for i in range(5))
+        source = logic.create_text_source(team_id=self.team.id, created_by_id=self.user.id, name="Docs", text=text)
+        KnowledgeDocument.objects.unscoped().filter(source_id=source.id).update(safety_verdict=SafetyVerdict.SAFE)
+        self.doc = KnowledgeDocument.objects.unscoped().get(source_id=source.id)
+        self.url = f"/api/projects/{self.team.id}/business_knowledge/documents/{self.doc.id}/window/?around_ordinal=2"
+
+    def _auth_with_pak(self, scopes: list[str]) -> None:
+        key = self.create_personal_api_key_with_scopes(scopes)
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {key}")
+
+    def test_read_scope_allows_window(self, _ff) -> None:
+        self._auth_with_pak(["business_knowledge:read"])
+        response = self.client.get(self.url)
+        assert response.status_code == status.HTTP_200_OK, response.content
+
+    def test_wrong_scope_is_forbidden(self, _ff) -> None:
+        self._auth_with_pak(["insight:read"])
+        response = self.client.get(self.url)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+# ---------------------------------------------------------------------------
+# Search endpoint
+# ---------------------------------------------------------------------------
+
+
+@patch("posthoganalytics.feature_enabled", return_value=True)
+class TestKnowledgeDocumentSearchAPI(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.url = f"/api/projects/{self.team.id}/business_knowledge/documents/search/"
+
+    def _ready_safe_source(self, *, name: str = "Docs", text: str | None = None, team=None) -> KnowledgeSource:
+        team = team or self.team
+        if text is None:
+            filler = "lorem ipsum dolor sit amet " * 50
+            text = "\n\n".join(f"Paragraph {i}: {filler}" for i in range(5))
+        source = logic.create_text_source(team_id=team.id, created_by_id=self.user.id, name=name, text=text)
+        KnowledgeDocument.objects.unscoped().filter(source_id=source.id).update(safety_verdict=SafetyVerdict.SAFE)
+        return source
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_returns_ranked_chunks(self, _embed, _ff) -> None:
+        self._ready_safe_source(
+            text="Pricing plans are available on request.\n\n" + "x " * 600 + "\n\nOur refund policy is flexible."
+        )
+        response = self.client.get(self.url, {"query": "pricing"})
+        assert response.status_code == status.HTTP_200_OK, response.content
+        body = response.json()
+        assert len(body) >= 1
+        first = body[0]
+        assert set(first.keys()) == {
+            "chunk_id",
+            "document_id",
+            "ordinal",
+            "source_id",
+            "source_name",
+            "source_type",
+            "document_title",
+            "heading_path",
+            "content",
+            "is_generated",
+            "url",
+            "matched_by",
+            "similarity",
+        }
+        assert [(chunk["ordinal"], chunk["matched_by"], chunk["similarity"]) for chunk in body] == [
+            (0, "keyword", None),
+            (1, "context", None),
+        ]
+        assert first["source_name"] == "Docs"
+        assert first["url"] == ""
+        assert first["is_generated"] is False
+        assert "pricing" in first["content"].lower() or "Pricing" in first["content"]
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_honors_limit(self, _embed, _ff) -> None:
+        # The default source chunks into several passages that all match "lorem",
+        # so neighbour expansion would return more than one chunk without the trim.
+        self._ready_safe_source()
+        response = self.client.get(self.url, {"query": "lorem", "limit": "1"})
+        assert response.status_code == status.HTTP_200_OK, response.content
+        assert len(response.json()) == 1
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_requires_query(self, _embed, _ff) -> None:
+        self._ready_safe_source()
+        response = self.client.get(self.url)
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json().get("attr") == "query"
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_rejects_blank_query(self, _embed, _ff) -> None:
+        self._ready_safe_source()
+        response = self.client.get(self.url, {"query": "   "})
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_cross_team_isolation(self, _embed, _ff) -> None:
+        from posthog.models.team import Team
+
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        self._ready_safe_source(name="Theirs", text="secret pricing data " * 60, team=other_team)
+        response = self.client.get(self.url, {"query": "secret pricing"})
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == []
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_excludes_unsafe_documents(self, _embed, _ff) -> None:
+        source = self._ready_safe_source(text="Return policy details " * 60)
+        KnowledgeDocument.objects.unscoped().filter(source_id=source.id).update(safety_verdict=SafetyVerdict.UNSAFE)
+        response = self.client.get(self.url, {"query": "return policy"})
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == []
+
+    def test_search_feature_flag_gated(self, _ff) -> None:
+        _ff.return_value = False
+        response = self.client.get(self.url, {"query": "anything"})
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_embedding_failure_falls_back_to_fts(self, _embed, _ff) -> None:
+        self._ready_safe_source(text="Deployment guide for kubernetes " * 60)
+        response = self.client.get(self.url, {"query": "kubernetes"})
+        assert response.status_code == status.HTTP_200_OK, response.content
+        body = response.json()
+        assert len(body) >= 1
+        assert "kubernetes" in body[0]["content"].lower()
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    @patch("products.business_knowledge.backend.logic.rerank_chunks")
+    def test_search_rerank_param_calls_reranker(self, mock_rerank, _embed, _ff) -> None:
+        self._ready_safe_source(text="Return policy details " * 60)
+        mock_rerank.side_effect = lambda _team, query, results, *, top_k, trace, **_budget: list(reversed(results))
+
+        response = self.client.get(self.url, {"query": "return policy", "rerank": "true"})
+        assert response.status_code == status.HTTP_200_OK, response.content
+        mock_rerank.assert_called_once()
+        assert mock_rerank.call_args.kwargs["top_k"] == 10
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_rerank_stays_inside_the_request_deadline(self, _embed, _ff) -> None:
+        self._ready_safe_source()
+        self.organization.is_ai_data_processing_approved = True
+        self.organization.save()
+        gateway = MagicMock()
+
+        with patch("products.business_knowledge.backend.logic.build_ai_gateway_anthropic_client", return_value=gateway):
+            response = self.client.get(self.url, {"query": "lorem", "rerank": "true"})
+
+        assert response.status_code == status.HTTP_200_OK, response.content
+        budget = gateway.with_options.call_args.kwargs
+        worst_case_seconds = budget["timeout"].read * (budget["max_retries"] + 1)
+        assert worst_case_seconds <= 30
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_search_rerank_defaults_false(self, _embed, _ff) -> None:
+        self._ready_safe_source(text="Return policy details " * 60)
+
+        with patch("products.business_knowledge.backend.logic.rerank_chunks") as mock_rerank:
+            response = self.client.get(self.url, {"query": "return policy"})
+            assert response.status_code == status.HTTP_200_OK, response.content
+            mock_rerank.assert_not_called()
+
+
+@patch("posthoganalytics.feature_enabled", return_value=True)
+class TestKnowledgeDocumentSearchScopes(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        filler = "lorem ipsum dolor sit amet " * 50
+        text = "\n\n".join(f"Paragraph {i}: {filler}" for i in range(3))
+        source = logic.create_text_source(team_id=self.team.id, created_by_id=self.user.id, name="Docs", text=text)
+        KnowledgeDocument.objects.unscoped().filter(source_id=source.id).update(safety_verdict=SafetyVerdict.SAFE)
+        self.url = f"/api/projects/{self.team.id}/business_knowledge/documents/search/?query=lorem"
+
+    def _auth_with_pak(self, scopes: list[str]) -> None:
+        key = self.create_personal_api_key_with_scopes(scopes)
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {key}")
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_read_scope_allows_search(self, _embed, _ff) -> None:
+        self._auth_with_pak(["business_knowledge:read"])
+        response = self.client.get(self.url)
+        assert response.status_code == status.HTTP_200_OK, response.content
+
+    @patch("posthog.api.embedding_worker.generate_embedding", side_effect=Exception("unavailable"))
+    def test_wrong_scope_is_forbidden(self, _embed, _ff) -> None:
+        self._auth_with_pak(["insight:read"])
+        response = self.client.get(self.url)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+class TestDeriveScopeGlobs(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("subpath", "https://posthog.com/docs/support", ["/docs/support", "/docs/support/*"]),
+            ("deep_subpath", "https://example.com/a/b/c", ["/a/b/c", "/a/b/c/*"]),
+            ("root_slash", "https://posthog.com/", []),
+            ("root_no_slash", "https://posthog.com", []),
+            ("trailing_slash_stripped", "https://example.com/docs/", ["/docs", "/docs/*"]),
+        ]
+    )
+    def test_derivation(self, _name: str, url: str, expected: list[str]) -> None:
+        assert _derive_scope_globs(url) == expected
+
+
+@patch("posthoganalytics.feature_enabled", return_value=True)
+@patch("products.business_knowledge.backend.api.serializers.is_url_allowed", return_value=(True, None))
+class TestCrawlSourceAutoScope(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.api_url = f"/api/projects/{self.team.id}/business_knowledge/sources/"
+
+    @patch("products.business_knowledge.backend.api.views.KnowledgeSourceViewSet._start_background_ingest")
+    @patch("products.business_knowledge.backend.api.views.logic.claim_url_source")
+    def test_same_origin_derives_globs_from_entry_url(self, mock_claim, _bg, _url, _ff) -> None:
+        mock_claim.return_value = KnowledgeSource(
+            id="00000000-0000-0000-0000-000000000001",
+            team=self.team,
+            name="Support docs",
+            source_type="url",
+            status="processing",
+            crawl_mode="same_origin",
+            crawl_config={
+                "include_globs": ["/docs/support", "/docs/support/*"],
+                "exclude_globs": [],
+                "max_pages": 50,
+                "max_depth": 2,
+            },
+        )
+        response = self.client.post(
+            self.api_url,
+            {
+                "source_type": "url",
+                "name": "Support docs",
+                "url": "https://posthog.com/docs/support",
+                "crawl_mode": "same_origin",
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+        call_kwargs = mock_claim.call_args.kwargs
+        assert call_kwargs["crawl_config"]["include_globs"] == ["/docs/support", "/docs/support/*"]
+
+    @patch("products.business_knowledge.backend.api.views.KnowledgeSourceViewSet._start_background_ingest")
+    @patch("products.business_knowledge.backend.api.views.logic.claim_url_source")
+    def test_explicit_include_globs_override_auto_scope(self, mock_claim, _bg, _url, _ff) -> None:
+        mock_claim.return_value = KnowledgeSource(
+            id="00000000-0000-0000-0000-000000000002",
+            team=self.team,
+            name="Custom",
+            source_type="url",
+            status="processing",
+            crawl_mode="same_origin",
+            crawl_config={"include_globs": ["/custom/*"], "exclude_globs": [], "max_pages": 50, "max_depth": 2},
+        )
+        response = self.client.post(
+            self.api_url,
+            {
+                "source_type": "url",
+                "name": "Custom",
+                "url": "https://posthog.com/docs/support",
+                "crawl_mode": "same_origin",
+                "include_globs": ["/custom/*"],
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+        call_kwargs = mock_claim.call_args.kwargs
+        assert call_kwargs["crawl_config"]["include_globs"] == ["/custom/*"]
+
+    @patch("products.business_knowledge.backend.api.views.KnowledgeSourceViewSet._start_background_ingest")
+    @patch("products.business_knowledge.backend.api.views.logic.claim_url_source")
+    def test_root_url_derives_empty_globs(self, mock_claim, _bg, _url, _ff) -> None:
+        mock_claim.return_value = KnowledgeSource(
+            id="00000000-0000-0000-0000-000000000003",
+            team=self.team,
+            name="Whole site",
+            source_type="url",
+            status="processing",
+            crawl_mode="same_origin",
+            crawl_config={"include_globs": [], "exclude_globs": [], "max_pages": 50, "max_depth": 2},
+        )
+        response = self.client.post(
+            self.api_url,
+            {
+                "source_type": "url",
+                "name": "Whole site",
+                "url": "https://posthog.com/",
+                "crawl_mode": "same_origin",
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+        call_kwargs = mock_claim.call_args.kwargs
+        assert call_kwargs["crawl_config"]["include_globs"] == []
+
+    @patch("products.business_knowledge.backend.api.views.KnowledgeSourceViewSet._start_background_ingest")
+    @patch("products.business_knowledge.backend.api.views.logic.update_url_source")
+    def test_update_url_rederives_globs_when_not_sent(self, mock_update, _bg, _url, _ff) -> None:
+        source = KnowledgeSource.objects.unscoped().create(
+            id="00000000-0000-0000-0000-000000000004",
+            team=self.team,
+            name="Old source",
+            source_type="url",
+            status="ready",
+            source_url="https://posthog.com/docs/old",
+            crawl_mode="same_origin",
+            crawl_config={
+                "include_globs": ["/docs/old", "/docs/old/*"],
+                "exclude_globs": [],
+                "max_pages": 50,
+                "max_depth": 2,
+            },
+        )
+        mock_update.return_value = logic.UrlSourceUpdate(source=source, is_refresh_claimed=False)
+        response = self.client.patch(
+            f"{self.api_url}{source.id}/",
+            {
+                "url": "https://posthog.com/docs/new",
+                "crawl_mode": "same_origin",
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.content
+        call_kwargs = mock_update.call_args.kwargs
+        assert call_kwargs["crawl_config"]["include_globs"] == ["/docs/new", "/docs/new/*"]
+
+
+@patch("posthoganalytics.feature_enabled", return_value=True)
+class TestKnowledgeUsageAPI(APIBaseTest):
+    def _source(self, name: str, *, learned: bool = False) -> KnowledgeSource:
+        source = logic.create_text_source(team_id=self.team.id, created_by_id=self.user.id, name=name, text=name)
+        if learned:
+            KnowledgeSource.objects.unscoped().filter(id=source.id).update(is_generated=True)
+        return source
+
+    def _cite(self, run_id: str, source_id: UUID, cited_at: datetime) -> None:
+        KnowledgeRunCitation.objects.for_team(self.team.id).create(
+            team=self.team,
+            run_id=run_id,
+            ticket_id=uuid4(),
+            chunk_id=uuid4(),
+            document_id=uuid4(),
+            source_id=source_id,
+            created_at=cited_at,
+        )
+
+    def _meter(self, usage_key: KnowledgeUsageKey, quantity: int, surface: str, at: datetime, team_id: int = 0) -> None:
+        record = KnowledgeUsageRecord.objects.unscoped().create(
+            team_id=team_id or self.team.id, usage_key=usage_key, quantity=quantity, surface=surface
+        )
+        KnowledgeUsageRecord.objects.unscoped().filter(id=record.id).update(created_at=at)
+
+    def test_usage_counts_runs_in_the_period_for_sources_that_still_exist(self, _ff) -> None:
+        now = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+        yesterday = now - timedelta(days=1)
+        docs = self._source("Docs")
+        learned = self._source("Learned answer", learned=True)
+        self._source("Unused")
+        self._cite("run-1", docs.id, now)
+        # One run that cites two chunks of a source is still one run for that source.
+        self._cite("run-1", docs.id, now)
+        self._cite("run-2", docs.id, yesterday)
+        self._cite("run-2", learned.id, yesterday)
+        self._cite("run-old", docs.id, now - timedelta(days=3))
+        self._cite("run-deleted-source", uuid4(), now)
+        # The sources above metered their own chunks at the real time, outside the frozen period.
+        KnowledgeUsageRecord.objects.unscoped().all().delete()
+        self._meter(KnowledgeUsageKey.CHUNKS, 5, "url", now)
+        self._meter(KnowledgeUsageKey.CHUNKS, 4, "url", yesterday)
+        self._meter(KnowledgeUsageKey.CHUNKS, 2, "text", yesterday)
+        self._meter(KnowledgeUsageKey.CHUNKS, 9, "url", now - timedelta(days=3))
+        self._meter(KnowledgeUsageKey.QUERIES, 1, "support", now)
+        self._meter(KnowledgeUsageKey.QUERIES, 1, "api", now)
+        self._meter(KnowledgeUsageKey.QUERIES, 1, "api", yesterday)
+        self._meter(KnowledgeUsageKey.QUERIES, 1, "api", now, team_id=self.team.id + 1000)
+
+        with time_machine.travel(now, tick=False):
+            usage = self.client.get(f"/api/projects/{self.team.id}/business_knowledge/sources/usage/?days=2")
+            sources = self.client.get(f"/api/projects/{self.team.id}/business_knowledge/sources/")
+
+        assert usage.status_code == status.HTTP_200_OK, usage.content
+        assert usage.json() == {
+            "days": 2,
+            "cited_run_count": 2,
+            "learned_cited_run_count": 1,
+            "source_count": 3,
+            "cited_source_count": 2,
+            "chunks_ingested": 11,
+            "query_count": 3,
+            "chunks_by_surface": [{"surface": "url", "total": 9}, {"surface": "text", "total": 2}],
+            "queries_by_surface": [{"surface": "api", "total": 2}, {"surface": "support", "total": 1}],
+            "daily": [
+                {"date": "2026-05-19", "cited_run_count": 1, "chunks_ingested": 6, "query_count": 1},
+                {"date": "2026-05-20", "cited_run_count": 1, "chunks_ingested": 5, "query_count": 2},
+            ],
+            "top_sources": [
+                {
+                    "source_id": str(docs.id),
+                    "name": "Docs",
+                    "is_generated": False,
+                    "cited_run_count": 2,
+                    "last_cited_at": "2026-05-20T12:00:00Z",
+                },
+                {
+                    "source_id": str(learned.id),
+                    "name": "Learned answer",
+                    "is_generated": True,
+                    "cited_run_count": 1,
+                    "last_cited_at": "2026-05-19T12:00:00Z",
+                },
+            ],
+        }
+        # The list counts every run, whatever the period.
+        assert {row["name"]: (row["cited_run_count"], row["last_cited_at"]) for row in sources.json()["results"]} == {
+            "Docs": (3, "2026-05-20T12:00:00Z"),
+            "Learned answer": (1, "2026-05-19T12:00:00Z"),
+            "Unused": (0, None),
+        }

@@ -1,0 +1,207 @@
+import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { defaultProvider } from '@aws-sdk/credential-provider-node'
+import { Upload } from '@aws-sdk/lib-storage'
+import { NodeHttpHandler } from '@smithy/node-http-handler'
+import * as fs from 'fs'
+import { HttpsProxyAgent } from 'https-proxy-agent'
+import { Readable, Transform } from 'stream'
+import { pipeline } from 'stream/promises'
+
+import { config } from './config'
+import { resolveEgressProxyUrl } from './egress-proxy'
+import { RasterizationError } from './errors'
+import { createLogger } from './logger'
+
+const log = createLogger()
+
+// The AWS SDK attaches $responseBodyText to an error only when it could not parse the response body at
+// all, and hangs the HTTP response itself on a non-enumerable $response. Both are absent from its public
+// error type. That pair identifies the one failure worth translating: a proxy or gateway answering with
+// plaintext or an HTML error page instead of S3's XML, where the error the SDK raises describes its own
+// parser rather than the request, and the raw body is the only place the real reason survives.
+type UndecodableS3Response = {
+    $responseBodyText?: string
+    $response?: { statusCode?: number }
+}
+
+function undecodableResponse(err: unknown): { status?: number; body: string } | null {
+    const { $responseBodyText, $response } = (err ?? {}) as UndecodableS3Response
+    if (typeof $responseBodyText !== 'string') {
+        return null
+    }
+    return { status: $response?.statusCode, body: $responseBodyText.slice(0, 500) }
+}
+
+let s3Client: S3Client | null = null
+
+function getS3Client(): S3Client {
+    if (!s3Client) {
+        const proxyUrl = resolveEgressProxyUrl()
+        const requestHandler = proxyUrl ? { httpsAgent: new HttpsProxyAgent(proxyUrl) } : undefined
+        s3Client = new S3Client({
+            region: config.s3Region,
+            ...(config.s3Endpoint ? { endpoint: config.s3Endpoint, forcePathStyle: true } : {}),
+            ...(requestHandler ? { requestHandler } : {}),
+            // DO NOT REMOVE this credentials override. The SDK's nested STS client inherits
+            // the parent's requestHandler (parentClientConfig); without an explicit unproxied
+            // handler, IRSA STS credential refresh gets routed through the proxy, which rejects
+            // it (407) and fails every S3 upload.
+            ...(requestHandler
+                ? { credentials: defaultProvider({ clientConfig: { requestHandler: new NodeHttpHandler() } }) }
+                : {}),
+        })
+    }
+    return s3Client
+}
+
+const FORMAT_META: Record<string, { ext: string; contentType: string }> = {
+    mp4: { ext: 'mp4', contentType: 'video/mp4' },
+    webm: { ext: 'webm', contentType: 'video/webm' },
+    gif: { ext: 'gif', contentType: 'image/gif' },
+    png: { ext: 'png', contentType: 'image/png' },
+    webp: { ext: 'webp', contentType: 'image/webp' },
+}
+
+export async function uploadToS3(
+    localPath: string,
+    bucket: string,
+    keyPrefix: string,
+    id: string,
+    format: 'mp4' | 'webm' | 'gif' | 'png' | 'webp' = 'mp4',
+    onProgress?: () => void
+): Promise<string> {
+    const { ext, contentType } = FORMAT_META[format] || FORMAT_META.mp4
+    const key = `${keyPrefix}/${id}.${ext}`
+
+    const upload = new Upload({
+        client: getS3Client(),
+        params: {
+            Bucket: bucket,
+            Key: key,
+            Body: fs.createReadStream(localPath),
+            ContentType: contentType,
+        },
+    })
+
+    if (onProgress) {
+        upload.on('httpUploadProgress', () => onProgress())
+    }
+
+    const target = `s3://${bucket}/${key}`
+    try {
+        await upload.done()
+    } catch (err) {
+        const undecodable = undecodableResponse(err)
+        if (!undecodable) {
+            // Raw SDK errors would surface as UNKNOWN in the error metrics and as untyped
+            // ApplicationFailures to the workflow. Always retryable: a 403 can be a transient
+            // credential-refresh race, and a wasted retry is cheaper than discarding a finished
+            // render over a misclassified permanent failure.
+            const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode
+            log.warn({ bucket, key, status, err: (err as Error)?.message }, 'S3 upload failed')
+            throw new RasterizationError(
+                `S3 upload failed${status ? ` (status ${status})` : ''}: ${(err as Error)?.message ?? String(err)}`,
+                true,
+                'S3_UPLOAD_FAILED',
+                err
+            )
+        }
+        // Bucket, key and the raw body stay in this log line. The thrown message reaches team users as
+        // ReplayObservation.error_reason, and the body is whatever an upstream proxy or gateway chose to
+        // return, so only the status code goes into it. Retryability is untouched: the workflow's retry
+        // policy keeps deciding, as it does for any other upload failure.
+        log.warn(
+            { bucket, key, status: undecodable.status, response_body: undecodable.body },
+            'S3 upload returned an unreadable response'
+        )
+        throw new RasterizationError(
+            `S3 upload failed: the object store returned an unreadable (non-XML) response (status ${undecodable.status ?? 'unknown'})`,
+            true,
+            'S3_UPLOAD_UNDECODABLE_RESPONSE',
+            err
+        )
+    }
+
+    return target
+}
+
+export function parseS3Uri(uri: string): { bucket: string; key: string } {
+    const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri)
+    if (!match) {
+        throw new RasterizationError(`Not an S3 URI: ${uri}`, false, 'INVALID_INPUT')
+    }
+    return { bucket: match[1], key: match[2] }
+}
+
+/** Fails the download once more than `maxBytes` arrive, for a response that sent no Content-Length to check first. */
+export function byteLimit(maxBytes: number): Transform {
+    let seen = 0
+    return new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+            seen += chunk.length
+            if (seen > maxBytes) {
+                callback(
+                    new RasterizationError(`S3 object too large: over ${maxBytes} bytes`, false, 'RECORDING_TOO_LARGE')
+                )
+                return
+            }
+            callback(null, chunk)
+        },
+    })
+}
+
+/** Fetch one object to a local path. The thumbnail activity reads the analysis MP4 this way. */
+export async function downloadFromS3(
+    bucket: string,
+    key: string,
+    localPath: string,
+    options: { maxBytes?: number; signal?: AbortSignal } = {}
+): Promise<void> {
+    try {
+        const res = await getS3Client().send(new GetObjectCommand({ Bucket: bucket, Key: key }), {
+            abortSignal: options.signal,
+        })
+        if (!res.Body) {
+            throw new RasterizationError(`S3 object is empty: s3://${bucket}/${key}`, false, 'S3_DOWNLOAD_EMPTY')
+        }
+        if (options.maxBytes !== undefined && (res.ContentLength ?? 0) > options.maxBytes) {
+            ;(res.Body as Readable).destroy()
+            throw new RasterizationError(
+                `S3 object too large: ${res.ContentLength} bytes (limit ${options.maxBytes})`,
+                false,
+                'RECORDING_TOO_LARGE'
+            )
+        }
+        // Streamed, not buffered: thumbnail extraction reads several tens-of-megabytes MP4s at once.
+        const stages: NodeJS.ReadWriteStream[] = options.maxBytes !== undefined ? [byteLimit(options.maxBytes)] : []
+        await pipeline([res.Body as Readable, ...stages, fs.createWriteStream(localPath)], { signal: options.signal })
+    } catch (err) {
+        if (err instanceof RasterizationError) {
+            throw err
+        }
+        const undecodable = undecodableResponse(err)
+        if (undecodable) {
+            // An egress proxy answering HTML surfaces as a parser error, with the real reason in the body.
+            log.warn(
+                { bucket, key, status: undecodable.status, response_body: undecodable.body },
+                'S3 download returned an unreadable response'
+            )
+            throw new RasterizationError(
+                `S3 download failed: the object store returned an unreadable (non-XML) response (status ${undecodable.status ?? 'unknown'})`,
+                true,
+                'S3_DOWNLOAD_UNDECODABLE_RESPONSE',
+                err
+            )
+        }
+        const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode
+        log.warn({ bucket, key, status, err: (err as Error)?.message }, 'S3 download failed')
+        // Only a missing object is permanent; a 403 is the credential-refresh race the upload path allows for.
+        const retryable = status !== 404
+        throw new RasterizationError(
+            `S3 download failed${status ? ` (status ${status})` : ''}: ${(err as Error)?.message ?? String(err)}`,
+            retryable,
+            'S3_DOWNLOAD_FAILED',
+            err
+        )
+    }
+}

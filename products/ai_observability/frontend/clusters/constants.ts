@@ -1,0 +1,48 @@
+// Noise/outlier cluster ID from HDBSCAN
+export const NOISE_CLUSTER_ID = -1
+
+// Color for outlier/noise cluster
+export const OUTLIER_COLOR = '#888888'
+
+// Pagination
+export const TRACES_PER_PAGE = 50
+
+// Query limits
+export const MAX_CLUSTERING_RUNS = 20
+
+// How far back to look for clustering runs. Scheduled runs are emitted (roughly) daily, but
+// a team can go several days without a fresh run — low-traffic days, sampling, or a paused
+// schedule. A wide window keeps the most recent run visible instead of the page going empty
+// the moment the last run ages past a day or two. MAX_CLUSTERING_RUNS still bounds the result.
+export const CLUSTERING_RUNS_LOOKBACK_DAYS = 90
+
+// Cluster detail URL pattern. Mirrored in `manifest.tsx`'s route registration so any
+// `urlToAction` matcher (e.g. `clusterDetailLogic`, `aiObservabilitySharedLogic`)
+// stays in lockstep with the actual route.
+export const AI_OBSERVABILITY_CLUSTER_URL_PATTERN = '/ai-observability/clusters/:runId/:clusterId'
+
+// Scene names used as ClickHouse query tags. These match the route registrations in
+// `manifest.tsx`, and the query runner pulls them off `query.tags.scene` to attach to
+// every executed query for analytics. Centralised so the tags don't drift if the scene
+// names ever change.
+export const AI_OBSERVABILITY_CLUSTERS_SCENE_TAG = 'AIObservabilityClusters'
+export const AI_OBSERVABILITY_CLUSTER_SCENE_TAG = 'AIObservabilityCluster'
+
+// Characters a UUID can contain. This is a character check, not a full UUID check.
+export const SAFE_ID_RE = /^[a-f0-9-]+$/i
+
+// Mirrors `MAX_SELECT_RETURNED_ROWS` in `posthog/hogql/constants.py`. Query rows above
+// this are silently truncated server-side, so post-hoc property-filter queries against the
+// full set of cluster items must either fit under the cap or fall back to "no filtering".
+export const FILTER_QUERY_MAX_ROWS = 50000
+
+// Events that belong to a trace. Keep in sync with `traces_query_runner.py`, so a filter keeps
+// the same traces on the clusters page and the traces list.
+export const TRACE_MEMBER_EVENTS = [
+    '$ai_span',
+    '$ai_generation',
+    '$ai_embedding',
+    '$ai_metric',
+    '$ai_feedback',
+    '$ai_trace',
+]

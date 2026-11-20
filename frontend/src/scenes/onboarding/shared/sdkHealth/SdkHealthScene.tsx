@@ -1,0 +1,212 @@
+import { useActions, useValues } from 'kea'
+import posthog from 'posthog-js'
+
+import { IconBell, IconRefresh } from '@posthog/icons'
+import { LemonBanner, LemonButton, LemonTag, Link } from '@posthog/lemon-ui'
+import { Button } from '@posthog/quill'
+
+import { dayjs } from 'lib/dayjs'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
+import { LinkPrimitive } from 'lib/lemon-ui/Link'
+import { preflightLogic } from 'lib/logic/preflightLogic'
+import { inStorybook } from 'lib/utils/dom'
+import { pluralize } from 'lib/utils/strings'
+import { SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+
+import { SdkSection } from './SdkHealthComponents'
+import { SdkType, sdkHealthLogic } from './sdkHealthLogic'
+import { sdkHealthSceneLogic } from './sdkHealthSceneLogic'
+
+export const scene: SceneExport = {
+    component: SdkHealthScene,
+    logic: sdkHealthSceneLogic,
+}
+
+export function SdkHealthScene(): JSX.Element {
+    const {
+        augmentedData,
+        reportLoading: loading,
+        needsUpdatingCount,
+        hasErrors,
+        isSnoozed,
+        snoozedUntil,
+    } = useValues(sdkHealthLogic)
+    const { isDev } = useValues(preflightLogic)
+
+    const { loadReport, snoozeSdkHealth, unsnooze } = useActions(sdkHealthLogic)
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+
+    const trackAlertsClick = (): void => {
+        posthog.capture('health_alerts_entry_point_clicked', { source: 'sdk_health' })
+    }
+
+    useOnMountEffect(() => {
+        posthog.capture('sdk doctor loaded', { needsUpdatingCount })
+    })
+
+    const scanEvents = (): void => {
+        posthog.capture('sdk doctor scan events')
+        loadReport({ forceRefresh: true })
+    }
+
+    const snoozeWarning = (): void => {
+        posthog.capture('sdk doctor snooze warning')
+        snoozeSdkHealth()
+    }
+
+    const showWarningAgain = (): void => {
+        posthog.capture('sdk doctor unsnooze warning')
+        unsnooze()
+    }
+
+    const snoozeNotice = `${pluralize(needsUpdatingCount, 'SDK')} still ${pluralize(
+        needsUpdatingCount,
+        'needs',
+        'need',
+        false
+    )} an update. Snoozed until ${dayjs(snoozedUntil).format('MMM D, YYYY')}.`
+
+    return (
+        <SceneContent>
+            <SceneTitleSection
+                name="SDK Health"
+                description="Monitor and maintain your PostHog SDK integrations by automatically detecting version issues, configuration problems, and implementation patterns across your applications."
+                resourceType={{
+                    to: undefined,
+                    type: 'sdk_health',
+                }}
+                actions={
+                    todayRailNav ? (
+                        <>
+                            <Button
+                                variant="outline"
+                                render={<LinkPrimitive to={urls.healthAlerts(['sdk_outdated'])} />}
+                                onClick={trackAlertsClick}
+                                tooltip="Subscribe to alerts when SDKs go outdated"
+                            >
+                                <IconBell />
+                                Alerts
+                            </Button>
+                            <Button
+                                variant="primary"
+                                disabledReason={loading ? 'Scan in progress' : undefined}
+                                onClick={scanEvents}
+                            >
+                                <IconRefresh />
+                                {loading ? 'Scanning events...' : 'Scan events'}
+                            </Button>
+                        </>
+                    ) : (
+                        <>
+                            <LemonButton
+                                size="small"
+                                type="secondary"
+                                to={urls.healthAlerts(['sdk_outdated'])}
+                                onClick={trackAlertsClick}
+                                icon={<IconBell className="size-4" />}
+                                tooltip="Subscribe to alerts when SDKs go outdated"
+                            >
+                                Alerts
+                            </LemonButton>
+                            <LemonButton
+                                size="small"
+                                type="primary"
+                                disabledReason={loading ? 'Scan in progress' : undefined}
+                                onClick={scanEvents}
+                                icon={<IconRefresh className="size-4" />}
+                            >
+                                {loading ? 'Scanning events...' : 'Scan events'}
+                            </LemonButton>
+                        </>
+                    )
+                }
+            />
+
+            {isDev && !inStorybook() && (
+                <div>
+                    <LemonBanner type="info">
+                        <strong>DEVELOPMENT WARNING!</strong> When running in development, make sure you've run the
+                        Dagster job <LemonTag>cache_github_sdk_versions_job</LemonTag>. Team SDK version data is cached
+                        by the Temporal <LemonTag>sdk_outdated</LemonTag> health check.
+                    </LemonBanner>
+                </div>
+            )}
+
+            <div className="p-3">
+                {loading ? null : hasErrors ? (
+                    <div className="text-center text-muted p-4">
+                        Error loading SDK information. Please try again later.
+                    </div>
+                ) : Object.keys(augmentedData).length === 0 ? (
+                    <div className="text-center text-muted p-4">
+                        No SDK information found. Are you sure you have our SDK installed? You can scan events to get
+                        started.
+                    </div>
+                ) : needsUpdatingCount === 0 ? (
+                    <section className="mb-2">
+                        <h3>SDK health is good</h3>
+                        <LemonBanner type="success" hideIcon={false}>
+                            <p className="font-semibold">No SDK updates needed right now.</p>
+                            <p className="text-sm mt-1">Your SDKs are on the latest version or close behind it.</p>
+                        </LemonBanner>
+                    </section>
+                ) : isSnoozed ? (
+                    <section className="mb-2">
+                        <h3>Update warning snoozed</h3>
+                        <LemonBanner
+                            type="info"
+                            hideIcon={false}
+                            action={{
+                                children: 'Show warning',
+                                onClick: showWarningAgain,
+                                'data-attr': 'sdk-health-unsnooze-warning',
+                            }}
+                        >
+                            <p className="text-sm">{snoozeNotice}</p>
+                        </LemonBanner>
+                    </section>
+                ) : (
+                    <section className="mb-2">
+                        <h3>Time for an update!</h3>
+                        <LemonBanner
+                            type="warning"
+                            hideIcon={false}
+                            action={{
+                                children: 'Snooze warning for 30 days',
+                                onClick: snoozeWarning,
+                                'data-attr': 'sdk-health-snooze-warning',
+                            }}
+                        >
+                            {Object.entries(augmentedData).flatMap(([sdkType, sdk]) =>
+                                sdk.banners.map((banner, index) => (
+                                    <p key={`${sdkType}-${index}`} className="text-sm mb-1">
+                                        {banner}
+                                    </p>
+                                ))
+                            )}
+                            <p className="font-semibold">
+                                An outdated SDK means you're missing out on bug fixes and enhancements.
+                            </p>
+                            <p className="text-sm mt-1">
+                                <Link to="https://posthog.com/docs/sdk-doctor/keeping-sdks-current" target="_blank">
+                                    Learn how
+                                </Link>{' '}
+                                to keep your SDK versions current.
+                            </p>
+                            <p className="text-sm mt-1">See the 'Releases' and 'Docs' links below for more info.</p>
+                        </LemonBanner>
+                    </section>
+                )}
+            </div>
+
+            {Object.keys(augmentedData).map((sdkType) => (
+                <SdkSection key={sdkType} sdkType={sdkType as SdkType} />
+            ))}
+        </SceneContent>
+    )
+}

@@ -1,0 +1,983 @@
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, NoReturn
+
+from django.conf import settings
+
+import pyarrow as pa
+import posthoganalytics
+from redis import exceptions as redis_exceptions
+from structlog.typing import FilteringBoundLogger
+from temporalio import activity
+
+from posthog.dataclasses import frozen
+from posthog.exceptions_capture import capture_exception
+from posthog.redis import get_async_client
+from posthog.sync import database_sync_to_async_pool
+from posthog.temporal.common.errors import NonReportableError
+from posthog.utils import get_machine_id
+
+from products.warehouse_sources.backend.billing import is_in_free_historical_window
+from products.warehouse_sources.backend.logic.source_inputs import SourceInputsStore, UnreadableSourceInputsError
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.common.load import get_incremental_field_value
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.arrow_utils import (
+    DUPLICATE_PRIMARY_KEYS_ERROR,
+    BillingLimitsWillBeReachedException,
+    DuplicatePrimaryKeysException,
+    MissingPrimaryKeysException,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.delta.errors import (
+    is_transient_object_store_error,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.delta.table import DeltaTableRef
+from products.warehouse_sources.backend.temporal.data_imports.row_tracking import (
+    decrement_rows,
+    increment_rows,
+    setup_row_tracking,
+    will_hit_billing_limit,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.primary_keys import resolve_merge_keys
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.metadata import (
+    extract_available_column_names,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
+from products.warehouse_sources.backend.temporal.data_imports.util import NonRetryableException
+from products.warehouse_sources.backend.temporal.data_imports.workload_report import enrich_death_event_properties
+
+if TYPE_CHECKING:
+    from products.warehouse_sources.backend.models.external_data_job import ExternalDataJob
+    from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+    from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+    from products.warehouse_sources.backend.temporal.data_imports.sources.common.cursor import SourceCursorManager
+    from products.warehouse_sources.backend.temporal.data_imports.workflow_activities.import_data_sync import (
+        ImportDataActivityInputs,
+    )
+
+
+@asynccontextmanager
+async def _get_redis():
+    """Returns an async Redis client for row tracking operations."""
+    redis = None
+    try:
+        if not settings.DATA_WAREHOUSE_REDIS_HOST or not settings.DATA_WAREHOUSE_REDIS_PORT:
+            raise Exception(
+                "Missing env vars for dwh row tracking: DATA_WAREHOUSE_REDIS_HOST or DATA_WAREHOUSE_REDIS_PORT"
+            )
+
+        redis = get_async_client(f"redis://{settings.DATA_WAREHOUSE_REDIS_HOST}:{settings.DATA_WAREHOUSE_REDIS_PORT}/")
+        await redis.ping()
+    except Exception as e:
+        capture_exception(e)
+        # get_async_client only builds a lazy client, so a failed ping means redis is
+        # still unreachable - reset it to None so callers' `if redis_client is None` guard
+        # actually skips the real command instead of raising the same error uncaught.
+        redis = None
+
+    yield redis
+
+
+def build_non_retryable_errors_redis_key(team_id: int, source_id: str, run_id: str) -> str:
+    return f"posthog:data_warehouse:non_retryable_errors:{team_id}:{source_id}:{run_id}"
+
+
+NON_RETRYABLE_ERROR_RETRY_LIMIT = 3
+NON_RESUMABLE_HANDOFF_MAX_ATTEMPT_AGE = timedelta(minutes=10)
+
+
+UNREADABLE_JOB_INPUTS_MESSAGE = (
+    "Can't read this source's saved connection settings. Reconnect the source to fix the sync."
+)
+
+
+class UnreadableJobInputsError(Exception):
+    """A stored `job_inputs` value that holds no mapping, so no run of this source can read it.
+
+    Raised as the cause of a `NonRetryableException` because the workflow reads the customer-facing
+    error text off the cause, not off the wrapper.
+    """
+
+
+async def trim_source_job_inputs(source: "ExternalDataSource") -> None:
+    decoded_from_string = SourceInputsStore.stored_as_string(source)
+    try:
+        job_inputs = await SourceInputsStore.aload(source)
+    except UnreadableSourceInputsError:
+        if decoded_from_string:
+            raise NonRetryableException() from UnreadableJobInputsError(UNREADABLE_JOB_INPUTS_MESSAGE)
+        # A value that is not a mapping has no keys to trim. Config parsing reports the invalid value.
+        return
+
+    # A value decoded out of a string is saved even when no key needs trimming, so the row is
+    # rewritten as a mapping once instead of every run reading the string back.
+    did_update_inputs = decoded_from_string
+    for key, value in job_inputs.items():
+        if isinstance(value, str):
+            if value.startswith(" ") or value.endswith(" "):
+                job_inputs[key] = value.strip()
+                did_update_inputs = True
+
+    if did_update_inputs:
+        await SourceInputsStore.asave(source, job_inputs)
+
+
+def _source_type_for_death_event(inputs: "ImportDataActivityInputs") -> str | None:
+    """The source type behind a dying run, so a death event is diagnosable per connector without
+    joining against the source table. Best-effort: the death event must survive a failed lookup."""
+    try:
+        from products.warehouse_sources.backend.models.external_data_source import (  # noqa: PLC0415 — Django models must not be imported at this activity module's load time
+            ExternalDataSource,
+        )
+
+        return (
+            ExternalDataSource.objects.filter(id=inputs.source_id, team_id=inputs.team_id)
+            .values_list("source_type", flat=True)
+            .first()
+        )
+    except Exception:
+        return None
+
+
+def report_heartbeat_timeout(inputs: "ImportDataActivityInputs", logger: FilteringBoundLogger) -> None:
+    logger.debug("Checking for heartbeat timeout reporting...")
+
+    try:
+        info = activity.info()
+        heartbeat_timeout = info.heartbeat_timeout
+        current_attempt_scheduled_time = info.current_attempt_scheduled_time
+
+        if not heartbeat_timeout:
+            logger.debug(f"No heartbeat timeout set for this activity: {heartbeat_timeout}")
+            return
+
+        if not current_attempt_scheduled_time:
+            logger.debug(f"No current attempt scheduled time set for this activity: {current_attempt_scheduled_time}")
+            return
+
+        if info.attempt < 2:
+            logger.debug("First attempt of activity, no heartbeat timeout to report.")
+            return
+
+        heartbeat_details = info.heartbeat_details
+        if not isinstance(heartbeat_details, tuple | list) or len(heartbeat_details) < 1:
+            logger.debug(
+                f"No heartbeat details found to analyze for timeout: {heartbeat_details}. Class: {heartbeat_details.__class__.__name__}"
+            )
+            return
+
+        last_heartbeat = heartbeat_details[-1]
+        logger.debug(f"Resuming activity after failure. Last heartbeat details: {last_heartbeat}")
+
+        if not isinstance(last_heartbeat, dict):
+            logger.debug(
+                f"Last heartbeat details not in expected format (dict). Found: {type(last_heartbeat)}: {last_heartbeat}"
+            )
+            return
+
+        last_heartbeat_host = last_heartbeat.get("host", None)
+        last_heartbeat_timestamp = last_heartbeat.get("ts", None)
+
+        logger.debug(f"Last heartbeat was {last_heartbeat}")
+
+        if last_heartbeat_host is None or last_heartbeat_timestamp is None:
+            logger.debug("Incomplete heartbeat details. No host or timestamp found.")
+            return
+
+        try:
+            last_heartbeat_timestamp = float(last_heartbeat_timestamp)
+        except (TypeError, ValueError):
+            logger.debug(f"Last heartbeat timestamp could not be converted to float: {last_heartbeat_timestamp}")
+            return
+
+        gap_between_beats = current_attempt_scheduled_time.timestamp() - float(last_heartbeat_timestamp)
+        if gap_between_beats > heartbeat_timeout.total_seconds():
+            logger.debug(
+                "Last heartbeat was longer ago than the heartbeat timeout allows. Likely due to a pod OOM or restart.",
+                last_heartbeat_host=last_heartbeat_host,
+                last_heartbeat_timestamp=last_heartbeat_timestamp,
+                gap_between_beats=gap_between_beats,
+                heartbeat_timeout_seconds=heartbeat_timeout.total_seconds(),
+            )
+
+            properties = {
+                "team_id": inputs.team_id,
+                "schema_id": str(inputs.schema_id),
+                "source_id": str(inputs.source_id),
+                "run_id": inputs.run_id,
+                "host": last_heartbeat_host,
+                "gap_between_beats": gap_between_beats,
+                "heartbeat_timeout_seconds": heartbeat_timeout.total_seconds(),
+                "task_queue": info.task_queue,
+                "workflow_id": info.workflow_id,
+                "workflow_run_id": info.workflow_run_id,
+                "workflow_type": info.workflow_type,
+                "attempt": info.attempt,
+                "source_type": _source_type_for_death_event(inputs),
+            }
+            # What the dead attempt said it was doing, and what its pod neighbours said, at the moment
+            # of death — the per-activity context this event otherwise cannot carry. Adds nothing when
+            # no reports exist.
+            enrich_death_event_properties(
+                properties, run_id=str(inputs.run_id), host=last_heartbeat_host, death_ts=last_heartbeat_timestamp
+            )
+
+            posthoganalytics.capture("dwh_pod_heartbeat_timeout", distinct_id=None, properties=properties)
+
+            # Durable per-occurrence record for the repartition trigger to read, snapshotting the
+            # workload evidence the enrichment just gathered — its Redis source expires in hours, and
+            # the row must remain explainable (and re-classifiable) long after. `self_*` is this
+            # team's own data; the co-tenant fields are aggregates only, never other teams' ids.
+            # Best-effort: a write failure here must never disrupt the sync.
+            try:
+                from products.warehouse_sources.backend.models.oom_event import (  # noqa: PLC0415 — Django models must not be imported at this activity module's load time
+                    ExternalDataSchemaOOMEvent,
+                )
+
+                if inputs.schema_id is not None:
+                    # Age of the evidence *at the death*, not at this retry: the last heartbeat is the
+                    # best proxy for when the worker died, and the report's own ts says when the
+                    # evidence was flushed. The rules refuse to exonerate on evidence older than a
+                    # small bound, because a phase flip (extract -> merge) reaches Redis only on the
+                    # next sample, and a merge that OOMs inside that window still shows "extract".
+                    report_ts = properties.get("self_report_ts")
+                    self_report_age = (
+                        max(0.0, last_heartbeat_timestamp - float(report_ts)) if report_ts is not None else None
+                    )
+                    ExternalDataSchemaOOMEvent.objects.for_team(inputs.team_id).create(
+                        team_id=inputs.team_id,
+                        schema_id=inputs.schema_id,
+                        run_id=inputs.run_id,
+                        host=last_heartbeat_host,
+                        gap_seconds=gap_between_beats,
+                        self_phase=properties.get("self_phase"),
+                        self_report_age_at_death_seconds=self_report_age,
+                        self_peak_buffer_bytes=properties.get("self_peak_buffer_bytes"),
+                        # The *correlated* max, not the raw one: raw spans keys retained for up to
+                        # the TTL, so a neighbour that crashed an hour ago (or a survivor's refreshed
+                        # report carrying a long-released lifetime peak) could exonerate a death it
+                        # had nothing to do with. Absent when no co-tenant reported near the death,
+                        # which the culprit rule treats as unknown — it fails open.
+                        co_tenant_correlated_max_peak_buffer_bytes=properties.get(
+                            "co_tenant_correlated_max_peak_buffer_bytes"
+                        ),
+                        co_tenant_report_count=properties.get("co_tenant_report_count"),
+                    )
+            except Exception as record_error:
+                logger.debug(f"Failed to record suspected OOM event for schema {inputs.schema_id}: {record_error}")
+        else:
+            logger.debug("Last heartbeat was within the heartbeat timeout window. No action needed.")
+    except Exception as e:
+        logger.debug(f"Error while reporting heartbeat timeout: {e}", exc_info=e)
+
+
+def count_worker_deaths(inputs: "ImportDataActivityInputs", logger: FilteringBoundLogger) -> int:
+    """Times a worker died on this run without raising. `report_heartbeat_timeout` records each one."""
+    try:
+        from products.warehouse_sources.backend.models.oom_event import (  # noqa: PLC0415 — Django models must not be imported at this activity module's load time
+            ExternalDataSchemaOOMEvent,
+        )
+
+        return (
+            ExternalDataSchemaOOMEvent.objects.for_team(inputs.team_id)
+            .filter(schema_id=inputs.schema_id, run_id=inputs.run_id)
+            .count()
+        )
+    except Exception as e:
+        # The count only makes a read more careful, so a read of it that fails must not fail the sync.
+        logger.debug(f"Could not count worker deaths for schema {inputs.schema_id}: {e}", exc_info=e)
+        return 0
+
+
+async def handle_non_retryable_error(
+    team_id: int,
+    source_id: str,
+    run_id: str,
+    error_msg: str,
+    logger: FilteringBoundLogger,
+    error: Exception,
+) -> NoReturn:
+    async with _get_redis() as redis_client:
+        if redis_client is None:
+            await logger.adebug(f"Failed to get Redis client for non-retryable error tracking. error={error_msg}")
+            raise NonRetryableException() from error
+
+        retry_key = build_non_retryable_errors_redis_key(team_id, source_id, run_id)
+        try:
+            attempts = await redis_client.incr(retry_key)
+            if attempts <= NON_RETRYABLE_ERROR_RETRY_LIMIT:
+                await redis_client.expire(retry_key, 86400)  # Expire after 24 hours
+        except redis_exceptions.RedisError as e:
+            # A successful ping doesn't guarantee later commands still have a Redis to talk to -
+            # treat that the same as a `None` client instead of letting it surface unwrapped and
+            # mask the already-classified `error` behind an ordinary retryable activity failure.
+            capture_exception(e)
+            await logger.adebug(f"Redis became unreachable tracking a non-retryable error. error={error_msg}")
+            raise NonRetryableException() from error
+
+        if attempts <= NON_RETRYABLE_ERROR_RETRY_LIMIT:
+            await logger.adebug(
+                f"Non-retryable error attempt {attempts}/{NON_RETRYABLE_ERROR_RETRY_LIMIT}, retrying. error={error_msg}"
+            )
+            # The caller already matched this error against a known non-retryable pattern (a
+            # customer/upstream condition, e.g. a revoked permission), so re-raising the raw
+            # `error` here would report it to error tracking on every one of these attempts even
+            # though it's fully understood. Wrap it so only the retry behavior survives.
+            raise NonReportableError(error_msg) from error
+
+    await logger.adebug(f"Non-retryable error after {attempts} runs, giving up. error={error_msg}")
+    raise NonRetryableException() from error
+
+
+async def reset_rows_synced_if_needed(
+    job: "ExternalDataJob", should_resume: bool, kept_rows_synced: int | None = None
+) -> None:
+    # Reset the rows_synced count - this may not be 0 if the job restarted due to a heartbeat timeout.
+    #
+    # The incremental cursor is staged and only promoted on completion, so a retried attempt
+    # re-extracts the whole window from batch 0, and keeping the previous attempt's count
+    # double-counts every re-read row — `rows_synced` feeds billed usage via `Sum("rows_synced")`
+    # in usage reports. A resumed attempt picks up the earlier attempt's staged batches instead.
+    #
+    # `kept_rows_synced` is the count through the loaded prefix that moved the watermark this
+    # attempt reads from. This attempt does not read those rows again, so they stay counted.
+    if job.rows_synced is not None and job.rows_synced != 0 and not should_resume:
+        job.rows_synced = min(job.rows_synced, kept_rows_synced or 0)
+        await database_sync_to_async_pool(job.save)(update_fields=["rows_synced", "updated_at"])
+
+
+def resolve_primary_keys(
+    schema: "ExternalDataSchema",
+    resource: SourceResponse,
+) -> list[str] | None:
+    """Resolve the primary keys for an incremental merge with a stable precedence.
+
+    1. Persisted `sync_type_config["primary_key_columns"]` (a user override or an earlier
+       detection) — always wins.
+    2. Otherwise the keys the source detected live this run.
+    3. Otherwise fall back to an `id` column when the schema has one — mirroring the discovery
+       path, which sync-time driver detection (e.g. a flaky Snowflake `SHOW PRIMARY KEYS`) lacks.
+
+    Returns None when no key can be resolved, so the keyless-table guardrail still fires.
+    """
+    return resolve_merge_keys(
+        schema.primary_key_columns,
+        resource.primary_keys,
+        extract_available_column_names(schema.schema_metadata),
+    )
+
+
+async def persist_primary_keys(
+    schema: "ExternalDataSchema",
+    resource: SourceResponse,
+    is_incremental: bool,
+    logger: FilteringBoundLogger,
+) -> None:
+    await _persist_detected_primary_keys(schema, resource, is_incremental, logger)
+    await persist_verified_primary_keys(schema, resource, logger)
+
+
+async def _persist_detected_primary_keys(
+    schema: "ExternalDataSchema",
+    resource: SourceResponse,
+    is_incremental: bool,
+    logger: FilteringBoundLogger,
+) -> None:
+    """Persist a freshly resolved primary key so future runs stop depending on flaky live
+    detection (e.g. a Snowflake `SHOW PRIMARY KEYS` that intermittently returns nothing).
+
+    Only fills an empty stored value — never overwrites a user override — and checks again
+    inside the row lock so a concurrent API edit isn't clobbered. Best-effort: a failure here
+    must not fail an otherwise successful sync.
+    """
+    # A CDC schema snapshots as full_refresh but streams incrementally, so its key has to be
+    # persisted during that first non-incremental run or the streaming phase has none.
+    if schema.primary_key_columns:
+        return
+    if not is_incremental and not schema.is_cdc:
+        return
+    primary_keys = resource.primary_keys
+    if not primary_keys:
+        return
+
+    resolved = list(primary_keys)
+
+    def _set_if_absent(config: dict[str, Any]) -> None:
+        if not config.get("primary_key_columns"):
+            config["primary_key_columns"] = resolved
+
+    from products.warehouse_sources.backend.models.external_data_schema import (  # noqa: PLC0415 — Django model import kept off this activity module's load path
+        update_sync_type_config_keys,
+    )
+
+    try:
+        config = await database_sync_to_async_pool(update_sync_type_config_keys)(
+            schema.id,
+            schema.team_id,
+            mutate=_set_if_absent,
+        )
+        schema.sync_type_config = config
+    except Exception:
+        await logger.aexception("Failed to persist detected primary keys into sync_type_config")
+
+
+async def persist_verified_primary_keys(
+    schema: "ExternalDataSchema",
+    resource: SourceResponse,
+    logger: FilteringBoundLogger,
+) -> None:
+    """Record the key a full-table probe proved unique, so later runs only probe what they read.
+
+    Best-effort: losing this costs another full probe next run, not correctness.
+    """
+    verified = resource.verified_primary_keys
+    if not verified or list(verified) == list(schema.verified_primary_keys or []):
+        return
+
+    from products.warehouse_sources.backend.models.external_data_schema import (  # noqa: PLC0415 — Django model import kept off this activity module's load path
+        update_sync_type_config_keys,
+    )
+
+    try:
+        config = await database_sync_to_async_pool(update_sync_type_config_keys)(
+            schema.id,
+            schema.team_id,
+            updates={"verified_primary_keys": list(verified)},
+        )
+        schema.sync_type_config = config
+    except Exception:
+        await logger.aexception("Failed to persist verified primary keys into sync_type_config")
+
+
+def validate_incremental_sync(
+    is_incremental: bool,
+    resource: SourceResponse,
+    *,
+    is_first_sync: bool = True,
+) -> None:
+    if is_incremental and resource.has_duplicate_primary_keys:
+        raise DuplicatePrimaryKeysException(
+            f"{DUPLICATE_PRIMARY_KEYS_ERROR}. We can't sync incrementally until the table "
+            f"has a unique primary key. Primary keys being used are: {resource.primary_keys}"
+        )
+
+    # The Delta merge needs a key to match rows on, so a keyless incremental table fails once a
+    # table already exists. Raise before extraction rather than letting the writer hit it mid-load:
+    # on pipeline v3 the write happens in the load consumer, which can only fail the job, so the
+    # schema is never paused and the same doomed run repeats on every schedule. A run with a replace
+    # scope appends instead of merging, so it needs no key.
+    if is_incremental and not is_first_sync and not resource.primary_keys and resource.replace_scope is None:
+        raise MissingPrimaryKeysException()
+
+
+async def setup_row_tracking_with_billing_check(
+    team_id: int,
+    schema: "ExternalDataSchema",
+    resource: SourceResponse,
+    source: "ExternalDataSource",
+    logger: FilteringBoundLogger,
+    billable: bool | None = True,
+) -> None:
+    # The limit check sums these rows over every running sync in the organization. A run the check skips (a
+    # non-billable job, or a source in its free first week at the start) must stay out, or it blocks the others.
+    if not resource.rows_to_sync or not billable or is_in_free_historical_window(source.created_at):
+        return
+
+    await increment_rows(team_id, schema.id, resource.rows_to_sync)
+    if await will_hit_billing_limit(team_id=team_id, source=source, logger=logger):
+        raise BillingLimitsWillBeReachedException(
+            f"Your account will hit your Sources billing limits syncing {resource.name} "
+            f"with {resource.rows_to_sync} rows"
+        )
+
+
+def reset_pipeline_requested(
+    schema: "ExternalDataSchema",
+    *,
+    workflow_reset_pipeline: bool | None,
+    scheduled_full_refresh: bool,
+    job_created_at: datetime,
+) -> bool:
+    """Whether this run was asked to load the table again from the start.
+
+    The import and the pre-extraction repartition both read this answer. One function keeps them
+    from a disagreement, in which the repartition rewrites a table that the import then deletes.
+    """
+    if workflow_reset_pipeline is not None:
+        return workflow_reset_pipeline
+    if schema.sync_type_config.get("reset_pipeline", False) is True:
+        return True
+    # Each attempt loads the schema again. Checked at the job's creation, it stays due until the wipe moves the due
+    # time past that point, so a retry after the wipe carries on instead of wiping again. The current time is not
+    # safe: with a 1-day interval and a set time, a wipe more than an hour early leaves that day's slot due.
+    return scheduled_full_refresh and schema.scheduled_full_refresh_due(now=job_created_at)
+
+
+def import_replaces_table(
+    schema: "ExternalDataSchema", *, workflow_reset_pipeline: bool | None, job_created_at: datetime
+) -> bool:
+    """Whether the import that follows the repartition step deletes the table and loads it again.
+
+    Answers before the source is built, so it cannot see three things that the import sees later: a
+    resumed run, a webhook-only resource, and a reset that the source asks for. A resumed run is the
+    second attempt or later, and the repartition step runs before the first. A webhook schema counts
+    as webhook-only here, so the answer for it is always False. In each unseen case the answer is
+    False and the repartition step does what it did before.
+
+    A scheduled full refresh is not an input, because the workflow does not run the repartition step
+    for it.
+    """
+    reset_pipeline = reset_pipeline_requested(
+        schema,
+        workflow_reset_pipeline=workflow_reset_pipeline,
+        scheduled_full_refresh=False,
+        job_created_at=job_created_at,
+    )
+    return resets_table_before_extraction(
+        reset_pipeline, should_resume=False, schema=schema, webhook_only=schema.is_webhook
+    )
+
+
+def resets_table_before_extraction(
+    reset_pipeline: bool,
+    should_resume: bool,
+    schema: "ExternalDataSchema",
+    webhook_only: bool = False,
+    keeps_table: bool = False,
+) -> bool:
+    """Whether `handle_reset_or_full_refresh` deletes the table for these inputs."""
+    from products.warehouse_sources.backend.models.external_data_schema import (  # noqa: PLC0415 — Django model import kept off this activity module's load path
+        ExternalDataSchema,
+    )
+
+    if should_resume:
+        return False
+    if reset_pipeline:
+        return not webhook_only and not keeps_table
+    return schema.sync_type == ExternalDataSchema.SyncType.FULL_REFRESH
+
+
+async def handle_reset_or_full_refresh(
+    reset_pipeline: bool,
+    should_resume: bool,
+    schema: "ExternalDataSchema",
+    delta_table_ref: DeltaTableRef,
+    logger: FilteringBoundLogger,
+    webhook_only: bool = False,
+    keeps_table: bool = False,
+) -> None:
+    """`keeps_table` marks a table that holds the only copy of its data, such as a history table. Its
+    reset starts the sync position over and leaves the table alone."""
+    from products.warehouse_sources.backend.models.external_data_schema import (
+        ExternalDataSchema,
+        update_sync_type_config_keys,
+    )
+
+    if reset_pipeline and webhook_only:
+        # A webhook-only table's rows exist only as webhook-delivered events — the poll does
+        # no backfill, so a wipe could never be rebuilt. Consume the reset request by resuming
+        # webhook ingestion over the existing table: buffered webhook files drain this run, and
+        # any events lost while ingestion was off are unrecoverable either way. Only the flag is
+        # cleared; the incremental watermark and initial_sync_complete are kept since nothing
+        # was wiped.
+        await logger.adebug("Skipping table reset for webhook-only schema; resuming webhook ingestion")
+        # column_type_widened rides along with reset_pipeline (see auto_widen_resync); since this
+        # branch consumes the reset without wiping, drop the marker too so it can't linger forever.
+        await database_sync_to_async_pool(update_sync_type_config_keys)(
+            schema.id, schema.team_id, removes=["reset_pipeline", "column_type_widened"]
+        )
+        # Also drop them from the in-memory config: a later watermark save (update_incremental_field_values
+        # / V3 staging) persists this same schema's sync_type_config, which would otherwise write
+        # reset_pipeline back and leave every subsequent run treated as a reset.
+        if schema.sync_type_config:
+            schema.sync_type_config.pop("reset_pipeline", None)
+            schema.sync_type_config.pop("column_type_widened", None)
+    elif reset_pipeline and not should_resume:
+        if keeps_table:
+            await logger.adebug("Keeping the table through the reset; only its sync position starts over")
+        else:
+            await logger.adebug("Deleting existing table due to reset_pipeline being set")
+            await delta_table_ref.reset_table()
+        await database_sync_to_async_pool(schema.update_sync_type_config_for_reset_pipeline)(
+            promote_pending_repartition=True
+        )
+    elif schema.sync_type == ExternalDataSchema.SyncType.FULL_REFRESH and not should_resume:
+        # Avoid schema mismatches from existing data about to be overwritten
+        await logger.adebug("Deleting existing table due to sync being full refresh")
+        await delta_table_ref.reset_table()
+        # Keep the initial_sync_complete latch: this branch runs on every scheduled full-refresh
+        # sync, and a run that extracts zero rows never reaches post-load to re-set it.
+        await database_sync_to_async_pool(schema.update_sync_type_config_for_reset_pipeline)(
+            clear_initial_sync_complete=False, promote_pending_repartition=True
+        )
+
+
+def _capture_delta_revived(
+    schema: "ExternalDataSchema", job: "ExternalDataJob", *, outcome: str, made_non_billable: bool
+) -> None:
+    """Emit a `warehouse_delta_revived` event so corrupt-log recoveries are observable (how many, salvaged
+    vs reset+rebuild, and whether the rebuild was made non-billable). Best-effort — never blocks the sync."""
+    try:
+        posthoganalytics.capture(
+            distinct_id=get_machine_id(),
+            event="warehouse_delta_revived",
+            properties={
+                "team_id": schema.team_id,
+                "schema_id": str(schema.id),
+                "source_id": str(schema.source_id),
+                "resource_name": schema.name,
+                "job_id": str(job.id),
+                "outcome": outcome,
+                "made_non_billable": made_non_billable,
+            },
+        )
+    except Exception as e:
+        capture_exception(e)
+
+
+class KeptTableCorruptError(Exception):
+    """A corrupt table that holds the only copy of its data, so no run can rebuild it. Non-retryable."""
+
+
+async def handle_corrupted_delta_log(
+    schema: "ExternalDataSchema",
+    job: "ExternalDataJob",
+    delta_table_ref: DeltaTableRef,
+    logger: FilteringBoundLogger,
+    *,
+    table_will_be_reset: bool = False,
+    keeps_table: bool = False,
+) -> bool:
+    """Detect and revive a corrupt Delta table before extraction.
+
+    Two corruption signatures trigger it:
+
+    - `_delta_log` unreadable (open raises DeltaError / FileNotFoundError) — interrupted repartition
+      swaps and OOM-crashed merges leave this, after which every sync fails to open the table and
+      loops forever.
+    - The schema's `delta_revive_required` marker — set by the repartition activity when the log
+      opens fine but references data files that are gone from S3 (a hollow table an interleaved swap
+      left behind). Only a full scan discovers that state, so it arrives as a marker rather than a
+      check here.
+
+    Runs before extraction so the table self-heals in the same run:
+
+    - Salvage: an interrupted repartition swap that left a `ready` temp table is finished from temp (no
+      re-pull from source).
+    - Otherwise the table is reset so this run rebuilds it from source, and the job is marked
+      non-billable — the corruption is our fault, not the customer's.
+
+    `table_will_be_reset` says that this run deletes the table before extraction in any case (a
+    scheduled full refresh or a requested reset). The delete does not read the log, so an unreadable
+    log needs no detection there, and the open is skipped. A revive marker and a staged swap are
+    still handled, because they need more than the delete.
+
+    `keeps_table` marks a table that holds the only copy of its data, such as a history table. A rebuild
+    from the source can't bring that data back, so it is never reset here: `KeptTableCorruptError` stops
+    the run and leaves the table for a repair.
+
+    Returns True if a revive happened. Otherwise best-effort: any other failure here must not block the sync.
+    """
+    revive_marker = schema.delta_revive_required
+    if revive_marker is None:
+        if table_will_be_reset and schema.repartition_swap is None:
+            return False
+        try:
+            if not await delta_table_ref.is_table_corrupted():
+                return False
+        except Exception as e:
+            if is_transient_object_store_error(e):
+                # `is_table_corrupted` opens the table via `DeltaTable.is_deltatable`, which can hit
+                # the same IMDS/STS credential-provider or connectivity blips as any other delta-rs
+                # object-store call — not evidence the table is corrupt, just a blip talking to our
+                # own S3 bucket. Skip the revive check this sync rather than reporting a defect; the
+                # next sync's check runs fresh.
+                await logger.awarning(
+                    f"handle_corrupted_delta_log: is_table_corrupted transient object-store error, "
+                    f"skipping revive check schema_id={schema.id}: {e}"
+                )
+                return False
+            capture_exception(e)
+            return False
+
+    await logger.awarning(
+        f"handle_corrupted_delta_log: {'revive marker set' if revive_marker else 'unreadable delta log detected'}, "
+        f"reviving schema_id={schema.id}",
+        schema_id=str(schema.id),
+    )
+
+    # Salvage first: finish an interrupted repartition swap from its `ready` temp table (delete the corrupt
+    # live, copy temp into place) rather than re-pull from source. `_resume_swap_with_missing_live` skips
+    # and clears the markers when temp is also gone (the terminal corrupt state), so we then fall to reset.
+    swap = schema.repartition_swap
+    if swap and swap.get("state") == "ready" and swap.get("temp_uri") and swap.get("live_uri"):
+        from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.repartition import (  # noqa: PLC0415 — deferred to avoid an import cycle with the repartition modules
+            _resume_swap_with_missing_live,
+        )
+        from products.warehouse_sources.backend.temporal.data_imports.workflow_activities.repartition_table import (  # noqa: PLC0415 — deferred to avoid an import cycle with the repartition modules
+            RepartitionTarget,
+            _target_from_schema,
+        )
+
+        try:
+            target = (
+                RepartitionTarget.from_dict(schema.repartition_pending)
+                if schema.repartition_pending is not None
+                else _target_from_schema(schema)
+            )
+            result = await _resume_swap_with_missing_live(
+                table_ref=delta_table_ref,
+                schema=schema,
+                target=target,
+                temp_uri=swap["temp_uri"],
+                live_uri=swap["live_uri"],
+                storage_options=delta_table_ref.get_storage_options(),
+                logger=logger,
+            )
+            if result.get("outcome") == "completed":
+                from products.warehouse_sources.backend.models.external_data_schema import (  # noqa: PLC0415 — Django model import kept off this activity module's load path
+                    update_sync_type_config_keys,
+                )
+
+                # The completed swap copied the full temp table over live, so any hollow-table
+                # marker is stale now. Refresh the in-memory config from the persisted result —
+                # this schema object keeps saving `sync_type_config` for the rest of the run, and
+                # a stale copy would write the marker back, re-arming the revive every sync.
+                schema.sync_type_config = await database_sync_to_async_pool(update_sync_type_config_keys)(
+                    schema.id, schema.team_id, removes=["delta_revive_required"]
+                )
+                await logger.ainfo(
+                    f"handle_corrupted_delta_log: salvaged from interrupted swap schema_id={schema.id}",
+                    schema_id=str(schema.id),
+                )
+                _capture_delta_revived(schema, job, outcome="salvaged", made_non_billable=False)
+                return True
+        except Exception as e:
+            capture_exception(e)
+            await logger.aexception(f"handle_corrupted_delta_log: salvage failed, resetting: {e}", exc_info=e)
+
+    if keeps_table:
+        await logger.aerror(
+            f"handle_corrupted_delta_log: keeping the corrupt table for a repair, schema_id={schema.id}",
+            schema_id=str(schema.id),
+        )
+        # A run would extract and bill rows it can't write, so syncs stop until the repair.
+        raise KeptTableCorruptError(
+            f"The table of {schema.name} is damaged, and it holds the only copy of its data, so it can't be "
+            "rebuilt from the source. Syncs stop until it's repaired. Contact support."
+        )
+
+    # Reset + rebuild from source in this run, marked non-billable — we caused the corruption.
+    from products.warehouse_sources.backend.models.external_data_schema import (  # noqa: PLC0415 — Django model import kept off this activity module's load path
+        update_sync_type_config_keys,
+    )
+
+    try:
+        await delta_table_ref.reset_table()
+    except Exception as e:
+        if is_transient_object_store_error(e):
+            # A rate-limited or connectivity blip purging the old table's S3 prefix isn't a bug —
+            # the revive markers stay set, so the next sync attempt retries the same reset from
+            # scratch. Escalating this through the non-retryable-error policy below would burn
+            # through its attempt budget on pure S3 throttling and give up on a revivable schema.
+            await logger.awarning(
+                f"handle_corrupted_delta_log: reset_table transient object-store error, retrying next sync, "
+                f"schema_id={schema.id}: {e}"
+            )
+            return False
+        # A reset that can't even complete (e.g. the storage backend rejects the delete) leaves the
+        # revive markers in place, so an unguarded re-raise here would repeat this exact same failing
+        # reset on every subsequent sync attempt forever. Give up after a few identical failures
+        # instead of looping — same policy as any other non-retryable import error.
+        capture_exception(e)
+        await logger.aexception(
+            f"handle_corrupted_delta_log: reset_table failed, schema_id={schema.id}: {e}", exc_info=e
+        )
+        await handle_non_retryable_error(schema.team_id, str(job.pipeline_id), str(job.id), str(e), logger, e)
+
+    await database_sync_to_async_pool(schema.update_sync_type_config_for_reset_pipeline)()
+    # Refresh the in-memory config from the persisted result — this schema object keeps saving
+    # `sync_type_config` for the rest of the run (incremental staging, partition bookkeeping), and
+    # a stale copy would write the marker back, re-arming a non-billable revive on every sync.
+    schema.sync_type_config = await database_sync_to_async_pool(update_sync_type_config_keys)(
+        schema.id, schema.team_id, removes=["repartition_pending", "repartition_swap", "delta_revive_required"]
+    )
+    was_billable = bool(job.billable)
+    if job.billable:
+        job.billable = False
+        await database_sync_to_async_pool(job.save)(update_fields=["billable"])
+        # The run registered its row estimate while the job was still billable. The estimate must
+        # stop counting toward the limit check, the same as for a job that starts non-billable.
+        await setup_row_tracking(schema.team_id, schema.id)
+
+    _capture_delta_revived(schema, job, outcome="reset_rebuild", made_non_billable=was_billable)
+    await logger.awarning(
+        f"handle_corrupted_delta_log: reset corrupt table for non-billable rebuild schema_id={schema.id}",
+        schema_id=str(schema.id),
+    )
+    return True
+
+
+def cleanup_memory(pa_memory_pool: pa.MemoryPool, py_table: pa.Table | None = None) -> None:
+    if py_table is not None:
+        del py_table
+    pa_memory_pool.release_unused()
+
+
+@frozen
+class IncrementalFieldValues:
+    last_value: Any
+    earliest_value: Any
+
+
+async def update_incremental_field_values(
+    schema: "ExternalDataSchema",
+    pa_table: pa.Table,
+    resource: SourceResponse,
+    last_incremental_field_value: Any,
+    earliest_incremental_field_value: Any,
+    logger: FilteringBoundLogger,
+    log_prefix: str = "",
+    staging_run_uuid: str | None = None,
+) -> IncrementalFieldValues:
+    last_value = get_incremental_field_value(schema, pa_table)
+
+    if last_value is not None:
+        last_advanced = (last_incremental_field_value is None) or (last_value > last_incremental_field_value)
+        if last_advanced:
+            last_incremental_field_value = last_value
+
+        # The loader promotes the staged value only when the run completes, so the largest value
+        # read is the watermark with or without an order. A descending read stages it at the end.
+        if resource.sort_mode != "desc":
+            await logger.adebug(
+                f"{log_prefix}Updating incremental_field_last_value with {last_incremental_field_value}"
+            )
+            if staging_run_uuid is not None:
+                await database_sync_to_async_pool(schema.stage_incremental_field_value)(
+                    staging_run_uuid, last_incremental_field_value
+                )
+            else:
+                await database_sync_to_async_pool(schema.update_incremental_field_value)(last_incremental_field_value)
+
+        if resource.sort_mode == "desc":
+            earliest_value = get_incremental_field_value(schema, pa_table, aggregate="min")
+            earliest_advanced = (
+                earliest_incremental_field_value is None or earliest_value < earliest_incremental_field_value
+            )
+            if earliest_advanced:
+                earliest_incremental_field_value = earliest_value
+                await logger.adebug(f"{log_prefix}Updating incremental_field_earliest_value with {earliest_value}")
+
+            if staging_run_uuid is not None:
+                # The high-water mark is staged with every checkpoint so a resumed attempt can inherit it
+                # (see `staged_run_last_value`). Staging is not promotion: the loader promotes the
+                # watermark only when the final batch of the run completes the job.
+                if last_advanced or earliest_advanced:
+                    await database_sync_to_async_pool(schema.stage_incremental_field_value)(
+                        staging_run_uuid,
+                        last_incremental_field_value,
+                        earliest_value if earliest_advanced else None,
+                    )
+            elif earliest_advanced:
+                await database_sync_to_async_pool(schema.update_incremental_field_value)(
+                    earliest_value, type="earliest"
+                )
+
+    return IncrementalFieldValues(
+        last_value=last_incremental_field_value, earliest_value=earliest_incremental_field_value
+    )
+
+
+async def update_row_tracking_after_batch(
+    job_id: str,
+    team_id: int,
+    schema_id: Any,
+    row_count: int,
+    logger: FilteringBoundLogger,
+) -> None:
+    from products.warehouse_sources.backend.temporal.data_imports.pipelines.common.load import update_job_row_count
+
+    await update_job_row_count(job_id, row_count, logger)
+    await decrement_rows(team_id, schema_id, row_count)
+
+
+def is_young_first_attempt(shutdown_grace_seconds: float = 0.0) -> bool:
+    """`shutdown_grace_seconds` is the time the shutdown monitor let the run continue after the signal.
+
+    It does not count toward the age, so the grace never turns a run that was young at the signal into
+    one that keeps the worker until it finishes.
+    """
+    if not activity.in_activity():
+        return False
+
+    info = activity.info()
+    age = datetime.now(UTC) - info.started_time - timedelta(seconds=shutdown_grace_seconds)
+    return info.attempt == 1 and age < NON_RESUMABLE_HANDOFF_MAX_ATTEMPT_AGE
+
+
+def should_check_shutdown(
+    schema: "ExternalDataSchema",
+    resource: SourceResponse,
+    reset_pipeline: bool,
+    source_is_resumable: bool,
+    shutdown_grace_seconds: float = 0.0,
+) -> bool:
+    # A descending run does not raise, because each stop restarts it from the old watermark. An ascending
+    # incremental run keeps its progress after a stop only through the handoff checkpoint.
+    # Let a new attempt leave a shutting-down worker before it holds the worker for hours.
+    # Limit handoffs to attempt one so full refresh keeps two attempts for retries.
+    # Raising during a full reset will reset our progress back to 0 rows
+    incremental_sync_raise_during_shutdown = (
+        schema.should_use_incremental_field and resource.sort_mode != "desc" and not reset_pipeline
+    )
+    return (
+        incremental_sync_raise_during_shutdown or source_is_resumable or is_young_first_attempt(shutdown_grace_seconds)
+    )
+
+
+async def finalize_desc_sort_incremental_value(
+    resource: SourceResponse,
+    schema: "ExternalDataSchema",
+    last_incremental_field_value: Any,
+    logger: FilteringBoundLogger,
+    log_prefix: str = "",
+    staging_run_uuid: str | None = None,
+) -> None:
+    if resource.sort_mode == "desc" and last_incremental_field_value is not None:
+        await logger.adebug(
+            f"{log_prefix}Sort mode is 'desc' -> updating incremental_field_last_value "
+            f"with {last_incremental_field_value}"
+        )
+        await database_sync_to_async_pool(schema.refresh_from_db)()
+        if staging_run_uuid is not None:
+            await database_sync_to_async_pool(schema.stage_incremental_field_value)(
+                staging_run_uuid, last_incremental_field_value
+            )
+        else:
+            await database_sync_to_async_pool(schema.update_incremental_field_value)(last_incremental_field_value)
+
+
+async def commit_source_cursor(
+    source_cursor_manager: "SourceCursorManager[Any] | None",
+    schema: "ExternalDataSchema",
+    logger: FilteringBoundLogger,
+    *,
+    staging_run_uuid: str | None,
+    log_prefix: str = "",
+) -> None:
+    """Persist the cursor the source staged, once this run's rows are durable or about to be.
+
+    With `staging_run_uuid`, the cursor waits in the staged slot until the loader promotes it with
+    the final batch, so a load that fails never leaves the cursor past rows it did not write.
+    Without it, the caller has already written every row and the cursor is stored directly.
+    """
+    if source_cursor_manager is None:
+        return
+    payload = source_cursor_manager.staged_payload()
+    if payload is None:
+        return
+
+    await logger.adebug(f"{log_prefix}Committing source cursor", kind=payload["kind"], staged=staging_run_uuid)
+    if staging_run_uuid is not None:
+        await database_sync_to_async_pool(schema.stage_source_cursor)(staging_run_uuid, payload)
+    else:
+        await database_sync_to_async_pool(schema.update_source_cursor)(payload)

@@ -1,0 +1,34 @@
+import { urls } from 'scenes/urls'
+
+import { ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
+
+import { ProductManifest } from '../../frontend/src/types'
+
+export const manifest: ProductManifest = {
+    name: 'Toolbar',
+    scenes: {
+        Toolbar: {
+            name: 'Toolbar',
+            projectBased: true,
+            description: 'PostHog toolbar launches PostHog right in your app or website.',
+            iconType: 'toolbar',
+            docsHref: 'https://posthog.com/docs/toolbar',
+        },
+    },
+    urls: {
+        toolbarLaunch: (): string => '/toolbar',
+    },
+    treeItemsProducts: [
+        {
+            path: 'Toolbar',
+            intents: [ProductKey.TOOLBAR],
+            href: urls.toolbarLaunch(),
+            searchKeywords: ['authorized urls', 'inspect element'],
+            type: 'toolbar',
+            category: ProductItemCategory.TOOLS,
+            iconType: 'toolbar',
+            iconColor: ['var(--color-product-toolbar-light)', 'var(--color-product-toolbar-dark)'],
+            sceneKey: 'Toolbar',
+        },
+    ],
+}

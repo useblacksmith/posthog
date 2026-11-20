@@ -1,0 +1,1422 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from threading import Barrier
+from typing import TYPE_CHECKING
+
+import pytest
+from posthog.test.base import APIBaseTest, BaseTest
+from unittest.mock import patch
+
+from django.db import connection, connections
+from django.test import SimpleTestCase
+
+from asgiref.sync import async_to_sync
+from parameterized import parameterized
+from rest_framework import status
+from rest_framework.test import APIClient
+
+from posthog.models import Organization, User
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.team.team import Team
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+
+from products.alerts.backend.models.alert import AlertConfiguration
+from products.product_analytics.backend.facade.models import Insight
+from products.signals.backend.emission.steering import afetch_source_config
+from products.signals.backend.facade.api import set_signal_source_types_enabled
+from products.signals.backend.facade.source_configs import (
+    AlertFilterOutcome,
+    AlertNamePatterns,
+    enabled_issue_filters,
+    evaluate_alert_filter,
+    get_analytics_alert_name_patterns,
+    get_analytics_alert_scope,
+)
+from products.signals.backend.models import (
+    SignalFilterCatalogVersion,
+    SignalFilterSourceDefinition,
+    SignalSourceConfig,
+    SignalSourceFilterState,
+)
+from products.signals.backend.serializers import SignalSourceConfigSerializer
+from products.signals.backend.source_filters import saved_filter_fingerprint, writes_open
+from products.warehouse_sources.backend.facade.models import ExternalDataSchema, ExternalDataSource
+
+from common.hogvm.python.execute import execute_bytecode
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+_SAVED_FILTER = {"expression": "assignee_id IS NULL", "catalog_version": 1}
+
+
+class TestSignalSourceConfigAPI(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        # Enabling `session_analysis_cluster` gates on org-level AI consent.
+        self.organization.is_ai_data_processing_approved = True
+        self.organization.save(update_fields=["is_ai_data_processing_approved"])
+
+    def _url(self, config_id: str | None = None) -> str:
+        base = f"/api/projects/{self.team.id}/signals/source_configs/"
+        if config_id:
+            return f"{base}{config_id}/"
+        return base
+
+    # --- Alert pattern preview ---
+
+    @parameterized.expand(
+        [
+            (
+                "valid",
+                {"alert_allow_patterns": ["(?i)^checkout", "revenue"], "alert_block_patterns": [" test"]},
+                None,
+                None,
+                ["not_allowed", "blocked", "passed"],
+            ),
+            ("no_patterns", {}, None, None, ["passed", "passed", "passed"]),
+            (
+                "invalid_allow",
+                {"alert_allow_patterns": ["(checkout"], "alert_block_patterns": ["test"]},
+                "Pattern '(checkout' is not a valid RE2 regex: missing ): (checkout",
+                None,
+                [],
+            ),
+            (
+                "too_many_block",
+                {"alert_block_patterns": [f"p{i}" for i in range(21)]},
+                None,
+                "Must have at most 20 patterns",
+                [],
+            ),
+        ]
+    )
+    def test_alert_pattern_preview(self, _name, body, allow_error, block_error, outcomes):
+        for alert_name, insight_name in [
+            ("Checkout conversion", "Weekly revenue"),
+            ("Checkout test", "Checkout funnel"),
+            ("Signups", "Daily signups"),
+        ]:
+            insight = Insight.objects.create(team=self.team, name=insight_name)
+            AlertConfiguration.objects.create(team=self.team, insight=insight, name=alert_name, enabled=True)
+
+        response = self.client.post(f"{self._url()}alert_pattern_preview/", data=body, format="json")
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        data = response.json()
+        assert data["alert_allow_patterns_error"] == allow_error
+        assert data["alert_block_patterns_error"] == block_error
+        assert [alert["outcome"] for alert in data["alerts"]] == outcomes
+        assert data["has_more"] is False
+
+    # --- Create ---
+
+    def test_create_source_config(self):
+        response = self.client.post(
+            self._url(),
+            data={
+                "source_product": "session_replay",
+                "source_type": "session_analysis_cluster",
+                "enabled": True,
+                "config": {"recording_filters": {"duration_min": 5}},
+            },
+            format="json",
+        )
+        data = response.json()
+        assert response.status_code == status.HTTP_201_CREATED, data
+        assert data["source_product"] == "session_replay"
+        assert data["source_type"] == "session_analysis_cluster"
+        assert data["enabled"] is True
+        # `sample_rate` is auto-set to the default for newly created session-analysis configs.
+        assert data["config"] == {"recording_filters": {"duration_min": 5}, "sample_rate": 0.1}
+        assert SignalSourceConfig.objects.filter(id=data["id"], team=self.team).exists()
+
+    def test_create_source_config_sets_created_by(self):
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "session_replay", "source_type": "session_analysis_cluster"},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+        config = SignalSourceConfig.objects.get(id=response.json()["id"])
+        assert config.created_by_id == self.user.id
+
+    def test_create_source_config_defaults(self):
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "session_replay", "source_type": "session_analysis_cluster"},
+            format="json",
+        )
+        data = response.json()
+        assert response.status_code == status.HTTP_201_CREATED, data
+        assert data["enabled"] is True
+        assert data["config"] == {"sample_rate": 0.1}
+
+    def test_create_source_config_preserves_user_provided_sample_rate(self):
+        response = self.client.post(
+            self._url(),
+            data={
+                "source_product": "session_replay",
+                "source_type": "session_analysis_cluster",
+                "config": {"sample_rate": 0.5},
+            },
+            format="json",
+        )
+        data = response.json()
+        assert response.status_code == status.HTTP_201_CREATED, data
+        assert data["config"] == {"sample_rate": 0.5}
+
+    def test_create_source_config_no_default_for_other_source_types(self):
+        # Defaulting only applies to session_replay/session_analysis_cluster.
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "github", "source_type": "issue", "enabled": False},
+            format="json",
+        )
+        data = response.json()
+        assert response.status_code == status.HTTP_201_CREATED, data
+        assert data["config"] == {}
+
+    def test_create_source_config_invalid_source_type(self):
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "session_replay", "source_type": "nonexistent_type"},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "source_type" in str(response.json())
+
+    def test_create_session_analysis_cluster_rejected_without_ai_consent(self):
+        self.organization.is_ai_data_processing_approved = False
+        self.organization.save(update_fields=["is_ai_data_processing_approved"])
+        response = self.client.post(
+            self._url(),
+            data={
+                "source_product": "session_replay",
+                "source_type": "session_analysis_cluster",
+                "enabled": True,
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "AI data processing" in str(response.json())
+
+    def test_create_session_analysis_cluster_allowed_when_disabled_without_consent(self):
+        self.organization.is_ai_data_processing_approved = False
+        self.organization.save(update_fields=["is_ai_data_processing_approved"])
+        response = self.client.post(
+            self._url(),
+            data={
+                "source_product": "session_replay",
+                "source_type": "session_analysis_cluster",
+                "enabled": False,
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+
+    def test_create_duplicate_source_type_per_team_rejected(self):
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "session_replay", "source_type": "session_analysis_cluster"},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "already exists" in str(response.json())
+
+    def test_same_source_type_allowed_on_different_teams(self):
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        other_team = Team.objects.create(organization=self.organization, name="Other Team")
+        SignalSourceConfig.objects.create(
+            team=other_team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        assert SignalSourceConfig.objects.filter(source_type="session_analysis_cluster").count() == 2
+
+    # --- Config validation ---
+
+    @parameterized.expand(
+        [
+            ("valid_recording_filters", {"recording_filters": {"duration_min": 5}}, status.HTTP_201_CREATED),
+            ("empty_config", {}, status.HTTP_201_CREATED),
+            ("recording_filters_not_dict", {"recording_filters": "bad"}, status.HTTP_400_BAD_REQUEST),
+        ]
+    )
+    def test_create_config_validation(self, _name, config, expected_status):
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "session_replay", "source_type": "session_analysis_cluster", "config": config},
+            format="json",
+        )
+        assert response.status_code == expected_status, response.json()
+
+    @parameterized.expand(
+        [
+            ("valid_steering", {"steering": "Ignore issues labeled chore"}, status.HTTP_201_CREATED),
+            ("steering_at_cap", {"steering": "x" * 2000}, status.HTTP_201_CREATED),
+            ("steering_over_cap", {"steering": "x" * 2001}, status.HTTP_400_BAD_REQUEST),
+            ("steering_not_string", {"steering": ["skip", "chores"]}, status.HTTP_400_BAD_REQUEST),
+            ("valid_default_not_actionable", {"default_not_actionable": True}, status.HTTP_201_CREATED),
+            ("default_not_actionable_not_bool", {"default_not_actionable": "yes"}, status.HTTP_400_BAD_REQUEST),
+            (
+                "both_keys_valid",
+                {"steering": "Release checklists are never actionable", "default_not_actionable": False},
+                status.HTTP_201_CREATED,
+            ),
+            # Falsy non-dict values must be rejected, not skipped by a truthiness guard.
+            ("config_list", [], status.HTTP_400_BAD_REQUEST),
+            ("config_string", "skip chores", status.HTTP_400_BAD_REQUEST),
+            # Explicit nulls violate the key types and must not persist.
+            ("steering_null", {"steering": None}, status.HTTP_400_BAD_REQUEST),
+            ("default_not_actionable_null", {"default_not_actionable": None}, status.HTTP_400_BAD_REQUEST),
+        ]
+    )
+    def test_create_steering_config_validation(self, _name, config, expected_status):
+        # Steering keys are shared by every emission source, so they validate on a
+        # non-session-replay source too.
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "github", "source_type": "issue", "enabled": False, "config": config},
+            format="json",
+        )
+        assert response.status_code == expected_status, response.json()
+        if expected_status == status.HTTP_201_CREATED:
+            assert response.json()["config"] == config
+
+    def test_create_linear_config_persists_team_ids(self):
+        # Wiring guard for the serializer-level matrix in TestSignalSourceConfigSerializerValidation.
+        config = {"linear_team_ids": ["team-1", "team-2"], "steering": "Skip chores"}
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "linear", "source_type": "issue", "config": config},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        assert response.json()["config"] == config
+        assert SignalSourceConfig.objects.get(id=response.json()["id"]).config == config
+
+    # --- List ---
+
+    def test_list_source_configs(self):
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        response = self.client.get(self._url())
+        data = response.json()
+        assert response.status_code == status.HTTP_200_OK
+        assert len(data["results"]) == 1
+        assert data["results"][0]["source_type"] == "session_analysis_cluster"
+
+    def test_list_excludes_other_teams(self):
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        other_team = Team.objects.create(organization=self.organization, name="Other Team")
+        SignalSourceConfig.objects.create(
+            team=other_team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+
+        response = self.client.get(self._url())
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()["results"]) == 1
+
+    def _filter_state_row(self, team: Team, *, live: str = "yes", from_current_filter: bool = True, **fields) -> None:
+        source = ExternalDataSource.objects.create(
+            team=team, source_type="Linear", status="Running", prefix="linear_", deleted=live == "source_deleted"
+        )
+        schema = ExternalDataSchema.objects.create(
+            team=team, source=source, name="issues", deleted=live == "schema_deleted"
+        )
+        saved = _SAVED_FILTER if from_current_filter else {"expression": "priority = 1", "catalog_version": 1}
+        SignalSourceFilterState.objects.create(
+            team=team,
+            source_product="linear",
+            source_type="issue",
+            schema_id=schema.id,
+            filter_fingerprint=saved_filter_fingerprint(saved),
+            **fields,
+        )
+
+    def _linear_config(self, team: Team, *, has_filter: bool = True) -> None:
+        SignalSourceConfig.objects.create(
+            team=team,
+            source_product="linear",
+            source_type="issue",
+            config={"hogql_filter": _SAVED_FILTER} if has_filter else {},
+            created_by=self.user,
+        )
+
+    @parameterized.expand(
+        [
+            (
+                "one_failing_schema_makes_the_source_failing",
+                True,
+                [
+                    {"last_success_at": datetime(2026, 11, 10, 8, tzinfo=UTC), "last_malformed_count": 2},
+                    {
+                        "last_error_code": "unknown_field",
+                        "last_error_message": "Use an unqualified field from the filter catalog.",
+                        "last_error_at": datetime(2026, 11, 10, 9, tzinfo=UTC),
+                        "pending_window_start": datetime(2026, 11, 9, tzinfo=UTC),
+                        "last_malformed_count": 1,
+                    },
+                ],
+                {
+                    "state": "failing",
+                    "error_code": "unknown_field",
+                    "error_message": "Use an unqualified field from the filter catalog.",
+                    "failed_at": "2026-11-10T09:00:00Z",
+                    "unread_since": "2026-11-09T00:00:00Z",
+                    "last_success_at": "2026-11-10T08:00:00Z",
+                    "malformed_count": 3,
+                },
+            ),
+            (
+                "removed_filter_hides_old_failures",
+                False,
+                [{"last_error_code": "query_failed", "last_error_at": datetime(2026, 11, 10, tzinfo=UTC)}],
+                None,
+            ),
+            ("not_fetched_with_the_filter_yet", True, [], None),
+            (
+                "result_of_a_replaced_filter_is_hidden",
+                True,
+                [{"from_current_filter": False, "last_error_code": "catalog_missing"}],
+                None,
+            ),
+            (
+                "failure_on_a_deleted_connection_is_ignored",
+                True,
+                [
+                    {"live": "source_deleted", "last_error_code": "query_failed"},
+                    {"last_success_at": datetime(2026, 11, 10, 8, tzinfo=UTC)},
+                ],
+                {
+                    "state": "ok",
+                    "error_code": None,
+                    "error_message": None,
+                    "failed_at": None,
+                    "unread_since": None,
+                    "last_success_at": "2026-11-10T08:00:00Z",
+                    "malformed_count": 0,
+                },
+            ),
+            (
+                "failure_on_a_deleted_schema_is_ignored",
+                True,
+                [{"live": "schema_deleted", "last_error_code": "query_failed"}],
+                None,
+            ),
+        ]
+    )
+    def test_list_reports_filter_status(self, _name, has_filter, state_rows, expected):
+        self._linear_config(self.team, has_filter=has_filter)
+        for row in state_rows:
+            self._filter_state_row(self.team, **row)
+
+        response = self.client.get(self._url())
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["results"][0]["filter_status"] == expected
+
+    def test_filter_status_reads_only_its_own_environment(self):
+        child = Team.objects.create(organization=self.organization, project=self.team.project, parent_team=self.team)
+        self._filter_state_row(self.team, last_error_code="query_failed")
+        self._filter_state_row(child, last_success_at=datetime(2026, 11, 10, 8, tzinfo=UTC))
+        self._linear_config(child)
+
+        response = self.client.get(f"/api/projects/{child.id}/signals/source_configs/")
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["results"][0]["filter_status"]["state"] == "ok"
+
+    # --- Retrieve ---
+
+    def test_retrieve_source_config(self):
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            config={"recording_filters": {"duration_min": 10}},
+            created_by=self.user,
+        )
+        response = self.client.get(self._url(str(config.id)))
+        data = response.json()
+        assert response.status_code == status.HTTP_200_OK
+        assert data["id"] == str(config.id)
+        assert data["source_type"] == "session_analysis_cluster"
+        assert data["config"] == {"recording_filters": {"duration_min": 10}}
+
+    def test_retrieve_other_teams_config_forbidden(self):
+        other_team = Team.objects.create(organization=self.organization, name="Other Team")
+        config = SignalSourceConfig.objects.create(
+            team=other_team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        response = self.client.get(self._url(str(config.id)))
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @parameterized.expand([({"enabled": False},), ({"config_set": {"steering": "Example"}},)])
+    def test_update_other_teams_config_forbidden(self, body: dict[str, object]) -> None:
+        other_team = Team.objects.create(organization=self.organization, name="Other Team")
+        config = SignalSourceConfig.objects.create(
+            team=other_team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        response = self.client.patch(
+            self._url(str(config.id)),
+            data=body,
+            format="json",
+        )
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    # --- Update ---
+
+    def test_update_enabled(self):
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            enabled=True,
+            created_by=self.user,
+        )
+        response = self.client.patch(
+            self._url(str(config.id)),
+            data={"enabled": False},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["enabled"] is False
+        config.refresh_from_db()
+        assert config.enabled is False
+
+    def test_update_config(self):
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            config={"steering": "Original guidance", "hogql_filter": "false"},
+            created_by=self.user,
+        )
+        response = self.client.patch(
+            self._url(str(config.id)),
+            data={"config": {"recording_filters": {"duration_min": 30}}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["config"] == {"recording_filters": {"duration_min": 30}}
+
+    def test_config_key_updates_preserve_unrelated_settings(self) -> None:
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="linear",
+            source_type="issue",
+            config={"hogql_filter": "false", "default_not_actionable": True, "nested": {"keep": True}},
+        )
+        response = self.client.patch(
+            self._url(str(config.id)),
+            {
+                "config_set": {"steering": "Prioritize documentation tasks"},
+                "config_remove": ["default_not_actionable", "missing"],
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        response = self.client.patch(
+            self._url(str(config.id)),
+            {"config_set": {"linear_team_ids": [" team-example "], "nested": {"replace": True}, "nullable": None}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        config.refresh_from_db()
+        assert config.config == {
+            "hogql_filter": "false",
+            "nested": {"replace": True},
+            "nullable": None,
+            "steering": "Prioritize documentation tasks",
+            "linear_team_ids": ["team-example"],
+        }
+        assert response.json()["config"] == config.config
+        assert "config_set" not in response.json()
+        assert "config_remove" not in response.json()
+
+    def test_invalid_merged_config_does_not_write_other_fields(self) -> None:
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="linear",
+            source_type="issue",
+            enabled=False,
+            config={"linear_team_ids": "invalid", "default_not_actionable": True},
+        )
+        updated_at = config.updated_at
+        response = self.client.patch(
+            self._url(str(config.id)),
+            {
+                "enabled": True,
+                "config_set": {"steering": "Review API documentation"},
+                "config_remove": ["default_not_actionable"],
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        config.refresh_from_db()
+        assert config.enabled is False
+        assert config.config == {"linear_team_ids": "invalid", "default_not_actionable": True}
+        assert config.updated_at == updated_at
+        response = self.client.patch(self._url(str(config.id)), {"config_remove": ["linear_team_ids"]}, format="json")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["config"] == {"default_not_actionable": True}
+
+    def test_issue_filters_are_compiled_on_the_server(self) -> None:
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="error_tracking",
+            source_type="issue_spiking",
+            enabled=False,
+            config={"steering": "Skip errors from bots"},
+        )
+        production = {"key": "$environment", "value": ["production"], "operator": "exact", "type": "event"}
+
+        response = self.client.patch(
+            self._url(str(config.id)),
+            # Client bytecode that matches everything must not reach emission.
+            {"config_set": {"issue_filters": {"properties": [production], "bytecode": ["_H", 1, 29]}}},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        config.refresh_from_db()
+        assert config.enabled is False
+        assert config.config["steering"] == "Skip errors from bots"
+        bytecode = config.config["issue_filters"]["bytecode"]
+        assert execute_bytecode(bytecode, {"properties": {"$environment": "production"}}).result is True
+        assert execute_bytecode(bytecode, {"properties": {"$environment": "staging"}}).result is False
+        log = ActivityLog.objects.get(scope="SignalSourceConfig", item_id=str(config.id), activity="updated")
+        assert log.detail is not None
+        assert [change["field"] for change in log.detail["changes"]] == ["config"]
+
+    @parameterized.expand(
+        [
+            ("not_error_tracking", "linear", "issue", {"properties": []}),
+            ("not_an_object", "error_tracking", "issue_created", []),
+            (
+                "event_branch",
+                "error_tracking",
+                "issue_created",
+                {"events": [{"id": "$error_tracking_issue_created", "type": "events"}]},
+            ),
+            (
+                "person_property",
+                "error_tracking",
+                "issue_created",
+                {"properties": [{"key": "email", "value": ["a@example.com"], "type": "person"}]},
+            ),
+            # A leaf without a value compiles to a match-all branch.
+            ("leaf_without_value", "error_tracking", "issue_created", {"properties": [{"key": "$environment"}]}),
+        ]
+    )
+    def test_invalid_issue_filters_are_rejected(
+        self, _name: str, source_product: str, source_type: str, filters: object
+    ) -> None:
+        config = SignalSourceConfig.objects.create(
+            team=self.team, source_product=source_product, source_type=source_type, config={}
+        )
+
+        response = self.client.patch(
+            self._url(str(config.id)), {"config_set": {"issue_filters": filters}}, format="json"
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        config.refresh_from_db()
+        assert config.config == {}
+
+    def _linear_filter_catalog(self, *, eligible: bool = True) -> None:
+        source = SignalFilterSourceDefinition.objects.create(
+            source_product="linear", source_type="issue", adapter_kind="warehouse", rollout_state="internal"
+        )
+        version = SignalFilterCatalogVersion.objects.create(
+            source=source,
+            version=1,
+            bundle={
+                "schema_version": 1,
+                "fields": [
+                    {
+                        "name": "project_name",
+                        "type": "string",
+                        "description": "Name of the issue's project.",
+                        "binding": {"kind": "json_path", "column": "project", "path": ["name"]},
+                        "missing_value": "null",
+                        "malformed_value": "error",
+                    }
+                ],
+                "starter_expressions": [],
+            },
+        )
+        source.activate(version)
+        source.filter_query_eligible = eligible
+        source.save()
+
+    @patch("products.signals.backend.source_filters.feature_enabled_or_false", return_value=True)
+    def test_hogql_filter_is_pinned_to_the_catalog_version(self, _flag: object) -> None:
+        self._linear_filter_catalog()
+        config = SignalSourceConfig.objects.create(team=self.team, source_product="linear", source_type="issue")
+
+        response = self.client.patch(
+            self._url(str(config.id)), {"config_set": {"hogql_filter": "project_name = 'Core'"}}, format="json"
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        config.refresh_from_db()
+        saved = {"expression": "project_name = 'Core'", "catalog_version": 1}
+        assert config.config["hogql_filter"] == saved
+        source = SignalFilterSourceDefinition.objects.get(source_product="linear", source_type="issue")
+        source.filter_query_eligible = False
+        source.save()
+
+        response = self.client.patch(self._url(str(config.id)), {"config_set": {"steering": "Skip"}}, format="json")
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        config.refresh_from_db()
+        assert config.config == {"hogql_filter": saved, "steering": "Skip"}
+
+    @parameterized.expand([("writable", True, True), ("flag_off", False, True), ("not_eligible", True, False)])
+    def test_filter_catalogs_list_only_sources_this_project_can_filter(
+        self, _name: str, flag_enabled: bool, eligible: bool
+    ) -> None:
+        self._linear_filter_catalog(eligible=eligible)
+
+        with patch("products.signals.backend.source_filters.feature_enabled_or_false", return_value=flag_enabled):
+            response = self.client.get(f"{self._url()}filter_catalogs/")
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        expected = (
+            [
+                {
+                    "source_product": "linear",
+                    "source_type": "issue",
+                    "catalog_version": 1,
+                    "filter_fields": [
+                        {"name": "project_name", "type": "string", "description": "Name of the issue's project."}
+                    ],
+                    "starter_expressions": [],
+                }
+            ]
+            if flag_enabled and eligible
+            else []
+        )
+        assert response.json() == {"results": expected}
+
+    @parameterized.expand(
+        [
+            ("flag_off", False, "project_name = 'Core'"),
+            ("unknown_field", True, "category = 'Core'"),
+            ("not_boolean", True, "project_name"),
+            ("client_pinned_version", True, {"expression": "true", "catalog_version": 1}),
+        ]
+    )
+    def test_invalid_hogql_filter_is_rejected(self, _name: str, flag_enabled: bool, value: object) -> None:
+        self._linear_filter_catalog()
+        config = SignalSourceConfig.objects.create(team=self.team, source_product="linear", source_type="issue")
+
+        with patch("products.signals.backend.source_filters.feature_enabled_or_false", return_value=flag_enabled):
+            response = self.client.patch(
+                self._url(str(config.id)), {"config_set": {"hogql_filter": value}}, format="json"
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        config.refresh_from_db()
+        assert config.config == {}
+
+    def test_bulk_disable_is_logged(self) -> None:
+        enabled = SignalSourceConfig.objects.create(
+            team=self.team, source_product="error_tracking", source_type="issue_created", enabled=True
+        )
+        SignalSourceConfig.objects.create(
+            team=self.team, source_product="error_tracking", source_type="issue_reopened", enabled=False
+        )
+
+        set_signal_source_types_enabled(
+            team_id=self.team.id,
+            source_product="error_tracking",
+            source_types=("issue_created", "issue_reopened"),
+            enabled=False,
+            created_by_id=self.user.id,
+        )
+
+        logs = ActivityLog.objects.filter(scope="SignalSourceConfig", activity="updated")
+        assert [log.item_id for log in logs] == [str(enabled.id)]
+
+    def test_config_keys_require_write_scope(self) -> None:
+        config = SignalSourceConfig.objects.create(team=self.team, source_product="linear", source_type="issue")
+        raw = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            user=self.user,
+            secure_value=hash_key_value(raw),
+            scopes=["task:read"],
+            scoped_teams=[self.team.id],
+        )
+        self.client.logout()
+        response = self.client.patch(
+            self._url(str(config.id)),
+            {"config_set": {"steering": "Review API documentation"}},
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {raw}",
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        config.refresh_from_db()
+        assert config.config == {}
+
+    def test_update_config_recording_filters_not_dict_rejected(self):
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            config={},
+            created_by=self.user,
+        )
+        response = self.client.patch(
+            self._url(str(config.id)),
+            data={"config": {"recording_filters": [1, 2, 3]}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "recording_filters must be a JSON object" in str(response.json())
+
+    def test_update_source_keys_are_immutable(self):
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        for field, value in (("source_type", "issue_created"), ("source_product", "error_tracking")):
+            response = self.client.patch(self._url(str(config.id)), data={field: value}, format="json")
+            assert response.status_code == status.HTTP_400_BAD_REQUEST, response.json()
+        config.refresh_from_db()
+        assert config.source_product == "session_replay"
+        assert config.source_type == "session_analysis_cluster"
+
+    def test_delete_other_teams_config_forbidden(self):
+        other_team = Team.objects.create(organization=self.organization, name="Other Team")
+        config = SignalSourceConfig.objects.create(
+            team=other_team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        response = self.client.delete(self._url(str(config.id)))
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        assert SignalSourceConfig.objects.filter(id=config.id).exists()
+
+    # --- Delete ---
+
+    def test_delete_source_config(self):
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            created_by=self.user,
+        )
+        config_id = str(config.id)
+        response = self.client.delete(self._url(config_id))
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert not SignalSourceConfig.objects.filter(id=config_id).exists()
+
+    # --- Read-only fields ---
+
+    def test_read_only_fields_in_response(self):
+        response = self.client.post(
+            self._url(),
+            data={"source_product": "session_replay", "source_type": "session_analysis_cluster"},
+            format="json",
+        )
+        data = response.json()
+        assert response.status_code == status.HTTP_201_CREATED, data
+        assert "id" in data
+        assert "created_at" in data
+        assert "updated_at" in data
+
+    # --- Auth ---
+
+    def test_unauthenticated_request_rejected(self):
+        self.client.logout()
+        response = self.client.get(self._url())
+        assert response.status_code in (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN)
+
+
+class TestSourceFilterWriteGate(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("enabled", "enabled", True, False, True),
+            ("internal_with_flag", "internal", True, True, True),
+            ("internal_without_flag", "internal", True, False, False),
+            ("disabled_with_flag", "disabled", True, True, False),
+            ("not_eligible", "enabled", False, True, False),
+        ]
+    )
+    def test_writes_open(
+        self, _name: str, rollout_state: str, eligible: bool, internal_flag_enabled: bool, expected: bool
+    ) -> None:
+        assert (
+            writes_open(
+                SignalFilterSourceDefinition.RolloutState(rollout_state),
+                eligible=eligible,
+                internal_flag_enabled=internal_flag_enabled,
+            )
+            is expected
+        )
+
+
+class TestSignalSourceConfigSerializerValidation(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ({"config_set": []},),
+            ({"config_set": None},),
+            ({"config_remove": "steering"},),
+            ({"config_set": {"steering": "new"}, "config_remove": ["steering"]},),
+            ({"config": {}, "config_set": {}},),
+            ({"config": {}, "config_remove": []},),
+            ({"config_set": {"steering": None}},),
+            ({"config_set": {"linear_team_ids": "invalid"}},),
+        ]
+    )
+    def test_invalid_config_key_updates(self, data: dict[str, object]) -> None:
+        instance = SignalSourceConfig(source_product="linear", source_type="issue", config={"steering": "original"})
+        serializer = SignalSourceConfigSerializer(instance, data=data, partial=True)
+        assert not serializer.is_valid()
+        assert instance.config == {"steering": "original"}
+
+    def test_config_key_updates_are_rejected_on_create(self) -> None:
+        serializer = SignalSourceConfigSerializer(
+            data={"source_product": "linear", "source_type": "issue", "config_set": {}}
+        )
+        assert not serializer.is_valid()
+
+    @parameterized.expand(
+        [
+            ("valid", {"linear_team_ids": ["team-1", "team-2"]}, True),
+            ("empty_list_means_all_teams", {"linear_team_ids": []}, True),
+            ("at_cap", {"linear_team_ids": [f"team-{i}" for i in range(100)]}, True),
+            ("over_cap", {"linear_team_ids": [f"team-{i}" for i in range(101)]}, False),
+            ("at_id_length_cap", {"linear_team_ids": ["t" * 255]}, True),
+            ("over_id_length_cap", {"linear_team_ids": ["t" * 256]}, False),
+            ("not_a_list", {"linear_team_ids": "team-1"}, False),
+            ("null", {"linear_team_ids": None}, False),
+            ("non_string_entry", {"linear_team_ids": ["team-1", 2]}, False),
+            ("blank_entry", {"linear_team_ids": ["team-1", " "]}, False),
+        ]
+    )
+    def test_linear_team_ids(self, _name, config, expected_valid):
+        serializer = SignalSourceConfigSerializer(
+            data={"source_product": "linear", "source_type": "issue", "config": config}
+        )
+        assert serializer.is_valid() is expected_valid, serializer.errors
+        if not expected_valid:
+            assert "linear_team_ids" in str(serializer.errors["config"])
+
+    def test_linear_team_ids_are_stored_stripped(self):
+        serializer = SignalSourceConfigSerializer(
+            data={
+                "source_product": "linear",
+                "source_type": "issue",
+                "config": {"linear_team_ids": [" team-1 ", "team-2"]},
+            }
+        )
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["config"]["linear_team_ids"] == ["team-1", "team-2"]
+
+    @parameterized.expand(
+        [
+            ("investigated_only", "analytics", "anomaly_investigation", "investigated_only", True),
+            ("all_firing_alerts", "analytics", "anomaly_investigation", "all_firing_alerts", True),
+            ("off", "analytics", "anomaly_investigation", "off", True),
+            ("unknown_value", "analytics", "anomaly_investigation", "everything", False),
+            ("null", "analytics", "anomaly_investigation", None, False),
+            ("unhashable", "analytics", "anomaly_investigation", ["all_firing_alerts"], False),
+            ("other_source", "github", "issue", "all_firing_alerts", False),
+        ]
+    )
+    def test_alert_scope(self, _name, source_product, source_type, value, expected_valid):
+        serializer = SignalSourceConfigSerializer(
+            data={"source_product": source_product, "source_type": source_type, "config": {"alert_scope": value}}
+        )
+        assert serializer.is_valid() is expected_valid, serializer.errors
+        if not expected_valid:
+            assert "alert_scope" in str(serializer.errors["config"])
+
+    def test_alert_scope_is_validated_on_config_set(self) -> None:
+        instance = SignalSourceConfig(source_product="github", source_type="issue", config={})
+        serializer = SignalSourceConfigSerializer(
+            instance, data={"config_set": {"alert_scope": "all_firing_alerts"}}, partial=True
+        )
+        assert not serializer.is_valid()
+
+    @parameterized.expand(
+        [
+            ("allow", "analytics", "anomaly_investigation", "alert_allow_patterns", ["(?i)checkout", "^Daily"], None),
+            ("block", "analytics", "anomaly_investigation", "alert_block_patterns", ["test"], None),
+            ("empty_list", "analytics", "anomaly_investigation", "alert_block_patterns", [], None),
+            ("not_a_list", "analytics", "anomaly_investigation", "alert_allow_patterns", "checkout", "list"),
+            ("empty_pattern", "analytics", "anomaly_investigation", "alert_allow_patterns", [""], "list"),
+            ("too_many", "analytics", "anomaly_investigation", "alert_allow_patterns", ["a"] * 21, "at most 20"),
+            ("too_long", "analytics", "anomaly_investigation", "alert_block_patterns", ["a" * 201], "at most 200"),
+            ("lookahead", "analytics", "anomaly_investigation", "alert_block_patterns", ["ok", "(?=x)"], "'(?=x)'"),
+            ("unbalanced", "analytics", "anomaly_investigation", "alert_allow_patterns", ["a("], "'a('"),
+            ("other_source", "github", "issue", "alert_allow_patterns", ["checkout"], "only supported"),
+        ]
+    )
+    def test_alert_patterns(self, _name, source_product, source_type, key, value, expected_error):
+        serializer = SignalSourceConfigSerializer(
+            data={"source_product": source_product, "source_type": source_type, "config": {key: value}}
+        )
+        assert serializer.is_valid() is (expected_error is None), serializer.errors
+        if expected_error is not None:
+            error = str(serializer.errors["config"])
+            assert key in error
+            assert expected_error in error
+
+
+class TestScoutSourceCanonicalization(APIBaseTest):
+    """The scout source config is a project-level singleton: the scout fleet canonicalizes child
+    environments to the parent team and the emit preflight gates on the parent team's row, so the
+    inbox toggle must read and write that same canonical row from any environment in the project."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # A second environment within the same project, parented to the default team.
+        self.child_team = Team.objects.create(
+            organization=self.organization, project=self.project, parent_team=self.team, name="Child env"
+        )
+
+    def _child_url(self, config_id: str | None = None) -> str:
+        base = f"/api/projects/{self.child_team.id}/signals/source_configs/"
+        return f"{base}{config_id}/" if config_id else base
+
+    def test_create_from_child_env_writes_canonical_team(self):
+        response = self.client.post(
+            self._child_url(),
+            data={"source_product": "signals_scout", "source_type": "cross_source_issue", "enabled": True},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        config = SignalSourceConfig.objects.get(id=response.json()["id"])
+        # Written to the parent team, so the emit preflight (which canonicalizes) finds it.
+        assert config.team_id == self.team.id
+        assert SignalSourceConfig.is_source_enabled(self.team.id, "signals_scout", "cross_source_issue") is True
+
+    def test_child_env_lists_canonical_scout_row(self):
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="signals_scout",
+            source_type="cross_source_issue",
+            enabled=True,
+        )
+        results = self.client.get(self._child_url()).json()["results"]
+        assert [r["id"] for r in results] == [str(config.id)]
+
+    def test_child_env_updates_canonical_scout_row(self):
+        config = SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="signals_scout",
+            source_type="cross_source_issue",
+            enabled=True,
+        )
+        response = self.client.patch(self._child_url(str(config.id)), data={"enabled": False}, format="json")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        config.refresh_from_db()
+        assert config.enabled is False
+
+    def test_child_env_cannot_retag_config_into_scout_source(self):
+        # A child-environment row retagged to the scout source would otherwise stay on the child
+        # team, hidden by the read filter while the emit gate checks the parent — a hidden, broken
+        # scout config. Source keys are immutable on update, so the retag is rejected outright.
+        config = SignalSourceConfig.objects.create(
+            team=self.child_team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            enabled=True,
+        )
+        response = self.client.patch(
+            self._child_url(str(config.id)),
+            data={"source_product": "signals_scout", "source_type": "cross_source_issue"},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST, response.json()
+        config.refresh_from_db()
+        assert config.team_id == self.child_team.id
+        assert config.source_product == "session_replay"
+        assert config.source_type == "session_analysis_cluster"
+        # No stranded scout row exists on either team.
+        assert not SignalSourceConfig.objects.filter(
+            team_id__in=[self.team.id, self.child_team.id],
+            source_product="signals_scout",
+            source_type="cross_source_issue",
+        ).exists()
+
+    def test_non_scout_source_stays_environment_scoped(self):
+        # A parent-team session-analysis row must not leak into the child environment's list.
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="session_replay",
+            source_type="session_analysis_cluster",
+            enabled=True,
+        )
+        assert self.client.get(self._child_url()).json()["results"] == []
+
+    def _child_scoped_api_key_auth(self) -> str:
+        raw = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="child-scoped",
+            user=self.user,
+            secure_value=hash_key_value(raw),
+            scopes=["task:read", "task:write"],
+            scoped_teams=[self.child_team.id],
+        )
+        self.client.logout()
+        return f"Bearer {raw}"
+
+    def test_child_scoped_api_key_lists_only_child_rows(self):
+        SignalSourceConfig.objects.create(
+            team=self.team, source_product="signals_scout", source_type="cross_source_issue"
+        )
+        child_row = SignalSourceConfig.objects.create(
+            team=self.child_team, source_product="session_replay", source_type="session_analysis_cluster"
+        )
+        response = self.client.get(self._child_url(), HTTP_AUTHORIZATION=self._child_scoped_api_key_auth())
+        assert response.status_code == status.HTTP_200_OK
+        assert [r["id"] for r in response.json()["results"]] == [str(child_row.id)]
+
+    @parameterized.expand([("get",), ("patch",), ("delete",)])
+    def test_child_scoped_api_key_cannot_touch_canonical_scout_row(self, method: str):
+        scout_row = SignalSourceConfig.objects.create(
+            team=self.team, source_product="signals_scout", source_type="cross_source_issue", enabled=True
+        )
+        response = getattr(self.client, method)(
+            self._child_url(str(scout_row.id)),
+            {"enabled": False},
+            format="json",
+            HTTP_AUTHORIZATION=self._child_scoped_api_key_auth(),
+        )
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        scout_row.refresh_from_db()
+        assert scout_row.enabled is True
+
+    def test_child_scoped_api_key_cannot_create_canonical_scout_row(self):
+        response = self.client.post(
+            self._child_url(),
+            {"source_product": "signals_scout", "source_type": "cross_source_issue", "enabled": False},
+            format="json",
+            HTTP_AUTHORIZATION=self._child_scoped_api_key_auth(),
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert not SignalSourceConfig.objects.filter(source_product="signals_scout").exists()
+
+
+class TestIsSourceEnabledGating(APIBaseTest):
+    """Source-level gating quirks: session_problem routes through the session_analysis_cluster
+    config rather than requiring its own SignalSourceConfig row."""
+
+    def test_session_problem_gated_by_session_analysis_cluster(self):
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product=SignalSourceConfig.SourceProduct.SESSION_REPLAY,
+            source_type=SignalSourceConfig.SourceType.SESSION_ANALYSIS_CLUSTER,
+            enabled=True,
+        )
+
+        assert SignalSourceConfig.is_source_enabled(self.team.id, "session_replay", "session_problem") is True
+
+    @parameterized.expand([("no_row", None, False), ("enabled_row", True, True), ("disabled_row", False, False)])
+    def test_alert_firing_gated_by_product_analytics_row(self, _name, existing_enabled, expected):
+        if existing_enabled is not None:
+            SignalSourceConfig.objects.create(
+                team=self.team,
+                source_product=SignalSourceConfig.SourceProduct.ANALYTICS,
+                source_type=SignalSourceConfig.SourceType.ANOMALY_INVESTIGATION,
+                enabled=existing_enabled,
+                config={"steering": "Skip the staging alerts."},
+            )
+
+        assert SignalSourceConfig.is_source_enabled(self.team.id, "analytics", "alert_firing") is expected
+        steering = async_to_sync(afetch_source_config)(self.team.id, "analytics", "alert_firing").get("steering")
+        assert steering == (None if existing_enabled is None else "Skip the staging alerts.")
+
+    def test_pganalyze_issue_requires_own_config(self):
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product=SignalSourceConfig.SourceProduct.PGANALYZE,
+            source_type=SignalSourceConfig.SourceType.ISSUE,
+            enabled=True,
+        )
+
+        assert SignalSourceConfig.is_source_enabled(self.team.id, "pganalyze", "issue") is True
+
+    def test_pganalyze_disabled_when_no_config(self):
+        assert SignalSourceConfig.is_source_enabled(self.team.id, "pganalyze", "issue") is False
+
+    def test_replay_vision_scanner_finding_is_self_authorizing(self):
+        # The scanner's `emits_signals` flag is the config — no SignalSourceConfig row exists.
+        assert SignalSourceConfig.is_source_enabled(self.team.id, "replay_vision", "scanner_finding") is True
+
+    @parameterized.expand(
+        [
+            ("evaluation_report_requires_row", SignalSourceConfig.SourceType.EVALUATION_REPORT, None, False),
+            ("evaluation_report_enabled_row", SignalSourceConfig.SourceType.EVALUATION_REPORT, True, True),
+            ("evaluation_report_disabled_row", SignalSourceConfig.SourceType.EVALUATION_REPORT, False, False),
+        ]
+    )
+    def test_llm_analytics_gating(self, _name, source_type, existing_enabled, expected):
+        # llm_analytics has no always-on bypass: evaluation_report signals go through the
+        # standard config-row check.
+        if existing_enabled is not None:
+            SignalSourceConfig.objects.create(
+                team=self.team,
+                source_product=SignalSourceConfig.SourceProduct.LLM_ANALYTICS,
+                source_type=source_type,
+                enabled=existing_enabled,
+            )
+
+        assert SignalSourceConfig.is_source_enabled(self.team.id, "llm_analytics", source_type) is expected
+
+    @parameterized.expand(
+        [
+            ("no_row_defaults_on", None, True),
+            ("explicit_disabled_opts_out", False, False),
+            ("explicit_enabled_on", True, True),
+        ]
+    )
+    def test_scout_source_on_by_default(self, _name, existing_enabled, expected):
+        if existing_enabled is not None:
+            SignalSourceConfig.objects.create(
+                team=self.team,
+                source_product=SignalSourceConfig.SourceProduct.SIGNALS_SCOUT,
+                source_type=SignalSourceConfig.SourceType.CROSS_SOURCE_ISSUE,
+                enabled=existing_enabled,
+            )
+
+        assert SignalSourceConfig.is_source_enabled(self.team.id, "signals_scout", "cross_source_issue") is expected
+
+
+class TestGetAnalyticsAlertScope(BaseTest):
+    @parameterized.expand(
+        [
+            ("no_row", None, True, "investigated_only"),
+            ("no_key", {}, True, "investigated_only"),
+            ("unknown_stored_value", {"alert_scope": "everything"}, True, "investigated_only"),
+            ("unhashable_stored_value", {"alert_scope": ["all_firing_alerts"]}, True, "investigated_only"),
+            ("all_firing_alerts_flag_on", {"alert_scope": "all_firing_alerts"}, True, "all_firing_alerts"),
+            ("all_firing_alerts_flag_off", {"alert_scope": "all_firing_alerts"}, False, "investigated_only"),
+            ("off_flag_off", {"alert_scope": "off"}, False, "off"),
+        ]
+    )
+    def test_scope(self, _name, config, flag_enabled, expected):
+        if config is not None:
+            SignalSourceConfig.objects.create(
+                team=self.team, source_product="analytics", source_type="anomaly_investigation", config=config
+            )
+
+        with patch(
+            "products.signals.backend.facade.source_configs.feature_enabled_or_false", return_value=flag_enabled
+        ):
+            assert get_analytics_alert_scope(team_id=self.team.id) == expected
+
+    def test_flag_service_error_reads_default_scope(self) -> None:
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="analytics",
+            source_type="anomaly_investigation",
+            config={"alert_scope": "all_firing_alerts"},
+        )
+
+        with patch(
+            "products.signals.backend.facade.source_configs.feature_enabled_or_false",
+            side_effect=RuntimeError("flag service down"),
+        ):
+            assert get_analytics_alert_scope(team_id=self.team.id) == "investigated_only"
+
+
+class TestGetAnalyticsAlertNamePatterns(BaseTest):
+    @parameterized.expand(
+        [
+            ("no_row", None, True, AlertNamePatterns()),
+            ("no_keys", {"alert_scope": "all_firing_alerts"}, True, AlertNamePatterns()),
+            (
+                "valid",
+                {"alert_allow_patterns": ["^Daily"], "alert_block_patterns": ["test"]},
+                True,
+                AlertNamePatterns(allow=("^Daily",), block=("test",)),
+            ),
+            ("flag_off", {"alert_block_patterns": ["test"]}, False, AlertNamePatterns()),
+            ("not_a_list", {"alert_block_patterns": "test"}, True, AlertNamePatterns(invalid=True)),
+            ("null", {"alert_allow_patterns": None}, True, AlertNamePatterns(invalid=True)),
+            ("no_longer_compiles", {"alert_block_patterns": ["(?=x)"]}, True, AlertNamePatterns(invalid=True)),
+        ]
+    )
+    def test_patterns(self, _name, config, flag_enabled, expected):
+        if config is not None:
+            SignalSourceConfig.objects.create(
+                team=self.team, source_product="analytics", source_type="anomaly_investigation", config=config
+            )
+
+        with patch(
+            "products.signals.backend.facade.source_configs.feature_enabled_or_false", return_value=flag_enabled
+        ):
+            assert get_analytics_alert_name_patterns(team_id=self.team.id) == expected
+
+    def test_flag_service_error_fails_closed(self) -> None:
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="analytics",
+            source_type="anomaly_investigation",
+            config={"alert_allow_patterns": ["^Daily"]},
+        )
+
+        with patch(
+            "products.signals.backend.facade.source_configs.feature_enabled_or_false",
+            side_effect=RuntimeError("flag service down"),
+        ):
+            assert get_analytics_alert_name_patterns(team_id=self.team.id) == AlertNamePatterns(invalid=True)
+
+
+class TestEnabledIssueFilters(BaseTest):
+    FILTERS = {"properties": [{"key": "severity", "value": ["high"], "operator": "exact", "type": "event"}]}
+
+    @parameterized.expand(
+        [
+            ("enabled_row_with_filter", "issue_created", True, {"issue_filters": FILTERS}, FILTERS),
+            ("disabled_row", "issue_created", False, {"issue_filters": FILTERS}, None),
+            ("other_source_type", "issue_spiking", True, {"issue_filters": FILTERS}, None),
+            ("no_filter_key", "issue_created", True, {}, None),
+            ("malformed_filter_returned_as_stored", "issue_created", True, {"issue_filters": "nope"}, "nope"),
+        ]
+    )
+    def test_reads_only_the_enabled_row_for_the_source_type(self, _name, stored_type, enabled, config, expected):
+        SignalSourceConfig.objects.create(
+            team=self.team,
+            source_product="error_tracking",
+            source_type=stored_type,
+            enabled=enabled,
+            config=config,
+        )
+
+        assert (
+            enabled_issue_filters(team_id=self.team.id, source_product="error_tracking", source_type="issue_created")
+            == expected
+        )
+
+
+class TestEvaluateAlertFilter(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("no_patterns", AlertNamePatterns(), AlertFilterOutcome.PASSED),
+            ("allow_matches", AlertNamePatterns(allow=("Checkout",)), AlertFilterOutcome.PASSED),
+            ("allow_misses", AlertNamePatterns(allow=("signups",)), AlertFilterOutcome.NOT_ALLOWED),
+            ("block_misses", AlertNamePatterns(block=("signups",)), AlertFilterOutcome.PASSED),
+            ("block_matches", AlertNamePatterns(block=("conversion",)), AlertFilterOutcome.BLOCKED),
+            (
+                "block_wins_over_allow",
+                AlertNamePatterns(allow=("Checkout",), block=("conversion",)),
+                AlertFilterOutcome.BLOCKED,
+            ),
+            (
+                "allow_matches_and_block_misses",
+                AlertNamePatterns(allow=("Checkout",), block=("signups",)),
+                AlertFilterOutcome.PASSED,
+            ),
+            ("matches_the_insight_name", AlertNamePatterns(allow=("^Weekly revenue$",)), AlertFilterOutcome.PASSED),
+            ("search_not_full_match", AlertNamePatterns(allow=("out conv",)), AlertFilterOutcome.PASSED),
+            ("case_sensitive_by_default", AlertNamePatterns(allow=("^checkout",)), AlertFilterOutcome.NOT_ALLOWED),
+            ("case_insensitive_flag", AlertNamePatterns(allow=("(?i)^checkout",)), AlertFilterOutcome.PASSED),
+            ("pattern_that_does_not_compile", AlertNamePatterns(block=("(?=x)",)), AlertFilterOutcome.INVALID),
+            ("invalid_stored_patterns", AlertNamePatterns(invalid=True), AlertFilterOutcome.INVALID),
+        ]
+    )
+    def test_outcome(self, _name, patterns, expected):
+        outcome = evaluate_alert_filter(patterns, alert_name="Checkout conversion", insight_name="Weekly revenue")
+
+        assert outcome == expected
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("status_lookup_fails", [False, True])
+def test_concurrent_config_key_updates_preserve_both_edits(status_lookup_fails: bool) -> None:
+    organization = Organization.objects.create(name="Config concurrency test")
+    team = Team.objects.create(organization=organization)
+    user = User.objects.create(email="config-editor@example.com")
+    organization.members.add(user)
+    config = SignalSourceConfig.objects.create(
+        team=team,
+        source_product="linear",
+        source_type="issue",
+        enabled=False,
+        config={"hogql_filter": "false", "default_not_actionable": True},
+    )
+    barrier = Barrier(2)
+
+    def update_config(body: dict[str, object]) -> int:
+        failed_status_reads: list[str] = []
+
+        def fail_status_read(
+            execute: Callable[..., object], sql: str, params: object, many: bool, context: dict[str, object]
+        ) -> object:
+            if status_lookup_fails and ExternalDataSchema._meta.db_table in sql:
+                failed_status_reads.append(sql)
+                return execute("SELECT 1 / 0", None, many, context)
+            return execute(sql, params, many, context)
+
+        try:
+            client = APIClient()
+            client.force_authenticate(user)
+            barrier.wait(timeout=10)
+            with connection.execute_wrapper(fail_status_read):
+                response = client.patch(
+                    f"/api/projects/{team.id}/signals/source_configs/{config.id}/", body, format="json"
+                )
+            assert bool(failed_status_reads) is status_lookup_fails
+            assert response.status_code == status.HTTP_200_OK, response.json()
+            return response.status_code
+        finally:
+            connections.close_all()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        updates: list[dict[str, object]] = [
+            {"config_set": {"steering": "Prioritize documentation tasks"}, "config_remove": ["default_not_actionable"]},
+            {"config_set": {"linear_team_ids": ["team-example"]}},
+        ]
+        futures = [pool.submit(update_config, body) for body in updates]
+        for future in futures:
+            future.result(timeout=20)
+    config.refresh_from_db()
+    assert config.config == {
+        "hogql_filter": "false",
+        "steering": "Prioritize documentation tasks",
+        "linear_team_ids": ["team-example"],
+    }

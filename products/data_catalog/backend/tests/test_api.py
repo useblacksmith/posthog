@@ -1,0 +1,800 @@
+from posthog.test.base import APIBaseTest
+from unittest.mock import MagicMock, patch
+
+from django.core.cache import cache
+from django.db import connection
+from django.test import SimpleTestCase
+from django.test.utils import CaptureQueriesContext
+
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.constants import AvailableFeature
+from posthog.models import User
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.organization import Organization, OrganizationMembership
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.team import Team
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+from posthog.rate_limit import (
+    ClickHouseBurstRateThrottle,
+    HogQLQueryThrottle,
+    MetricSearchBurstRateThrottle,
+    MetricWriteBurstRateThrottle,
+)
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.data_catalog.backend.facade.api import DESCRIPTION_TOO_LONG_MESSAGE, MAX_DESCRIPTION_LENGTH
+from products.data_catalog.backend.facade.enums import MetricStatus
+from products.data_catalog.backend.logic.metrics import (
+    BULK_SKIP_ALREADY_APPROVED,
+    BULK_SKIP_DRIFTED,
+    BULK_SKIP_NOT_FOUND,
+    METRIC_BULK_MAX,
+    approve_metric,
+    bulk_change_metric_owner,
+    soft_delete_metric,
+    upsert_metric,
+)
+from products.data_catalog.backend.models import Metric
+from products.data_catalog.backend.presentation.serializers import (
+    MetricBulkNamesRequestSerializer,
+    MetricRunQuerySerializer,
+    MetricRunRequestSerializer,
+)
+from products.product_analytics.backend.facade.models import Insight
+
+_HOGQL = {"kind": "HogQLQuery", "query": "select count() from events"}
+_PROCESS_QUERY = "products.data_catalog.backend.logic.execution.process_query_dict"
+
+
+class TestMetricAPI(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.url = f"/api/projects/{self.team.id}/data_catalog/metrics/"
+
+    def test_create_lands_proposed(self) -> None:
+        response = self.client.post(self.url, {"name": "mrr", "description": "Monthly revenue"}, format="json")
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        body = response.json()
+        assert body["name"] == "mrr"
+        assert body["status"] == MetricStatus.PROPOSED
+
+    def test_list_filters_status_and_definition_kind_before_pagination(self) -> None:
+        for name, metric_status, definition in [
+            ("approved_sql", MetricStatus.APPROVED, _HOGQL),
+            ("proposed_sql", MetricStatus.PROPOSED, _HOGQL),
+            ("approved_markdown", MetricStatus.APPROVED, None),
+        ]:
+            Metric.objects.for_team(self.team.id).create(
+                team=self.team, name=name, status=metric_status, definition=definition
+            )
+        response = self.client.get(self.url, {"status": "approved", "definition_kind": "HogQLQuery", "limit": "1"})
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["count"] == 1
+        assert [row["name"] for row in response.json()["results"]] == ["approved_sql"]
+
+    def test_status_and_approval_are_not_writable(self) -> None:
+        response = self.client.post(
+            self.url,
+            {"name": "mrr", "description": "d", "status": "approved", "approved_at": "2020-01-01T00:00:00Z"},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        assert response.json()["status"] == MetricStatus.PROPOSED
+        assert response.json()["approved_at"] is None
+
+    def test_overlong_description_rejected(self) -> None:
+        response = self.client.post(
+            self.url, {"name": "mrr", "description": "x" * (MAX_DESCRIPTION_LENGTH + 1)}, format="json"
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["attr"] == "description"
+        assert response.json()["detail"] == DESCRIPTION_TOO_LONG_MESSAGE
+
+    def test_create_with_taken_name_conflicts_until_overwrite(self) -> None:
+        self.client.post(self.url, {"name": "mrr", "description": "v1"}, format="json")
+
+        conflict = self.client.post(self.url, {"name": "mrr", "description": "v2"}, format="json")
+        assert conflict.status_code == status.HTTP_409_CONFLICT, conflict.json()
+        assert conflict.json()["code"] == "metric_name_taken"
+        assert conflict.json()["extra"] == {"existing_metric": {"name": "mrr", "status": MetricStatus.PROPOSED}}
+        assert self.client.get(f"{self.url}mrr/").json()["description"] == "v1"
+
+        response = self.client.post(self.url, {"name": "mrr", "description": "v2", "overwrite": True}, format="json")
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        assert "overwrite" not in response.json()
+        assert Metric.objects.for_team(self.team.id).count() == 1
+        assert self.client.get(f"{self.url}mrr/").json()["description"] == "v2"
+
+    def test_refine_via_post_preserves_omitted_definition(self) -> None:
+        definition = {"kind": "HogQLQuery", "query": "select count() from events"}
+        self.client.post(self.url, {"name": "mrr", "description": "v1", "definition": definition}, format="json")
+        response = self.client.post(self.url, {"name": "mrr", "description": "v2", "overwrite": True}, format="json")
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        body = self.client.get(f"{self.url}mrr/").json()
+        assert body["description"] == "v2"
+        assert body["definition"]["kind"] == "HogQLQuery"
+        assert body["referenced_table_names"] == ["events"]
+
+    def test_name_addressed_detail_routes(self) -> None:
+        self.client.post(self.url, {"name": "mrr", "description": "v1"}, format="json")
+
+        assert self.client.get(f"{self.url}mrr/").status_code == status.HTTP_200_OK
+
+        patched = self.client.patch(f"{self.url}mrr/", {"display_name": "MRR"}, format="json")
+        assert patched.status_code == status.HTTP_200_OK
+        assert patched.json()["display_name"] == "MRR"
+
+        assert self.client.delete(f"{self.url}mrr/").status_code == status.HTTP_204_NO_CONTENT
+        assert self.client.get(f"{self.url}mrr/").status_code == status.HTTP_404_NOT_FOUND
+
+    def test_patch_renames_metric(self) -> None:
+        self.client.post(self.url, {"name": "mrr", "description": "v1"}, format="json")
+        response = self.client.patch(f"{self.url}mrr/", {"name": "arr"}, format="json")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["name"] == "arr"
+        assert self.client.get(f"{self.url}mrr/").status_code == status.HTTP_404_NOT_FOUND
+        assert self.client.get(f"{self.url}arr/").status_code == status.HTTP_200_OK
+
+    @parameterized.expand(
+        [
+            ("reassign_to_member", "new.owner@example.com", status.HTTP_200_OK, "new.owner@example.com"),
+            ("clear", None, status.HTTP_200_OK, None),
+            ("reject_outsider", "outsider@example.com", status.HTTP_400_BAD_REQUEST, "user1@posthog.com"),
+        ]
+    )
+    def test_patch_owner_keeps_approval(
+        self, _name: str, owner: str | None, expected_status: int, expected_owner: str | None
+    ) -> None:
+        User.objects.create_and_join(self.organization, "new.owner@example.com", None)
+        User.objects.create_and_join(Organization.objects.create(name="Other"), "outsider@example.com", None)
+        self.client.post(self.url, {"name": "mrr", "description": "v1"}, format="json")
+        self.client.post(f"{self.url}mrr/approve/")
+
+        response = self.client.patch(f"{self.url}mrr/", {"owner": owner}, format="json")
+
+        assert response.status_code == expected_status, response.json()
+        body = self.client.get(f"{self.url}mrr/").json()
+        assert body["owner"] == expected_owner
+        assert body["status"] == MetricStatus.APPROVED
+
+    @parameterized.expand(
+        [
+            ("member", {"owner": "new.owner@example.com"}, status.HTTP_201_CREATED, "new.owner@example.com"),
+            ("explicit_null", {"owner": None}, status.HTTP_201_CREATED, None),
+            ("omitted_defaults_to_caller", {}, status.HTTP_201_CREATED, "user1@posthog.com"),
+            ("reject_outsider", {"owner": "outsider@example.com"}, status.HTTP_400_BAD_REQUEST, None),
+        ]
+    )
+    def test_create_assigns_owner(
+        self, _name: str, owner_payload: dict, expected_status: int, expected_owner: str | None
+    ) -> None:
+        User.objects.create_and_join(self.organization, "new.owner@example.com", None)
+        User.objects.create_and_join(Organization.objects.create(name="Other"), "outsider@example.com", None)
+
+        response = self.client.post(self.url, {"name": "mrr", "description": "v1", **owner_payload}, format="json")
+
+        assert response.status_code == expected_status, response.json()
+        created = Metric.objects.for_team(self.team.id).filter(name="mrr").select_related("owner").first()
+        assert (created.owner.email if created and created.owner else None) == expected_owner
+        assert (created is not None) == (expected_status == status.HTTP_201_CREATED)
+
+    def test_create_after_delete_starts_fresh(self) -> None:
+        created = self.client.post(
+            self.url, {"name": "mrr", "description": "v1", "definition": _HOGQL}, format="json"
+        ).json()
+        self.client.delete(f"{self.url}mrr/")
+
+        response = self.client.post(self.url, {"name": "mrr", "description": "v2"}, format="json")
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        body = response.json()
+        assert body["id"] != created["id"]
+        assert body["definition"] is None
+
+    def test_invalid_definition_rejected(self) -> None:
+        response = self.client.post(
+            self.url,
+            {"name": "mrr", "description": "d", "definition": {"kind": "EventsQuery"}},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        # The agent-facing envelope must carry the actual problem, not just the field name.
+        body = response.json()
+        assert body["attr"] == "definition"
+        assert "Unsupported definition kind" in body["detail"]
+
+    def test_markdown_definition_accepted(self) -> None:
+        response = self.client.post(
+            self.url,
+            {
+                "name": "activation",
+                "description": "Activated users",
+                "definition": {"kind": "MarkdownDefinition", "markdown": "1. User did A then B within 7 days."},
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        assert response.json()["definition_kind"] == "MarkdownDefinition"
+
+    @parameterized.expand(
+        [
+            ("unfiltered", "", ["mine", "unrelated"], "description"),
+            ("search", "activation revenue", ["mine"], "description"),
+            ("natural_language", "what is our activation", ["mine"], "description"),
+            ("stop_words", "what is our", [], "description"),
+            ("display_name", "what is activation", ["mine"], "display_name"),
+            ("definition", "what is activation", ["mine"], "definition"),
+            ("query", "what is count", ["mine"], "query"),
+        ]
+    )
+    def test_list_is_team_scoped(self, name: str, search: str, expected: list[str], match_field: str) -> None:
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        fields: dict[str, object] = {"description": "retention"}
+        if match_field == "definition":
+            fields["definition"] = {"kind": "MarkdownDefinition", "markdown": "Overview\nactivation"}
+        elif match_field == "query":
+            fields["definition"] = {"kind": "HogQLQuery", "query": "SELECT\ncount() FROM events"}
+        else:
+            fields[match_field] = "activation"
+        created = self.client.post(self.url, {"name": "mine", **fields}, format="json")
+        assert created.status_code == status.HTTP_201_CREATED, created.json()
+        Metric.objects.for_team(other_team.id).create(team=other_team, name="theirs", **fields)
+
+        self.client.post(self.url, {"name": "unrelated", "description": "retention"}, format="json")
+        names = [row["name"] for row in self.client.get(self.url, {"search": search}).json()["results"]]
+        assert sorted(names) == expected
+
+    @patch("products.data_catalog.backend.logic.metrics.Database.create_for")
+    def test_metrics_referencing_denied_tables_are_hidden(self, create_database: MagicMock) -> None:
+        database = MagicMock()
+        database._denied_tables = {"restricted_source"}
+        create_database.return_value = database
+        assert self.client.get(self.url).json()["results"] == []
+        create_database.assert_not_called()
+
+        allowed = self.client.post(self.url, {"name": "allowed", "description": "d"}, format="json").json()
+        hidden = self.client.post(self.url, {"name": "hidden", "description": "d"}, format="json").json()
+        Metric.objects.for_team(self.team.id).filter(pk=allowed["id"]).update(referenced_table_names=["safe_source"])
+        Metric.objects.for_team(self.team.id).filter(pk=hidden["id"]).update(
+            referenced_table_names=["restricted_source"]
+        )
+
+        names = [row["name"] for row in self.client.get(self.url).json()["results"]]
+        searched = [row["name"] for row in self.client.get(self.url, {"search": "hidden, allowed"}).json()["results"]]
+
+        assert names == ["allowed"]
+        assert searched == ["allowed"]
+        assert self.client.get(f"{self.url}hidden/").status_code == status.HTTP_404_NOT_FOUND
+        for overwrite in (False, True):
+            conflict = self.client.post(
+                self.url, {"name": "hidden", "description": "taken over", "overwrite": overwrite}, format="json"
+            )
+            assert conflict.status_code == status.HTTP_409_CONFLICT, conflict.json()
+            assert "extra" not in conflict.json()
+        assert Metric.objects.for_team(self.team.id).get(pk=hidden["id"]).description == "d"
+
+        conflict = self.client.post(self.url, {"name": "allowed", "description": "taken over"}, format="json")
+        assert conflict.status_code == status.HTTP_409_CONFLICT, conflict.json()
+        assert conflict.json()["extra"] == {"existing_metric": {"name": "allowed", "status": MetricStatus.PROPOSED}}
+        overwritten = self.client.post(
+            self.url, {"name": "allowed", "description": "taken over", "overwrite": True}, format="json"
+        )
+        assert overwritten.status_code == status.HTTP_201_CREATED, overwritten.json()
+        assert overwritten.json()["description"] == "taken over"
+
+
+class TestMetricLifecycleAPI(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.url = f"/api/projects/{self.team.id}/data_catalog/metrics/"
+
+    def _insight(self, query: dict | None = None) -> Insight:
+        return Insight.objects.create(team=self.team, created_by=self.user, query=query or _HOGQL)
+
+    def test_session_user_can_approve(self) -> None:
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        response = self.client.post(f"{self.url}mrr/approve/")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["status"] == MetricStatus.APPROVED
+
+    def test_create_from_insight_snapshots_definition(self) -> None:
+        insight = self._insight()
+        response = self.client.post(
+            self.url, {"name": "mrr", "description": "d", "source_insight_short_id": insight.short_id}, format="json"
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+        body = response.json()
+        assert body["definition"]["kind"] == "HogQLQuery"
+        assert body["is_drifted"] is False
+
+    def test_list_computes_drift_in_a_single_insight_query(self) -> None:
+        # is_drifted must not fan out into one insight lookup per metric: the list view precomputes
+        # drift for the whole page in one bulk query. Three linked metrics => one insight query.
+        for i in range(3):
+            insight = self._insight()
+            self.client.post(
+                self.url,
+                {"name": f"m{i}", "description": "d", "source_insight_short_id": insight.short_id},
+                format="json",
+            )
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(self.url)
+        assert response.status_code == status.HTTP_200_OK
+        insight_queries = [q for q in ctx.captured_queries if "posthog_dashboarditem" in q["sql"]]
+        assert len(insight_queries) == 1, insight_queries
+
+    def test_approve_returns_409_while_drifted(self) -> None:
+        insight = self._insight()
+        self.client.post(
+            self.url, {"name": "mrr", "description": "d", "source_insight_short_id": insight.short_id}, format="json"
+        )
+        Insight.objects.filter(pk=insight.pk).update(
+            query={"kind": "HogQLQuery", "query": "select count() from persons"}
+        )
+        assert self.client.get(f"{self.url}mrr/").json()["is_drifted"] is True
+        assert self.client.post(f"{self.url}mrr/approve/").status_code == status.HTTP_409_CONFLICT
+
+    def test_refresh_then_approve_succeeds(self) -> None:
+        insight = self._insight()
+        self.client.post(
+            self.url, {"name": "mrr", "description": "d", "source_insight_short_id": insight.short_id}, format="json"
+        )
+        Insight.objects.filter(pk=insight.pk).update(
+            query={"kind": "HogQLQuery", "query": "select count() from persons"}
+        )
+        assert self.client.post(f"{self.url}mrr/refresh_from_insight/").status_code == status.HTTP_200_OK
+        assert self.client.post(f"{self.url}mrr/approve/").status_code == status.HTTP_200_OK
+
+    def _bearer(self, scopes: list[str]) -> dict:
+        raw = generate_random_token_personal()
+        PersonalAPIKey.objects.create(label="k", user=self.user, secure_value=hash_key_value(raw), scopes=scopes)
+        return {"HTTP_AUTHORIZATION": f"Bearer {raw}"}
+
+    @parameterized.expand(
+        [
+            ("without_approval_scope", ["data_catalog:read", "data_catalog:write"], status.HTTP_403_FORBIDDEN),
+            ("approval_scope_only", ["data_catalog_approval:write"], status.HTTP_403_FORBIDDEN),
+            (
+                "with_approval_scope",
+                ["data_catalog:read", "data_catalog:write", "data_catalog_approval:write"],
+                status.HTTP_200_OK,
+            ),
+        ]
+    )
+    def test_token_needs_approval_scope_to_approve(self, _name: str, scopes: list[str], expected: int) -> None:
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        self.client.logout()  # force the personal API key authenticator, not the session
+        response = self.client.post(f"{self.url}mrr/approve/", **self._bearer(scopes))
+        assert response.status_code == expected, response.json()
+
+    @parameterized.expand(
+        [
+            ("without_insight_read", ["data_catalog:read", "data_catalog:write"], status.HTTP_403_FORBIDDEN),
+            (
+                "with_insight_read",
+                ["data_catalog:read", "data_catalog:write", "insight:read"],
+                status.HTTP_201_CREATED,
+            ),
+        ]
+    )
+    def test_create_from_insight_needs_insight_read_scope(self, _name: str, scopes: list[str], expected: int) -> None:
+        insight = self._insight()
+        self.client.logout()
+        response = self.client.post(
+            self.url,
+            {"name": "mrr", "description": "d", "source_insight_short_id": insight.short_id},
+            format="json",
+            **self._bearer(scopes),
+        )
+        assert response.status_code == expected, response.json()
+
+    @parameterized.expand(
+        [
+            ("without_insight_read", ["data_catalog:read", "data_catalog:write"], status.HTTP_403_FORBIDDEN),
+            ("with_insight_read", ["data_catalog:read", "data_catalog:write", "insight:read"], status.HTTP_200_OK),
+        ]
+    )
+    def test_refresh_from_insight_needs_insight_read_scope(self, _name: str, scopes: list[str], expected: int) -> None:
+        insight = self._insight()
+        upsert_metric(
+            team=self.team, user=self.user, name="mrr", description="d", source_insight_short_id=insight.short_id
+        )
+        self.client.logout()
+        response = self.client.post(f"{self.url}mrr/refresh_from_insight/", **self._bearer(scopes))
+        assert response.status_code == expected, response.json()
+
+    def test_plain_create_does_not_need_insight_scope(self) -> None:
+        self.client.logout()
+        response = self.client.post(
+            self.url, {"name": "mrr", "description": "d"}, format="json", **self._bearer(["data_catalog:write"])
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+
+    def test_run_without_definition_returns_400(self) -> None:
+        self.client.post(self.url, {"name": "mrr", "description": "stub only"}, format="json")
+        response = self.client.post(f"{self.url}mrr/run/")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_run_rejects_date_params_on_hogql_metric(self) -> None:
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        response = self.client.post(f"{self.url}mrr/run/", {"date_from": "-7d"}, format="json")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        body = response.json()
+        assert body["attr"] == "date_from"
+        assert "fixed in its SQL" in body["detail"]
+
+    def test_run_requires_query_read_scope(self) -> None:
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        self.client.logout()
+        # data_catalog:read alone is not enough — run also touches the query engine.
+        response = self.client.post(f"{self.url}mrr/run/", **self._bearer(["data_catalog:read"]))
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_run_denied_for_session_user_without_query_access(self) -> None:
+        # Session users carry no API scopes, so required_scopes can't gate them and
+        # AccessControlPermission only checks the data_catalog resource. A member with query
+        # access explicitly set to "none" must still be blocked from reading data through a run.
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL}
+        ]
+        self.organization.save(update_fields=["available_product_features"])
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save(update_fields=["level"])
+        AccessControl.objects.create(
+            team=self.team,
+            resource="query",
+            resource_id=None,
+            organization_member=self.organization_membership,
+            access_level="none",
+        )
+        cache.clear()
+        response = self.client.post(f"{self.url}mrr/run/")
+        assert response.status_code == status.HTTP_403_FORBIDDEN, response.json()
+
+    def test_run_markdown_metric_returns_instructions(self) -> None:
+        upsert_metric(
+            team=self.team,
+            user=self.user,
+            name="activation",
+            description="d",
+            definition={"kind": "MarkdownDefinition", "markdown": "1. User did A then B within 7 days."},
+        )
+        response = self.client.post(f"{self.url}activation/run/")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        body = response.json()
+        assert body["kind"] == "MarkdownDefinition"
+        assert body["results"] is None
+        assert "A then B" in body["instructions"]
+
+    @parameterized.expand(
+        [
+            ("invalid_interval_in_body", {"interval": "fortnight"}, ""),
+            ("invalid_refresh_query_param", {}, "?refresh=nope"),
+        ]
+    )
+    def test_run_rejects_malformed_input(self, _name: str, body: dict, query_string: str) -> None:
+        # Wiring guard: the run action must validate through its serializers, so malformed input
+        # never reaches the query engine. The value matrix lives in TestMetricRunInputValidation.
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        response = self.client.post(f"{self.url}mrr/run/{query_string}", body, format="json")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def _drifted_metric(self, name: str) -> Metric:
+        insight = self._insight()
+        metric = upsert_metric(
+            team=self.team, user=self.user, name=name, description="d", source_insight_short_id=insight.short_id
+        )
+        Insight.objects.filter(pk=insight.pk).update(
+            query={"kind": "HogQLQuery", "query": "select count() from persons"}
+        )
+        return metric
+
+    def _other_team_metric(self, name: str) -> Metric:
+        other_team = Team.objects.create_with_data(
+            organization=self.organization, initiating_user=self.user, name="Other"
+        )
+        return Metric.objects.for_team(other_team.id).create(team=other_team, name=name, description="d")
+
+    def test_bulk_approve_partitions_the_batch_and_reasons_every_skip(self) -> None:
+        upsert_metric(team=self.team, user=self.user, name="first", description="d", definition=_HOGQL)
+        upsert_metric(team=self.team, user=self.user, name="second", description="d", definition=_HOGQL)
+        approve_metric(
+            upsert_metric(team=self.team, user=self.user, name="blessed", description="d", definition=_HOGQL), self.user
+        )
+        self._drifted_metric("stale")
+        soft_delete_metric(upsert_metric(team=self.team, user=self.user, name="gone", description="d"))
+        theirs = self._other_team_metric("theirs")
+
+        response = self.client.post(
+            f"{self.url}bulk_approve/",
+            {"names": ["first", "blessed", "stale", "gone", "theirs", "unheard_of", "second"]},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        body = response.json()
+        assert [metric["name"] for metric in body["approved"]] == ["first", "second"]
+        assert {skip["name"]: skip["reason"] for skip in body["skipped"]} == {
+            "blessed": BULK_SKIP_ALREADY_APPROVED,
+            "stale": BULK_SKIP_DRIFTED,
+            "gone": BULK_SKIP_NOT_FOUND,
+            "theirs": BULK_SKIP_NOT_FOUND,
+            "unheard_of": BULK_SKIP_NOT_FOUND,
+        }
+        assert Metric.objects.for_team(self.team.id).get(name="stale").status == MetricStatus.PROPOSED
+        theirs.refresh_from_db()
+        assert theirs.status == MetricStatus.PROPOSED
+
+    def test_bulk_approve_dedupes_repeated_names(self) -> None:
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        response = self.client.post(f"{self.url}bulk_approve/", {"names": ["mrr", "mrr"]}, format="json")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert [metric["name"] for metric in response.json()["approved"]] == ["mrr"]
+
+    @parameterized.expand(
+        [
+            ("bulk_approve", "bulk_approve", {}),
+            ("bulk_change_owner", "bulk/change_owner", {"owner": None}),
+        ]
+    )
+    def test_bulk_action_computes_drift_in_a_single_insight_query(
+        self, _name: str, url_path: str, extra_payload: dict
+    ) -> None:
+        # Same N+1 guard as the list view: drift must not fan out into one insight lookup per metric.
+        names = []
+        for index in range(3):
+            insight = self._insight()
+            names.append(f"m{index}")
+            upsert_metric(
+                team=self.team,
+                user=self.user,
+                name=names[-1],
+                description="d",
+                source_insight_short_id=insight.short_id,
+            )
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.post(f"{self.url}{url_path}/", {"names": names, **extra_payload}, format="json")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        insight_queries = [q for q in ctx.captured_queries if "posthog_dashboarditem" in q["sql"]]
+        assert len(insight_queries) == 1, insight_queries
+
+    def test_bulk_approve_writes_the_audit_trail_per_metric(self) -> None:
+        # The approval must go through save(), not a queryset UPDATE, or the audit trail is silently lost.
+        upsert_metric(team=self.team, user=self.user, name="first", description="d", definition=_HOGQL)
+        upsert_metric(team=self.team, user=self.user, name="second", description="d", definition=_HOGQL)
+        ActivityLog.objects.all().delete()
+
+        response = self.client.post(f"{self.url}bulk_approve/", {"names": ["first", "second"]}, format="json")
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        logged = ActivityLog.objects.filter(team_id=self.team.id, scope="Metric", activity="updated")
+        assert {entry.detail["name"] for entry in logged if entry.detail} == {"first", "second"}
+
+    def test_bulk_delete_frees_the_names_and_skips_unknown_ones(self) -> None:
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d")
+        upsert_metric(team=self.team, user=self.user, name="arr", description="d")
+        theirs = self._other_team_metric("theirs")
+
+        response = self.client.post(
+            f"{self.url}bulk_delete/", {"names": ["mrr", "arr", "theirs", "unheard_of"]}, format="json"
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        body = response.json()
+        assert body["deleted"] == ["mrr", "arr"]
+        assert {skip["name"] for skip in body["skipped"]} == {"theirs", "unheard_of"}
+        assert self.client.get(self.url).json()["results"] == []
+        theirs.refresh_from_db()
+        assert theirs.deleted is False
+
+    def test_bulk_change_owner_keeps_approval_and_skips_unknown_ones(self) -> None:
+        User.objects.create_and_join(self.organization, "new.owner@example.com", None)
+        approved = upsert_metric(team=self.team, user=self.user, name="mrr", description="d")
+        approve_metric(approved, self.user)
+        upsert_metric(team=self.team, user=self.user, name="arr", description="d")
+        theirs = self._other_team_metric("theirs")
+
+        response = self.client.post(
+            f"{self.url}bulk/change_owner/",
+            {"names": ["mrr", "arr", "theirs", "unheard_of"], "owner": "new.owner@example.com"},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        body = response.json()
+        assert [(metric["name"], metric["owner"], metric["status"]) for metric in body["updated"]] == [
+            ("mrr", "new.owner@example.com", MetricStatus.APPROVED),
+            ("arr", "new.owner@example.com", MetricStatus.PROPOSED),
+        ]
+        assert {skip["name"] for skip in body["skipped"]} == {"theirs", "unheard_of"}
+        theirs.refresh_from_db()
+        assert theirs.owner_id != User.objects.get(email="new.owner@example.com").id
+
+    def test_bulk_change_owner_skips_a_metric_renamed_after_name_resolution(self) -> None:
+        renamed = upsert_metric(team=self.team, user=self.user, name="arr", description="d")
+
+        change = bulk_change_metric_owner(
+            team_id=self.team.id, names_by_id={renamed.id: "mrr"}, owner_id=None, user_id=self.user.id
+        )
+
+        assert change.updated_ids == []
+        assert change.skipped_ids == [renamed.id]
+        renamed.refresh_from_db()
+        assert renamed.owner_id == self.user.id
+
+    def test_bulk_change_owner_path_leaves_a_metric_of_that_name_reachable(self) -> None:
+        upsert_metric(team=self.team, user=self.user, name="bulk_change_owner", description="d")
+
+        assert self.client.get(f"{self.url}bulk_change_owner/").status_code == status.HTTP_200_OK
+
+    @parameterized.expand(
+        [
+            (
+                "approve_without_approval_scope",
+                "bulk_approve",
+                ["data_catalog:read", "data_catalog:write"],
+                status.HTTP_403_FORBIDDEN,
+            ),
+            (
+                "approve_with_approval_scope",
+                "bulk_approve",
+                ["data_catalog:read", "data_catalog:write", "data_catalog_approval:write"],
+                status.HTTP_200_OK,
+            ),
+            ("delete_read_only", "bulk_delete", ["data_catalog:read"], status.HTTP_403_FORBIDDEN),
+            ("delete_with_write_scope", "bulk_delete", ["data_catalog:write"], status.HTTP_200_OK),
+            ("change_owner_read_only", "bulk/change_owner", ["data_catalog:read"], status.HTTP_403_FORBIDDEN),
+            ("change_owner_with_write_scope", "bulk/change_owner", ["data_catalog:write"], status.HTTP_200_OK),
+        ]
+    )
+    def test_bulk_actions_enforce_token_scopes(
+        self, _name: str, url_path: str, scopes: list[str], expected: int
+    ) -> None:
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        self.client.logout()
+        response = self.client.post(
+            f"{self.url}{url_path}/", {"names": ["mrr"], "owner": None}, format="json", **self._bearer(scopes)
+        )
+        assert response.status_code == expected, response.json()
+
+    def test_bulk_approve_rejects_an_over_cap_batch(self) -> None:
+        # Wiring guard: the action validates through its request serializer. Bounds live in
+        # TestMetricBulkNamesValidation.
+        response = self.client.post(
+            f"{self.url}bulk_approve/", {"names": [f"m{index}" for index in range(METRIC_BULK_MAX + 1)]}, format="json"
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["attr"] == "names"
+
+    def test_run_reports_drift_on_approved_metric(self) -> None:
+        # An approved metric whose source insight has moved on must say so in the run envelope —
+        # an agent decides trust from this response alone.
+        insight = Insight.objects.create(team=self.team, created_by=self.user, query=_HOGQL)
+        self.client.post(
+            self.url, {"name": "mrr", "description": "d", "source_insight_short_id": insight.short_id}, format="json"
+        )
+        assert self.client.post(f"{self.url}mrr/approve/").status_code == status.HTTP_200_OK
+        Insight.objects.filter(pk=insight.pk).update(
+            query={"kind": "HogQLQuery", "query": "select count() from persons"}
+        )
+
+        with patch(_PROCESS_QUERY, return_value={"results": [[1]], "hogql": "SELECT 1"}):
+            response = self.client.post(f"{self.url}mrr/run/")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        body = response.json()
+        assert body["status"] == MetricStatus.APPROVED
+        assert body["is_drifted"] is True
+
+
+class TestMetricRunThrottles(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.url = f"/api/projects/{self.team.id}/data_catalog/metrics/"
+
+    def _denied(self, throttle_class: type) -> tuple:
+        return (
+            patch.object(throttle_class, "allow_request", return_value=False),
+            patch.object(throttle_class, "wait", return_value=None),
+        )
+
+    def test_hogql_metric_uses_hogql_query_throttle(self) -> None:
+        upsert_metric(team=self.team, user=self.user, name="mrr", description="d", definition=_HOGQL)
+        deny, wait = self._denied(HogQLQueryThrottle)
+        with deny, wait:
+            response = self.client.post(f"{self.url}mrr/run/")
+        assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+    def test_structured_metric_uses_clickhouse_throttles(self) -> None:
+        upsert_metric(
+            team=self.team,
+            user=self.user,
+            name="purchases",
+            description="d",
+            definition={"kind": "EventsNode", "event": "purchase"},
+        )
+        deny, wait = self._denied(ClickHouseBurstRateThrottle)
+        with deny, wait:
+            response = self.client.post(f"{self.url}purchases/run/")
+        assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+    @parameterized.expand(
+        [
+            ("search", MetricSearchBurstRateThrottle, "get", {"search": "revenue"}, status.HTTP_429_TOO_MANY_REQUESTS),
+            ("plain_list", MetricSearchBurstRateThrottle, "get", {}, status.HTTP_200_OK),
+            ("create", MetricWriteBurstRateThrottle, "post", {"name": "mrr", "description": "d"}, 429),
+            ("search_is_not_a_write", MetricWriteBurstRateThrottle, "get", {"search": "revenue"}, status.HTTP_200_OK),
+        ]
+    )
+    @patch("products.data_catalog.backend.logic.metric_embeddings.posthoganalytics.feature_enabled", return_value=False)
+    def test_search_and_write_limits_apply_only_to_their_requests(
+        self, _name: str, throttle_class: type, method: str, data: dict[str, str], expected: int, _flag: MagicMock
+    ) -> None:
+        deny, wait = self._denied(throttle_class)
+        with deny, wait:
+            if method == "post":
+                response = self.client.post(self.url, data, format="json")
+            else:
+                response = self.client.get(self.url, data)
+        assert response.status_code == expected
+
+    def test_markdown_metric_keeps_default_throttles(self) -> None:
+        upsert_metric(
+            team=self.team,
+            user=self.user,
+            name="activation",
+            description="d",
+            definition={"kind": "MarkdownDefinition", "markdown": "1. Count."},
+        )
+        hogql_deny, hogql_wait = self._denied(HogQLQueryThrottle)
+        ch_deny, ch_wait = self._denied(ClickHouseBurstRateThrottle)
+        with hogql_deny, hogql_wait, ch_deny, ch_wait:
+            response = self.client.post(f"{self.url}activation/run/")
+        assert response.status_code == status.HTTP_200_OK
+
+
+class TestMetricRunInputValidation(SimpleTestCase):
+    @parameterized.expand([("day", True), ("month", True), ("fortnight", False), ("5m", False)])
+    def test_interval_choices(self, value: str, valid: bool) -> None:
+        serializer = MetricRunRequestSerializer(data={"interval": value})
+        assert serializer.is_valid() is valid
+        if not valid:
+            assert "interval" in serializer.errors
+
+    @parameterized.expand(
+        [
+            ("blocking", True),
+            ("async", True),
+            ("lazy_async", True),
+            ("force_blocking", True),
+            ("force_async", True),
+            ("force_cache", True),
+            ("true", False),
+            ("nope", False),
+        ]
+    )
+    def test_refresh_choices(self, value: str, valid: bool) -> None:
+        serializer = MetricRunQuerySerializer(data={"refresh": value})
+        assert serializer.is_valid() is valid
+        if not valid:
+            assert "refresh" in serializer.errors
+
+
+class TestMetricBulkNamesValidation(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("empty", 0, False),
+            ("one", 1, True),
+            ("at_cap", METRIC_BULK_MAX, True),
+            ("over_cap", METRIC_BULK_MAX + 1, False),
+        ]
+    )
+    def test_batch_size_bounds(self, _name: str, count: int, valid: bool) -> None:
+        serializer = MetricBulkNamesRequestSerializer(data={"names": [f"m{index}" for index in range(count)]})
+        assert serializer.is_valid() is valid, serializer.errors
+        if not valid:
+            assert "names" in serializer.errors

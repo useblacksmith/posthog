@@ -1,0 +1,3286 @@
+import { MakeLogicType, actions, connect, kea, listeners, path, props, reducers, selectors } from 'kea'
+import { forms } from 'kea-forms'
+import type { DeepPartial, DeepPartialMap, FieldName, ValidationErrorType } from 'kea-forms'
+import { loaders } from 'kea-loaders'
+import { router, urlToAction } from 'kea-router'
+import posthog from 'posthog-js'
+
+import { LemonDialog, lemonToast } from '@posthog/lemon-ui'
+
+import api from 'lib/api'
+import { tryShowMCPHint } from 'lib/components/MCPHint/mcpHintLogic'
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { preflightLogic } from 'lib/logic/preflightLogic'
+import { captureMarketingCrossSellSourceCreated, getMarketingCrossSellAttribution } from 'lib/marketingCrossSell'
+import { Scene } from 'scenes/sceneTypes'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+import {
+    Breadcrumb,
+    ExternalDataSourceCreatePayload,
+    ExternalDataSourceSyncSchema,
+    type ExternalDataSourceType,
+    IncrementalField,
+    manualLinkSources,
+    RowFilter,
+} from '~/types'
+
+import type { SourceFieldConfig } from 'products/data_warehouse/frontend/types'
+import {
+    externalDataSourcesBulkUpdateSchemasPartialUpdate,
+    externalDataSourcesIncrementalFieldRecommendationsCreate,
+    externalDataSourcesRetrieve,
+} from 'products/warehouse_sources/frontend/generated/api'
+import {
+    ExternalDataSourceBulkUpdateSchemaApi,
+    SourceConfigResponseApi,
+    SourceFieldSwitchGroupConfigApi,
+    SuggestedTableApi,
+} from 'products/warehouse_sources/frontend/generated/api.schemas'
+import {
+    externalDataSourcesIncrementalFieldRecommendationsCreateBodyTablesItemIncrementalFieldsMax,
+    externalDataSourcesIncrementalFieldRecommendationsCreateBodyTablesMax,
+} from 'products/warehouse_sources/frontend/generated/api.zod'
+
+import type { AvailableSetupTaskIdsEnumApi } from '../../../../../frontend/src/generated/core/api.schemas'
+import type { PaginatedResponse } from '../../../../../frontend/src/lib/api'
+import type { FeatureFlagsSet } from '../../../../../frontend/src/lib/logic/featureFlagLogic'
+import type { ProductIntentProperties } from '../../../../../frontend/src/lib/utils/product-intents'
+import type { ExternalDataSource, PreflightStatus } from '../../../../../frontend/src/types'
+import {
+    getDefaultExpandedSchemaKeys,
+    groupTablesBySchema,
+    splitQualifiedTableName,
+    supportsDirectQuery,
+} from '../../shared/components/forms/schemaGroupingUtils'
+import type { WebhookCreateResult } from '../../shared/components/forms/WebhookSetupForm'
+import { sourceManagementLogic } from '../../shared/logics/sourceManagementLogic'
+import { clonePayloadPreservingFiles, findUploadedFiles, readJsonFile } from '../../shared/sourceFieldFiles'
+import { destinationStepBlockReason, shouldShowDestinationStep } from './components/destinationStepUtils'
+import { FILE_UPLOAD_SOURCE_CONFIG, FILE_UPLOAD_SOURCE_NAME } from './fileUploadSource'
+import { restoreSourceFormState, saveSourceFormState } from './wizardFormStorage'
+
+export const SSH_FIELD: SourceFieldSwitchGroupConfigApi = {
+    name: 'ssh_tunnel',
+    label: 'Use SSH tunnel?',
+    type: 'switch-group',
+    default: false,
+    fields: [
+        {
+            name: 'host',
+            label: 'Tunnel host',
+            type: 'text',
+            required: true,
+            placeholder: 'localhost',
+            secret: false,
+        },
+        {
+            name: 'port',
+            label: 'Tunnel port',
+            type: 'number',
+            required: true,
+            placeholder: '22',
+            secret: false,
+        },
+        {
+            type: 'select',
+            name: 'auth',
+            label: 'Authentication type',
+            required: true,
+            defaultValue: 'password',
+            options: [
+                {
+                    label: 'Password',
+                    value: 'password',
+                    fields: [
+                        {
+                            name: 'username',
+                            label: 'Tunnel username',
+                            type: 'text',
+                            required: true,
+                            placeholder: 'User1',
+                            secret: false,
+                        },
+                        {
+                            name: 'password',
+                            label: 'Tunnel password',
+                            type: 'password',
+                            required: true,
+                            placeholder: '',
+                            secret: true,
+                        },
+                    ],
+                },
+                {
+                    label: 'Key pair',
+                    value: 'keypair',
+                    fields: [
+                        {
+                            name: 'username',
+                            label: 'Tunnel username',
+                            type: 'text',
+                            required: false,
+                            placeholder: 'User1',
+                            secret: false,
+                        },
+                        {
+                            name: 'private_key',
+                            label: 'Tunnel private key',
+                            type: 'textarea',
+                            required: true,
+                            placeholder: '',
+                            secret: true,
+                        },
+                        {
+                            name: 'passphrase',
+                            label: 'Tunnel passphrase',
+                            type: 'password',
+                            required: false,
+                            placeholder: '',
+                            secret: true,
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            name: 'host_key',
+            label: 'SSH host key (optional)',
+            type: 'textarea',
+            required: false,
+            placeholder: 'ssh-ed25519 AAAA...',
+            secret: false,
+            caption:
+                'Paste one public host key line for the tunnel server, and PostHog verifies its identity on every connect. Get it from your server administrator, or run `ssh-keyscan -p <port> <host>` and pick one of the lines it prints, then confirm that line through a channel you trust. Leave blank to connect without verifying the server.',
+        },
+        {
+            name: 'require_tls',
+            label: 'Require TLS through tunnel?',
+            type: 'switch-group',
+            default: true,
+            caption: 'Disable if your database does not support TLS.',
+            fields: [],
+        },
+    ],
+}
+
+export const buildKeaFormDefaultFromSourceDetails = (
+    sourceDetails: Record<string, SourceConfigResponseApi>
+): Record<string, any> => {
+    if (!sourceDetails) {
+        return {}
+    }
+
+    const fieldDefaults = (field: SourceFieldConfig, obj: Record<string, any>): void => {
+        if (field.type === 'switch-group') {
+            obj[field.name] = {}
+            obj[field.name]['enabled'] = field.default
+            field.fields.forEach((f) => fieldDefaults(f, obj[field.name]))
+            return
+        }
+
+        if (field.type === 'select') {
+            const hasOptionFields = !!field.options.filter((n) => (n.fields?.length ?? 0) > 0).length
+
+            if (field.multiple) {
+                obj[field.name] = field.defaultValue ? [field.defaultValue] : []
+                return
+            }
+
+            if (hasOptionFields) {
+                obj[field.name] = {}
+                obj[field.name]['selection'] = field.defaultValue
+                field.options.flatMap((n) => n.fields ?? []).forEach((f) => fieldDefaults(f, obj[field.name]))
+            } else {
+                obj[field.name] = field.defaultValue
+            }
+            return
+        }
+
+        if (field.type === 'oauth-account-select' && field.multiple) {
+            obj[field.name] = []
+            return
+        }
+
+        // All other types
+        obj[field.name] = ''
+    }
+
+    const sourceDetailsKeys = Object.keys(sourceDetails)
+    return sourceDetailsKeys.reduce(
+        (defaults, cur) => {
+            const fields = sourceDetails[cur].fields
+            fields.forEach((f) => {
+                if (f.type === 'ssh-tunnel') {
+                    fieldDefaults(SSH_FIELD, defaults['payload'])
+                } else {
+                    fieldDefaults(f, defaults['payload'])
+                }
+            })
+
+            return defaults
+        },
+        { prefix: '', description: '', payload: {} } as Record<string, any>
+    )
+}
+
+// Merge priority for the source connection form when a connector is (re)selected:
+//   1. connector-schema defaults (lowest)
+//   2. URL/UI access_method (e.g. `?access_method=direct`)
+//   3. OAuth-restored values (highest — saved access_method wins over a stale URL one because
+//      the OAuth callback URL doesn't carry it forward)
+export function mergeRestoredSourceFormValues(
+    defaults: Record<string, unknown>,
+    savedValues: Record<string, unknown> | null | undefined,
+    currentAccessMethod: unknown
+): Record<string, unknown> {
+    return {
+        ...defaults,
+        ...(currentAccessMethod !== undefined ? { access_method: currentAccessMethod } : {}),
+        ...savedValues,
+    }
+}
+
+export function shouldHydrateSourceFromUrl(
+    currentStep: number,
+    selectedConnector: SourceConfigResponseApi | null,
+    source: SourceConfigResponseApi,
+    currentAccessMethod: 'warehouse' | 'direct',
+    urlAccessMethod: 'warehouse' | 'direct'
+): boolean {
+    return !(selectedConnector?.name === source.name && currentAccessMethod === urlAccessMethod && currentStep > 1)
+}
+
+/**
+ * Resolve the `direct_query_enabled` create-payload value. Synced direct-capable sources
+ * default to live queries enabled unless the toggle was switched off; the flag is omitted
+ * for pure direct sources (backend ignores it) and for sources that can't be live-queried.
+ */
+export function resolveCreateDirectQueryEnabled(
+    sourceValues: { access_method?: string; direct_query_enabled?: boolean },
+    connectorName: string
+): boolean | undefined {
+    if (!supportsDirectQuery(connectorName) || sourceValues.access_method === 'direct') {
+        return undefined
+    }
+    return sourceValues.direct_query_enabled !== false
+}
+
+export function buildCreateSourcePayload(
+    sourceValues: { access_method?: string; direct_query_enabled?: boolean },
+    connectorName: string
+): Record<string, any> {
+    const isDirectQueryMode = supportsDirectQuery(connectorName) && sourceValues.access_method === 'direct'
+    return {
+        ...sourceValues,
+        access_method: isDirectQueryMode ? 'direct' : 'warehouse',
+        direct_query_enabled: resolveCreateDirectQueryEnabled(sourceValues, connectorName),
+        source_type: connectorName,
+    }
+}
+
+function withoutColumns(columns: string[] | null | undefined, removed: (string | null)[]): string[] | null | undefined {
+    const names = new Set(removed.filter((name): name is string => !!name).map((name) => name.toLowerCase()))
+    return columns?.filter((column) => !names.has(column.toLowerCase())) ?? columns
+}
+
+function webhookResultHasNoPendingInputs(webhookResult: WebhookCreateResult | null | undefined): boolean {
+    return !!webhookResult?.success && (webhookResult.pending_inputs?.length ?? 0) === 0
+}
+
+// A thrown fetch has no HTTP status, so its message is the raw "Failed to fetch", most often an ad
+// blocker or extension blocking the request. Name that likely cause instead of echoing it.
+// Django REST Framework's placeholder detail for an unhandled 500. It carries no more meaning
+// than the status code itself, so don't let it stand in for a message the source wrote.
+const GENERIC_SERVER_ERROR_DETAIL = 'A server error occurred.'
+
+// A wrong-but-valid JSON file (a client config instead of a service account key, say) parses
+// fine, so the API is left rejecting it by naming its own config fields. Check the keys the
+// source declared while the file is still in hand.
+export function missingUploadedFileKeys(parsed: unknown, keys: '*' | string[]): string[] {
+    if (keys === '*') {
+        return []
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return [...keys]
+    }
+    const record = parsed as Record<string, unknown>
+    return keys.filter((key) => record[key] === undefined || record[key] === null || record[key] === '')
+}
+
+// Carries the failed submit out of the form without the outer handler mistaking it for an API
+// error; the toast has already said what to do, so nothing else reports it.
+export class UnusableUploadedFileError extends Error {
+    constructor(fieldName: string) {
+        super(`Uploaded "${fieldName}" file is missing the keys this source requires`)
+        this.name = 'UnusableUploadedFileError'
+    }
+}
+
+export const WRONG_UPLOADED_FILE_MESSAGE =
+    'This JSON file is missing the fields PostHog needs. Upload the key file exactly as it was generated, without editing its contents.'
+
+// Mirrors the backend `prefix_required` check: a second unprefixed source of the same type would
+// write to the same table names, so the API rejects it.
+export function isPrefixRequired(sources: ExternalDataSource[] | undefined, sourceType: string | undefined): boolean {
+    if (!sourceType || !sources) {
+        return false
+    }
+    return sources.some((source) => source.source_type === sourceType && !source.prefix)
+}
+
+export function resolveConnectErrorMessage(e: any): string {
+    const detail = e?.detail === GENERIC_SERVER_ERROR_DETAIL ? undefined : e?.detail
+    const apiMessage = e?.data?.message ?? detail
+    if (apiMessage) {
+        return apiMessage
+    }
+    if (e?.status === undefined || e?.status === null || e?.status === 0) {
+        return "PostHog couldn't reach the server to set up your source. This is often an ad blocker or browser extension blocking the request. Try pausing it or switching networks, then try again."
+    }
+    if (e?.status >= 500) {
+        // Every source reaches this branch, including ones with no database behind them, so the
+        // message can't name a cause only some of them have.
+        return "PostHog couldn't set up your source. Check that the details you entered are correct and that the source is reachable, then try again."
+    }
+    // A 4xx without a message body would otherwise toast "undefined".
+    return e?.message ?? 'Something went wrong setting up your source. Please try again.'
+}
+
+const isTimestampType = (field: IncrementalField): boolean => {
+    const type = field.type || field.field_type
+    return type === 'timestamp' || type === 'datetime' || type === 'date'
+}
+
+const isIdField = (field: IncrementalField): boolean => /^(id|uuid)/i.test(field.label) && field.type === 'integer'
+
+// A rule pick is trusted only for the field kinds the name rules accept, so a recommended `score`
+// integer is not a cursor. A model pick read the column names, so any type is trusted.
+const recommendedIncrementalField = (fields: IncrementalField[]): IncrementalField | undefined =>
+    fields.find((field) => field.recommended && (field.picked_by_model || isTimestampType(field) || isIdField(field)))
+
+const resolveIncrementalField = (fields: IncrementalField[]): IncrementalField | undefined => {
+    const recommended = recommendedIncrementalField(fields)
+    if (recommended) {
+        return recommended
+    }
+    // check for timestamp field matching "updated_at" or "updatedAt" case insensitive
+    const updatedAt = fields.find((field) => {
+        const regex = /^updated/i
+        return regex.test(field.label) && isTimestampType(field)
+    })
+    if (updatedAt) {
+        return updatedAt
+    }
+    // fallback to timestamp field matching "created_at" or "createdAt" case insensitive
+    const createdAt = fields.find((field) => {
+        const regex = /^created/i
+        return regex.test(field.label) && isTimestampType(field)
+    })
+    if (createdAt) {
+        return createdAt
+    }
+    // fallback to any timestamp or datetime field
+    const timestamp = fields.find((field) => isTimestampType(field))
+    if (timestamp) {
+        return timestamp
+    }
+    // fallback to numeric fields matching "id" or "uuid" case insensitive
+    const id = fields.find(isIdField)
+    if (id) {
+        return id
+    }
+    // leave unset and require user configuration
+    return undefined
+}
+
+// Supabase tables carry arbitrary user columns, so the "any timestamp/date" and id-column
+// fallbacks above can land on a value that never changes on update (a date of birth, a
+// config integer). Such a cursor syncs each row once and then silently stops seeing
+// updates, so only trust update-tracking columns and otherwise default to full refresh.
+export const resolveUpdateTrackedIncrementalField = (fields: IncrementalField[]): IncrementalField | undefined =>
+    // A model pick read the column names for one that changes on update, such as `fecha_actualizacion`.
+    fields.find((field) => field.picked_by_model) ??
+    fields.find((field) => /^(updated|modified|last_modified)/i.test(field.label) && isTimestampType(field)) ??
+    fields.find((field) => /^created/i.test(field.label) && isTimestampType(field))
+
+// An incremental sync merges rows on a primary key, and source creation rejects an incremental
+// table whose introspected columns have no key and no `id` column to fall back to. A table with
+// no introspected columns resolves its key at sync time, so it needs no key here.
+const hasIncrementalMergeKey = (schema: ExternalDataSourceSyncSchema): boolean =>
+    !!schema.primary_key_columns?.length ||
+    !!schema.detected_primary_keys?.length ||
+    (schema.available_columns?.length
+        ? schema.available_columns.some((column) => column.field.toLowerCase() === 'id')
+        : !schema.declares_primary_keys)
+
+// Shared rule for bulk enablement (select-all, onboarding auto-configure): permission_error
+// rows stay off so bulk toggle never queues guaranteed-403 syncs, and default-off tables
+// (e.g. Supabase Vault tables, which hold decrypted secrets) keep their current state so
+// enabling them always takes an explicit per-table opt-in. Bulk disable still clears them.
+export const bulkToggledShouldSync = (schema: ExternalDataSourceSyncSchema, selectAll: boolean): boolean => {
+    if (schema.permission_error) {
+        return false
+    }
+    if (selectAll && schema.should_sync_default === false) {
+        return schema.should_sync
+    }
+    return selectAll
+}
+
+export interface PollingSyncSettings {
+    sync_type: 'full_refresh' | 'incremental' | 'append'
+    incremental_field?: string
+    incremental_field_type?: string
+}
+
+/** The default sync method for a table that does not sync by CDC or webhook. */
+export function defaultPollingSyncSettings(
+    schema: ExternalDataSourceSyncSchema,
+    connectorName: string
+): PollingSyncSettings {
+    if (schema.prefers_full_refresh) {
+        return { sync_type: 'full_refresh' }
+    }
+    if (schema.incremental_available && !hasIncrementalMergeKey(schema)) {
+        return { sync_type: 'full_refresh' }
+    }
+    if (schema.incremental_available || schema.append_available) {
+        const resolvedField =
+            connectorName === 'Supabase'
+                ? resolveUpdateTrackedIncrementalField(schema.incremental_fields)
+                : resolveIncrementalField(schema.incremental_fields)
+        if (resolvedField) {
+            return {
+                sync_type: schema.incremental_available ? 'incremental' : 'append',
+                incremental_field: resolvedField.field,
+                incremental_field_type: resolvedField.field_type,
+            }
+        }
+    }
+    return { sync_type: 'full_refresh' }
+}
+
+// The backend marks the candidates it ranked, so only those go to the model.
+const recommendationCandidates = (schema: ExternalDataSourceSyncSchema): IncrementalField[] =>
+    schema.incremental_fields
+        .filter((field) => field.recommended !== undefined)
+        .slice(0, externalDataSourcesIncrementalFieldRecommendationsCreateBodyTablesItemIncrementalFieldsMax)
+
+// Mirrors MAX_COLUMNS_PER_CALL on the endpoint, which rejects a request over it with a 400.
+const MAX_RECOMMENDATION_COLUMNS = 32
+// Requests in flight at once. More would arrive at the model as a burst and get rate limited.
+const MAX_PARALLEL_RECOMMENDATION_REQUESTS = 3
+
+/** Tables grouped into requests that each fit one model call, in their original order. */
+export function packRecommendationBatches(tables: ExternalDataSourceSyncSchema[]): ExternalDataSourceSyncSchema[][] {
+    const batches: ExternalDataSourceSyncSchema[][] = []
+    let columns = 0
+    for (const table of tables) {
+        const count = recommendationCandidates(table).length
+        const current = batches[batches.length - 1]
+        const fits =
+            current &&
+            current.length < externalDataSourcesIncrementalFieldRecommendationsCreateBodyTablesMax &&
+            columns + count <= MAX_RECOMMENDATION_COLUMNS
+        if (fits) {
+            current.push(table)
+            columns += count
+        } else {
+            batches.push([table])
+            columns = count
+        }
+    }
+    return batches
+}
+
+/** The model's picks for one batch of tables, or none when the request fails. */
+async function fetchIncrementalFieldPicks(
+    teamId: number,
+    batch: ExternalDataSourceSyncSchema[]
+): Promise<Map<string, IncrementalField[]>> {
+    const picked = new Map<string, IncrementalField[]>()
+    try {
+        const response = await externalDataSourcesIncrementalFieldRecommendationsCreate(String(teamId), {
+            tables: batch.map((schema) => ({
+                table: schema.table,
+                incremental_fields: recommendationCandidates(schema),
+            })),
+        })
+        for (const table of response.tables) {
+            picked.set(table.table, table.incremental_fields as IncrementalField[])
+        }
+    } catch (error) {
+        // The picks are optional, but a rejected batch can mean the wizard and endpoint limits drifted.
+        posthog.captureException(error)
+    }
+    return picked
+}
+
+const isExcludedColumn = (schema: ExternalDataSourceSyncSchema, column: string): boolean =>
+    !!schema.masked_columns?.includes(column) || (!!schema.enabled_columns && !schema.enabled_columns.includes(column))
+
+/** Puts the model's order on a table, and moves its cursor only when the person kept the default. */
+function applyIncrementalFieldPick(
+    schema: ExternalDataSourceSyncSchema,
+    reordered: IncrementalField[],
+    connectorName: string
+): ExternalDataSourceSyncSchema {
+    const sent = new Set(reordered.map((field) => field.field))
+    const updated = {
+        ...schema,
+        incremental_fields: [...reordered, ...schema.incremental_fields.filter((field) => !sent.has(field.field))],
+    }
+    const previous = defaultPollingSyncSettings(schema, connectorName)
+    // A full-refresh default keeps whatever cursor discovery returned, so only the sync type says
+    // whether the person changed it.
+    const untouched =
+        schema.sync_type === previous.sync_type &&
+        (previous.sync_type === 'full_refresh' ||
+            (schema.incremental_field ?? undefined) === previous.incremental_field)
+    const next = defaultPollingSyncSettings(updated, connectorName)
+    // A column the person masked or left out of the sync cannot be the cursor.
+    if (!untouched || (next.incremental_field && isExcludedColumn(schema, next.incremental_field))) {
+        return updated
+    }
+    updated.sync_type = next.sync_type
+    updated.incremental_field = next.incremental_field ?? null
+    updated.incremental_field_type = next.incremental_field_type ?? null
+    return updated
+}
+
+function syncExpandedSchemaGroupKeys(
+    actions: sourceWizardLogicType['actions'],
+    values: sourceWizardLogicType['values']
+): void {
+    if (!values.isDirectQueryMode) {
+        return
+    }
+
+    const fingerprint = values.schemaGroupKeys.join('|')
+    if (values.schemaGroupKeysFingerprint === fingerprint) {
+        return
+    }
+
+    actions.syncExpandedSchemaGroupKeys(values.schemaGroupKeys, fingerprint)
+}
+
+export interface SourceWizardLogicProps {
+    onComplete?: () => void
+    availableSources: Record<string, SourceConfigResponseApi>
+    /** When set, only these tables will be pre-selected and they cannot be deselected */
+    requiredTables?: string[]
+    requiredTableSyncType?: 'full_refresh'
+    oauthRedirectUrl?: string
+    /** Onboarding: pre-select every syncable table with smart defaults for a one-click sync */
+    autoConfigureTables?: boolean
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sourceWizardLogicValues {
+    featureFlags: FeatureFlagsSet // featureFlagLogic
+    preflight: PreflightStatus | null // preflightLogic
+    dataWarehouseSources: PaginatedResponse<ExternalDataSource> | null // sourceManagementLogic
+    currentTeamId: number | null // teamLogic
+    availableSources: any
+    breadcrumbs: Breadcrumb[]
+    canGoBack: boolean
+    canGoNext: boolean
+    cdcPrereqsCheckResult: {
+        errors: string[]
+        valid: boolean
+    } | null
+    cdcPrereqsCheckResultLoading: boolean
+    cdcSelfManagedSetupDialogOpen: boolean
+    cdcSelfManagedVerifyResult: {
+        errors: string[]
+        valid: boolean
+    } | null
+    cdcSelfManagedVerifyResultLoading: boolean
+    configuredSchemaName: string | null
+    connectError: string | null
+    connectorSelectionCount: number
+    connectors: SourceConfigResponseApi[]
+    currentStep: number
+    currentSyncMethodModalSchema: ExternalDataSourceSyncSchema | null
+    databaseSchema: ExternalDataSourceSyncSchema[]
+    defaultSourceConnectionDetails: Record<string, unknown>
+    expandedSchemaGroupKeys: string[]
+    filteredDatabaseSchema: ExternalDataSourceSyncSchema[]
+    groupedDatabaseSchema: {
+        schemaName: string
+        tables: ExternalDataSourceSyncSchema[]
+    }[]
+    hasWebhookSchemas: boolean
+    incrementalFieldModelEnabled: boolean
+    isDirectQueryMode: boolean
+    isLoading: boolean
+    isManualLinkingSelected: boolean
+    isSourceConnectionDetailsSubmitting: boolean
+    isSourceConnectionDetailsValid: boolean
+    isWebhookFieldInputsSubmitting: boolean
+    isWebhookFieldInputsValid: boolean
+    isWrapped: boolean
+    modalTitle:
+        | ''
+        | 'Choose destinations'
+        | 'Importing your data...'
+        | 'Link your data source'
+        | 'Select tables to import'
+        | 'Select tables to query'
+        | 'Set up webhook'
+        | 'Tables ready to query'
+    nextButtonDisabledReason: string | null
+    nextButtonText: string
+    oauthRedirectUrl: string | undefined
+    prefixRequired: boolean
+    requiredTables: any
+    returnConfig: {
+        entryPoint?: string
+        returnLabel: string
+        returnUrl: string
+    } | null
+    schemaGroupKeys: string[]
+    schemaGroupKeysFingerprint: string
+    schemaNameFilter: string
+    selectedConnector: SourceConfigResponseApi | null
+    showDestinationStep: boolean
+    showFooter: boolean
+    showSkipButton: boolean
+    showSourceConnectionDetailsErrors: boolean
+    showWebhookFieldInputsErrors: boolean
+    source: {
+        access_method: 'direct' | 'warehouse'
+        description: string
+        direct_query_enabled?: boolean
+        payload: Record<string, any>
+        prefix: string
+    }
+    sourceConnectionDetails: Record<string, any>
+    sourceConnectionDetailsAllErrors: Record<string, any>
+    sourceConnectionDetailsChanged: boolean
+    sourceConnectionDetailsErrors: DeepPartialMap<Record<string, any>, ValidationErrorType>
+    sourceConnectionDetailsHasErrors: boolean
+    sourceConnectionDetailsManualErrors: Record<string, any>
+    sourceConnectionDetailsTouched: boolean
+    sourceConnectionDetailsTouches: Record<string, boolean>
+    sourceConnectionDetailsValidationErrors: DeepPartialMap<Record<string, any>, ValidationErrorType>
+    sourceId: string | null
+    suggestedTablesMap: Record<string, string | null>
+    syncMethodModalOpen: boolean
+    tablesAllToggledOn: boolean | 'indeterminate'
+    webhookCreating: boolean
+    webhookFieldInputs: Record<string, any>
+    webhookFieldInputsAllErrors: Record<string, any>
+    webhookFieldInputsChanged: boolean
+    webhookFieldInputsErrors: DeepPartialMap<Record<string, any>, ValidationErrorType>
+    webhookFieldInputsHasErrors: boolean
+    webhookFieldInputsManualErrors: Record<string, any>
+    webhookFieldInputsTouched: boolean
+    webhookFieldInputsTouches: Record<string, boolean>
+    webhookFieldInputsValidationErrors: DeepPartialMap<Record<string, any>, ValidationErrorType>
+    webhookManualSetupConfirmed: boolean
+    webhookNeedsManualConfirmation: boolean
+    webhookResult: WebhookCreateResult | null
+    webhookStepComplete: boolean
+    webhookTablesSwitching: boolean
+    wizardAvailableDestinationCount: number
+    wizardDestinationIds: string[]
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sourceWizardLogicActions {
+    markTaskAsCompleted: (taskIdOrIds: SetupTaskId | SetupTaskId[]) => {
+        taskIdOrIds: AvailableSetupTaskIdsEnumApi | AvailableSetupTaskIdsEnumApi[]
+    } // globalSetupLogic
+    loadSources: () => {
+        value: true
+    } // sourceManagementLogic
+    addProductIntent: (properties: ProductIntentProperties) => ProductIntentProperties // teamLogic
+    cancelSyncMethodModal: () => {
+        value: true
+    }
+    cancelWizard: () => {
+        value: true
+    }
+    checkCdcPrereqs: () => any
+    checkCdcPrereqsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    checkCdcPrereqsSuccess: (
+        cdcPrereqsCheckResult: {
+            errors: string[]
+            valid: boolean
+        } | null,
+        payload?: any
+    ) => {
+        cdcPrereqsCheckResult: {
+            errors: string[]
+            valid: boolean
+        } | null
+        payload?: any
+    }
+    clearCdcPrereqsCheckResult: () => {
+        value: true
+    }
+    clearCdcPrereqsCheckResultFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    clearCdcPrereqsCheckResultSuccess: (
+        cdcPrereqsCheckResult: null,
+        payload?: {
+            value: true
+        }
+    ) => {
+        cdcPrereqsCheckResult: null
+        payload?: {
+            value: true
+        }
+    }
+    clearCdcSelfManagedVerifyResult: () => {
+        value: true
+    }
+    clearCdcSelfManagedVerifyResultFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    clearCdcSelfManagedVerifyResultSuccess: (
+        cdcSelfManagedVerifyResult: null,
+        payload?: {
+            value: true
+        }
+    ) => {
+        cdcSelfManagedVerifyResult: null
+        payload?: {
+            value: true
+        }
+    }
+    clearReturnConfig: () => {
+        value: true
+    }
+    clearSource: () => {
+        value: true
+    }
+    closeCdcSelfManagedSetupDialog: () => {
+        value: true
+    }
+    closeWizard: () => {
+        value: true
+    }
+    createSource: () => {
+        value: true
+    }
+    createWebhook: () => {
+        value: true
+    }
+    getDatabaseSchemas: () => {
+        value: true
+    }
+    handleRedirect: (
+        source: ExternalDataSourceType,
+        searchParams?: any
+    ) => {
+        searchParams: any
+        source: string
+    }
+    loadIncrementalFieldRecommendations: () => {
+        value: true
+    }
+    onBack: () => {
+        value: true
+    }
+    onClear: () => {
+        value: true
+    }
+    onNext: () => {
+        value: true
+    }
+    onSubmit: () => {
+        value: true
+    }
+    openCdcSelfManagedSetupDialog: () => {
+        value: true
+    }
+    openSyncMethodModal: (schema: ExternalDataSourceSyncSchema) => {
+        schema: ExternalDataSourceSyncSchema
+    }
+    resetSourceConnectionDetails: (values?: Record<string, any>) => {
+        values?: Record<string, any>
+    }
+    resetSourceForm: (accessMethod?: 'direct' | 'warehouse') => {
+        accessMethod: 'direct' | 'warehouse' | undefined
+    }
+    resetWebhookFieldInputs: (values?: Record<string, any>) => {
+        values?: Record<string, any>
+    }
+    saveFormStateBeforeRedirect: () => {
+        value: true
+    }
+    selectConnector: (
+        connector: SourceConfigResponseApi | null,
+        accessMethod?: 'direct' | 'warehouse'
+    ) => {
+        accessMethod: 'direct' | 'warehouse' | undefined
+        connector: SourceConfigResponseApi | null
+    }
+    setConnectError: (message: string | null) => {
+        message: string | null
+    }
+    setDatabaseSchemas: (schemas: ExternalDataSourceSyncSchema[]) => {
+        schemas: ExternalDataSourceSyncSchema[]
+    }
+    setExpandedSchemaGroupKeys: (expandedSchemaKeys: string[]) => {
+        expandedSchemaKeys: string[]
+    }
+    setInitialConnector: (connector: SourceConfigResponseApi | null) => {
+        connector: SourceConfigResponseApi | null
+    }
+    setIsLoading: (isLoading: boolean) => {
+        isLoading: boolean
+    }
+    setReturnConfig: (
+        returnUrl: string,
+        returnLabel: string,
+        entryPoint?: string
+    ) => {
+        entryPoint: string | undefined
+        returnLabel: string
+        returnUrl: string
+    }
+    setSchemaMaskedColumns: (
+        schema: ExternalDataSourceSyncSchema,
+        maskedColumns: string[]
+    ) => {
+        maskedColumns: string[]
+        schema: ExternalDataSourceSyncSchema
+    }
+    setSchemaNameFilter: (schemaNameFilter: string) => {
+        schemaNameFilter: string
+    }
+    setSchemaRowFilters: (
+        schema: ExternalDataSourceSyncSchema,
+        rowFilters: RowFilter[] | null
+    ) => {
+        rowFilters: RowFilter[] | null
+        schema: ExternalDataSourceSyncSchema
+    }
+    setSchemaSyncedColumns: (
+        schema: ExternalDataSourceSyncSchema,
+        enabledColumns: string[] | null
+    ) => {
+        enabledColumns: string[] | null
+        schema: ExternalDataSourceSyncSchema
+    }
+    setSourceConnectionDetailsManualErrors: (errors: Record<string, any>) => {
+        errors: Record<string, any>
+    }
+    setSourceConnectionDetailsValue: (
+        key: FieldName,
+        value: any
+    ) => {
+        name: FieldName
+        value: any
+    }
+    setSourceConnectionDetailsValues: (values: DeepPartial<Record<string, any>>) => {
+        values: DeepPartial<Record<string, any>>
+    }
+    setSourceId: (id: string) => {
+        sourceId: string
+    }
+    setStep: (step: number) => {
+        step: number
+    }
+    setWebhookFieldInputsManualErrors: (errors: Record<string, any>) => {
+        errors: Record<string, any>
+    }
+    setWebhookFieldInputsValue: (
+        key: FieldName,
+        value: any
+    ) => {
+        name: FieldName
+        value: any
+    }
+    setWebhookFieldInputsValues: (values: DeepPartial<Record<string, any>>) => {
+        values: DeepPartial<Record<string, any>>
+    }
+    setWebhookManualSetupConfirmed: (confirmed: boolean) => {
+        confirmed: boolean
+    }
+    setWebhookResult: (result: WebhookCreateResult | null) => {
+        result: WebhookCreateResult | null
+    }
+    setWebhookTablesSwitching: (switching: boolean) => {
+        switching: boolean
+    }
+    setWizardAvailableDestinationCount: (count: number) => {
+        count: number
+    }
+    setWizardDestinationIds: (destinationIds: string[]) => {
+        destinationIds: string[]
+    }
+    skipWebhookSetup: () => {
+        value: true
+    }
+    submitSourceConnectionDetails: () => {
+        value: boolean
+    }
+    submitSourceConnectionDetailsFailure: (
+        error: Error,
+        errors: Record<string, any>
+    ) => {
+        error: Error
+        errors: Record<string, any>
+    }
+    submitSourceConnectionDetailsRequest: (sourceConnectionDetails: Record<string, any>) => {
+        sourceConnectionDetails: Record<string, any>
+    }
+    submitSourceConnectionDetailsSuccess: (sourceConnectionDetails: Record<string, any>) => {
+        sourceConnectionDetails: Record<string, any>
+    }
+    submitWebhookFieldInputs: () => {
+        value: boolean
+    }
+    submitWebhookFieldInputsFailure: (
+        error: Error,
+        errors: Record<string, any>
+    ) => {
+        error: Error
+        errors: Record<string, any>
+    }
+    submitWebhookFieldInputsRequest: (webhookFieldInputs: Record<string, any>) => {
+        webhookFieldInputs: Record<string, any>
+    }
+    submitWebhookFieldInputsSuccess: (webhookFieldInputs: Record<string, any>) => {
+        webhookFieldInputs: Record<string, any>
+    }
+    submitWebhookFields: () => {
+        value: true
+    }
+    switchWebhookTablesToPolling: () => {
+        value: true
+    }
+    syncExpandedSchemaGroupKeys: (
+        groupedSchemaKeys: string[],
+        fingerprint: string
+    ) => {
+        fingerprint: string
+        groupedSchemaKeys: string[]
+    }
+    toggleAllTables: (
+        selectAll: boolean,
+        tableNames?: string[]
+    ) => {
+        selectAll: boolean
+        tableNames: string[] | undefined
+    }
+    toggleSchemaGroup: (
+        schemaName: string,
+        shouldSync: boolean
+    ) => {
+        schemaName: string
+        shouldSync: boolean
+    }
+    toggleSchemaShouldSync: (
+        schema: ExternalDataSourceSyncSchema,
+        shouldSync: boolean
+    ) => {
+        schema: ExternalDataSourceSyncSchema
+        shouldSync: boolean
+    }
+    touchAllSourceConnectionDetailsFields: () => {
+        value: true
+    }
+    touchSourceConnectionDetailsField: (key: string) => {
+        key: string
+    }
+    touchWebhookFieldInputsField: (key: string) => {
+        key: string
+    }
+    updateSchemaSyncType: (
+        schema: ExternalDataSourceSyncSchema,
+        syncType: ExternalDataSourceSyncSchema['sync_type'],
+        incrementalField: string | null,
+        incrementalFieldType: string | null,
+        primaryKeyColumns: string[] | null,
+        cdcTableMode?: 'both' | 'cdc_only' | 'consolidated',
+        incrementalFieldLookbackSeconds?: number | null
+    ) => {
+        cdcTableMode: 'both' | 'cdc_only' | 'consolidated' | undefined
+        incrementalField: string | null
+        incrementalFieldLookbackSeconds: number | null | undefined
+        incrementalFieldType: string | null
+        primaryKeyColumns: string[] | null
+        schema: ExternalDataSourceSyncSchema
+        syncType: 'append' | 'cdc' | 'full_refresh' | 'incremental' | 'webhook' | 'xmin' | null
+    }
+    updateSource: (source: Partial<ExternalDataSourceCreatePayload>) => {
+        source: Partial<ExternalDataSourceCreatePayload>
+    }
+    verifyCdcSelfManagedSetup: () => any
+    verifyCdcSelfManagedSetupFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    verifyCdcSelfManagedSetupSuccess: (
+        cdcSelfManagedVerifyResult: {
+            errors: string[]
+            valid: boolean
+        } | null,
+        payload?: any
+    ) => {
+        cdcSelfManagedVerifyResult: {
+            errors: string[]
+            valid: boolean
+        } | null
+        payload?: any
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sourceWizardLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        oauthRedirectUrl: (arg: any) => string | undefined
+        availableSources: (arg: any) => any
+        requiredTables: (arg: any) => any
+        defaultSourceConnectionDetails: (selectedConnector: SourceConfigResponseApi | null) => Record<string, unknown>
+        suggestedTablesMap: (selectedConnector: SourceConfigResponseApi | null) => Record<string, string | null>
+        breadcrumbs: (selectedConnector: SourceConfigResponseApi | null) => Breadcrumb[]
+        hasWebhookSchemas: (databaseSchema: ExternalDataSourceSyncSchema[]) => boolean
+        webhookNeedsManualConfirmation: (
+            webhookResult: WebhookCreateResult | null,
+            selectedConnector: SourceConfigResponseApi | null
+        ) => boolean
+        webhookStepComplete: (
+            webhookResult: WebhookCreateResult | null,
+            webhookNeedsManualConfirmation: boolean,
+            webhookManualSetupConfirmed: boolean
+        ) => boolean
+        isManualLinkingSelected: (selectedConnector: SourceConfigResponseApi | null) => boolean
+        isDirectQueryMode: (
+            source: {
+                access_method: 'direct' | 'warehouse'
+                description: string
+                direct_query_enabled?: boolean
+                payload: Record<string, any>
+                prefix: string
+            },
+            selectedConnector: SourceConfigResponseApi | null
+        ) => boolean
+        canGoBack: (currentStep: number) => boolean
+        canGoNext: (
+            currentStep: number,
+            isManualLinkingSelected: boolean,
+            databaseSchema: ExternalDataSourceSyncSchema[],
+            isDirectQueryMode: boolean,
+            webhookStepComplete: boolean,
+            wizardAvailableDestinationCount: number,
+            wizardDestinationIds: string[]
+        ) => boolean
+        nextButtonDisabledReason: (
+            currentStep: number,
+            isManualLinkingSelected: boolean,
+            databaseSchema: ExternalDataSourceSyncSchema[],
+            isDirectQueryMode: boolean,
+            webhookStepComplete: boolean,
+            wizardAvailableDestinationCount: number,
+            wizardDestinationIds: string[]
+        ) => string | null
+        showSkipButton: (currentStep: number) => boolean
+        nextButtonText: (
+            currentStep: number,
+            isManualLinkingSelected: boolean,
+            isDirectQueryMode: boolean,
+            hasWebhookSchemas: boolean,
+            showDestinationStep: boolean,
+            arg: any,
+            returnConfig: {
+                entryPoint?: string
+                returnLabel: string
+                returnUrl: string
+            } | null,
+            sourceId: string | null
+        ) => string
+        showFooter: (selectedConnector: SourceConfigResponseApi | null) => boolean
+        prefixRequired: (
+            dataWarehouseSources: PaginatedResponse<ExternalDataSource> | null,
+            selectedConnector: SourceConfigResponseApi | null
+        ) => boolean
+        connectors: (
+            dataWarehouseSources: PaginatedResponse<ExternalDataSource> | null,
+            availableSources: any
+        ) => SourceConfigResponseApi[]
+        filteredDatabaseSchema: (
+            databaseSchema: ExternalDataSourceSyncSchema[],
+            schemaNameFilter: string
+        ) => ExternalDataSourceSyncSchema[]
+        tablesAllToggledOn: (filteredDatabaseSchema: ExternalDataSourceSyncSchema[]) => boolean | 'indeterminate'
+        configuredSchemaName: (source: {
+            access_method: 'direct' | 'warehouse'
+            description: string
+            direct_query_enabled?: boolean
+            payload: Record<string, any>
+            prefix: string
+        }) => string | null
+        groupedDatabaseSchema: (
+            filteredDatabaseSchema: ExternalDataSourceSyncSchema[],
+            configuredSchemaName: string | null
+        ) => {
+            schemaName: string
+            tables: ExternalDataSourceSyncSchema[]
+        }[]
+        schemaGroupKeys: (
+            groupedDatabaseSchema: {
+                schemaName: string
+                tables: ExternalDataSourceSyncSchema[]
+            }[]
+        ) => string[]
+        showDestinationStep: (
+            featureFlags: FeatureFlagsSet,
+            isDirectQueryMode: boolean,
+            databaseSchema: ExternalDataSourceSyncSchema[],
+            arg: any
+        ) => boolean
+        modalTitle: (
+            currentStep: number,
+            isDirectQueryMode: boolean
+        ) =>
+            | ''
+            | 'Choose destinations'
+            | 'Importing your data...'
+            | 'Link your data source'
+            | 'Select tables to import'
+            | 'Select tables to query'
+            | 'Set up webhook'
+            | 'Tables ready to query'
+        isWrapped: (arg: any) => boolean
+        incrementalFieldModelEnabled: (featureFlags: FeatureFlagsSet, isDirectQueryMode: boolean, arg: any) => boolean
+    }
+}
+
+export type sourceWizardLogicType = MakeLogicType<
+    sourceWizardLogicValues,
+    sourceWizardLogicActions,
+    SourceWizardLogicProps,
+    sourceWizardLogicMeta
+>
+
+// Numbered after the existing steps rather than slotted between them. Several scenes embed this
+// wizard and pin steps 1-5 (webhook, progress), so renumbering would move the ground under them
+// for a flag most projects do not have on. Order comes from the explicit jumps below, not the number.
+export const WIZARD_DESTINATION_STEP = 6
+
+export const sourceWizardLogic = kea<sourceWizardLogicType>([
+    path(['products', 'dataWarehouse', 'sourceWizardLogic']),
+    props({} as SourceWizardLogicProps),
+    actions({
+        selectConnector: (connector: SourceConfigResponseApi | null, accessMethod?: 'warehouse' | 'direct') => ({
+            connector,
+            accessMethod,
+        }),
+        setInitialConnector: (connector: SourceConfigResponseApi | null) => ({ connector }),
+        handleRedirect: (source: ExternalDataSourceType, searchParams?: any) => ({
+            source,
+            searchParams,
+        }),
+        setReturnConfig: (returnUrl: string, returnLabel: string, entryPoint?: string) => ({
+            returnUrl,
+            returnLabel,
+            entryPoint,
+        }),
+        clearReturnConfig: true,
+        onClear: true,
+        onBack: true,
+        onNext: true,
+        onSubmit: true,
+        loadIncrementalFieldRecommendations: true,
+        setWizardDestinationIds: (destinationIds: string[]) => ({ destinationIds }),
+        setWizardAvailableDestinationCount: (count: number) => ({ count }),
+        resetSourceForm: (accessMethod?: 'warehouse' | 'direct') => ({ accessMethod }),
+        setDatabaseSchemas: (schemas: ExternalDataSourceSyncSchema[]) => ({
+            schemas,
+        }),
+        toggleSchemaShouldSync: (schema: ExternalDataSourceSyncSchema, shouldSync: boolean) => ({ schema, shouldSync }),
+        setSchemaSyncedColumns: (schema: ExternalDataSourceSyncSchema, enabledColumns: string[] | null) => ({
+            schema,
+            enabledColumns,
+        }),
+        setSchemaRowFilters: (schema: ExternalDataSourceSyncSchema, rowFilters: RowFilter[] | null) => ({
+            schema,
+            rowFilters,
+        }),
+        setSchemaMaskedColumns: (schema: ExternalDataSourceSyncSchema, maskedColumns: string[]) => ({
+            schema,
+            maskedColumns,
+        }),
+        updateSchemaSyncType: (
+            schema: ExternalDataSourceSyncSchema,
+            syncType: ExternalDataSourceSyncSchema['sync_type'],
+            incrementalField: string | null,
+            incrementalFieldType: string | null,
+            primaryKeyColumns: string[] | null,
+            cdcTableMode?: 'consolidated' | 'cdc_only' | 'both',
+            incrementalFieldLookbackSeconds?: number | null
+        ) => ({
+            schema,
+            syncType,
+            incrementalField,
+            incrementalFieldType,
+            primaryKeyColumns,
+            cdcTableMode,
+            incrementalFieldLookbackSeconds,
+        }),
+        clearSource: true,
+        updateSource: (source: Partial<ExternalDataSourceCreatePayload>) => ({
+            source,
+        }),
+        createSource: true,
+        setIsLoading: (isLoading: boolean) => ({ isLoading }),
+        setConnectError: (message: string | null) => ({ message }),
+        setSourceId: (id: string) => ({ sourceId: id }),
+        closeWizard: true,
+        cancelWizard: true,
+        setStep: (step: number) => ({ step }),
+        getDatabaseSchemas: true,
+        openSyncMethodModal: (schema: ExternalDataSourceSyncSchema) => ({ schema }),
+        cancelSyncMethodModal: true,
+        toggleAllTables: (selectAll: boolean, tableNames?: string[]) => ({ selectAll, tableNames }),
+        toggleSchemaGroup: (schemaName: string, shouldSync: boolean) => ({ schemaName, shouldSync }),
+        setSchemaNameFilter: (schemaNameFilter: string) => ({ schemaNameFilter }),
+        setExpandedSchemaGroupKeys: (expandedSchemaKeys: string[]) => ({ expandedSchemaKeys }),
+        syncExpandedSchemaGroupKeys: (groupedSchemaKeys: string[], fingerprint: string) => ({
+            groupedSchemaKeys,
+            fingerprint,
+        }),
+        saveFormStateBeforeRedirect: true,
+        createWebhook: true,
+        setWebhookResult: (result: WebhookCreateResult | null) => ({
+            result,
+        }),
+        submitWebhookFields: true,
+        setWebhookManualSetupConfirmed: (confirmed: boolean) => ({ confirmed }),
+        switchWebhookTablesToPolling: true,
+        setWebhookTablesSwitching: (switching: boolean) => ({ switching }),
+        skipWebhookSetup: true,
+        openCdcSelfManagedSetupDialog: true,
+        closeCdcSelfManagedSetupDialog: true,
+        clearCdcPrereqsCheckResult: true,
+        clearCdcSelfManagedVerifyResult: true,
+        touchAllSourceConnectionDetailsFields: true,
+    }),
+    connect(() => ({
+        values: [
+            sourceManagementLogic,
+            ['dataWarehouseSources'],
+            preflightLogic,
+            ['preflight'],
+            featureFlagLogic,
+            ['featureFlags'],
+            teamLogic,
+            ['currentTeamId'],
+        ],
+        actions: [
+            sourceManagementLogic,
+            ['loadSources'],
+            teamLogic,
+            ['addProductIntent'],
+            globalSetupLogic,
+            ['markTaskAsCompleted'],
+        ],
+    })),
+    reducers({
+        cdcSelfManagedSetupDialogOpen: [
+            false,
+            {
+                openCdcSelfManagedSetupDialog: () => true,
+                closeCdcSelfManagedSetupDialog: () => false,
+                onClear: () => false,
+            },
+        ],
+        selectedConnector: [
+            null as SourceConfigResponseApi | null,
+            {
+                selectConnector: (_, { connector }) => connector,
+                setInitialConnector: (_, { connector }) => connector,
+            },
+        ],
+        wizardDestinationIds: [
+            [] as string[],
+            {
+                setWizardDestinationIds: (_, { destinationIds }) => destinationIds,
+                onClear: () => [],
+            },
+        ],
+        // Reported by the destination step once its list resolves. The Import button needs it to
+        // tell "turned every destination off" apart from "this team has no destinations yet".
+        wizardAvailableDestinationCount: [
+            0,
+            {
+                setWizardAvailableDestinationCount: (_, { count }) => count,
+                onClear: () => 0,
+            },
+        ],
+        currentStep: [
+            1,
+            {
+                onNext: (state) => state + 1,
+                // The destination step sits after the numbered ones, so stepping back from it
+                // returns to table selection rather than decrementing into the progress step.
+                onBack: (state) => (state === WIZARD_DESTINATION_STEP ? 3 : state - 1),
+                onClear: () => 1,
+                setStep: (_, { step }) => step,
+                setInitialConnector: () => 2,
+            },
+        ],
+        databaseSchema: [
+            [] as ExternalDataSourceSyncSchema[],
+            {
+                setDatabaseSchemas: (_, { schemas }) => schemas,
+                toggleAllTables: (state, { selectAll, tableNames }) => {
+                    if (!tableNames) {
+                        return state.map((schema) => ({
+                            ...schema,
+                            should_sync: bulkToggledShouldSync(schema, selectAll),
+                        }))
+                    }
+                    const targetSet = new Set(tableNames)
+                    return state.map((schema) => ({
+                        ...schema,
+                        should_sync: targetSet.has(schema.table)
+                            ? bulkToggledShouldSync(schema, selectAll)
+                            : schema.should_sync,
+                    }))
+                },
+                toggleSchemaShouldSync: (state, { schema, shouldSync }) => {
+                    return state.map((s) => ({
+                        ...s,
+                        should_sync:
+                            s.table === schema.table ? (s.permission_error ? false : shouldSync) : s.should_sync,
+                    }))
+                },
+                setSchemaSyncedColumns: (state, { schema, enabledColumns }) => {
+                    return state.map((s) => ({
+                        ...s,
+                        enabled_columns: s.table === schema.table ? enabledColumns : s.enabled_columns,
+                    }))
+                },
+                setSchemaRowFilters: (state, { schema, rowFilters }) => {
+                    return state.map((s) => ({
+                        ...s,
+                        row_filters: s.table === schema.table ? rowFilters : s.row_filters,
+                    }))
+                },
+                setSchemaMaskedColumns: (state, { schema, maskedColumns }) => {
+                    return state.map((s) => ({
+                        ...s,
+                        masked_columns: s.table === schema.table ? maskedColumns : s.masked_columns,
+                    }))
+                },
+                updateSchemaSyncType: (
+                    state,
+                    {
+                        schema,
+                        syncType,
+                        incrementalField,
+                        incrementalFieldType,
+                        primaryKeyColumns,
+                        cdcTableMode,
+                        incrementalFieldLookbackSeconds,
+                    }
+                ) => {
+                    return state.map((s) => ({
+                        ...s,
+                        sync_type: s.table === schema.table ? syncType : s.sync_type,
+                        incremental_field: s.table === schema.table ? incrementalField : s.incremental_field,
+                        incremental_field_type:
+                            s.table === schema.table ? incrementalFieldType : s.incremental_field_type,
+                        incremental_field_lookback_seconds:
+                            s.table === schema.table
+                                ? (incrementalFieldLookbackSeconds ?? null)
+                                : s.incremental_field_lookback_seconds,
+                        primary_key_columns: s.table === schema.table ? primaryKeyColumns : s.primary_key_columns,
+                        // The server refuses to mask a cursor or key column, which would fail the whole source creation.
+                        masked_columns:
+                            s.table === schema.table
+                                ? withoutColumns(s.masked_columns, [incrementalField, ...(primaryKeyColumns ?? [])])
+                                : s.masked_columns,
+                        ...(s.table === schema.table && syncType === 'cdc' && cdcTableMode
+                            ? { cdc_table_mode: cdcTableMode }
+                            : {}),
+                    }))
+                },
+            },
+        ],
+        expandedSchemaGroupKeys: [
+            [] as string[],
+            {
+                setExpandedSchemaGroupKeys: (_, { expandedSchemaKeys }) => expandedSchemaKeys,
+                syncExpandedSchemaGroupKeys: (state, { groupedSchemaKeys }) => {
+                    const nextKeys = state.filter((key) => groupedSchemaKeys.includes(key))
+                    return nextKeys.length > 0 ? nextKeys : groupedSchemaKeys
+                },
+                onClear: () => [],
+                clearSource: () => [],
+            },
+        ],
+        schemaGroupKeysFingerprint: [
+            '',
+            {
+                syncExpandedSchemaGroupKeys: (_, { fingerprint }) => fingerprint,
+                onClear: () => '',
+                clearSource: () => '',
+            },
+        ],
+        schemaNameFilter: [
+            '',
+            {
+                setSchemaNameFilter: (_, { schemaNameFilter }) => schemaNameFilter,
+                onClear: () => '',
+                clearSource: () => '',
+            },
+        ],
+        source: [
+            {
+                payload: {},
+                prefix: '',
+                description: '',
+                access_method: 'warehouse',
+            } as {
+                prefix: string
+                description: string
+                access_method: 'warehouse' | 'direct'
+                direct_query_enabled?: boolean
+                payload: Record<string, any>
+            },
+            {
+                updateSource: (state, { source }) => {
+                    return {
+                        prefix: source.prefix ?? state.prefix,
+                        description: source.description ?? state.description,
+                        access_method: source.access_method ?? state.access_method,
+                        direct_query_enabled:
+                            'direct_query_enabled' in source ? source.direct_query_enabled : state.direct_query_enabled,
+                        payload: {
+                            ...state.payload,
+                            ...source.payload,
+                        },
+                    }
+                },
+                clearSource: () => ({
+                    payload: {},
+                    prefix: '',
+                    description: '',
+                    access_method: 'warehouse',
+                }),
+            },
+        ],
+        isLoading: [
+            false as boolean,
+            {
+                onNext: () => false,
+                setIsLoading: (_, { isLoading }) => isLoading,
+                selectConnector: () => false,
+            },
+        ],
+        // Counts selections rather than comparing connector objects, so picking the same source
+        // again (A, then B, then A) still marks an earlier in-flight probe as stale.
+        connectorSelectionCount: [
+            0,
+            {
+                selectConnector: (count) => count + 1,
+            },
+        ],
+        // The toast that also carries this message is gone in a few seconds, so people retry the
+        // same rejected credentials. Keep the reason next to the form until the next attempt.
+        connectError: [
+            null as string | null,
+            {
+                setConnectError: (_, { message }) => message,
+                getDatabaseSchemas: () => null,
+                createSource: () => null,
+                onBack: () => null,
+                onClear: () => null,
+                selectConnector: () => null,
+                setInitialConnector: () => null,
+            },
+        ],
+        sourceId: [
+            null as string | null,
+            {
+                setSourceId: (_, { sourceId }) => sourceId,
+            },
+        ],
+        returnConfig: [
+            null as { returnUrl: string; returnLabel: string; entryPoint?: string } | null,
+            {
+                setReturnConfig: (_, { returnUrl, returnLabel, entryPoint }) => ({
+                    returnUrl,
+                    returnLabel,
+                    entryPoint,
+                }),
+                clearReturnConfig: () => null,
+            },
+        ],
+        syncMethodModalOpen: [
+            false as boolean,
+            {
+                openSyncMethodModal: () => true,
+                cancelSyncMethodModal: () => false,
+            },
+        ],
+        currentSyncMethodModalSchema: [
+            null as ExternalDataSourceSyncSchema | null,
+            {
+                openSyncMethodModal: (_, { schema }) => schema,
+                cancelSyncMethodModal: () => null,
+                updateSchemaSyncType: (
+                    _,
+                    {
+                        schema,
+                        syncType,
+                        incrementalField,
+                        incrementalFieldType,
+                        primaryKeyColumns,
+                        cdcTableMode,
+                        incrementalFieldLookbackSeconds,
+                    }
+                ) => ({
+                    ...schema,
+                    sync_type: syncType,
+                    incremental_field: incrementalField,
+                    incremental_field_type: incrementalFieldType,
+                    incremental_field_lookback_seconds: incrementalFieldLookbackSeconds ?? null,
+                    primary_key_columns: primaryKeyColumns,
+                    ...(syncType === 'cdc' && cdcTableMode ? { cdc_table_mode: cdcTableMode } : {}),
+                }),
+            },
+        ],
+        webhookResult: [
+            null as WebhookCreateResult | null,
+            {
+                setWebhookResult: (_, { result }) => result,
+                onClear: () => null,
+            },
+        ],
+        webhookCreating: [
+            false,
+            {
+                createWebhook: () => true,
+                setWebhookResult: () => false,
+            },
+        ],
+        webhookManualSetupConfirmed: [
+            false,
+            {
+                setWebhookManualSetupConfirmed: (_, { confirmed }) => confirmed,
+                setWebhookResult: () => false,
+                onClear: () => false,
+            },
+        ],
+        webhookTablesSwitching: [
+            false,
+            {
+                setWebhookTablesSwitching: (_, { switching }) => switching,
+            },
+        ],
+    }),
+    loaders(({ values }) => ({
+        cdcPrereqsCheckResult: [
+            null as { valid: boolean; errors: string[] } | null,
+            {
+                clearCdcPrereqsCheckResult: () => null,
+                checkCdcPrereqs: async () => {
+                    if (!values.currentTeamId) {
+                        lemonToast.error('No project selected — reload the page and try again.')
+                        return null
+                    }
+                    const payload = ((values.sourceConnectionDetails as any)?.payload || {}) as Record<string, any>
+                    const mode = (payload.cdc_management_mode || 'posthog') as 'posthog' | 'self_managed'
+                    try {
+                        return await api.externalDataSources.check_cdc_prerequisites(
+                            {
+                                source_type: (values.selectedConnector?.name || 'Postgres') as ExternalDataSourceType,
+                                ...payload,
+                                cdc_management_mode: mode,
+                                tables: [],
+                                cdc_slot_name: null,
+                                cdc_publication_name: null,
+                            },
+                            values.currentTeamId
+                        )
+                    } catch (e: any) {
+                        lemonToast.error(e?.detail || e?.message || 'Failed to check prerequisites')
+                        return null
+                    }
+                },
+            },
+        ],
+        cdcSelfManagedVerifyResult: [
+            null as { valid: boolean; errors: string[] } | null,
+            {
+                clearCdcSelfManagedVerifyResult: () => null,
+                verifyCdcSelfManagedSetup: async () => {
+                    if (!values.currentTeamId) {
+                        lemonToast.error('No project selected — reload the page and try again.')
+                        return null
+                    }
+                    const sourcePayload = ((values.source as any)?.payload || {}) as Record<string, any>
+                    const connectionPayload = ((values.sourceConnectionDetails as any)?.payload || {}) as Record<
+                        string,
+                        any
+                    >
+                    const pubName = (sourcePayload.cdc_publication_name as string) || 'posthog_pub'
+                    const cdcTableNames = (values.databaseSchema || [])
+                        .filter((s: any) => s.should_sync && s.sync_type === 'cdc')
+                        .map((s: any) => s.table as string)
+                    try {
+                        return await api.externalDataSources.check_cdc_prerequisites(
+                            {
+                                source_type: (values.selectedConnector?.name || 'Postgres') as ExternalDataSourceType,
+                                ...connectionPayload,
+                                cdc_management_mode: 'self_managed',
+                                // PostHog creates the slot itself — only verify the publication.
+                                cdc_slot_name: null,
+                                cdc_publication_name: pubName,
+                                tables: cdcTableNames,
+                            },
+                            values.currentTeamId
+                        )
+                    } catch (e: any) {
+                        lemonToast.error(e?.detail || e?.message || 'Could not verify CDC setup')
+                        return null
+                    }
+                },
+            },
+        ],
+    })),
+    selectors({
+        oauthRedirectUrl: [
+            () => [(_, props) => props.oauthRedirectUrl],
+            (url: string | undefined): string | undefined => url,
+        ],
+        availableSources: [() => [(_, p) => p.availableSources], (availableSources) => availableSources],
+        requiredTables: [() => [(_, p) => p.requiredTables], (requiredTables) => requiredTables ?? null],
+        // Form defaults derived from the selected connector's field schema. Returning a fresh
+        // object on every connector change is cheap and keeps the form layer side-effect-free —
+        // the `resetSourceForm` listener writes these into form state.
+        defaultSourceConnectionDetails: [
+            (s) => [s.selectedConnector],
+            (selectedConnector: SourceConfigResponseApi | null): Record<string, unknown> => {
+                if (!selectedConnector) {
+                    return { prefix: '', description: '', payload: {} }
+                }
+                return buildKeaFormDefaultFromSourceDetails({
+                    [selectedConnector.name]: selectedConnector,
+                })
+            },
+        ],
+        suggestedTablesMap: [
+            (s) => [s.selectedConnector],
+            (selectedConnector: SourceConfigResponseApi | null): Record<string, string | null> => {
+                if (!selectedConnector?.suggestedTables) {
+                    return {}
+                }
+
+                return selectedConnector.suggestedTables.reduce(
+                    (acc: Record<string, string | null>, suggested: SuggestedTableApi) => {
+                        acc[suggested.table] = suggested.tooltip ?? null
+                        return acc
+                    },
+                    {} as Record<string, string | null>
+                )
+            },
+        ],
+        breadcrumbs: [
+            (s) => [s.selectedConnector],
+            (selectedConnector: SourceConfigResponseApi | null): Breadcrumb[] => {
+                return [
+                    {
+                        key: Scene.Sources,
+                        name: 'Sources',
+                        path: urls.sources(),
+                        iconType: 'data_pipeline',
+                    },
+                    {
+                        key: Scene.DataWarehouseSource,
+                        name: selectedConnector?.label ?? 'New',
+                        iconType: 'data_pipeline',
+                    },
+                ]
+            },
+        ],
+
+        hasWebhookSchemas: [
+            (s) => [s.databaseSchema],
+            (databaseSchema: ExternalDataSourceSyncSchema[]): boolean =>
+                databaseSchema.some((s) => s.supports_webhooks && s.sync_type === 'webhook' && s.should_sync),
+        ],
+        webhookNeedsManualConfirmation: [
+            (s) => [s.webhookResult, s.selectedConnector],
+            (webhookResult: WebhookCreateResult | null, selectedConnector: SourceConfigResponseApi | null): boolean => {
+                if (!webhookResult?.webhook_url || webhookResultHasNoPendingInputs(webhookResult)) {
+                    return false
+                }
+                // With a required field to save, saving that form is the proof of the manual setup.
+                const webhookFields = selectedConnector?.webhookFields ?? []
+                return !webhookFields.some((f) => 'required' in f && f.required)
+            },
+        ],
+        webhookStepComplete: [
+            (s) => [s.webhookResult, s.webhookNeedsManualConfirmation, s.webhookManualSetupConfirmed],
+            (
+                webhookResult: WebhookCreateResult | null,
+                webhookNeedsManualConfirmation: boolean,
+                webhookManualSetupConfirmed: boolean
+            ): boolean => {
+                if (webhookResultHasNoPendingInputs(webhookResult)) {
+                    return true
+                }
+                return webhookNeedsManualConfirmation && webhookManualSetupConfirmed
+            },
+        ],
+        isManualLinkingSelected: [
+            (s) => [s.selectedConnector],
+            (selectedConnector: SourceConfigResponseApi | null): boolean => !selectedConnector,
+        ],
+        isDirectQueryMode: [
+            (s) => [s.source, s.selectedConnector],
+            (
+                source: {
+                    access_method: 'direct' | 'warehouse'
+                    description: string
+                    payload: Record<string, any>
+                    prefix: string
+                },
+                selectedConnector: SourceConfigResponseApi | null
+            ): boolean => source.access_method === 'direct' && supportsDirectQuery(selectedConnector?.name),
+        ],
+        canGoBack: [
+            (s) => [s.currentStep],
+            (currentStep: number): boolean => {
+                return currentStep !== 4 && currentStep !== 5
+            },
+        ],
+        canGoNext: [
+            (s) => [
+                s.currentStep,
+                s.isManualLinkingSelected,
+                s.databaseSchema,
+                s.isDirectQueryMode,
+                s.webhookStepComplete,
+                s.wizardAvailableDestinationCount,
+                s.wizardDestinationIds,
+            ],
+            (
+                currentStep: number,
+                isManualLinkingSelected: boolean,
+                databaseSchema: ExternalDataSourceSyncSchema[],
+                isDirectQueryMode: boolean,
+                webhookStepComplete: boolean,
+                wizardAvailableDestinationCount: number,
+                wizardDestinationIds: string[]
+            ): boolean => {
+                if (isManualLinkingSelected && currentStep === 1) {
+                    return false
+                }
+
+                if (!isManualLinkingSelected && currentStep === 3) {
+                    if (databaseSchema.filter((n) => n.should_sync).length === 0) {
+                        return false
+                    }
+
+                    if (isDirectQueryMode) {
+                        return true
+                    }
+
+                    return databaseSchema.filter((n) => n.should_sync && !n.sync_type).length === 0
+                }
+
+                if (currentStep === 4) {
+                    return webhookStepComplete
+                }
+
+                if (currentStep === WIZARD_DESTINATION_STEP) {
+                    return destinationStepBlockReason(wizardAvailableDestinationCount, wizardDestinationIds) === null
+                }
+
+                return true
+            },
+        ],
+        nextButtonDisabledReason: [
+            (s) => [
+                s.currentStep,
+                s.isManualLinkingSelected,
+                s.databaseSchema,
+                s.isDirectQueryMode,
+                s.webhookStepComplete,
+                s.wizardAvailableDestinationCount,
+                s.wizardDestinationIds,
+            ],
+            (
+                currentStep: number,
+                isManualLinkingSelected: boolean,
+                databaseSchema: ExternalDataSourceSyncSchema[],
+                isDirectQueryMode: boolean,
+                webhookStepComplete: boolean,
+                wizardAvailableDestinationCount: number,
+                wizardDestinationIds: string[]
+            ): string | null => {
+                if (!isManualLinkingSelected && currentStep === 3) {
+                    const tablesToSync = databaseSchema.filter((n) => n.should_sync)
+                    if (tablesToSync.length === 0) {
+                        return 'Select at least one table to sync'
+                    }
+
+                    if (!isDirectQueryMode && tablesToSync.some((n) => !n.sync_type)) {
+                        return 'Choose a sync method for each table you want to sync'
+                    }
+                }
+
+                if (currentStep === 4 && !webhookStepComplete) {
+                    return 'Set up the webhook, or choose another option below this step'
+                }
+
+                if (currentStep === WIZARD_DESTINATION_STEP) {
+                    return destinationStepBlockReason(wizardAvailableDestinationCount, wizardDestinationIds)
+                }
+
+                return null
+            },
+        ],
+        showSkipButton: [
+            (s) => [s.currentStep],
+            (currentStep: number): boolean => {
+                return currentStep === 5
+            },
+        ],
+        nextButtonText: [
+            (s) => [
+                s.currentStep,
+                s.isManualLinkingSelected,
+                s.isDirectQueryMode,
+                s.hasWebhookSchemas,
+                s.showDestinationStep,
+                (_, props) => props.onComplete,
+                s.returnConfig,
+                s.sourceId,
+            ],
+            (
+                currentStep: number,
+                isManualLinkingSelected: boolean,
+                isDirectQueryMode: boolean,
+                hasWebhookSchemas: boolean,
+                showDestinationStep: boolean,
+                onComplete,
+                returnConfig: {
+                    returnLabel: string
+                    returnUrl: string
+                } | null,
+                sourceId: string | null
+            ): string => {
+                if (currentStep === 3 && isManualLinkingSelected) {
+                    return 'Link'
+                }
+
+                if (currentStep === 3) {
+                    if (isDirectQueryMode) {
+                        return 'Save tables'
+                    }
+
+                    if (hasWebhookSchemas) {
+                        return 'Set up webhook'
+                    }
+
+                    // The destination step follows, so this one no longer creates the source.
+                    return showDestinationStep ? 'Next' : 'Import'
+                }
+
+                if (currentStep === 4) {
+                    return 'Next'
+                }
+
+                if (currentStep === WIZARD_DESTINATION_STEP) {
+                    return 'Import'
+                }
+
+                if (currentStep === 5) {
+                    if (onComplete) {
+                        return 'Next'
+                    }
+                    if (returnConfig) {
+                        return `Return to ${returnConfig.returnLabel}`
+                    }
+                    if (sourceId) {
+                        return 'Go to source'
+                    }
+                    return 'Return to sources'
+                }
+
+                return 'Next'
+            },
+        ],
+        showFooter: [
+            (s) => [s.selectedConnector],
+            (selectedConnector: SourceConfigResponseApi | null): boolean => !!selectedConnector,
+        ],
+        prefixRequired: [
+            (s) => [s.dataWarehouseSources, s.selectedConnector],
+            (
+                sources: PaginatedResponse<ExternalDataSource> | null,
+                selectedConnector: SourceConfigResponseApi | null
+            ): boolean => isPrefixRequired(sources?.results, selectedConnector?.name),
+        ],
+        connectors: [
+            (s) => [s.dataWarehouseSources, s.availableSources],
+            (
+                sources: null | import('lib/api').PaginatedResponse<import('~/types').ExternalDataSource>,
+                availableSources: Record<string, SourceConfigResponseApi>
+            ): SourceConfigResponseApi[] => {
+                if (!availableSources) {
+                    return []
+                }
+                return Object.values(availableSources).map((connector) => ({
+                    ...connector,
+                    disabledReason:
+                        sources && sources.results.find((source) => source.source_type === connector.name)
+                            ? 'Already linked'
+                            : null,
+                    existingSource:
+                        sources && sources.results.find((source) => source.source_type === connector.name)
+                            ? true
+                            : false,
+                }))
+            },
+        ],
+        filteredDatabaseSchema: [
+            (s) => [s.databaseSchema, s.schemaNameFilter],
+            (
+                databaseSchema: ExternalDataSourceSyncSchema[],
+                schemaNameFilter: string
+            ): ExternalDataSourceSyncSchema[] => {
+                if (!schemaNameFilter) {
+                    return databaseSchema
+                }
+                const filter = schemaNameFilter.toLowerCase()
+                return databaseSchema.filter((schema) => (schema.label ?? schema.table).toLowerCase().includes(filter))
+            },
+        ],
+        tablesAllToggledOn: [
+            (s) => [s.filteredDatabaseSchema],
+            (filteredDatabaseSchema: ExternalDataSourceSyncSchema[]): boolean | 'indeterminate' => {
+                if (filteredDatabaseSchema.length === 0) {
+                    return false
+                }
+                const enabledCount = filteredDatabaseSchema.filter((schema) => schema.should_sync).length
+                const totalCount = filteredDatabaseSchema.length
+                return enabledCount === totalCount ? true : enabledCount > 0 ? 'indeterminate' : false
+            },
+        ],
+        configuredSchemaName: [
+            (s) => [s.source],
+            (source: {
+                access_method: 'direct' | 'warehouse'
+                description: string
+                payload: Record<string, any>
+                prefix: string
+            }): string | null => (typeof source.payload.schema === 'string' ? source.payload.schema : null),
+        ],
+        groupedDatabaseSchema: [
+            (s) => [s.filteredDatabaseSchema, s.configuredSchemaName],
+            (filteredDatabaseSchema: ExternalDataSourceSyncSchema[], configuredSchemaName: string | null) =>
+                groupTablesBySchema(filteredDatabaseSchema, (schema) => schema.table, configuredSchemaName),
+        ],
+        schemaGroupKeys: [
+            (s) => [s.groupedDatabaseSchema],
+            (
+                groupedDatabaseSchema: {
+                    schemaName: string
+                    tables: ExternalDataSourceSyncSchema[]
+                }[]
+            ) => getDefaultExpandedSchemaKeys(groupedDatabaseSchema),
+        ],
+        // Destinations are picked before the source is created, so the first sync already lands
+        // where the user wants it. Choosing them afterwards costs a full resync of every table.
+        showDestinationStep: [
+            (s) => [s.featureFlags, s.isDirectQueryMode, s.databaseSchema, (_, props) => props.requiredTables],
+            (
+                featureFlags: FeatureFlagsSet,
+                isDirectQueryMode: boolean,
+                databaseSchema: ExternalDataSourceSyncSchema[],
+                requiredTables: unknown
+            ): boolean =>
+                shouldShowDestinationStep({
+                    flagEnabled: !!featureFlags[FEATURE_FLAGS.WAREHOUSE_MULTI_DESTINATION],
+                    isDirectQueryMode,
+                    schemas: databaseSchema,
+                    requiredTables,
+                }),
+        ],
+        modalTitle: [
+            (s) => [s.currentStep, s.isDirectQueryMode],
+            (currentStep: number, isDirectQueryMode: boolean) => {
+                if (currentStep === 1) {
+                    return ''
+                }
+                if (currentStep === 2) {
+                    return 'Link your data source'
+                }
+
+                if (currentStep === 3) {
+                    return isDirectQueryMode ? 'Select tables to query' : 'Select tables to import'
+                }
+
+                if (currentStep === 4) {
+                    return 'Set up webhook'
+                }
+
+                if (currentStep === WIZARD_DESTINATION_STEP) {
+                    return 'Choose destinations'
+                }
+
+                if (currentStep === 5) {
+                    return isDirectQueryMode ? 'Tables ready to query' : 'Importing your data...'
+                }
+
+                return ''
+            },
+        ],
+        // determines if the wizard is wrapped in another component
+        isWrapped: [() => [(_, props) => props.onComplete], (onComplete) => !!onComplete],
+        // One-click setup shows no table list, so a late pick would change tables nobody reviews.
+        // A direct-query source syncs nothing, so a pick would only reorder unused candidates.
+        incrementalFieldModelEnabled: [
+            (s) => [s.featureFlags, s.isDirectQueryMode, (_, props) => props.autoConfigureTables],
+            (
+                featureFlags: FeatureFlagsSet,
+                isDirectQueryMode: boolean,
+                autoConfigureTables: boolean | undefined
+            ): boolean =>
+                !!featureFlags[FEATURE_FLAGS.WAREHOUSE_INCREMENTAL_FIELD_MODEL] &&
+                !isDirectQueryMode &&
+                !autoConfigureTables,
+        ],
+    }),
+    listeners(({ actions, values, props, cache }) => ({
+        // The table list never waits for the decision model: its picks arrive here afterwards, and
+        // replace the defaults only of tables the person has not changed yet.
+        loadIncrementalFieldRecommendations: async () => {
+            const connectorName = values.selectedConnector?.name
+            const teamId = values.currentTeamId
+            const tables = values.databaseSchema.filter(
+                (schema) => !schema.permission_error && recommendationCandidates(schema).length >= 2
+            )
+            if (!connectorName || teamId === null || tables.length === 0 || !values.incrementalFieldModelEnabled) {
+                return
+            }
+            // A rediscovery, even for the same connector, makes the answer belong to another database.
+            const discovery = cache.schemaDiscovery
+            const selection = values.connectorSelectionCount
+            // Reading `values` after the wizard unmounts throws, so the disposal check goes first.
+            const stillApplies = (): boolean =>
+                !cache.disposables.isDisposed &&
+                cache.schemaDiscovery === discovery &&
+                cache.recommendationsFrozenFor !== discovery &&
+                values.connectorSelectionCount === selection
+            const batches = packRecommendationBatches(tables)
+            const sendNext = async (): Promise<void> => {
+                // An obsolete discovery would spend the team's model budget on answers nobody reads.
+                for (let batch = batches.shift(); batch && stillApplies(); batch = batches.shift()) {
+                    const picked = await fetchIncrementalFieldPicks(teamId, batch)
+                    if (picked.size > 0 && stillApplies()) {
+                        actions.setDatabaseSchemas(
+                            values.databaseSchema.map((schema) => {
+                                const reordered = picked.get(schema.table)
+                                return reordered ? applyIncrementalFieldPick(schema, reordered, connectorName) : schema
+                            })
+                        )
+                    }
+                }
+            }
+            await Promise.all(Array.from({ length: MAX_PARALLEL_RECOMMENDATION_REQUESTS }, sendNext))
+        },
+        verifyCdcSelfManagedSetupSuccess: ({ cdcSelfManagedVerifyResult }) => {
+            if (cdcSelfManagedVerifyResult?.valid) {
+                actions.closeCdcSelfManagedSetupDialog()
+                actions.setIsLoading(true)
+                actions.createSource()
+                if (values.selectedConnector) {
+                    posthog.capture('source created', { sourceType: values.selectedConnector.name })
+                }
+            }
+        },
+        closeCdcSelfManagedSetupDialog: () => {
+            actions.clearCdcSelfManagedVerifyResult()
+        },
+        touchAllSourceConnectionDetailsFields: () => {
+            // Walk the connector field tree and touch each leaf path so kea-forms
+            // renders validation errors (matching the Next button behavior).
+            const walk = (fields: any[], prefix: string): void => {
+                for (const f of fields ?? []) {
+                    if (!f?.name) {
+                        continue
+                    }
+                    const p = prefix ? `${prefix}.${f.name}` : f.name
+                    actions.touchSourceConnectionDetailsField(p)
+                    if (Array.isArray(f.fields)) {
+                        walk(f.fields, p)
+                    }
+                }
+            }
+            walk(values.selectedConnector?.fields ?? [], '')
+            actions.touchSourceConnectionDetailsField('prefix')
+        },
+        setInitialConnector: () => {
+            syncExpandedSchemaGroupKeys(actions, values)
+            actions.resetSourceForm()
+        },
+        resetSourceForm: ({ accessMethod }) => {
+            const defaults = values.defaultSourceConnectionDetails
+            const sourceConnectionDetails = values.sourceConnectionDetails as Record<string, unknown>
+            const sourceKind = values.selectedConnector?.name?.toLowerCase()
+            const savedValues = sourceKind ? restoreSourceFormState(sourceKind) : null
+            const currentAccessMethod = accessMethod ?? sourceConnectionDetails?.access_method
+
+            actions.resetSourceConnectionDetails(
+                mergeRestoredSourceFormValues(defaults, savedValues, currentAccessMethod)
+            )
+        },
+        setDatabaseSchemas: () => {
+            syncExpandedSchemaGroupKeys(actions, values)
+        },
+        updateSource: () => {
+            syncExpandedSchemaGroupKeys(actions, values)
+        },
+        toggleSchemaGroup: ({ schemaName, shouldSync }) => {
+            actions.setDatabaseSchemas(
+                values.databaseSchema.map((schema) => ({
+                    ...schema,
+                    should_sync:
+                        splitQualifiedTableName(schema.table, values.configuredSchemaName).schemaName === schemaName
+                            ? schema.permission_error
+                                ? false
+                                : shouldSync
+                            : schema.should_sync,
+                }))
+            )
+            actions.setExpandedSchemaGroupKeys(
+                shouldSync
+                    ? Array.from(new Set([...values.expandedSchemaGroupKeys, schemaName]))
+                    : values.expandedSchemaGroupKeys.filter((key) => key !== schemaName)
+            )
+        },
+        saveFormStateBeforeRedirect: () => {
+            const sourceKind = values.selectedConnector?.name?.toLowerCase()
+            if (sourceKind) {
+                saveSourceFormState(sourceKind, values.sourceConnectionDetails as Record<string, unknown>)
+            }
+        },
+        onBack: () => {
+            if (values.currentStep <= 1) {
+                actions.onClear()
+            }
+        },
+        onClear: () => {
+            actions.selectConnector(null)
+            actions.resetSourceConnectionDetails()
+            actions.clearSource()
+            actions.setIsLoading(false)
+        },
+        onSubmit: () => {
+            // Shared function that triggers different actions depending on the current step.
+            // Snapshot the step once: some branches below (e.g. step 4) dispatch actions that
+            // synchronously advance `currentStep`, and re-reading `values.currentStep` after that
+            // would let this same call fall through into the next step's branch too.
+            const step = values.currentStep
+
+            if (step === 1) {
+                return
+            }
+
+            if (step === 2 && values.selectedConnector?.name) {
+                actions.submitSourceConnectionDetails()
+            }
+
+            if (step === 3 && values.selectedConnector?.name) {
+                if (values.isDirectQueryMode) {
+                    actions.updateSource({
+                        payload: {
+                            schemas: values.databaseSchema.map((schema) => ({
+                                name: schema.table,
+                                should_sync: schema.should_sync,
+                                sync_type: null,
+                                incremental_field: null,
+                                incremental_field_type: null,
+                                sync_time_of_day: null,
+                                primary_key_columns: null,
+                            })),
+                        },
+                    })
+                    actions.setIsLoading(true)
+                    actions.createSource()
+                    if (values.selectedConnector) {
+                        posthog.capture('source created', {
+                            sourceType: values.selectedConnector.name,
+                        })
+                    }
+                    return
+                }
+
+                const ignoredTables = values.databaseSchema.filter(
+                    (schema) => !schema.should_sync || schema.sync_type === null
+                )
+                const cdcTables = values.databaseSchema.filter(
+                    (schema) => schema.should_sync && schema.sync_type === 'cdc'
+                )
+                const webhookTables = values.databaseSchema.filter(
+                    (schema) => schema.should_sync && schema.sync_type === 'webhook'
+                )
+                const appendOnlyTables = values.databaseSchema.filter(
+                    (schema) => schema.should_sync && schema.sync_type === 'append'
+                )
+                const incrementalTables = values.databaseSchema.filter(
+                    (schema) => schema.should_sync && schema.sync_type === 'incremental'
+                )
+                const xminTables = values.databaseSchema.filter(
+                    (schema) => schema.should_sync && schema.sync_type === 'xmin'
+                )
+                const fullRefreshTables = values.databaseSchema.filter(
+                    (schema) => schema.should_sync && schema.sync_type === 'full_refresh'
+                )
+
+                const confirmation = (
+                    <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 mt-2">
+                        {/* CDC - Best */}
+                        {cdcTables.length > 0 && (
+                            <>
+                                <div className="font-bold text-success">CDC</div>
+                                <div>
+                                    <span className="text-muted">{tableCountFormatter(cdcTables.length)}</span> —
+                                    Real-time change capture via logical replication.
+                                </div>
+                            </>
+                        )}
+
+                        {/* Webhook - Best */}
+                        {webhookTables.length > 0 && (
+                            <>
+                                <div className="font-bold text-success">Webhook</div>
+                                <div>
+                                    <span className="text-muted">{tableCountFormatter(webhookTables.length)}</span> —
+                                    Real-time updates via webhooks.
+                                </div>
+                            </>
+                        )}
+
+                        {/* Incremental - Good */}
+                        <div className="font-bold text-success">Incremental</div>
+                        <div>
+                            <span className="text-muted">
+                                {tableCountFormatter(incrementalTables.length)}
+                                {incrementalTables.length === 69 ? ' (nice)' : ''}
+                                {incrementalTables.length === 67 ? ' (nice but only for genz)' : ''}
+                            </span>{' '}
+                            — Ideal. Syncs only changed rows using a field like{' '}
+                            <span className="font-mono text-xs">updated_at</span>.
+                        </div>
+
+                        {/* xmin - Good */}
+                        {xminTables.length > 0 && (
+                            <>
+                                <div className="font-bold text-success">xmin</div>
+                                <div>
+                                    <span className="text-muted">{tableCountFormatter(xminTables.length)}</span> — Syncs
+                                    only changed rows using Postgres' internal{' '}
+                                    <span className="font-mono text-xs">xmin</span> column. No cursor field required.
+                                </div>
+                            </>
+                        )}
+
+                        {/* Append-only - Caution */}
+                        <div className="font-bold text-warning">Append-only</div>
+                        <div>
+                            <span className="text-muted">{tableCountFormatter(appendOnlyTables.length)}</span> — Use a
+                            field that doesn't change on updates, like{' '}
+                            <span className="font-mono text-xs">created_at</span>.
+                        </div>
+
+                        {/* Full refresh - Danger */}
+                        <div className="font-bold text-danger">Full refresh</div>
+                        <div>
+                            <span className="text-muted">
+                                {tableCountFormatter(fullRefreshTables.length, {
+                                    none: 'None ✓',
+                                })}
+                            </span>{' '}
+                            — Re-syncs all rows every time. Can significantly increase costs.
+                        </div>
+
+                        {/* Ignored - Muted */}
+                        <div className="font-bold text-muted">Ignored</div>
+                        <div>
+                            <span className="text-muted">{tableCountFormatter(ignoredTables.length)}</span> — Tables
+                            without sync configured will be skipped.
+                        </div>
+                    </div>
+                )
+
+                const sourcePayload = (values.source?.payload || {}) as Record<string, any>
+                const cdcSelfManaged =
+                    !!sourcePayload.cdc_enabled &&
+                    sourcePayload.cdc_management_mode === 'self_managed' &&
+                    cdcTables.length > 0
+
+                // The dialog shows counts from the settings as they are now, so a pick arriving later
+                // must not change what the person confirms.
+                cache.recommendationsFrozenFor = cache.schemaDiscovery
+                LemonDialog.open({
+                    title: 'Confirm your table configurations',
+                    content: confirmation,
+                    primaryButton: {
+                        children: cdcSelfManaged ? 'Next: CDC setup SQL' : 'Confirm',
+                        type: 'primary',
+                        onClick: () => {
+                            actions.updateSource({
+                                payload: {
+                                    schemas: values.databaseSchema.map((schema) => ({
+                                        name: schema.table,
+                                        should_sync: schema.should_sync,
+                                        sync_type: schema.sync_type,
+                                        incremental_field: schema.incremental_field,
+                                        incremental_field_type: schema.incremental_field_type,
+                                        incremental_field_lookback_seconds:
+                                            schema.incremental_field_lookback_seconds ?? null,
+                                        sync_time_of_day: schema.sync_time_of_day,
+                                        primary_key_columns: schema.primary_key_columns,
+                                        enabled_columns: schema.enabled_columns ?? null,
+                                        masked_columns: schema.masked_columns ?? null,
+                                        row_filters: schema.row_filters ?? null,
+                                        ...(schema.sync_type === 'cdc' && schema.cdc_table_mode
+                                            ? { cdc_table_mode: schema.cdc_table_mode }
+                                            : {}),
+                                    })),
+                                },
+                            })
+                            if (cdcSelfManaged) {
+                                // Show the setup SQL popup; user confirms → we verify → createSource fires
+                                actions.openCdcSelfManagedSetupDialog()
+                                return
+                            }
+                            if (values.showDestinationStep) {
+                                // Pick destinations before the source exists, so its first sync
+                                // already lands where the user wants it.
+                                actions.setStep(WIZARD_DESTINATION_STEP)
+                                return
+                            }
+                            actions.setIsLoading(true)
+                            actions.createSource()
+                            if (values.selectedConnector) {
+                                posthog.capture('source created', {
+                                    sourceType: values.selectedConnector.name,
+                                })
+                            }
+                        },
+                        size: 'small',
+                    },
+                    secondaryButton: {
+                        children: 'Cancel',
+                        type: 'tertiary',
+                        size: 'small',
+                    },
+                })
+            }
+
+            if (step === WIZARD_DESTINATION_STEP) {
+                actions.setIsLoading(true)
+                actions.createSource()
+                if (values.selectedConnector) {
+                    posthog.capture('source created', {
+                        sourceType: values.selectedConnector.name,
+                    })
+                }
+            } else if (step === 4) {
+                if (webhookResultHasNoPendingInputs(values.webhookResult)) {
+                    actions.onNext()
+                } else {
+                    // Manual mode (or auto-create with pending inputs) — submit webhook form
+                    // (validates, then triggers submitWebhookFields)
+                    actions.submitWebhookFieldInputs()
+                }
+            } else if (step === 5) {
+                if (props.onComplete) {
+                    props.onComplete()
+                } else {
+                    actions.closeWizard()
+                }
+            }
+        },
+        closeWizard: () => {
+            const returnUrl = values.returnConfig?.returnUrl
+            const sourceUrl = values.sourceId ? urls.dataWarehouseSource(values.sourceId, 'schemas') : undefined
+            actions.cancelWizard()
+            // Prefer an explicit caller-provided return URL, then drop the user on the
+            // source they just created, falling back to the sources list.
+            router.actions.push(returnUrl ?? sourceUrl ?? urls.sources())
+        },
+        cancelWizard: () => {
+            actions.onClear()
+            actions.clearSource()
+            actions.loadSources()
+            actions.resetSourceConnectionDetails()
+        },
+        createSource: async () => {
+            if (values.selectedConnector === null) {
+                // This should never happen
+                return
+            }
+
+            // Webhook-sync tables produce no rows until the webhook is registered with the
+            // provider, and the required-tables flow never shows the webhook step (step 4) —
+            // register the webhook after creation and only report completion once it succeeds.
+            const registerRequiredWebhookAndComplete = async (sourceId: string): Promise<void> => {
+                let webhookResult: WebhookCreateResult
+                try {
+                    webhookResult = await api.externalDataSources.createWebhook(sourceId)
+                } catch (e: any) {
+                    posthog.captureException(e)
+                    webhookResult = {
+                        success: false,
+                        webhook_url: '',
+                        error: e.data?.message ?? e.message,
+                    }
+                }
+                actions.setWebhookResult(webhookResult)
+                if (!webhookResultHasNoPendingInputs(webhookResult)) {
+                    lemonToast.error(
+                        `We created the source but couldn't set up its webhook${
+                            webhookResult.error ? `: ${webhookResult.error}` : ''
+                        }. Connect again to retry, or finish webhook setup in the source settings.`
+                    )
+                    return
+                }
+                props.onComplete!()
+            }
+
+            // A required-tables run whose webhook registration failed left the source created —
+            // retry the webhook instead of creating a duplicate source.
+            if (values.requiredTables && props.onComplete && values.sourceId) {
+                if (values.hasWebhookSchemas) {
+                    await registerRequiredWebhookAndComplete(values.sourceId)
+                } else {
+                    props.onComplete()
+                }
+                actions.setIsLoading(false)
+                return
+            }
+
+            const crossSellAttribution =
+                values.featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_MARKETING_CROSS_SELL] === true &&
+                values.selectedConnector.category === 'Advertising' &&
+                values.currentTeamId
+                    ? getMarketingCrossSellAttribution(values.currentTeamId)
+                    : null
+
+            try {
+                const { id } = await api.externalDataSources.create({
+                    ...values.source,
+                    source_type: values.selectedConnector.name,
+                    created_via: 'web',
+                    // Sent with creation, not after it. Creation schedules the first sync before
+                    // it returns, and extraction snapshots the destinations onto that run, so a
+                    // follow-up request lands too late and the opening run goes to the warehouse
+                    // alone.
+                    ...(values.wizardDestinationIds.length > 0 ? { destination_ids: values.wizardDestinationIds } : {}),
+                })
+
+                actions.setSourceId(id)
+
+                actions.resetSourceConnectionDetails()
+                actions.loadSources()
+                actions.markTaskAsCompleted(SetupTaskId.ConnectSource)
+
+                // Fires only after the source is created server-side. Unlike the intent-time
+                // `source created` capture in onSubmit (which fires before this request resolves),
+                // this measures true connect completion — use it for the real onboarding funnel.
+                posthog.capture('warehouse source connect completed', {
+                    sourceType: values.selectedConnector.name,
+                    returnLabel: values.returnConfig?.returnLabel,
+                    entry_point: values.returnConfig?.entryPoint,
+                    accessMethod: values.source.access_method,
+                    hasWebhookSchemas: values.hasWebhookSchemas,
+                })
+
+                if (crossSellAttribution) {
+                    captureMarketingCrossSellSourceCreated(crossSellAttribution, id, values.selectedConnector.name)
+                }
+
+                tryShowMCPHint('data_warehouse_sources.create', {
+                    derivedPrompt: `Connect a ${values.selectedConnector.name} source`,
+                })
+
+                // When requiredTables is set (e.g. signals setup), skip step 4 and complete directly
+                if (values.requiredTables && props.onComplete) {
+                    if (values.hasWebhookSchemas) {
+                        await registerRequiredWebhookAndComplete(id)
+                    } else {
+                        props.onComplete()
+                    }
+                } else if (values.hasWebhookSchemas) {
+                    // Absolute: createSource also runs from WIZARD_DESTINATION_STEP, where onNext would overshoot.
+                    actions.setStep(4)
+                } else {
+                    // Skip webhook step, go directly to progress (5)
+                    actions.setStep(5)
+                }
+            } catch (e: any) {
+                const connectErrorMessage = resolveConnectErrorMessage(e)
+                actions.setConnectError(connectErrorMessage)
+                lemonToast.error(connectErrorMessage)
+                // Surface the failure instead of leaving it as a toast-only dead end: a captured
+                // exception keeps the stack triageable, and the event closes the connect funnel.
+                posthog.captureException(e)
+                posthog.capture('warehouse source connect failed', {
+                    sourceType: values.selectedConnector?.name,
+                    errorMessage: e.data?.message ?? e.message,
+                    status: e.status,
+                })
+            } finally {
+                actions.setIsLoading(false)
+            }
+        },
+        createWebhook: async () => {
+            if (!values.sourceId) {
+                return
+            }
+
+            try {
+                const result = await api.externalDataSources.createWebhook(values.sourceId)
+                actions.setWebhookResult(result)
+            } catch (e: any) {
+                actions.setWebhookResult({
+                    success: false,
+                    webhook_url: '',
+                    error: e.data?.message ?? e.message ?? 'Failed to create webhook',
+                })
+                posthog.captureException(e)
+            }
+        },
+        switchWebhookTablesToPolling: async () => {
+            const { sourceId, currentTeamId, selectedConnector } = values
+            if (!sourceId || !currentTeamId || !selectedConnector) {
+                return
+            }
+            actions.setWebhookTablesSwitching(true)
+            try {
+                const source = await externalDataSourcesRetrieve(String(currentTeamId), sourceId)
+                const wizardSchemas = new Map(values.databaseSchema.map((schema) => [schema.table, schema]))
+                const updates: ExternalDataSourceBulkUpdateSchemaApi[] = []
+                const switched = new Map<string, PollingSyncSettings>()
+                let webhookOnlyCount = 0
+                for (const item of source.schemas) {
+                    const schemaId = typeof item.id === 'string' ? item.id : null
+                    const name = typeof item.name === 'string' ? item.name : null
+                    const wizardSchema = name ? wizardSchemas.get(name) : undefined
+                    if (!schemaId || !name || !wizardSchema || item.sync_type !== 'webhook' || !item.should_sync) {
+                        continue
+                    }
+                    // A webhook-only table (e.g. Stripe Discount) has no list endpoint to poll, and the
+                    // API rejects any other sync type for it, so it stays on webhook sync.
+                    if (wizardSchema.webhook_only) {
+                        webhookOnlyCount += 1
+                        continue
+                    }
+                    const settings = defaultPollingSyncSettings(wizardSchema, selectedConnector.name)
+                    switched.set(name, settings)
+                    updates.push({
+                        id: schemaId,
+                        sync_type: settings.sync_type,
+                        incremental_field: settings.incremental_field ?? null,
+                        incremental_field_type: settings.incremental_field_type ?? null,
+                    })
+                }
+                if (updates.length > 0) {
+                    await externalDataSourcesBulkUpdateSchemasPartialUpdate(String(currentTeamId), sourceId, {
+                        schemas: updates,
+                    })
+                }
+                actions.setDatabaseSchemas(
+                    values.databaseSchema.map((schema) => {
+                        const settings = switched.get(schema.table)
+                        return settings
+                            ? {
+                                  ...schema,
+                                  sync_type: settings.sync_type,
+                                  incremental_field: settings.incremental_field ?? null,
+                                  incremental_field_type: settings.incremental_field_type ?? null,
+                              }
+                            : schema
+                    })
+                )
+                posthog.capture('source wizard webhook tables switched to polling', {
+                    sourceType: selectedConnector.name,
+                    tableCount: updates.length,
+                })
+                lemonToast.success(
+                    `Switched ${updates.length.toLocaleString()} ${updates.length === 1 ? 'table' : 'tables'} to another sync method` +
+                        (webhookOnlyCount > 0
+                            ? `. ${webhookOnlyCount.toLocaleString()} ${webhookOnlyCount === 1 ? 'table syncs' : 'tables sync'} only by webhook and stayed on webhook sync.`
+                            : '')
+                )
+                actions.setStep(5)
+            } catch (e: any) {
+                posthog.captureException(e)
+                lemonToast.error(
+                    `Couldn't change the sync method: ${e.data?.detail ?? e.data?.message ?? e.message ?? 'unknown error'}. Try again, or change it on the source's Schemas tab later.`
+                )
+            } finally {
+                actions.setWebhookTablesSwitching(false)
+            }
+        },
+        skipWebhookSetup: () => {
+            const sourceName = values.selectedConnector?.label ?? values.selectedConnector?.name ?? 'the source'
+            LemonDialog.open({
+                title: 'Skip the webhook setup?',
+                description: `Tables that use webhook sync get no webhook updates until you set up the webhook. Until then, each sync reads the ${sourceName} API instead. This is slower, and a sync can read the whole table each time. You can set up the webhook later on the source's Webhook tab.`,
+                primaryButton: {
+                    children: 'Skip webhook setup',
+                    status: 'danger',
+                    onClick: () => {
+                        posthog.capture('source wizard webhook setup skipped', {
+                            sourceType: values.selectedConnector?.name,
+                            webhookCreateFailed: values.webhookResult ? !values.webhookResult.success : null,
+                        })
+                        actions.setStep(5)
+                    },
+                    'data-attr': 'source-wizard-skip-webhook-confirm',
+                },
+                secondaryButton: {
+                    children: 'Go back',
+                    type: 'tertiary',
+                },
+            })
+        },
+        submitWebhookFields: async () => {
+            if (!values.sourceId) {
+                return
+            }
+
+            const fieldValues = values.webhookFieldInputs
+            if (Object.keys(fieldValues).length > 0) {
+                try {
+                    await api.externalDataSources.updateWebhookInputs(values.sourceId, fieldValues)
+                } catch (e: any) {
+                    lemonToast.error(e.data?.message ?? e.message ?? 'Failed to update webhook inputs')
+                    return
+                }
+            }
+
+            // Only advance from the webhook step — guards against a stray double submission
+            // (e.g. the form's own Save button plus the wizard's Next button) re-firing this and
+            // pushing `currentStep` past the last real step.
+            if (values.currentStep === 4) {
+                actions.onNext()
+            }
+        },
+        handleRedirect: async ({ source }) => {
+            // The redirect names the source it came back for. Only a source the catalog lists can continue.
+            if (values.availableSources?.[source]) {
+                actions.updateSource({
+                    source_type: source,
+                })
+            } else {
+                lemonToast.error(
+                    `Couldn't finish connecting your source. Please try again, and if it keeps happening contact support.`
+                )
+            }
+        },
+        submitSourceConnectionDetailsSuccess: () => {
+            actions.getDatabaseSchemas()
+        },
+        getDatabaseSchemas: async () => {
+            cache.schemaDiscovery = {}
+            if (!values.selectedConnector) {
+                return
+            }
+
+            actions.setIsLoading(true)
+
+            const sourceType = values.selectedConnector.name
+            // The logic is not keyed per connector, so a slow probe can finish after the user picks
+            // another source. Its result then belongs to no visible form and must not reach the UI.
+            const selection = values.connectorSelectionCount
+            const connectorChanged = (): boolean => values.connectorSelectionCount !== selection
+            const startedAt = performance.now()
+            const captureSchemasLoaded = (success: boolean, schemaCount: number | null): void => {
+                posthog.capture('source wizard schemas loaded', {
+                    sourceType,
+                    success,
+                    schema_count: schemaCount,
+                    duration_ms: Math.round(performance.now() - startedAt),
+                })
+            }
+
+            try {
+                const schemas = await api.externalDataSources
+                    .database_schema(sourceType, getDatabaseSchemaPayload(values.source))
+                    .catch((e) => {
+                        captureSchemasLoaded(false, null)
+                        throw e
+                    })
+                captureSchemasLoaded(true, schemas.length)
+                if (connectorChanged()) {
+                    return
+                }
+
+                // Backend `cdc_available` only reflects table support — clear it when the
+                // user didn't toggle CDC on for this source in step 1.
+                const sourceCdcEnabled = !!values.source.payload?.cdc_enabled
+                if (!sourceCdcEnabled) {
+                    for (const schema of schemas) {
+                        schema.cdc_available = false
+                    }
+                }
+
+                let showToast = false
+
+                for (const schema of schemas) {
+                    if (values.isDirectQueryMode) {
+                        schema.should_sync = true
+                        schema.sync_type = null
+                        continue
+                    }
+
+                    // Unreachable scope → leave off. User fixes permissions before opting in.
+                    if (schema.permission_error) {
+                        schema.should_sync = false
+                        continue
+                    }
+
+                    if (schema.sync_type === null) {
+                        showToast = true
+                        schema.should_sync = schema.should_sync_default ?? true
+
+                        const cdcEnabled = sourceCdcEnabled
+                        if (cdcEnabled && schema.cdc_available) {
+                            schema.sync_type = 'cdc'
+                        } else if (schema.supports_webhooks) {
+                            schema.sync_type = 'webhook'
+                        } else {
+                            const settings = defaultPollingSyncSettings(schema, values.selectedConnector.name)
+                            schema.sync_type = settings.sync_type
+                            if (settings.incremental_field) {
+                                schema.incremental_field = settings.incremental_field
+                                schema.incremental_field_type = settings.incremental_field_type ?? null
+                            }
+                        }
+                    }
+
+                    // Onboarding one-click setup: opt every syncable table in (permission errors
+                    // already continued above), so the user can sync the whole source in one click.
+                    // Default-off tables stay off via the shared bulk rule: this path shows no
+                    // table picker, so nothing else stops a secrets table from syncing.
+                    if (props.autoConfigureTables) {
+                        schema.should_sync = bulkToggledShouldSync(schema, true)
+                    }
+                }
+
+                if (showToast && !values.requiredTables) {
+                    lemonToast.info(
+                        "We've setup some defaults for you! Please take a look to make sure you're happy with the results."
+                    )
+                }
+
+                // If required tables are specified (e.g. signals setup), skip the schema selection step
+                // entirely and create the source with only those tables, using their default sync settings
+                if (values.requiredTables) {
+                    // Multi-repo sources qualify their schema names (`owner/repo.endpoint`), so a
+                    // required table matches by suffix as well as exactly, and can resolve to one
+                    // row per repo. Mirrors ensureRequiredTableSyncing in signalSourcesLogic.
+                    const matchesRequiredTable = (tableName: string, requiredTable: string): boolean =>
+                        tableName === requiredTable || tableName.endsWith(`.${requiredTable}`)
+                    // The payload below forces should_sync on, so a permission-errored row would
+                    // queue a guaranteed-403 sync. Treat it as unavailable instead.
+                    const requiredSchemas = schemas.filter(
+                        (schema) =>
+                            !schema.permission_error &&
+                            values.requiredTables!.some((table: string) => matchesRequiredTable(schema.table, table))
+                    )
+                    const missingTables = values.requiredTables.filter(
+                        (table: string) => !requiredSchemas.some((schema) => matchesRequiredTable(schema.table, table))
+                    )
+                    if (missingTables.length > 0) {
+                        const permissionError = schemas.find(
+                            (schema) =>
+                                schema.permission_error &&
+                                missingTables.some((table: string) => matchesRequiredTable(schema.table, table))
+                        )?.permission_error
+                        lemonToast.error(
+                            permissionError
+                                ? `Source credentials cannot read the tables this needs (${missingTables.join(', ')}): ${permissionError}. Grant the missing scope in your source provider and reconnect.`
+                                : `Required tables not found in source: ${missingTables.join(', ')}`
+                        )
+                        actions.setIsLoading(false)
+                        return
+                    }
+                    for (const schema of requiredSchemas) {
+                        schema.should_sync = true
+                        schema.sync_type = props.requiredTableSyncType ?? schema.sync_type
+                    }
+                    // createSource reads hasWebhookSchemas off databaseSchema to decide whether the
+                    // new source still needs its webhook registered.
+                    actions.setDatabaseSchemas(requiredSchemas)
+
+                    actions.updateSource({
+                        payload: {
+                            schemas: requiredSchemas.map((schema) => ({
+                                name: schema.table,
+                                should_sync: true,
+                                sync_type: schema.sync_type,
+                                incremental_field: schema.incremental_field,
+                                incremental_field_type: schema.incremental_field_type,
+                                incremental_field_lookback_seconds: schema.incremental_field_lookback_seconds ?? null,
+                                sync_time_of_day: schema.sync_time_of_day ?? null,
+                                primary_key_columns: schema.primary_key_columns,
+                                ...(schema.sync_type === 'cdc' && schema.cdc_table_mode
+                                    ? { cdc_table_mode: schema.cdc_table_mode }
+                                    : {}),
+                            })),
+                        },
+                    })
+                    // Jump to step 3 so that createSource's onNext() advances to step 4 (sync progress)
+                    actions.setStep(3)
+                    actions.setIsLoading(true)
+                    actions.createSource()
+                    return
+                }
+
+                actions.setDatabaseSchemas(schemas)
+                actions.onNext()
+                actions.loadIncrementalFieldRecommendations()
+            } catch (e: any) {
+                if (connectorChanged()) {
+                    return
+                }
+                const apiMessage = e.data?.message ?? e.detail
+                const errorMessage = resolveConnectErrorMessage(e)
+                actions.setConnectError(errorMessage)
+                lemonToast.error(errorMessage)
+
+                // A 5xx with no body is an unexpected server failure, not a user credential
+                // mistake — capture the stack so these stay diagnosable (the report flagged
+                // swallowed generic `Error`s on this path with no captured stack).
+                if (!apiMessage && e.status >= 500) {
+                    posthog.captureException(e)
+                }
+
+                posthog.capture('warehouse credentials invalid', {
+                    sourceType: values.selectedConnector?.name,
+                    errorMessage,
+                    // Keep the raw error (status code etc.) so server-side failures stay triageable.
+                    rawError: e.message,
+                    status: e.status,
+                })
+            }
+
+            actions.setIsLoading(false)
+        },
+        selectConnector: ({ connector, accessMethod }) => {
+            syncExpandedSchemaGroupKeys(actions, values)
+            actions.resetSourceForm(accessMethod)
+
+            actions.addProductIntent({
+                product_type: ProductKey.DATA_WAREHOUSE,
+                intent_context: ProductIntentContext.SELECTED_CONNECTOR,
+            })
+
+            // Track interest for marketing ad sources and marketing analytics
+            if (connector?.category === 'Advertising') {
+                actions.addProductIntent({
+                    product_type: ProductKey.MARKETING_ANALYTICS,
+                    intent_context: ProductIntentContext.MARKETING_ANALYTICS_ADS_INTEGRATION_VISITED,
+                })
+            }
+        },
+        toggleAllTables: ({ selectAll, tableNames }) => {
+            // databaseSchema reducer already applied the toggle; re-emit so the
+            // setDatabaseSchemas listener (syncExpandedSchemaGroupKeys) fires.
+            actions.setDatabaseSchemas(values.databaseSchema)
+
+            if (selectAll) {
+                // Select all leaves default-off tables off, so the header checkbox never fills.
+                // Say why, otherwise it reads as a checkbox that ignores clicks.
+                const targetSet = tableNames ? new Set(tableNames) : null
+                const skippedDefaultOff = values.databaseSchema.some(
+                    (schema) =>
+                        (!targetSet || targetSet.has(schema.table)) &&
+                        schema.should_sync_default === false &&
+                        !schema.should_sync &&
+                        !schema.permission_error
+                )
+                if (skippedDefaultOff) {
+                    lemonToast.info(
+                        'Select all skips tables that are off by default. Check those tables one at a time to sync them.'
+                    )
+                }
+            }
+        },
+    })),
+    urlToAction(({ actions, values }) => {
+        const handleUrlChange = (_: Record<string, string | undefined>, searchParams: Record<string, string>): void => {
+            const kind = searchParams.kind?.toLowerCase()
+            const accessMethod = searchParams.access_method === 'direct' ? 'direct' : 'warehouse'
+            const returnUrl = searchParams.returnUrl
+            const returnLabel = searchParams.returnLabel
+
+            if (returnUrl && returnLabel) {
+                actions.setReturnConfig(returnUrl, returnLabel, searchParams.entry_point)
+            } else {
+                actions.clearReturnConfig()
+            }
+
+            // File upload isn't in the connector list, so resolve its client-only synthetic config
+            // directly rather than from `connectors`.
+            if (kind === FILE_UPLOAD_SOURCE_NAME.toLowerCase()) {
+                if (values.selectedConnector?.name === FILE_UPLOAD_SOURCE_NAME && values.currentStep > 1) {
+                    return
+                }
+                actions.selectConnector(FILE_UPLOAD_SOURCE_CONFIG)
+                actions.setStep(2)
+                return
+            }
+
+            // The managed object storage sources replace self-managed tables, so no new ones are created.
+            if (manualLinkSources.some((type) => type === kind)) {
+                actions.selectConnector(null)
+                actions.setStep(1)
+                router.actions.replace(urls.dataWarehouseSourceNew())
+                return
+            }
+
+            const source = values.connectors?.find((s) => s?.name?.toLowerCase?.() === kind)
+
+            if (source) {
+                if (
+                    !shouldHydrateSourceFromUrl(
+                        values.currentStep,
+                        values.selectedConnector,
+                        source,
+                        values.source.access_method,
+                        accessMethod
+                    )
+                ) {
+                    return
+                }
+
+                // selectConnector forwards accessMethod to `resetSourceForm`, which seeds the
+                // connector's defaults and restores any OAuth-saved form state — saved
+                // access_method wins over the URL one (the OAuth callback URL doesn't carry it).
+                actions.selectConnector(source, accessMethod)
+                actions.handleRedirect(source.name)
+                actions.setStep(2)
+                return
+            }
+
+            if (values.currentStep <= 1) {
+                // A `kind` that matches no known connector means a source card navigated here but
+                // the wizard can't advance — the "dead click on a source" failure mode. Don't fail
+                // silently: always capture it for diagnosis, and once connectors have loaded (so
+                // we know it's a genuine mismatch, not the load race) tell the user what to do.
+                if (kind) {
+                    const connectorsLoaded = (values.connectors?.length ?? 0) > 0
+                    posthog.capture('warehouse new source kind unresolved', { kind, connectorsLoaded })
+                    if (connectorsLoaded) {
+                        lemonToast.error(
+                            `We couldn't open the "${kind}" connector — please pick a source from the list.`
+                        )
+                    }
+                }
+                actions.selectConnector(null)
+                actions.setStep(1)
+            }
+        }
+
+        return {
+            [urls.dataWarehouseSourceNew()]: handleUrlChange,
+        }
+    }),
+
+    forms(({ actions, values }) => ({
+        sourceConnectionDetails: {
+            // Real defaults come from the `defaultSourceConnectionDetails` selector and are
+            // pushed into the form by the `resetSourceForm` listener. The cast widens the form's
+            // inferred value type so call sites that read fields like `access_method`,
+            // `payload.host`, `cdc_management_mode`, etc. still type-check.
+            defaults: { prefix: '', description: '', payload: {} } as Record<string, any>,
+            errors: (sourceValues) => {
+                const selectedAccessMethod =
+                    (sourceValues as Record<string, any>)?.access_method === 'direct' ? 'direct' : 'warehouse'
+                const normalizedValues = {
+                    ...(sourceValues as Record<string, any>),
+                    access_method: selectedAccessMethod,
+                }
+                const errors = getErrorsForFields(values.selectedConnector?.fields ?? [], normalizedValues as any)
+
+                if (values.sourceConnectionDetailsManualErrors.prefix && sourceValues.prefix) {
+                    actions.setSourceConnectionDetailsManualErrors({
+                        prefix: undefined,
+                    })
+                }
+
+                return errors
+            },
+            submit: async (sourceValues) => {
+                if (values.selectedConnector) {
+                    const payload = buildCreateSourcePayload(sourceValues, values.selectedConnector.name)
+                    const isDirectQueryMode = payload.access_method === 'direct'
+                    actions.setIsLoading(true)
+
+                    try {
+                        if (!isDirectQueryMode) {
+                            await api.externalDataSources.source_prefix(payload.source_type, sourceValues.prefix)
+                        }
+
+                        const formPayload = clonePayloadPreservingFiles(payload['payload'] ?? {}) as Record<string, any>
+
+                        for (const { field, container, file } of findUploadedFiles(
+                            values.selectedConnector?.fields ?? [],
+                            formPayload
+                        )) {
+                            let parsedFile: unknown
+                            try {
+                                // Assumes we're loading a JSON file
+                                parsedFile = await readJsonFile(file)
+                            } catch (e: any) {
+                                posthog.captureException(e)
+                                lemonToast.error(
+                                    `The "${field.name}" file is not valid — it must be a readable JSON file.`
+                                )
+                                // Returning here would resolve the submit, so the wizard would go
+                                // on to discover schemas for a source it never updated.
+                                throw e
+                            }
+                            if (missingUploadedFileKeys(parsedFile, field.fileFormat.keys).length > 0) {
+                                lemonToast.error(WRONG_UPLOADED_FILE_MESSAGE)
+                                throw new UnusableUploadedFileError(field.name)
+                            }
+                            container[field.name] = parsedFile
+                        }
+
+                        const fieldPayload: Record<string, any> = {
+                            source_type: values.selectedConnector.name,
+                        }
+
+                        for (const field of values.selectedConnector?.fields ?? []) {
+                            fieldPayload[field.name] = formPayload[field.name]
+                        }
+
+                        // Include CDC configuration if present
+                        const cdcFields: Record<string, any> = {}
+                        const cdcKeys = [
+                            'cdc_enabled',
+                            'cdc_management_mode',
+                            'cdc_slot_name',
+                            'cdc_publication_name',
+                            'cdc_auto_drop_slot',
+                            'cdc_lag_warning_threshold_mb',
+                            'cdc_lag_critical_threshold_mb',
+                        ]
+                        for (const key of cdcKeys) {
+                            if (formPayload[key] !== undefined) {
+                                cdcFields[key] = formPayload[key]
+                            }
+                        }
+
+                        // Only store the keys of the source type we're using
+                        actions.updateSource({
+                            ...payload,
+                            payload: {
+                                source_type: values.selectedConnector.name,
+                                ...fieldPayload,
+                                ...cdcFields,
+                            },
+                        })
+
+                        actions.setIsLoading(false)
+                    } catch (e: any) {
+                        if (e?.data?.message) {
+                            actions.setSourceConnectionDetailsManualErrors({
+                                prefix: e.data.message,
+                            })
+                        }
+                        actions.setIsLoading(false)
+
+                        throw e
+                    }
+                }
+            },
+        },
+        webhookFieldInputs: {
+            defaults: {} as Record<string, any>,
+            errors: (sourceValues) => {
+                const webhookFields = values.selectedConnector?.webhookFields ?? []
+                return getErrorsForFields(webhookFields, {
+                    prefix: '',
+                    payload: sourceValues as Record<string, any>,
+                }).payload
+            },
+            submit: async () => {
+                actions.submitWebhookFields()
+            },
+        },
+    })),
+])
+
+export const getDatabaseSchemaPayload = (
+    source: Pick<ExternalDataSourceCreatePayload, 'access_method' | 'payload'>
+): Record<string, any> => ({
+    ...source.payload,
+    access_method: source.access_method ?? 'warehouse',
+})
+
+export const getErrorsForFields = (
+    fields: SourceFieldConfig[],
+    values:
+        | {
+              prefix: string
+              payload: Record<string, any>
+              access_method?: 'warehouse' | 'direct'
+          }
+        | undefined,
+    options?: { allowBlankSensitiveFields?: boolean }
+): Record<string, any> => {
+    const errors: Record<string, any> = {
+        payload: {},
+    }
+
+    const isDirectMode = values?.access_method === 'direct'
+
+    if (isDirectMode) {
+        if (!values?.prefix?.trim()) {
+            errors['prefix'] = 'Please enter a name for this direct query source.'
+        }
+    } else {
+        // Mirror the backend `validate_source_prefix` rules (which strip only underscores, not
+        // whitespace) so an invalid prefix is caught here rather than after the create request.
+        const prefix = values?.prefix ?? ''
+        const cleaned = prefix.replace(/^_+|_+$/g, '')
+        if (prefix && !cleaned) {
+            errors['prefix'] = 'Prefix cannot consist of only underscores'
+        } else if (cleaned && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(cleaned)) {
+            errors['prefix'] =
+                'Prefix must contain only letters, numbers, and underscores, and start with a letter or underscore'
+        }
+    }
+
+    // Payload errors
+    const validateField = (
+        field: SourceFieldConfig,
+        valueObj: Record<string, any>,
+        errorsObj: Record<string, any>
+    ): void => {
+        if (field.type === 'switch-group') {
+            // handle string value coming down from the backend for an update
+            if (valueObj[field.name]?.['enabled'] && valueObj[field.name]?.['enabled'] !== 'False') {
+                errorsObj[field.name] = {}
+                field.fields.forEach((f) => validateField(f, valueObj[field.name], errorsObj[field.name]))
+            }
+
+            return
+        }
+
+        if (field.type === 'select') {
+            const hasOptionFields = !!field.options.filter((n) => (n.fields?.length ?? 0) > 0).length
+
+            if (!hasOptionFields) {
+                // An empty array is truthy, so a multiple select needs its own emptiness
+                // check or `required` passes with nothing selected.
+                const selected = valueObj[field.name]
+                const selectionMissing = Array.isArray(selected) ? selected.length === 0 : !selected
+                if (field.required && selectionMissing) {
+                    errorsObj[field.name] = Array.isArray(selected)
+                        ? `Please select at least one of your ${field.label.toLowerCase()}`
+                        : `${field.label} is required`
+                }
+            } else {
+                errorsObj[field.name] = {}
+                const selection = valueObj[field.name]?.['selection']
+                field.options
+                    .find((n) => n.value === selection)
+                    ?.fields?.forEach((f) => validateField(f, valueObj[field.name], errorsObj[field.name]))
+            }
+            return
+        }
+
+        // All other types - check if required property exists on this field type
+        if (
+            options?.allowBlankSensitiveFields &&
+            (('secret' in field && field.secret) || ('type' in field && field.type === 'password')) &&
+            !valueObj[field.name]
+        ) {
+            return
+        }
+
+        // An empty array is truthy, so multi-value fields (e.g. repo pickers) need their own
+        // emptiness check or `required` would pass with zero selections.
+        const fieldValue = valueObj[field.name]
+        const valueMissing = Array.isArray(fieldValue) ? fieldValue.length === 0 : !fieldValue
+
+        // An OAuth field with nothing selected can never produce a working source, but some
+        // backend configs keep it `required=False` so stored configs on the other auth branch
+        // (e.g. GitHub PAT sources) still parse. Enforce it here instead of letting the submit
+        // through to a guaranteed credentials error.
+        if (field.type === 'oauth' && valueMissing) {
+            // Label verbatim: OAuth field labels lead with a brand name ("GitHub account"),
+            // which lowercasing would mangle.
+            errorsObj[field.name] = `Select or connect a ${field.label}`
+            return
+        }
+
+        if ('required' in field && field.required && valueMissing) {
+            errorsObj[field.name] = Array.isArray(fieldValue)
+                ? `Please enter at least one of your ${field.label.toLowerCase()}`
+                : `${field.label} is required`
+        }
+    }
+
+    for (const field of fields) {
+        if (field.type === 'ssh-tunnel') {
+            validateField(SSH_FIELD, values?.payload ?? {}, errors['payload'])
+        } else {
+            validateField(field, values?.payload ?? {}, errors['payload'])
+        }
+    }
+
+    return errors
+}
+
+const tableCountFormatter = (
+    count: number,
+    { none = 'None', one = '1 table', many = 'tables' }: { none?: string; one?: string; many?: string } = {}
+): string => {
+    if (count === 0) {
+        return none
+    }
+
+    if (count === 1) {
+        return one
+    }
+
+    return `${count} ${many}`
+}

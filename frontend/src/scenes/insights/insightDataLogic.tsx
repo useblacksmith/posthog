@@ -1,0 +1,1246 @@
+import {
+    MakeLogicType,
+    actions,
+    afterMount,
+    connect,
+    isBreakpoint,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    propsChanged,
+    reducers,
+    selectors,
+} from 'kea'
+import { loaders } from 'kea-loaders'
+import { actionToUrl, router } from 'kea-router'
+import posthog from 'posthog-js'
+
+import api from 'lib/api'
+import { keyForInsightLogicProps } from 'lib/insights/sharedUtils'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { PromiseTimeoutError, withTimeout } from 'lib/utils/async'
+import { objectsEqual } from 'lib/utils/objects'
+import { insightsApi } from 'scenes/insights/utils/api'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { Scene } from 'scenes/sceneTypes'
+import { filterTestAccountsDefaultsLogic } from 'scenes/settings/environment/filterTestAccountDefaultsLogic'
+
+import { sceneLayoutLogic } from '~/layout/scenes/sceneLayoutLogic'
+import { cohortsModel, getReferencedCohortIds, isIndividualInsightPath } from '~/models/cohortsModel'
+import { insightsModel } from '~/models/insightsModel'
+import { examples } from '~/queries/examples'
+import { DataNodeLogicProps, dataNodeLogic } from '~/queries/nodes/DataNode/dataNodeLogic'
+import {
+    applyVisualizationType,
+    columnsFromResponse,
+    getAutoVisualizationType,
+    rowCountFromResponse,
+} from '~/queries/nodes/DataVisualization/dataVisualizationLogic'
+import { sqlVisualizationDisabledReason } from '~/queries/nodes/DataVisualization/sqlVisualizationSupport'
+import { nodeKindToInsightType } from '~/queries/nodes/InsightQuery/defaults'
+import { insightVizDataNodeKey } from '~/queries/nodes/InsightViz/insightVizKeys'
+import { compareQuery, isDraftQueryWorthSaving } from '~/queries/nodes/InsightViz/queryUtils'
+import { getDefaultQuery, queryFromKind } from '~/queries/nodes/InsightViz/utils'
+import { queryExportContext } from '~/queries/query'
+import {
+    isDataTableNode,
+    isDataVisualizationNode,
+    isDataVisualizationNodeWithHogQLQuery,
+    isHogQLQuery,
+    isInsightQueryNode,
+    isInsightVizNode,
+} from '~/queries/schema/node-guards'
+import { VisualizationNode, HogQLVariable, InsightVizNode, Node, NodeKind } from '~/queries/schema/schema-general'
+import { isHogQuery, isWebAnalyticsInsightQuery, shouldQueryBeAsync } from '~/queries/utils'
+import { ChartDisplayType, ExportContext, InsightLogicProps, InsightType } from '~/types'
+
+import { DATAWAREHOUSE_EDITOR_ITEM_ID } from 'products/data_warehouse/frontend/utils'
+
+import type { AlertType } from '../../../../products/alerts/frontend/types'
+import type { InsightFilterOverrideContextApi } from '../../../../products/product_analytics/frontend/generated/api.schemas'
+import type {
+    DashboardFilter,
+    DataNode,
+    ErrorTrackingQueryResponse,
+    EventsQueryResponse,
+    HogQLAutocompleteResponse,
+    HogQLMetadataResponse,
+    HogQLQueryResponse,
+    HogQueryResponse,
+    LogAttributesQueryResponse,
+    LogValuesQueryResponse,
+    LogsQueryResponse,
+    MetricsQueryResponse,
+    QuerySchema,
+    QueryStatus,
+    RefreshType,
+    ResolvedDateRangeResponse,
+    SessionsQueryResponse,
+    TraceSpansAggregationQueryResponse,
+    TraceSpansAttributeBreakdownQueryResponse,
+    TraceSpansQueryResponse,
+    TraceSpansTreeQueryResponse,
+} from '../../queries/schema/schema-general'
+import type {
+    AccessControlLevel,
+    DashboardTileBasicType,
+    InsightShortId,
+    InsightModel,
+    SetInsightOptions,
+    UserBasicType,
+} from '../../types'
+import { teamLogic } from '../teamLogic'
+import { insightDataTimingLogic } from './insightDataTimingLogic'
+import { insightLogic } from './insightLogic'
+import { insightSceneLogic } from './insightSceneLogic'
+import { insightUsageLogic } from './insightUsageLogic'
+import { crushDraftQueryForLocalStorage, isQueryTooLarge } from './utils'
+
+// insightId/dashboardId are reducers set synchronously by the same action that matches the URL.
+// insightLogicRef is set by a separate listener that rebuilds and mounts a new logic instance, a
+// side effect that can still be running right after the scene mounts. Comparing against the ref
+// can read a stale value while insightId/dashboardId are already correct, letting a save through
+// while the editor is still showing this insight.
+export const isInsightSceneInstance = (props: InsightLogicProps): boolean => {
+    if (sceneLogic.values.activeSceneId !== Scene.Insight) {
+        return false
+    }
+    const sceneValues = insightSceneLogic.findMounted()?.values
+    return (
+        sceneValues?.insightId === props.dashboardItemId &&
+        (sceneValues?.dashboardId ?? null) === (props.dashboardId ?? null)
+    )
+}
+
+const isMatchingSqlQuery = (
+    query: Node | null | undefined,
+    reference: Node | null | undefined
+): query is VisualizationNode =>
+    !!query &&
+    isDataVisualizationNodeWithHogQLQuery(query) &&
+    query.kind === NodeKind.DataVisualizationNode &&
+    !!reference &&
+    isDataVisualizationNodeWithHogQLQuery(reference) &&
+    reference.kind === NodeKind.DataVisualizationNode &&
+    query.source.query === reference.source.query &&
+    objectsEqual(query.source.variables ?? {}, reference.source.variables ?? {})
+
+// A tile's query carries the dashboard's filters in these fields (resolve_effective_dashboard_filters and
+// QueryRunner.apply_dashboard_filters). Saving them back bakes the filters into the insight, nesting
+// properties one group deeper per save.
+const DASHBOARD_FILTERED_SOURCE_KEYS = [
+    'series',
+    'properties',
+    'dateRange',
+    'breakdownFilter',
+    'interval',
+    'filterTestAccounts',
+    'compareFilter',
+] as const
+
+// Restores a field from the stored query only when the tile left it as loaded, so a change the tile
+// made on purpose (switching to World map adds a country breakdown) is still saved.
+const withStoredDashboardFilteredFields = (
+    query: Node,
+    tileBaseQuery: Node | null | undefined,
+    storedQuery: Node | null | undefined
+): Node => {
+    if (
+        !isInsightVizNode(query) ||
+        !isInsightVizNode(tileBaseQuery) ||
+        !isInsightVizNode(storedQuery) ||
+        query.source.kind !== storedQuery.source.kind
+    ) {
+        return query
+    }
+    const source: Record<string, any> = { ...query.source }
+    const baseSource: Record<string, any> = tileBaseQuery.source
+    const storedSource: Record<string, any> = storedQuery.source
+    for (const key of DASHBOARD_FILTERED_SOURCE_KEYS) {
+        if (!objectsEqual(source[key], baseSource[key])) {
+            continue
+        }
+        if (key in storedSource) {
+            source[key] = storedSource[key]
+        } else {
+            delete source[key]
+        }
+    }
+    return { ...query, source } as InsightVizNode
+}
+
+export type SqlVisualizationUpdate =
+    | { type: 'chart-type'; display: ChartDisplayType }
+    | { type: 'display-options'; query: VisualizationNode }
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface insightDataLogicValues {
+    getInsightRefreshButtonDisabledReason: () => string // dataNodeLogic
+    insightDataError: Record<string, any> | null // dataNodeLogic
+    insightDataLoading: boolean // dataNodeLogic
+    insightDataRaw:
+        | ErrorTrackingQueryResponse
+        | HogQLAutocompleteResponse
+        | HogQLMetadataResponse
+        | HogQLQueryResponse<any[]>
+        | HogQueryResponse
+        | LogAttributesQueryResponse
+        | LogValuesQueryResponse
+        | MetricsQueryResponse
+        | Record<string, any>
+        | SessionsQueryResponse
+        | TraceSpansAggregationQueryResponse
+        | TraceSpansAttributeBreakdownQueryResponse
+        | TraceSpansQueryResponse
+        | TraceSpansTreeQueryResponse
+        | null // dataNodeLogic
+    insightLoadingTimeSeconds: number // dataNodeLogic
+    insightPollResponse: Record<string, QueryStatus | null> | null // dataNodeLogic
+    insightQuery: DataNode<Record<string, any>> // dataNodeLogic
+    queryId: string | null // dataNodeLogic
+    filterTestAccountsDefault: boolean // filterTestAccountsDefaultsLogic
+    insight: Partial<InsightModel<Node<Record<string, any>>>> // insightLogic
+    savedInsight: Partial<InsightModel<Node<Record<string, any>>>> // insightLogic
+    currentTeamId: number | null // teamLogic
+    canEditInSqlEditor: boolean
+    exportContext: ExportContext | undefined
+    generatedInsightMetadata: {
+        description: string
+        name: string
+    } | null
+    generatedInsightMetadataLoading: boolean
+    hogQL: string | null
+    hogQLVariables: Record<string, HogQLVariable> | undefined
+    insightData: Record<string, any>
+    internalQuery: Node | null
+    isDataWarehouseQuery: boolean
+    propsQuery: QuerySchema | null | undefined
+    query: Node | null
+    queryChanged: boolean
+    queryFromUrl: boolean
+    savingDisplayOptions: boolean
+    savingSqlVisualization: SqlVisualizationUpdate['type'] | null
+    showDebugPanel: boolean
+    showQueryEditor: boolean
+    sqlVisualizationVersion: number
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface insightDataLogicActions {
+    loadData: (
+        refresh?: RefreshType | undefined,
+        alreadyRunningQueryId?: string | undefined,
+        overrideQuery?: DataNode<Record<string, any>> | undefined
+    ) => {
+        overrideQuery: DataNode<Record<string, any>> | undefined
+        pollOnly: boolean
+        queryId: string
+        refresh: RefreshType | undefined
+    } // dataNodeLogic
+    loadDataFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    } // dataNodeLogic
+    loadDataSuccess: (
+        response:
+            | ErrorTrackingQueryResponse
+            | HogQLAutocompleteResponse
+            | HogQLMetadataResponse
+            | HogQLQueryResponse<any[]>
+            | HogQueryResponse
+            | LogAttributesQueryResponse
+            | LogValuesQueryResponse
+            | MetricsQueryResponse
+            | Record<string, any>
+            | SessionsQueryResponse
+            | TraceSpansAggregationQueryResponse
+            | TraceSpansAttributeBreakdownQueryResponse
+            | TraceSpansQueryResponse
+            | TraceSpansTreeQueryResponse
+            | null,
+        payload?:
+            | {
+                  overrideQuery: DataNode<Record<string, any>> | undefined
+                  pollOnly: boolean
+                  queryId: string
+                  refresh: RefreshType | undefined
+              }
+            | undefined
+    ) => {
+        payload?: {
+            overrideQuery: DataNode<Record<string, any>> | undefined
+            pollOnly: boolean
+            queryId: string
+            refresh: RefreshType | undefined
+        }
+        response:
+            | ErrorTrackingQueryResponse
+            | HogQLAutocompleteResponse
+            | HogQLMetadataResponse
+            | HogQLQueryResponse<any[]>
+            | HogQueryResponse
+            | LogAttributesQueryResponse
+            | LogValuesQueryResponse
+            | MetricsQueryResponse
+            | Record<string, any>
+            | SessionsQueryResponse
+            | TraceSpansAggregationQueryResponse
+            | TraceSpansAttributeBreakdownQueryResponse
+            | TraceSpansQueryResponse
+            | TraceSpansTreeQueryResponse
+            | null
+    } // dataNodeLogic
+    setInsightData: (
+        response:
+            | ErrorTrackingQueryResponse
+            | EventsQueryResponse
+            | HogQLAutocompleteResponse
+            | HogQLMetadataResponse
+            | HogQLQueryResponse<any[]>
+            | HogQueryResponse
+            | LogAttributesQueryResponse
+            | LogsQueryResponse
+            | LogValuesQueryResponse
+            | MetricsQueryResponse
+            | Record<string, any>
+            | SessionsQueryResponse
+            | TraceSpansAggregationQueryResponse
+            | TraceSpansAttributeBreakdownQueryResponse
+            | TraceSpansQueryResponse
+            | TraceSpansTreeQueryResponse
+    ) =>
+        | ErrorTrackingQueryResponse
+        | EventsQueryResponse
+        | HogQLAutocompleteResponse
+        | HogQLMetadataResponse
+        | HogQLQueryResponse<any[]>
+        | HogQueryResponse
+        | LogAttributesQueryResponse
+        | LogsQueryResponse
+        | LogValuesQueryResponse
+        | MetricsQueryResponse
+        | Record<string, any>
+        | SessionsQueryResponse
+        | TraceSpansAggregationQueryResponse
+        | TraceSpansAttributeBreakdownQueryResponse
+        | TraceSpansQueryResponse
+        | TraceSpansTreeQueryResponse // dataNodeLogic
+    loadInsightSuccess: (
+        insight: {
+            _create_in_folder?: string | null | undefined
+            alerts?: AlertType[] | undefined
+            cache_target_age?: string | null | undefined
+            columns?: string[] | null | undefined
+            created_at: string
+            created_by: UserBasicType | null
+            dashboard_tiles: DashboardTileBasicType[] | null
+            dashboards?: number[] | undefined
+            deleted: boolean
+            derived_name?: string | null | undefined
+            description?: string | undefined
+            disable_baseline?: boolean | undefined
+            favorited?: boolean | undefined
+            filter_override_context?: InsightFilterOverrideContextApi | null | undefined
+            id: number
+            is_cached?: boolean | undefined
+            is_sample: boolean
+            last_modified_at: string
+            last_modified_by: UserBasicType | null
+            last_refresh: string | null
+            last_viewed_at?: string | null | undefined
+            name: string
+            next?: string | undefined
+            next_allowed_client_refresh?: string | null | undefined
+            order: number | null
+            query: Node<Record<string, any>> | null
+            query_scan?: import('~/queries/schema/schema-general').QueryScanSummary | undefined
+            query_status?: QueryStatus | undefined
+            resolved_date_range?: ResolvedDateRangeResponse | null | undefined
+            result: any
+            saved: boolean
+            short_id: InsightShortId
+            tags?: string[] | undefined
+            timezone?: string | null | undefined
+            types?: string[][] | null | undefined
+            updated_at: string
+            user_access_level: AccessControlLevel
+            view_count?: number | undefined
+            viewers?: UserBasicType[] | undefined
+            warnings?:
+                | (
+                      | import('~/queries/schema/schema-general').AccessControlFilterWarning
+                      | import('~/queries/schema/schema-general').BreakdownNotAppliedWarning
+                      | import('~/queries/schema/schema-general').DataWarehouseSyncWarning
+                  )[]
+                | null
+                | undefined
+        },
+        payload?:
+            | {
+                  filtersOverride: DashboardFilter | null | undefined
+                  shortId: InsightShortId
+                  tileFiltersOverride: DashboardFilter | null | undefined
+                  variablesOverride: Record<string, HogQLVariable> | null | undefined
+              }
+            | undefined
+    ) => {
+        insight: {
+            _create_in_folder?: string | null | undefined
+            alerts?: AlertType[] | undefined
+            cache_target_age?: string | null | undefined
+            columns?: string[] | null | undefined
+            created_at: string
+            created_by: UserBasicType | null
+            dashboard_tiles: DashboardTileBasicType[] | null
+            dashboards?: number[] | undefined
+            deleted: boolean
+            derived_name?: string | null | undefined
+            description?: string | undefined
+            disable_baseline?: boolean | undefined
+            favorited?: boolean | undefined
+            filter_override_context?: InsightFilterOverrideContextApi | null | undefined
+            id: number
+            is_cached?: boolean | undefined
+            is_sample: boolean
+            last_modified_at: string
+            last_modified_by: UserBasicType | null
+            last_refresh: string | null
+            last_viewed_at?: string | null | undefined
+            name: string
+            next?: string | undefined
+            next_allowed_client_refresh?: string | null | undefined
+            order: number | null
+            query: Node<Record<string, any>> | null
+            query_scan?: import('~/queries/schema/schema-general').QueryScanSummary | undefined
+            query_status?: QueryStatus | undefined
+            resolved_date_range?: ResolvedDateRangeResponse | null | undefined
+            result: any
+            saved: boolean
+            short_id: InsightShortId
+            tags?: string[] | undefined
+            timezone?: string | null | undefined
+            types?: string[][] | null | undefined
+            updated_at: string
+            user_access_level: AccessControlLevel
+            view_count?: number | undefined
+            viewers?: UserBasicType[] | undefined
+            warnings?:
+                | (
+                      | import('~/queries/schema/schema-general').AccessControlFilterWarning
+                      | import('~/queries/schema/schema-general').BreakdownNotAppliedWarning
+                      | import('~/queries/schema/schema-general').DataWarehouseSyncWarning
+                  )[]
+                | null
+                | undefined
+        }
+        payload?: {
+            filtersOverride: DashboardFilter | null | undefined
+            shortId: InsightShortId
+            tileFiltersOverride: DashboardFilter | null | undefined
+            variablesOverride: Record<string, HogQLVariable> | null | undefined
+        }
+    } // insightLogic
+    setInsight: (
+        insight: Partial<InsightModel<Node<Record<string, any>>>>,
+        options: SetInsightOptions
+    ) => {
+        insight: Partial<InsightModel<Node<Record<string, any>>>>
+        options: SetInsightOptions
+    } // insightLogic
+    setInsightMetadata: (
+        metadataUpdate: Partial<
+            Pick<InsightModel<Node<Record<string, any>>>, 'description' | 'favorited' | 'name' | 'tags'>
+        >
+    ) => {
+        metadataUpdate: Partial<
+            Pick<InsightModel<Node<Record<string, any>>>, 'description' | 'favorited' | 'name' | 'tags'>
+        >
+    } // insightLogic
+    renameInsightSuccess: (item: InsightModel<Node<Record<string, any>>>) => {
+        item: InsightModel<Node<Record<string, any>>>
+    } // insightsModel
+    cancelChanges: () => {
+        value: true
+    }
+    generateInsightMetadata: () => any
+    generateInsightMetadataFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    generateInsightMetadataSuccess: (
+        generatedInsightMetadata: {
+            description: string
+            name: string
+        } | null,
+        payload?: any
+    ) => {
+        generatedInsightMetadata: {
+            description: string
+            name: string
+        } | null
+        payload?: any
+    }
+    loadReferencedCohorts: () => {
+        value: true
+    }
+    persistDisplayOptions: (query: Node) => {
+        query: Node<Record<string, any>>
+    }
+    persistDisplayOptionsSettled: () => {
+        value: true
+    }
+    persistSqlVisualization: (update: SqlVisualizationUpdate) => {
+        update: SqlVisualizationUpdate
+    }
+    persistSqlVisualizationFailed: (update: SqlVisualizationUpdate) => {
+        update: SqlVisualizationUpdate
+    }
+    persistSqlVisualizationSettled: () => {
+        value: true
+    }
+    setQuery: (
+        query: Node | null,
+        fromUrl?: boolean
+    ) => {
+        fromUrl: boolean
+        query: Node<Record<string, any>> | null
+    }
+    syncQueryFromProps: (query: Node | null) => {
+        query: Node<Record<string, any>> | null
+    }
+    toggleDebugPanel: () => {
+        value: true
+    }
+    toggleQueryEditorPanel: () => {
+        value: true
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface insightDataLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        query: (
+            propsQuery: QuerySchema | null | undefined,
+            insight: Partial<InsightModel<Node<Record<string, any>>>>,
+            internalQuery: Node<Record<string, any>> | null,
+            filterTestAccountsDefault: boolean,
+            isDataWarehouseQuery: boolean
+        ) => Node | null
+        isDataWarehouseQuery: (arg: any) => boolean
+        propsQuery: (arg: any) => QuerySchema | null | undefined
+        exportContext: (
+            query: Node<Record<string, any>> | null,
+            insight: Partial<InsightModel<Node<Record<string, any>>>>
+        ) => ExportContext | undefined
+        queryChanged: (
+            query: Node<Record<string, any>> | null,
+            savedInsight: Partial<InsightModel<Node<Record<string, any>>>>,
+            filterTestAccountsDefault: boolean
+        ) => boolean
+        insightData: (
+            insightDataRaw:
+                | ErrorTrackingQueryResponse
+                | HogQLAutocompleteResponse
+                | HogQLMetadataResponse
+                | HogQLQueryResponse<any[]>
+                | HogQueryResponse
+                | LogAttributesQueryResponse
+                | LogValuesQueryResponse
+                | MetricsQueryResponse
+                | Record<string, any>
+                | SessionsQueryResponse
+                | TraceSpansAggregationQueryResponse
+                | TraceSpansAttributeBreakdownQueryResponse
+                | TraceSpansQueryResponse
+                | TraceSpansTreeQueryResponse
+                | null
+        ) => Record<string, any>
+        hogQL: (insightData: Record<string, any>, query: Node<Record<string, any>> | null) => string | null
+        hogQLVariables: (query: Node<Record<string, any>> | null) => Record<string, HogQLVariable> | undefined
+        canEditInSqlEditor: (hogQL: string | null, query: Node<Record<string, any>> | null) => boolean
+    }
+}
+
+export type insightDataLogicType = MakeLogicType<
+    insightDataLogicValues,
+    insightDataLogicActions,
+    InsightLogicProps,
+    insightDataLogicMeta
+>
+
+export const insightDataLogic = kea<insightDataLogicType>([
+    props({} as InsightLogicProps),
+    key(keyForInsightLogicProps('new')),
+    path((key) => ['scenes', 'insights', 'insightDataLogic', key]),
+
+    connect((props: InsightLogicProps) => ({
+        values: [
+            insightLogic,
+            ['insight', 'savedInsight'],
+            teamLogic,
+            ['currentTeamId'],
+            dataNodeLogic({
+                key: insightVizDataNodeKey(props),
+                loadPriority: props.loadPriority,
+                filtersOverride: props.filtersOverride,
+                variablesOverride: props.variablesOverride,
+            } as DataNodeLogicProps),
+            [
+                'query as insightQuery',
+                'response as insightDataRaw',
+                'dataLoading as insightDataLoading',
+                'loadingTimeSeconds as insightLoadingTimeSeconds',
+                'responseErrorObject as insightDataError',
+                'getInsightRefreshButtonDisabledReason',
+                'pollResponse as insightPollResponse',
+                'queryId',
+            ],
+            filterTestAccountsDefaultsLogic,
+            ['filterTestAccountsDefault'],
+        ],
+        actions: [
+            insightLogic,
+            ['setInsight', 'setInsightMetadata', 'loadInsightSuccess'],
+            dataNodeLogic({ key: insightVizDataNodeKey(props) } as DataNodeLogicProps),
+            ['loadData', 'loadDataSuccess', 'loadDataFailure', 'setResponse as setInsightData'],
+            insightsModel,
+            ['renameInsightSuccess'],
+        ],
+        logic: [insightDataTimingLogic(props), insightUsageLogic(props)],
+    })),
+
+    actions({
+        loadReferencedCohorts: true,
+        setQuery: (query: Node | null, fromUrl: boolean = false) => ({ query, fromUrl }),
+        syncQueryFromProps: (query: Node | null) => ({ query }),
+        toggleQueryEditorPanel: true,
+        toggleDebugPanel: true,
+        cancelChanges: true,
+        persistDisplayOptions: (query: Node) => ({ query }),
+        persistDisplayOptionsSettled: true,
+        persistSqlVisualization: (update: SqlVisualizationUpdate) => ({ update }),
+        persistSqlVisualizationFailed: (update: SqlVisualizationUpdate) => ({ update }),
+        persistSqlVisualizationSettled: true,
+    }),
+
+    reducers({
+        savingDisplayOptions: [
+            false,
+            {
+                persistDisplayOptions: () => true,
+                persistDisplayOptionsSettled: () => false,
+            },
+        ],
+        savingSqlVisualization: [
+            null as SqlVisualizationUpdate['type'] | null,
+            {
+                persistSqlVisualization: (_, { update }) => update.type,
+                persistSqlVisualizationFailed: () => null,
+                persistSqlVisualizationSettled: () => null,
+            },
+        ],
+        sqlVisualizationVersion: [
+            0,
+            {
+                persistSqlVisualizationFailed: (state) => state + 1,
+            },
+        ],
+        internalQuery: [
+            null as Node | null,
+            {
+                setQuery: (_, { query }) => query,
+                syncQueryFromProps: (_, { query }) => query,
+            },
+        ],
+        queryFromUrl: [
+            false,
+            {
+                setQuery: (_, { fromUrl }) => fromUrl,
+                syncQueryFromProps: () => false,
+            },
+        ],
+        showQueryEditor: [
+            false,
+            {
+                toggleQueryEditorPanel: (state) => !state,
+            },
+        ],
+        showDebugPanel: [
+            false,
+            {
+                toggleDebugPanel: (state) => !state,
+            },
+        ],
+    }),
+
+    loaders(({ values }) => ({
+        generatedInsightMetadata: [
+            null as { name: string; description: string } | null,
+            {
+                generateInsightMetadata: async () => {
+                    const insightQuery = values.insightQuery
+                    if (!insightQuery) {
+                        return null
+                    }
+
+                    try {
+                        const query =
+                            insightQuery.kind === NodeKind.ActorsQuery ||
+                            insightQuery.kind === NodeKind.EventsQuery ||
+                            insightQuery.kind === NodeKind.GroupsQuery
+                                ? insightQuery
+                                : { kind: NodeKind.InsightVizNode, source: insightQuery }
+                        const response = await api.insights.generateMetadata(query)
+
+                        posthog.capture('insight metadata ai generated', { query_kind: insightQuery.kind })
+
+                        return { name: response.name, description: response.description }
+                    } catch (e) {
+                        posthog.capture('insight metadata ai generation failed', { query_kind: insightQuery.kind })
+                        throw e
+                    }
+                },
+            },
+        ],
+    })),
+
+    selectors({
+        query: [
+            (s) => [s.propsQuery, s.insight, s.internalQuery, s.filterTestAccountsDefault, s.isDataWarehouseQuery],
+            (
+                propsQuery: null | import('~/queries/schema/schema-general').QuerySchema | undefined,
+                insight: Partial<import('~/types').InsightModel<Node<Record<string, any>>>>,
+                internalQuery: Node | null,
+                filterTestAccountsDefault: boolean,
+                isDataWarehouseQuery: boolean
+            ): Node | null =>
+                internalQuery ||
+                propsQuery ||
+                insight.query ||
+                (isDataWarehouseQuery
+                    ? examples.DataWarehouse
+                    : queryFromKind(NodeKind.TrendsQuery, filterTestAccountsDefault)),
+        ],
+
+        isDataWarehouseQuery: [
+            () => [(_, props) => props],
+            (props: InsightLogicProps) => !!props.dashboardItemId?.startsWith(DATAWAREHOUSE_EDITOR_ITEM_ID),
+        ],
+
+        propsQuery: [
+            () => [(_, props) => props],
+            // overwrite query from props for standalone InsightVizNode queries
+            (props: InsightLogicProps) => (props.dashboardItemId?.startsWith('new-AdHoc.') ? props.query : null),
+        ],
+
+        exportContext: [
+            (s) => [s.query, s.insight],
+            (query: Node | null, insight: Partial<import('~/types').InsightModel<Node<Record<string, any>>>>) => {
+                if (!query) {
+                    // if we're here without a query then an empty query context is not the problem
+                    return undefined
+                }
+                const filename = ['export', insight.name || insight.derived_name].join('-')
+
+                let sourceQuery = query
+                if (isInsightVizNode(query)) {
+                    sourceQuery = query.source
+                }
+
+                return {
+                    ...queryExportContext(sourceQuery, undefined, undefined),
+                    filename,
+                } as ExportContext
+            },
+        ],
+
+        queryChanged: [
+            (s) => [s.query, s.savedInsight, s.filterTestAccountsDefault],
+            (
+                query: Node | null,
+                savedInsight: Partial<import('~/types').InsightModel<Node<Record<string, any>>>>,
+                filterTestAccountsDefault: boolean
+            ) => {
+                let savedOrDefaultQuery
+                if (savedInsight.query) {
+                    savedOrDefaultQuery = savedInsight.query as InsightVizNode | VisualizationNode
+                } else if (isInsightVizNode(query)) {
+                    // Web Analytics insights don't have traditional defaults, they come from tiles
+                    // and should always be considered "changed" for URL hash purposes
+                    if (isWebAnalyticsInsightQuery(query.source)) {
+                        return true
+                    }
+                    // Source kinds without a product analytics default (e.g. a TracesQuery from an
+                    // AI-generated link) have no default to compare against, so treat as changed
+                    if (!(query.source.kind in nodeKindToInsightType)) {
+                        return true
+                    }
+                    const insightType = nodeKindToInsightType[query.source.kind]
+                    savedOrDefaultQuery = getDefaultQuery(insightType, filterTestAccountsDefault)
+                } else if (isDataVisualizationNode(query)) {
+                    savedOrDefaultQuery = getDefaultQuery(InsightType.SQL, filterTestAccountsDefault)
+                } else if (isDataTableNode(query)) {
+                    savedOrDefaultQuery = getDefaultQuery(InsightType.JSON, filterTestAccountsDefault)
+                } else if (isHogQuery(query)) {
+                    savedOrDefaultQuery = getDefaultQuery(InsightType.HOG, filterTestAccountsDefault)
+                } else {
+                    return false
+                }
+
+                return !compareQuery(savedOrDefaultQuery, query as InsightVizNode | VisualizationNode)
+            },
+        ],
+
+        insightData: [
+            (s) => [s.insightDataRaw],
+            (
+                insightDataRaw:
+                    | Record<string, any>
+                    | null
+                    | import('~/queries/schema/schema-general').ErrorTrackingQueryResponse
+                    | import('~/queries/schema/schema-general').HogQLAutocompleteResponse
+                    | import('~/queries/schema/schema-general').HogQLMetadataResponse
+                    | import('~/queries/schema/schema-general').HogQLQueryResponse<any[]>
+                    | import('~/queries/schema/schema-general').HogQueryResponse
+                    | import('~/queries/schema/schema-general').LogAttributesQueryResponse
+                    | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsQueryResponse
+                    | import('~/queries/schema/schema-general').SessionsQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansQueryResponse
+            ): Record<string, any> => {
+                // :TRICKY: The queries return results as `results`, but insights expect `result`
+                return {
+                    ...insightDataRaw,
+                    result: (insightDataRaw as any)?.results ?? (insightDataRaw as any)?.result,
+                }
+            },
+        ],
+
+        hogQL: [
+            (s) => [s.insightData, s.query],
+            (insightData: Record<string, any>, query: Node | null): string | null => {
+                // Try to get it from the query itself, so we don't have to wait for the response
+                if (isDataVisualizationNode(query) && isHogQLQuery(query.source)) {
+                    return query.source.query
+                }
+                if (isHogQLQuery(query)) {
+                    return query.query
+                }
+                // Otherwise, get it from the response
+                if (insightData && 'hogql' in insightData && insightData.hogql !== '') {
+                    return insightData.hogql
+                }
+                return null
+            },
+        ],
+        hogQLVariables: [
+            (s) => [s.query],
+            (query: Node | null): Record<string, HogQLVariable> | undefined => {
+                if (isDataVisualizationNode(query) && isHogQLQuery(query.source)) {
+                    return query.source.variables
+                }
+                if (isHogQLQuery(query)) {
+                    return query.variables
+                }
+                return undefined
+            },
+        ],
+        canEditInSqlEditor: [
+            (s) => [s.hogQL, s.query],
+            (hogQL: string | null, query: Node | null): boolean =>
+                // We need a resolved hogql string, and the insight must not already be SQL-authored
+                // (otherwise "Edit in SQL editor" is a no-op).
+                hogQL != null &&
+                !isHogQLQuery(query) &&
+                !(isDataVisualizationNode(query) && isHogQLQuery(query.source)),
+        ],
+    }),
+
+    listeners(({ actions, cache, values, props }) => ({
+        loadReferencedCohorts: () => {
+            if (isIndividualInsightPath(router.values.location.pathname)) {
+                const ids = getReferencedCohortIds(values.query)
+                if (ids.length) {
+                    cohortsModel.actions.loadCohortsByIds({ ids })
+                }
+            }
+        },
+        syncQueryFromProps: () => actions.loadReferencedCohorts(),
+        persistDisplayOptions: async ({ query }, breakpoint) => {
+            // Never auto-persist while the user is editing this insight in the insight scene.
+            // insightDataLogic is keyed `${shortId}/on-dashboard-${dashboardId}`, so an insight
+            // opened from a dashboard shares its instance with the dashboard tile, which wired
+            // props.setQuery to persistDisplayOptions. Without this guard, any edit in the scene
+            // (a display toggle or removing a filter) would PATCH the insight before the user
+            // clicks Save. Edits there must persist only through an explicit save.
+            if (isInsightSceneInstance(props)) {
+                actions.persistDisplayOptionsSettled()
+                return
+            }
+            const insightId = values.insight.id
+            if (!insightId) {
+                actions.persistDisplayOptionsSettled()
+                return
+            }
+            // Only persist when the query actually differs from what's saved. The setQuery →
+            // props.setQuery path fires for any InsightVizNode change, including programmatic
+            // re-syncs (tile re-renders, results refreshes) that carry an unchanged query;
+            // persisting those produces spurious saves and activity-log churn.
+            if (objectsEqual(query, values.savedInsight.query)) {
+                actions.persistDisplayOptionsSettled()
+                return
+            }
+            const refreshResults = values.savedInsight.query
+                ? !compareQuery(query, values.savedInsight.query, { ignoreVisualizationOnlyChanges: true })
+                : false
+            const saveId = (cache.displayOptionsSaveId ?? 0) + 1
+            cache.displayOptionsSaveId = saveId
+            try {
+                // Debounce rapid clicks. insightDataLogic is keyed per insight, so breakpoint
+                // only cancels concurrent saves for this insight without affecting unrelated tiles.
+                await breakpoint(700)
+                // Breakpoints cannot cancel PATCHes that have already started, so serialize them per insight.
+                await cache.displayOptionsSave
+                breakpoint()
+                const shortId = values.insight.short_id
+                const tileBaseQuery = values.savedInsight.query
+                const save = withTimeout(
+                    async (signal) => {
+                        const storedInsight =
+                            props.dashboardId != null && shortId ? await insightsApi.getByShortId(shortId, true) : null
+                        const persistedQuery = withStoredDashboardFilteredFields(
+                            query,
+                            tileBaseQuery,
+                            storedInsight?.query
+                        )
+                        return insightsApi.update(insightId, { query: persistedQuery }, { signal })
+                    },
+                    15_000,
+                    'Saving display options timed out'
+                )
+                // The next save only needs to know when this request finishes.
+                cache.displayOptionsSave = save.catch(() => undefined)
+                const updatedItem = await save
+                if (saveId !== cache.displayOptionsSaveId) {
+                    return
+                }
+                // The response holds the stored query; the tile keeps its dashboard-filtered one.
+                const tileItem = props.dashboardId != null ? { ...updatedItem, query } : updatedItem
+                actions.renameInsightSuccess(tileItem)
+                if (refreshResults) {
+                    props.refreshAfterDisplayOptionsChange?.(tileItem)
+                }
+                actions.persistDisplayOptionsSettled()
+                lemonToast.success('Insight updated')
+            } catch (e) {
+                // A breakpoint means a newer save superseded this one, and that save owns the state.
+                if (!isBreakpoint(e as Error) && saveId === cache.displayOptionsSaveId) {
+                    if (e instanceof PromiseTimeoutError) {
+                        actions.persistDisplayOptionsSettled()
+                        lemonToast.warning(
+                            "Couldn't confirm whether the insight was updated. Refresh the dashboard to check."
+                        )
+                        return
+                    }
+                    actions.syncQueryFromProps(values.savedInsight.query ?? null)
+                    actions.persistDisplayOptionsSettled()
+                    lemonToast.error('Failed to update insight')
+                }
+            }
+        },
+
+        persistSqlVisualization: async ({ update }, breakpoint) => {
+            const fail = (reason: 'mismatch' | 'unsupported' | 'no_columns' | 'error'): void => {
+                actions.persistSqlVisualizationFailed(update)
+                posthog.capture('dashboard_sql_visualization_failed', {
+                    insight_id: values.insight.id,
+                    type: update.type,
+                    reason,
+                })
+                lemonToast.error(
+                    update.type === 'chart-type'
+                        ? "Couldn't update chart type. Refresh the dashboard and try again."
+                        : "Couldn't update display options. Refresh the dashboard and try again."
+                )
+            }
+
+            if (isInsightSceneInstance(props)) {
+                actions.persistSqlVisualizationSettled()
+                return
+            }
+
+            try {
+                await breakpoint(update.type === 'display-options' ? 700 : 0)
+                const insightId = values.insight.id
+                const shortId = values.insight.short_id
+                if (!insightId || !shortId) {
+                    actions.persistSqlVisualizationSettled()
+                    return
+                }
+
+                const savedQuery = (await insightsApi.getByShortId(shortId, true))?.query
+                if (!isMatchingSqlQuery(savedQuery, values.query)) {
+                    fail('mismatch')
+                    return
+                }
+
+                let nextQuery: VisualizationNode
+                if (update.type === 'chart-type') {
+                    const columns = columnsFromResponse(values.insightData)
+                    const rowCount = rowCountFromResponse(values.insightData)
+                    const autoVisualizationType = getAutoVisualizationType(columns, rowCount)
+                    if (columns.length === 0) {
+                        fail('no_columns')
+                        return
+                    }
+                    if (
+                        sqlVisualizationDisabledReason(
+                            update.display,
+                            savedQuery,
+                            columns,
+                            rowCount,
+                            autoVisualizationType
+                        )
+                    ) {
+                        fail('unsupported')
+                        return
+                    }
+                    nextQuery = applyVisualizationType(savedQuery, update.display, columns, rowCount)
+                } else {
+                    if (
+                        !isMatchingSqlQuery(update.query, values.query) ||
+                        savedQuery.display !== update.query.display
+                    ) {
+                        fail('mismatch')
+                        return
+                    }
+                    nextQuery = { ...savedQuery, chartSettings: update.query.chartSettings }
+                }
+
+                if (objectsEqual(nextQuery, savedQuery)) {
+                    actions.persistSqlVisualizationSettled()
+                    return
+                }
+
+                const updatedItem = await insightsApi.update(insightId, { query: nextQuery })
+                await breakpoint(0)
+                actions.renameInsightSuccess(updatedItem)
+                actions.persistSqlVisualizationSettled()
+                posthog.capture('dashboard_sql_visualization_changed', {
+                    insight_id: insightId,
+                    type: update.type,
+                    display: update.type === 'chart-type' ? update.display : update.query.display,
+                })
+                lemonToast.success('Insight updated')
+            } catch (e) {
+                if (!isBreakpoint(e as Error)) {
+                    fail('error')
+                }
+            }
+        },
+
+        generateInsightMetadataSuccess: ({ generatedInsightMetadata }) => {
+            if (generatedInsightMetadata) {
+                actions.setInsightMetadata({
+                    name: generatedInsightMetadata.name,
+                    description: generatedInsightMetadata.description,
+                })
+                if (generatedInsightMetadata.description && !sceneLayoutLogic.values.showDescription) {
+                    sceneLayoutLogic.actions.toggleShowDescription()
+                }
+            }
+        },
+        setInsight: ({ insight: { query, result }, options: { overrideQuery } }) => {
+            // we don't want to override the query for example when updating the insight's name
+            if (!overrideQuery) {
+                return
+            }
+
+            if (query) {
+                actions.setQuery(query)
+            }
+
+            if (result) {
+                actions.setInsightData({ ...values.insightData, result })
+            }
+        },
+        loadInsightSuccess: ({ insight }) => {
+            actions.loadReferencedCohorts()
+            // A shared link's query (`#q=`) is applied before the saved insight arrives, so re-syncing
+            // here would silently discard the date range and interval the sender chose.
+            if (values.queryFromUrl) {
+                return
+            }
+
+            // `internalQuery` wins over `insight.query` in the `query` selector, and the SQL editor
+            // updates a different logic instance, so a reload alone leaves this scene on the stale
+            // query until a hard refresh. Re-sync the override to the freshly loaded query.
+            if (insight.query && !objectsEqual(insight.query, values.query)) {
+                actions.syncQueryFromProps(insight.query)
+            }
+        },
+        cancelChanges: () => {
+            const savedQuery = values.savedInsight.query
+            const savedResult = values.savedInsight.result
+            actions.setQuery(savedQuery || null)
+            actions.setInsightData({ ...values.insightData, result: savedResult ? savedResult : null })
+        },
+        setQuery: ({ query }) => {
+            actions.loadReferencedCohorts()
+            // When this is the insight scene's own insight, sync the query to the URL
+            if (isInsightSceneInstance(props)) {
+                const insightId = insightSceneLogic.findMounted()?.values.insightId
+                const { pathname, searchParams, hashParams } = router.values.currentLocation
+                if (query && (values.queryChanged || insightId === 'new')) {
+                    const { insight: _, ...hash } = hashParams // remove existing /new#insight=TRENDS param
+                    router.actions.replace(pathname, searchParams, {
+                        ...hash,
+                        q: query,
+                    })
+                } else {
+                    const { q: _, ...hash } = hashParams // remove existing insight query hash param
+                    router.actions.replace(pathname, searchParams, hash)
+                }
+            }
+
+            // if the query is not changed, don't save it
+            if (!query || !values.queryChanged) {
+                return
+            }
+
+            // only run on insight scene
+            if (sceneLogic.values.activeSceneId !== Scene.Insight) {
+                return
+            }
+
+            // don't save for saved insights
+            if (isInsightSceneInstance(props)) {
+                const insightId = insightSceneLogic.findMounted()?.values.insightId
+                if (insightId && insightId !== 'new') {
+                    return
+                }
+            }
+
+            // a draft that only differs from the type's default in cosmetic ways (or that the
+            // editor marks as changed by construction) is noise when resurfaced as "unsaved insight"
+            if (!isDraftQueryWorthSaving(query, values.filterTestAccountsDefault)) {
+                // reverting a meaningful edit supersedes the draft this editor persisted, but an
+                // editor that never persisted one must not delete a draft from an earlier session
+                if (cache.persistedDraftQuery) {
+                    cache.persistedDraftQuery = false
+                    localStorage.removeItem(`draft-query-${values.currentTeamId}`)
+                }
+                return
+            }
+
+            if (isQueryTooLarge(query)) {
+                // same gating as above: only supersede a draft this editor persisted itself
+                if (cache.persistedDraftQuery) {
+                    cache.persistedDraftQuery = false
+                    localStorage.removeItem(`draft-query-${values.currentTeamId}`)
+                }
+                return
+            }
+
+            localStorage.setItem(
+                `draft-query-${values.currentTeamId}`,
+                crushDraftQueryForLocalStorage(query, Date.now())
+            )
+            cache.persistedDraftQuery = true
+        },
+    })),
+    propsChanged(({ actions, props, values }, oldProps) => {
+        // Uses syncQueryFromProps (not setQuery) to avoid triggering the
+        // insightVizDataLogic.setQuery listener which would loop back via props.setQuery.
+        // Guard must match propsQuery selector (only ad-hoc insights receive query via props).
+        if (props.dashboardItemId?.startsWith('new-AdHoc.') && props.query) {
+            try {
+                if (!objectsEqual(props.query, values.query)) {
+                    actions.syncQueryFromProps(props.query)
+                }
+            } catch {
+                actions.syncQueryFromProps(props.query)
+            }
+            return
+        }
+
+        if (!props.cachedInsight?.query) {
+            return
+        }
+
+        const cachedQueryChanged =
+            !oldProps?.cachedInsight?.query || !objectsEqual(oldProps.cachedInsight.query, props.cachedInsight.query)
+
+        if (!cachedQueryChanged) {
+            return
+        }
+        // On dashboard tiles props.setQuery persists edits, and `setQuery` is shared with
+        // insightVizDataLogic whose listener calls props.setQuery, so re-syncing a stale incoming
+        // cached query (e.g. from a tile results refresh) via setQuery loops back and PATCHes it,
+        // reverting a just-saved display option. syncQueryFromProps updates local state without the
+        // loop. The insight scene keeps setQuery for its URL/draft sync.
+        const syncCachedQuery = props.dashboardId != null ? actions.syncQueryFromProps : actions.setQuery
+        try {
+            if (!objectsEqual(props.cachedInsight.query, values.query)) {
+                syncCachedQuery(props.cachedInsight.query)
+            }
+        } catch {
+            // values.query can throw if the logic's state isn't in the store yet
+            // (e.g. when InsightCard rebuilds the logic during navigation)
+            syncCachedQuery(props.cachedInsight.query)
+        }
+    }),
+    afterMount(({ actions, props }) => {
+        actions.loadReferencedCohorts()
+        // On a dashboard, the first response for a tile can say “we don’t have chart numbers yet”
+        // (`result: null`) instead of leaving the field unset. Without a real fetch, the UI can look
+        // like a failed load (“Chart data didn’t load”) even though we simply haven’t run the query.
+        // Force-refresh here for dashboard-backed insights only so we don’t change generic data-node behavior.
+        if (props.doNotLoad || props.dashboardId == null) {
+            return
+        }
+        const cached = props.cachedInsight
+        if (!cached || typeof cached !== 'object') {
+            return
+        }
+        const cr = cached as Record<string, unknown>
+        const hasRenderable =
+            (cr.result !== null && cr.result !== undefined) || (cr.results !== null && cr.results !== undefined)
+        if (hasRenderable) {
+            return
+        }
+        const iq = cached.query
+        if (!iq || !isInsightVizNode(iq)) {
+            return
+        }
+        const source = iq.source
+        if (isInsightQueryNode(source)) {
+            if (isWebAnalyticsInsightQuery(source)) {
+                return
+            }
+            actions.loadData(shouldQueryBeAsync(source) ? 'force_async' : 'force_blocking')
+        } else if (isHogQLQuery(source)) {
+            actions.loadData('force_blocking')
+        }
+    }),
+    actionToUrl(({ props }) => ({
+        cancelChanges: () => {
+            if (isInsightSceneInstance(props)) {
+                const { pathname, searchParams, hashParams } = router.values.currentLocation
+                const { q: _, ...hash } = hashParams
+                return [pathname, searchParams, hash]
+            }
+        },
+    })),
+])

@@ -1,0 +1,242 @@
+import typing as t
+import dataclasses
+
+from django.db import close_old_connections
+
+from structlog.contextvars import bind_contextvars
+from temporalio import activity
+
+from posthog.credentials_service.errors import CredentialsServiceFailure
+from posthog.exceptions_capture import capture_exception
+from posthog.models.integration import UndecryptedIntegrationSecretError
+from posthog.temporal.common.errors import NonReportableError
+from posthog.temporal.common.logger import get_logger
+
+from products.data_warehouse.backend.facade.api import delete_discover_schemas_schedule, get_direct_query_engine
+from products.warehouse_sources.backend.logic.source_inputs import SourceInputsStore
+from products.warehouse_sources.backend.models.external_data_schema import (
+    auto_enable_new_schemas,
+    sync_old_schemas_with_new_schemas,
+)
+from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+from products.warehouse_sources.backend.temporal.data_imports.external_data_job import Any_Source_Errors
+from products.warehouse_sources.backend.temporal.data_imports.sources import SourceRegistry
+from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse.source import ClickHouseSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
+    AnySource,
+    error_message_matches,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.errors import (
+    is_transient_egress_proxy_error,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import known_source_key
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.base import SQLSource
+from products.warehouse_sources.backend.types import ExternalDataSourceType
+
+LOGGER = get_logger(__name__)
+
+
+@dataclasses.dataclass
+class SyncNewSchemasActivityInputs:
+    source_id: str
+    team_id: int
+
+    @property
+    def properties_to_log(self) -> dict[str, t.Any]:
+        return {
+            "source_id": self.source_id,
+            "team_id": self.team_id,
+        }
+
+
+def _persist_column_metadata(
+    source: ExternalDataSource, source_impl: AnySource, schemas: list[SourceSchema], team_id: int
+) -> None:
+    """Store discovered column lists, as "Pull new schemas" does, so tables found after source creation
+    can be queried live and get a column picker without a person refreshing them."""
+    # In direct mode the reconcile also creates, hides and soft-deletes live tables; that stays a manual
+    # refresh. Warehouse mode, including synced sources that are also live-queryable, writes metadata only.
+    if source.is_direct_query:
+        return
+    engine = get_direct_query_engine(source.direct_engine)
+    if engine is not None:
+        engine.reconcile_schemas(source=source, source_schemas=schemas, team_id=team_id)
+    elif isinstance(source_impl, (SQLSource, ClickHouseSource)) and source_impl.supports_column_selection:
+        source_impl.reconcile_schema_metadata(source=source, source_schemas=schemas, team_id=team_id)
+
+
+@activity.defn
+def sync_new_schemas_activity(inputs: SyncNewSchemasActivityInputs) -> None:
+    bind_contextvars(team_id=inputs.team_id)
+    logger = LOGGER.bind()
+
+    close_old_connections()
+
+    logger.info("Syncing new -> old schemas")
+
+    # Self-destruct: if the source has been deleted (or hard-removed) since the schedule
+    # was created, drop the discovery schedule so we stop firing zombie workflows. Mirrors
+    # the existing per-schema pattern in `create_external_data_job_model_activity`.
+    source_exists = (
+        ExternalDataSource.objects.filter(team_id=inputs.team_id, id=inputs.source_id).exclude(deleted=True).exists()
+    )
+    if not source_exists:
+        delete_discover_schemas_schedule(str(inputs.source_id))
+        logger.info("Source no longer exists, deleted the discover-schemas schedule")
+        return
+
+    source = ExternalDataSource.objects.get(team_id=inputs.team_id, id=inputs.source_id)
+
+    if source.is_self_managed_migration:
+        # The source is rooted at a whole bucket, so discovery would offer every folder as a table.
+        # Users add its tables by path instead.
+        logger.info("Skipping schema discovery: the source reads tables from anywhere in its bucket")
+        return
+
+    try:
+        source_type_key = known_source_key(source.source_type)
+    except ValueError:
+        # A stored source type that this build does not register cannot be synced by any code
+        # path here, so every discovery run repeats the same failure. Three situations reach
+        # this: a source type that was removed while rows still referenced it, a source type that
+        # web code creates before every worker carries it, and a vendor module that failed to
+        # import. The last two recover on their own once the worker catches up or the import is
+        # fixed, so the schedule stays in place instead of self-destructing.
+        logger.warning(
+            "Skipping schema discovery: stored source type is not a registered source",
+            source_type=source.source_type,
+        )
+        return
+
+    if SourceRegistry.is_registered(source_type_key):
+        try:
+            source_inputs = SourceInputsStore.load(source)
+            if not source_inputs:
+                return
+
+            new_source = SourceRegistry.get_source(source_type_key)
+            config = new_source.parse_config(source_inputs)
+        except Exception:
+            # Config parsing is deterministic over the stored `job_inputs`, so a corrupt or
+            # double-encoded config fails identically on every discovery run - there is nothing
+            # to retry. The per-schema sync path surfaces and disables the source on the same
+            # config, so skip quietly here rather than spamming retries and error tracking.
+            logger.warning("Skipping schema discovery: source config could not be parsed", exc_info=True)
+            return
+
+        try:
+            schemas = new_source.get_schemas(
+                config, inputs.team_id, api_version=new_source.resolve_api_version(source.api_version)
+            )
+        except Exception as e:
+            # Schema discovery is best-effort and runs on its own ~6h cadence. If the source's
+            # credentials are broken (expired/revoked tokens, permission denied, deleted account,
+            # etc.) discovery will keep failing until the user reconnects — there is nothing to
+            # retry here, and the per-schema sync path surfaces and disables the source on the
+            # same error. Skip quietly on known non-retryable source errors rather than spamming
+            # retries and error tracking on every discovery run. Other errors still propagate.
+            #
+            # UndecryptedIntegrationSecretError is checked by type, not message, mirroring
+            # import_data_sync.py's handling: it's shared across every OAuth-based source and
+            # fails identically on every retry, so it shouldn't depend on each source listing the
+            # message in get_non_retryable_errors.
+            if isinstance(e, UndecryptedIntegrationSecretError):
+                logger.warning(f"Skipping schema discovery due to non-retryable source error: {e}")
+                return
+
+            error_msg = str(e)
+            # Every credential the credentials service holds is PostHog's own (OAuth app secrets,
+            # API keys), never the customer's, and none of its failure states are permanent — a
+            # burned key gets re-provisioned, an unreachable service comes back. Unlike the skips
+            # above, this isn't ours to give up on: re-raise wrapped in NonReportableError so the
+            # workflow's own retry policy (discover_schemas_workflow.py) retries the activity, the
+            # same recovery import_data_sync.py's _handle_import_error already gives the per-schema
+            # sync path, without minting an error tracking issue per credential read for a platform
+            # blip the service's own availability alerting already covers.
+            if isinstance(e, CredentialsServiceFailure):
+                if e.reportable:
+                    capture_exception(e)
+                    logger.exception(error_msg)
+                else:
+                    logger.warning(error_msg)
+                raise NonReportableError(error_msg) from e
+
+            # PostHog's own egress proxy throttled or refused the connection. Raise rather than
+            # skip so Temporal still retries this discovery run, and classify here rather than per
+            # source so every connector gets the same treatment.
+            if is_transient_egress_proxy_error(error_msg):
+                logger.warning(f"Transient egress-proxy error during schema discovery: {error_msg}")
+                raise NonReportableError(error_msg) from e
+            # Cross-source non-retryable errors (an unresolvable/private database host, bad SSH
+            # tunnel auth, a widened column type) are raised from shared connection/pipeline code,
+            # not any one source, so they never make it into a source's own get_non_retryable_errors.
+            # Without merging this in, discovery retries the activity's whole budget and reports on
+            # every attempt for a failure that will never recover on its own.
+            non_retryable_errors = {**Any_Source_Errors, **new_source.get_non_retryable_errors()}
+            if error_message_matches(error_msg, non_retryable_errors):
+                logger.warning(f"Skipping schema discovery due to non-retryable source error: {error_msg}")
+                return
+            # Retryable source errors (a transient connect blip, a self-recovering HTTP status) reach
+            # us only after the source exhausted its own retries. Re-raise as NonReportableError so the
+            # activity interceptor suppresses the error-tracking report while Temporal still retries the
+            # activity, opening a fresh connection that usually succeeds. This mirrors import_data_sync's
+            # handling of the same get_retryable_errors set. Returning here instead would skip the whole
+            # discovery pass until the next ~6h run and waste the workflow's remaining retry attempts.
+            retryable_errors = new_source.get_retryable_errors()
+            if error_message_matches(error_msg, retryable_errors):
+                logger.warning(f"Retrying schema discovery after retryable source error: {error_msg}")
+                raise NonReportableError(error_msg) from e
+            raise
+
+        schemas_to_sync = {s.name: s.label for s in schemas}
+
+        try:
+            server_metadata = new_source.get_server_metadata(config, inputs.team_id)
+            if isinstance(server_metadata, dict) and server_metadata:
+                # `source` was read before schema discovery, which is a network call of its own, so
+                # the merge re-reads the row under a lock rather than trusting that snapshot.
+                source.merge_connection_metadata(server_metadata)
+        except Exception:
+            # Recording the version is incidental to schema discovery, and both steps here can fail
+            # on their own: the probe opens a connection to the customer's server, and the merge
+            # waits on a row lock that the backfill command can hold. Neither says anything about
+            # the schemas already discovered above, so a pass that otherwise succeeded stays
+            # successful. A real connection fault still reaches the user through the per-schema sync
+            # path, which has its own reporting.
+            logger.warning("Could not record source server metadata", exc_info=True)
+    else:
+        raise ValueError(f"Source type missing from SourceRegistry: {source.source_type}")
+
+    # TODO: this could cause a race condition where each schema worker creates the missing schema
+
+    # GitHub keeps its legacy repo's rows bare alongside qualified rows for added repos, so
+    # bare↔qualified tail matching would wrongly collapse them; match names exactly and seed
+    # per-repo location metadata on newly created rows.
+    is_github = source_type_key == ExternalDataSourceType.GITHUB
+    sync_result = sync_old_schemas_with_new_schemas(
+        schemas_to_sync,
+        source_id=inputs.source_id,
+        team_id=inputs.team_id,
+        strict_name_match=is_github,
+        schema_metadata_by_name={s.name: s.schema_metadata for s in schemas if s.schema_metadata},
+    )
+
+    try:
+        _persist_column_metadata(source, new_source, schemas, inputs.team_id)
+    except Exception:
+        logger.warning("Could not persist schema column metadata", exc_info=True)
+
+    if len(sync_result.created) > 0:
+        logger.info(f"Added new schemas: {', '.join(sync_result.created)}")
+
+        auto_enabled = auto_enable_new_schemas(source, sync_result.created, {s.name: s for s in schemas})
+        if auto_enabled:
+            logger.info(f"Auto-enabled sync for new schemas: {', '.join(auto_enabled)}")
+    else:
+        logger.info("No new schemas to create")
+
+    if len(sync_result.deleted) > 0:
+        logger.info(f"Deleted schemas: {', '.join(sync_result.deleted)}")
+    else:
+        logger.info("No schemas to delete")

@@ -1,0 +1,541 @@
+import { combineUrl } from 'kea-router'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { urls } from 'scenes/urls'
+
+import { FileSystemIconType, ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
+
+import { ActivityScope, FileSystemIconColor, ProductManifest } from '../../frontend/src/types'
+import { AI_OBSERVABILITY_CLUSTER_URL_PATTERN } from './frontend/clusters/constants'
+import { scorerFiltersFromSearchParams } from './frontend/scoreDefinitions/scoreDefinitionNavigation'
+
+export const manifest: ProductManifest = {
+    name: 'AI observability',
+    activityDescribers: {
+        [ActivityScope.LLM_PROMPT]: () =>
+            import('./frontend/prompts/promptActivityDescriber').then((module) => module.promptActivityDescriber),
+        [ActivityScope.LLM_PROMPT_LABEL]: () =>
+            import('./frontend/prompts/promptLabelActivityDescriber').then(
+                (module) => module.promptLabelActivityDescriber
+            ),
+    },
+    scenes: {
+        AIObservability: {
+            import: () => import('./frontend/AIObservabilityScene'),
+            projectBased: true,
+            name: 'AI observability',
+            layout: 'app-container',
+            description: 'Analyze and understand your AI usage and performance.',
+            iconType: 'llm_analytics',
+            docsHref: 'https://posthog.com/docs/ai-observability',
+        },
+        AIObservabilityTrace: {
+            import: () => import('./frontend/redesign/trace/TraceScene'),
+            projectBased: true,
+            name: 'AI observability trace',
+            layout: 'app-container',
+        },
+        AIObservabilitySession: {
+            import: () => import('./frontend/AIObservabilitySessionScene'),
+            projectBased: true,
+            name: 'AI observability session',
+            layout: 'app-container',
+        },
+        AIObservabilityUsers: {
+            import: () => import('./frontend/AIObservabilityUsers'),
+            projectBased: true,
+            name: 'AI observability users',
+            layout: 'app-container',
+        },
+        AIObservabilityPlayground: {
+            import: () => import('./frontend/playground/AIObservabilityPlaygroundScene'),
+            projectBased: true,
+            name: 'Playground',
+            description: 'Test and experiment with LLM prompts in a sandbox environment.',
+            layout: 'app-full-scene-height',
+            iconType: 'llm_playground',
+            docsHref: 'https://posthog.com/docs/ai-observability/playground',
+        },
+        AIObservabilityDatasets: {
+            import: () => import('./frontend/datasets/AIObservabilityDatasetsScene'),
+            projectBased: true,
+            name: 'Datasets',
+            description: 'Manage datasets for testing and evaluation.',
+            layout: 'app-container',
+            iconType: 'llm_datasets',
+            docsHref: 'https://posthog.com/docs/ai-evals/datasets',
+        },
+        AIObservabilityDataset: {
+            import: () => import('./frontend/datasets/AIObservabilityDatasetScene'),
+            projectBased: true,
+            name: 'Dataset',
+            layout: 'app-container',
+            iconType: 'llm_datasets',
+        },
+        AIObservabilityEvaluations: {
+            import: () => import('./frontend/evaluations/EvaluationsScene'),
+            projectBased: true,
+            name: 'Evaluations',
+            description: 'Configure and monitor automated LLM output evaluations.',
+            activityScope: 'AIObservability',
+            layout: 'app-container',
+            iconType: 'llm_evaluations',
+            docsHref: 'https://posthog.com/docs/ai-evals',
+        },
+        AIObservabilityScorers: {
+            import: () => import('./frontend/scoreDefinitions/AIObservabilityScorersScene'),
+            projectBased: true,
+            name: 'Scorers',
+            layout: 'app-container',
+            iconType: 'llm_evaluations',
+        },
+        AIObservabilityScorer: {
+            import: () => import('./frontend/scoreDefinitions/AIObservabilityScorerScene'),
+            projectBased: true,
+            name: 'Scorer',
+            layout: 'app-container',
+            iconType: 'llm_evaluations',
+        },
+        AIObservabilityOfflineExperiments: {
+            import: () => import('./frontend/offline-evaluations/OfflineExperimentsScene'),
+            projectBased: true,
+            name: 'Offline evals',
+            description: 'Manage datasets, follow score trends, and inspect offline experiment results.',
+            layout: 'app-container',
+            iconType: 'llm_evaluations',
+        },
+        AIObservabilityOfflineExperiment: {
+            import: () => import('./frontend/offline-evaluations/OfflineExperimentScene'),
+            projectBased: true,
+            name: 'Offline experiment',
+            layout: 'app-container',
+            iconType: 'llm_evaluations',
+        },
+        AIObservabilityOfflineScorerHistory: {
+            import: () => import('./frontend/offline-evaluations/OfflineScorerHistoryScene'),
+            projectBased: true,
+            name: 'Scorer history',
+            layout: 'app-container',
+            iconType: 'llm_evaluations',
+        },
+        AIObservabilityEvaluation: {
+            import: () => import('./frontend/evaluations/AIObservabilityEvaluation'),
+            projectBased: true,
+            name: 'Evaluation',
+            activityScope: 'AIObservability',
+            layout: 'app-container',
+            iconType: 'llm_evaluations',
+        },
+        AIObservabilityEvaluationTemplates: {
+            import: () => import('./frontend/evaluations/EvaluationTemplates'),
+            projectBased: true,
+            name: 'Evaluation templates',
+            activityScope: 'AIObservability',
+            layout: 'app-container',
+            iconType: 'llm_evaluations',
+        },
+        AIObservabilityTags: {
+            import: () => import('./frontend/tags/AIObservabilityTagsScene'),
+            projectBased: true,
+            name: 'Taggers',
+            description: 'Add custom tags to your AI generations automatically.',
+            activityScope: 'AIObservability',
+            layout: 'app-container',
+            iconType: 'llm_tags',
+            docsHref: 'https://posthog.com/docs/ai-evals/taggers',
+        },
+        AIObservabilityTag: {
+            import: () => import('./frontend/tags/AIObservabilityTagScene'),
+            projectBased: true,
+            name: 'Tagger',
+            activityScope: 'AIObservability',
+            layout: 'app-container',
+            iconType: 'llm_tags',
+        },
+        AIObservabilityPrompts: {
+            import: () => import('./frontend/prompts/LLMPromptsScene'),
+            projectBased: true,
+            name: 'Prompts',
+            description: 'Track and manage your LLM prompts.',
+            layout: 'app-container',
+            iconType: 'llm_prompts',
+            docsHref: 'https://posthog.com/docs/prompt-management',
+        },
+        AIObservabilityPrompt: {
+            import: () => import('./frontend/prompts/LLMPromptScene'),
+            projectBased: true,
+            name: 'Prompt',
+            layout: 'app-container',
+            iconType: 'llm_prompts',
+        },
+        AIObservabilityClusters: {
+            import: () => import('./frontend/clusters/AIObservabilityClustersScene'),
+            projectBased: true,
+            name: 'Clusters',
+            description: 'Discover patterns and clusters in your AI usage.',
+            layout: 'app-container',
+            iconType: 'llm_clusters',
+            docsHref: 'https://posthog.com/docs/ai-observability/clusters',
+        },
+        AIObservabilityCluster: {
+            import: () => import('./frontend/clusters/AIObservabilityClusterScene'),
+            projectBased: true,
+            name: 'AI observability cluster',
+            layout: 'app-container',
+            iconType: 'llm_clusters',
+        },
+    },
+    routes: {
+        '/ai-observability/dashboard': ['AIObservability', 'aiObservabilityDashboard'],
+        '/ai-observability/self-driving': ['AIObservability', 'aiObservabilitySelfDriving'],
+        '/ai-observability/generations': ['AIObservability', 'aiObservabilityGenerations'],
+        '/ai-observability/reviews': ['AIObservability', 'aiObservabilityReviews'],
+        '/ai-observability/traces': ['AIObservability', 'aiObservabilityTraces'],
+        '/ai-observability/traces/:id': ['AIObservabilityTrace', 'aiObservability'],
+        '/ai-observability/users': ['AIObservability', 'aiObservabilityUsers'],
+        '/ai-observability/errors': ['AIObservability', 'aiObservabilityErrors'],
+        '/ai-observability/tools': ['AIObservability', 'aiObservabilityTools'],
+        '/ai-observability/sentiment': ['AIObservability', 'aiObservabilitySentiment'],
+        '/ai-observability/sessions': ['AIObservability', 'aiObservabilitySessions'],
+        '/ai-observability/sessions/:id': ['AIObservability', 'aiObservabilitySessions'],
+        '/ai-observability/playground': ['AIObservabilityPlayground', 'aiObservabilityPlayground'],
+        '/ai-observability/clusters': ['AIObservabilityClusters', 'aiObservabilityClusters'],
+        '/ai-observability/clusters/:runId': ['AIObservabilityClusters', 'aiObservabilityClusters'],
+        [AI_OBSERVABILITY_CLUSTER_URL_PATTERN]: ['AIObservabilityCluster', 'aiObservabilityCluster'],
+        '/ai-evals/evaluations/offline/datasets/:id': ['AIObservabilityDataset', 'aiObservabilityDataset'],
+        '/ai-evals/taggers': ['AIObservabilityTags', 'aiObservabilityTags'],
+        '/ai-evals/taggers/:id': ['AIObservabilityTag', 'aiObservabilityTag'],
+        '/ai-evals/evaluations': ['AIObservabilityEvaluations', 'aiObservabilityEvaluations'],
+        '/ai-evals/evaluations/offline/experiments': [
+            'AIObservabilityOfflineExperiments',
+            'aiObservabilityOfflineEvaluations',
+        ],
+        '/ai-evals/evaluations/offline/experiments/:experimentId': [
+            'AIObservabilityOfflineExperiment',
+            'aiObservabilityOfflineEvaluationExperiment',
+        ],
+        '/ai-evals/evaluations/scorers': ['AIObservabilityScorers', 'aiObservabilityScorers'],
+        '/ai-evals/evaluations/scorers/:scorerId/offline': [
+            'AIObservabilityOfflineScorerHistory',
+            'aiObservabilityOfflineScorerHistory',
+        ],
+        '/ai-evals/evaluations/scorers/:scorerId': ['AIObservabilityScorer', 'aiObservabilityScorer'],
+        '/ai-evals/evaluations/templates': ['AIObservabilityEvaluationTemplates', 'aiObservabilityEvaluationTemplates'],
+        '/ai-evals/evaluations/:id': ['AIObservabilityEvaluation', 'aiObservabilityEvaluation'],
+        '/prompt-management/prompts': ['AIObservabilityPrompts', 'aiObservabilityPrompts'],
+        '/prompt-management/prompts/:name': ['AIObservabilityPrompt', 'aiObservabilityPrompt'],
+    },
+    redirects: {
+        '/ai-observability': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDashboard(), searchParams, hashParams).url,
+        '/ai-observability/settings': (_params, searchParams, hashParams) => {
+            const nextHashParams = { ...hashParams }
+
+            if (Object.prototype.hasOwnProperty.call(nextHashParams, 'llm-analytics-byok')) {
+                delete nextHashParams['llm-analytics-byok']
+            }
+            if (nextHashParams.setting === 'llm-analytics-byok') {
+                nextHashParams.setting = 'ai-observability-byok'
+            }
+            if (nextHashParams.selectedSetting === 'llm-analytics-byok') {
+                nextHashParams.selectedSetting = 'ai-observability-byok'
+            }
+            nextHashParams['ai-observability-byok'] = null
+
+            return combineUrl(urls.settings('project-ai-observability'), searchParams, nextHashParams).url
+        },
+        '/ai-evals': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityEvaluations(), searchParams, hashParams).url,
+        '/ai-evals/datasets': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDatasets(), { ...searchParams, tab: 'datasets' }, hashParams).url,
+        '/ai-evals/datasets/:id': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDataset(params.id), searchParams, hashParams).url,
+        '/ai-evals/evaluations/offline': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityOfflineEvaluations(), searchParams, hashParams).url,
+        '/ai-evals/tags': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTags(), searchParams, hashParams).url,
+        '/ai-evals/tags/:id': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTag(params.id), searchParams, hashParams).url,
+        '/prompt-management': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityPrompts(), searchParams, hashParams).url,
+        '/llm-analytics': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDashboard(), searchParams, hashParams).url,
+        '/llm-analytics/settings': (_params, searchParams, hashParams) => {
+            const nextHashParams = { ...hashParams }
+
+            if (Object.prototype.hasOwnProperty.call(nextHashParams, 'llm-analytics-byok')) {
+                delete nextHashParams['llm-analytics-byok']
+            }
+            if (nextHashParams.setting === 'llm-analytics-byok') {
+                nextHashParams.setting = 'ai-observability-byok'
+            }
+            if (nextHashParams.selectedSetting === 'llm-analytics-byok') {
+                nextHashParams.selectedSetting = 'ai-observability-byok'
+            }
+            nextHashParams['ai-observability-byok'] = null
+
+            return combineUrl(urls.settings('project-ai-observability'), searchParams, nextHashParams).url
+        },
+        '/llm-analytics/dashboard': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDashboard(), searchParams, hashParams).url,
+        '/llm-analytics/generations': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityGenerations(), searchParams, hashParams).url,
+        '/llm-analytics/reviews': (_params, searchParams, hashParams) =>
+            searchParams.human_reviews_tab === 'scorers'
+                ? combineUrl(urls.aiObservabilityScorers(), scorerFiltersFromSearchParams(searchParams)).url
+                : combineUrl(urls.aiObservabilityReviews(), searchParams, hashParams).url,
+        '/llm-analytics/traces': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTraces(), searchParams, hashParams).url,
+        '/llm-analytics/traces/:id': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTrace(params.id), searchParams, hashParams).url,
+        '/llm-analytics/users': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityUsers(), searchParams, hashParams).url,
+        '/llm-analytics/errors': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityErrors(), searchParams, hashParams).url,
+        '/llm-analytics/tools': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTools(), searchParams, hashParams).url,
+        '/llm-analytics/sentiment': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilitySentiment(), searchParams, hashParams).url,
+        '/llm-analytics/sessions': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilitySessions(), searchParams, hashParams).url,
+        '/llm-analytics/sessions/:id': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilitySession(params.id), searchParams, hashParams).url,
+        '/llm-analytics/playground': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityPlayground(), searchParams, hashParams).url,
+        '/llm-analytics/clusters': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityClusters(), searchParams, hashParams).url,
+        '/llm-analytics/clusters/:runId': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityClusters(params.runId), searchParams, hashParams).url,
+        '/llm-analytics/clusters/:runId/:clusterId': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityCluster(params.runId, params.clusterId), searchParams, hashParams).url,
+        '/llm-analytics/datasets': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDatasets(), { ...searchParams, tab: 'datasets' }, hashParams).url,
+        '/llm-analytics/datasets/:id': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDataset(params.id), searchParams, hashParams).url,
+        '/llm-analytics/tags': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTags(), searchParams, hashParams).url,
+        '/llm-analytics/tags/:id': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTag(params.id), searchParams, hashParams).url,
+        '/llm-analytics/evaluations': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityEvaluations(), searchParams, hashParams).url,
+        '/llm-analytics/evaluations/offline': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityOfflineEvaluations(), searchParams, hashParams).url,
+        '/llm-analytics/evaluations/offline/experiments': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityOfflineEvaluations(), searchParams, hashParams).url,
+        '/llm-analytics/evaluations/offline/experiments/:experimentId': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityOfflineEvaluationExperiment(params.experimentId), searchParams, hashParams)
+                .url,
+        '/llm-analytics/evaluations/templates': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityEvaluationTemplates(), searchParams, hashParams).url,
+        '/llm-analytics/evaluations/:id': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityEvaluation(params.id), searchParams, hashParams).url,
+        '/llm-analytics/prompts': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityPrompts(), searchParams, hashParams).url,
+        '/llm-analytics/prompts/:name': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityPrompt(params.name), searchParams, hashParams).url,
+        '/llm-observability': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDashboard(), searchParams, hashParams).url,
+        '/llm-observability/dashboard': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityDashboard(), searchParams, hashParams).url,
+        '/llm-observability/generations': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityGenerations(), searchParams, hashParams).url,
+        '/llm-observability/reviews': (_params, searchParams, hashParams) =>
+            searchParams.human_reviews_tab === 'scorers'
+                ? combineUrl(urls.aiObservabilityScorers(), scorerFiltersFromSearchParams(searchParams)).url
+                : combineUrl(urls.aiObservabilityReviews(), searchParams, hashParams).url,
+        '/llm-observability/traces': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTraces(), searchParams, hashParams).url,
+        '/llm-observability/traces/:id': (params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityTrace(params.id), searchParams, hashParams).url,
+        '/llm-observability/users': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityUsers(), searchParams, hashParams).url,
+        '/llm-observability/playground': (_params, searchParams, hashParams) =>
+            combineUrl(urls.aiObservabilityPlayground(), searchParams, hashParams).url,
+    },
+    // Keep the event list and staleness window in sync with the in-scene check
+    // (`hasRecentAIEvents` in frontend/utils/aiEvents.ts) - string literals here
+    // because the probe is cloned into the eager generated products.tsx.
+    setupProbe: {
+        productKey: ProductKey.AI_OBSERVABILITY,
+        hasDataEvents: ['$ai_generation', '$ai_trace', '$ai_span', '$ai_embedding'],
+        staleAfterDays: 90,
+    },
+    urls: {
+        aiObservabilityDashboard: (): string => '/ai-observability/dashboard',
+        aiObservabilitySelfDriving: (): string => '/ai-observability/self-driving',
+        aiObservabilityGenerations: (): string => '/ai-observability/generations',
+        aiObservabilityReviews: (): string => '/ai-observability/reviews',
+        aiObservabilityTraces: (): string => '/ai-observability/traces',
+        aiObservabilityTrace: (
+            id: string,
+            params?: {
+                event?: string
+                timestamp?: string
+                exception_ts?: string
+                search?: string
+                tab?: string
+                msg?: string
+                // Only string values are valid query params. An object (e.g. the filters array)
+                // would stringify to "[object Object]" and corrupt the URL, so reject it at compile time.
+                [key: string]: string | undefined
+            }
+        ): string => {
+            const encodePathSegment = (value: string): string => {
+                // kea-router decodes the pathname before matching, so preserve an encoded layer for the trace scene.
+                const encodedValue = encodeURIComponent(value).replace(
+                    /[!'()*]/g,
+                    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+                )
+                return encodeURIComponent(encodedValue).replace(
+                    /[!'()*]/g,
+                    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+                )
+            }
+            const definedParams: Record<string, string> = {}
+            for (const [key, value] of Object.entries(params ?? {})) {
+                if (value !== undefined) {
+                    definedParams[key] = value
+                }
+            }
+            const queryParams = new URLSearchParams(definedParams)
+            const stringifiedParams = queryParams.toString()
+            return `/ai-observability/traces/${encodePathSegment(id)}${stringifiedParams ? `?${stringifiedParams}` : ''}`
+        },
+        aiObservabilityUsers: (): string => '/ai-observability/users',
+        aiObservabilityErrors: (): string => '/ai-observability/errors',
+        aiObservabilityTools: (): string => '/ai-observability/tools',
+        aiObservabilitySentiment: (): string => '/ai-observability/sentiment',
+        aiObservabilitySessions: (): string => '/ai-observability/sessions',
+        aiObservabilitySession: (
+            id: string,
+            params?: {
+                timestamp?: string
+            }
+        ): string => {
+            const queryParams = new URLSearchParams(params)
+            const stringifiedParams = queryParams.toString()
+            return `/ai-observability/sessions/${id}${stringifiedParams ? `?${stringifiedParams}` : ''}`
+        },
+        aiObservabilityPlayground: (): string => '/ai-observability/playground',
+        aiObservabilityDatasets: (): string => '/ai-evals/evaluations/offline/experiments?tab=datasets',
+        aiObservabilityDataset: (id: string, params?: { item?: string }): string =>
+            combineUrl(`/ai-evals/evaluations/offline/datasets/${id}`, params).url,
+        aiObservabilityTags: (): string => '/ai-evals/taggers',
+        aiObservabilityTag: (id: string): string => `/ai-evals/taggers/${id}`,
+        aiObservabilityEvaluations: (): string => '/ai-evals/evaluations',
+        aiObservabilityScorers: (): string => '/ai-evals/evaluations/scorers',
+        aiObservabilityScorer: (scorerId: string, params?: { duplicate?: string }): string =>
+            combineUrl(`/ai-evals/evaluations/scorers/${encodeURIComponent(scorerId)}`, params).url,
+        aiObservabilityOfflineScorerHistory: (scorerId: string, encode: boolean = true): string =>
+            `/ai-evals/evaluations/scorers/${encode ? encodeURIComponent(scorerId) : scorerId}/offline`,
+        aiObservabilityOfflineEvaluations: (): string => '/ai-evals/evaluations/offline/experiments',
+        aiObservabilityOfflineEvaluationExperiment: (experimentId: string, encode: boolean = true): string =>
+            `/ai-evals/evaluations/offline/experiments/${encode ? encodeURIComponent(experimentId) : experimentId}`,
+        aiObservabilityEvaluationTemplates: (): string => '/ai-evals/evaluations/templates',
+        aiObservabilityEvaluation: (id: string): string => `/ai-evals/evaluations/${id}`,
+        aiObservabilityPrompts: (): string => '/prompt-management/prompts',
+        aiObservabilityPrompt: (name: string): string => `/prompt-management/prompts/${name}`,
+        aiObservabilityClusters: (runId?: string): string =>
+            runId ? `/ai-observability/clusters/${encodeURIComponent(runId)}` : '/ai-observability/clusters',
+        aiObservabilityCluster: (runId: string, clusterId: number | string): string =>
+            `/ai-observability/clusters/${encodeURIComponent(runId)}/${clusterId}`,
+    },
+    fileSystemTypes: {},
+    treeItemsNew: [],
+    treeItemsProducts: [
+        {
+            path: 'LLM analytics',
+            displayLabel: 'AI observability',
+            intents: [
+                ProductKey.AI_OBSERVABILITY,
+                ProductKey.LLM_EVALUATIONS,
+                ProductKey.LLM_DATASETS,
+                ProductKey.LLM_PROMPTS,
+                ProductKey.LLM_CLUSTERS,
+            ],
+            category: ProductItemCategory.AI_ENGINEERING,
+            visualOrder: 1,
+            type: 'llm_analytics',
+            iconType: 'llm_analytics' as FileSystemIconType,
+            iconColor: [
+                'var(--color-product-llm-analytics-light)',
+                'var(--color-product-llm-analytics-dark)',
+            ] as FileSystemIconColor,
+            href: urls.aiObservabilityDashboard(),
+            searchKeywords: ['llm analytics', 'llm observability', 'llm costs', 'token usage'],
+            searchTabs: [
+                { name: 'Traces', href: urls.aiObservabilityTraces() },
+                { name: 'Generations', href: urls.aiObservabilityGenerations() },
+                { name: 'Sessions', href: urls.aiObservabilitySessions() },
+                { name: 'Users', href: urls.aiObservabilityUsers() },
+                { name: 'Errors', href: urls.aiObservabilityErrors() },
+                { name: 'Tools', href: urls.aiObservabilityTools() },
+                { name: 'Sentiment', href: urls.aiObservabilitySentiment() },
+                { name: 'Reviews', href: urls.aiObservabilityReviews() },
+            ],
+            sceneKey: 'AIObservability',
+        },
+        {
+            path: 'Playground',
+            intents: [ProductKey.AI_OBSERVABILITY],
+            category: ProductItemCategory.AI_ENGINEERING,
+            type: 'llm_playground',
+            iconType: 'llm_playground' as FileSystemIconType,
+            iconColor: ['var(--color-product-llm-playground-light)', 'var(--color-product-llm-playground-dark)'],
+            href: urls.aiObservabilityPlayground(),
+            searchKeywords: ['prompt testing', 'model comparison'],
+            sceneKey: 'AIObservabilityPlayground',
+        },
+        {
+            path: 'Clusters',
+            intents: [ProductKey.LLM_CLUSTERS],
+            category: ProductItemCategory.AI_ENGINEERING,
+            type: 'llm_clusters',
+            iconType: 'llm_clusters' as FileSystemIconType,
+            iconColor: ['var(--color-product-llm-clusters-light)', 'var(--color-product-llm-clusters-dark)'],
+            href: urls.aiObservabilityClusters(),
+            searchKeywords: ['topics'],
+            sceneKey: 'AIObservabilityClusters',
+        },
+        {
+            path: 'Evaluations',
+            intents: [ProductKey.LLM_EVALUATIONS, ProductKey.LLM_DATASETS],
+            category: ProductItemCategory.AI_ENGINEERING,
+            type: 'llm_evaluations',
+            iconType: 'llm_evaluations' as FileSystemIconType,
+            iconColor: ['var(--color-product-llm-evaluations-light)', 'var(--color-product-llm-evaluations-dark)'],
+            href: urls.aiObservabilityEvaluations(),
+            searchKeywords: ['evals', 'llm judge', 'llm as a judge', 'grading', 'datasets', 'test sets', 'golden set'],
+            searchTabs: [
+                { name: 'Offline evals', href: urls.aiObservabilityOfflineEvaluations() },
+                { name: 'Datasets', href: urls.aiObservabilityDatasets(), flag: FEATURE_FLAGS.LLM_ANALYTICS_DATASETS },
+                { name: 'Scorers', href: urls.aiObservabilityScorers() },
+            ],
+            sceneKey: 'AIObservabilityEvaluations',
+        },
+        {
+            path: 'Taggers',
+            intents: [ProductKey.AI_OBSERVABILITY],
+            category: ProductItemCategory.AI_ENGINEERING,
+            type: 'llm_tags',
+            iconType: 'llm_tags' as FileSystemIconType,
+            iconColor: ['var(--color-product-llm-tags-light)', 'var(--color-product-llm-tags-dark)'],
+            href: urls.aiObservabilityTags(),
+            searchKeywords: ['llm tags', 'auto-tagging'],
+            flag: FEATURE_FLAGS.LLM_ANALYTICS_TAGS,
+            tags: ['alpha'],
+            sceneKey: 'AIObservabilityTags',
+        },
+        {
+            path: 'Prompts',
+            intents: [ProductKey.LLM_PROMPTS],
+            category: ProductItemCategory.AI_ENGINEERING,
+            type: 'llm_prompts',
+            iconType: 'llm_prompts' as FileSystemIconType,
+            iconColor: ['var(--color-product-llm-prompts-light)', 'var(--color-product-llm-prompts-dark)'],
+            href: urls.aiObservabilityPrompts(),
+            searchKeywords: ['prompt management', 'prompt templates'],
+            sceneKey: 'AIObservabilityPrompts',
+        },
+    ],
+}

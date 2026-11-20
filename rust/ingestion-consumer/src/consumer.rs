@@ -1,0 +1,801 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use common_kafka_consumer::{
+    AssignmentEpoch, Offset, Partition, TopicOffsetLedger, TopicPartition,
+};
+use lifecycle::Handle;
+use metrics::{counter, gauge, histogram};
+use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::error::KafkaError;
+use rdkafka::message::BorrowedMessage;
+use rdkafka::TopicPartitionList;
+use tokio::time::MissedTickBehavior;
+use tracing::{error, info, warn};
+
+use crate::batcher::{make_batch_id, Batcher, BatcherCompletion, BatcherObserver, BatcherOutputs};
+use crate::charge_limit::ChargeLimit;
+use crate::committer::{CommitError, Committer};
+use crate::config::Config;
+use crate::debug_recorder::{record_if, CommitOffset, DebugEventKind, DebugRecorder};
+use crate::discovery::DiscoveryMode;
+use crate::grpc_transport::GrpcTransport;
+use crate::ledger_rejection::{report_rejection, RejectedSlice};
+use crate::partition_budget::BudgetLimits;
+use crate::polling::{
+    debug_partition_offsets, debug_partition_spans, BatchStats, CollectedBatch, ContinuousPolling,
+    InFlightPoll, PartitionDeliveries, Parts, PollLimits, PollingStrategy, Step,
+};
+use crate::rebalance::{
+    partition_error, partition_names, Drain, Event, RebalanceContext, Unassign,
+};
+use crate::settlement::{Commit, GroupSettlement, Settlement};
+
+fn batcher_partitions(partitions: &[TopicPartition]) -> Vec<(String, i32)> {
+    partitions
+        .iter()
+        .map(|tp| (tp.topic.clone(), tp.partition))
+        .collect()
+}
+
+fn commit_tick(commit_interval: Duration) -> Duration {
+    const HEALTH_TICK: Duration = Duration::from_secs(1);
+    // A commit can resume a partition, so a tick longer than the commit
+    // interval delays the resume.
+    if commit_interval.is_zero() {
+        HEALTH_TICK
+    } else {
+        commit_interval.min(HEALTH_TICK)
+    }
+}
+
+const COMMIT_RETRY_WAIT: Duration = Duration::from_secs(1);
+/// The exit flush runs after the shutdown drain, inside
+/// [`crate::config::GRACEFUL_SHUTDOWN`].
+const EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Options for constructing an [`IngestionConsumer`] from pre-built parts.
+pub struct IngestionConsumerOptions {
+    pub batch_size: usize,
+    /// Payload-byte bound on a batch; `0` disables it (count-only collection).
+    /// See `Config::consumer_batch_size_kb`.
+    pub batch_size_bytes: usize,
+    pub batch_timeout: Duration,
+    pub in_flight_limit: ChargeLimit,
+    pub group_id: String,
+    pub debug_recorder: Option<Arc<DebugRecorder>>,
+    pub commit_interval: Duration,
+    pub revoke_drain_timeout: Duration,
+    pub ledger: Arc<TopicOffsetLedger>,
+    pub partition_budget: BudgetLimits,
+}
+
+/// The main consumer loop: reads from Kafka, demuxes each poll into groups,
+/// submits them to the [`Batcher`], and commits offsets once the batcher's
+/// completions cover a group.
+pub struct IngestionConsumer {
+    consumer: Arc<StreamConsumer<RebalanceContext>>,
+    batcher: Batcher,
+    /// Taken once by `process`.
+    outputs: Option<BatcherOutputs>,
+    transport: Arc<GrpcTransport>,
+    worker_urls: Vec<String>,
+    batch_size: usize,
+    batch_size_bytes: usize,
+    batch_timeout: Duration,
+    in_flight_limit: ChargeLimit,
+    commit_tick: Duration,
+    handle: Handle,
+    group_id: String,
+    debug_recorder: Option<Arc<DebugRecorder>>,
+    topic_offset_ledger: Arc<TopicOffsetLedger>,
+    assignment_epoch: AssignmentEpoch,
+    revoke_drain_timeout: Duration,
+    settlement: Arc<GroupSettlement>,
+    committer: Committer,
+}
+
+impl IngestionConsumer {
+    /// Constructs a consumer from parts the caller builds. The caller must
+    /// subscribe `consumer` to its topic.
+    pub fn from_parts(
+        consumer: StreamConsumer<RebalanceContext>,
+        batcher: Batcher,
+        outputs: BatcherOutputs,
+        transport: Arc<GrpcTransport>,
+        worker_urls: Vec<String>,
+        options: IngestionConsumerOptions,
+        handle: Handle,
+    ) -> Self {
+        let topic_offset_ledger = options.ledger;
+        let settlement: Arc<GroupSettlement> = Arc::new(GroupSettlement::new(
+            Arc::clone(&topic_offset_ledger),
+            options.commit_interval,
+            options.partition_budget,
+        ));
+        let consumer = Arc::new(consumer);
+        Self {
+            committer: Committer::start(Arc::clone(&consumer), COMMIT_RETRY_WAIT),
+            debug_recorder: options.debug_recorder,
+            topic_offset_ledger,
+            assignment_epoch: transport.assignment_epoch(),
+            revoke_drain_timeout: options.revoke_drain_timeout,
+            settlement,
+            consumer,
+            batcher,
+            outputs: Some(outputs),
+            transport,
+            worker_urls,
+            batch_size: options.batch_size,
+            batch_size_bytes: options.batch_size_bytes,
+            batch_timeout: options.batch_timeout,
+            in_flight_limit: options.in_flight_limit,
+            commit_tick: commit_tick(options.commit_interval),
+            handle,
+            group_id: options.group_id,
+        }
+    }
+
+    pub fn new(
+        config: &Config,
+        batcher: Batcher,
+        outputs: BatcherOutputs,
+        transport: Arc<GrpcTransport>,
+        handle: Handle,
+        debug_recorder: Option<Arc<DebugRecorder>>,
+    ) -> anyhow::Result<Self> {
+        // Endpointslice mode discovers workers at runtime, so it has no static
+        // readiness list.
+        let worker_urls = match config.worker_discovery_mode {
+            DiscoveryMode::Static => config.worker_urls(),
+            DiscoveryMode::EndpointSlice => Vec::new(),
+        };
+        if config.worker_discovery_mode == DiscoveryMode::Static && worker_urls.is_empty() {
+            anyhow::bail!("No worker addresses configured");
+        }
+
+        let client_config = config.build_consumer_config();
+        // After the build, so the caps reported are the ones the client runs
+        // with rather than the settings that seeded them.
+        crate::kafka_stats::export_limits(
+            &client_config,
+            config.consumer_batch_size,
+            config.consumer_batch_size_kb,
+        );
+        batcher
+            .key_order_sentinel()
+            .set_enabled(config.consumer_order_sentinel_enabled);
+        let topic_offset_ledger = Arc::new(TopicOffsetLedger::new());
+        let partition_budget = config
+            .partition_budget()
+            .map_err(|err| anyhow::anyhow!("invalid partition budget: {err}"))?;
+        let in_flight_limit = config
+            .in_flight_limit()
+            .map_err(|err| anyhow::anyhow!("invalid in-flight limit: {err}"))?;
+        let revoke_drain_timeout = config
+            .revoke_drain_timeout()
+            .map_err(|err| anyhow::anyhow!("invalid revoke drain timeout: {err}"))?;
+        let commit_interval = Duration::from_millis(config.consumer_commit_interval_ms);
+        let settlement: Arc<GroupSettlement> = Arc::new(GroupSettlement::new(
+            Arc::clone(&topic_offset_ledger),
+            commit_interval,
+            partition_budget,
+        ));
+        let consumer: StreamConsumer<RebalanceContext> =
+            client_config.create_with_context(RebalanceContext::new())?;
+        consumer.subscribe(&[&config.ingestion_consumer_consume_topic])?;
+        let consumer = Arc::new(consumer);
+
+        info!(
+            topic = %config.ingestion_consumer_consume_topic,
+            group = %config.ingestion_consumer_group_id,
+            workers = worker_urls.len(),
+            batch_size = config.consumer_batch_size,
+            batch_size_kb = config.consumer_batch_size_kb,
+            in_flight_limit = ?in_flight_limit,
+            "Kafka consumer subscribed"
+        );
+
+        Ok(Self {
+            committer: Committer::start(Arc::clone(&consumer), COMMIT_RETRY_WAIT),
+            consumer,
+            debug_recorder,
+            topic_offset_ledger,
+            assignment_epoch: transport.assignment_epoch(),
+            revoke_drain_timeout,
+            settlement,
+            batcher,
+            outputs: Some(outputs),
+            transport,
+            worker_urls,
+            batch_size: config.consumer_batch_size,
+            batch_size_bytes: config.consumer_batch_size_kb.saturating_mul(1024),
+            batch_timeout: Duration::from_millis(config.consumer_batch_timeout_ms),
+            in_flight_limit,
+            commit_tick: commit_tick(commit_interval),
+            handle,
+            group_id: config.ingestion_consumer_group_id.clone(),
+        })
+    }
+
+    pub fn batcher_observer(&self) -> BatcherObserver {
+        self.batcher.observer()
+    }
+
+    /// Runs the consumer loop until the lifecycle handle signals shutdown.
+    /// First waits until the statically configured workers are ready.
+    pub async fn process(mut self) {
+        let _guard = self.handle.process_scope();
+        let outputs = self.outputs.take().expect("process is called once");
+
+        info!("Waiting for workers to be ready");
+        if let Err(err) = self
+            .transport
+            .wait_for_workers_ready(&self.worker_urls, &self.handle)
+            .await
+        {
+            error!(error = %err, "Failed waiting for workers");
+            self.handle
+                .signal_failure("Workers not ready before shutdown".to_string());
+            return;
+        }
+
+        info!("Consumer loop starting");
+        record_if(&self.debug_recorder, || DebugEventKind::ConsumerStarted {
+            group_id: self.group_id.clone(),
+            workers: self.worker_urls.clone(),
+        });
+
+        let parts = Parts {
+            limits: PollLimits {
+                batch_size: self.batch_size,
+                batch_size_bytes: self.batch_size_bytes,
+                batch_timeout: self.batch_timeout,
+            },
+            settlement: Arc::clone(&self.settlement),
+            group_id: self.group_id.clone(),
+        };
+        let poller = ContinuousPolling::new(parts, self.in_flight_limit);
+        self.run(poller, outputs).await;
+        self.commit_on_exit().await;
+        info!("Consumer loop stopped");
+    }
+
+    fn rebalance(&self) -> &RebalanceContext {
+        self.consumer.context()
+    }
+
+    async fn run<P: PollingStrategy>(&self, mut poller: P, outputs: BatcherOutputs) {
+        self.rebalance().on_started(self.revoke_drain_timeout);
+        self.run_until_stopped(&mut poller, outputs).await;
+        let drain = self.rebalance().on_stopped();
+        self.apply_rebalance_events(&mut poller);
+        if let Err(err) = self.finish_drain(&mut poller, drain, "stopped").await {
+            warn!(error = %err, "Could not commit the revoked partitions on exit");
+        }
+    }
+
+    async fn run_until_stopped<P: PollingStrategy>(&self, poller: &mut P, outputs: BatcherOutputs) {
+        let BatcherOutputs {
+            mut completions,
+            mut errors,
+        } = outputs;
+        let mut tick = tokio::time::interval(self.commit_tick);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let poll_deadline = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(poll_deadline);
+        let drain_deadline = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(drain_deadline);
+        let mut accepting_new_batches = true;
+        loop {
+            let mut submitted = false;
+            while let Some(step) = poller.next_step(tokio::time::Instant::now()) {
+                submitted |= matches!(step, Step::Submit(_));
+                if let Err(failure) = self.carry_out(step, poller) {
+                    match failure {
+                        Stopped::Drained => {}
+                        Stopped::Batch(err) => self.stop_on_batch_error(err),
+                    }
+                    return;
+                }
+            }
+            // rdkafka's stream spends none of tokio's budget, so a ready
+            // backlog keeps `recv` ready on every turn and this loop would
+            // never yield. The batcher runs on this runtime.
+            if submitted {
+                tokio::task::yield_now().await;
+            }
+
+            let deadline = poller.deadline();
+            if let Some(deadline) = deadline {
+                if poll_deadline.deadline() != deadline {
+                    poll_deadline.as_mut().reset(deadline);
+                }
+            }
+            let drain_until = self.rebalance().drain_deadline();
+            if let Some(until) = drain_until {
+                if drain_deadline.deadline() != until {
+                    drain_deadline.as_mut().reset(until);
+                }
+            }
+            let reading = poller.reading();
+            let woke = tokio::select! {
+                _ = self.handle.shutdown_recv(), if accepting_new_batches => Woke::Shutdown,
+                completion = completions.recv() => Woke::Completion(completion),
+                failure = errors.recv() => Woke::Error(failure),
+                _ = tick.tick() => Woke::Tick,
+                _ = &mut poll_deadline, if deadline.is_some() => Woke::Deadline,
+                _ = &mut drain_deadline, if drain_until.is_some() => Woke::DrainTimedOut,
+                _ = self.rebalance().wait_for_rebalance() => Woke::Rebalanced,
+                err = self.committer.stopped() => Woke::CommitterStopped(err),
+                received = self.consumer.recv(), if reading => Woke::Received(received),
+            };
+            // The rebalance callbacks run inside `recv`, also in a `recv` that
+            // the select dropped. Their events apply before anything that woke
+            // the loop.
+            self.apply_rebalance_events(poller);
+
+            let failure = match woke {
+                Woke::Shutdown => {
+                    info!("Shutdown signal received, draining in-flight batches");
+                    accepting_new_batches = false;
+                    self.batcher.begin_shutdown();
+                    poller.on_shutdown();
+                    None
+                }
+                Woke::Completion(Some(BatcherCompletion::Group(completion))) => {
+                    poller.on_completed(&completion).err()
+                }
+                Woke::Completion(Some(BatcherCompletion::Drained(revoke))) => {
+                    let drain = self.rebalance().on_drained(revoke);
+                    self.finish_drain(poller, drain, "drained").await.err()
+                }
+                Woke::Completion(None) => {
+                    Some(anyhow::anyhow!("batcher completion channel closed"))
+                }
+                Woke::Error(Some(message)) => Some(anyhow::anyhow!(message)),
+                Woke::Error(None) => Some(anyhow::anyhow!("batcher error channel closed")),
+                Woke::CommitterStopped(err) => {
+                    self.stop_on_commit_error(err);
+                    return;
+                }
+                Woke::Tick => {
+                    self.handle.report_healthy();
+                    poller.on_ticked();
+                    None
+                }
+                Woke::Deadline | Woke::Rebalanced => None,
+                Woke::DrainTimedOut => {
+                    let drain = self
+                        .rebalance()
+                        .on_drain_timed_out(tokio::time::Instant::now());
+                    self.finish_drain(poller, drain, "timed_out").await.err()
+                }
+                Woke::Received(Ok(message)) => {
+                    poller.on_received(&message, tokio::time::Instant::now());
+                    None
+                }
+                Woke::Received(Err(err)) => self.on_recv_error(err).err(),
+            };
+            if let Some(err) = failure {
+                self.stop_on_batch_error(err);
+                return;
+            }
+        }
+    }
+
+    fn carry_out<P: PollingStrategy>(&self, step: Step, poller: &mut P) -> Result<(), Stopped> {
+        match step {
+            Step::Submit(collected) => {
+                let poll = self.submit_poll(collected).map_err(Stopped::Batch)?;
+                poller.on_submitted(poll);
+                self.handle.report_healthy();
+                Ok(())
+            }
+            Step::Commit(commit) => {
+                self.submit_commit(commit);
+                Ok(())
+            }
+            Step::Stop => Err(Stopped::Drained),
+        }
+    }
+
+    fn apply_rebalance_events<P: PollingStrategy>(&self, poller: &mut P) {
+        let events = self.rebalance().take_events();
+        for event in events {
+            match event {
+                Event::Assigned(assigned) => {
+                    self.settlement.on_assigned(&assigned);
+                    self.committer.forget(&assigned);
+                    self.assignment_epoch.bump();
+                    poller.on_assigned(&assigned);
+                }
+                Event::Revoked {
+                    revoke,
+                    partitions: revoked,
+                    unassign,
+                } => {
+                    self.settlement.on_revoked(&revoked);
+                    self.committer.forget(&revoked);
+                    self.batcher.revoke(revoke, &batcher_partitions(&revoked));
+                    poller.on_revoked(&revoked);
+                    unassign.apply(&*self.consumer);
+                }
+                Event::Draining {
+                    revoke,
+                    partitions: draining,
+                } => {
+                    self.batcher.revoke(revoke, &batcher_partitions(&draining));
+                    poller.on_drain_started(&draining);
+                }
+            }
+        }
+    }
+
+    async fn finish_drain<P: PollingStrategy>(
+        &self,
+        poller: &mut P,
+        drain: Option<Drain>,
+        outcome: &'static str,
+    ) -> anyhow::Result<()> {
+        let Some(Drain {
+            partitions: drained,
+            unassign,
+            started,
+            timeout,
+            ..
+        }) = drain
+        else {
+            return Ok(());
+        };
+        let unassign_on_drop = UnassignOnDrop {
+            consumer: Arc::clone(&self.consumer),
+            unassign: Some(unassign),
+        };
+        let committed = self.commit_drained(poller, &drained, timeout).await;
+        self.settlement.on_revoked(&drained);
+        self.committer.forget(&drained);
+        drop(unassign_on_drop);
+        let elapsed = started.elapsed();
+        counter!("ingestion_consumer_revoke_drains_total", "outcome" => outcome).increment(1);
+        histogram!("ingestion_consumer_revoke_drain_seconds").record(elapsed.as_secs_f64());
+        info!(
+            topic_partitions = ?partition_names(&drained),
+            outcome,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Rebalance: drained partitions unassigned"
+        );
+        committed
+    }
+
+    async fn commit_drained<P: PollingStrategy>(
+        &self,
+        poller: &mut P,
+        partitions: &[TopicPartition],
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        if let Some(commit) = poller.on_drain_finished(partitions) {
+            self.submit_commit(commit);
+        }
+        // A commit still in flight at the timeout can land after the unassign.
+        if !self.committer.flush(partitions, timeout).await {
+            counter!("ingestion_consumer_revoke_commit_errors_total").increment(1);
+            warn!("Could not commit the revoked partitions before their release");
+        }
+        Ok(())
+    }
+
+    fn on_recv_error(&self, err: KafkaError) -> anyhow::Result<()> {
+        warn!(error = %err, "Kafka recv error");
+        counter!("ingestion_consumer_kafka_errors_total").increment(1);
+        // A fatal client error (such as UnreleasedInstanceId from a
+        // static-membership collision) permanently disables the
+        // consumer. Propagate it so the process exits and Kubernetes
+        // restarts the pod, instead of re-polling a dead client forever
+        // while still reporting healthy.
+        if let Some((code, reason)) = self.consumer.client().fatal_error() {
+            anyhow::bail!("fatal Kafka client error ({code:?}): {reason}");
+        }
+        Ok(())
+    }
+
+    fn record_commit(&self, offsets: &HashMap<TopicPartition, Offset>) {
+        counter!("ingestion_consumer_offset_commits_total").increment(1);
+        record_if(&self.debug_recorder, || DebugEventKind::CommitSubmitted {
+            offsets: offsets
+                .iter()
+                .map(|(topic_partition, offset)| CommitOffset {
+                    topic: topic_partition.topic.clone(),
+                    partition: topic_partition.partition,
+                    offset: offset.0,
+                })
+                .collect(),
+        });
+    }
+
+    fn submit_poll(&self, collected: CollectedBatch) -> anyhow::Result<InFlightPoll> {
+        let CollectedBatch {
+            accumulator,
+            mut partitions,
+            stats,
+        } = collected;
+        let mut uncommitted = HashMap::with_capacity(partitions.len());
+        let mut generations = HashMap::with_capacity(partitions.len());
+        // One ledger call per partition keeps the lock and the gauge labels
+        // off the per-message path.
+        for (topic_partition, partition) in &mut partitions {
+            partition.generation = self.topic_offset_ledger.generation(topic_partition);
+            generations.insert(Partition(topic_partition.partition), partition.generation);
+            match self
+                .settlement
+                .charge(topic_partition, partition.generation, &partition.charges)
+            {
+                Ok(charged) => {
+                    if charged.pause.is_some() {
+                        self.pause_partition(topic_partition);
+                    }
+                    uncommitted.insert(topic_partition.clone(), charged.uncommitted);
+                }
+                Err(rejection) => report_rejection(
+                    "charge",
+                    topic_partition,
+                    rejection,
+                    RejectedSlice::charged(&partition.charges),
+                )?,
+            }
+        }
+
+        let message_count = accumulator.message_count();
+        let poll_id = make_batch_id();
+        emit_poll_stats(
+            &stats,
+            &partitions,
+            message_count,
+            &self.group_id,
+            self.batch_size,
+            self.batch_size_bytes,
+        );
+
+        let assignment_epoch = self.batcher.submit(accumulator, &generations);
+        record_if(&self.debug_recorder, || DebugEventKind::BatchDispatched {
+            batch_id: poll_id.clone(),
+            messages: message_count,
+            partitions: debug_partition_offsets(&partitions),
+            assignment_epoch,
+            spans: debug_partition_spans(&partitions),
+        });
+
+        info!(
+            batch_id = %poll_id,
+            messages = message_count,
+            "Kafka batch dispatched"
+        );
+
+        Ok(InFlightPoll {
+            partitions,
+            uncommitted,
+        })
+    }
+
+    fn pause_partition(&self, topic_partition: &TopicPartition) {
+        let tpl = partition_list(topic_partition);
+        if let Err(err) = self
+            .consumer
+            .pause(&tpl)
+            .and_then(|()| partition_error(&tpl))
+        {
+            error!(
+                topic = %topic_partition.topic,
+                partition = topic_partition.partition,
+                error = %err,
+                "Could not pause a partition at its budget"
+            );
+        }
+    }
+
+    fn resume_partition(&self, topic_partition: &TopicPartition) {
+        let tpl = partition_list(topic_partition);
+        if let Err(err) = self
+            .consumer
+            .resume(&tpl)
+            .and_then(|()| partition_error(&tpl))
+        {
+            error!(
+                topic = %topic_partition.topic,
+                partition = topic_partition.partition,
+                error = %err,
+                "Could not resume a partition under its budget"
+            );
+        }
+    }
+
+    async fn commit_on_exit(&self) {
+        if let Some(commit) = self.settlement.take_all() {
+            self.submit_commit(commit);
+        }
+        if !self.committer.flush_all(EXIT_FLUSH_TIMEOUT).await {
+            warn!("Could not commit the processed offsets before the close");
+        }
+    }
+
+    fn submit_commit(&self, commit: Commit) {
+        self.record_commit(&commit.offsets);
+        self.committer.submit(&commit.offsets);
+        for topic_partition in &commit.resume {
+            self.resume_partition(topic_partition);
+        }
+    }
+
+    fn stop_on_batch_error(&self, err: anyhow::Error) {
+        error!(error = %err, "Batch processing failed");
+        counter!("ingestion_consumer_batch_errors_total").increment(1);
+        record_if(&self.debug_recorder, || DebugEventKind::BatchFailed {
+            batch_id: None,
+            error: format!("{err:#}"),
+        });
+        self.handle
+            .signal_failure(format!("Batch processing failed: {err:#}"));
+    }
+
+    /// The Kafka client refused a commit, so it cannot commit at all. Consuming
+    /// on would freeze the committed position while reporting healthy, so the
+    /// process exits and restarts.
+    fn stop_on_commit_error(&self, err: CommitError) {
+        error!(error = %err, "Offset commit failed");
+        counter!("ingestion_consumer_commit_errors_total").increment(1);
+        record_if(&self.debug_recorder, || DebugEventKind::CommitFailed {
+            error: format!("{err:#}"),
+        });
+        self.handle
+            .signal_failure(format!("Offset commit failed: {err:#}"));
+    }
+}
+
+struct UnassignOnDrop {
+    consumer: Arc<StreamConsumer<RebalanceContext>>,
+    unassign: Option<Unassign>,
+}
+
+impl Drop for UnassignOnDrop {
+    fn drop(&mut self) {
+        if let Some(unassign) = self.unassign.take() {
+            unassign.apply(&*self.consumer);
+        }
+    }
+}
+
+/// A dropped task never reaches the end of `run`. The rdkafka close that
+/// follows waits for every unassign the loop still owes.
+impl Drop for IngestionConsumer {
+    fn drop(&mut self) {
+        for unassign in self.rebalance().on_dropped() {
+            unassign.apply(&*self.consumer);
+        }
+    }
+}
+
+enum Woke<'a> {
+    Shutdown,
+    Completion(Option<BatcherCompletion>),
+    Error(Option<String>),
+    Tick,
+    Deadline,
+    DrainTimedOut,
+    Rebalanced,
+    CommitterStopped(CommitError),
+    Received(Result<BorrowedMessage<'a>, KafkaError>),
+}
+
+enum Stopped {
+    Drained,
+    Batch(anyhow::Error),
+}
+
+fn partition_list(topic_partition: &TopicPartition) -> TopicPartitionList {
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(&topic_partition.topic, topic_partition.partition);
+    tpl
+}
+
+/// Per-poll metrics, most with the same names as the Node.js consumer's.
+fn emit_poll_stats(
+    stats: &BatchStats,
+    partitions: &HashMap<TopicPartition, PartitionDeliveries>,
+    batch_size: usize,
+    group_id: &str,
+    max_batch_size: usize,
+    max_batch_bytes: usize,
+) {
+    counter!("ingestion_consumer_messages_received_total").increment(batch_size as u64);
+    gauge!("ingestion_consumer_batch_size").set(batch_size as f64);
+
+    // Matches Node.js `consumer_batch_utilization`.
+    if max_batch_size > 0 {
+        gauge!("consumer_batch_utilization", "groupId" => group_id.to_string())
+            .set(batch_size as f64 / max_batch_size as f64);
+    }
+
+    // The same ratio against the byte bound. On lanes with large events the
+    // byte bound ends collection first, so the count ratio stays low while
+    // batches are full. Absent when the byte bound is disabled.
+    if max_batch_bytes > 0 {
+        gauge!("consumer_batch_utilization_bytes", "groupId" => group_id.to_string())
+            .set(stats.total_bytes as f64 / max_batch_bytes as f64);
+    }
+
+    // Matches Node.js.
+    histogram!("consumer_batch_size").record(batch_size as f64);
+    histogram!("consumer_batch_size_kb").record(stats.total_bytes as f64 / 1024.0);
+
+    // Matches Node.js.
+    for (topic_partition, partition) in partitions {
+        let Some(max_lag) = partition.max_lag_ms else {
+            continue;
+        };
+        gauge!(
+            "ingestion_lag_ms",
+            "topic" => topic_partition.topic.clone(),
+            "partition" => topic_partition.partition.to_string(),
+            "groupId" => group_id.to_string()
+        )
+        .set(max_lag as f64);
+    }
+
+    // Matches Node.js.
+    for (partition, lag_ms) in &stats.message_lags_ms {
+        histogram!(
+            "ingestion_lag_ms_histogram",
+            "groupId" => group_id.to_string(),
+            "partition" => partition.to_string()
+        )
+        .record(*lag_ms as f64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rdkafka::config::ClientConfig;
+
+    #[tokio::test]
+    async fn a_drain_commit_cancelled_midway_still_unassigns() {
+        let consumer: StreamConsumer<RebalanceContext> = ClientConfig::new()
+            .set("bootstrap.servers", "127.0.0.1:1")
+            .set("group.id", "test")
+            .create_with_context(RebalanceContext::new())
+            .expect("a client needs no broker to be built");
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition("events", 0);
+        consumer.assign(&tpl).expect("an assign needs no broker");
+        let consumer = Arc::new(consumer);
+        let unassign_on_drop = UnassignOnDrop {
+            consumer: Arc::clone(&consumer),
+            unassign: Some(Unassign::new(tpl, false)),
+        };
+
+        let commit = tokio::spawn(async move {
+            let _unassign_on_drop = unassign_on_drop;
+            std::future::pending::<()>().await;
+        });
+        commit.abort();
+        let _ = commit.await;
+
+        assert_eq!(consumer.assignment().expect("assignment").count(), 0);
+    }
+
+    #[rstest::rstest]
+    #[case::below_a_second(200, 200)]
+    #[case::above_a_second(5_000, 1_000)]
+    #[case::immediate(0, 1_000)]
+    fn the_commit_tick_follows_the_commit_interval(
+        #[case] commit_interval_ms: u64,
+        #[case] expected_ms: u64,
+    ) {
+        assert_eq!(
+            commit_tick(Duration::from_millis(commit_interval_ms)),
+            Duration::from_millis(expected_ms)
+        );
+    }
+}

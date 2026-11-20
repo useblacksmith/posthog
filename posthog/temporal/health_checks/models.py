@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any
+
+from temporalio.exceptions import ApplicationError
+
+from posthog.dataclasses import frozen
+from posthog.models.health_issue import HealthIssue
+
+if TYPE_CHECKING:
+    from posthog.temporal.health_checks.framework import HealthCheckRegistration
+
+
+@dataclass
+class HealthCheckResult:
+    severity: HealthIssue.Severity
+    payload: dict[str, Any]
+    hash_keys: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        valid = set(HealthIssue.Severity.values)
+        if self.severity not in valid:
+            raise ValueError(f"Invalid severity '{self.severity}', must be one of: {', '.join(sorted(valid))}")
+
+
+@dataclass
+class BatchResult:
+    batch_size: int = 0
+    issues_upserted: int = 0
+    issues_resolved: int = 0
+    teams_with_issues: int = 0
+    teams_healthy: int = 0
+    teams_failed: int = 0
+    teams_skipped: int = 0
+    detect_duration: float = 0.0
+    db_write_duration: float = 0.0
+    resolve_duration: float = 0.0
+
+    @property
+    def total_duration(self) -> float:
+        return self.detect_duration + self.db_write_duration + self.resolve_duration
+
+    @property
+    def teams_per_second(self) -> float:
+        return self.batch_size / self.total_duration if self.total_duration > 0 else 0
+
+    @property
+    def not_processed_rate(self) -> float:
+        return (self.teams_failed + self.teams_skipped) / self.batch_size if self.batch_size > 0 else 0
+
+    # Adds up all fields from another BatchResult, e.g. totals += batch_result
+    def __iadd__(self, other: BatchResult) -> BatchResult:
+        for f in dataclasses.fields(self):
+            setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
+        return self
+
+
+BatchDetectFn = Callable[[list[int]], dict[int, list[HealthCheckResult]]]
+
+DEFAULT_ACTIVE_SINCE_DAYS: int = 90
+# Shorter than a day, so a broken run of a daily check closes before the next scheduled start.
+DEFAULT_EXECUTION_TIMEOUT: timedelta = timedelta(hours=12)
+
+
+@frozen
+class HealthCheckRunProgress:
+    """How far one scheduled run got. It crosses continue-as-new, so the run reports and judges every team."""
+
+    after_team_id: int = 0
+    totals: BatchResult = dataclasses.field(default_factory=BatchResult)
+    batches: int = 0
+    failed_batches: int = 0
+
+
+@frozen
+class TeamIdPage:
+    team_ids: list[int]
+    next_after_team_id: int | None
+    stopped_by_kill_switch: bool = False
+
+
+@dataclass(frozen=True)
+class HealthCheckWorkflowInputs:
+    name: str
+    kind: str
+    batch_size: int = 250
+    max_concurrent: int = 1
+    team_ids: list[int] | None = None
+    rollout_percentage: float = 1.0
+    not_processed_threshold: float = 0.1
+    dry_run: bool = False
+    active_since_days: int | None = DEFAULT_ACTIVE_SINCE_DAYS
+    owner: str = ""
+    progress: HealthCheckRunProgress | None = None
+
+    @classmethod
+    def from_config(cls, config: HealthCheckRegistration) -> HealthCheckWorkflowInputs:
+        return cls(
+            name=config.name,
+            kind=config.kind,
+            batch_size=config.batch_size,
+            max_concurrent=config.max_concurrent,
+            rollout_percentage=config.rollout_percentage,
+            not_processed_threshold=config.not_processed_threshold,
+            dry_run=config.dry_run,
+            active_since_days=config.active_since_days,
+            owner=config.owner.value,
+        )
+
+
+class HealthCheckThresholdExceeded(ApplicationError):
+    """Fails the run when too many teams were skipped or failed.
+
+    The workflow raises it, so it must be an `ApplicationError`. Temporal treats any other exception raised in a
+    workflow as a workflow task failure and retries the task until the run times out. The schedule skips every
+    start while the run stays open, and each retry reports the same breach again.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, type="HealthCheckThresholdExceeded", non_retryable=True)
+
+
+class HealthCheckBatchSkipped(Exception):
+    """Raised by `detect` when the batch cannot be judged, for example when its input data is stale.
+
+    The framework counts every team in the batch as skipped, so each team keeps its current issues
+    and the run fails once skipped teams pass `not_processed_threshold`.
+    """

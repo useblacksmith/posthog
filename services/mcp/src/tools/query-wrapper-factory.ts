@@ -1,0 +1,273 @@
+import { z } from 'zod'
+
+import { type TraceDetail, compactTraceResponse } from '@/lib/trace-compaction'
+import { redactTraceResults } from '@/lib/trace-redaction'
+import {
+    POSTHOG_FORMATTED_RESULTS_OVERRIDE_KEY,
+    POSTHOG_META_KEY,
+    type Context,
+    type ToolBase,
+    type ZodObjectAny,
+} from '@/tools/types'
+
+// LLM trace query kinds return every event with its full properties (entire
+// prompts, completions, tool payloads, and whatever else the calling application
+// attached). Their results are redacted down to the AI payload, then bounded, so
+// a response carries neither a credential nor enough volume to blow the caller's
+// context window.
+const TRACE_QUERY_KINDS = new Set(['TraceQuery', 'TracesQuery'])
+
+const TRACE_DETAIL_FIELD = 'detail'
+const DEFAULT_TRACE_DETAIL: TraceDetail = 'full'
+const TRACE_DETAIL_DESCRIPTION =
+    'How much of each event to return. "full" (default) returns the retained event properties, subject to response size limits. Set "summary" to browse trace and event metadata (IDs, timestamps, model, latency, tokens, cost, tools called, errors); prompts, outputs, and other content are left out and only their names are listed.'
+
+/**
+ * Add the `detail` control to the trace wrappers only. The field is a tool-level
+ * control rather than part of the query body, and the backend trace queries
+ * forbid unknown fields, so the handler strips it before POSTing.
+ */
+function withTraceDetail<T extends ZodObjectAny>(schema: T, kind: string): T {
+    if (!TRACE_QUERY_KINDS.has(kind) || !(schema instanceof z.ZodObject)) {
+        return schema
+    }
+    return schema.extend({
+        [TRACE_DETAIL_FIELD]: z
+            .enum(['summary', 'full'])
+            .default(DEFAULT_TRACE_DETAIL)
+            .optional()
+            .describe(TRACE_DETAIL_DESCRIPTION),
+    }) as unknown as T
+}
+
+interface QueryWrapperConfig<T extends ZodObjectAny> {
+    name: string
+    schema: T
+    kind: string
+    uiResourceUri?: string
+    /**
+     * Output format for the tool response. `'optimized'` surfaces the backend formatter output
+     * (`formatted_results`) as the text content when available; `'json'` skips the formatter
+     * override entirely and returns raw JSON. Omit to fall back to the default TOON encoding.
+     */
+    outputFormat?: 'optimized' | 'json'
+    /**
+     * When set, `_posthogUrl` uses `{baseUrl}{urlPrefix}` instead of `/insights/new#q=...`.
+     * May contain `{param}` placeholders filled from the query body, e.g.
+     * `/ai-observability/traces/{traceId}`.
+     */
+    urlPrefix?: string
+}
+
+const TEST_ACCOUNT_FILTER_FIELD = 'filterTestAccounts'
+
+function hasTestAccountFilterField(schema: ZodObjectAny): schema is z.ZodObject<z.ZodRawShape> {
+    return schema instanceof z.ZodObject && TEST_ACCOUNT_FILTER_FIELD in schema.shape
+}
+
+/**
+ * Most generated query schemas hard-default `filterTestAccounts` to `false`, which
+ * silently ignores the project's "Filter out internal and test users" default
+ * (`test_account_filters_default_checked`) that the UI applies to every new
+ * insight. Stripping the schema default lets an omitted value survive validation
+ * as `undefined`, so the handler can fill in the project default instead. An
+ * explicit `filterTestAccounts` from the caller always wins.
+ *
+ * Only a `false` default is stripped: a schema that defaults the field to `true`
+ * (e.g. AssistantTracesQuery) is an intentional stricter product default, and
+ * replacing it would flip its queries to unfiltered on projects where the
+ * setting is unchecked.
+ */
+function withoutTestAccountFilterDefault<T extends ZodObjectAny>(schema: T): T {
+    if (!hasTestAccountFilterField(schema)) {
+        return schema
+    }
+    // `ZodRawShape` values are typed as core `$ZodType`, which hides `safeParse`.
+    const field = schema.shape[TEST_ACCOUNT_FILTER_FIELD] as z.ZodType
+    const omittedValue = field.safeParse(undefined)
+    if (!omittedValue.success || omittedValue.data !== false) {
+        return schema
+    }
+    return schema.extend({
+        // Strict boolean, not `z.coerce.boolean()`: coercion turns the string
+        // `"false"` into `true`, which would silently flip query semantics.
+        [TEST_ACCOUNT_FILTER_FIELD]: z
+            .boolean()
+            .optional()
+            .describe(
+                'Exclude internal and test users by applying the respective filters. When omitted, follows the project\'s "Filter out internal and test users" default setting.'
+            ),
+    }) as unknown as T
+}
+
+/** Fills an omitted `filterTestAccounts` from the project's default, the way the UI does for a new insight. */
+export async function applyProjectTestAccountDefault(context: Context, query: Record<string, unknown>): Promise<void> {
+    if (query[TEST_ACCOUNT_FILTER_FIELD] !== undefined) {
+        return
+    }
+    const project = await context.stateManager.getCachedOrFetchProject().catch(() => undefined)
+    // Only inject `true`: when the project default is unchecked the field
+    // stays omitted and the backend's own `false` default applies.
+    if (project?.test_account_filters_default_checked) {
+        query[TEST_ACCOUNT_FILTER_FIELD] = true
+    }
+}
+
+/**
+ * Kea Router decodes paths before route matching, and scenes decode captured parameters again.
+ * Double encoding keeps opaque values within the route matcher character set through both steps.
+ */
+function encodeRouterPathSegment(value: string): string {
+    const encodedValue = encodeURIComponent(value).replace(
+        /[!'()*]/g,
+        (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+    )
+    return encodeURIComponent(encodedValue).replace(
+        /[!'()*]/g,
+        (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+    )
+}
+
+/**
+ * Fill `{param}` placeholders in a `urlPrefix` from the query body. A placeholder the query
+ * leaves unset (or sets to something other than a non-empty string/number) truncates the path
+ * at that segment, so the link falls back to the closest parent page instead of pointing at a
+ * literal `{traceId}`.
+ */
+function resolveUrlPrefix(urlPrefix: string, query: Record<string, unknown>): string {
+    if (!urlPrefix.includes('{')) {
+        return urlPrefix
+    }
+    const segments: string[] = []
+    for (const segment of urlPrefix.split('/')) {
+        if (!segment.includes('{')) {
+            segments.push(segment)
+            continue
+        }
+        const paramName = /^\{(\w+)\}$/.exec(segment)?.[1]
+        const value = paramName === undefined ? undefined : query[paramName]
+        if ((typeof value !== 'string' && typeof value !== 'number') || value === '') {
+            break
+        }
+        segments.push(encodeRouterPathSegment(String(value)))
+    }
+    return segments.join('/')
+}
+
+function buildInsightUrl(
+    kind: 'InsightVizNode' | 'DataTableNode',
+    query: Record<string, unknown>,
+    baseUrl: string,
+    urlPrefix?: string
+): string {
+    if (urlPrefix) {
+        return `${baseUrl}${resolveUrlPrefix(urlPrefix, query)}`
+    }
+    const q = encodeURIComponent(JSON.stringify({ kind, source: query }))
+    return `${baseUrl}/insights/new#q=${q}`
+}
+
+export function createQueryWrapper<T extends ZodObjectAny>(config: QueryWrapperConfig<T>): () => ToolBase<T> {
+    // Both the advertised tool schema and the handler's re-parse must use the
+    // stripped schema — parsing with the original would re-apply the `false`
+    // default and make omission indistinguishable from an explicit `false`.
+    const schema = withTraceDetail(withoutTestAccountFilterDefault(config.schema), config.kind)
+    const isTraceQuery = TRACE_QUERY_KINDS.has(config.kind)
+    return () => ({
+        name: config.name,
+        schema,
+        handler: async (context: Context, rawParams: z.infer<T>) => {
+            const projectId = await context.stateManager.getProjectId()
+            const params = schema.parse(rawParams)
+            // `output_format` is a tool-level control, not part of the query body. Strip it before
+            // POSTing so it doesn't leak into the backend `kind: ...Query` payload.
+            const { output_format: callerOutputFormat, ...queryParams } = params as typeof params & {
+                output_format?: 'optimized' | 'json'
+            }
+            // `detail` is a trace-wrapper control, not part of the query body either.
+            // Only the trace wrappers advertise it, so anywhere else a field of that
+            // name belongs to the backend query and stays in `queryParams`.
+            const traceDetailParams = queryParams as { [TRACE_DETAIL_FIELD]?: TraceDetail }
+            const traceDetail = traceDetailParams[TRACE_DETAIL_FIELD] ?? DEFAULT_TRACE_DETAIL
+            if (isTraceQuery) {
+                delete traceDetailParams[TRACE_DETAIL_FIELD]
+            }
+            const query: Record<string, unknown> = {
+                ...queryParams,
+                kind: config.kind,
+            }
+            if (hasTestAccountFilterField(schema)) {
+                await applyProjectTestAccountDefault(context, query)
+            }
+            const baseUrl = context.api.getProjectBaseUrl(projectId)
+            const effectiveOutputFormat = callerOutputFormat ?? config.outputFormat
+
+            if (config.kind.endsWith('ActorsQuery')) {
+                const sourceKind = (query.source as Record<string, unknown> | undefined)?.kind
+                const queryClient = context.api.query({ projectId })
+                let data
+                switch (sourceKind) {
+                    case 'LifecycleQuery':
+                        data = await queryClient.lifecycleActors({ query })
+                        break
+                    case 'TrendsQuery':
+                        data = await queryClient.trendsActors({ query })
+                        break
+                    case 'PathsQuery':
+                        data = await queryClient.pathsActors({ query })
+                        break
+                    case 'RetentionQuery':
+                        data = await queryClient.retentionActors({ query })
+                        break
+                    case 'StickinessQuery':
+                        data = await queryClient.stickinessActors({ query })
+                        break
+                    case 'FunnelsQuery':
+                        data = await queryClient.funnelActors({ query })
+                        break
+                    default:
+                        throw new Error(`Unsupported source kind for actors query: ${sourceKind}`)
+                }
+                return {
+                    ...data,
+                    _posthogUrl: buildInsightUrl('DataTableNode', data.query, baseUrl, config.urlPrefix),
+                }
+            }
+
+            const data = await context.api.query({ projectId }).runQuery({ query })
+            // The backend renders `formatted_results` from the unredacted results, and
+            // some clients read that string in preference to the structured payload, so
+            // a trace response never carries it.
+            const shouldSurfaceFormatted = !isTraceQuery && effectiveOutputFormat !== 'json' && data.formatted_results
+            // Include `query` in the payload so UI apps (TrendsVisualizer, LifecycleVisualizer)
+            // can honor query-level filters like `lifecycleFilter.toggledLifecycles` and
+            // `trendsFilter.display`.
+            const response = {
+                _posthogUrl: buildInsightUrl('InsightVizNode', query, baseUrl, config.urlPrefix),
+                query,
+                results: isTraceQuery ? redactTraceResults(data.results) : data.results,
+                // Table queries (e.g. WebStatsTableQuery) return positional rows, so the
+                // column names are the only way to read each cell.
+                ...(Array.isArray(data.columns) && Array.isArray(data.results) ? { columns: data.columns } : {}),
+                ...(data.warnings ? { warnings: data.warnings } : {}),
+                ...(data.warehouse_suggestions?.length ? { warehouse_suggestions: data.warehouse_suggestions } : {}),
+                ...(typeof data.disclaimer === 'string' ? { disclaimer: data.disclaimer } : {}),
+                // Cursor-paginated queries (e.g. RecordingsQuery) need these for the caller to request the next page.
+                ...(typeof data.has_next === 'boolean'
+                    ? { has_next: data.has_next, next_cursor: data.next_cursor ?? null }
+                    : {}),
+            }
+            if (isTraceQuery) {
+                return compactTraceResponse(response, traceDetail, effectiveOutputFormat)
+            }
+            return {
+                ...response,
+                ...(shouldSurfaceFormatted ? { [POSTHOG_FORMATTED_RESULTS_OVERRIDE_KEY]: data.formatted_results } : {}),
+            }
+        },
+        _meta: {
+            ...(config.uiResourceUri ? { ui: { resourceUri: config.uiResourceUri } } : {}),
+            ...(config.outputFormat ? { [POSTHOG_META_KEY]: { outputFormat: config.outputFormat } } : {}),
+        },
+    })
+}

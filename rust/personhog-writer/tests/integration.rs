@@ -1,0 +1,1799 @@
+mod common;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, TimeZone, Utc};
+use common::{
+    cleanup_team, create_local_kafka_producer, create_mock_kafka, create_test_pool, make_person,
+    unique_team_id, KAFKA_BOOTSTRAP, TARGET_TABLE, TOPIC,
+};
+use personhog_coordination::follow::Follower;
+use personhog_coordination::types::{ChangelogConfig, Generation};
+use personhog_proto::personhog::types::v1::Person;
+use personhog_writer::buffer::BufferedPerson;
+use personhog_writer::consumer::{ConsumerTask, FlushBatch};
+use personhog_writer::kafka::{PersonConsumer, Source};
+use personhog_writer::pg::PgStore;
+use personhog_writer::store::{
+    BatchOutcome, PersonDb, PersonWriteStore, WriteError, WriteErrorKind,
+};
+use personhog_writer::writer::WriterTask;
+use prost::Message;
+use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::producer::FutureRecord;
+use rdkafka::{ClientConfig, Offset, TopicPartitionList};
+use tokio::sync::mpsc;
+
+fn source_on(topic: &str, partition: i32) -> Source {
+    Source {
+        topic: Arc::from(topic),
+        partition,
+    }
+}
+
+fn source(partition: i32) -> Source {
+    source_on(TOPIC, partition)
+}
+
+fn rows(persons: Vec<Person>) -> Vec<BufferedPerson> {
+    persons
+        .into_iter()
+        .map(|person| BufferedPerson {
+            source: source(0),
+            person,
+        })
+        .collect()
+}
+
+// ============================================================
+// PG Writer: upsert correctness
+// ============================================================
+
+#[tokio::test]
+async fn writer_upserts_person_to_pg() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    let person = make_person(team_id as i64, 1, 1);
+
+    assert!(matches!(
+        writer.upsert_batch(vec![person]).await,
+        BatchOutcome::Success
+    ));
+
+    let row: (i64, i64, bool) = sqlx::query_as(
+        "SELECT id, version, is_identified FROM personhog_person_tmp WHERE team_id = $1 AND id = $2",
+    )
+    .bind(team_id)
+    .bind(1_i64)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, 1); // id
+    assert_eq!(row.1, 1); // version
+    assert!(!row.2); // is_identified
+
+    cleanup_team(&pool, team_id).await;
+}
+
+/// Persons created before personhog from a client's zero `DateTime` carry
+/// year 1 as `created_at`; the leader admits what this upsert binds, so
+/// the bind has to hold at the far end of the range.
+#[tokio::test]
+async fn writer_upserts_a_year_one_created_at() {
+    const YEAR_ONE_MS: i64 = -62_135_596_800_000;
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    let person = Person {
+        created_at: YEAR_ONE_MS,
+        last_seen_at: Some(YEAR_ONE_MS),
+        ..make_person(team_id as i64, 1, 1)
+    };
+
+    assert!(matches!(
+        writer.upsert_batch(vec![person]).await,
+        BatchOutcome::Success
+    ));
+
+    let row: (DateTime<Utc>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT created_at, last_seen_at FROM personhog_person_tmp WHERE team_id = $1 AND id = $2",
+    )
+    .bind(team_id)
+    .bind(1_i64)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let year_one = Utc.timestamp_millis_opt(YEAR_ONE_MS).unwrap();
+    assert_eq!(row.0, year_one);
+    assert_eq!(row.1, Some(year_one));
+
+    // The leader admits down to Postgres's own floor, Julian day 0, so
+    // that exact instant has to bind as well.
+    const PG_TIMESTAMPTZ_MIN_MS: i64 = -210_866_803_200_000;
+    let floor_person = Person {
+        created_at: PG_TIMESTAMPTZ_MIN_MS,
+        ..make_person(team_id as i64, 2, 1)
+    };
+    assert!(matches!(
+        writer.upsert_batch(vec![floor_person]).await,
+        BatchOutcome::Success
+    ));
+    let floor: (DateTime<Utc>,) = sqlx::query_as(
+        "SELECT created_at FROM personhog_person_tmp WHERE team_id = $1 AND id = $2",
+    )
+    .bind(team_id)
+    .bind(2_i64)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        floor.0,
+        Utc.timestamp_millis_opt(PG_TIMESTAMPTZ_MIN_MS).unwrap()
+    );
+
+    cleanup_team(&pool, team_id).await;
+}
+
+#[tokio::test]
+async fn writer_projects_death_documents_as_tombstones() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+
+    let fetch_row = |pool: sqlx::PgPool| async move {
+        let row: (i64, bool, String) = sqlx::query_as(
+            "SELECT version, is_deleted, properties::text \
+             FROM personhog_person_tmp WHERE team_id = $1 AND id = $2",
+        )
+        .bind(team_id)
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        row
+    };
+
+    // Birth: live.
+    assert!(matches!(
+        writer
+            .upsert_batch(vec![make_person(team_id as i64, 1, 1)])
+            .await,
+        BatchOutcome::Success
+    ));
+    let row = fetch_row(pool.clone()).await;
+    assert!(!row.1);
+
+    // The death document projects as an ordinary update whose tombstone
+    // lands on the row: is_deleted set, properties scrubbed — never a row
+    // delete (burial is the GC job's, after ClickHouse erasure).
+    let mut death = make_person(team_id as i64, 1, 3);
+    death.is_deleted = true;
+    death.properties = b"{}".to_vec();
+    assert!(matches!(
+        writer.upsert_batch(vec![death]).await,
+        BatchOutcome::Success
+    ));
+    let row = fetch_row(pool.clone()).await;
+    assert_eq!(row.0, 3);
+    assert!(row.1, "the tombstone is projected, not a row delete");
+    assert_eq!(row.2, "{}");
+
+    // A lagging pre-death record must not resurrect the tombstone.
+    let stale = make_person(team_id as i64, 1, 2);
+    assert!(matches!(
+        writer.upsert_batch(vec![stale]).await,
+        BatchOutcome::Success
+    ));
+    let row = fetch_row(pool.clone()).await;
+    assert_eq!(row.0, 3, "version guard holds");
+    assert!(row.1, "the tombstone survives lagging writes");
+
+    cleanup_team(&pool, team_id).await;
+}
+
+#[tokio::test]
+async fn writer_version_guard_skips_stale_updates() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+
+    // Write version 5
+    let person_v5 = make_person(team_id as i64, 1, 5);
+    assert!(matches!(
+        writer.upsert_batch(vec![person_v5]).await,
+        BatchOutcome::Success
+    ));
+
+    // Attempt to write version 3 (stale) -- should be a no-op
+    let mut person_v3 = make_person(team_id as i64, 1, 3);
+    person_v3.properties =
+        serde_json::to_vec(&serde_json::json!({"email": "stale@example.com"})).unwrap();
+    assert!(matches!(
+        writer.upsert_batch(vec![person_v3]).await,
+        BatchOutcome::Success
+    ));
+
+    let row: (i64,) =
+        sqlx::query_as("SELECT version FROM personhog_person_tmp WHERE team_id = $1 AND id = $2")
+            .bind(team_id)
+            .bind(1_i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(row.0, 5); // version unchanged
+
+    cleanup_team(&pool, team_id).await;
+}
+
+#[tokio::test]
+async fn writer_upsert_does_not_wait_on_a_person_foreign_key_check() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    assert!(matches!(
+        writer
+            .upsert_batch(vec![make_person(team_id as i64, 1, 1)])
+            .await,
+        BatchOutcome::Success
+    ));
+
+    let mut attach = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO personhog_persondistinctid_tmp (distinct_id, person_id, team_id, version)
+         VALUES ('fk-check', $1, $2, 1)",
+    )
+    .bind(1_i64)
+    .bind(team_id)
+    .execute(&mut *attach)
+    .await
+    .unwrap();
+    let probe = sqlx::query(
+        "SELECT 1 FROM personhog_person_tmp WHERE team_id = $1 AND id = $2 FOR UPDATE NOWAIT",
+    )
+    .bind(team_id)
+    .bind(1_i64)
+    .execute(&pool)
+    .await;
+    assert!(
+        matches!(&probe, Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03")),
+        "the distinct id insert must hold a foreign-key lock on its person: {probe:?}"
+    );
+
+    let upsert = tokio::time::timeout(
+        Duration::from_secs(5),
+        writer.upsert_batch(vec![make_person(team_id as i64, 1, 2)]),
+    )
+    .await;
+    attach.rollback().await.unwrap();
+
+    assert!(
+        matches!(&upsert, Ok(BatchOutcome::Success)),
+        "the upsert must not wait on the open distinct id insert for its person: {upsert:?}"
+    );
+    let row: (i64,) =
+        sqlx::query_as("SELECT version FROM personhog_person_tmp WHERE team_id = $1 AND id = $2")
+            .bind(team_id)
+            .bind(1_i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, 2);
+
+    cleanup_team(&pool, team_id).await;
+}
+
+#[tokio::test]
+async fn writer_merges_last_seen_instead_of_assigning() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = 99_006;
+    cleanup_team(&pool, team_id).await;
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+
+    let fetch = |pool: sqlx::PgPool| async move {
+        let row: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT version, last_seen_at
+             FROM personhog_person_tmp WHERE team_id = $1 AND id = $2",
+        )
+        .bind(team_id)
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        (row.0, row.1.map(|t| t.timestamp_millis()))
+    };
+
+    let mut person = make_person(team_id as i64, 1, 1);
+    person.last_seen_at = Some(5000);
+    assert!(matches!(
+        writer.upsert_batch(vec![person]).await,
+        BatchOutcome::Success
+    ));
+    assert_eq!(fetch(pool.clone()).await, (1, Some(5000)));
+
+    // A newer record with an older last-seen. The version guard admits it,
+    // but it must not lower the last-seen value.
+    let mut older_last_seen = make_person(team_id as i64, 1, 2);
+    older_last_seen.last_seen_at = Some(3000);
+    assert!(matches!(
+        writer.upsert_batch(vec![older_last_seen]).await,
+        BatchOutcome::Success
+    ));
+    assert_eq!(
+        fetch(pool.clone()).await,
+        (2, Some(5000)),
+        "a record with an older last-seen must not lower the stored value"
+    );
+
+    // A record with no last-seen at all (predating the field) must also
+    // leave the stored value in place.
+    let no_last_seen = make_person(team_id as i64, 1, 3);
+    assert!(matches!(
+        writer.upsert_batch(vec![no_last_seen]).await,
+        BatchOutcome::Success
+    ));
+    assert_eq!(fetch(pool.clone()).await, (3, Some(5000)));
+
+    // A newer last-seen replaces the stored value, so merging must not
+    // freeze the column at its first value.
+    let mut advancing = make_person(team_id as i64, 1, 4);
+    advancing.last_seen_at = Some(6000);
+    assert!(matches!(
+        writer.upsert_batch(vec![advancing]).await,
+        BatchOutcome::Success
+    ));
+    assert_eq!(fetch(pool.clone()).await, (4, Some(6000)));
+
+    cleanup_team(&pool, team_id).await;
+}
+
+#[tokio::test]
+async fn writer_upsert_batch_multiple_persons() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    let persons: Vec<Person> = (1..=10)
+        .map(|i| make_person(team_id as i64, i, 1))
+        .collect();
+
+    assert!(matches!(
+        writer.upsert_batch(persons).await,
+        BatchOutcome::Success
+    ));
+
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM personhog_person_tmp WHERE team_id = $1")
+            .bind(team_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(count.0, 10);
+
+    cleanup_team(&pool, team_id).await;
+}
+
+#[tokio::test]
+async fn writer_surfaces_invalid_uuids_as_violations_never_silent_skips() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+
+    let valid_person = make_person(team_id as i64, 1, 1);
+    let mut bad_person = make_person(team_id as i64, 2, 1);
+    bad_person.uuid = "not-a-valid-uuid".to_string();
+    let another_valid = make_person(team_id as i64, 3, 1);
+
+    // An unbindable row fails its chunk: silently dropping it would
+    // permanently diverge PG from the cache and changelog.
+    let outcome = writer
+        .upsert_batch(vec![valid_person, bad_person, another_valid])
+        .await;
+    let BatchOutcome::Partial {
+        transient,
+        saturated,
+        data_failed,
+    } = outcome
+    else {
+        panic!("a chunk with an unbindable row must be data-failed");
+    };
+    assert!(transient.is_empty());
+    assert!(saturated.is_empty());
+    assert_eq!(data_failed.len(), 3);
+
+    // The per-row pass isolates the poison row as a violation; the valid
+    // rows apply.
+    let fallback = writer.upsert_rows_parallel(data_failed).await;
+    assert!(fallback.transient.is_empty());
+    assert_eq!(fallback.violations.len(), 1);
+    assert_eq!(fallback.violations[0].person_id, 2);
+
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM personhog_person_tmp WHERE team_id = $1")
+            .bind(team_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count.0, 2,
+        "valid rows apply; the poison row writes nothing"
+    );
+
+    cleanup_team(&pool, team_id).await;
+}
+
+// ============================================================
+// Consumer + Writer: channel flow with mock Kafka
+// ============================================================
+
+#[tokio::test]
+async fn consumer_flushes_on_buffer_size_threshold() {
+    let (mock_cluster, _producer) = create_mock_kafka().await;
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(2);
+
+    let client_config = ClientConfig::new()
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-flush-threshold")
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .clone();
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let consumer_handle = manager.register(
+        "consumer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let writer_handle = manager.register(
+        "writer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let _monitor = manager.monitor_background();
+
+    // Start writer task
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), writer, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    // Produce 6 messages to mock Kafka (two full batches of 3)
+    let producer = &_producer;
+    for i in 1..=6 {
+        let person = make_person(team_id as i64, i, 1);
+        let payload = person.encode_to_vec();
+        let key = format!("{}:{}", team_id, i);
+        let record = FutureRecord::to(TOPIC).key(&key).payload(&payload);
+        producer
+            .send_result(record)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // Start consumer with flush_buffer_size=3 (flushes at exactly 3 and 6)
+    let consumer_task = ConsumerTask::new(
+        kafka_consumer,
+        vec![flush_tx],
+        100,
+        Duration::from_secs(60), // long timer so only size triggers flush
+        3,                       // flush at 3 messages
+        consumer_handle,
+    );
+    tokio::spawn(async move { consumer_task.run().await });
+
+    // Wait for all 6 rows to appear in PG (two flush cycles)
+    let mut retries = 0;
+    loop {
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM personhog_person_tmp WHERE team_id = $1")
+                .bind(team_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        if count.0 >= 6 {
+            break;
+        }
+
+        retries += 1;
+        if retries > 50 {
+            panic!(
+                "Expected 6 rows in personhog_person_tmp for team {}, got {}",
+                team_id, count.0
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    cleanup_team(&pool, team_id).await;
+}
+
+// ============================================================
+// Consumer + Writer: timer-based flush
+// ============================================================
+
+#[tokio::test]
+async fn consumer_flushes_on_timer() {
+    let (mock_cluster, _producer) = create_mock_kafka().await;
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(2);
+
+    let client_config = ClientConfig::new()
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-flush-timer")
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .clone();
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let consumer_handle = manager.register(
+        "consumer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let writer_handle = manager.register(
+        "writer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let _monitor = manager.monitor_background();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), writer, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    // Produce 2 messages -- below the size threshold of 1000
+    let producer = &_producer;
+    for i in 1..=2 {
+        let person = make_person(team_id as i64, i, 1);
+        let payload = person.encode_to_vec();
+        let key = format!("{}:{}", team_id, i);
+        let record = FutureRecord::to(TOPIC).key(&key).payload(&payload);
+        producer
+            .send_result(record)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // Start consumer with high size threshold but short timer (500ms)
+    let consumer_task = ConsumerTask::new(
+        kafka_consumer,
+        vec![flush_tx],
+        100,
+        Duration::from_millis(500), // short timer triggers flush
+        1000,                       // high threshold so only timer triggers
+        consumer_handle,
+    );
+    tokio::spawn(async move { consumer_task.run().await });
+
+    // Wait for rows -- should appear within ~1s (timer flush)
+    let mut retries = 0;
+    loop {
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM personhog_person_tmp WHERE team_id = $1")
+                .bind(team_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        if count.0 >= 2 {
+            break;
+        }
+
+        retries += 1;
+        if retries > 30 {
+            panic!(
+                "Expected 2 rows from timer flush for team {}, got {}",
+                team_id, count.0
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    cleanup_team(&pool, team_id).await;
+}
+
+// ============================================================
+// Consumer + Writer: dedup under load
+// ============================================================
+
+#[tokio::test]
+async fn consumer_deduplicates_multiple_updates_for_same_person() {
+    let (mock_cluster, _producer) = create_mock_kafka().await;
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(2);
+
+    let client_config = ClientConfig::new()
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-dedup")
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .clone();
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let consumer_handle = manager.register(
+        "consumer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let writer_handle = manager.register(
+        "writer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let _monitor = manager.monitor_background();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), writer, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    // Produce 5 updates for the same person (id=1) with increasing versions
+    let producer = &_producer;
+    for v in 1..=5 {
+        let mut person = make_person(team_id as i64, 1, v);
+        person.properties = serde_json::to_vec(&serde_json::json!({"version_seen": v})).unwrap();
+        let payload = person.encode_to_vec();
+        let key = format!("{}:1", team_id);
+        let record = FutureRecord::to(TOPIC).key(&key).payload(&payload);
+        producer
+            .send_result(record)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // Start consumer with high size threshold, short timer
+    let consumer_task = ConsumerTask::new(
+        kafka_consumer,
+        vec![flush_tx],
+        100,
+        Duration::from_millis(500),
+        1000,
+        consumer_handle,
+    );
+    tokio::spawn(async move { consumer_task.run().await });
+
+    // Wait for the row to appear
+    let mut retries = 0;
+    loop {
+        let result: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT version, id FROM personhog_person_tmp WHERE team_id = $1 AND id = $2",
+        )
+        .bind(team_id)
+        .bind(1_i64)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        if let Some((version, _)) = result {
+            // Should have the latest version, not an intermediate one
+            assert_eq!(version, 5, "expected latest version 5 after dedup");
+            break;
+        }
+
+        retries += 1;
+        if retries > 30 {
+            panic!("Row never appeared for deduped person");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Should be exactly 1 row, not 5
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM personhog_person_tmp WHERE team_id = $1")
+            .bind(team_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count.0, 1, "expected 1 row after dedup, not 5");
+
+    cleanup_team(&pool, team_id).await;
+}
+
+// ============================================================
+// Consumer: multi-lane routing, lane-local dedup, independent flush
+// ============================================================
+
+/// With two lanes over a two-partition topic, each lane must receive only
+/// its own partition's persons and offsets (routing + disjoint commits),
+/// dedup within its own buffer, and flush on size without draining the
+/// other lane. Asserted on the lane channels directly — the consumer's
+/// public output — so no writer or PG is involved.
+#[tokio::test]
+async fn multi_lane_consumer_routes_partitions_and_flushes_independently() {
+    let (mock_cluster, producer) = common::create_mock_kafka_with_partitions(2).await;
+    let team_id: i64 = 99_060;
+
+    let (tx0, mut rx0) = mpsc::channel::<FlushBatch>(2);
+    let (tx1, mut rx1) = mpsc::channel::<FlushBatch>(2);
+
+    let client_config = ClientConfig::new()
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-multi-lane")
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .clone();
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let consumer_handle = manager.register(
+        "consumer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let _monitor = manager.monitor_background();
+
+    // Partition 0: person 1 twice (dedup) plus persons 2 and 3 — four
+    // messages but three unique persons, hitting the size threshold of 3.
+    // Partition 1: person 4 only, staying below the threshold.
+    let mut to_produce = vec![
+        (0, make_person(team_id, 1, 1)),
+        (0, make_person(team_id, 1, 2)),
+        (0, make_person(team_id, 2, 1)),
+        (0, make_person(team_id, 3, 1)),
+        (1, make_person(team_id, 4, 1)),
+    ];
+    for (partition, person) in to_produce.drain(..) {
+        let payload = person.encode_to_vec();
+        let key = format!("{}:{}", team_id, person.id);
+        let record = FutureRecord::to(TOPIC)
+            .partition(partition)
+            .key(&key)
+            .payload(&payload);
+        producer
+            .send_result(record)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let consumer_task = ConsumerTask::new(
+        kafka_consumer,
+        vec![tx0, tx1],
+        100,
+        Duration::from_secs(60), // long timer so only size triggers flush
+        3,
+        consumer_handle,
+    );
+    tokio::spawn(async move { consumer_task.run().await });
+
+    // Lane 0 flushes on size with only partition 0's persons and offsets,
+    // person 1 deduped to its latest version.
+    let batch0 = tokio::time::timeout(Duration::from_secs(15), rx0.recv())
+        .await
+        .expect("lane 0 should flush on size")
+        .expect("lane 0 channel should be open");
+    assert_eq!(
+        batch0.offsets.keys().cloned().collect::<Vec<_>>(),
+        vec![source(0)]
+    );
+    assert_eq!(batch0.offsets[&source(0)], 3); // four messages, offsets 0..=3
+    let mut persons0 = batch0.persons;
+    persons0.sort_by_key(|p| p.person.id);
+    assert_eq!(
+        persons0.iter().map(|p| p.person.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        persons0[0].person.version, 2,
+        "dedup must keep the latest version"
+    );
+
+    // Lane 1 is below its size threshold and the timer is far away, so a
+    // lane-0 flush must not have drained it.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), rx1.recv())
+            .await
+            .is_err(),
+        "lane 1 must not flush before reaching its own threshold"
+    );
+
+    // Two more persons on partition 1 push lane 1 to its threshold; its
+    // batch carries only partition 1's persons and offsets.
+    for id in [5, 6] {
+        let person = make_person(team_id, id, 1);
+        let payload = person.encode_to_vec();
+        let key = format!("{team_id}:{id}");
+        let record = FutureRecord::to(TOPIC)
+            .partition(1)
+            .key(&key)
+            .payload(&payload);
+        producer
+            .send_result(record)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let batch1 = tokio::time::timeout(Duration::from_secs(15), rx1.recv())
+        .await
+        .expect("lane 1 should flush on size")
+        .expect("lane 1 channel should be open");
+    assert_eq!(
+        batch1.offsets.keys().cloned().collect::<Vec<_>>(),
+        vec![source(1)]
+    );
+    assert_eq!(batch1.offsets[&source(1)], 2); // three messages, offsets 0..=2
+    let mut ids1: Vec<i64> = batch1.persons.iter().map(|p| p.person.id).collect();
+    ids1.sort_unstable();
+    assert_eq!(ids1, vec![4, 5, 6]);
+}
+
+/// Flushes drain whole partitions up to the flush size, so a batch's
+/// committed offsets must cover exactly the partitions of the persons it
+/// carries — never a partition whose persons are still buffered. Asserted
+/// on the lane channel directly across however many capped batches the
+/// consumer emits; arrival interleaving decides the exact split.
+#[tokio::test]
+async fn capped_drains_commit_only_the_partitions_they_carry() {
+    let (mock_cluster, producer) = common::create_mock_kafka_with_partitions(2).await;
+    let team_id: i64 = 99_061;
+
+    let (tx, mut rx) = mpsc::channel::<FlushBatch>(2);
+
+    let client_config = ClientConfig::new()
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-capped-drain")
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .clone();
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let consumer_handle = manager.register(
+        "consumer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let _monitor = manager.monitor_background();
+
+    // Person ids encode their partition: 1..=3 on partition 0, 4..=6 on
+    // partition 1, so each flushed person maps back to a partition.
+    for (partition, id) in [(0, 1), (0, 2), (0, 3), (1, 4), (1, 5), (1, 6)] {
+        let person = make_person(team_id, id, 1);
+        let payload = person.encode_to_vec();
+        let key = format!("{team_id}:{id}");
+        let record = FutureRecord::to(TOPIC)
+            .partition(partition)
+            .key(&key)
+            .payload(&payload);
+        producer
+            .send_result(record)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // Flush size 3 caps each drain below the 6 buffered persons; the short
+    // timer sweeps up any tail the size trigger leaves behind.
+    let consumer_task = ConsumerTask::new(
+        kafka_consumer,
+        vec![tx],
+        100,
+        Duration::from_secs(2),
+        3,
+        consumer_handle,
+    );
+    tokio::spawn(async move { consumer_task.run().await });
+
+    let mut seen_persons = 0;
+    let mut batches = 0;
+    let mut max_offset_seen: HashMap<i32, i64> = HashMap::new();
+    while seen_persons < 6 {
+        let batch = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("expected another capped batch")
+            .expect("consumer channel should be open");
+
+        let partitions_in_batch: std::collections::HashSet<i32> = batch
+            .persons
+            .iter()
+            .map(|p| if p.person.id <= 3 { 0 } else { 1 })
+            .collect();
+        let committed: std::collections::HashSet<i32> =
+            batch.offsets.keys().map(|s| s.partition).collect();
+        assert_eq!(
+            committed, partitions_in_batch,
+            "a batch's offsets must cover exactly the partitions it drained"
+        );
+
+        for (source, offset) in &batch.offsets {
+            let entry = max_offset_seen.entry(source.partition).or_insert(-1);
+            *entry = (*entry).max(*offset);
+        }
+        seen_persons += batch.persons.len();
+        batches += 1;
+    }
+
+    assert!(batches >= 2, "a capped drain must split 6 rows at cap 3");
+    // Three messages per partition, offsets 0..=2, all eventually committed.
+    assert_eq!(max_offset_seen[&0], 2);
+    assert_eq!(max_offset_seen[&1], 2);
+}
+
+async fn wait_until(limit: Duration, mut ready: impl FnMut() -> bool) -> Result<(), ()> {
+    let deadline = tokio::time::Instant::now() + limit;
+    while !ready() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+fn committed_offset(tpl: &TopicPartitionList, partition: i32) -> Option<i64> {
+    tpl.elements()
+        .iter()
+        .find(|e| e.partition() == partition)
+        .and_then(|e| match e.offset() {
+            Offset::Offset(offset) => Some(offset),
+            _ => None,
+        })
+}
+
+/// A second member joining revokes one partition from the first, which must
+/// flush only the partition it kept and leave the revoked one uncommitted.
+#[tokio::test]
+async fn revoked_partitions_are_dropped_and_their_offsets_stay_uncommitted() {
+    let (mock_cluster, producer) = common::create_mock_kafka_with_partitions(2).await;
+    let team_id: i64 = 99_062;
+
+    let member_config = |client_id: &str| {
+        ClientConfig::new()
+            .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+            .set("group.id", "test-revoke")
+            .set("client.id", client_id)
+            .set("auto.offset.reset", "earliest")
+            .set("enable.auto.commit", "false")
+            .set("enable.auto.offset.store", "false")
+            .set("partition.assignment.strategy", "cooperative-sticky")
+            .set("session.timeout.ms", "6000")
+            .set("heartbeat.interval.ms", "1000")
+            .clone()
+    };
+
+    // Two persons per partition, produced before the first member joins so
+    // it reads them as soon as it is assigned. Ids encode the partition.
+    for (partition, id) in [(0, 1), (0, 2), (1, 3), (1, 4)] {
+        let person = make_person(team_id, id, 1);
+        let payload = person.encode_to_vec();
+        let key = format!("{team_id}:{id}");
+        let record = FutureRecord::to(TOPIC)
+            .partition(partition)
+            .key(&key)
+            .payload(&payload);
+        producer
+            .send_result(record)
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let first = Arc::new(PersonConsumer::new(&member_config("first"), TOPIC.to_string()).unwrap());
+    let (tx, mut rx) = mpsc::channel::<FlushBatch>(4);
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let consumer_handle = manager.register(
+        "consumer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let shutdown = consumer_handle.clone();
+    let _monitor = manager.monitor_background();
+
+    // A timer far beyond the test and a size threshold above the row count:
+    // only the shutdown flush drains the buffer.
+    let consumer_task = ConsumerTask::new(
+        Arc::clone(&first),
+        vec![tx],
+        100,
+        Duration::from_secs(600),
+        100,
+        consumer_handle,
+    );
+    tokio::spawn(async move { consumer_task.run().await });
+
+    wait_until(Duration::from_secs(20), || {
+        first
+            .positions()
+            .map(|p| p.get(&source(0)) == Some(&2) && p.get(&source(1)) == Some(&2))
+            .unwrap_or(false)
+    })
+    .await
+    .expect("the first member should consume both partitions");
+
+    // The second member joins and keeps polling so the rebalance completes.
+    let second: Arc<StreamConsumer> = Arc::new(member_config("second").create().unwrap());
+    second.subscribe(&[TOPIC]).unwrap();
+    {
+        let second = Arc::clone(&second);
+        tokio::spawn(async move { while second.recv().await.is_ok() {} });
+    }
+    wait_until(Duration::from_secs(20), || {
+        second.assignment().map(|a| a.count() == 1).unwrap_or(false)
+    })
+    .await
+    .expect("the second member should take one partition");
+    let revoked = second.assignment().unwrap().elements()[0].partition();
+    let kept = 1 - revoked;
+
+    shutdown.request_shutdown();
+    let mut flushed_ids = Vec::new();
+    let mut flushed_partitions = HashSet::new();
+    while let Ok(Some(batch)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+        flushed_ids.extend(batch.persons.iter().map(|p| p.person.id));
+        flushed_partitions.extend(batch.offsets.keys().map(|s| s.partition));
+    }
+    flushed_ids.sort_unstable();
+    let kept_ids = if kept == 0 { vec![1, 2] } else { vec![3, 4] };
+    assert_eq!(
+        flushed_ids, kept_ids,
+        "only the kept partition's rows may flush"
+    );
+    assert_eq!(flushed_partitions, HashSet::from([kept]));
+
+    first
+        .commit_offsets(&HashMap::from([(source(kept), 1), (source(revoked), 1)]))
+        .unwrap();
+    let mut probe = TopicPartitionList::new();
+    probe.add_partition(TOPIC, kept);
+    probe.add_partition(TOPIC, revoked);
+    wait_until(Duration::from_secs(10), || {
+        second
+            .committed_offsets(probe.clone(), Duration::from_secs(2))
+            .map(|c| committed_offset(&c, kept) == Some(2))
+            .unwrap_or(false)
+    })
+    .await
+    .expect("the kept partition's commit should land");
+    let committed = second
+        .committed_offsets(probe.clone(), Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        committed_offset(&committed, revoked),
+        None,
+        "the revoked partition must stay uncommitted"
+    );
+}
+
+const NEXT_TOPIC: &str = "personhog_updates_g2";
+
+fn plain_member_config(bootstrap: &str, group: &str) -> ClientConfig {
+    ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", group)
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("session.timeout.ms", "6000")
+        .set("heartbeat.interval.ms", "1000")
+        .clone()
+}
+
+/// After a resubscribe the assignment reuses the partition numbers, so an
+/// old-topic batch still in flight must never commit onto the next topic.
+#[tokio::test]
+async fn a_late_batch_never_commits_its_offsets_onto_the_next_topic() {
+    let (mock_cluster, _producer) = common::create_mock_kafka_with_partitions(2).await;
+    mock_cluster
+        .create_topic(NEXT_TOPIC, 2, 1)
+        .expect("create the next generation");
+    let bootstrap = mock_cluster.bootstrap_servers();
+    let member = plain_member_config(&bootstrap, "test-late-batch");
+
+    let consumer = Arc::new(PersonConsumer::new(&member, TOPIC.to_string()).unwrap());
+    // Keeps the client polled, so rebalances land.
+    {
+        let consumer = Arc::clone(&consumer);
+        tokio::spawn(async move {
+            loop {
+                drop(consumer.recv().await);
+            }
+        });
+    }
+    let assigned_to = |consumer: &PersonConsumer, topic: &str| {
+        consumer
+            .assigned_partitions()
+            .ok()
+            .flatten()
+            .is_some_and(|a| a == HashSet::from([source_on(topic, 0), source_on(topic, 1)]))
+    };
+    wait_until(Duration::from_secs(20), || assigned_to(&consumer, TOPIC))
+        .await
+        .expect("the member owns the first topic");
+
+    let probe: StreamConsumer = plain_member_config(&bootstrap, "test-late-batch")
+        .create()
+        .unwrap();
+    let mut both = TopicPartitionList::new();
+    for topic in [TOPIC, NEXT_TOPIC] {
+        both.add_partition(topic, 0);
+        both.add_partition(topic, 1);
+    }
+    let committed_on = |topic: &str, partition: i32| {
+        probe
+            .committed_offsets(both.clone(), Duration::from_secs(2))
+            .ok()
+            .and_then(|c| {
+                c.elements()
+                    .iter()
+                    .find(|e| e.topic() == topic && e.partition() == partition)
+                    .and_then(|e| match e.offset() {
+                        Offset::Offset(offset) => Some(offset),
+                        _ => None,
+                    })
+            })
+    };
+
+    consumer
+        .commit_offsets(&HashMap::from([(source(0), 1)]))
+        .unwrap();
+    wait_until(Duration::from_secs(10), || {
+        committed_on(TOPIC, 0) == Some(2)
+    })
+    .await
+    .expect("the first topic's commit lands");
+
+    consumer.resubscribe(NEXT_TOPIC.to_string()).unwrap();
+    wait_until(Duration::from_secs(20), || {
+        assigned_to(&consumer, NEXT_TOPIC)
+    })
+    .await
+    .expect("the member moves to the next topic");
+
+    // Commits are sequenced on the client: the live one landing proves the late one was handled.
+    consumer
+        .commit_offsets(&HashMap::from([(source(1), 5)]))
+        .unwrap();
+    consumer
+        .commit_offsets(&HashMap::from([(source_on(NEXT_TOPIC, 0), 0)]))
+        .unwrap();
+    wait_until(Duration::from_secs(10), || {
+        committed_on(NEXT_TOPIC, 0) == Some(1)
+    })
+    .await
+    .expect("the next topic's commit lands");
+
+    assert_eq!(
+        committed_on(NEXT_TOPIC, 1),
+        None,
+        "an old-topic batch must not commit onto the next topic"
+    );
+    assert_eq!(
+        committed_on(TOPIC, 1),
+        None,
+        "a batch for a partition no longer assigned is not committed"
+    );
+    assert_eq!(committed_on(TOPIC, 0), Some(2));
+}
+
+/// The draining flag follows the subscribed topic, not the move: a writer
+/// already on the topic when it was sealed raises it too.
+#[tokio::test]
+async fn the_draining_flag_follows_the_subscribed_topic_not_the_move() {
+    let (mock_cluster, _producer) = common::create_mock_kafka_with_partitions(1).await;
+    mock_cluster
+        .create_topic(NEXT_TOPIC, 1, 1)
+        .expect("create the next generation");
+    let member = plain_member_config(&mock_cluster.bootstrap_servers(), "test-follow");
+    let consumer = PersonConsumer::new(&member, TOPIC.to_string()).unwrap();
+    let flipped = ChangelogConfig {
+        cluster: None,
+        topic: NEXT_TOPIC.to_string(),
+        partitions: 1,
+        epoch: 2,
+        writer_group: "test-follow".to_string(),
+        retire_groups: vec![],
+        draining: vec![Generation {
+            cluster: None,
+            topic: TOPIC.to_string(),
+            partitions: 1,
+            epoch: 1,
+        }],
+    };
+
+    let mut follower = Follower::default();
+    follower
+        .follow_once(&consumer, &flipped, |_| async { Ok(false) })
+        .await
+        .unwrap();
+    assert_eq!(consumer.topic(), TOPIC);
+    assert!(
+        consumer.is_draining(),
+        "the subscribed topic is a sealed generation"
+    );
+
+    follower
+        .follow_once(&consumer, &flipped, |_| async { Ok(true) })
+        .await
+        .unwrap();
+    assert_eq!(consumer.topic(), NEXT_TOPIC);
+    assert!(!consumer.is_draining());
+
+    // A later probe that cannot vouch for the old generation never sends it back.
+    follower
+        .follow_once(&consumer, &flipped, |_| async { Ok(false) })
+        .await
+        .unwrap();
+    assert_eq!(consumer.topic(), NEXT_TOPIC);
+}
+
+// ============================================================
+// Writer task: signals completion through channel
+// ============================================================
+
+#[tokio::test]
+async fn writer_processes_batch_from_channel() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(2);
+
+    let (mock_cluster, _) = create_mock_kafka().await;
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-writer-channel")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false");
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let writer_handle = manager.register("writer", lifecycle::ComponentOptions::new());
+    let _monitor = manager.monitor_background();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), writer, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    // Send a batch directly through the channel
+    let person = make_person(team_id as i64, 1, 1);
+    let batch = FlushBatch {
+        persons: rows(vec![person]),
+        offsets: HashMap::new(),
+        oldest_message_ts_ms: None,
+    };
+    flush_tx.send(batch).await.unwrap();
+
+    // Wait for the row to appear
+    let mut retries = 0;
+    loop {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM personhog_person_tmp WHERE team_id = $1 AND id = $2",
+        )
+        .bind(team_id)
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        if count.0 == 1 {
+            break;
+        }
+
+        retries += 1;
+        if retries > 50 {
+            panic!("Row never appeared in personhog_person_tmp");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    cleanup_team(&pool, team_id).await;
+}
+
+// ============================================================
+// Writer task: failure and recovery (mock-based)
+// ============================================================
+
+/// Mock DB that fails chunks a configurable number of times, then succeeds.
+/// Rows succeed unless `row_error_kind` is set. Exercises the full
+/// orchestration layer above it.
+struct MockDb {
+    chunk_remaining_failures: std::sync::atomic::AtomicU32,
+    chunk_error_kind: WriteErrorKind,
+    row_error_kind: Option<WriteErrorKind>,
+}
+
+#[async_trait::async_trait]
+impl PersonDb for MockDb {
+    async fn execute_chunk(&self, _chunk: &[Person]) -> Result<(), WriteError> {
+        let remaining = self.chunk_remaining_failures.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |v| if v > 0 { Some(v - 1) } else { None },
+        );
+        if remaining.is_ok() {
+            Err(WriteError {
+                message: "mock failure".to_string(),
+                kind: self.chunk_error_kind,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn execute_row(&self, _person: &Person) -> Result<(), WriteError> {
+        match self.row_error_kind {
+            Some(kind) => Err(WriteError {
+                message: "mock row failure".to_string(),
+                kind,
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn writer_crashes_after_exhausting_transient_retries() {
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(4);
+
+    let (mock_cluster, _) = create_mock_kafka().await;
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-writer-crash")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false");
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let writer_handle = manager.register("writer", lifecycle::ComponentOptions::new());
+    let monitor = manager.monitor_background();
+
+    // Always fail with transient errors
+    let mock_db = MockDb {
+        chunk_remaining_failures: std::sync::atomic::AtomicU32::new(100),
+        chunk_error_kind: WriteErrorKind::Transient,
+        row_error_kind: None,
+    };
+    let store = PersonWriteStore::new(
+        mock_db,
+        personhog_writer::store::StoreConfig {
+            chunk_size: 10,
+            row_fallback_concurrency: 4,
+        },
+        common::test_permits(),
+    );
+
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), store, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    let batch = FlushBatch {
+        persons: rows(vec![make_person(99_040, 1, 1)]),
+        offsets: HashMap::new(),
+        oldest_message_ts_ms: None,
+    };
+    flush_tx.send(batch).await.unwrap();
+
+    // Should crash within backoff time (1s + 2s + 4s = 7s + overhead)
+    let result = tokio::time::timeout(Duration::from_secs(15), monitor.wait()).await;
+    assert!(result.is_ok(), "lifecycle should shut down within timeout");
+    assert!(
+        result.unwrap().is_err(),
+        "lifecycle should report component failure"
+    );
+}
+
+#[tokio::test]
+async fn writer_recovers_on_transient_retry() {
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(4);
+
+    let (mock_cluster, _) = create_mock_kafka().await;
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-writer-recover")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false");
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let writer_handle = manager.register("writer", lifecycle::ComponentOptions::new());
+    let _monitor = manager.monitor_background();
+
+    // Fail once, then succeed
+    let mock_db = MockDb {
+        chunk_remaining_failures: std::sync::atomic::AtomicU32::new(1),
+        chunk_error_kind: WriteErrorKind::Transient,
+        row_error_kind: None,
+    };
+    let store = PersonWriteStore::new(
+        mock_db,
+        personhog_writer::store::StoreConfig {
+            chunk_size: 10,
+            row_fallback_concurrency: 4,
+        },
+        common::test_permits(),
+    );
+
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), store, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    let batch = FlushBatch {
+        persons: rows(vec![make_person(99_041, 1, 1)]),
+        offsets: HashMap::new(),
+        oldest_message_ts_ms: None,
+    };
+    flush_tx.send(batch).await.unwrap();
+
+    // Send a second batch to verify the writer is still alive after recovery
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let batch2 = FlushBatch {
+        persons: rows(vec![make_person(99_041, 2, 1)]),
+        offsets: HashMap::new(),
+        oldest_message_ts_ms: None,
+    };
+    assert!(
+        flush_tx.send(batch2).await.is_ok(),
+        "writer should still be alive after transient recovery"
+    );
+}
+
+#[tokio::test]
+async fn writer_falls_back_to_per_row_on_data_error() {
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(4);
+
+    let (mock_cluster, _) = create_mock_kafka().await;
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-writer-fallback")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false");
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let writer_handle = manager.register("writer", lifecycle::ComponentOptions::new());
+    let _monitor = manager.monitor_background();
+
+    // Batch always fails with data error, per-row always succeeds
+    let mock_db = MockDb {
+        chunk_remaining_failures: std::sync::atomic::AtomicU32::new(100),
+        chunk_error_kind: WriteErrorKind::Data,
+        row_error_kind: None,
+    };
+    let store = PersonWriteStore::new(
+        mock_db,
+        personhog_writer::store::StoreConfig {
+            chunk_size: 10,
+            row_fallback_concurrency: 4,
+        },
+        common::test_permits(),
+    );
+
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), store, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    let batch = FlushBatch {
+        persons: rows(vec![make_person(99_042, 1, 1), make_person(99_042, 2, 1)]),
+        offsets: HashMap::new(),
+        oldest_message_ts_ms: None,
+    };
+    flush_tx.send(batch).await.unwrap();
+
+    // Writer should handle the data error via fallback and stay alive
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let batch2 = FlushBatch {
+        persons: rows(vec![make_person(99_042, 3, 1)]),
+        offsets: HashMap::new(),
+        oldest_message_ts_ms: None,
+    };
+    assert!(
+        flush_tx.send(batch2).await.is_ok(),
+        "writer should still be alive after data error fallback"
+    );
+}
+
+/// After a batch with unapplyable rows signals failure, the writer must
+/// stop receiving entirely: Kafka offset commits are cumulative per
+/// partition, so processing a later batch and committing its offsets
+/// would silently skip the failed batch's uncommitted rows after restart.
+/// The observable halt is the flush channel closing.
+#[tokio::test]
+async fn unapplyable_batch_halts_the_writer_before_any_later_batch() {
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(4);
+
+    let (mock_cluster, _) = create_mock_kafka().await;
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "test-writer-halt")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false");
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let writer_handle = manager.register("writer", lifecycle::ComponentOptions::new());
+    let monitor = manager.monitor_background();
+
+    // The first chunk fails with a data error and its per-row fallback
+    // fails too — an unapplyable batch despite leader admission. Later
+    // chunks would succeed, so a writer that kept going would commit the
+    // buffered batch's offsets past the failed one.
+    let mock_db = MockDb {
+        chunk_remaining_failures: std::sync::atomic::AtomicU32::new(1),
+        chunk_error_kind: WriteErrorKind::Data,
+        row_error_kind: Some(WriteErrorKind::PropertiesSizeViolation),
+    };
+    let store = PersonWriteStore::new(
+        mock_db,
+        personhog_writer::store::StoreConfig {
+            chunk_size: 10,
+            row_fallback_concurrency: 4,
+        },
+        common::test_permits(),
+    );
+
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), store, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    // A second batch is already buffered behind the poison one — the
+    // regression this guards is the writer pulling and committing it.
+    let poison = FlushBatch {
+        persons: rows(vec![make_person(99_043, 1, 1)]),
+        offsets: HashMap::new(),
+        oldest_message_ts_ms: None,
+    };
+    let buffered = FlushBatch {
+        persons: rows(vec![make_person(99_043, 2, 1)]),
+        offsets: HashMap::new(),
+        oldest_message_ts_ms: None,
+    };
+    flush_tx.send(poison).await.unwrap();
+    flush_tx.send(buffered).await.unwrap();
+
+    // The writer must drop its receiver without consuming the buffered
+    // batch, and the lifecycle must report the failure.
+    tokio::time::timeout(Duration::from_secs(5), flush_tx.closed())
+        .await
+        .expect("writer should stop receiving after an unapplyable batch");
+    let result = tokio::time::timeout(Duration::from_secs(5), monitor.wait())
+        .await
+        .expect("lifecycle should shut down");
+    assert!(result.is_err(), "lifecycle should report component failure");
+}
+
+// ============================================================
+// Properties size violation: invariant violation, never corrected
+// ============================================================
+
+/// A row violating check_properties_size cannot reach the writer through
+/// a correctly-admitting leader, so the writer treats one as an admission
+/// bug: a non-transient error that halts the flush without committing and
+/// writes nothing. A writer-side trim or skip would make Postgres diverge
+/// from the cache and changelog — the exact drift leader admission exists
+/// to prevent.
+#[tokio::test]
+async fn properties_size_violation_errors_and_writes_nothing() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    let store = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+
+    // Would have been trimmable under the old semantics: protected email
+    // is small, two large custom properties push past the constraint.
+    let mut props = serde_json::Map::new();
+    props.insert(
+        "email".to_string(),
+        serde_json::json!("protected@example.com"),
+    );
+    let big_value = "x".repeat(400_000);
+    props.insert("custom_a".to_string(), serde_json::json!(big_value));
+    props.insert("custom_b".to_string(), serde_json::json!(big_value));
+
+    let mut person = make_person(team_id as i64, 1, 1);
+    person.properties = serde_json::to_vec(&serde_json::Value::Object(props)).unwrap();
+
+    let err = store
+        .upsert_row(&person)
+        .await
+        .expect_err("an unapplyable row must error, never be skipped");
+    assert!(matches!(err.kind, WriteErrorKind::PropertiesSizeViolation));
+
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM personhog_person_tmp WHERE team_id = $1 AND id = $2")
+            .bind(team_id)
+            .bind(1_i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count.0, 0, "an unapplyable person must write nothing");
+
+    cleanup_team(&pool, team_id).await;
+}
+
+// ============================================================
+// E2E: real Kafka + real PG
+// ============================================================
+
+#[tokio::test]
+async fn e2e_produce_to_kafka_and_verify_pg_write() {
+    let pool = create_test_pool().await;
+    let team_id: i32 = unique_team_id();
+
+    // Produce a Person proto to local Kafka
+    let producer = create_local_kafka_producer().await;
+    let person = make_person(team_id as i64, 42, 1);
+    let payload = person.encode_to_vec();
+    let key = format!("{team_id}:42");
+    let record = FutureRecord::to(TOPIC).key(&key).payload(&payload);
+    producer
+        .send_result(record)
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Set up the full consumer + writer pipeline against local Kafka
+    let (flush_tx, flush_rx) = mpsc::channel::<FlushBatch>(2);
+
+    let client_config = ClientConfig::new()
+        .set("bootstrap.servers", KAFKA_BOOTSTRAP)
+        .set(
+            "group.id",
+            format!("e2e-pg-writer-{}", uuid::Uuid::new_v4()),
+        )
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .clone();
+    let kafka_consumer = Arc::new(PersonConsumer::new(&client_config, TOPIC.to_string()).unwrap());
+
+    let mut manager = lifecycle::Manager::builder("test")
+        .with_trap_signals(false)
+        .build();
+    let consumer_handle = manager.register(
+        "consumer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let writer_handle = manager.register(
+        "writer",
+        lifecycle::ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(5)),
+    );
+    let _monitor = manager.monitor_background();
+
+    let writer = PersonWriteStore::new(
+        PgStore::new(pool.clone(), TARGET_TABLE.to_string()),
+        common::test_store_config(),
+        common::test_permits(),
+    );
+    let writer_task = WriterTask::new(Arc::clone(&kafka_consumer), writer, flush_rx, writer_handle);
+    tokio::spawn(async move { writer_task.run().await });
+
+    let consumer_task = ConsumerTask::new(
+        kafka_consumer,
+        vec![flush_tx],
+        50000,
+        Duration::from_millis(500), // fast flush for test
+        1,                          // flush after every message
+        consumer_handle,
+    );
+    tokio::spawn(async move { consumer_task.run().await });
+
+    // Wait for the row to appear in PG
+    let mut retries = 0;
+    loop {
+        let result: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, version FROM personhog_person_tmp WHERE team_id = $1 AND id = $2",
+        )
+        .bind(team_id)
+        .bind(42_i64)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        if let Some((id, version)) = result {
+            assert_eq!(id, 42);
+            assert_eq!(version, 1);
+            break;
+        }
+
+        retries += 1;
+        if retries > 100 {
+            panic!("Row never appeared in personhog_person_tmp for team {team_id}, person 42");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    cleanup_team(&pool, team_id).await;
+}

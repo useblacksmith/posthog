@@ -1,0 +1,155 @@
+import '@testing-library/jest-dom'
+
+import { cleanup, render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+
+import { NodeKind } from '~/queries/schema/schema-general'
+import { initKeaTests } from '~/test/init'
+import { EntityTypes } from '~/types'
+
+import { DisplayableEntity, EntityFilterInfo } from './EntityFilterInfo'
+
+describe('EntityFilterInfo', () => {
+    beforeEach(() => {
+        initKeaTests()
+    })
+
+    afterEach(cleanup)
+
+    // A series can be renamed via `custom_name`, or via `name` (e.g. set through the API).
+    // In both cases the label alone doesn't reveal the event actually queried, so the
+    // underlying event must be shown alongside it.
+    it.each([
+        [
+            'custom_name matching name',
+            { type: EntityTypes.EVENTS, id: 'user signed up', name: 'Signed up', custom_name: 'Signed up' },
+            'Signed up',
+            'user signed up',
+        ],
+        [
+            'name only',
+            { type: EntityTypes.EVENTS, id: '$pageview', name: 'Visited posthog.com' },
+            'Visited posthog.com',
+            'Pageview',
+        ],
+        [
+            'custom_name on an action',
+            { type: EntityTypes.ACTIONS, id: 5, name: 'Completed purchase', custom_name: 'Checkout' },
+            'Checkout',
+            'Completed purchase',
+        ],
+        [
+            'custom_name on an all-events series',
+            { type: EntityTypes.EVENTS, id: null, name: 'All events', custom_name: 'Total traffic' },
+            'Total traffic',
+            'All events',
+        ],
+        [
+            'name on a flag calls series',
+            {
+                kind: NodeKind.DataWarehouseNode,
+                id: 'posthog.flag_evaluations',
+                table_name: 'posthog.flag_evaluations',
+                name: 'Checkout flag calls',
+                timestamp_field: 'timestamp',
+                id_field: 'uuid',
+                distinct_id_field: 'distinct_id',
+            },
+            'Checkout flag calls',
+            'Feature flag called',
+        ],
+    ] as [string, DisplayableEntity, string, string][])(
+        'shows the underlying entity next to a series renamed via %s',
+        (_, filter, label, underlying) => {
+            render(<EntityFilterInfo filter={filter} />)
+            expect(screen.getByText(label)).toBeInTheDocument()
+            expect(screen.getByText(underlying)).toBeInTheDocument()
+        }
+    )
+
+    it.each([
+        [
+            'a custom event',
+            { type: EntityTypes.EVENTS, id: 'user signed up', name: 'user signed up' },
+            'user signed up',
+        ],
+        ['a core event', { type: EntityTypes.EVENTS, id: '$pageview', name: '$pageview' }, 'Pageview'],
+        // API-created series often carry no name at all — the raw id label is not a rename
+        ['a name-less core event', { type: EntityTypes.EVENTS, id: '$pageview' }, '$pageview'],
+        ['an all-events series', { type: EntityTypes.EVENTS, id: null, name: 'All events' }, 'All events'],
+        [
+            'a flag calls series',
+            {
+                kind: NodeKind.DataWarehouseNode,
+                id: 'posthog.flag_evaluations',
+                table_name: 'posthog.flag_evaluations',
+                name: 'Feature flag called',
+                timestamp_field: 'timestamp',
+                id_field: 'uuid',
+                distinct_id_field: 'distinct_id',
+            },
+            'Feature flag called',
+        ],
+        [
+            'a flag calls series in query results',
+            {
+                type: EntityTypes.EVENTS,
+                id: 'posthog.flag_evaluations',
+                name: 'posthog.flag_evaluations',
+                custom_name: 'Feature flag called',
+            },
+            'Feature flag called',
+        ],
+        [
+            'a flag calls step in funnel results',
+            {
+                type: EntityTypes.DATA_WAREHOUSE,
+                id: null,
+                name: 'posthog.flag_evaluations',
+                custom_name: 'Feature flag called',
+            },
+            'Feature flag called',
+        ],
+    ] as [string, DisplayableEntity, string][])(
+        'shows a single label for an unrenamed series on %s',
+        (_, filter, label) => {
+            const { container } = render(<EntityFilterInfo filter={filter} />)
+            expect(screen.getAllByText(label)).toHaveLength(1)
+            expect(container.querySelectorAll('.EntityFilterInfo')).toHaveLength(1)
+        }
+    )
+
+    it('keeps the underlying entity out of the inline label when showSingleName is set', () => {
+        const { container } = render(
+            <EntityFilterInfo
+                filter={{ type: EntityTypes.EVENTS, id: 'user signed up', name: 'Signed up', custom_name: 'Signed up' }}
+                showSingleName
+            />
+        )
+        expect(container).toHaveTextContent('Signed up')
+        expect(container).not.toHaveTextContent('user signed up')
+    })
+
+    it('reveals the raw event key in the tooltip of a renamed series', async () => {
+        render(
+            <EntityFilterInfo
+                filter={{ type: EntityTypes.EVENTS, id: 'user signed up', name: 'Signed up', custom_name: 'Signed up' }}
+            />
+        )
+        userEvent.hover(screen.getByText('Signed up'))
+        expect(await screen.findByText(/Event sent as/, {}, { timeout: 3000 })).toBeInTheDocument()
+    })
+
+    // Formula series carry `action: null`, so callers pass a null filter. That must render
+    // nothing rather than crash the scene (getUnderlyingEntity used to dereference filter.type).
+    it.each([
+        ['null', null],
+        ['undefined', undefined],
+    ] as [string, DisplayableEntity | null | undefined][])(
+        'renders nothing without throwing for a %s filter',
+        (_, filter) => {
+            const { container } = render(<EntityFilterInfo filter={filter} />)
+            expect(container.querySelectorAll('.EntityFilterInfo')).toHaveLength(0)
+        }
+    )
+})

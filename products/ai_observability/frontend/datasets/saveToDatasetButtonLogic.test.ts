@@ -1,0 +1,1120 @@
+import { router } from 'kea-router'
+import { expectLogic } from 'kea-test-utils'
+import posthog from 'posthog-js'
+
+import { ApiError } from 'lib/api-error'
+import { lemonToast } from 'lib/lemon-ui/LemonToast'
+import { lemonToast as loaderFailureToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+
+import { initKeaTests } from '~/test/init'
+
+import type { DatasetReadApi as Dataset, PaginatedDatasetReadListApi } from '../generated/api.schemas'
+import { datasetsApi } from './datasetsApi'
+import {
+    DATASETS_PER_PAGE,
+    RECENT_DATASETS_LIMIT,
+    getStorageKey,
+    saveToDatasetButtonLogic,
+    truncateRecentDatasets,
+} from './saveToDatasetButtonLogic'
+import type { DatasetItemDraft, TraceStep } from './traceStepDatasetItem'
+
+jest.mock('./datasetsApi', () => ({
+    datasetsApi: {
+        listDatasets: jest.fn(),
+        createItem: jest.fn(),
+        getTraceStepItem: jest.fn(),
+    },
+}))
+jest.mock('lib/lemon-ui/LemonToast')
+jest.mock('lib/lemon-ui/LemonToast/LemonToast')
+
+describe('saveToDatasetButtonLogic', () => {
+    const mockDataset1: Dataset = {
+        tags: [],
+        id: 'test-dataset-1',
+        name: 'Test Dataset 1',
+        description: 'First test dataset',
+        metadata: { key1: 'value1' },
+        team_id: 997,
+        created_at: '2024-01-01T00:00:00Z',
+        updated_at: '2024-01-01T00:00:00Z',
+        created_by: null,
+        archived: false,
+        expires_at: null,
+        expiring_soon: false,
+        current_revision: null,
+        current_revision_id: null,
+        user_access_level: 'editor',
+    }
+
+    const mockDataset2: Dataset = {
+        tags: [],
+        id: 'test-dataset-2',
+        name: 'Test Dataset 2',
+        description: 'Second test dataset',
+        metadata: { key2: 'value2' },
+        team_id: 997,
+        created_at: '2024-01-02T00:00:00Z',
+        updated_at: '2024-01-02T00:00:00Z',
+        created_by: null,
+        archived: false,
+        expires_at: null,
+        expiring_soon: false,
+        current_revision: null,
+        current_revision_id: null,
+        user_access_level: 'editor',
+    }
+
+    const STEP_A: TraceStep = { traceId: 't-1', nodeId: 'n-a', timestamp: '2026-09-01T10:00:00Z' }
+    const STEP_B: TraceStep = { ...STEP_A, nodeId: 'n-b' }
+    const draftA: DatasetItemDraft = {
+        client_item_id: 'n-a',
+        source_trace_id: 't-1',
+        source_event_id: 'n-a',
+        source_timestamp: STEP_A.timestamp,
+        input: { messages: ['step a'] },
+        source_output: { answer: 'a' },
+        metadata: { model: 'model-a' },
+    }
+    const draftB: DatasetItemDraft = {
+        ...draftA,
+        client_item_id: 'n-b',
+        source_event_id: 'n-b',
+        input: { messages: ['step b'] },
+        source_output: { answer: 'b' },
+        metadata: { model: 'model-b' },
+    }
+
+    const mockDatasetsResponse: PaginatedDatasetReadListApi = {
+        results: [mockDataset1, mockDataset2],
+        count: 2,
+        next: null,
+        previous: null,
+    }
+
+    const mockDatasetsApi = jest.mocked(datasetsApi)
+
+    beforeEach(() => {
+        jest.resetAllMocks()
+
+        // Clear localStorage to ensure persistent state doesn't leak between tests
+        window.localStorage.clear()
+
+        // Mock lemonToast methods
+        ;(lemonToast.success as jest.Mock) = jest.fn()
+        ;(lemonToast.error as jest.Mock) = jest.fn()
+
+        mockDatasetsApi.listDatasets.mockResolvedValue(mockDatasetsResponse)
+        mockDatasetsApi.createItem.mockResolvedValue({} as never)
+        mockDatasetsApi.getTraceStepItem.mockResolvedValue(draftA)
+    })
+
+    describe('getStorageKey', () => {
+        it('serializes a key with search term', () => {
+            const key = getStorageKey('test search')
+            expect(key).toBe('limit=100&offset=0&search=test%20search')
+        })
+
+        it('serializes a key with empty search', () => {
+            const key = getStorageKey('')
+            expect(key).toBe('limit=100&offset=0&search=')
+        })
+
+        it('serializes a key with special characters', () => {
+            const key = getStorageKey('test & special')
+            expect(key).toBe('limit=100&offset=0&search=test%20%26%20special')
+        })
+    })
+
+    describe('truncateRecentDatasets', () => {
+        it('returns array unchanged when under limit', () => {
+            const input = [mockDataset1, mockDataset2]
+            const result = truncateRecentDatasets(input)
+            expect(result).toEqual(input)
+            expect(result).toHaveLength(2)
+        })
+
+        it('truncates array to limit when over limit', () => {
+            const mockDataset3: Dataset = { ...mockDataset1, id: 'test-dataset-3', name: 'Test Dataset 3' }
+            const mockDataset4: Dataset = { ...mockDataset1, id: 'test-dataset-4', name: 'Test Dataset 4' }
+            const input = [mockDataset1, mockDataset2, mockDataset3, mockDataset4]
+            const result = truncateRecentDatasets(input)
+            expect(result).toEqual([mockDataset1, mockDataset2, mockDataset3])
+            expect(result).toHaveLength(RECENT_DATASETS_LIMIT)
+        })
+
+        it('returns empty array when input is empty', () => {
+            const result = truncateRecentDatasets([])
+            expect(result).toEqual([])
+            expect(result).toHaveLength(0)
+        })
+
+        it('returns array unchanged when exactly at limit', () => {
+            const mockDataset3: Dataset = { ...mockDataset1, id: 'test-dataset-3', name: 'Test Dataset 3' }
+            const input = [mockDataset1, mockDataset2, mockDataset3]
+            const result = truncateRecentDatasets(input)
+            expect(result).toEqual(input)
+            expect(result).toHaveLength(RECENT_DATASETS_LIMIT)
+        })
+    })
+
+    describe('logic tests', () => {
+        beforeEach(() => {
+            initKeaTests()
+            // Mock router actions after Kea is initialized
+            jest.spyOn(router.actions, 'push').mockImplementation(jest.fn())
+        })
+
+        describe('datasets selector', () => {
+            it('returns datasets for matching search key', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // Set search form value first
+                logic.actions.setSearchFormValue('search', 'test')
+
+                // Manually populate the datasetStore with the right key
+                const storageKey = getStorageKey('test')
+                logic.actions.loadDatasetsSuccess({
+                    ...logic.values.datasetStore,
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+
+                expect(logic.values.datasets).toEqual([mockDataset1, mockDataset2])
+            })
+
+            it('returns null when no datasets match search key', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.setSearchFormValue('search', 'nonexistent')
+
+                expect(logic.values.datasets).toBeNull()
+            })
+
+            it('returns datasets for empty search', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // For empty search, the default search form value is ''
+                const storageKey = getStorageKey('')
+                logic.actions.loadDatasetsSuccess({
+                    ...logic.values.datasetStore,
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+
+                expect(logic.values.datasets).toEqual([mockDataset1, mockDataset2])
+            })
+        })
+
+        describe('isLoadingDatasets selector', () => {
+            it('returns true when datasets is null and loading', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.loadDatasets()
+
+                expect(logic.values.isLoadingDatasets).toBe(true)
+            })
+
+            it('returns false when datasets exist', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // Load datasets with the correct storage key structure
+                const storageKey = getStorageKey('')
+                logic.actions.loadDatasetsSuccess({
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+
+                expect(logic.values.isLoadingDatasets).toBe(false)
+            })
+
+            it('returns false when not loading even if datasets is null', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // Wait for any initial loading to complete
+                await expectLogic(logic).toFinishAllListeners()
+
+                // Now make sure datasets is populated so the selector can work properly
+                const storageKey = getStorageKey('')
+                logic.actions.loadDatasetsSuccess({
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+
+                // isLoadingDatasets should be false when datasets exist
+                expect(logic.values.isLoadingDatasets).toBe(false)
+
+                // Clear datasets to test null case but not loading
+                logic.actions.loadDatasetsSuccess({})
+
+                // datasets should be null and still not loading
+                expect(logic.values.datasets).toBeNull()
+                expect(logic.values.isLoadingDatasets).toBe(false)
+            })
+        })
+
+        describe('form reset conditions', () => {
+            it('resets search form when modal is opened', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.setSearchFormValue('search', 'test search')
+                logic.actions.setIsModalOpen(true)
+
+                expect(logic.values.searchForm.search).toBe('')
+            })
+
+            it('resets search form when dropdown is closed', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.setSearchFormValue('search', 'test search')
+                // Manually reset the form to simulate what would happen in the UI
+                logic.actions.resetSearchForm()
+
+                expect(logic.values.searchForm.search).toBe('')
+            })
+
+            it('resets search form after successful dataset selection', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // First set the search form value, then load datasets with matching key
+                logic.actions.setSearchFormValue('search', 'test')
+                const storageKey = getStorageKey('test')
+                logic.actions.loadDatasetsSuccess({
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+
+                // Set edit mode to create so the form submission creates an item
+                logic.actions.setEditMode('create')
+
+                // Verify the form has the expected value before submission
+                expect(logic.values.searchForm.search).toBe('test')
+
+                // Test direct form reset first
+                logic.actions.resetSearchForm()
+                expect(logic.values.searchForm.search).toBe('')
+
+                // Set it back to test and try the full submission flow
+                logic.actions.setSearchFormValue('search', 'test')
+                expect(logic.values.searchForm.search).toBe('test')
+
+                await expectLogic(logic, () => {
+                    logic.actions.setSearchFormValues({ search: 'test', datasetId: 'test-dataset-1' })
+                    logic.actions.submitSearchForm()
+                }).toFinishAllListeners()
+
+                // After successful submission, the form should be reset
+                expect(logic.values.searchForm.search).toBe('')
+                expect(logic.values.searchForm.datasetId).toBeNull()
+            })
+        })
+
+        describe('dataset item creation', () => {
+            it('successfully creates dataset item in create mode', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // First set the search form value to match what will be submitted
+                logic.actions.setSearchFormValue('search', '')
+                // Then load datasets with the correct storage key structure
+                const storageKey = getStorageKey('')
+                logic.actions.loadDatasetsSuccess({
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+                logic.actions.setEditMode('create')
+
+                await expectLogic(logic, () => {
+                    logic.actions.setSearchFormValues({ search: 'test', datasetId: 'test-dataset-1' })
+                    logic.actions.submitSearchForm()
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.createItem).toHaveBeenCalledWith({
+                    dataset: 'test-dataset-1',
+                    client_item_id: draftA.client_item_id,
+                    input: draftA.input,
+                    expected_output: undefined,
+                    source_output: draftA.source_output,
+                    metadata: draftA.metadata,
+                    source_trace_id: draftA.source_trace_id,
+                    source_event_id: draftA.source_event_id,
+                    source_timestamp: draftA.source_timestamp,
+                })
+                expect(lemonToast.success).toHaveBeenCalledWith('Dataset item has been created successfully', {
+                    button: {
+                        label: 'View',
+                        action: expect.any(Function),
+                    },
+                })
+            })
+
+            it('shows the API detail when dataset item creation conflicts', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // First set the search form value to match what will be submitted
+                logic.actions.setSearchFormValue('search', '')
+                // Then load datasets with the correct storage key structure
+                const storageKey = getStorageKey('')
+                logic.actions.loadDatasetsSuccess({
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+                logic.actions.setEditMode('create')
+                mockDatasetsApi.createItem.mockRejectedValue(
+                    new ApiError(undefined, 409, undefined, {
+                        detail: 'Restore this dataset before adding items.',
+                        code: 'dataset_archived',
+                    })
+                )
+
+                await expectLogic(logic, () => {
+                    logic.actions.setSearchFormValues({ search: '', datasetId: 'test-dataset-1' })
+                    logic.actions.submitSearchForm()
+                }).toFinishAllListeners()
+
+                expect(lemonToast.error).toHaveBeenCalledWith('Restore this dataset before adding items.')
+            })
+
+            it('opens modal in edit mode without creating item', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // First set the search form value to match what will be submitted
+                logic.actions.setSearchFormValue('search', '')
+                // Then load datasets with the correct storage key structure
+                const storageKey = getStorageKey('')
+                logic.actions.loadDatasetsSuccess({
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+                logic.actions.setEditMode('edit')
+
+                await expectLogic(logic, () => {
+                    logic.actions.setSearchFormValues({ search: '', datasetId: 'test-dataset-1' })
+                    logic.actions.submitSearchForm()
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.createItem).not.toHaveBeenCalled()
+                expect(logic.values.selectedDataset).toEqual(mockDataset1)
+                expect(logic.values.isModalOpen).toBe(true)
+            })
+
+            it('does nothing when dataset is not found', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // First set the search form value to match what will be submitted
+                logic.actions.setSearchFormValue('search', '')
+                // Then load datasets with the correct storage key structure
+                const storageKey = getStorageKey('')
+                logic.actions.loadDatasetsSuccess({
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+
+                await expectLogic(logic, () => {
+                    logic.actions.setSearchFormValues({ search: '', datasetId: 'nonexistent-dataset' })
+                    logic.actions.submitSearchForm()
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.createItem).not.toHaveBeenCalled()
+                expect(logic.values.selectedDataset).toBeNull()
+                expect(logic.values.isModalOpen).toBe(false)
+            })
+
+            it('loads datasets when no datasetId is provided', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                await expectLogic(logic, () => {
+                    logic.actions.setSearchFormValues({ search: 'test', datasetId: null })
+                    logic.actions.submitSearchForm()
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.listDatasets).toHaveBeenCalledWith({
+                    limit: DATASETS_PER_PAGE,
+                    offset: 0,
+                    search: 'test',
+                })
+            })
+
+            it('navigates to dataset page after successful creation', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                // First set the search form value to match what will be submitted
+                logic.actions.setSearchFormValue('search', '')
+                // Then load datasets with the correct storage key structure
+                const storageKey = getStorageKey('')
+                logic.actions.loadDatasetsSuccess({
+                    [storageKey]: mockDatasetsResponse.results,
+                })
+                logic.actions.setEditMode('create')
+
+                await expectLogic(logic, () => {
+                    logic.actions.setSearchFormValues({ search: '', datasetId: 'test-dataset-1' })
+                    logic.actions.submitSearchForm()
+                }).toFinishAllListeners()
+
+                const successCall = (lemonToast.success as jest.Mock).mock.calls[0]
+                const viewAction = successCall[1].button.action
+
+                viewAction()
+
+                expect(router.actions.push).toHaveBeenCalledWith(
+                    '/ai-evals/evaluations/offline/datasets/test-dataset-1'
+                )
+            })
+        })
+
+        describe('data loading', () => {
+            it('loads datasets on mount if none exist', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                await expectLogic(logic).toFinishAllListeners()
+
+                expect(mockDatasetsApi.listDatasets).toHaveBeenCalledWith({
+                    limit: DATASETS_PER_PAGE,
+                    offset: 0,
+                })
+            })
+
+            it('does not load datasets on mount if they already exist', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.loadDatasetsSuccess({
+                    [getStorageKey('')]: mockDatasetsResponse.results,
+                })
+                logic.unmount()
+                mockDatasetsApi.listDatasets.mockClear()
+
+                logic.mount()
+
+                expect(mockDatasetsApi.listDatasets).toHaveBeenCalledTimes(1)
+            })
+
+            it('loads datasets when search form value changes', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                await expectLogic(logic, () => {
+                    logic.actions.setSearchFormValue('search', 'new search')
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.listDatasets).toHaveBeenCalledWith({
+                    limit: DATASETS_PER_PAGE,
+                    offset: 0,
+                    search: 'new search',
+                })
+            })
+
+            it('loads datasets when dropdown becomes visible', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+                mockDatasetsApi.listDatasets.mockClear()
+
+                await expectLogic(logic, () => {
+                    logic.actions.setDropdownVisible(true)
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.listDatasets).toHaveBeenCalledWith({
+                    limit: DATASETS_PER_PAGE,
+                    offset: 0,
+                })
+            })
+
+            it('drops an in-flight load that resolves after unmount', async () => {
+                const captureException = jest.spyOn(posthog, 'captureException').mockImplementation(() => undefined)
+                let resolveListDatasets: (response: PaginatedDatasetReadListApi) => void = () => {}
+                mockDatasetsApi.listDatasets.mockReturnValue(
+                    new Promise((resolve) => {
+                        resolveListDatasets = resolve
+                    })
+                )
+
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+                logic.unmount()
+
+                resolveListDatasets(mockDatasetsResponse)
+                await new Promise((resolve) => setTimeout(resolve, 0))
+
+                expect(captureException).not.toHaveBeenCalled()
+                captureException.mockRestore()
+            })
+
+            it('uses debounce when loading datasets', async () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                await expectLogic(logic, () => {
+                    logic.actions.loadDatasets(true)
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.listDatasets).toHaveBeenCalled()
+            })
+        })
+
+        describe('step mode', () => {
+            function deferredRead(): {
+                promise: Promise<DatasetItemDraft>
+                resolve: (draft: DatasetItemDraft) => void
+                reject: (error: ApiError) => void
+            } {
+                let resolve: (draft: DatasetItemDraft) => void = () => {}
+                let reject: (error: ApiError) => void = () => {}
+                const promise = new Promise<DatasetItemDraft>((done, fail) => {
+                    resolve = done
+                    reject = fail
+                })
+                return { promise, resolve, reject }
+            }
+
+            function mountForStep(step: TraceStep): ReturnType<typeof saveToDatasetButtonLogic> {
+                const logic = saveToDatasetButtonLogic({ step })
+                logic.mount()
+                logic.actions.loadDatasetsSuccess({ [getStorageKey('')]: mockDatasetsResponse.results })
+                return logic
+            }
+
+            function pickDataset(logic: ReturnType<typeof saveToDatasetButtonLogic>): void {
+                logic.actions.setSearchFormValues({ search: '', datasetId: mockDataset1.id })
+                logic.actions.submitSearchForm()
+            }
+
+            it('reads the step item when the dropdown opens', async () => {
+                mockDatasetsApi.getTraceStepItem.mockResolvedValue(draftA)
+                const logic = mountForStep(STEP_A)
+
+                await expectLogic(logic, () => {
+                    logic.actions.setDropdownVisible(true)
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.getTraceStepItem).toHaveBeenCalledTimes(1)
+                expect(mockDatasetsApi.getTraceStepItem).toHaveBeenCalledWith(STEP_A)
+            })
+
+            it('creates the item from the step read on a quick pick', async () => {
+                mockDatasetsApi.getTraceStepItem.mockResolvedValue(draftA)
+                const logic = mountForStep(STEP_A)
+                await expectLogic(logic, () => {
+                    logic.actions.setDropdownVisible(true)
+                }).toFinishAllListeners()
+
+                await expectLogic(logic, () => pickDataset(logic)).toFinishAllListeners()
+
+                expect(mockDatasetsApi.createItem).toHaveBeenCalledWith({ dataset: mockDataset1.id, ...draftA })
+                expect(lemonToast.success).toHaveBeenCalledWith('Dataset item has been created successfully', {
+                    button: { label: 'View', action: expect.any(Function) },
+                })
+            })
+
+            it('waits for the step read when a dataset is picked first', async () => {
+                const readA = deferredRead()
+                mockDatasetsApi.getTraceStepItem.mockReturnValue(readA.promise)
+                const logic = mountForStep(STEP_A)
+                logic.actions.setDropdownVisible(true)
+
+                pickDataset(logic)
+                await new Promise((resolve) => setTimeout(resolve, 0))
+                expect(mockDatasetsApi.createItem).not.toHaveBeenCalled()
+
+                readA.resolve(draftA)
+                await expectLogic(logic).toFinishAllListeners()
+
+                expect(mockDatasetsApi.getTraceStepItem).toHaveBeenCalledTimes(1)
+                expect(mockDatasetsApi.createItem).toHaveBeenCalledWith({ dataset: mockDataset1.id, ...draftA })
+            })
+
+            it.each([
+                ['resolves', (read: ReturnType<typeof deferredRead>) => read.resolve(draftA)],
+                ['fails', (read: ReturnType<typeof deferredRead>) => read.reject(new ApiError(undefined, 500))],
+            ])('never saves an item read for another step when the earlier read %s', async (_, settleA) => {
+                const readA = deferredRead()
+                const readB = deferredRead()
+                mockDatasetsApi.getTraceStepItem.mockImplementation((step) =>
+                    step.nodeId === STEP_A.nodeId ? readA.promise : readB.promise
+                )
+                const logic = mountForStep(STEP_A)
+                logic.actions.setDropdownVisible(true)
+
+                saveToDatasetButtonLogic({ step: STEP_B })
+                logic.actions.setDropdownVisible(true)
+                settleA(readA)
+                await new Promise((resolve) => setTimeout(resolve, 0))
+                expect(logic.values.stepReadStatus).toBe('loading')
+
+                readB.resolve(draftB)
+                await expectLogic(logic).toFinishAllListeners()
+
+                await expectLogic(logic, () => pickDataset(logic)).toFinishAllListeners()
+
+                expect(mockDatasetsApi.getTraceStepItem).toHaveBeenCalledWith(STEP_B)
+                expect(mockDatasetsApi.createItem).toHaveBeenCalledTimes(1)
+                expect(mockDatasetsApi.createItem).toHaveBeenCalledWith({ dataset: mockDataset1.id, ...draftB })
+            })
+
+            it('reads the new step when a dataset is picked after the selection moves', async () => {
+                mockDatasetsApi.getTraceStepItem.mockImplementation(async (step) =>
+                    step.nodeId === STEP_A.nodeId ? draftA : draftB
+                )
+                const logic = mountForStep(STEP_A)
+                await expectLogic(logic, () => {
+                    logic.actions.setDropdownVisible(true)
+                }).toFinishAllListeners()
+
+                saveToDatasetButtonLogic({ step: STEP_B })
+                await expectLogic(logic, () => pickDataset(logic)).toFinishAllListeners()
+
+                expect(mockDatasetsApi.createItem).toHaveBeenCalledWith({ dataset: mockDataset1.id, ...draftB })
+            })
+
+            it('opens the modal with the step read on the pencil', async () => {
+                mockDatasetsApi.getTraceStepItem.mockResolvedValue(draftA)
+                const logic = mountForStep(STEP_A)
+                logic.actions.setEditMode('edit')
+                await expectLogic(logic, () => {
+                    logic.actions.setDropdownVisible(true)
+                }).toFinishAllListeners()
+
+                await expectLogic(logic, () => pickDataset(logic)).toFinishAllListeners()
+
+                expect(mockDatasetsApi.createItem).not.toHaveBeenCalled()
+                expect(logic.values.isModalOpen).toBe(true)
+                expect(logic.values.modalItem).toEqual(draftA)
+            })
+
+            it('shows a failed step read and reads again on retry', async () => {
+                mockDatasetsApi.getTraceStepItem
+                    .mockRejectedValueOnce(new ApiError(undefined, 500, undefined, { detail: 'Internal server error' }))
+                    .mockResolvedValueOnce(draftA)
+                const logic = mountForStep(STEP_A)
+
+                await expectLogic(logic, () => {
+                    logic.actions.setDropdownVisible(true)
+                }).toFinishAllListeners()
+                expect(logic.values.stepReadStatus).toBe('error')
+                expect(loaderFailureToast.error).not.toHaveBeenCalled()
+
+                await expectLogic(logic, () => {
+                    logic.actions.retryStepRead()
+                }).toFinishAllListeners()
+
+                expect(mockDatasetsApi.getTraceStepItem).toHaveBeenCalledTimes(2)
+                expect(logic.values.stepReadStatus).toBe('ready')
+            })
+
+            it('shows a missing step without a retry', async () => {
+                mockDatasetsApi.getTraceStepItem.mockRejectedValue(new ApiError(undefined, 404))
+                const logic = mountForStep(STEP_A)
+
+                await expectLogic(logic, () => {
+                    logic.actions.setDropdownVisible(true)
+                }).toFinishAllListeners()
+
+                expect(logic.values.stepReadStatus).toBe('not_found')
+            })
+
+            it("shows the create's error detail for an item over the size cap", async () => {
+                mockDatasetsApi.getTraceStepItem.mockResolvedValue(draftA)
+                mockDatasetsApi.createItem.mockRejectedValue(
+                    new ApiError(undefined, 400, undefined, { detail: 'Item must be 405 KB or smaller.' })
+                )
+                const logic = mountForStep(STEP_A)
+                await expectLogic(logic, () => {
+                    logic.actions.setDropdownVisible(true)
+                }).toFinishAllListeners()
+
+                await expectLogic(logic, () => pickDataset(logic)).toFinishAllListeners()
+
+                expect(lemonToast.error).toHaveBeenCalledWith('Item must be 405 KB or smaller.')
+            })
+        })
+
+        describe('state management', () => {
+            it('sets modal open state', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.setIsModalOpen(true)
+                expect(logic.values.isModalOpen).toBe(true)
+
+                logic.actions.setIsModalOpen(false)
+                expect(logic.values.isModalOpen).toBe(false)
+            })
+
+            it('sets edit mode', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.setEditMode('edit')
+                expect(logic.values.editMode).toBe('edit')
+
+                logic.actions.setEditMode('create')
+                expect(logic.values.editMode).toBe('create')
+            })
+
+            it('resets edit mode to create when modal is closed', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.setEditMode('edit')
+                logic.actions.setIsModalOpen(false)
+
+                expect(logic.values.editMode).toBe('create')
+            })
+
+            it('sets dropdown visibility', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.setDropdownVisible(true)
+                expect(logic.values.dropdownVisible).toBe(true)
+
+                logic.actions.setDropdownVisible(false)
+                expect(logic.values.dropdownVisible).toBe(false)
+            })
+
+            it('sets selected dataset', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                logic.actions.setSelectedDataset(mockDataset1)
+                expect(logic.values.selectedDataset).toEqual(mockDataset1)
+
+                logic.actions.setSelectedDataset(null)
+                expect(logic.values.selectedDataset).toBeNull()
+            })
+
+            it('computes isModalMounted based on edit mode', () => {
+                const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                logic.mount()
+
+                expect(logic.values.isModalMounted).toBe(false)
+
+                logic.actions.setEditMode('edit')
+                expect(logic.values.isModalMounted).toBe(true)
+
+                logic.actions.setEditMode('create')
+                expect(logic.values.isModalMounted).toBe(false)
+            })
+        })
+
+        describe('recent datasets functionality', () => {
+            describe('recent dataset IDs state management', () => {
+                it('initializes with empty recent dataset IDs', () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    expect(logic.values.recentDatasetIds).toEqual([])
+                })
+
+                it('sets recent dataset IDs and truncates to limit', () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    const ids = ['id1', 'id2', 'id3', 'id4', 'id5']
+                    logic.actions.setRecentDatasetIds(ids)
+
+                    expect(logic.values.recentDatasetIds).toEqual(['id1', 'id2', 'id3'])
+                    expect(logic.values.recentDatasetIds).toHaveLength(RECENT_DATASETS_LIMIT)
+                })
+
+                it('preserves order when setting recent dataset IDs', () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    const ids = ['newest', 'middle', 'oldest']
+                    logic.actions.setRecentDatasetIds(ids)
+
+                    expect(logic.values.recentDatasetIds).toEqual(['newest', 'middle', 'oldest'])
+                })
+            })
+
+            describe('recent datasets state management', () => {
+                it('initializes with empty recent datasets', () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    expect(logic.values.recentDatasets).toEqual([])
+                })
+
+                it('sets recent datasets and truncates to limit', () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    const mockDataset3: Dataset = { ...mockDataset1, id: 'test-dataset-3', name: 'Test Dataset 3' }
+                    const mockDataset4: Dataset = { ...mockDataset1, id: 'test-dataset-4', name: 'Test Dataset 4' }
+                    const datasets = [mockDataset1, mockDataset2, mockDataset3, mockDataset4]
+
+                    logic.actions.setRecentDatasets(datasets)
+
+                    expect(logic.values.recentDatasets).toEqual([mockDataset1, mockDataset2, mockDataset3])
+                    expect(logic.values.recentDatasets).toHaveLength(RECENT_DATASETS_LIMIT)
+                })
+
+                it('preserves order when setting recent datasets', () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    const datasets = [mockDataset2, mockDataset1]
+                    logic.actions.setRecentDatasets(datasets)
+
+                    expect(logic.values.recentDatasets).toEqual([mockDataset2, mockDataset1])
+                })
+            })
+
+            describe('recent datasets loading', () => {
+                it('loads recent datasets by ID', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    logic.actions.setRecentDatasetIds(['test-dataset-1', 'test-dataset-2'])
+
+                    await expectLogic(logic, () => {
+                        logic.actions.loadRecentDatasets()
+                    }).toFinishAllListeners()
+
+                    expect(mockDatasetsApi.listDatasets).toHaveBeenCalledWith({
+                        id__in: ['test-dataset-1', 'test-dataset-2'],
+                        limit: RECENT_DATASETS_LIMIT,
+                        offset: 0,
+                    })
+                })
+
+                it('returns empty array when no recent dataset IDs exist', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    // Ensure recentDatasetIds is empty first
+                    expect(logic.values.recentDatasetIds).toEqual([])
+
+                    await expectLogic(logic, () => {
+                        logic.actions.loadRecentDatasets()
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasets).toEqual([])
+                    expect(mockDatasetsApi.listDatasets).not.toHaveBeenCalledWith(
+                        expect.objectContaining({ id__in: expect.anything() })
+                    )
+                })
+
+                it('handles missing datasets by updating recent dataset IDs', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    logic.actions.setRecentDatasetIds(['test-dataset-1', 'missing-dataset', 'test-dataset-2'])
+
+                    await expectLogic(logic, () => {
+                        logic.actions.loadRecentDatasets()
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasetIds).toEqual(['test-dataset-1', 'test-dataset-2'])
+                    expect(logic.values.recentDatasets).toEqual([mockDataset1, mockDataset2])
+                })
+
+                it('preserves original order of recent dataset IDs when loading', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    logic.actions.setRecentDatasetIds(['test-dataset-2', 'test-dataset-1'])
+
+                    await expectLogic(logic, () => {
+                        logic.actions.loadRecentDatasets()
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasets).toEqual([mockDataset2, mockDataset1])
+                })
+
+                it('excludes archived datasets and removes them from recents', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    logic.actions.setRecentDatasetIds(['test-dataset-1', 'test-dataset-2'])
+                    mockDatasetsApi.listDatasets.mockResolvedValue({
+                        ...mockDatasetsResponse,
+                        results: [mockDataset1, { ...mockDataset2, archived: true }],
+                    })
+
+                    await expectLogic(logic, () => {
+                        logic.actions.loadRecentDatasets()
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasetIds).toEqual(['test-dataset-1'])
+                    expect(logic.values.recentDatasets).toEqual([mockDataset1])
+                })
+
+                it('keeps recent dataset IDs when loading fails', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    logic.actions.setRecentDatasetIds(['test-dataset-1'])
+                    mockDatasetsApi.listDatasets.mockRejectedValue(new Error('API Error'))
+
+                    await expectLogic(logic, () => {
+                        logic.actions.loadRecentDatasets()
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasetIds).toEqual(['test-dataset-1'])
+                    expect(logic.values.recentDatasets).toEqual([])
+                })
+
+                it('uses debounce when loading recent datasets', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    logic.actions.setRecentDatasetIds(['test-dataset-1'])
+
+                    await expectLogic(logic, () => {
+                        logic.actions.loadRecentDatasets(true)
+                    }).toFinishAllListeners()
+
+                    expect(mockDatasetsApi.listDatasets).toHaveBeenCalledWith({
+                        id__in: ['test-dataset-1'],
+                        limit: RECENT_DATASETS_LIMIT,
+                        offset: 0,
+                    })
+                })
+
+                it('loads recent datasets on mount when recent dataset IDs exist', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    // Set up recent dataset IDs and verify they're loaded when loadRecentDatasets is called
+                    logic.actions.setRecentDatasetIds(['test-dataset-1'])
+
+                    mockDatasetsApi.listDatasets.mockClear()
+
+                    await expectLogic(logic, () => {
+                        logic.actions.loadRecentDatasets()
+                    }).toFinishAllListeners()
+
+                    expect(mockDatasetsApi.listDatasets).toHaveBeenCalledWith({
+                        id__in: ['test-dataset-1'],
+                        limit: RECENT_DATASETS_LIMIT,
+                        offset: 0,
+                    })
+                })
+            })
+
+            describe('adding to recent datasets', () => {
+                it('adds dataset to recent when dataset ID is selected and not already recent', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    // Ensure clean state
+                    expect(logic.values.recentDatasetIds).toEqual([])
+                    expect(logic.values.recentDatasets).toEqual([])
+
+                    // Load datasets first
+                    const storageKey = getStorageKey('')
+                    logic.actions.loadDatasetsSuccess({
+                        [storageKey]: [mockDataset1, mockDataset2],
+                    })
+
+                    await expectLogic(logic, () => {
+                        logic.actions.setSearchFormValue('datasetId', 'test-dataset-1')
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasetIds).toEqual(['test-dataset-1'])
+                })
+
+                it('does not add dataset to recent when dataset ID is already in recent', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    // Ensure clean state first
+                    expect(logic.values.recentDatasetIds).toEqual([])
+                    expect(logic.values.recentDatasets).toEqual([])
+
+                    // Set up existing recent datasets
+                    logic.actions.setRecentDatasetIds(['test-dataset-1'])
+                    logic.actions.setRecentDatasets([mockDataset1])
+
+                    // Load datasets
+                    const storageKey = getStorageKey('')
+                    logic.actions.loadDatasetsSuccess({
+                        [storageKey]: [mockDataset1, mockDataset2],
+                    })
+
+                    await expectLogic(logic, () => {
+                        logic.actions.setSearchFormValue('datasetId', 'test-dataset-1')
+                    }).toFinishAllListeners()
+
+                    // Should remain unchanged
+                    expect(logic.values.recentDatasetIds).toEqual(['test-dataset-1'])
+                })
+
+                it('adds new dataset to front of recent lists', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    // Ensure clean state first
+                    expect(logic.values.recentDatasetIds).toEqual([])
+                    expect(logic.values.recentDatasets).toEqual([])
+
+                    // Set up existing recent datasets
+                    logic.actions.setRecentDatasetIds(['test-dataset-1'])
+                    logic.actions.setRecentDatasets([mockDataset1])
+
+                    // Load datasets
+                    const storageKey = getStorageKey('')
+                    logic.actions.loadDatasetsSuccess({
+                        [storageKey]: [mockDataset1, mockDataset2],
+                    })
+
+                    await expectLogic(logic, () => {
+                        logic.actions.setSearchFormValue('datasetId', 'test-dataset-2')
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasetIds).toEqual(['test-dataset-2', 'test-dataset-1'])
+                })
+
+                it('does not add to recent when dataset is not found in datasets', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    // Clear any existing recent datasets
+                    logic.actions.setRecentDatasetIds([])
+                    logic.actions.setRecentDatasets([])
+
+                    // Load datasets without the target dataset
+                    const storageKey = getStorageKey('')
+                    logic.actions.loadDatasetsSuccess({
+                        [storageKey]: [mockDataset1],
+                    })
+
+                    await expectLogic(logic, () => {
+                        logic.actions.setSearchFormValue('datasetId', 'nonexistent-dataset')
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasetIds).toEqual([])
+                    expect(logic.values.recentDatasets).toEqual([])
+                })
+
+                it('does not add to recent when datasets is null', async () => {
+                    const logic = saveToDatasetButtonLogic({ step: STEP_A })
+                    logic.mount()
+
+                    // Clear any existing recent datasets
+                    logic.actions.setRecentDatasetIds([])
+                    logic.actions.setRecentDatasets([])
+
+                    // Ensure datasets is null (don't load any datasets)
+                    expect(logic.values.datasets).toBeNull()
+
+                    await expectLogic(logic, () => {
+                        logic.actions.setSearchFormValue('datasetId', 'test-dataset-1')
+                    }).toFinishAllListeners()
+
+                    expect(logic.values.recentDatasetIds).toEqual([])
+                    expect(logic.values.recentDatasets).toEqual([])
+                })
+            })
+        })
+    })
+})

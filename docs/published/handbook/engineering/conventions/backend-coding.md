@@ -1,0 +1,236 @@
+---
+title: Backend coding conventions
+sidebar: Handbook
+---
+
+#### Query trace correlation
+
+`ServerTimingsGathered` includes endpoint timings and the 20 slowest HogQL timings in its `Server-Timing` header.
+The header stops at complete entries within 10,000 characters to stay below load balancer limits.
+Truncation emits the structured info log `server_timing_header_truncated` and does not report an exception or affect the response body.
+
+The `query.client_query_id` attribute on `posthog.query.process_query_model` matches the browser `query completed` event's `queryId` and the API response event's `client_query_id`.
+Only UUID-shaped IDs are added to spans; other client IDs remain valid API inputs.
+A matching ID links a request to its processing span. It does not prove that the request delayed page rendering.
+An asynchronous query can continue in a separate trace after the submission request ends.
+Check request timing against browser performance metrics, and inspect child spans and self time before choosing a performance fix.
+
+Query API responses expose a validated HTTP request UUID through `X-Request-ID` and the `Server-Timing` metric named `request_id`.
+Query analytics include the same UUID as `http_request_id`.
+When server timing is enabled, `pg` and `ch` report cumulative client query time in milliseconds.
+The matching `_max` metrics report the longest query, `_count` metrics count query attempts, and `_slow` metrics count attempts longer than 50 milliseconds.
+Failed queries contribute to these metrics too.
+The browser records response wait, body read, JSON parsing, and available resource phases on existing query outcome events.
+Resource phases require one matching response UUID; missing, ambiguous, or truncated evidence remains explicit.
+Cross-origin resource details also require `Timing-Allow-Origin`.
+The pre-request phase includes connection setup and browser waiting; it does not measure server queueing.
+Automatic capture covers `performQuery` submission POSTs and the status poll that returns a completed async result; earlier polls and rejected-response body processing remain outside this capture.
+
+#### Logging
+
+As a general rule, we should have logs for every expected and unexpected actions of the application, using the appropriate _log level_.
+
+We should also be logging these exceptions to Posthog. Python exceptions should almost always be captured automatically without extra instrumentation, but custom ones (such as failed requests to external services, query errors, or Celery task failures) can be tracked using `capture_exception()`.
+
+##### Levels
+
+A _log level_ or _log severity_ is a piece of information telling how important a given log message is:
+
+- `DEBUG`: should be used for information that may be needed for diagnosing issues and troubleshooting or when running application
+  in the test environment for the purpose of making sure everything is running correctly
+- `INFO`: should be used as standard log level, indicating that something happened
+- `WARN`: should be used when something unexpected happened but the code can continue the work
+- `ERROR`: should be used when the application hits an issue preventing one or more functionalities from properly functioning
+
+##### Format
+
+`django-structlog` is the default logging library we use (see [docs](https://django-structlog.readthedocs.io/en/latest/)).
+It's a _structured logging_ framework that adds cohesive metadata on each logs that makes it easier to track events or incidents.
+
+Structured logging means that you don’t write hard-to-parse and hard-to-keep-consistent prose in your logs
+but that you log events that happen in a context instead.
+
+```python
+import structlog
+logger = structlog.get_logger(__name__)
+logger.debug("event_sent_to_kafka", event_uuid=str(event_uuid), kafka_topic=topic)
+```
+
+will produce:
+
+```console
+2021-10-28T13:46:40.099007Z [debug] event_sent_to_kafka [posthog.api.capture] event_uuid=017cc727-1662-0000-630c-d35f6a29bae3 kafka_topic=default
+```
+
+As you can see above, the log contains all the information needed to understand the app behavior.
+
+##### Enabling INFO logs for your module
+
+By default, most `posthog.*` loggers only output WARNING and above. This keeps production logs clean but means your `logger.info()` calls won't appear.
+
+To enable INFO logging for a specific module, add it to `posthog/settings/logs.py`:
+
+```python
+"loggers": {
+    # ... existing loggers ...
+    "posthog.tasks.my_module": {"level": "INFO", "handlers": ["console"], "propagate": False},
+}
+```
+
+Note: calling `logger.setLevel(logging.INFO)` in your code doesn't work with structlog - you must add the config entry above.
+
+##### Security
+
+Don’t log sensitive information. Make sure you never log:
+
+- authorization tokens
+- passwords
+- financial data
+- health data
+- PII (Personal Identifiable Information)
+
+### Testing
+
+A test suite is a shared, permanent liability: every test runs on every PR forever, costs CI time, can flake and block unrelated work, and is code someone has to maintain as the system changes.
+So judge a new test on two independent axes — **value** (does it catch a realistic regression we actually make?) and **cost** (how far down the test pyramid does it sit?).
+Maximize value and minimize cost; this never means "write fewer tests", it means drop the ones that catch nothing and push the rest as far down the pyramid as they go.
+
+- All new packages and most new significant functionality should come with unit tests
+- Significant features should come with integration and/or end-to-end tests
+- Analytics-related queries should be covered by snapshot tests for ease of reviewing
+- For pytest use the `assert x == y` instead of the `self.assertEqual(x, y)` format of tests
+  - it's recommended in the pytest docs
+  - and you get better output when the test fails
+- prefer assertions like `assert ['x', 'y'] == response.json()["results"]` over `assert len(response.json()["results"]) == 2`
+  - that's because you want test output to give you the information you need to fix a failure
+  - and because you want your assertions to be as concrete as possible it shouldn't be possible to break the code and the test pass
+
+#### Does this test earn its place?
+
+Before writing a test, answer in one sentence: **what realistic regression does this catch that no existing test already catches?**
+Name the bug, the code path, and the input that would break — "increases coverage", "good practice", and "the function exists" are not answers.
+A good answer sounds like _"if someone makes `parse_filters` drop the `team_id` clause, this fails"_.
+
+Most low-value tests are one of these — recognize them and extend an existing test (or delete the code) instead:
+
+- **Trivial / framework behavior**: getters, setters, constants, that Django saved a row or that DRF serialized a field. You're testing someone else's code, not yours.
+- **Change-detector tests**: asserting which private methods were called, with mocks wired to match the current code. They fail on every refactor and catch no real bug. Assert observable behavior through the public interface (return value, persisted state, emitted event, HTTP response), not the choreography that produces it. See [Change-Detector Tests Considered Harmful](https://testing.googleblog.com/2015/01/testing-on-toilet-change-detector-tests.html).
+- **Redundant coverage**: a new test that's a variation of an existing one is a `@parameterized` case (Python) or a `test.each` row (Jest), not a new test function.
+- **Coverage-chasing**: an uncovered line is information, not a defect — don't add a test just to move the number.
+
+Then answer a second question: **why can't this be a case in the test that already covers the nearest behavior?**
+Earning the coverage doesn't earn a new test function.
+Default to extending the existing test with a parameterized case, and write a standalone one only when you can say why extending doesn't work: different setup, a different unit, or nothing relevant exists.
+Extend to remove duplication, not to save setup time, since a parameterized case still runs `setUp` for itself.
+Fold in variations of the same behavior, and don't attach unrelated assertions to a test that already passes.
+Add your case, not the neighbor's mocks: if the nearest test asserts on mock calls, assert the observable outcome in your case instead.
+
+#### Weight tests down the pyramid
+
+Each level is slower and flakier than the one below:
+
+```text
+pure function  →  kea logic test  →  Django TestCase / Node service test  →  ClickHouse-backed test  →  Node serial lane / Playwright e2e
+   cheapest                                                                                                         most expensive
+```
+
+Aim for a ratio, not a cap: many tests at the bottom, very few at the top — if you want more coverage, add it at the bottom.
+Pick the lowest level where the behavior exists and its outcome is visible: a lower level that sees only an internal call or a mock is not a cheaper test of the same behavior.
+An outcome is what a caller can observe: a return value, a response, a stored row, a kea logic's values, or the request, message, or email a boundary fake recorded. A call to your own helper is not an outcome.
+Break the line each test guards and watch the test fail. A test that stays green guards nothing, so rewrite it or delete it.
+When logic is hard to test cheaply, that's a design signal: extract it into a pure function (or a kea logic) and test it through its own interface rather than standing up a database, a request, and a render.
+Don't mock the tangled code's internal helpers to make it cheap instead, and when the behavior lives in a query, a transaction, or the wiring, test it at the level where a caller observes it.
+
+- **Use `TestCase`, not `TransactionTestCase`, unless you truly need it.** `TransactionTestCase` flushes the DB between tests instead of rolling back a transaction — dramatically slower, and a common source of cross-test interference. For `transaction.on_commit` side effects use `self.captureOnCommitCallbacks(execute=True)`; reaching ClickHouse is not a reason to switch (`ClickhouseTestMixin` runs on a plain `TestCase`).
+- Take a real dependency (Postgres, ClickHouse, Redis) only when the behavior reads or writes it, and then use the real one, not a mock. For services CI can't reach, use a fake that answers like the real service, or a stub at that boundary when the test needs one specific answer, such as a canned success or a 500. Either way, assert the outcome, not that the stub was called. Don't mock your own internal helpers; that's how change-detector tests are born.
+- Node (`nodejs/`): drive the consumer or service entry point with the real dependencies its behavior uses (`createHub` when it takes a hub), and assert what a boundary recorded. Keep case matrices out of `*.serial.test.ts` files, which run one at a time and add straight to CI time; the serial lane is for tests that share infrastructure they can't isolate or cover a flow across services.
+- Use `parameterized` for cases known before execution. Reserve `self.subTest` for runtime cases, such as query results. Our pytest configuration makes `self.subTest` fail fast so CI can retry the test. Avoid the pytest `subtests` fixture: a successful retry can leave a failure in JUnit XML.
+- Frontend: prefer a kea logic test over a full component render whenever the behavior lives in the logic: call its actions as a component would and assert on the values a component reads. Don't snapshot large rendered trees — assert specific fields instead.
+- Keep tests deterministic and isolated: no `time.sleep` or arbitrary waits (use `time_machine.travel(..., tick=False)` or wait on a real condition), no real network or live external services, and they must pass in any order. Don't leave a `@skip`/`xfail`/`.only` without a one-line reason and a linked issue.
+  Prefer an event, future, or process output to confirm readiness. Use `posthog.test.waiting.wait_until` for bounded polling when the dependency only exposes a condition to check.
+  The `no-fixed-sleeps-in-tests` Semgrep rule blocks new `time.sleep` and non-zero `asyncio.sleep` calls in CI, including import aliases and calls with `noqa` comments. Calls already on the base branch stay allowed. When elapsed time is the behavior under test, explain why next to a specific `# nosemgrep: no-fixed-sleeps-in-tests` exemption.
+- **An absolute date in a test is a time bomb until you pin the clock.** A fixture date holds its meaning only while the real clock stays where you left it, so a test that measures that date against `now` — an age, a window, a "recent" flag, an expiry — passes today and fails weeks later on every open branch. Pin the process clock to the same instant (`time_machine.travel(..., tick=False)`, or `jest.useFakeTimers()` with `jest.setSystemTime()`), or write the fixture relative to `now`. Pinning covers only what reads the clock inside your process: anything outside it, such as a ClickHouse TTL or an S3 lifecycle rule, still runs on the real one.
+
+#### Fast developer ("unit") tests
+
+A good test should:
+
+- focus on a single use-case at a time
+- have a minimal set of assertions per test
+- explain itself well
+- help you understand the system
+- make good use of parameterized testing to show behavior with a range of inputs
+- help us have confidence that the impossible is unrepresentable
+- help us have confidence that the system will work as expected
+
+#### Integration tests
+
+For event-query regressions, decorate the test with `events_only_in_active_schema()` from `posthog.models.event.util`.
+In native mode, both event fixture helpers omit the legacy copy; legacy mode still inserts legacy events.
+Keep deferred fixture flushing inside the scope, assert that legacy events are empty in native mode, and check expected query results.
+Use this only for paths intended to read native events; exports and historical person properties can deliberately depend on legacy storage.
+
+- Integration tests should ensure that the feature works in the running system
+- They give greater confidence (because you avoid the mistake of just testing a mock) but they're slower
+- They are generally less brittle in response to changes because they test at a higher level than developer tests (e.g. they test a Django API not a class used inside it)
+
+#### Temporary migration tests
+
+A dedicated data migration test protects the rollout. Remove the test after the migration has run in every supported environment, the rollback window has closed, and no supported upgrade still relies on the old data state.
+
+Delete an expired migration test instead of marking it skipped. Keep the migration file. Fresh-schema CI continues to check that the migration chain applies.
+
+Keep tests for migration tooling, migration safety checks, reusable backfill systems, and backfills that people can still run.
+
+### Dataclasses
+
+Prefer a small dataclass over a tuple when returning or passing multiple values: always when two or more elements share a type (callers can silently swap them, e.g. `(start, end)` timestamps or `(username, password)` credentials), and when there are roughly 3+ elements, where positional access hurts readability.
+
+Use the house-default decorator:
+
+```python
+from posthog.dataclasses import frozen
+
+
+@frozen
+class BillingPeriod:
+    start: datetime
+    end: datetime
+```
+
+`@frozen` applies `frozen=True` (immutable, hashable), `kw_only=True` (keyword-only construction, so same-typed fields can't be transposed), and `slots=True` (less memory, typo-safe attribute access).
+Every flag is overridable per class: `@frozen(slots=False)` when a class needs `functools.cached_property`, or an explicit `@dataclass(frozen=False, ...)` for a deliberately mutable builder.
+
+Consume results with dot notation (`result.field`).
+Don't unpack them back into positional locals (`a, b = result.a, result.b`), which recreates the swap hazard the dataclass exists to prevent.
+
+Name dataclasses after the domain concept (`ClickHouseCredentials`, `BillingPeriod`), never `*Info`/`*Data`/`*Tuple`; use a `*Result` suffix only when the function's outcome genuinely is the concept.
+Mark secret fields with `field(repr=False)` so they stay out of logs and tracebacks.
+
+Enforcement: a new bare `@dataclass` without an explicit `frozen=` choice fails the ratchet in `posthog/test/repo_invariants/test_dataclass_defaults.py` (existing uses are grandfathered in its baseline) and is flagged inline by the `prefer-frozen-dataclasses` semgrep rule.
+
+### Querying ClickHouse
+
+**Always use HogQL instead of raw ClickHouse queries in product code.**
+
+Querying ClickHouse directly from product code is a bad idea for several reasons:
+
+1. **Data safety**: HogQL automatically scopes queries to the current team, preventing accidental cross-team data access. Raw queries that fetch data for multiple teams and separate it in code are risky—even if correct now, future changes could introduce data breaches.
+
+2. **Consistency**: HogQL handles property access, person mapping, and other PostHog-specific concerns correctly and consistently.
+
+3. **Query attribution**: If you must query ClickHouse directly for a valid reason, ensure you [tag your queries appropriately](https://posthog.com/handbook/engineering/clickhouse/query-attribution) with the right product tag and ClickHouse user.
+
+The only case where raw ClickHouse queries might be justified is cross-team queries, but even then consider alternatives:
+
+- Can you detect what you need via PostgreSQL instead? (e.g., checking feature usage via team settings)
+- Can you use one simple ClickHouse query to get team IDs, then run HogQL queries per-team for the actual data?
+- Can you leverage existing cross-team infrastructure like usage reports?
+
+### To ee or not to ee?
+
+We default to open but when adding a new feature we should consider if it should be MIT licensed or Enterprise edition licensed. Everything in the `ee` folder is covered by [a different license](https://github.com/PostHog/posthog/blob/master/ee/LICENSE). It's easy to move things from `ee` to open, but not the other way.
+
+All the open source code is copied to [the posthog-foss repo](https://github.com/posthog/posthog-foss) with the `ee` code stripped out. You need to consider whether your code will work if imports to `ee` are unavailable.
+
+> Sync note: This file is also copied to posthog/posthog/.claude/commands/conventions.md for Claude Code. When updating this file, please also update the copy there.

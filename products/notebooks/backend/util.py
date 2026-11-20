@@ -1,0 +1,1151 @@
+import re
+import html
+import json
+import uuid
+import hashlib
+from collections.abc import Iterator
+from typing import Any
+
+from django.core.exceptions import ValidationError
+from django.core.validators import URLValidator
+
+from posthog.dataclasses import frozen
+
+# Type aliases for TipTap editor nodes
+TipTapNode = dict[str, Any]
+TipTapContent = list[TipTapNode]
+
+# ProseMirror node type used by Markdown notebooks.
+# Keep in sync with `NotebookNodeType.MarkdownNotebook` in frontend/src/scenes/notebooks/types.ts.
+MARKDOWN_NOTEBOOK_NODE_TYPE = "ph-markdown-notebook"
+# ProseMirror node type used by NotebookNodeQuery on the frontend.
+# Keep in sync with `NotebookNodeType.Query` in frontend/src/scenes/notebooks/types.ts.
+QUERY_NODE_TYPE = "ph-query"
+# QuerySchema kind that points at a saved insight by its short_id.
+SAVED_INSIGHT_NODE_KIND = "SavedInsightNode"
+MARKDOWN_QUERY_TAG = "Query"
+
+# Keep in sync with `SHARED_NOTEBOOK_SUPPORTED_NODE_TYPES` in
+# `frontend/src/scenes/notebooks/Nodes/sharedNodeSupport.tsx`.
+SHARED_NOTEBOOK_SUPPORTED_NODE_TYPES: frozenset[str] = frozenset(
+    {
+        "ph-image",
+        "ph-latex",
+        "ph-embed",
+        "ph-query",
+    }
+)
+
+SHARED_NOTEBOOK_SUPPORTED_MARKDOWN_COMPONENT_TAGS: frozenset[str] = frozenset(
+    {
+        "Comment",
+        "Columns",
+        "Column",
+        "ColumnEnd",
+        "ColumnsEnd",
+        "Divider",
+        "Embed",
+        "Image",
+        "Latex",
+        "Query",
+    }
+)
+
+_SHARED_NOTEBOOK_MARKDOWN_COMPONENT_PROP_TYPES: dict[str, dict[str, type | tuple[type, ...]]] = {
+    "Comment": {"ref": str, "replies": list, "text": str},
+    "Columns": {},
+    "Column": {"width": (int, float)},
+    "ColumnEnd": {},
+    "ColumnsEnd": {},
+    "Divider": {},
+    "Embed": {"height": (int, float), "src": str, "title": str, "width": (int, float)},
+    "Image": {"alt": str, "height": (int, float), "src": str, "title": str, "width": (int, float)},
+    "Latex": {"content": str, "editing": bool, "title": str},
+    "Query": {
+        "hideFilters": bool,
+        "hideResults": bool,
+        "showFilters": bool,
+        "showResults": bool,
+        "height": (int, float),
+        "isDefaultFilterApplied": bool,
+        "nodeId": str,
+        "outputTab": str,
+        "query": dict,
+        "showSettings": bool,
+        "title": str,
+    },
+}
+
+_MARKDOWN_COMPONENT_START_REGEX = re.compile(r"^<[A-Z][A-Za-z0-9]*(\s|>|/)")
+_MARKDOWN_COMPONENT_TAG_REGEX = re.compile(r"^<([A-Z][A-Za-z0-9]*)([\s\S]*?)(?:/>|>[\s\S]*</\1>)$")
+_MARKDOWN_COMPONENT_PROP_NAME_REGEX = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)")
+_MARKDOWN_COMPONENT_RAW_PROP_VALUE_REGEX = re.compile(r"^([^\s/>]+)")
+_MARKDOWN_COMPONENT_NUMBER_REGEX = re.compile(r"^-?\d+(\.\d+)?$")
+_MARKDOWN_ESCAPED_COMPONENT_START_REGEX = re.compile(r"^\\<[A-Z][A-Za-z0-9]*(\s|>|/)")
+_MARKDOWN_INLINE_ESCAPABLE_CHARACTERS = frozenset("\\`*_~[]()<>#+-.|!")
+_MAX_MARKDOWN_COMPONENT_LINES = 1_000
+_MAX_MARKDOWN_COMPONENT_CHARACTERS = 256 * 1024
+_validate_notebook_embed_src = URLValidator(schemes=["http", "https"])
+
+
+@frozen
+class _MarkdownComponentScan:
+    raw: str
+    next_line_index: int
+    found_terminator: bool
+
+
+@frozen(frozen=False)
+class _MarkdownComponentScanState:
+    quote: str | None = None
+    expression_depth: int = 0
+    escape_next: bool = False
+    awaiting_prop_value: bool = False
+    opening_tag_closed: bool = False
+
+
+def filter_notebook_content_for_sharing(content: Any) -> Any:
+    """Return a copy of a notebook's ProseMirror document with unsupported widget nodes redacted.
+
+    Any ``ph-*`` node not in :data:`SHARED_NOTEBOOK_SUPPORTED_NODE_TYPES` has its ``attrs`` and
+    child ``content`` stripped. The original ``type`` is preserved so the frontend's allow-list
+    check still renders ``UnsupportedNodePlaceholder`` without leaking the original attrs to
+    anonymous viewers. Built-in ProseMirror nodes pass through unchanged.
+    """
+    if not isinstance(content, dict):
+        return content
+
+    node_type = content.get("type")
+    if node_type == MARKDOWN_NOTEBOOK_NODE_TYPE:
+        return _filter_markdown_notebook_content_for_sharing(content)
+
+    if (
+        isinstance(node_type, str)
+        and node_type.startswith("ph-")
+        and node_type not in SHARED_NOTEBOOK_SUPPORTED_NODE_TYPES
+    ):
+        return {"type": node_type}
+
+    filtered: dict[str, Any] = {k: v for k, v in content.items() if k != "content"}
+    children = content.get("content")
+    if isinstance(children, list):
+        filtered["content"] = [_filter_notebook_child_content_for_sharing(child) for child in children]
+    elif "content" in content:
+        filtered["content"] = children
+    return filtered
+
+
+def _filter_notebook_child_content_for_sharing(child: Any) -> Any:
+    if isinstance(child, dict) and child.get("type") == MARKDOWN_NOTEBOOK_NODE_TYPE:
+        return _filter_markdown_notebook_content_for_sharing(child)
+    return filter_notebook_content_for_sharing(child)
+
+
+def _filter_markdown_notebook_content_for_sharing(content: TipTapNode) -> TipTapNode:
+    attrs = content.get("attrs")
+    if not isinstance(attrs, dict):
+        return {"type": MARKDOWN_NOTEBOOK_NODE_TYPE}
+
+    filtered_attrs: dict[str, Any] = {}
+    node_id = attrs.get("nodeId")
+    if isinstance(node_id, str):
+        filtered_attrs["nodeId"] = node_id
+
+    markdown = attrs.get("markdown")
+    if isinstance(markdown, str):
+        filtered_attrs["markdown"] = _filter_markdown_components_for_sharing(markdown)
+
+    return {"type": MARKDOWN_NOTEBOOK_NODE_TYPE, "attrs": filtered_attrs}
+
+
+def _filter_markdown_components_for_sharing(markdown: str) -> str:
+    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    filtered_lines: list[str] = []
+    line_index = 0
+
+    while line_index < len(lines):
+        if lines[line_index].strip().startswith("```"):
+            code_block_end = _get_markdown_code_block_end(lines, line_index)
+            filtered_lines.extend(lines[line_index:code_block_end])
+            line_index = code_block_end
+            continue
+
+        component = _read_markdown_component_block(lines, line_index)
+        if component is None:
+            filtered_lines.append(lines[line_index])
+            line_index += 1
+            continue
+
+        tag_name, _raw, next_line_index = component
+        if tag_name in SHARED_NOTEBOOK_SUPPORTED_MARKDOWN_COMPONENT_TAGS:
+            filtered_lines.append(_filter_supported_markdown_component_for_sharing(tag_name, _raw))
+        else:
+            filtered_lines.append(f"<{tag_name} />")
+        line_index = next_line_index
+
+    return "\n".join(filtered_lines)
+
+
+def _filter_supported_markdown_component_for_sharing(tag_name: str, raw: str) -> str:
+    supported_props = _SHARED_NOTEBOOK_MARKDOWN_COMPONENT_PROP_TYPES[tag_name]
+    props = _parse_markdown_component_props(raw)
+    filtered_props: dict[str, Any] = {}
+
+    for prop_name, expected_type in supported_props.items():
+        value = props.get(prop_name)
+        if _is_markdown_component_prop_type(value, expected_type):
+            if tag_name == "Embed" and prop_name == "src" and isinstance(value, str):
+                value = value.strip()
+                try:
+                    _validate_notebook_embed_src(value)
+                except ValidationError:
+                    continue
+            filtered_props[prop_name] = value
+
+    return _serialize_markdown_component(tag_name, filtered_props)
+
+
+def _is_markdown_component_prop_type(value: Any, expected_type: type | tuple[type, ...]) -> bool:
+    if isinstance(value, bool):
+        return expected_type is bool or (isinstance(expected_type, tuple) and bool in expected_type)
+    if isinstance(value, expected_type):
+        return True
+    return False
+
+
+def _serialize_markdown_component(tag_name: str, props: dict[str, Any]) -> str:
+    prop_source = "".join(
+        _serialize_markdown_component_prop(name, props[name])
+        for name in _SHARED_NOTEBOOK_MARKDOWN_COMPONENT_PROP_TYPES[tag_name]
+        if name in props
+    )
+    if tag_name in {"ColumnEnd", "ColumnsEnd"}:
+        return f"</{tag_name[:-3]}>"
+    if tag_name in {"Column", "Columns"}:
+        return f"<{tag_name}{prop_source}>"
+    return f"<{tag_name}{prop_source} />"
+
+
+def _serialize_markdown_component_prop(name: str, value: Any) -> str:
+    if value is True:
+        return f" {name}"
+    if isinstance(value, str):
+        return f" {name}={json.dumps(value, ensure_ascii=False)}"
+    return f" {name}={{{json.dumps(value, ensure_ascii=False, separators=(',', ':'))}}}"
+
+
+def _coerce_query_attr(raw: Any) -> dict[str, Any] | None:
+    """Resolve a notebook ph-query node's `query` attribute to a dict.
+
+    Notebooks save attrs through tiptap, which can serialize complex attrs as JSON strings
+    (the `jsonAttr` wrapper in `NodeWrapper.tsx` round-trips through `JSON.stringify` /
+    `JSON.parse`). Older notebooks were also saved with stringified queries before the
+    `convertInsightQueryStringsToObjects` frontend migration normalized them. Accept either form.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def iter_prosemirror_nodes(doc: Any) -> Iterator[TipTapNode]:
+    """Yield every node in a ProseMirror document, depth-first.
+
+    Tolerates malformed input — anything that isn't a dict with a `content` list is skipped.
+    """
+    if not isinstance(doc, dict):
+        return
+    yield doc
+    children = doc.get("content")
+    if not isinstance(children, list):
+        return
+    for child in children:
+        yield from iter_prosemirror_nodes(child)
+
+
+def extract_referenced_insight_short_ids(content: Any) -> set[str]:
+    """Walk a notebook's ProseMirror document and collect every saved-insight short_id it embeds.
+
+    Only ``ph-query`` nodes whose query is a ``SavedInsightNode`` reference an insight by id.
+    Inline (ad-hoc) queries store the full query in node attrs — see
+    :func:`extract_inline_query_nodes` for those.
+    """
+    short_ids: set[str] = set()
+    for node in iter_prosemirror_nodes(content):
+        if node.get("type") != QUERY_NODE_TYPE:
+            continue
+        attrs = node.get("attrs")
+        if not isinstance(attrs, dict):
+            continue
+        query = _coerce_query_attr(attrs.get("query"))
+        if query is None:
+            continue
+        if query.get("kind") != SAVED_INSIGHT_NODE_KIND:
+            continue
+        short_id = query.get("shortId")
+        if isinstance(short_id, str) and short_id:
+            short_ids.add(short_id)
+    for _node_id, query in iter_markdown_query_nodes(content):
+        if query.get("kind") != SAVED_INSIGHT_NODE_KIND:
+            continue
+        short_id = query.get("shortId")
+        if isinstance(short_id, str) and short_id:
+            short_ids.add(short_id)
+    return short_ids
+
+
+def extract_inline_query_nodes(content: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Walk a notebook's ProseMirror document and collect every inline (non-saved-insight) query.
+
+    Returns a list of ``(nodeId, query_dict)`` pairs. Used by the shared-notebook payload
+    builder to pre-compute results for ad-hoc queries (DataTableNode, HogQLQuery, InsightVizNode
+    without a saved insight reference, etc.) so the shared viewer can render them without
+    POSTing to ``/api/projects/<id>/query/`` — a path sharing tokens cannot reach.
+
+    Saved insights are deliberately excluded; they go through
+    :func:`extract_referenced_insight_short_ids` and the existing
+    ``InsightSerializer`` shared-mode path.
+
+    Legacy ProseMirror ``ph-query`` nodes whose ``nodeId`` is missing are skipped; without it
+    the frontend has no key to look the cached result up by. Markdown ``<Query>`` components
+    without an explicit ``nodeId`` instead receive a content-derived stable ID (see
+    :func:`iter_markdown_query_nodes`).
+    """
+    inline_nodes: list[tuple[str, dict[str, Any]]] = []
+    for node in iter_prosemirror_nodes(content):
+        if node.get("type") != QUERY_NODE_TYPE:
+            continue
+        attrs = node.get("attrs")
+        if not isinstance(attrs, dict):
+            continue
+        query = _coerce_query_attr(attrs.get("query"))
+        if query is None:
+            continue
+        if query.get("kind") == SAVED_INSIGHT_NODE_KIND:
+            continue
+        node_id = attrs.get("nodeId")
+        if not isinstance(node_id, str) or not node_id:
+            continue
+        inline_nodes.append((node_id, query))
+    for node_id, query in iter_markdown_query_nodes(content):
+        if query.get("kind") == SAVED_INSIGHT_NODE_KIND:
+            continue
+        inline_nodes.append((node_id, query))
+    return inline_nodes
+
+
+def iter_markdown_query_nodes(content: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+    markdown = _get_markdown_notebook_markdown(content)
+    if markdown is None:
+        return
+
+    occurrences: dict[str, int] = {}
+    for tag_name, raw, _next_line_index in _iter_markdown_component_blocks(markdown):
+        if tag_name != MARKDOWN_QUERY_TAG:
+            continue
+
+        props = _parse_markdown_component_props(raw)
+        fingerprint = _get_markdown_component_fingerprint(tag_name, props)
+        occurrence = occurrences.get(fingerprint, 0)
+        occurrences[fingerprint] = occurrence + 1
+
+        query = _coerce_query_attr(props.get("query"))
+        if query is None:
+            continue
+
+        explicit_node_id = props.get("nodeId")
+        node_id = (
+            explicit_node_id
+            if isinstance(explicit_node_id, str) and explicit_node_id
+            else _create_stable_markdown_node_id(fingerprint, occurrence)
+        )
+        yield node_id, query
+
+
+@frozen
+class MarkdownBlock:
+    """One addressable span of a markdown notebook, in document order.
+
+    Blocks never overlap and never include the blank lines between them, so replacing the
+    span `[start, end)` keeps the separators that group cells into cards.
+    """
+
+    kind: str
+    tag_name: str | None
+    node_id: str
+    explicit_node_id: str | None
+    source: str
+    start: int
+    end: int
+
+
+def _get_anchored_markdown_cell_end(lines: list[str], start: int) -> int:
+    end = start
+    while end < len(lines):
+        stripped = lines[end].strip()
+        if _MARKDOWN_NODE_ANCHOR_REGEX.match(stripped) or _opens_markdown_component_block(lines, end):
+            break
+        if not stripped:
+            if end + 1 >= len(lines) or not lines[end + 1].strip():
+                break
+            end += 1
+            continue
+        if stripped.startswith("```"):
+            end = _get_markdown_code_block_end(lines, end)
+        else:
+            end += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return end
+
+
+def iter_markdown_blocks(
+    markdown: str, max_prose_blocks: int | None = None, *, group_anchored_prose: bool = False
+) -> Iterator[MarkdownBlock]:
+    """Walk every block of a markdown notebook, prose included.
+
+    A block whose document carries an anchor above it takes that stored id, which survives an
+    edit to the block. A block without one falls back to an id derived from its own content, so
+    the id changes when the block changes and a caller must resolve it against the read it edits.
+
+    `group_anchored_prose` keeps an anchored markdown cell's paragraphs together until a card
+    boundary, another anchor, or a component, so cell edits replace all of its prose.
+
+    `max_prose_blocks` bounds how many prose blocks this builds. A save accepts a body up to
+    `DATA_UPLOAD_MAX_MEMORY_SIZE`, and a body of that size holds millions of one-character
+    blocks, so an unbounded walk lets one request allocate for minutes. The walk continues past
+    the cap without building the extra prose, because component tags carry the cells that run
+    and must stay addressable wherever they sit in the document.
+    """
+    lines = _split_markdown_lines(markdown)
+    occurrences: dict[str, int] = {}
+    line_index = 0
+    prose_built = 0
+    pending_anchor_id: str | None = None
+    # An anchor names one block. A second copy of one reaches the document through a three-way
+    # markdown merge, and two blocks under one id leave neither addressable, because every cell
+    # tool refuses an id that names more than one. The first keeps it; the rest fall back to a
+    # derived id. `ensureUniqueNodeIds` does the same in the editor.
+    claimed_anchor_ids: set[str] = set()
+
+    def claim_anchor_id() -> str | None:
+        nonlocal pending_anchor_id
+        anchor_id = pending_anchor_id
+        pending_anchor_id = None
+        if anchor_id is None or anchor_id in claimed_anchor_ids:
+            return None
+        claimed_anchor_ids.add(anchor_id)
+        return anchor_id
+
+    # Two counters over one walk: code points to slice the document Python holds, UTF-16 units
+    # to report, because the caller slices in UTF-16. Each advances once per character.
+    code_points = 0
+    utf16 = 0
+
+    def prose_budget_left() -> bool:
+        return max_prose_blocks is None or prose_built < max_prose_blocks
+
+    def span_code_points(start_line: int, end_line: int) -> int:
+        """Width of lines `[start_line, end_line)`, each with the terminator that closes it."""
+        width = 0
+        for index in range(start_line, end_line):
+            width += len(lines[index])
+            width += _markdown_terminator_width(markdown, code_points + width)
+        return width
+
+    def block_source(start_line: int, end_line: int) -> str:
+        # The last line of a document often has no terminator, so one looked up from the end of
+        # the span would be a character of the block itself.
+        width = span_code_points(start_line, end_line - 1) + len(lines[end_line - 1])
+        return markdown[code_points : code_points + width]
+
+    def consume(start_line: int, end_line: int) -> None:
+        nonlocal code_points, utf16
+        width = span_code_points(start_line, end_line)
+        utf16 += _utf16_length(markdown[code_points : code_points + width])
+        code_points += width
+
+    while line_index < len(lines):
+        if not lines[line_index].strip():
+            # An anchor names only the block on the line below it. Text removed from under an
+            # anchor leaves the anchor behind, and carried over a blank line it would hand the id
+            # to the next block, so an edit by that id would reach a block its caller never read.
+            pending_anchor_id = None
+            consume(line_index, line_index + 1)
+            line_index += 1
+            continue
+
+        # Read before the fence and tag scans, so an anchor never becomes a block of its own and
+        # its span never joins the block it names. A fenced block is consumed whole below, so an
+        # anchor written as an example inside one is never seen here.
+        anchor_match = _MARKDOWN_NODE_ANCHOR_REGEX.match(lines[line_index].strip())
+        if anchor_match:
+            pending_anchor_id = anchor_match.group(1)
+            consume(line_index, line_index + 1)
+            line_index += 1
+            continue
+
+        if (
+            group_anchored_prose
+            and pending_anchor_id is not None
+            and pending_anchor_id not in claimed_anchor_ids
+            and not _opens_markdown_component_block(lines, line_index)
+        ):
+            end_line_index = _get_anchored_markdown_cell_end(lines, line_index)
+            if prose_budget_left():
+                prose_built += 1
+                yield _build_markdown_prose_block(
+                    block_source(line_index, end_line_index), utf16, occurrences, claim_anchor_id()
+                )
+            pending_anchor_id = None
+            consume(line_index, end_line_index)
+            line_index = end_line_index
+            continue
+
+        if lines[line_index].strip().startswith("```"):
+            end_line_index = _get_markdown_code_block_end(lines, line_index)
+            if prose_budget_left():
+                prose_built += 1
+                yield _build_markdown_prose_block(
+                    block_source(line_index, end_line_index), utf16, occurrences, claim_anchor_id()
+                )
+            pending_anchor_id = None
+            consume(line_index, end_line_index)
+            line_index = end_line_index
+            continue
+
+        component = (
+            _read_markdown_component_block(lines, line_index)
+            if _opens_markdown_component_block(lines, line_index)
+            else None
+        )
+        if component is not None:
+            tag_name, raw, next_line_index = component
+            yield _build_markdown_component_block(
+                tag_name, raw, block_source(line_index, next_line_index), utf16, occurrences, claim_anchor_id()
+            )
+            consume(line_index, next_line_index)
+            line_index = next_line_index
+            continue
+
+        end_line_index = line_index + 1
+        while end_line_index < len(lines) and _continues_markdown_prose_block(lines, end_line_index):
+            end_line_index += 1
+        if prose_budget_left():
+            prose_built += 1
+            yield _build_markdown_prose_block(
+                block_source(line_index, end_line_index), utf16, occurrences, claim_anchor_id()
+            )
+        pending_anchor_id = None
+        consume(line_index, end_line_index)
+        line_index = end_line_index
+
+
+def _continues_markdown_prose_block(lines: list[str], line_index: int) -> bool:
+    stripped = lines[line_index].strip()
+    if not stripped or stripped.startswith("```"):
+        return False
+    # An anchor names the block below it. Absorbed into the paragraph above, it would sit inside
+    # that block's reported source, and a caller slicing the span back would not match it.
+    if _MARKDOWN_NODE_ANCHOR_REGEX.match(stripped):
+        return False
+    return not _opens_markdown_component_block(lines, line_index)
+
+
+def _opens_markdown_component_block(lines: list[str], line_index: int) -> bool:
+    """Whether a component block starts at this line.
+
+    The `<` test runs first because it settles every prose line with one string comparison. The
+    regex scan behind it costs enough to dominate the walk of a large document when every line
+    pays it.
+    """
+    stripped = lines[line_index].lstrip()
+    if not stripped.startswith("<") and not stripped.startswith("\\<"):
+        return False
+    return _read_markdown_component_block(lines, line_index) is not None
+
+
+_MARKDOWN_NODE_ANCHOR_REGEX = re.compile(r"^<!--ph:(phb-[A-Za-z0-9._-]{1,124})-->$")
+"""A block id the document stores, written on its own line above the block it names.
+
+Mirrors `NODE_ANCHOR_REGEX` in frontend/src/lib/components/MarkdownNotebook/markdown.ts,
+prefix included. A wider pattern here would read an authorial `<!--ph:note-->` as an anchor
+that the editor reads as a comment, and the two layers would disagree on the block list.
+
+A paragraph has no attribute to carry an id, so a comment is the only place one fits, and it
+renders nowhere.
+"""
+
+_MARKDOWN_LINE_SPLIT_REGEX = re.compile(r"\r\n|\r|\n")
+
+
+def _split_markdown_lines(markdown: str) -> list[str]:
+    """Lines, split on the terminators `_iter_markdown_component_blocks` collapses before it splits.
+
+    A walk that split on `\n` alone would read different block boundaries than the component
+    walker, so a tag after a lone `\r` would be prose here and a live cell there.
+
+    Only the lines are materialized, matching what the component walker already allocates. A
+    terminator's width comes from `_markdown_terminator_width` at the offset the walk holds,
+    because a second list of that length costs as much again on a document of millions of lines.
+    """
+    return _MARKDOWN_LINE_SPLIT_REGEX.split(markdown)
+
+
+def _markdown_terminator_width(markdown: str, offset: int) -> int:
+    if offset >= len(markdown):
+        return 0
+    return 2 if markdown.startswith("\r\n", offset) else 1
+
+
+def _utf16_length(text: str) -> int:
+    """Length in UTF-16 code units, the unit the collaboration protocol and JavaScript both use.
+
+    Python counts code points, so an astral character is one here and two there. Reporting code
+    points would put every offset after an emoji two apart from where a JavaScript caller slices.
+    """
+    return len(text) + sum(1 for character in text if ord(character) > 0xFFFF)
+
+
+def _build_markdown_prose_block(
+    source: str, start: int, occurrences: dict[str, int], anchor_id: str | None = None
+) -> MarkdownBlock:
+    occurrence = occurrences.get(source, 0)
+    occurrences[source] = occurrence + 1
+    return MarkdownBlock(
+        kind="prose",
+        tag_name=None,
+        node_id=anchor_id or _create_stable_markdown_prose_id(source, occurrence),
+        explicit_node_id=anchor_id,
+        source=source,
+        start=start,
+        end=start + _utf16_length(source),
+    )
+
+
+def _build_markdown_component_block(
+    tag_name: str,
+    raw: str,
+    source: str,
+    start: int,
+    occurrences: dict[str, int],
+    anchor_id: str | None = None,
+) -> MarkdownBlock:
+    props = _parse_markdown_component_props(raw)
+    fingerprint = _get_markdown_component_fingerprint(tag_name, props)
+    occurrence = occurrences.get(fingerprint, 0)
+    occurrences[fingerprint] = occurrence + 1
+    explicit_node_id = props.get("nodeId")
+    explicit_node_id = explicit_node_id if isinstance(explicit_node_id, str) and explicit_node_id else None
+    # The tag's own prop wins over an anchor above it: a cell added over MCP carries its id
+    # there, and the editor writes no anchor for a tag that already has one.
+    explicit_node_id = explicit_node_id or anchor_id
+    return MarkdownBlock(
+        kind="component",
+        tag_name=tag_name,
+        node_id=explicit_node_id or _create_stable_markdown_node_id(fingerprint, occurrence),
+        explicit_node_id=explicit_node_id,
+        source=source,
+        start=start,
+        end=start + _utf16_length(source),
+    )
+
+
+def _get_markdown_notebook_markdown(content: Any) -> str | None:
+    if not isinstance(content, dict):
+        return None
+
+    nodes = content.get("content")
+    if not isinstance(nodes, list) or len(nodes) != 1:
+        return None
+
+    node = nodes[0]
+    if not isinstance(node, dict) or node.get("type") != MARKDOWN_NOTEBOOK_NODE_TYPE:
+        return None
+
+    attrs = node.get("attrs")
+    markdown = attrs.get("markdown") if isinstance(attrs, dict) else None
+    return markdown if isinstance(markdown, str) else None
+
+
+def _iter_markdown_component_blocks(markdown: str) -> Iterator[tuple[str, str, int]]:
+    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    line_index = 0
+
+    while line_index < len(lines):
+        if lines[line_index].strip().startswith("```"):
+            line_index = _get_markdown_code_block_end(lines, line_index)
+            continue
+
+        component = _read_markdown_component_block(lines, line_index)
+        if component is None:
+            line_index += 1
+            continue
+
+        yield component
+        line_index = component[2]
+
+
+def _get_markdown_code_block_end(lines: list[str], line_index: int) -> int:
+    next_line_index = line_index + 1
+    while next_line_index < len(lines):
+        if lines[next_line_index].strip().startswith("```"):
+            return next_line_index + 1
+        next_line_index += 1
+    return next_line_index
+
+
+def _read_markdown_component_block(lines: list[str], line_index: int) -> tuple[str, str, int] | None:
+    first_line = lines[line_index].strip()
+    closing_column = re.fullmatch(r"</(Column|Columns)>", first_line)
+    if closing_column:
+        tag_name = f"{closing_column.group(1)}End"
+        return tag_name, f"<{tag_name} />", line_index + 1
+    if re.fullmatch(r"<(Column|Columns)(\s[^\n]*?)?>", first_line) and not first_line.endswith("/>"):
+        tag_name = "Columns" if first_line.startswith("<Columns") else "Column"
+        return tag_name, f"{first_line[:-1]} />", line_index + 1
+    recover_escaped_source = bool(_MARKDOWN_ESCAPED_COMPONENT_START_REGEX.match(first_line))
+    if recover_escaped_source:
+        first_line = _unescape_markdown_inline_source(first_line)
+    if not _MARKDOWN_COMPONENT_START_REGEX.match(first_line):
+        return None
+
+    tag_match = re.match(r"^<([A-Z][A-Za-z0-9]*)", first_line)
+    if not tag_match:
+        return None
+    tag_name = tag_match.group(1)
+
+    scan = _scan_markdown_component_block(lines, line_index, tag_name, recover_escaped_source)
+    if recover_escaped_source and scan.next_line_index <= line_index + 1:
+        return None
+    if not scan.found_terminator:
+        if _MARKDOWN_COMPONENT_TAG_REGEX.match(first_line):
+            return tag_name, first_line, line_index + 1
+        return None
+
+    return tag_name, scan.raw, scan.next_line_index
+
+
+def _scan_markdown_component_block(
+    lines: list[str], line_index: int, tag_name: str, recover_escaped_source: bool = False
+) -> _MarkdownComponentScan:
+    raw_lines: list[str] = []
+    state = _MarkdownComponentScanState()
+    character_count = 0
+    next_line_index = line_index
+    fallback_raw_line_count: int | None = None
+    fallback_next_line_index: int | None = None
+    line_limit = min(len(lines), line_index + _MAX_MARKDOWN_COMPONENT_LINES)
+
+    while next_line_index < line_limit:
+        line = (
+            _unescape_markdown_inline_source(lines[next_line_index])
+            if recover_escaped_source
+            else lines[next_line_index]
+        )
+        if next_line_index > line_index and not line.strip() and fallback_next_line_index is None:
+            fallback_raw_line_count = len(raw_lines)
+            fallback_next_line_index = next_line_index
+        if next_line_index > line_index and not line.strip() and state.quote is None and state.expression_depth == 0:
+            break
+
+        separator_length = 1 if raw_lines else 0
+        if raw_lines and character_count + separator_length + len(line) > _MAX_MARKDOWN_COMPONENT_CHARACTERS:
+            break
+        character_count += separator_length + len(line)
+        raw_lines.append(line)
+
+        character_index = 0
+        while character_index < len(line):
+            character = line[character_index]
+
+            if state.opening_tag_closed:
+                closing_tag = f"</{tag_name}>"
+                if (
+                    line.startswith(closing_tag, character_index)
+                    and not line[character_index + len(closing_tag) :].strip()
+                ):
+                    return _MarkdownComponentScan(
+                        raw="\n".join(raw_lines).strip(),
+                        next_line_index=next_line_index + 1,
+                        found_terminator=True,
+                    )
+                character_index += 1
+                continue
+
+            if (
+                state.quote is None
+                and state.expression_depth == 0
+                and line.startswith("/>", character_index)
+                and not line[character_index + 2 :].strip()
+            ):
+                return _MarkdownComponentScan(
+                    raw="\n".join(raw_lines).strip(),
+                    next_line_index=next_line_index + 1,
+                    found_terminator=True,
+                )
+            _advance_markdown_component_scan(state, character)
+            character_index += 1
+
+        # Joined source contains a newline here. It consumes a pending escape without closing
+        # the quoted value, matching the prop parser's treatment of backslash-newline.
+        if state.quote is not None and state.escape_next:
+            state.escape_next = False
+        next_line_index += 1
+
+    fallback_raw_lines = raw_lines if fallback_raw_line_count is None else raw_lines[:fallback_raw_line_count]
+    return _MarkdownComponentScan(
+        raw="\n".join(fallback_raw_lines).strip(),
+        next_line_index=fallback_next_line_index if fallback_next_line_index is not None else next_line_index,
+        found_terminator=False,
+    )
+
+
+def _unescape_markdown_inline_source(source: str) -> str:
+    unescaped: list[str] = []
+    index = 0
+    while index < len(source):
+        character = source[index]
+        next_character = source[index + 1] if index + 1 < len(source) else None
+        if character == "\\" and next_character in _MARKDOWN_INLINE_ESCAPABLE_CHARACTERS:
+            unescaped.append(next_character)
+            index += 2
+        else:
+            unescaped.append(character)
+            index += 1
+    return "".join(unescaped)
+
+
+def _advance_markdown_component_scan(state: _MarkdownComponentScanState, character: str) -> None:
+    if state.quote is not None:
+        _advance_markdown_component_quote(state, character)
+        return
+
+    if state.expression_depth > 0:
+        _advance_markdown_component_expression(state, character)
+        return
+
+    if state.awaiting_prop_value:
+        if character.isspace():
+            return
+        state.awaiting_prop_value = False
+        if character in {"'", '"'}:
+            state.quote = character
+            return
+        if character == "{":
+            state.expression_depth = 1
+            return
+
+    if character == "=":
+        state.awaiting_prop_value = True
+    elif character == ">":
+        state.opening_tag_closed = True
+
+
+def _advance_markdown_component_quote(state: _MarkdownComponentScanState, character: str) -> None:
+    if state.escape_next:
+        state.escape_next = False
+    elif character == "\\":
+        state.escape_next = True
+    elif character == state.quote:
+        state.quote = None
+
+
+def _advance_markdown_component_expression(state: _MarkdownComponentScanState, character: str) -> None:
+    if character in {"'", '"'}:
+        state.quote = character
+    elif character == "{":
+        state.expression_depth += 1
+    elif character == "}":
+        state.expression_depth -= 1
+
+
+def _parse_markdown_component_props(raw: str) -> dict[str, Any]:
+    match = _MARKDOWN_COMPONENT_TAG_REGEX.match(raw)
+    if not match:
+        return {}
+
+    props: dict[str, Any] = {}
+    source = match.group(2) or ""
+    index = 0
+    while index < len(source):
+        index = _skip_markdown_component_whitespace(source, index)
+        if index >= len(source):
+            break
+
+        name_match = _MARKDOWN_COMPONENT_PROP_NAME_REGEX.match(source[index:])
+        if not name_match:
+            break
+
+        name = name_match.group(1)
+        index += len(name)
+        index = _skip_markdown_component_whitespace(source, index)
+
+        if index >= len(source) or source[index] != "=":
+            props[name] = True
+            continue
+
+        index += 1
+        index = _skip_markdown_component_whitespace(source, index)
+
+        value, index = _read_markdown_component_prop_value(source, index)
+        if _is_markdown_notebook_prop_value(value):
+            props[name] = value
+
+    return props
+
+
+def _skip_markdown_component_whitespace(source: str, index: int) -> int:
+    while index < len(source) and source[index].isspace():
+        index += 1
+    return index
+
+
+def _read_markdown_component_prop_value(source: str, index: int) -> tuple[Any, int]:
+    first_char = source[index] if index < len(source) else ""
+
+    if first_char in {"'", '"'}:
+        quote = first_char
+        next_index = index + 1
+        value = ""
+        while next_index < len(source):
+            character = source[next_index]
+            if character == "\\" and next_index + 1 < len(source):
+                value += source[next_index + 1]
+                next_index += 2
+                continue
+            if character == quote:
+                if quote == '"':
+                    try:
+                        parsed_value = json.loads(source[index : next_index + 1])
+                        if isinstance(parsed_value, str):
+                            return html.unescape(parsed_value), next_index + 1
+                    except (TypeError, ValueError):
+                        pass
+                return html.unescape(value), next_index + 1
+            value += character
+            next_index += 1
+        return None, next_index
+
+    if first_char == "{":
+        balanced = _read_balanced_markdown_expression(source, index)
+        if balanced is None:
+            return None, len(source)
+        value, next_index = balanced
+        return _parse_markdown_expression_value(value), next_index
+
+    raw_match = _MARKDOWN_COMPONENT_RAW_PROP_VALUE_REGEX.match(source[index:])
+    raw = raw_match.group(1) if raw_match else ""
+    return _parse_markdown_expression_value(raw), index + len(raw)
+
+
+def _read_balanced_markdown_expression(source: str, index: int) -> tuple[str, int] | None:
+    depth = 0
+    next_index = index
+    quote: str | None = None
+
+    while next_index < len(source):
+        character = source[next_index]
+        if quote:
+            if character == quote and not _is_escaped_markdown_expression_quote(source, next_index):
+                quote = None
+            next_index += 1
+            continue
+
+        if character in {"'", '"'}:
+            quote = character
+            next_index += 1
+            continue
+
+        if character == "{":
+            depth += 1
+        if character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[index : next_index + 1], next_index + 1
+        next_index += 1
+
+    return None
+
+
+def _is_escaped_markdown_expression_quote(source: str, quote_index: int) -> bool:
+    backslash_count = 0
+    index = quote_index - 1
+    while index >= 0 and source[index] == "\\":
+        backslash_count += 1
+        index -= 1
+    return backslash_count % 2 == 1
+
+
+def _parse_markdown_expression_value(raw: str) -> Any:
+    trimmed = raw.strip()
+    unwrapped = trimmed[1:-1].strip() if trimmed.startswith("{") and trimmed.endswith("}") else trimmed
+
+    if unwrapped == "true":
+        return True
+    if unwrapped == "false":
+        return False
+    if unwrapped == "null":
+        return None
+    if _MARKDOWN_COMPONENT_NUMBER_REGEX.match(unwrapped):
+        return float(unwrapped) if "." in unwrapped else int(unwrapped)
+
+    try:
+        return json.loads(unwrapped)
+    except (TypeError, ValueError):
+        return trimmed
+
+
+def _is_markdown_notebook_prop_value(value: Any) -> bool:
+    if value is None or isinstance(value, str | int | float | bool):
+        return True
+    if isinstance(value, list):
+        return all(_is_markdown_notebook_prop_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_markdown_notebook_prop_value(item) for key, item in value.items())
+    return False
+
+
+def _get_markdown_component_fingerprint(tag_name: str, props: dict[str, Any]) -> str:
+    return json.dumps(
+        {"type": "component", "tagName": tag_name, "props": _sort_markdown_component_props(props)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _sort_markdown_component_props(props: dict[str, Any]) -> dict[str, Any]:
+    return {key: _sort_markdown_component_prop_value(props[key]) for key in sorted(props)}
+
+
+def _sort_markdown_component_prop_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_sort_markdown_component_prop_value(item) for item in value]
+    if isinstance(value, dict):
+        return _sort_markdown_component_props(value)
+    return value
+
+
+def _create_stable_markdown_node_id(fingerprint: str, occurrence: int) -> str:
+    return f"mdn-{_hash_markdown_node_id_seed(fingerprint)}-{occurrence}"
+
+
+def _create_stable_markdown_prose_id(source: str, occurrence: int) -> str:
+    # A separate prefix from `mdn-` keeps prose ids and component ids in disjoint spaces, so a
+    # caller can route an id to the right lookup without inspecting the document.
+    #
+    # This does not reuse `_hash_markdown_node_id_seed`, whose 32 bits mirror the frontend's own
+    # hash for component ids. Two prose blocks that collide there share an id, and an edit meant
+    # for one lands on the other, so prose takes a width where a collision cannot be constructed.
+    digest = hashlib.blake2b(source.encode("utf-8"), digest_size=8).digest()
+    return f"mdp-{_to_base36(int.from_bytes(digest, 'big'))}-{occurrence}"
+
+
+def _hash_markdown_node_id_seed(value: str) -> str:
+    hash_value = 5381
+    encoded = value.encode("utf-16-le", "surrogatepass")
+    for index in range(0, len(encoded), 2):
+        code_unit = encoded[index] | (encoded[index + 1] << 8)
+        hash_value = ((hash_value * 33) ^ code_unit) & 0xFFFFFFFF
+    return _to_base36(hash_value)
+
+
+def _to_base36(value: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if value == 0:
+        return "0"
+    result = ""
+    while value:
+        value, remainder = divmod(value, 36)
+        result = digits[remainder] + result
+    return result
+
+
+def create_bullet_list(items: list[str] | list[TipTapContent] | TipTapContent) -> TipTapNode:
+    """Create a bullet list with list items. Items can be strings or content arrays."""
+    list_items = []
+    for item in items:
+        if isinstance(item, str):
+            list_items.append({"type": "listItem", "content": [create_paragraph_with_text(item)]})
+        elif isinstance(item, list):
+            # item is already a content array (could be paragraph + nested list)
+            list_items.append({"type": "listItem", "content": item})
+        else:
+            # item is a single content node
+            list_items.append({"type": "listItem", "content": [create_paragraph_with_content([item])]})
+
+    return {"type": "bulletList", "content": list_items}
+
+
+def create_heading_with_text(text: str, level: int, *, collapsed: bool = False) -> TipTapNode:
+    """Create a heading node with sanitized text content."""
+    heading_id = str(uuid.uuid4())
+    return {
+        "type": "heading",
+        "attrs": {"id": heading_id, "level": level, "data-toc-id": heading_id, "collapsed": collapsed},
+        "content": [{"type": "text", "text": sanitize_text_content(text)}],
+    }
+
+
+def create_paragraph_with_text(text: str, marks: list[dict[str, Any]] | None = None) -> TipTapNode:
+    """Create a paragraph node with sanitized text content and optional marks."""
+    content_node: dict[str, Any] = {"type": "text", "text": sanitize_text_content(text)}
+    if marks:
+        content_node["marks"] = marks
+    return {
+        "type": "paragraph",
+        "content": [content_node],
+    }
+
+
+def create_paragraph_with_content(content: TipTapContent) -> TipTapNode:
+    """Create a paragraph node with a list of content items."""
+    return {
+        "type": "paragraph",
+        "content": content,
+    }
+
+
+def create_text_content(text: str, is_bold: bool = False, is_italic: bool = False) -> TipTapNode:
+    """Create a text node with optional marks."""
+    node: dict[str, Any] = {"type": "text", "text": text}
+    marks = []
+    if is_bold:
+        marks.append({"type": "bold"})
+    if is_italic:
+        marks.append({"type": "italic"})
+    if marks:
+        node["marks"] = marks
+    return node
+
+
+def create_empty_paragraph() -> TipTapNode:
+    """Create a paragraph node with no content to add spacing."""
+    return {"type": "paragraph"}
+
+
+def create_task_list(items: list[tuple[str, bool]]) -> TipTapNode:
+    """Create a bullet list with checkbox-style items.
+
+    Args:
+        items: List of tuples (task_text, is_completed)
+    """
+    list_items = []
+    for task_text, is_completed in items:
+        checkbox = "[x]" if is_completed else "[ ]"
+        task_content = f"{checkbox} {task_text}"
+        list_items.append({"type": "listItem", "content": [create_paragraph_with_text(task_content)]})
+
+    return {"type": "bulletList", "content": list_items}
+
+
+def sanitize_text_content(text: str) -> str:
+    """Sanitize text content to ensure it's valid for TipTap editor."""
+    if not text or not text.strip():
+        raise ValueError("Empty text should not be passed to create heading or paragraph")
+    return text.strip()

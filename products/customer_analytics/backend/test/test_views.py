@@ -1,0 +1,4536 @@
+from collections.abc import Callable
+from datetime import timedelta
+from uuid import uuid4
+
+import pytest
+import time_machine
+from posthog.test.base import APIBaseTest
+from unittest.mock import MagicMock, patch
+
+from django.apps import apps
+from django.db import connection
+from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
+
+from parameterized import parameterized
+from redis.exceptions import RedisError
+from rest_framework import status
+
+from posthog.auth import MCP_USER_AGENT_MARKER
+from posthog.constants import AvailableFeature
+from posthog.models import Tag, TaggedItem
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.comment import Comment
+from posthog.models.integration import Integration
+from posthog.models.oauth import OAuthAccessToken, OAuthApplication
+from posthog.models.organization import OrganizationMembership
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.team import Team
+from posthog.models.user import User
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.conversations.backend.models import (
+    EMAIL_THREAD_COMMENT_SCOPE,
+    EmailThread,
+    EmailThreadAccountLink,
+    EmailThreadMessage,
+    EmailThreadMessageDirection,
+    EmailThreadParticipant,
+    EmailThreadParticipantKind,
+)
+from products.conversations.backend.models.ticket import Ticket
+from products.customer_analytics.backend.logic import (
+    ownership,
+    relationships as relationships_logic,
+)
+from products.customer_analytics.backend.models import (
+    Account,
+    AccountRelationship,
+    AccountRelationshipDefinition,
+    CustomerJourney,
+    CustomerProfileConfig,
+    CustomPropertyDefinition,
+    CustomPropertySource,
+    CustomPropertyValue,
+    DisplayType,
+    Meeting,
+    MeetingParticipant,
+    TargetType,
+)
+from products.customer_analytics.backend.test.factories import (
+    create_account,
+    create_custom_property_definition,
+    enroll_account,
+)
+from products.event_definitions.backend.models import PropertyDefinition
+from products.notebooks.backend.facade.content import build_markdown_notebook_content
+from products.notebooks.backend.models import Notebook, ResourceNotebook
+from products.product_analytics.backend.facade.models import Insight
+from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+from products.warehouse_sources.backend.models.table import DataWarehouseTable
+from products.workflows.backend.facade.contracts import WorkflowSummary
+from products.workflows.backend.facade.testing import create_workflow_for_test
+
+
+class TestCustomerProfileConfigViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.endpoint_base = f"/api/environments/{self.team.id}/customer_profile_configs/"
+        self.valid_data = {
+            "scope": "person",
+            "content": [{"type": "ph-node-foo", "index": 0}],
+            "sidebar": [{"type": "ph-node-bar"}],
+        }
+
+    def assertActivityLog(self, config_id, activity):
+        logs = ActivityLog.objects.filter(team_id=self.team.id, scope="CustomerProfileConfig", activity=activity)
+        self.assertEqual(logs.count(), 1)
+        log = logs.latest("created_at")
+        self.assertEqual(log.item_id, str(config_id))
+
+    def test_create_customer_profile_config_success(self):
+        response = self.client.post(self.endpoint_base, self.valid_data, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        response_data = response.json()
+
+        self.assertIn("id", response_data)
+        self.assertEqual("person", response_data["scope"])
+        self.assertEqual(self.valid_data["content"], response_data["content"])
+        self.assertEqual(self.valid_data["sidebar"], response_data["sidebar"])
+        self.assertIn("created_at", response_data)
+        self.assertIn("updated_at", response_data)
+
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        config = CustomerProfileConfig.objects.get(id=response_data["id"])
+        self.assertEqual(config.scope, "person", "Should persist data")
+        self.assertEqual(config.team, self.team)
+        self.assertEqual(config.content, self.valid_data["content"])
+        self.assertEqual(config.sidebar, self.valid_data["sidebar"])
+        self.assertEqual(config.created_by, self.user)
+        self.assertActivityLog(config.id, "created")
+
+    def test_list_customer_profile_configs(self):
+        config1 = CustomerProfileConfig.objects.create(team=self.team, scope="person", content={"type": "person"})
+        config2 = CustomerProfileConfig.objects.create(team=self.team, scope="group_0", content={"type": "group"})
+        other_team = Team.objects.create(organization=self.organization)
+        CustomerProfileConfig.objects.create(team=other_team, scope="person", content={"type": "other"})
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        response_data = response.json()
+        self.assertEqual(response_data["count"], 2, "Should only return configs for current team")
+        config_ids = [config["id"] for config in response_data["results"]]
+        self.assertIn(str(config1.id), config_ids)
+        self.assertIn(str(config2.id), config_ids)
+
+        # one-row pages walk both configs without skipping or repeating one
+        paged_ids = {
+            self.client.get(self.endpoint_base, {"limit": 1, "offset": offset}).json()["results"][0]["id"]
+            for offset in range(2)
+        }
+        self.assertEqual(paged_ids, {str(config1.id), str(config2.id)})
+
+    def test_retrieve_customer_profile_config(self):
+        config = CustomerProfileConfig.objects.create(
+            team=self.team, scope="person", content=self.valid_data["content"], sidebar=self.valid_data["sidebar"]
+        )
+
+        response = self.client.get(f"{self.endpoint_base}{config.id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        response_data = response.json()
+        self.assertEqual(str(config.id), response_data["id"])
+        self.assertEqual("person", response_data["scope"])
+        self.assertEqual(self.valid_data["content"], response_data["content"])
+        self.assertEqual(self.valid_data["sidebar"], response_data["sidebar"])
+
+    def test_update_customer_profile_config(self):
+        config = CustomerProfileConfig.objects.create(team=self.team, scope="person", content={"old": "data"})
+        update_data = {"scope": "group_0", "content": {"new": "data"}, "sidebar": {"updated": "sidebar"}}
+
+        response = self.client.patch(f"{self.endpoint_base}{config.id}/", update_data, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        response_data = response.json()
+
+        self.assertEqual("group_0", response_data["scope"])
+        self.assertEqual(update_data["content"], response_data["content"])
+        self.assertEqual(update_data["sidebar"], response_data["sidebar"])
+
+        config.refresh_from_db()
+        self.assertEqual("group_0", config.scope)
+        self.assertEqual(update_data["content"], config.content, "Should update database")
+        self.assertActivityLog(config.id, "updated")
+
+    def test_delete_customer_profile_config(self):
+        config = CustomerProfileConfig.objects.create(team=self.team, scope="person", content={"test": "data"})
+        config_id = str(config.id)
+
+        response = self.client.delete(f"{self.endpoint_base}{config.id}/")
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        self.assertFalse(CustomerProfileConfig.objects.filter(id=config.id).exists())
+        self.assertActivityLog(config_id, "deleted")
+
+    @parameterized.expand(
+        [
+            (
+                "invalid_scope",
+                {"scope": "quick"},
+                {
+                    "attr": "scope",
+                    "type": "validation_error",
+                    "code": "invalid_choice",
+                    "detail": '"quick" is not a valid choice.',
+                },
+            ),
+            (
+                "content_not_dict",
+                {"scope": "person", "content": "not_a_dict"},
+                {
+                    "attr": "content",
+                    "type": "validation_error",
+                    "code": "invalid_input",
+                    "detail": "Invalid value for field 'content'",
+                },
+            ),
+            (
+                "sidebar_not_dict",
+                {"scope": "person", "content": {}, "sidebar": "not_a_dict"},
+                {
+                    "attr": "sidebar",
+                    "type": "validation_error",
+                    "code": "invalid_input",
+                    "detail": "Invalid value for field 'sidebar'",
+                },
+            ),
+            (
+                "missing_scope",
+                {},
+                {"attr": "scope", "type": "validation_error", "code": "required", "detail": "This field is required."},
+            ),
+        ]
+    )
+    def test_validation_errors(self, name, invalid_data, expected_response):
+        response = self.client.post(self.endpoint_base, invalid_data, format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        response_data = response.json()
+        self.assertEqual(response_data, expected_response)
+
+    def test_team_isolation(self):
+        other_team = Team.objects.create(organization=self.organization)
+        other_config = CustomerProfileConfig.objects.create(team=other_team, scope="person", content={"other": "team"})
+
+        response = self.client.get(f"{self.endpoint_base}{other_config.id}/")
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+        response = self.client.patch(f"{self.endpoint_base}{other_config.id}/", {"scope": "group_0"}, format="json")
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+        response = self.client.delete(f"{self.endpoint_base}{other_config.id}/")
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_scope_choices_validation(self):
+        valid_scopes = ["person", "group_0", "group_1", "group_2", "group_3", "group_4"]
+
+        for scope in valid_scopes:
+            data = {"scope": scope, "content": {}}
+            response = self.client.post(self.endpoint_base, data, format="json")
+            self.assertEqual(status.HTTP_201_CREATED, response.status_code, f"Failed for scope: {scope}")
+
+    def test_json_fields_defaults(self):
+        data = {"scope": "person", "content": None, "sidebar": None}
+
+        response = self.client.post(self.endpoint_base, data, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code)
+        response_data = response.json()
+        self.assertEqual({}, response_data["content"], "Should default to empty dict")
+        self.assertEqual({}, response_data["sidebar"], "Should default to empty dict")
+
+    def test_permissions_authentication_required(self):
+        self.client.logout()
+
+        endpoints = [
+            ("GET", self.endpoint_base),
+            ("POST", self.endpoint_base),
+            ("GET", f"{self.endpoint_base}test-id/"),
+            ("PATCH", f"{self.endpoint_base}test-id/"),
+            ("DELETE", f"{self.endpoint_base}test-id/"),
+        ]
+
+        for method, url in endpoints:
+            response = getattr(self.client, method.lower())(url, format="json")
+            self.assertIn(response.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+
+
+class TestCustomerJourneyViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.endpoint_base = f"/api/environments/{self.team.id}/customer_journeys/"
+        self.insight = Insight.objects.create(team=self.team)
+
+    def _create_journey(self, **kwargs):
+        defaults = {"team": self.team, "insight": self.insight, "name": "Test Journey"}
+        defaults.update(kwargs)
+        return CustomerJourney.objects.create(**defaults)
+
+    def test_create(self):
+        response = self.client.post(
+            self.endpoint_base,
+            {"insight": self.insight.id, "name": "My Journey", "description": "A description"},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        data = response.json()
+        self.assertIn("id", data)
+        self.assertEqual(data["name"], "My Journey")
+        self.assertEqual(data["description"], "A description")
+        self.assertEqual(data["insight"], self.insight.id)
+        self.assertIn("created_at", data)
+        self.assertIn("updated_at", data)
+
+        journey = CustomerJourney.objects.get(id=data["id"])  # nosemgrep: idor-lookup-without-team
+        self.assertEqual(journey.created_by, self.user)
+        self.assertEqual(journey.team, self.team)
+
+    def test_list(self):
+        insight2 = Insight.objects.create(team=self.team)
+        j1 = self._create_journey(name="Journey 1")
+        j2 = self._create_journey(name="Journey 2", insight=insight2)
+
+        other_team = Team.objects.create(organization=self.organization)
+        other_insight = Insight.objects.create(team=other_team)
+        CustomerJourney.objects.create(team=other_team, insight=other_insight, name="Other")
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        data = response.json()
+        self.assertEqual(data["count"], 2)
+        ids = {r["id"] for r in data["results"]}
+        self.assertEqual(ids, {str(j1.id), str(j2.id)})
+
+    def test_retrieve(self):
+        journey = self._create_journey(description="desc")
+
+        response = self.client.get(f"{self.endpoint_base}{journey.id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        data = response.json()
+        self.assertEqual(data["id"], str(journey.id))
+        self.assertEqual(data["name"], "Test Journey")
+        self.assertEqual(data["description"], "desc")
+        self.assertEqual(data["insight"], self.insight.id)
+
+    def test_update(self):
+        journey = self._create_journey()
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{journey.id}/",
+            {"name": "Updated", "description": "New desc"},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        journey.refresh_from_db()
+        self.assertEqual(journey.name, "Updated")
+        self.assertEqual(journey.description, "New desc")
+
+    def test_delete(self):
+        journey = self._create_journey()
+        journey_id = journey.id
+
+        response = self.client.delete(f"{self.endpoint_base}{journey.id}/")
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        self.assertFalse(
+            CustomerJourney.objects.filter(id=journey_id).exists()  # nosemgrep: idor-lookup-without-team
+        )
+
+    @parameterized.expand(
+        [
+            (
+                "create",
+                lambda self: self.client.post(
+                    self.endpoint_base,
+                    {"insight": self.insight.id, "name": "Logged"},
+                    format="json",
+                ),
+                "created",
+            ),
+            (
+                "update",
+                lambda self: self.client.patch(
+                    f"{self.endpoint_base}{self._create_journey().id}/",
+                    {"name": "Renamed"},
+                    format="json",
+                ),
+                "updated",
+            ),
+            (
+                "delete",
+                lambda self: self.client.delete(f"{self.endpoint_base}{self._create_journey().id}/"),
+                "deleted",
+            ),
+        ]
+    )
+    def test_activity_log(self, _name, perform_action, expected_activity):
+        perform_action(self)
+
+        logs = ActivityLog.objects.filter(team_id=self.team.id, scope="CustomerJourney", activity=expected_activity)
+        self.assertEqual(logs.count(), 1)
+
+    def test_unique_insight_per_team(self):
+        self._create_journey()
+
+        response = self.client.post(
+            self.endpoint_base,
+            {"insight": self.insight.id, "name": "Duplicate"},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_409_CONFLICT, response.status_code)
+        self.assertIn("already exists", response.json()["detail"])
+
+    def test_team_isolation(self):
+        other_team = Team.objects.create(organization=self.organization)
+        other_insight = Insight.objects.create(team=other_team)
+        other_journey = CustomerJourney.objects.create(team=other_team, insight=other_insight, name="Other")
+
+        response = self.client.get(f"{self.endpoint_base}{other_journey.id}/")
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_cannot_create_journey_with_other_team_insight(self):
+        other_team = Team.objects.create(organization=self.organization)
+        other_insight = Insight.objects.create(team=other_team)
+
+        response = self.client.post(
+            self.endpoint_base,
+            {"insight": other_insight.id, "name": "Cross-team journey"},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        data = response.json()
+        self.assertEqual(data["attr"], "insight")
+        self.assertEqual(data["detail"], "The insight does not belong to this team.")
+
+    @parameterized.expand(
+        [
+            ("missing_name", lambda self: {"insight": self.insight.id}, "name"),
+            ("missing_insight", lambda self: {"name": "Journey"}, "insight"),
+            ("invalid_insight_id", lambda self: {"name": "Journey", "insight": 999999}, "insight"),
+        ]
+    )
+    def test_validation_errors(self, _name, make_data, expected_error_field):
+        response = self.client.post(self.endpoint_base, make_data(self), format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        data = response.json()
+        self.assertEqual(data["attr"], expected_error_field)
+        self.assertEqual(data["type"], "validation_error")
+
+    def test_authentication_required(self):
+        self.client.logout()
+
+        for method, url, expected_status_code in [
+            ("GET", self.endpoint_base, status.HTTP_401_UNAUTHORIZED),
+            ("POST", self.endpoint_base, status.HTTP_401_UNAUTHORIZED),
+            ("GET", f"{self.endpoint_base}test-id/", status.HTTP_401_UNAUTHORIZED),
+            ("PATCH", f"{self.endpoint_base}test-id/", status.HTTP_401_UNAUTHORIZED),
+            ("DELETE", f"{self.endpoint_base}test-id/", status.HTTP_401_UNAUTHORIZED),
+        ]:
+            with self.subTest(method):
+                response = getattr(self.client, method.lower())(url, format="json")
+                self.assertEqual(expected_status_code, response.status_code)
+
+
+class TestAccountViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.endpoint_base = f"/api/environments/{self.team.id}/accounts/"
+
+    def _create_account(self, **kwargs):
+        defaults = {"team": self.team, "name": "Acme Corp"}
+        defaults.update(kwargs)
+        return Account.objects.unscoped().create(**defaults)
+
+    def test_create(self):
+        response = self.client.post(
+            self.endpoint_base,
+            {
+                "name": "Acme Corp",
+                "external_id": "acme-123",
+                "properties": {"stripe_customer_id": "cus_123"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        data = response.json()
+        self.assertIn("id", data)
+        self.assertEqual(data["name"], "Acme Corp")
+        self.assertEqual(data["external_id"], "acme-123")
+        self.assertEqual(data["properties"]["stripe_customer_id"], "cus_123")
+        self.assertIn("created_at", data)
+        self.assertIn("updated_at", data)
+
+        account = Account.objects.unscoped().get(id=data["id"])  # nosemgrep: idor-lookup-without-team
+        self.assertEqual(account.created_by, self.user)
+        self.assertEqual(account.team, self.team)
+        self.assertEqual(account.properties.stripe_customer_id, "cus_123")
+
+    def test_create_minimal_payload_uses_defaults(self):
+        response = self.client.post(self.endpoint_base, {"name": "Bare Account"}, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        data = response.json()
+        self.assertEqual(data["name"], "Bare Account")
+        self.assertIsNone(data["external_id"])
+        self.assertEqual(data["properties"], {})
+        self.assertIsNone(data["churned_at"])
+        self.assertIsNone(data["ignored_at"])
+
+    @parameterized.expand([("churned_at",), ("ignored_at",)])
+    def test_create_with_status_date(self, field: str) -> None:
+        response = self.client.post(
+            self.endpoint_base,
+            {"name": "Former customer", field: "2026-08-01T12:30:00Z"},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        self.assertEqual(response.json()[field], "2026-08-01T12:30:00Z")
+        account = Account.objects.unscoped().get(id=response.json()["id"])  # nosemgrep: idor-lookup-without-team
+        status_date = getattr(account, field)
+        assert status_date is not None
+        self.assertEqual(status_date.isoformat(), "2026-08-01T12:30:00+00:00")
+
+    def test_list(self):
+        a1 = self._create_account(name="Account 1")
+        a2 = self._create_account(name="Account 2")
+
+        other_team = Team.objects.create(organization=self.organization)
+        Account.objects.unscoped().create(team=other_team, name="Other Team Account")
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        data = response.json()
+        self.assertEqual(data["count"], 2)
+        ids = {r["id"] for r in data["results"]}
+        self.assertEqual(ids, {str(a1.id), str(a2.id)})
+
+    @parameterized.expand(
+        [
+            ("default", {}, {"Active"}),
+            ("include_churned", {"include_churned": "true"}, {"Active", "Churned"}),
+        ]
+    )
+    def test_list_churned_visibility(self, _name: str, params: dict[str, str], expected_names: set[str]) -> None:
+        self._create_account(name="Active")
+        self._create_account(name="Churned", churned_at=timezone.now())
+
+        response = self.client.get(self.endpoint_base, data=params)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual({account["name"] for account in response.json()["results"]}, expected_names)
+
+    @parameterized.expand(
+        [
+            ("default", {}, {"Tracked"}),
+            ("include_ignored", {"include_ignored": "true"}, {"Tracked", "Ignored"}),
+        ]
+    )
+    def test_list_ignored_visibility(self, _name: str, params: dict[str, str], expected_names: set[str]) -> None:
+        self._create_account(name="Tracked")
+        self._create_account(name="Ignored", ignored_at=timezone.now())
+
+        response = self.client.get(self.endpoint_base, data=params)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual({account["name"] for account in response.json()["results"]}, expected_names)
+
+    def test_list_inactive_last_puts_churned_and_ignored_accounts_after_active_ones(self) -> None:
+        self._create_account(name="A churned", churned_at=timezone.now())
+        self._create_account(name="B ignored", ignored_at=timezone.now())
+        self._create_account(name="C active")
+        self._create_account(name="D active")
+
+        response = self.client.get(
+            self.endpoint_base,
+            data={"include_churned": "true", "include_ignored": "true", "inactive_last": "true", "ordering": "name"},
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(
+            [account["name"] for account in response.json()["results"]],
+            ["C active", "D active", "A churned", "B ignored"],
+        )
+
+    def test_retrieve(self):
+        ignored_at = timezone.now()
+        account = self._create_account(
+            external_id="ext-1",
+            properties={"stripe_customer_id": "cus_123"},
+            ignored_at=ignored_at,
+        )
+
+        response = self.client.get(f"{self.endpoint_base}{account.id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        data = response.json()
+        self.assertEqual(data["id"], str(account.id))
+        self.assertEqual(data["name"], "Acme Corp")
+        self.assertEqual(data["external_id"], "ext-1")
+        self.assertEqual(data["properties"]["stripe_customer_id"], "cus_123")
+        self.assertEqual(data["ignored_at"], ignored_at.isoformat().replace("+00:00", "Z"))
+
+    @parameterized.expand([(" source-account ",), (" ",), ("symbols / %2F ? # + 漢字",)])
+    def test_retrieve_by_external_id_returns_the_uuid_retrieve_response(self, external_id: str) -> None:
+        account = self._create_account(external_id=external_id)
+        self.client.patch(f"{self.endpoint_base}{account.id}/", {"tags": ["example-tag"]}, format="json")
+        self.client.post(f"{self.endpoint_base}{account.id}/notebooks/", {"title": "Example note"}, format="json")
+
+        uuid_response = self.client.get(f"{self.endpoint_base}{account.id}/")
+        external_id_response = self.client.get(
+            f"{self.endpoint_base}by_external_id/", data={"external_id": account.external_id}
+        )
+
+        self.assertEqual(status.HTTP_200_OK, uuid_response.status_code, uuid_response.json())
+        self.assertEqual(status.HTTP_200_OK, external_id_response.status_code, external_id_response.json())
+        self.assertEqual(external_id_response.json(), uuid_response.json())
+        self.assertEqual(external_id_response.json()["tags"], ["example-tag"])
+        self.assertEqual(len(external_id_response.json()["notebooks"]), 1)
+
+    @parameterized.expand([(True,), (False,)])
+    def test_retrieve_by_external_id_does_not_fall_back_to_uuid(self, has_external_match: bool) -> None:
+        uuid_account = self._create_account(name="UUID account")
+        external_id_account = (
+            self._create_account(name="External ID account", external_id=str(uuid_account.id))
+            if has_external_match
+            else None
+        )
+
+        response = self.client.get(f"{self.endpoint_base}by_external_id/", data={"external_id": str(uuid_account.id)})
+
+        if external_id_account:
+            self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+            self.assertEqual(response.json()["id"], str(external_id_account.id))
+        else:
+            self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code, response.content)
+
+    @parameterized.expand([(True,), (False,)])
+    def test_retrieve_by_external_id_scopes_identical_external_ids_to_the_project(self, has_local_match: bool) -> None:
+        account = self._create_account(external_id="shared-external-id") if has_local_match else None
+        other_team = Team.objects.create(organization=self.organization)
+        Account.objects.for_team(other_team.id).create(
+            team=other_team, name="Other account", external_id="shared-external-id"
+        )
+
+        response = self.client.get(f"{self.endpoint_base}by_external_id/", data={"external_id": "shared-external-id"})
+
+        if account:
+            self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+            self.assertEqual(response.json()["id"], str(account.id))
+        else:
+            self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code, response.content)
+
+    def test_retrieve_by_external_id_accepts_an_account_read_api_key(self) -> None:
+        account = self._create_account(external_id="read-key-account")
+        token = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="account read",
+            user=self.user,
+            secure_value=hash_key_value(token),
+            scopes=["account:read"],
+            scoped_teams=[],
+            scoped_organizations=[],
+        )
+        self.client.logout()
+
+        response = self.client.get(
+            f"{self.endpoint_base}by_external_id/",
+            data={"external_id": account.external_id},
+            headers={"authorization": f"Bearer {token}"},
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.content)
+        self.assertEqual(response.json()["id"], str(account.id))
+
+    def test_retrieve_by_external_id_rejects_a_missing_query_parameter(self) -> None:
+        response = self.client.get(f"{self.endpoint_base}by_external_id/")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.content)
+
+    def test_retrieve_by_external_id_returns_404_when_not_found(self) -> None:
+        response = self.client.get(f"{self.endpoint_base}by_external_id/", data={"external_id": "missing-account"})
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code, response.content)
+
+    def test_presence_returns_other_viewers_once_and_excludes_the_caller(self) -> None:
+        account = self._create_account()
+        teammate = User.objects.create_and_join(self.organization, "presence@posthog.com", "testtest")
+        teammate.first_name = "Alex"
+        teammate.last_name = "Rivera"
+        teammate.save(update_fields=["first_name", "last_name"])
+        presence_url = f"{self.endpoint_base}{account.id}/presence/"
+
+        self.client.force_login(teammate)
+        self.assertEqual(self.client.post(presence_url, format="json").json(), [])
+        self.assertEqual(self.client.post(presence_url, format="json").json(), [])
+
+        self.client.force_login(self.user)
+        response = self.client.post(presence_url, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertEqual(response.json(), [{"user_id": teammate.id, "display_name": "Alex Rivera"}])
+
+    def test_presence_list_returns_viewers_for_requested_accessible_accounts(self) -> None:
+        first_account = self._create_account(name="First account")
+        second_account = self._create_account(name="Second account")
+        teammate = User.objects.create_and_join(self.organization, "presence@posthog.com", "testtest")
+        teammate.first_name = "Alex"
+        teammate.last_name = "Rivera"
+        teammate.save(update_fields=["first_name", "last_name"])
+
+        self.client.force_login(teammate)
+        self.client.post(f"{self.endpoint_base}{first_account.id}/presence/", format="json")
+        self.client.post(f"{self.endpoint_base}{second_account.id}/presence/", format="json")
+
+        self.client.force_login(self.user)
+        expected_teammate = [{"user_id": teammate.id, "display_name": "Alex Rivera"}]
+        self.assertEqual(
+            self.client.post(f"{self.endpoint_base}{first_account.id}/presence/", format="json").json(),
+            expected_teammate,
+        )
+        self.assertEqual(
+            self.client.post(f"{self.endpoint_base}{second_account.id}/presence/", format="json").json(),
+            expected_teammate,
+        )
+        response = self.client.post(
+            f"{self.endpoint_base}presence_list/",
+            {"account_ids": [str(first_account.id), str(second_account.id)]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertEqual(
+            {item["account_id"]: item["viewers"] for item in response.json()},
+            {
+                str(first_account.id): expected_teammate,
+                str(second_account.id): expected_teammate,
+            },
+        )
+
+    @patch("products.customer_analytics.backend.logic.account_presence.time")
+    def test_presence_removes_expired_viewers(self, mock_time: MagicMock) -> None:
+        account = self._create_account()
+        teammate = User.objects.create_and_join(self.organization, "presence@posthog.com", "testtest")
+        presence_url = f"{self.endpoint_base}{account.id}/presence/"
+        mock_time.time.side_effect = [100.0, 191.0]
+
+        self.client.force_login(teammate)
+        self.assertEqual(self.client.post(presence_url, format="json").json(), [])
+
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.post(presence_url, format="json").json(), [])
+
+    def test_presence_does_not_leak_accounts_from_other_teams(self) -> None:
+        other_team = Team.objects.create(organization=self.organization)
+        other_account = Account.objects.unscoped().create(team=other_team, name="Other")
+
+        response = self.client.post(f"{self.endpoint_base}{other_account.id}/presence/", format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch(
+        "products.customer_analytics.backend.logic.account_presence.get_client", side_effect=RedisError("unavailable")
+    )
+    def test_presence_redis_failure_returns_an_empty_roster(self, _get_client: MagicMock) -> None:
+        account = self._create_account()
+
+        response = self.client.post(f"{self.endpoint_base}{account.id}/presence/", format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+        self.assertEqual(response.json(), [])
+
+    def test_retrieve_hides_retired_role_keys_in_stored_rows(self):
+        # Rows not yet cleaned by backfill_account_relationships must not leak role keys:
+        # the frontend read-modify-writes `properties`, and echoing them back would 400.
+        account = self._create_account(
+            _properties={"csm": {"id": self.user.id, "email": self.user.email}, "billing_id": "B-1"}
+        )
+
+        response = self.client.get(f"{self.endpoint_base}{account.id}/")
+
+        self.assertEqual(response.json()["properties"], {"billing_id": "B-1"})
+
+    def test_update(self):
+        account = self._create_account(properties={"stripe_customer_id": "cus_123"})
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{account.id}/",
+            {
+                "name": "Renamed",
+                "properties": {"sfdc_id": "001xx", "website_domain": "https://www.acme.example/about"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        account.refresh_from_db()
+        self.assertEqual(account.name, "Renamed")
+        self.assertEqual(account.properties.sfdc_id, "001xx")
+        self.assertEqual(account.properties.website_domain, "acme.example")
+
+    @parameterized.expand([("churned_at",), ("ignored_at",)])
+    def test_update_and_clear_status_date(self, field: str) -> None:
+        account = self._create_account()
+        url = f"{self.endpoint_base}{account.id}/"
+
+        response = self.client.patch(url, {field: "2026-08-02T09:00:00Z"}, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()[field], "2026-08-02T09:00:00Z")
+        account.refresh_from_db()
+        self.assertEqual(getattr(account, field).isoformat(), "2026-08-02T09:00:00+00:00")
+
+        response = self.client.patch(url, {field: None}, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertIsNone(response.json()[field])
+        account.refresh_from_db()
+        self.assertIsNone(getattr(account, field))
+
+    @parameterized.expand(
+        [
+            ("member", OrganizationMembership.Level.MEMBER, status.HTTP_403_FORBIDDEN),
+            ("admin", OrganizationMembership.Level.ADMIN, status.HTTP_200_OK),
+        ]
+    )
+    def test_matching_update_requires_project_admin(
+        self, _name: str, membership_level: OrganizationMembership.Level, expected_status: int
+    ) -> None:
+        self.organization_membership.level = membership_level
+        self.organization_membership.save(update_fields=["level"])
+        account = self._create_account()
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{account.id}/",
+            {"properties": {"known_emails": ["jane@acme.com"]}},
+            format="json",
+        )
+
+        self.assertEqual(expected_status, response.status_code, response.json())
+        account.refresh_from_db()
+        expected_emails = ["jane@acme.com"] if expected_status == status.HTTP_200_OK else []
+        self.assertEqual(expected_emails, account.properties.known_emails)
+
+    def test_delete(self):
+        account = self._create_account()
+        account_id = account.id
+
+        response = self.client.delete(f"{self.endpoint_base}{account.id}/")
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        self.assertFalse(Account.objects.unscoped().filter(id=account_id).exists())
+
+    _EXTERNAL_IDENTIFIER_PROPERTIES = {
+        "stripe_customer_id": "cus_123",
+        "hubspot_deal_id": "deal_456",
+        "billing_id": "bill_789",
+        "sfdc_id": "001A000000DUMMY",
+        "zendesk_id": "zd_42",
+        "slack_channel_id": "C0123456789",
+        "usage_dashboard_link": "https://us.posthog.com/project/2/dashboard/12345",
+    }
+
+    def _assert_external_identifiers(self, properties_payload):
+        for key, value in self._EXTERNAL_IDENTIFIER_PROPERTIES.items():
+            self.assertEqual(properties_payload[key], value)
+
+    def test_create_with_external_identifier_properties(self):
+        response = self.client.post(
+            self.endpoint_base,
+            {"name": "Acme", "properties": self._EXTERNAL_IDENTIFIER_PROPERTIES},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        self._assert_external_identifiers(response.json()["properties"])
+
+    def test_update_with_external_identifier_properties(self):
+        account = self._create_account()
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{account.id}/",
+            {"properties": self._EXTERNAL_IDENTIFIER_PROPERTIES},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self._assert_external_identifiers(response.json()["properties"])
+
+    def test_retrieve_returns_external_identifier_properties(self):
+        account = self._create_account(properties=self._EXTERNAL_IDENTIFIER_PROPERTIES)
+
+        response = self.client.get(f"{self.endpoint_base}{account.id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self._assert_external_identifiers(response.json()["properties"])
+
+    def test_list_returns_external_identifier_properties(self):
+        self._create_account(properties=self._EXTERNAL_IDENTIFIER_PROPERTIES)
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self._assert_external_identifiers(response.json()["results"][0]["properties"])
+
+    @parameterized.expand(
+        [
+            (
+                "create",
+                lambda self: self.client.post(self.endpoint_base, {"name": "Logged"}, format="json"),
+                "created",
+            ),
+            (
+                "update",
+                lambda self: self.client.patch(
+                    f"{self.endpoint_base}{self._create_account().id}/",
+                    {"name": "Renamed"},
+                    format="json",
+                ),
+                "updated",
+            ),
+            (
+                "delete",
+                lambda self: self.client.delete(f"{self.endpoint_base}{self._create_account().id}/"),
+                "deleted",
+            ),
+        ]
+    )
+    def test_activity_log(self, _name, perform_action, expected_activity):
+        perform_action(self)
+
+        logs = ActivityLog.objects.filter(team_id=self.team.id, scope="Account", activity=expected_activity)
+        self.assertEqual(logs.count(), 1)
+
+    def test_team_isolation(self):
+        other_team = Team.objects.create(organization=self.organization)
+        other_account = Account.objects.unscoped().create(team=other_team, name="Other")
+
+        response = self.client.get(f"{self.endpoint_base}{other_account.id}/")
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+        response = self.client.patch(f"{self.endpoint_base}{other_account.id}/", {"name": "Hijacked"}, format="json")
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+        response = self.client.delete(f"{self.endpoint_base}{other_account.id}/")
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    @parameterized.expand(
+        [
+            ("missing_name", {}, "name"),
+            ("name_too_long", {"name": "x" * 401}, "name"),
+            ("properties_not_object", {"name": "Acme", "properties": [1, 2, 3]}, "properties"),
+            ("properties_not_object_string", {"name": "Acme", "properties": "not-a-dict"}, "properties"),
+            (
+                "properties_unknown_key",
+                {"name": "Acme", "properties": {"unknown_field": "x"}},
+                "properties",
+            ),
+            (
+                "properties_retired_role_key",
+                {"name": "Acme", "properties": {"csm": {"id": 1, "email": "a@b.co"}}},
+                "properties",
+            ),
+        ]
+    )
+    def test_validation_errors(self, _name, invalid_data, expected_error_field):
+        response = self.client.post(self.endpoint_base, invalid_data, format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        data = response.json()
+        self.assertEqual(data["attr"], expected_error_field)
+        self.assertEqual(data["type"], "validation_error")
+
+    def test_properties_default_when_null(self):
+        response = self.client.post(self.endpoint_base, {"name": "Acme", "properties": None}, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code)
+        self.assertEqual({}, response.json()["properties"])
+
+    def test_create_duplicate_external_id_returns_409(self):
+        first = self.client.post(self.endpoint_base, {"name": "First", "external_id": "acme-1"}, format="json")
+        self.assertEqual(status.HTTP_201_CREATED, first.status_code, first.json())
+
+        second = self.client.post(self.endpoint_base, {"name": "Second", "external_id": "acme-1"}, format="json")
+
+        self.assertEqual(status.HTTP_409_CONFLICT, second.status_code, second.json())
+        self.assertIn("already exists", second.json()["detail"])
+
+    def test_authentication_required(self):
+        self.client.logout()
+
+        for method, url in [
+            ("GET", self.endpoint_base),
+            ("POST", self.endpoint_base),
+            ("GET", f"{self.endpoint_base}test-id/"),
+            ("PATCH", f"{self.endpoint_base}test-id/"),
+            ("DELETE", f"{self.endpoint_base}test-id/"),
+        ]:
+            with self.subTest(method=method, url=url):
+                response = getattr(self.client, method.lower())(url, format="json")
+                self.assertIn(response.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+
+    def test_create_with_tags(self):
+        response = self.client.post(
+            self.endpoint_base,
+            {"name": "Tagged Account", "tags": ["enterprise", "priority"]},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        self.assertEqual(sorted(response.json()["tags"]), ["enterprise", "priority"])
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        account = Account.objects.unscoped().get(id=response.json()["id"])
+        self.assertEqual(
+            sorted(Tag.objects.filter(team=self.team).values_list("name", flat=True)),
+            ["enterprise", "priority"],
+        )
+        self.assertEqual(
+            sorted(TaggedItem.objects.for_object(account).values_list("tag__name", flat=True)),
+            ["enterprise", "priority"],
+        )
+
+    def test_retrieve_returns_tags(self):
+        account = self._create_account()
+        tag = Tag.objects.create(name="vip", team=self.team)
+        account.tagged_items.create(tag=tag)
+
+        response = self.client.get(f"{self.endpoint_base}{account.id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(response.json()["tags"], ["vip"])
+
+    def test_list_returns_tags(self):
+        account = self._create_account()
+        for name in ("alpha", "beta"):
+            account.tagged_items.create(tag=Tag.objects.create(name=name, team=self.team))
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        results = {r["id"]: r for r in response.json()["results"]}
+        self.assertEqual(sorted(results[str(account.id)]["tags"]), ["alpha", "beta"])
+
+    def test_update_replaces_tags(self):
+        account = self._create_account()
+        account.tagged_items.create(tag=Tag.objects.create(name="old", team=self.team))
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{account.id}/",
+            {"tags": ["new"]},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(response.json()["tags"], ["new"])
+        self.assertEqual(list(account.tagged_items.values_list("tag__name", flat=True)), ["new"])
+
+    def test_update_with_empty_tags_clears_them(self):
+        account = self._create_account()
+        account.tagged_items.create(tag=Tag.objects.create(name="stale", team=self.team))
+
+        response = self.client.patch(f"{self.endpoint_base}{account.id}/", {"tags": []}, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(response.json()["tags"], [])
+        self.assertFalse(account.tagged_items.exists())
+
+    def test_list_filters_by_tags(self):
+        billing_tag = Tag.objects.create(name="billing", team=self.team)
+        urgent_tag = Tag.objects.create(name="urgent", team=self.team)
+        churn_tag = Tag.objects.create(name="churn", team=self.team)
+
+        billing = self._create_account(name="Billing Co")
+        billing.tagged_items.create(tag=billing_tag)
+        urgent = self._create_account(name="Urgent Co")
+        urgent.tagged_items.create(tag=urgent_tag)
+        churn = self._create_account(name="Churn Co")
+        churn.tagged_items.create(tag=churn_tag)
+        self._create_account(name="Untagged Co")
+
+        response = self.client.get(f'{self.endpoint_base}?tags=["billing","urgent"]')
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        names = {r["name"] for r in response.json()["results"]}
+        self.assertEqual(names, {"Billing Co", "Urgent Co"})
+
+    def test_list_tags_filter_returns_each_account_once_when_multiple_tags_match(self):
+        billing_tag = Tag.objects.create(name="billing", team=self.team)
+        urgent_tag = Tag.objects.create(name="urgent", team=self.team)
+        account = self._create_account(name="Double Tagged")
+        account.tagged_items.create(tag=billing_tag)
+        account.tagged_items.create(tag=urgent_tag)
+
+        response = self.client.get(f'{self.endpoint_base}?tags=["billing","urgent"]')
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(response.json()["count"], 1)
+
+    @parameterized.expand(
+        [
+            ("not_json", "not-json"),
+            ("bare_token", "billing"),
+            ("json_string", '"billing"'),
+            ("json_object", '{"name":"billing"}'),
+            ("list_of_ints", "[1, 2]"),
+            ("mixed_list", '["billing", 1]'),
+        ]
+    )
+    def test_list_rejects_malformed_tags_param(self, _name, tags_value):
+        Tag.objects.create(name="billing", team=self.team)
+        self._create_account(name="Account A")
+        self._create_account(name="Account B")
+
+        response = self.client.get(f"{self.endpoint_base}?tags={tags_value}")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        self.assertIn("Must be a JSON-encoded list of strings.", str(response.json()))
+
+    def test_list_ignores_empty_tags_array(self):
+        self._create_account(name="Account A")
+        self._create_account(name="Account B")
+
+        response = self.client.get(f"{self.endpoint_base}?tags=[]")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(response.json()["count"], 2)
+
+    def test_list_with_tags_filter_does_not_n_plus_one(self):
+        billing_tag = Tag.objects.create(name="billing", team=self.team)
+        urgent_tag = Tag.objects.create(name="urgent", team=self.team)
+        for i in range(10):
+            account = self._create_account(name=f"Acct {i}")
+            account.tagged_items.create(tag=billing_tag)
+            account.tagged_items.create(tag=urgent_tag)
+
+        with self.assertNumQueries(9):
+            # Query budget for a tag-filtered account list. Constant regardless of result count
+            # because tagged_items and notebooks are prefetched once. If a query is added, please
+            # confirm it does not scale with the number of accounts before raising the limit:
+            # 1: load Django session
+            # 2: load authenticated user
+            # 3: load user's current organization
+            # 4: load team for the requested project
+            # 5: load org membership for permission checks
+            # 6: load RBAC access controls for customer_analytics
+            # 7: load org membership again for role inheritance
+            # 8: load constance instance setting (rate limit config)
+            # 9: COUNT(*) for pagination
+            # 10: SELECT page of accounts filtered by tag name
+            # 11: prefetch resourcenotebook (joined with notebook) for the page
+            # 12: prefetch tagged_items + tag for the page (the prefetch that prevents N+1)
+            response = self.client.get(f'{self.endpoint_base}?tags=["billing","urgent"]')
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(response.json()["count"], 10)
+
+    def test_tag_change_logs_to_account_activity_stream(self):
+        account = self._create_account()
+        initial_logs = ActivityLog.objects.filter(team_id=self.team.id, scope="Account", activity="updated").count()
+
+        response = self.client.patch(f"{self.endpoint_base}{account.id}/", {"tags": ["audit"]}, format="json")
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+
+        new_logs = ActivityLog.objects.filter(team_id=self.team.id, scope="Account", activity="updated").count()
+        self.assertGreater(new_logs, initial_logs)
+
+    def test_list_accounts_filter_all_roles_unassigned(self):
+        definition = AccountRelationshipDefinition.objects.for_team(self.team.id).create(
+            team_id=self.team.id, name="CSM"
+        )
+        assigned = self._create_account(name="Has CSM")
+        AccountRelationship.objects.for_team(self.team.id).create(
+            team_id=self.team.id, account=assigned, definition=definition, user=self.user
+        )
+        ended = self._create_account(name="Ended CSM")
+        AccountRelationship.objects.for_team(self.team.id).create(
+            team_id=self.team.id, account=ended, definition=definition, user=self.user, ended_at=timezone.now()
+        )
+        self._create_account(name="Unassigned")
+        response = self.client.get(f"{self.endpoint_base}?all_roles_unassigned=true")
+        assert sorted(r["name"] for r in response.json()["results"]) == ["Ended CSM", "Unassigned"]
+
+    def test_list_accounts_ordering_by_name_asc(self):
+        # Create in alphabetical order so default `-created_at` order is [Banana, Apple];
+        # ordering=name only matches if the filter actually flips the order.
+        self._create_account(name="Apple")
+        self._create_account(name="Banana")
+        response = self.client.get(f"/api/environments/{self.team.id}/accounts/?ordering=name")
+        assert [r["name"] for r in response.json()["results"]] == ["Apple", "Banana"]
+
+    def test_list_accounts_ordering_by_name_desc(self):
+        # Default `-created_at` order would be [Apple, Banana]; ordering=-name flips to [Banana, Apple].
+        self._create_account(name="Banana")
+        self._create_account(name="Apple")
+        response = self.client.get(f"/api/environments/{self.team.id}/accounts/?ordering=-name")
+        assert [r["name"] for r in response.json()["results"]] == ["Banana", "Apple"]
+
+    def test_list_accounts_invalid_ordering_is_ignored(self):
+        # Malformed ordering should fall back to default `-created_at` order.
+        self._create_account(name="Apple")
+        self._create_account(name="Banana")
+        response = self.client.get(f"/api/environments/{self.team.id}/accounts/?ordering=robert');drop")
+        assert response.status_code == status.HTTP_200_OK
+        assert [r["name"] for r in response.json()["results"]] == ["Banana", "Apple"]
+
+    @parameterized.expand(
+        [
+            ("name_exact", "Acme Corp", ["Acme Corp"]),
+            ("name_partial_case_insensitive", "acme", ["Acme Corp"]),
+            ("external_id_partial", "glx-9", ["Globex"]),
+            ("matches_name_or_external_id", "1", ["Acme Corp"]),
+            ("no_match", "zzzz", []),
+        ]
+    )
+    def test_list_accounts_search(self, _name, search, expected):
+        self._create_account(name="Acme Corp", external_id="acme-1")
+        self._create_account(name="Globex", external_id="glx-99")
+        response = self.client.get(f"{self.endpoint_base}?search={search}")
+        assert response.status_code == status.HTTP_200_OK
+        assert sorted(r["name"] for r in response.json()["results"]) == sorted(expected)
+
+    def test_list_accounts_blank_search_returns_all(self):
+        self._create_account(name="Acme Corp")
+        self._create_account(name="Globex")
+        response = self.client.get(f"{self.endpoint_base}?search=")
+        assert sorted(r["name"] for r in response.json()["results"]) == ["Acme Corp", "Globex"]
+
+    def test_list_accounts_search_respects_team_isolation(self):
+        other_team = Team.objects.create(organization=self.organization, name="other")
+        self._create_account(team=other_team, name="Acme Corp")
+        self._create_account(name="Acme Corp")
+        response = self.client.get(f"{self.endpoint_base}?search=acme")
+        assert len(response.json()["results"]) == 1
+
+    def test_retrieve_returns_empty_notebooks_when_none_linked(self):
+        account = self._create_account()
+
+        response = self.client.get(f"{self.endpoint_base}{account.id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(response.json()["notebooks"], [])
+
+    def test_retrieve_returns_all_linked_notebooks(self):
+        account = self._create_account()
+        notebook_a = Notebook.objects.create(
+            team=self.team, title="A", content=[], visibility=Notebook.Visibility.INTERNAL
+        )
+        notebook_b = Notebook.objects.create(
+            team=self.team, title="B", content=[], visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=notebook_a, account=account)
+        ResourceNotebook.objects.create(notebook=notebook_b, account=account)
+
+        response = self.client.get(f"{self.endpoint_base}{account.id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(set(response.json()["notebooks"]), {notebook_a.short_id, notebook_b.short_id})
+
+    def test_list_includes_notebooks_field(self):
+        account = self._create_account()
+        notebook = Notebook.objects.create(
+            team=self.team, title="Existing", content=[], visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=notebook, account=account)
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        result = next(r for r in response.json()["results"] if r["id"] == str(account.id))
+        self.assertEqual(result["notebooks"], [notebook.short_id])
+
+
+class TestAccountNotebookViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.account = Account.objects.unscoped().create(team=self.team, name="Acme Corp")
+        self.endpoint_base = f"/api/environments/{self.team.id}/accounts/{self.account.id}/notebooks/"
+
+    def test_create_account_notebook_uses_internal_visibility(self):
+        response = self.client.post(
+            self.endpoint_base,
+            {"title": "Q3 call", "content": {"type": "doc", "content": []}},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        data = response.json()
+        self.assertIn("short_id", data)
+        self.assertEqual(data["title"], "Q3 call")
+
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        notebook = Notebook.objects.get(short_id=data["short_id"])
+        self.assertEqual(notebook.team, self.team)
+        self.assertEqual(notebook.visibility, Notebook.Visibility.INTERNAL)
+        self.assertEqual(notebook.created_by, self.user)
+
+        self.assertTrue(
+            ResourceNotebook.objects.filter(notebook=notebook, account=self.account).exists(),
+        )
+
+    def test_list_returns_only_notebooks_for_account(self):
+        account_notebook = Notebook.objects.create(
+            team=self.team, title="Account note", content={}, visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=account_notebook, account=self.account)
+
+        other_account = Account.objects.unscoped().create(team=self.team, name="Other")
+        other_notebook = Notebook.objects.create(
+            team=self.team, title="Other note", content={}, visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=other_notebook, account=other_account)
+
+        Notebook.objects.create(team=self.team, title="Standalone", content={}, visibility=Notebook.Visibility.DEFAULT)
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        short_ids = [n["short_id"] for n in response.json()["results"]]
+        self.assertEqual(short_ids, [account_notebook.short_id])
+
+    def _link_internal_notebook(self, **kwargs) -> Notebook:
+        notebook = Notebook.objects.create(team=self.team, visibility=Notebook.Visibility.INTERNAL, **kwargs)
+        ResourceNotebook.objects.create(notebook=notebook, account=self.account)
+        return notebook
+
+    def test_list_search_matches_title_and_content(self):
+        by_title = self._link_internal_notebook(title="Renewal planning", text_content="")
+        by_content = self._link_internal_notebook(title="Untitled", text_content="discuss renewal terms")
+        self._link_internal_notebook(title="Onboarding", text_content="kickoff call")
+
+        response = self.client.get(f"{self.endpoint_base}?search=renewal")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        short_ids = {n["short_id"] for n in response.json()["results"]}
+        self.assertEqual(short_ids, {by_title.short_id, by_content.short_id})
+
+    def test_list_orders_by_created_at(self):
+        with time_machine.travel("2024-01-01", tick=False):
+            older = self._link_internal_notebook(title="Older", content={})
+        with time_machine.travel("2024-01-02", tick=False):
+            newer = self._link_internal_notebook(title="Newer", content={})
+
+        default_order = [n["short_id"] for n in self.client.get(self.endpoint_base).json()["results"]]
+        self.assertEqual(default_order, [newer.short_id, older.short_id])
+
+        ascending = [
+            n["short_id"] for n in self.client.get(f"{self.endpoint_base}?ordering=created_at").json()["results"]
+        ]
+        self.assertEqual(ascending, [older.short_id, newer.short_id])
+
+    def _tag(self, notebook: Notebook, *names: str) -> None:
+        for name in names:
+            tag, _ = Tag.objects.get_or_create(name=name, team=self.team)
+            TaggedItem.for_content_object(tag, notebook).save()
+
+    @parameterized.expand(
+        [
+            ("strings", ["Renewal", "risk"], ["renewal", "risk"]),
+            ("numbers", [123, "Risk"], ["123", "risk"]),
+        ]
+    )
+    def test_create_with_tags(self, _name: str, tags: list[str | int], expected: list[str]) -> None:
+        response = self.client.post(
+            self.endpoint_base,
+            {"title": "Renewal call", "text_content": "notes", "tags": tags},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        data = response.json()
+        self.assertEqual(data["tags"], expected)
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        notebook = Notebook.objects.get(short_id=data["short_id"])
+        self.assertEqual(sorted(notebook.tagged_items.values_list("tag__name", flat=True)), expected)
+
+    def test_create_with_tags_rolls_back_on_tag_insert_failure(self) -> None:
+        def fail_tag_insert(
+            execute: Callable[[str, object, bool, dict[str, object]], object],
+            sql: str,
+            params: object,
+            many: bool,
+            context: dict[str, object],
+        ) -> object:
+            if sql.startswith('INSERT INTO "posthog_taggeditem"'):
+                raise RuntimeError("tag insert failed")
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(fail_tag_insert):
+            response = self.client.post(
+                self.endpoint_base, {"title": "Rollback note", "text_content": "notes", "tags": ["risk"]}, format="json"
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertFalse(Notebook.objects.filter(team=self.team, title="Rollback note").exists())
+        self.assertFalse(ResourceNotebook.objects.filter(account=self.account).exists())
+        self.assertFalse(Tag.objects.filter(team=self.team, name="risk").exists())
+
+    def test_create_without_tags_returns_empty_tags(self):
+        # The "New note" button and any MCP caller that does not tag.
+        response = self.client.post(self.endpoint_base, {"title": "Plain note", "text_content": "notes"}, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.content)
+        self.assertEqual(response.json()["tags"], [])
+
+    def test_empty_tags_filter_means_no_filter(self):
+        self._link_internal_notebook(title="Plain")
+
+        response = self.client.get(self.endpoint_base, {"tags": "[]"})
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.content)
+        self.assertEqual([row["title"] for row in response.json()["results"]], ["Plain"])
+
+    def test_list_includes_tags(self):
+        notebook = self._link_internal_notebook(title="Tagged")
+        self._tag(notebook, "risk")
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        row = response.json()["results"][0]
+        self.assertEqual(row["tags"], ["risk"])
+
+    def test_list_filters_by_tags(self):
+        risky = self._link_internal_notebook(title="Risky")
+        self._tag(risky, "risk", "renewal")
+        self._link_internal_notebook(title="Plain")
+        other = self._link_internal_notebook(title="Other")
+        self._tag(other, "call")
+
+        response = self.client.get(f'{self.endpoint_base}?tags=["risk","call"]')
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        short_ids = {n["short_id"] for n in response.json()["results"]}
+        self.assertEqual(short_ids, {risky.short_id, other.short_id})
+        # A tagged notebook matching two filter tags appears once.
+        self.assertEqual(len(response.json()["results"]), 2)
+
+    def test_list_rejects_malformed_tags(self):
+        response = self.client.get(f"{self.endpoint_base}?tags=risk")
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+
+    def test_partial_update_replaces_tags(self):
+        notebook = self._link_internal_notebook(title="Before")
+        self._tag(notebook, "old")
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{notebook.short_id}/",
+            {"tags": ["Risk", "risk", "renewal"]},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["tags"], ["renewal", "risk"])
+        self.assertFalse(Tag.objects.filter(team=self.team, name="old").exists())
+        unchanged = self.client.patch(f"{self.endpoint_base}{notebook.short_id}/", {}, format="json")
+        self.assertEqual(unchanged.status_code, status.HTTP_200_OK)
+        self.assertEqual(unchanged.json()["tags"], ["renewal", "risk"])
+
+    def test_clearing_tags_keeps_activity_and_avoids_reloading_notebook_per_tag(self) -> None:
+        notebook = self._link_internal_notebook(title="Tagged")
+        self._tag(notebook, "one", "two", "three")
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.patch(f"{self.endpoint_base}{notebook.short_id}/", {"tags": []}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertEqual(response.json()["tags"], [])
+        notebook_reads = [q for q in queries if q["sql"].startswith("SELECT") and 'FROM "posthog_notebook"' in q["sql"]]
+        self.assertLessEqual(len(notebook_reads), 2)
+        logs = ActivityLog.objects.filter(team_id=self.team.id, scope="TaggedItem", activity="deleted")
+        self.assertEqual(logs.count(), 3)
+        tag_names: set[str] = set()
+        for log in logs:
+            detail = log.detail
+            assert detail is not None
+            tag_names.add(detail["context"]["tag_name"])
+            self.assertEqual(detail["context"]["related_object_id"], str(notebook.id))
+            self.assertEqual(detail["context"]["related_object_name"], "Tagged")
+        self.assertEqual(tag_names, {"one", "two", "three"})
+
+    def test_partial_update_does_not_rename(self):
+        # A note's displayed title comes from its first line, so a title set here would disagree
+        # with the heading the moment the note is opened. Renaming happens in the note itself.
+        notebook = self._link_internal_notebook(title="Keep me")
+        self._tag(notebook, "risk")
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{notebook.short_id}/", {"title": "Renamed", "tags": ["risk"]}, format="json"
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["title"], "Keep me")
+        notebook.refresh_from_db()
+        self.assertEqual(notebook.title, "Keep me")
+
+    def test_list_filters_by_created_by(self):
+        other_user = User.objects.create_and_join(self.organization, "account-note-author@posthog.com", None)
+        self._link_internal_notebook(title="Mine", created_by=self.user)
+        self._link_internal_notebook(title="Theirs", created_by=other_user)
+
+        response = self.client.get(f"{self.endpoint_base}?created_by={self.user.id}")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual([n["title"] for n in response.json()["results"]], ["Mine"])
+
+    def test_list_rejects_malformed_created_by(self):
+        response = self.client.get(f"{self.endpoint_base}?created_by=alice")
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+
+    def test_partial_update_of_notebook_on_other_account_is_404(self):
+        other_account = Account.objects.unscoped().create(team=self.team, name="Other")
+        notebook = Notebook.objects.create(team=self.team, title="Elsewhere", visibility=Notebook.Visibility.INTERNAL)
+        ResourceNotebook.objects.create(notebook=notebook, account=other_account)
+
+        response = self.client.patch(f"{self.endpoint_base}{notebook.short_id}/", {"tags": ["risk"]}, format="json")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+        self.assertEqual(notebook.tagged_items.count(), 0)
+
+    def test_retrieve_returns_notebook_for_account(self):
+        notebook = Notebook.objects.create(
+            team=self.team, title="Note", content={"foo": "bar"}, visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=notebook, account=self.account)
+
+        response = self.client.get(f"{self.endpoint_base}{notebook.short_id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        data = response.json()
+        self.assertEqual(data["short_id"], notebook.short_id)
+        self.assertEqual(data["title"], "Note")
+        self.assertEqual(data["content"], {"foo": "bar"})
+
+    def test_retrieve_notebook_not_linked_to_account_returns_404(self):
+        unrelated = Notebook.objects.create(
+            team=self.team, title="Unrelated", content={}, visibility=Notebook.Visibility.DEFAULT
+        )
+
+        response = self.client.get(f"{self.endpoint_base}{unrelated.short_id}/")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_destroy_notebook_for_account(self):
+        notebook = Notebook.objects.create(
+            team=self.team, title="Note", content={}, visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=notebook, account=self.account)
+        notebook_pk = notebook.pk
+
+        response = self.client.delete(f"{self.endpoint_base}{notebook.short_id}/")
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        self.assertFalse(Notebook.objects.filter(pk=notebook_pk).exists())
+        self.assertFalse(ResourceNotebook.objects.filter(account=self.account).exists())
+
+    def test_create_for_unknown_account_returns_404(self):
+        bad_url = f"/api/environments/{self.team.id}/accounts/00000000-0000-0000-0000-000000000000/notebooks/"
+
+        response = self.client.post(bad_url, {"title": "X"}, format="json")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_other_team_account_is_not_accessible(self):
+        other_team = Team.objects.create(organization=self.organization)
+        other_account = Account.objects.unscoped().create(team=other_team, name="Other team")
+
+        url = f"/api/environments/{self.team.id}/accounts/{other_account.id}/notebooks/"
+        response = self.client.post(url, {"title": "X"}, format="json")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_internal_account_notebooks_do_not_appear_in_notebooks_list(self):
+        notebook = Notebook.objects.create(
+            team=self.team, title="Account note", content={}, visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=notebook, account=self.account)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/notebooks/")
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        short_ids = [n["short_id"] for n in response.json()["results"]]
+        self.assertNotIn(notebook.short_id, short_ids)
+
+    def test_authentication_required(self):
+        self.client.logout()
+
+        for method, url in [
+            ("GET", self.endpoint_base),
+            ("POST", self.endpoint_base),
+            ("GET", f"{self.endpoint_base}abc123/"),
+            ("DELETE", f"{self.endpoint_base}abc123/"),
+        ]:
+            with self.subTest(method=method, url=url):
+                response = getattr(self.client, method.lower())(url, format="json")
+                self.assertIn(response.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+
+    def test_list_excludes_non_internal_notebooks_linked_to_account(self):
+        internal_notebook = Notebook.objects.create(
+            team=self.team, title="Internal", content={}, visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=internal_notebook, account=self.account)
+
+        default_notebook = Notebook.objects.create(
+            team=self.team, title="Default", content={}, visibility=Notebook.Visibility.DEFAULT
+        )
+        ResourceNotebook.objects.create(notebook=default_notebook, account=self.account)
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        short_ids = [n["short_id"] for n in response.json()["results"]]
+        self.assertIn(internal_notebook.short_id, short_ids)
+        self.assertNotIn(default_notebook.short_id, short_ids)
+
+    def test_create_derives_content_from_markdown_text_content(self):
+        response = self.client.post(
+            self.endpoint_base,
+            {"title": "Call notes", "text_content": "# Heading\n\nSome **bold** text."},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        notebook = Notebook.objects.get(short_id=response.json()["short_id"])
+        self.assertEqual(notebook.text_content, "# Heading\n\nSome **bold** text.")
+        self.assertEqual(notebook.content, build_markdown_notebook_content("# Heading\n\nSome **bold** text."))
+
+    @parameterized.expand(
+        [
+            (
+                "rich_text_content",
+                {
+                    "title": "Provided",
+                    "content": {
+                        "type": "doc",
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "from caller"}]}],
+                    },
+                    "text_content": "# ignored",
+                },
+                "from caller",
+            ),
+            ("empty_rich_text_doc", {"title": "Empty doc", "content": {"type": "doc", "content": []}}, ""),
+            ("neither_field", {"title": "Empty"}, ""),
+            ("empty_text_content", {"title": "Empty body", "text_content": ""}, ""),
+            (
+                "markdown_content_with_stale_text",
+                {
+                    "title": "Markdown",
+                    "content": build_markdown_notebook_content("# Current"),
+                    "text_content": "stale search text",
+                },
+                "# Current",
+            ),
+        ]
+    )
+    def test_create_stores_a_markdown_notebook(self, _name: str, payload: dict, expected_markdown: str) -> None:
+        response = self.client.post(self.endpoint_base, payload, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        notebook = Notebook.objects.get(short_id=response.json()["short_id"])
+        self.assertEqual(notebook.content, build_markdown_notebook_content(expected_markdown))
+        self.assertEqual(notebook.text_content, expected_markdown)
+
+    @parameterized.expand(
+        [
+            (
+                "rich_text_that_cannot_convert",
+                {
+                    "type": "doc",
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": "x", "marks": 1}]}],
+                },
+            ),
+            (
+                "markdown_over_the_cell_limit",
+                build_markdown_notebook_content(
+                    "\n\n".join(f'<SQLV2 nodeId="s{i}" code="select 1" />' for i in range(51))
+                ),
+            ),
+        ]
+    )
+    def test_create_rejects_invalid_content(self, _name: str, content: dict) -> None:
+        response = self.client.post(self.endpoint_base, {"title": "Invalid", "content": content}, format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertEqual(response.json()["attr"], "content")
+
+    def test_create_with_empty_dict_content_falls_back_to_markdown(self):
+        response = self.client.post(
+            self.endpoint_base,
+            {"title": "Plain", "content": {}, "text_content": "Just a sentence."},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        notebook = Notebook.objects.get(short_id=response.json()["short_id"])
+        self.assertEqual(notebook.content, build_markdown_notebook_content("Just a sentence."))
+
+    def test_notebook_detail_includes_parent_resource_for_linked_account(self):
+        notebook = Notebook.objects.create(
+            team=self.team, title="Account note", content={}, visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=notebook, account=self.account)
+
+        # The frontend NotebookScene fetches via /api/projects/{team}/notebooks/{short_id}/
+        # (not the customer-analytics nested endpoint), so the parent_resource field must be
+        # present on NotebookSerializer responses.
+        response = self.client.get(f"/api/projects/{self.team.id}/notebooks/{notebook.short_id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(
+            response.json()["parent_resource"],
+            {"type": "account", "id": str(self.account.id)},
+        )
+
+    def test_notebook_detail_parent_resource_is_null_for_standalone(self):
+        notebook = Notebook.objects.create(
+            team=self.team, title="Standalone", content={}, visibility=Notebook.Visibility.DEFAULT
+        )
+
+        response = self.client.get(f"/api/projects/{self.team.id}/notebooks/{notebook.short_id}/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertIsNone(response.json()["parent_resource"])
+
+
+@pytest.mark.ee
+class TestCustomerAnalyticsAccessControl(APIBaseTest):
+    """Resource-level access control tests for customer journeys and accounts.
+
+    Note: CustomerProfileConfig is a settings resource and uses project-level
+    admin permissions, not resource-level RBAC. See TestCustomerProfileConfigViewSet
+    for those tests.
+    """
+
+    def setUp(self):
+        super().setUp()
+
+        self.organization.available_product_features = [
+            {
+                "key": AvailableFeature.ACCESS_CONTROL,
+                "name": AvailableFeature.ACCESS_CONTROL,
+            },
+            {
+                "key": AvailableFeature.ROLE_BASED_ACCESS,
+                "name": AvailableFeature.ROLE_BASED_ACCESS,
+            },
+        ]
+        self.organization.save()
+
+        self.viewer_user = User.objects.create_and_join(self.organization, "viewer@posthog.com", "testtest")
+        self.editor_user = User.objects.create_and_join(self.organization, "editor@posthog.com", "testtest")
+        self.no_access_user = User.objects.create_and_join(self.organization, "noaccess@posthog.com", "testtest")
+
+        self.insight = Insight.objects.create(team=self.team)
+        self.journey = CustomerJourney.objects.create(
+            team=self.team,
+            insight=self.insight,
+            name="Test Journey",
+        )
+
+        self.journeys_url = f"/api/environments/{self.team.id}/customer_journeys/"
+
+        self.account = Account.objects.unscoped().create(team=self.team, name="ACL Account", external_id="acl-account")
+        self.accounts_url = f"/api/environments/{self.team.id}/accounts/"
+
+    def _set_access_level(self, user: User, resource: str = "customer_analytics", access_level: str = "viewer") -> None:
+        try:
+            membership = OrganizationMembership.objects.get(user=user, organization=self.organization)
+            AccessControl.objects.create(
+                team=self.team,
+                resource=resource,
+                resource_id=None,
+                access_level=access_level,
+                organization_member=membership,
+            )
+        except:
+            pass
+
+    # -- Viewer can list and retrieve journeys --
+
+    def test_viewer_can_list_journeys(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.get(self.journeys_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_viewer_can_retrieve_journey(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.get(f"{self.journeys_url}{self.journey.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    # -- Viewer cannot create/update/delete journeys --
+
+    def test_viewer_cannot_create_journey(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        insight2 = Insight.objects.create(team=self.team)
+        response = self.client.post(
+            self.journeys_url,
+            {"insight": insight2.id, "name": "New Journey"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_viewer_cannot_update_journey(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.patch(
+            f"{self.journeys_url}{self.journey.id}/",
+            {"name": "Updated"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_viewer_cannot_delete_journey(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.delete(f"{self.journeys_url}{self.journey.id}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # -- Editor can create/update/delete journeys --
+
+    def test_editor_can_create_journey(self):
+        self._set_access_level(self.editor_user, access_level="editor")
+        self.client.force_login(self.editor_user)
+
+        insight2 = Insight.objects.create(team=self.team)
+        response = self.client.post(
+            self.journeys_url,
+            {"insight": insight2.id, "name": "Editor Journey"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_editor_can_update_journey(self):
+        self._set_access_level(self.editor_user, access_level="editor")
+        self.client.force_login(self.editor_user)
+
+        response = self.client.patch(
+            f"{self.journeys_url}{self.journey.id}/",
+            {"name": "Updated by editor"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_editor_can_delete_journey(self):
+        self._set_access_level(self.editor_user, access_level="editor")
+        self.client.force_login(self.editor_user)
+
+        response = self.client.delete(f"{self.journeys_url}{self.journey.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    # -- None access blocks everything --
+
+    def test_none_access_blocks_journey_list(self):
+        self._set_access_level(self.no_access_user, access_level="none")
+        self.client.force_login(self.no_access_user)
+
+        response = self.client.get(self.journeys_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # -- Resource inheritance: customer_analytics access cascades to journeys --
+
+    def test_customer_analytics_viewer_can_list_journeys(self):
+        self._set_access_level(self.viewer_user, resource="customer_analytics", access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.get(self.journeys_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_customer_analytics_none_blocks_journey_list(self):
+        self._set_access_level(self.no_access_user, resource="customer_analytics", access_level="none")
+        self.client.force_login(self.no_access_user)
+
+        response = self.client.get(self.journeys_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_customer_analytics_editor_can_create_journey(self):
+        self._set_access_level(self.editor_user, resource="customer_analytics", access_level="editor")
+        self.client.force_login(self.editor_user)
+
+        insight2 = Insight.objects.create(team=self.team)
+        response = self.client.post(
+            self.journeys_url,
+            {"insight": insight2.id, "name": "Child Journey"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_customer_analytics_viewer_cannot_create_journey(self):
+        self._set_access_level(self.viewer_user, resource="customer_analytics", access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        insight2 = Insight.objects.create(team=self.team)
+        response = self.client.post(
+            self.journeys_url,
+            {"insight": insight2.id, "name": "Should Fail"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # -- Org admin has full access without explicit permissions --
+
+    def test_org_admin_has_full_access(self):
+        membership = OrganizationMembership.objects.get(user=self.editor_user, organization=self.organization)
+        membership.level = OrganizationMembership.Level.ADMIN
+        membership.save()
+
+        self.client.force_login(self.editor_user)
+
+        insight2 = Insight.objects.create(team=self.team)
+        response = self.client.post(
+            self.journeys_url,
+            {"insight": insight2.id, "name": "Admin Journey"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        response = self.client.delete(f"{self.journeys_url}{self.journey.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    # -- Resource inheritance: customer_analytics access cascades to accounts --
+
+    def test_customer_analytics_viewer_can_list_accounts(self):
+        self._set_access_level(self.viewer_user, resource="customer_analytics", access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.get(self.accounts_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_customer_analytics_viewer_cannot_create_account(self):
+        self._set_access_level(self.viewer_user, resource="customer_analytics", access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.post(self.accounts_url, {"name": "Should Fail"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_customer_analytics_editor_can_create_account(self):
+        self._set_access_level(self.editor_user, resource="customer_analytics", access_level="editor")
+        self.client.force_login(self.editor_user)
+
+        response = self.client.post(self.accounts_url, {"name": "Inherited Account"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    @parameterized.expand([("",), ("by_external_id/?external_id=acl-account",)])
+    def test_customer_analytics_none_blocks_account_reads(self, suffix: str) -> None:
+        self._set_access_level(self.no_access_user, resource="customer_analytics", access_level="none")
+        self.client.force_login(self.no_access_user)
+
+        response = self.client.get(f"{self.accounts_url}{suffix}")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # -- Account notebooks inherit object-level access from the parent account --
+
+    def test_account_notebooks_404_when_parent_account_access_denied(self):
+        AccessControl.objects.create(
+            team=self.team,
+            resource="account",
+            resource_id=str(self.account.id),
+            access_level="none",
+            organization_member=OrganizationMembership.objects.get(
+                user=self.viewer_user, organization=self.organization
+            ),
+        )
+        self._set_access_level(self.viewer_user, resource="account", access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        url = f"{self.accounts_url}{self.account.id}/notebooks/"
+
+        list_response = self.client.get(url)
+        self.assertEqual(list_response.status_code, status.HTTP_404_NOT_FOUND)
+
+        create_response = self.client.post(url, {"title": "x"}, format="json")
+        self.assertEqual(create_response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @parameterized.expand(
+        [
+            ("patch", "viewer", status.HTTP_403_FORBIDDEN),
+            ("delete", "viewer", status.HTTP_403_FORBIDDEN),
+            ("patch", "editor", status.HTTP_200_OK),
+            ("delete", "editor", status.HTTP_204_NO_CONTENT),
+        ]
+    )
+    def test_account_notebook_writes_require_resource_editor(
+        self, method: str, resource_level: str, expected_status: int
+    ) -> None:
+        self._set_access_level(self.viewer_user, resource="customer_analytics", access_level=resource_level)
+        membership = OrganizationMembership.objects.get(user=self.viewer_user, organization=self.organization)
+        other_account = Account.objects.for_team(self.team.id).create(team=self.team, name="Other account")
+        for account, level in [(self.account, "viewer"), (other_account, "editor")]:
+            AccessControl.objects.create(
+                team=self.team,
+                resource="account",
+                resource_id=str(account.id),
+                access_level=level,
+                organization_member=membership,
+            )
+        notebook = Notebook.objects.create(team=self.team, visibility=Notebook.Visibility.INTERNAL)
+        ResourceNotebook.objects.create(notebook=notebook, account=self.account)
+        self.client.force_login(self.viewer_user)
+        url = f"{self.accounts_url}{self.account.id}/notebooks/{notebook.short_id}/"
+
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_200_OK)
+        response = getattr(self.client, method)(url, {"tags": ["changed"]}, format="json")
+
+        self.assertEqual(response.status_code, expected_status, response.content)
+        if expected_status == status.HTTP_403_FORBIDDEN:
+            self.assertTrue(Notebook.objects.filter(team=self.team, pk=notebook.pk).exists())
+            self.assertFalse(notebook.tagged_items.exists())
+        elif method == "patch":
+            self.assertEqual(response.json()["tags"], ["changed"])
+        else:
+            self.assertFalse(Notebook.objects.filter(team=self.team, pk=notebook.pk).exists())
+
+    @parameterized.expand([("account_notebooks",), ("team_account_notes",)])
+    def test_account_grant_reaches_notes_when_customer_analytics_is_none(self, endpoint: str) -> None:
+        self._set_access_level(self.no_access_user, resource="customer_analytics", access_level="none")
+        AccessControl.objects.create(
+            team=self.team,
+            resource="account",
+            resource_id=str(self.account.id),
+            access_level="viewer",
+            organization_member=OrganizationMembership.objects.get(
+                user=self.no_access_user, organization=self.organization
+            ),
+        )
+        self.client.force_login(self.no_access_user)
+        url = {
+            "account_notebooks": f"{self.accounts_url}{self.account.id}/notebooks/",
+            "team_account_notes": f"/api/projects/{self.team.id}/account_notes/",
+        }[endpoint]
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+
+    def test_account_presence_404_when_object_access_denied(self) -> None:
+        AccessControl.objects.create(
+            team=self.team,
+            resource="account",
+            resource_id=str(self.account.id),
+            access_level="none",
+            organization_member=OrganizationMembership.objects.get(
+                user=self.viewer_user, organization=self.organization
+            ),
+        )
+        self._set_access_level(self.viewer_user, resource="account", access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.post(f"{self.accounts_url}{self.account.id}/presence/", format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_account_by_external_id_404_when_object_access_denied(self) -> None:
+        AccessControl.objects.create(
+            team=self.team,
+            resource="account",
+            resource_id=str(self.account.id),
+            access_level="none",
+            organization_member=OrganizationMembership.objects.get(
+                user=self.viewer_user, organization=self.organization
+            ),
+        )
+        self._set_access_level(self.viewer_user, resource="account", access_level="viewer")
+        self.client.force_login(self.viewer_user)
+
+        response = self.client.get(f"{self.accounts_url}by_external_id/?external_id={self.account.external_id}")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class TestCustomPropertyDefinitionViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.endpoint_base = f"/api/environments/{self.team.id}/custom_property_definitions/"
+
+    def test_list_without_pagination_preserves_envelope(self):
+        self._create(name="A")
+        self._create(name="B")
+        paginated = self.client.get(self.endpoint_base, {"limit": 1})
+        complete = self.client.get(self.endpoint_base, {"limit": "1", "offset": "1", "pagination": "none"})
+
+        self.assertEqual(paginated.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(paginated.json()["results"]), 1)
+        self.assertIsNotNone(paginated.json()["next"])
+        self.assertEqual(complete.status_code, status.HTTP_200_OK)
+        self.assertEqual([definition["name"] for definition in complete.json()["results"]], ["A", "B"])
+        self.assertEqual(complete.json()["count"], 2)
+        self.assertIsNone(complete.json()["next"])
+        self.assertIsNone(complete.json()["previous"])
+
+    def _create(self, **overrides):
+        payload = {"name": "ARR", "display_type": "currency", "is_big_number": True}
+        payload.update(overrides)
+        return self.client.post(self.endpoint_base, payload, format="json")
+
+    def test_values_returns_suggestions_envelope(self):
+        created = self._create(
+            name="Tier",
+            display_type="select",
+            is_big_number=False,
+            options=[
+                {"label": "Enterprise", "color": "preset-1"},
+                {"label": "Startup", "color": "preset-2"},
+            ],
+        )
+        definition_id = created.json()["id"]
+
+        response = self.client.get(f"{self.endpoint_base}values/?key={definition_id}&value=ent")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), {"results": [{"name": "Enterprise"}], "refreshing": False})
+
+        missing_key = self.client.get(f"{self.endpoint_base}values/")
+        self.assertEqual(missing_key.status_code, status.HTTP_200_OK)
+        self.assertEqual(missing_key.json(), {"results": [], "refreshing": False})
+
+    def test_create_success(self):
+        response = self._create()
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        data = response.json()
+        self.assertEqual(data["name"], "ARR")
+        self.assertEqual(data["display_type"], "currency")
+        self.assertTrue(data["is_big_number"])
+        self.assertIn("id", data)
+        self.assertIn("created_at", data)
+
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        definition = CustomPropertyDefinition.objects.unscoped().get(id=data["id"])
+        self.assertEqual(definition.team, self.team)
+        self.assertEqual(definition.created_by, self.user)
+
+    def test_create_text_property(self):
+        response = self._create(name="Tier", display_type="text", is_big_number=False)
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        self.assertEqual(response.json()["display_type"], "text")
+
+    @parameterized.expand(
+        [
+            ("text", "text", status.HTTP_201_CREATED),
+            ("link", "link", status.HTTP_201_CREATED),
+            ("number", "number", status.HTTP_201_CREATED),
+            ("currency", "currency", status.HTTP_201_CREATED),
+            ("percent", "percent", status.HTTP_201_CREATED),
+            ("date", "date", status.HTTP_201_CREATED),
+            ("datetime", "datetime", status.HTTP_201_CREATED),
+            ("boolean", "boolean", status.HTTP_201_CREATED),
+            ("unknown_rejected", "frobnicate", status.HTTP_400_BAD_REQUEST),
+        ]
+    )
+    def test_display_type_validation(self, _name, display_type, expected_status):
+        response = self.client.post(self.endpoint_base, {"name": "P", "display_type": display_type}, format="json")
+        self.assertEqual(expected_status, response.status_code, response.json())
+
+    def test_create_select_assigns_option_ids_and_patch_round_trips(self):
+        response = self._create(
+            name="Stage",
+            display_type="select",
+            is_big_number=False,
+            options=[{"label": "Open", "color": "preset-1"}, {"label": "Closed", "color": "preset-2"}],
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        options = response.json()["options"]
+        self.assertEqual([option["label"] for option in options], ["Open", "Closed"])
+        self.assertTrue(all(option["id"] for option in options))
+
+        patched = self.client.patch(
+            f"{self.endpoint_base}{response.json()['id']}/",
+            {"options": [{**options[0], "label": "Won"}, options[1]]},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, patched.status_code, patched.json())
+        self.assertEqual([option["label"] for option in patched.json()["options"]], ["Won", "Closed"])
+        self.assertEqual(patched.json()["options"][0]["id"], options[0]["id"])
+
+    @parameterized.expand(
+        [
+            ("select_without_options", {"name": "S1", "display_type": "select"}),
+            ("select_empty_options", {"name": "S2", "display_type": "select", "options": []}),
+            ("bad_color", {"name": "S3", "display_type": "select", "options": [{"label": "A", "color": "red"}]}),
+        ]
+    )
+    def test_create_select_rejects_invalid_payloads(self, _name, payload):
+        response = self.client.post(self.endpoint_base, payload, format="json")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+
+    def test_is_big_number_forced_false_for_non_numeric(self):
+        response = self._create(name="Tier", display_type="text", is_big_number=True)
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        self.assertFalse(response.json()["is_big_number"])
+
+    def test_create_with_duplicate_name_returns_409(self):
+        self._create(name="ARR")
+
+        response = self._create(name="ARR")
+
+        self.assertEqual(status.HTTP_409_CONFLICT, response.status_code, response.json())
+
+    def test_list_returns_only_current_team_ordered_by_name(self):
+        self._create(name="Beta", display_type="text")
+        self._create(name="Alpha", display_type="text")
+        other_team = Team.objects.create(organization=self.organization)
+        # nosemgrep: idor-lookup-without-team (test setup for another team)
+        CustomPropertyDefinition.objects.unscoped().create(team=other_team, name="Gamma", display_type="text")
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual([row["name"] for row in response.json()["results"]], ["Alpha", "Beta"])
+
+    def test_update_name(self):
+        created = self._create(name="ARR").json()
+
+        response = self.client.patch(f"{self.endpoint_base}{created['id']}/", {"name": "Annual revenue"}, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["name"], "Annual revenue")
+
+    def test_update_to_duplicate_name_returns_409(self):
+        self._create(name="ARR")
+        other = self._create(name="MRR").json()
+
+        response = self.client.patch(f"{self.endpoint_base}{other['id']}/", {"name": "ARR"}, format="json")
+
+        self.assertEqual(status.HTTP_409_CONFLICT, response.status_code, response.json())
+
+    def test_display_type_is_editable(self):
+        created = self._create(name="Field", display_type="text").json()
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{created['id']}/",
+            {"name": "Field", "display_type": "number", "is_big_number": False},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["display_type"], "number")
+
+    def test_patch_display_type_without_other_fields(self):
+        created = self._create(name="Field", display_type="currency").json()
+
+        response = self.client.patch(f"{self.endpoint_base}{created['id']}/", {"display_type": "text"}, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["display_type"], "text")
+
+    def test_delete_removes_definition_and_values(self):
+        keep = self._create(name="Keep", display_type="text").json()
+        remove = self._create(name="Remove", display_type="text").json()
+        remove_definition = CustomPropertyDefinition.objects.unscoped().get(id=remove["id"])
+        account = create_account(team_id=self.team.id, external_id="account-with-value")
+        CustomPropertyValue.objects.unscoped().create(
+            team_id=self.team.id,
+            definition=remove_definition,
+            account=account,
+            value_str="stored value",
+        )
+        membership = OrganizationMembership.objects.get(user=self.user, organization=self.organization)
+        membership.level = OrganizationMembership.Level.ADMIN
+        membership.save()
+
+        response = self.client.delete(f"{self.endpoint_base}{remove['id']}/")
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        self.assertFalse(CustomPropertyDefinition.objects.unscoped().filter(id=remove["id"]).exists())
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        self.assertFalse(CustomPropertyValue.objects.unscoped().filter(definition_id=remove["id"]).exists())
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        self.assertTrue(CustomPropertyDefinition.objects.unscoped().filter(id=keep["id"]).exists())
+
+    def test_cannot_access_other_teams_definition(self):
+        other_team = Team.objects.create(organization=self.organization)
+        # nosemgrep: idor-lookup-without-team (test setup for another team)
+        other_def = CustomPropertyDefinition.objects.unscoped().create(
+            team=other_team, name="Other", display_type="text"
+        )
+
+        response = self.client.get(f"{self.endpoint_base}{other_def.id}/")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_activity_log_on_create_and_delete(self):
+        created = self._create(name="ARR").json()
+        membership = OrganizationMembership.objects.get(user=self.user, organization=self.organization)
+        membership.level = OrganizationMembership.Level.ADMIN
+        membership.save()
+        self.client.delete(f"{self.endpoint_base}{created['id']}/")
+
+        logs = ActivityLog.objects.filter(
+            team_id=self.team.id, scope="CustomPropertyDefinition", item_id=str(created["id"])
+        )
+        self.assertEqual(set(logs.values_list("activity", flat=True)), {"created", "deleted"})
+
+
+class TestCustomPropertyDefinitionAccessControl(APIBaseTest):
+    """Resource-level access control for custom property definitions.
+
+    Definitions are a team-wide ``account``-resource config (no per-object ownership), so they are
+    gated at the resource level by the default ``AccessControlPermission`` (keyed on
+    ``scope_object="account"``) — the same gate as accounts and journeys, including inheritance from
+    the ``customer_analytics`` parent resource. Reads need ``viewer``, writes need ``editor``,
+    and deletion needs a project admin.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.save()
+
+        self.viewer_user = User.objects.create_and_join(self.organization, "def-viewer@posthog.com", "testtest")
+        self.editor_user = User.objects.create_and_join(self.organization, "def-editor@posthog.com", "testtest")
+        self.no_access_user = User.objects.create_and_join(self.organization, "def-noaccess@posthog.com", "testtest")
+
+        # nosemgrep: idor-lookup-without-team (test setup)
+        self.definition = CustomPropertyDefinition.objects.unscoped().create(
+            team=self.team, name="ARR", display_type="currency"
+        )
+        self.endpoint_base = f"/api/environments/{self.team.id}/custom_property_definitions/"
+
+    def _set_access_level(
+        self,
+        user: User,
+        resource: str = "customer_analytics",
+        access_level: str = "viewer",
+        resource_id: str | None = None,
+    ) -> None:
+        membership = OrganizationMembership.objects.get(user=user, organization=self.organization)
+        AccessControl.objects.create(
+            team=self.team,
+            resource=resource,
+            resource_id=resource_id,
+            access_level=access_level,
+            organization_member=membership,
+        )
+
+    def _create_workflow_reference(self, *, name: str) -> WorkflowSummary:
+        return create_workflow_for_test(
+            team_id=self.team.id,
+            name=name,
+            status="active",
+            actions=[
+                {
+                    "type": "function",
+                    "config": {
+                        "template_id": "template-posthog-update-account-property",
+                        "inputs": {"properties": {"value": {str(self.definition.id): "enterprise"}}},
+                    },
+                }
+            ],
+        )
+
+    def _token(self, scopes: list[str]) -> str:
+        value = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="custom property definitions",
+            user=self.user,
+            secure_value=hash_key_value(value),
+            scopes=scopes,
+            scoped_teams=[],
+            scoped_organizations=[],
+        )
+        return value
+
+    def test_viewer_can_list(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+        self.assertEqual(self.client.get(self.endpoint_base).status_code, status.HTTP_200_OK)
+
+    def test_viewer_can_retrieve(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+        response = self.client.get(f"{self.endpoint_base}{self.definition.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_workflow_presence_is_exposed_when_object_access_hides_references(self):
+        denied = self._create_workflow_reference(name="Update plan")
+        self._set_access_level(self.editor_user, resource="account", access_level="editor")
+        self._set_access_level(self.editor_user, resource="hog_flow", access_level="viewer")
+        self._set_access_level(
+            self.editor_user,
+            resource="hog_flow",
+            resource_id=str(denied.id),
+            access_level="none",
+        )
+        self.client.force_login(self.editor_user)
+
+        list_response = self.client.get(self.endpoint_base)
+        retrieve_response = self.client.get(f"{self.endpoint_base}{self.definition.id}/")
+        update_response = self.client.patch(
+            f"{self.endpoint_base}{self.definition.id}/", {"description": "Customer plan"}, format="json"
+        )
+
+        for response in (list_response, retrieve_response, update_response):
+            definition = response.json()["results"][0] if response is list_response else response.json()
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.json())
+            self.assertTrue(definition["has_workflow_reference"])
+            self.assertEqual(definition["references"], [])
+
+    def test_personal_api_key_without_workflow_scope_cannot_read_references(self):
+        self._create_workflow_reference(name="Update plan")
+        token = self._token(["account:read"])
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        list_response = self.client.get(self.endpoint_base)
+        retrieve_response = self.client.get(f"{self.endpoint_base}{self.definition.id}/")
+
+        for response in (list_response, retrieve_response):
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+            definition = response.json()["results"][0] if response is list_response else response.json()
+            self.assertTrue(definition["has_workflow_reference"])
+            self.assertEqual(definition["references"], [])
+
+    def test_object_level_workflow_denial_filters_only_the_denied_reference(self):
+        visible = self._create_workflow_reference(name="Visible workflow")
+        denied = self._create_workflow_reference(name="Denied workflow")
+        self._set_access_level(self.editor_user, resource="account", access_level="editor")
+        self._set_access_level(self.editor_user, resource="hog_flow", access_level="viewer")
+        self._set_access_level(
+            self.editor_user,
+            resource="hog_flow",
+            resource_id=str(denied.id),
+            access_level="none",
+        )
+        self.client.force_login(self.editor_user)
+
+        list_response = self.client.get(self.endpoint_base)
+        retrieve_response = self.client.get(f"{self.endpoint_base}{self.definition.id}/")
+        update_response = self.client.patch(
+            f"{self.endpoint_base}{self.definition.id}/", {"description": "Customer plan"}, format="json"
+        )
+
+        for response in (list_response, retrieve_response, update_response):
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+            definition = response.json()["results"][0] if response is list_response else response.json()
+            self.assertTrue(definition["has_workflow_reference"])
+            self.assertEqual(
+                definition["references"],
+                [{"id": str(visible.id), "name": visible.name, "status": "active", "type": "workflow"}],
+            )
+
+    def test_viewer_cannot_create(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+        response = self.client.post(self.endpoint_base, {"name": "New", "display_type": "text"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_viewer_cannot_update(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+        response = self.client.patch(f"{self.endpoint_base}{self.definition.id}/", {"name": "x"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_viewer_cannot_delete(self):
+        self._set_access_level(self.viewer_user, access_level="viewer")
+        self.client.force_login(self.viewer_user)
+        response = self.client.delete(f"{self.endpoint_base}{self.definition.id}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_editor_can_create(self):
+        self._set_access_level(self.editor_user, access_level="editor")
+        self.client.force_login(self.editor_user)
+        response = self.client.post(self.endpoint_base, {"name": "Editor Prop", "display_type": "text"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_editor_cannot_delete(self):
+        self._set_access_level(self.editor_user, access_level="editor")
+        self._set_access_level(
+            self.editor_user, resource="project", access_level="member", resource_id=str(self.team.id)
+        )
+        self.client.force_login(self.editor_user)
+        response = self.client.delete(f"{self.endpoint_base}{self.definition.id}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_can_delete(self):
+        membership = OrganizationMembership.objects.get(user=self.editor_user, organization=self.organization)
+        membership.level = OrganizationMembership.Level.ADMIN
+        membership.save()
+        self.client.force_login(self.editor_user)
+        response = self.client.delete(f"{self.endpoint_base}{self.definition.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_none_access_blocks_list(self):
+        self._set_access_level(self.no_access_user, access_level="none")
+        self.client.force_login(self.no_access_user)
+        self.assertEqual(self.client.get(self.endpoint_base).status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_org_admin_has_full_access(self):
+        membership = OrganizationMembership.objects.get(user=self.editor_user, organization=self.organization)
+        membership.level = OrganizationMembership.Level.ADMIN
+        membership.save()
+        self.client.force_login(self.editor_user)
+        response = self.client.post(self.endpoint_base, {"name": "Admin Prop", "display_type": "text"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+
+class TestCustomPropertyValueViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.account = create_account(team_id=self.team.id)
+        self.text_def = create_custom_property_definition(
+            team_id=self.team.id, name="Plan", display_type=DisplayType.TEXT
+        )
+        self.number_def = create_custom_property_definition(
+            team_id=self.team.id, name="Seats", display_type=DisplayType.NUMBER
+        )
+        self.endpoint = f"/api/projects/{self.team.id}/accounts/{self.account.id}/custom_property_values/"
+
+    def _set(self, definition_id, value, endpoint=None):
+        return self.client.post(
+            endpoint or self.endpoint, {"definition": str(definition_id), "value": value}, format="json"
+        )
+
+    @parameterized.expand([("text", "enterprise"), ("number", 42)])
+    def test_clear_value_preserves_history(self, property_type: str, value: str | int) -> None:
+        definition = self.text_def if property_type == "text" else self.number_def
+        created = self._set(definition.id, value).json()
+        self._set(
+            self.number_def.id if property_type == "text" else self.text_def.id,
+            7 if property_type == "text" else "other",
+        )
+
+        response = self._set(definition.id, None)
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        self.assertTrue(CustomPropertyValue.objects.for_team(self.team.id).get(id=created["id"]).is_deleted)
+        active = self.client.get(self.endpoint).json()
+        self.assertEqual(1, len(active))
+        self.assertNotEqual(str(definition.id), active[0]["definition_id"])
+        self.assertEqual(status.HTTP_204_NO_CONTENT, self._set(definition.id, None).status_code)
+
+    def test_clear_unknown_definition_is_rejected(self) -> None:
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, self._set(uuid4(), None).status_code)
+
+    def test_create_value_success(self):
+        response = self._set(self.text_def.id, "enterprise")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        data = response.json()
+        self.assertEqual("enterprise", data["value"])
+        self.assertEqual(str(self.text_def.id), data["definition_id"])
+        self.assertEqual(str(self.account.id), data["account_id"])
+
+    def test_create_numeric_value(self):
+        response = self._set(self.number_def.id, 1234.5)
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        self.assertEqual(1234.5, response.json()["value"])
+
+    def test_wrong_type_value_is_rejected(self):
+        response = self._set(self.number_def.id, "abc")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        self.assertEqual("value", response.json()["attr"])
+
+    def test_unknown_definition_is_rejected(self):
+        response = self._set(uuid4(), "x")
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        self.assertEqual("definition", response.json()["attr"])
+
+    def test_resetting_a_value_supersedes_the_previous_one(self):
+        self._set(self.text_def.id, "starter")
+        self._set(self.text_def.id, "enterprise")
+
+        values = self.client.get(self.endpoint).json()
+        plan_values = [v for v in values if v["definition_id"] == str(self.text_def.id)]
+        self.assertEqual(1, len(plan_values))
+        self.assertEqual("enterprise", plan_values[0]["value"])
+
+    def test_list_returns_active_values(self):
+        self._set(self.text_def.id, "enterprise")
+        self._set(self.number_def.id, 42)
+
+        response = self.client.get(self.endpoint)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        values = {v["definition_id"]: v["value"] for v in response.json()}
+        self.assertEqual({str(self.text_def.id): "enterprise", str(self.number_def.id): 42}, values)
+
+    @parameterized.expand([("current", False), ("cleared", True)])
+    def test_history_returns_each_distinct_value_oldest_first(self, _name: str, cleared: bool) -> None:
+        self._set(self.text_def.id, "starter")
+        self._set(self.text_def.id, "starter")
+        self._set(self.text_def.id, "enterprise")
+        self._set(self.number_def.id, 5)
+        self.text_def.display_type = DisplayType.NUMBER
+        self.text_def.save()
+        self._set(self.text_def.id, 42)
+        if cleared:
+            self._set(self.text_def.id, None)
+
+        response = self.client.get(f"{self.endpoint}history/", {"definition": str(self.text_def.id)})
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        history = response.json()
+        self.assertEqual(
+            [("starter", False), ("enterprise", False), (42, not cleared)],
+            [(e["value"], e["is_current"]) for e in history],
+        )
+        self.assertEqual([e["set_at"] for e in history[1:]], [e["replaced_at"] for e in history[:-1]])
+        self.assertIsNone(history[-1]["replaced_at"])
+        group_def = create_custom_property_definition(
+            team_id=self.team.id, name="Tier", target_type=TargetType.GROUP.value, group_type_index=0
+        )
+        for definition_id in (uuid4(), group_def.id):
+            unknown = self.client.get(f"{self.endpoint}history/", {"definition": str(definition_id)})
+            self.assertEqual(status.HTTP_400_BAD_REQUEST, unknown.status_code)
+
+    @parameterized.expand(
+        [
+            ("value_held_before_since", "2024-01-15", [("enterprise", "2024-01-10"), ("growth", "2024-02-01")]),
+            (
+                "repeated_value_keeps_its_first_set",
+                "2024-01-25",
+                [("enterprise", "2024-01-10"), ("growth", "2024-02-01")],
+            ),
+            ("replacement_exactly_at_since", "2024-02-01", [("growth", "2024-02-01")]),
+            ("current_value_set_before_since", "2024-03-01", [("growth", "2024-02-01")]),
+        ]
+    )
+    def test_history_since_starts_with_the_value_held_on_that_date(
+        self, _name: str, since: str, expected: list[tuple[str, str]]
+    ) -> None:
+        writes = [
+            ("2024-01-01", "starter"),
+            ("2024-01-10", "enterprise"),
+            ("2024-01-20", "enterprise"),
+            ("2024-02-01", "growth"),
+        ]
+        for day, plan in writes:
+            with time_machine.travel(day, tick=False):
+                self._set(self.text_def.id, plan)
+
+        response = self.client.get(f"{self.endpoint}history/", {"definition": str(self.text_def.id), "since": since})
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        history = response.json()
+        self.assertEqual(expected, [(e["value"], e["set_at"][:10]) for e in history])
+        self.assertEqual([False] * (len(history) - 1) + [True], [e["is_current"] for e in history])
+
+    def test_history_over_the_limit_asks_for_a_later_since(self) -> None:
+        for day, plan in [("2024-01-01", "starter"), ("2024-01-10", "enterprise"), ("2024-02-01", "growth")]:
+            with time_machine.travel(day, tick=False):
+                self._set(self.text_def.id, plan)
+
+        with patch("products.customer_analytics.backend.logic.custom_property_values.HISTORY_ENTRY_LIMIT", 2):
+            full = self.client.get(f"{self.endpoint}history/", {"definition": str(self.text_def.id)})
+            recent = self.client.get(
+                f"{self.endpoint}history/", {"definition": str(self.text_def.id), "since": "2024-01-15"}
+            )
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, full.status_code)
+        self.assertEqual("since", full.json()["attr"])
+        self.assertEqual(["enterprise", "growth"], [e["value"] for e in recent.json()])
+
+    @parameterized.expand([("write", "x"), ("clear", None)])
+    def test_account_from_another_team_returns_404(self, _name: str, value: str | None) -> None:
+        other_team = Team.objects.create(organization=self.organization)
+        other_account = create_account(team_id=other_team.id)
+        endpoint = f"/api/projects/{self.team.id}/accounts/{other_account.id}/custom_property_values/"
+
+        response = self._set(self.text_def.id, value, endpoint=endpoint)
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    @patch("products.customer_analytics.backend.facade.api.get_accessible_account_id")
+    def test_account_deleted_after_access_check_returns_404(self, mock_access):
+        # Account passes the access pre-check but is gone by the time the write commits.
+        mock_access.return_value = str(uuid4())
+
+        response = self._set(self.text_def.id, "x")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_unauthenticated_is_rejected(self):
+        self.client.logout()
+
+        response = self.client.get(self.endpoint)
+
+        self.assertIn(response.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+
+    @parameterized.expand([("write", "2026-01-01T00:00:00Z"), ("clear", None)])
+    def test_canonical_definition_rejects_manual_write(self, _name: str, value: str | None) -> None:
+        definition = create_custom_property_definition(
+            team_id=self.team.id, name="Last Slack message at", display_type=DisplayType.DATETIME
+        )
+        recorded_at = timezone.now()
+        current = CustomPropertyValue.objects.for_team(self.team.id).create(
+            team_id=self.team.id,
+            account=self.account,
+            definition=definition,
+            value_datetime=recorded_at,
+        )
+
+        response = self._set(definition.id, value)
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        self.assertEqual("definition", response.json()["attr"])
+        current.refresh_from_db()
+        self.assertFalse(current.is_deleted)
+        self.assertEqual(recorded_at, current.value_datetime)
+        self.assertEqual(1, len(self.client.get(self.endpoint).json()))
+
+    @parameterized.expand([("write", "manual"), ("clear", None)])
+    def test_source_backed_definition_rejects_manual_write(self, _name: str, value: str | None) -> None:
+        saved_query_model = apps.get_model("data_modeling", "DataWarehouseSavedQuery")
+        view = saved_query_model.objects.create(team=self.team, name="v", columns={"k": {}, "c": {}})
+        CustomPropertySource.objects.unscoped().create(
+            team_id=self.team.id,
+            definition_id=self.text_def.id,
+            saved_query=view,
+            source_column="c",
+            key_column="k",
+        )
+
+        response = self._set(self.text_def.id, value)
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        self.assertEqual("definition", response.json()["attr"])
+
+
+class TestCustomPropertySourceViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.endpoint = f"/api/projects/{self.team.id}/custom_property_sources/"
+        saved_query_model = apps.get_model("data_modeling", "DataWarehouseSavedQuery")
+        self.view = saved_query_model.objects.create(
+            team=self.team, name="billing_view", columns={"org_id": {}, "mrr": {}}
+        )
+        self.definition = create_custom_property_definition(team_id=self.team.id, name="MRR")
+
+    def test_create_list_and_toggle_round_trip(self):
+        created = self.client.post(
+            self.endpoint,
+            {
+                "definition": str(self.definition.id),
+                "saved_query": str(self.view.id),
+                "source_column": "mrr",
+                "key_column": "org_id",
+            },
+            format="json",
+        )
+        assert created.status_code == status.HTTP_201_CREATED, created.content
+        source_id = created.json()["id"]
+        assert created.json()["is_enabled"] is True
+
+        listed = self.client.get(self.endpoint)
+        assert listed.status_code == status.HTTP_200_OK
+        assert [s["id"] for s in listed.json()["results"]] == [source_id]
+
+        detail_endpoint = f"{self.endpoint}{source_id}/"
+        retrieved = self.client.get(detail_endpoint)
+        assert retrieved.status_code == status.HTTP_200_OK
+        assert retrieved.json()["column_property_map"] is None
+        assert retrieved.json()["column_descriptions"] is None
+
+        round_tripped = self.client.patch(detail_endpoint, retrieved.json(), format="json")
+        assert round_tripped.status_code == status.HTTP_200_OK, round_tripped.content
+
+        toggled = self.client.patch(detail_endpoint, {"is_enabled": False}, format="json")
+        assert toggled.status_code == status.HTTP_200_OK
+        assert toggled.json()["is_enabled"] is False
+
+    def _person_definition_and_schema(self):
+        definition = create_custom_property_definition(
+            team_id=self.team.id, name="Plan tier", target_type=TargetType.PERSON.value
+        )
+        source = ExternalDataSource.objects.create(
+            team=self.team, source_id="s", connection_id="c", status="Running", source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(team=self.team, source=source, name="users")
+        return definition, schema
+
+    def test_create_person_source_round_trip(self):
+        # Wiring guard: the viewset routes a person-target source through serializer + facade.
+        definition, schema = self._person_definition_and_schema()
+
+        created = self.client.post(
+            self.endpoint,
+            {
+                "definition": str(definition.id),
+                "external_data_schema": str(schema.id),
+                "column_property_map": {"plan": "plan_tier"},
+                "key_column": "distinct_id",
+            },
+            format="json",
+        )
+        assert created.status_code == status.HTTP_201_CREATED, created.content
+        body = created.json()
+        assert body["external_data_schema"] == str(schema.id)
+        assert body["column_property_map"] == {"plan": "plan_tier"}
+        assert body["saved_query"] is None
+
+    def test_patch_person_source_mapping_round_trip_and_validation(self):
+        source_id = self._create_person_source()
+
+        patched = self.client.patch(
+            f"{self.endpoint}{source_id}/",
+            {
+                "column_property_map": {"plan": "plan_tier", "seats": "seat_count"},
+                "column_descriptions": {"seats": " Seat count "},
+            },
+            format="json",
+        )
+
+        assert patched.status_code == status.HTTP_200_OK, patched.content
+        assert patched.json()["id"] == source_id
+        assert patched.json()["column_property_map"] == {"plan": "plan_tier", "seats": "seat_count"}
+        assert patched.json()["column_descriptions"] == {"seats": "Seat count"}
+
+        invalid = self.client.patch(f"{self.endpoint}{source_id}/", {"column_property_map": {}}, format="json")
+        assert invalid.status_code == status.HTTP_400_BAD_REQUEST, invalid.content
+
+        cleared = self.client.patch(f"{self.endpoint}{source_id}/", {"column_descriptions": None}, format="json")
+        assert cleared.status_code == status.HTTP_200_OK, cleared.content
+        assert cleared.json()["column_descriptions"] == {}
+
+    @patch("products.customer_analytics.backend.presentation.views.views.report_user_action")
+    def test_mapping_lifecycle_emits_usage_events(self, report_user_action):
+        definition, schema = self._person_definition_and_schema()
+
+        created = self.client.post(
+            self.endpoint,
+            {
+                "definition": str(definition.id),
+                "external_data_schema": str(schema.id),
+                "column_property_map": {"plan": "plan_tier", "seats": "seat_count"},
+                "key_column": "distinct_id",
+            },
+            format="json",
+        )
+        assert created.status_code == status.HTTP_201_CREATED, created.content
+        source_id = created.json()["id"]
+
+        patched = self.client.patch(f"{self.endpoint}{source_id}/", {"is_enabled": False}, format="json")
+        assert patched.status_code == status.HTTP_200_OK
+        deleted = self.client.delete(f"{self.endpoint}{source_id}/")
+        assert deleted.status_code == status.HTTP_204_NO_CONTENT
+
+        assert [call.args[1] for call in report_user_action.call_args_list] == [
+            "warehouse property mapping created",
+            "warehouse property mapping updated",
+            "warehouse property mapping deleted",
+        ]
+        create_properties = report_user_action.call_args_list[0].args[2]
+        assert create_properties["target_type"] == TargetType.PERSON.value
+        assert create_properties["mapped_column_count"] == 2
+        assert create_properties["reads_warehouse_table"] is True
+
+    def test_create_person_source_with_account_binding_is_rejected(self):
+        definition, _schema = self._person_definition_and_schema()
+
+        response = self.client.post(
+            self.endpoint,
+            {
+                "definition": str(definition.id),
+                "saved_query": str(self.view.id),
+                "source_column": "mrr",
+                "key_column": "distinct_id",
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST, response.content
+
+    def _create_person_source(self):
+        definition, schema = self._person_definition_and_schema()
+        created = self.client.post(
+            self.endpoint,
+            {
+                "definition": str(definition.id),
+                "external_data_schema": str(schema.id),
+                "column_property_map": {"plan": "plan_tier"},
+                "key_column": "distinct_id",
+            },
+            format="json",
+        )
+        assert created.status_code == status.HTTP_201_CREATED, created.content
+        return created.json()["id"]
+
+    @patch("posthoganalytics.feature_enabled", return_value=False)
+    @override_settings(WAREHOUSE_PERSON_PROPERTIES_ENABLED_SELF_HOSTED=False)
+    def test_person_source_actions_are_flag_gated(self, _flag):
+        # Regression: sync/backfill must 400 when WAREHOUSE_PERSON_PROPERTIES is off. The gate lives in
+        # the facade; a viewset refactor that dropped it would ship an ungated (billable) trigger.
+        # Both the Cloud rollout flag (mocked False above) and its self-hosted kill-switch equivalent
+        # are turned off here so this holds regardless of which code path the test runs under.
+        source_id = self._create_person_source()
+        for action in ("sync", "backfill"):
+            response = self.client.post(f"{self.endpoint}{source_id}/{action}/")
+            assert response.status_code == status.HTTP_400_BAD_REQUEST, (action, response.content)
+
+    @patch("products.warehouse_sources.backend.facade.temporal.start_person_property_backfill", return_value=True)
+    @patch("products.warehouse_sources.backend.facade.temporal.trigger_schema_sync")
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_person_source_actions_when_enabled(self, _flag, mock_trigger_sync, mock_start_backfill):
+        # Wiring guard: the actions route through the facade to the temporal seam, return the typed
+        # response, and an in-flight sync still sends the manual latest-revision follow-up.
+        source_id = self._create_person_source()
+
+        synced = self.client.post(f"{self.endpoint}{source_id}/sync/")
+        assert synced.status_code == status.HTTP_202_ACCEPTED, synced.content
+        assert synced.json()["status"] == "triggered"
+        mock_trigger_sync.assert_called_once()
+
+        backfilled = self.client.post(f"{self.endpoint}{source_id}/backfill/")
+        assert backfilled.status_code == status.HTTP_202_ACCEPTED, backfilled.content
+        assert backfilled.json() == {"status": "already_running", "already_running": True}
+        mock_start_backfill.assert_called_once()
+
+        runs = self.client.get(f"{self.endpoint}{source_id}/runs/")
+        assert runs.status_code == status.HTTP_200_OK
+        assert any(run["status"] == "running" for run in runs.json()["results"])
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_create_group_definition_and_source_round_trip(self, _flag):
+        # Group support: a group definition carries a group_type_index, and its source binds the same
+        # warehouse way as a person source (external_data_schema + column_property_map + key_column).
+        definitions_endpoint = f"/api/projects/{self.team.id}/custom_property_definitions/"
+        definition = self.client.post(
+            definitions_endpoint,
+            {"name": "Plan tier", "display_type": "text", "target_type": "group", "group_type_index": 0},
+            format="json",
+        )
+        assert definition.status_code == status.HTTP_201_CREATED, definition.content
+        assert definition.json()["group_type_index"] == 0
+
+        source = ExternalDataSource.objects.create(
+            team=self.team, source_id="s", connection_id="c", status="Running", source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(team=self.team, source=source, name="orgs")
+        created = self.client.post(
+            self.endpoint,
+            {
+                "definition": definition.json()["id"],
+                "external_data_schema": str(schema.id),
+                "column_property_map": {"plan": "plan_tier_pending"},
+                "key_column": "org_id",
+            },
+            format="json",
+        )
+        assert created.status_code == status.HTTP_201_CREATED, created.content
+        assert created.json()["external_data_schema"] == str(schema.id)
+
+        # Settle the mapping to its tested value via an update. Provenance is stamped as soon as an
+        # enabled source's effective mapping changes, without waiting for a value backfill.
+        settled = self.client.patch(
+            f"{self.endpoint}{created.json()['id']}/",
+            {"column_property_map": {"plan": "plan_tier"}},
+            format="json",
+        )
+        assert settled.status_code == status.HTTP_200_OK, settled.content
+        old_definition = PropertyDefinition.objects.get(
+            team_id=self.team.id, type=PropertyDefinition.Type.GROUP, group_type_index=0, name="plan_tier"
+        )
+        assert old_definition.warehouse_origin is not None
+        assert old_definition.warehouse_origin["custom_property_source_id"] == created.json()["id"]
+
+        patched = self.client.patch(
+            f"{self.endpoint}{created.json()['id']}/",
+            {"column_property_map": {"plan": "group_plan_tier"}},
+            format="json",
+        )
+        assert patched.status_code == status.HTTP_200_OK, patched.content
+        assert patched.json()["id"] == created.json()["id"]
+        assert patched.json()["column_property_map"] == {"plan": "group_plan_tier"}
+
+        # Regression: renaming a mapped column must not leave the old property definition claiming
+        # this source indefinitely once it no longer produces that property.
+        old_definition.refresh_from_db()
+        assert old_definition.warehouse_origin is None
+        new_definition = PropertyDefinition.objects.get(
+            team_id=self.team.id, type=PropertyDefinition.Type.GROUP, group_type_index=0, name="group_plan_tier"
+        )
+        assert new_definition.warehouse_origin is not None
+        assert new_definition.warehouse_origin["custom_property_source_id"] == created.json()["id"]
+
+    @parameterized.expand(
+        [
+            ("group_without_index", {"target_type": "group"}),
+            ("index_without_group", {"target_type": "person", "group_type_index": 0}),
+        ]
+    )
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_group_type_index_validation(self, _name, extra, _flag):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/custom_property_definitions/",
+            {"name": "X", "display_type": "text", **extra},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST, response.content
+
+
+class TestCustomPropertyGroupScope(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.definitions_endpoint = f"/api/projects/{self.team.id}/custom_property_definitions/"
+        self.sources_endpoint = f"/api/projects/{self.team.id}/custom_property_sources/"
+
+    def _token(self, scopes: list[str]) -> str:
+        value = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="scoped",
+            user=self.user,
+            secure_value=hash_key_value(value),
+            scopes=scopes,
+            scoped_teams=[],
+            scoped_organizations=[],
+        )
+        return value
+
+    @parameterized.expand(
+        [
+            ("account_only", ["account:write", "group:read"], status.HTTP_403_FORBIDDEN),
+            ("with_group_write", ["account:write", "group:write"], status.HTTP_201_CREATED),
+        ]
+    )
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_group_definition_create_requires_group_write_scope(self, _name, scopes, expected, _flag):
+        # Group-target definitions write group properties, so an account-scoped token must also carry
+        # group:write — a regression that drops this guard would let an account-only key configure the
+        # group-writing pipeline.
+        token = self._token(scopes)
+        response = self.client.post(
+            self.definitions_endpoint,
+            {"name": "Plan tier", "display_type": "text", "target_type": "group", "group_type_index": 0},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == expected, response.content
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_group_source_mutation_requires_group_write_scope(self, _flag):
+        # An account-only token must not be able to enable/mutate a source feeding a group definition.
+        # The group def + source are set up as an admin session, which the scope check exempts.
+        definition = self.client.post(
+            self.definitions_endpoint,
+            {"name": "Plan tier", "display_type": "text", "target_type": "group", "group_type_index": 0},
+            format="json",
+        )
+        assert definition.status_code == status.HTTP_201_CREATED, definition.content
+        source = ExternalDataSource.objects.create(
+            team=self.team, source_id="s", connection_id="c", status="Running", source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(team=self.team, source=source, name="orgs")
+        created = self.client.post(
+            self.sources_endpoint,
+            {
+                "definition": definition.json()["id"],
+                "external_data_schema": str(schema.id),
+                "column_property_map": {"plan": "plan_tier"},
+                "key_column": "org_id",
+            },
+            format="json",
+        )
+        assert created.status_code == status.HTTP_201_CREATED, created.content
+        source_id = created.json()["id"]
+
+        token = self._token(["account:write", "group:read"])
+        patched = self.client.patch(
+            f"{self.sources_endpoint}{source_id}/",
+            {"is_enabled": False},
+            format="json",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        assert patched.status_code == status.HTTP_403_FORBIDDEN, patched.content
+
+    def _create_group_definition_and_source(self):
+        definition = self.client.post(
+            self.definitions_endpoint,
+            {"name": "Plan tier", "display_type": "text", "target_type": "group", "group_type_index": 0},
+            format="json",
+        )
+        assert definition.status_code == status.HTTP_201_CREATED, definition.content
+        source = ExternalDataSource.objects.create(
+            team=self.team, source_id="s", connection_id="c", status="Running", source_type="Stripe"
+        )
+        schema = ExternalDataSchema.objects.create(team=self.team, source=source, name="orgs")
+        created = self.client.post(
+            self.sources_endpoint,
+            {
+                "definition": definition.json()["id"],
+                "external_data_schema": str(schema.id),
+                "column_property_map": {"plan": "plan_tier"},
+                "key_column": "org_id",
+            },
+            format="json",
+        )
+        assert created.status_code == status.HTTP_201_CREATED, created.content
+        return definition.json()["id"], created.json()["id"]
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_group_definition_reads_require_group_read_scope(self, _flag):
+        # A token without group read must not see group-target definitions in the list or detail;
+        # group:read makes them visible again.
+        def_id, _ = self._create_group_definition_and_source()
+
+        account_token = self._token(["account:read"])
+        listed = self.client.get(self.definitions_endpoint, headers={"authorization": f"Bearer {account_token}"})
+        assert listed.status_code == status.HTTP_200_OK, listed.content
+        assert def_id not in [d["id"] for d in listed.json()["results"]]
+        detail = self.client.get(
+            f"{self.definitions_endpoint}{def_id}/", headers={"authorization": f"Bearer {account_token}"}
+        )
+        assert detail.status_code == status.HTTP_404_NOT_FOUND, detail.content
+
+        group_token = self._token(["account:read", "group:read"])
+        listed2 = self.client.get(self.definitions_endpoint, headers={"authorization": f"Bearer {group_token}"})
+        assert def_id in [d["id"] for d in listed2.json()["results"]]
+        detail2 = self.client.get(
+            f"{self.definitions_endpoint}{def_id}/", headers={"authorization": f"Bearer {group_token}"}
+        )
+        assert detail2.status_code == status.HTTP_200_OK, detail2.content
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_group_source_reads_require_group_read_scope(self, _flag):
+        # Sources feeding a group definition are hidden from list and detail without group read.
+        # (The runs action rejects personal API keys outright, so it isn't reachable via a token.)
+        _, source_id = self._create_group_definition_and_source()
+
+        account_token = self._token(["account:read"])
+        listed = self.client.get(self.sources_endpoint, headers={"authorization": f"Bearer {account_token}"})
+        assert listed.status_code == status.HTTP_200_OK, listed.content
+        assert source_id not in [s["id"] for s in listed.json()["results"]]
+        detail = self.client.get(
+            f"{self.sources_endpoint}{source_id}/", headers={"authorization": f"Bearer {account_token}"}
+        )
+        assert detail.status_code == status.HTTP_404_NOT_FOUND, detail.content
+
+        group_token = self._token(["account:read", "group:read"])
+        detail2 = self.client.get(
+            f"{self.sources_endpoint}{source_id}/", headers={"authorization": f"Bearer {group_token}"}
+        )
+        assert detail2.status_code == status.HTTP_200_OK, detail2.content
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_group_definition_value_suggestions_require_group_read_scope(self, _flag):
+        # The values action loads a definition by id, so it must apply the same group-read gate as
+        # list/detail — an account-only token must not read a group-target definition's suggestions.
+        def_id, _ = self._create_group_definition_and_source()
+
+        account_token = self._token(["account:read"])
+        denied = self.client.get(
+            f"{self.definitions_endpoint}values/?key={def_id}",
+            headers={"authorization": f"Bearer {account_token}"},
+        )
+        assert denied.status_code == status.HTTP_404_NOT_FOUND, denied.content
+
+        group_token = self._token(["account:read", "group:read"])
+        allowed = self.client.get(
+            f"{self.definitions_endpoint}values/?key={def_id}",
+            headers={"authorization": f"Bearer {group_token}"},
+        )
+        assert allowed.status_code == status.HTTP_200_OK, allowed.content
+
+
+class TestAccountNotesViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.account = Account.objects.unscoped().create(team=self.team, name="Acme Corp")
+        self.endpoint_base = f"/api/projects/{self.team.id}/account_notes/"
+
+    def _link_note(self, account: Account | None = None, **kwargs) -> Notebook:
+        kwargs.setdefault("visibility", Notebook.Visibility.INTERNAL)
+        notebook = Notebook.objects.create(team=self.team, **kwargs)
+        ResourceNotebook.objects.create(notebook=notebook, account=account or self.account)
+        return notebook
+
+    def test_list_returns_account_notes_with_account_fields(self):
+        note = self._link_note(title="Renewal", created_by=self.user)
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        results = response.json()["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["short_id"], note.short_id)
+        self.assertEqual(results[0]["title"], "Renewal")
+        self.assertEqual(results[0]["account_id"], str(self.account.id))
+        self.assertEqual(results[0]["account_name"], "Acme Corp")
+        self.assertEqual(results[0]["created_by"]["id"], self.user.id)
+        self.assertEqual(results[0]["created_by"]["email"], self.user.email)
+
+    def test_list_excludes_unlinked_deleted_noninternal_and_other_team_notes(self):
+        included = self._link_note(title="Included")
+        Notebook.objects.create(team=self.team, title="Standalone")
+        self._link_note(title="Deleted", deleted=True)
+        self._link_note(title="Default visibility", visibility=Notebook.Visibility.DEFAULT)
+        other_team = Team.objects.create(organization=self.organization)
+        other_account = Account.objects.unscoped().create(team=other_team, name="Other")
+        other_note = Notebook.objects.create(
+            team=other_team, title="Other team", visibility=Notebook.Visibility.INTERNAL
+        )
+        ResourceNotebook.objects.create(notebook=other_note, account=other_account)
+
+        response = self.client.get(self.endpoint_base)
+
+        short_ids = [n["short_id"] for n in response.json()["results"]]
+        self.assertEqual(short_ids, [included.short_id])
+
+    @parameterized.expand(
+        [
+            ("matches_title", "renewal", {"Renewal planning"}),
+            ("matches_content", "pricing", {"Untitled"}),
+            ("matches_account_name", "acme", {"Renewal planning", "Untitled", "Kickoff"}),
+            ("no_match", "zzzz", set()),
+        ]
+    )
+    def test_list_search(self, _name, search, expected_titles):
+        self._link_note(title="Renewal planning", text_content="")
+        self._link_note(title="Untitled", text_content="pricing discussion")
+        self._link_note(title="Kickoff", text_content="agenda")
+
+        response = self.client.get(f"{self.endpoint_base}?search={search}")
+
+        titles = {n["title"] for n in response.json()["results"]}
+        self.assertEqual(titles, expected_titles)
+
+    def test_list_filter_by_account(self):
+        other_account = Account.objects.unscoped().create(team=self.team, name="Beta LLC")
+        self._link_note(title="Acme note")
+        self._link_note(title="Beta note", account=other_account)
+
+        response = self.client.get(f"{self.endpoint_base}?account_id={self.account.id}")
+
+        titles = [n["title"] for n in response.json()["results"]]
+        self.assertEqual(titles, ["Acme note"])
+
+    @parameterized.expand(
+        [
+            ("account_id", "not-a-uuid"),
+            ("created_by", "alice"),
+            ("created_by", "alice,bob"),
+            ("assigned_to", "alice"),
+        ]
+    )
+    def test_list_rejects_malformed_filter(self, param, value):
+        response = self.client.get(f"{self.endpoint_base}?{param}={value}")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_filter_by_assigned_to(self):
+        # "My accounts" on the Notes tab: notes on accounts where the user actively holds any
+        # relationship (mirrors the accounts list runner's assignedToUserIds).
+        definition = AccountRelationshipDefinition.objects.for_team(self.team.id).create(
+            team_id=self.team.id, name="CSM"
+        )
+        other_user = User.objects.create_and_join(self.organization, "other-holder@posthog.com", None)
+        assigned_account = Account.objects.unscoped().create(team=self.team, name="Assigned Co")
+        AccountRelationship.objects.for_team(self.team.id).create(
+            team_id=self.team.id, account=assigned_account, definition=definition, user=self.user
+        )
+        ended_account = Account.objects.unscoped().create(team=self.team, name="Ended Co")
+        AccountRelationship.objects.for_team(self.team.id).create(
+            team_id=self.team.id,
+            account=ended_account,
+            definition=definition,
+            user=self.user,
+            ended_at=timezone.now(),
+        )
+        other_account = Account.objects.unscoped().create(team=self.team, name="Other Co")
+        AccountRelationship.objects.for_team(self.team.id).create(
+            team_id=self.team.id, account=other_account, definition=definition, user=other_user
+        )
+        self._link_note(title="Assigned note", account=assigned_account)
+        self._link_note(title="Ended note", account=ended_account)
+        self._link_note(title="Other note", account=other_account)
+
+        response = self.client.get(f"{self.endpoint_base}?assigned_to={self.user.id}")
+
+        titles = {n["title"] for n in response.json()["results"]}
+        self.assertEqual(titles, {"Assigned note"})
+
+    @parameterized.expand(
+        [
+            ("single", "{uid}"),
+            ("comma_joined", "{uid},999999"),  # the encoding the generated frontend client sends
+            ("repeated", "{uid}&created_by=999999"),
+        ]
+    )
+    def test_list_filter_by_created_by(self, _name, created_by_query):
+        other_user = User.objects.create_and_join(self.organization, "note-author@posthog.com", None)
+        self._link_note(title="Mine", created_by=self.user)
+        self._link_note(title="Theirs", created_by=other_user)
+
+        query = created_by_query.format(uid=self.user.id)
+        response = self.client.get(f"{self.endpoint_base}?created_by={query}")
+
+        titles = [n["title"] for n in response.json()["results"]]
+        self.assertEqual(titles, ["Mine"])
+
+    def test_list_orders_by_last_modified_desc_and_paginates(self):
+        with time_machine.travel("2024-01-01", tick=False):
+            older = self._link_note(title="Older")
+        with time_machine.travel("2024-01-02", tick=False):
+            newer = self._link_note(title="Newer")
+
+        first_page = self.client.get(f"{self.endpoint_base}?limit=1").json()
+        self.assertEqual(first_page["count"], 2)
+        self.assertEqual([n["short_id"] for n in first_page["results"]], [newer.short_id])
+
+        second_page = self.client.get(f"{self.endpoint_base}?limit=1&offset=1").json()
+        self.assertEqual([n["short_id"] for n in second_page["results"]], [older.short_id])
+
+    def test_list_carries_tags_and_filters_and_sorts_by_them(self):
+        risky = self._link_note(title="Risky")
+        tag, _ = Tag.objects.get_or_create(name="risk", team=self.team)
+        TaggedItem.for_content_object(tag, risky).save()
+        plain = self._link_note(title="Plain")
+
+        response = self.client.get(self.endpoint_base)
+        rows = {row["short_id"]: row for row in response.json()["results"]}
+        self.assertEqual(rows[risky.short_id]["tags"], ["risk"])
+        self.assertEqual(rows[plain.short_id]["tags"], [])
+
+        by_tag = self.client.get(f'{self.endpoint_base}?tags=["risk"]').json()["results"]
+        self.assertEqual([row["short_id"] for row in by_tag], [risky.short_id])
+
+        by_title = self.client.get(f"{self.endpoint_base}?ordering=title").json()["results"]
+        self.assertEqual([row["short_id"] for row in by_title], [plain.short_id, risky.short_id])
+
+    def test_list_sorts_by_author(self):
+        # Saved views carry one ordering across the team tab and the account tab, so both take the author sort.
+        zoe = User.objects.create_and_join(self.organization, "zoe@posthog.com", None, first_name="Zoe")
+        adam = User.objects.create_and_join(self.organization, "adam@posthog.com", None, first_name="Adam")
+        by_zoe = self._link_note(title="By Zoe", created_by=zoe)
+        by_adam = self._link_note(title="By Adam", created_by=adam)
+
+        ascending = self.client.get(f"{self.endpoint_base}?ordering=created_by").json()["results"]
+        descending = self.client.get(f"{self.endpoint_base}?ordering=-created_by").json()["results"]
+
+        self.assertEqual([row["short_id"] for row in ascending], [by_adam.short_id, by_zoe.short_id])
+        self.assertEqual([row["short_id"] for row in descending], [by_zoe.short_id, by_adam.short_id])
+
+    def test_list_hides_notes_of_accounts_the_caller_cannot_read(self):
+        visible = self._link_note(title="Visible")
+        hidden_account = Account.objects.unscoped().create(team=self.team, name="Hidden Inc")
+        self._link_note(title="Hidden", account=hidden_account)
+
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.save()
+        viewer = User.objects.create_and_join(self.organization, "notes-viewer@posthog.com", None)
+        AccessControl.objects.create(
+            team=self.team,
+            resource="account",
+            resource_id=str(hidden_account.id),
+            access_level="none",
+            organization_member=OrganizationMembership.objects.get(user=viewer, organization=self.organization),
+        )
+        self.client.force_login(viewer)
+
+        response = self.client.get(self.endpoint_base)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        short_ids = [n["short_id"] for n in response.json()["results"]]
+        self.assertEqual(short_ids, [visible.short_id])
+
+
+class TestAccountRelationshipDefinitionViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.endpoint_base = f"/api/projects/{self.team.id}/account_relationship_definitions/"
+
+    def test_list_without_pagination_preserves_envelope(self):
+        self._create(name="A")
+        self._create(name="B")
+        paginated = self.client.get(self.endpoint_base, {"limit": 1})
+        complete = self.client.get(self.endpoint_base, {"limit": "1", "offset": "1", "pagination": "none"})
+
+        self.assertEqual(paginated.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(paginated.json()["results"]), 1)
+        self.assertIsNotNone(paginated.json()["next"])
+        self.assertEqual(complete.status_code, status.HTTP_200_OK)
+        self.assertEqual([definition["name"] for definition in complete.json()["results"]], ["A", "B"])
+        self.assertEqual(complete.json()["count"], 2)
+        self.assertIsNone(complete.json()["next"])
+        self.assertIsNone(complete.json()["previous"])
+
+    def _create(self, **overrides):
+        payload = {"name": "CSM", "description": "Customer success manager"}
+        payload.update(overrides)
+        return self.client.post(self.endpoint_base, payload, format="json")
+
+    def test_create_and_list_roundtrip(self):
+        response = self._create()
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.json())
+        data = response.json()
+        self.assertEqual(data["name"], "CSM")
+        self.assertEqual(data["description"], "Customer success manager")
+        self.assertTrue(data["is_single_holder"])
+
+        # nosemgrep: idor-lookup-without-team (test assertion)
+        definition = AccountRelationshipDefinition.objects.unscoped().get(id=data["id"])
+        self.assertEqual(definition.team, self.team)
+        self.assertEqual(definition.created_by, self.user)
+
+        listed = self.client.get(self.endpoint_base)
+        self.assertEqual(status.HTTP_200_OK, listed.status_code, listed.json())
+        self.assertEqual([d["id"] for d in listed.json()["results"]], [data["id"]])
+
+    def test_create_duplicate_name_returns_conflict(self):
+        self._create()
+        response = self._create()
+
+        self.assertEqual(status.HTTP_409_CONFLICT, response.status_code, response.json())
+
+    def test_patch_renames_and_toggles_cardinality(self):
+        definition_id = self._create(name="FDE").json()["id"]
+
+        response = self.client.patch(
+            f"{self.endpoint_base}{definition_id}/",
+            {"name": "Field engineer", "is_single_holder": False},
+            format="json",
+        )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["name"], "Field engineer")
+        self.assertFalse(response.json()["is_single_holder"])
+
+    def test_retrieve_returns_definition_and_404_for_unknown(self):
+        definition_id = self._create().json()["id"]
+
+        response = self.client.get(f"{self.endpoint_base}{definition_id}/")
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["name"], "CSM")
+
+        missing = self.client.get(f"{self.endpoint_base}00000000-0000-0000-0000-000000000000/")
+        self.assertEqual(status.HTTP_404_NOT_FOUND, missing.status_code)
+
+    def test_patch_unknown_id_returns_404(self):
+        response = self.client.patch(
+            f"{self.endpoint_base}00000000-0000-0000-0000-000000000000/", {"name": "X"}, format="json"
+        )
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_delete_removes_definition_and_cascades_history(self):
+        definition_id = self._create().json()["id"]
+        account = create_account(team_id=self.team.id, name="Acme")
+        # nosemgrep: idor-lookup-without-team (test setup)
+        definition = AccountRelationshipDefinition.objects.unscoped().get(id=definition_id)
+        relationships_logic.assign(
+            team_id=self.team.id,
+            account=account,
+            definition=definition,
+            user=self.user,
+            actor=relationships_logic.Actor.human(self.user),
+        )
+
+        response = self.client.delete(f"{self.endpoint_base}{definition_id}/")
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        self.assertFalse(AccountRelationshipDefinition.objects.unscoped().filter(id=definition_id).exists())
+        self.assertFalse(AccountRelationship.objects.unscoped().filter(definition_id=definition_id).exists())
+
+    def test_viewer_access_can_list_but_not_write(self):
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.save()
+        viewer = User.objects.create_and_join(self.organization, "rel-viewer@posthog.com", "testtest")
+        AccessControl.objects.create(
+            team=self.team,
+            resource="customer_analytics",
+            resource_id=None,
+            access_level="viewer",
+            organization_member=OrganizationMembership.objects.get(user=viewer, organization=self.organization),
+        )
+        self.client.force_login(viewer)
+
+        self.assertEqual(self.client.get(self.endpoint_base).status_code, status.HTTP_200_OK)
+        self.assertEqual(self._create().status_code, status.HTTP_403_FORBIDDEN)
+
+
+class TestAccountRelationshipViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.account = create_account(team_id=self.team.id)
+        self.endpoint = f"/api/projects/{self.team.id}/accounts/{self.account.id}/relationships/"
+
+    def _create_relationship_definition(self, name="CSM"):
+        return AccountRelationshipDefinition.objects.for_team(self.team.id).create(
+            team_id=self.team.id, name=name, created_by=self.user
+        )
+
+    def _assign(self, definition, user=None) -> AccountRelationship:
+        return relationships_logic.assign(
+            team_id=self.team.id,
+            account=self.account,
+            definition=definition,
+            user=user or self.user,
+            actor=relationships_logic.Actor.human(self.user),
+        )
+
+    def _end(self, relationship: AccountRelationship) -> None:
+        relationships_logic.end_relationship(
+            team_id=self.team.id,
+            account_id=self.account.id,
+            relationship_id=str(relationship.id),
+            actor=relationships_logic.Actor.human(),
+        )
+
+    def test_lists_active_relationships_by_default(self):
+        csm = self._create_relationship_definition("CSM")
+        fde = self._create_relationship_definition("FDE")
+        active = self._assign(csm)
+        ended = self._assign(fde)
+        self._end(ended)
+
+        response = self.client.get(self.endpoint)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        rows = response.json()
+        self.assertEqual([str(active.id)], [row["id"] for row in rows])
+        self.assertEqual(rows[0]["definition"]["id"], str(csm.id))
+        self.assertEqual(rows[0]["definition"]["name"], "CSM")
+        self.assertEqual(rows[0]["user"], {"id": self.user.id, "email": self.user.email})
+        self.assertIsNone(rows[0]["ended_at"])
+
+    def test_include_history_returns_full_timeline(self):
+        definition = self._create_relationship_definition()
+        successor = User.objects.create_and_join(self.organization, "successor@posthog.com", "testtest")
+        self._assign(definition)
+        self._assign(definition, successor)
+
+        response = self.client.get(f"{self.endpoint}?include_history=true")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        rows = response.json()
+        self.assertEqual(2, len(rows))
+        self.assertEqual(rows[0]["user"]["id"], successor.id)
+        self.assertIsNone(rows[0]["ended_at"])
+        self.assertEqual(rows[1]["user"]["id"], self.user.id)
+        self.assertIsNotNone(rows[1]["ended_at"])
+
+    def test_account_from_another_team_returns_404(self):
+        other_team = Team.objects.create(organization=self.organization)
+        other_account = create_account(team_id=other_team.id)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/accounts/{other_account.id}/relationships/")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    def test_assign_and_end_roundtrip(self):
+        definition = self._create_relationship_definition()
+
+        created = self.client.post(self.endpoint, {"definition": str(definition.id), "user": self.user.id})
+        self.assertEqual(status.HTTP_201_CREATED, created.status_code, created.json())
+        self.assertEqual(created.json()["definition"]["id"], str(definition.id))
+        self.assertEqual(created.json()["user"]["id"], self.user.id)
+        self.assertIsNone(created.json()["ended_at"])
+
+        ended = self.client.post(f"{self.endpoint}{created.json()['id']}/end/")
+        self.assertEqual(status.HTTP_200_OK, ended.status_code, ended.json())
+        self.assertIsNotNone(ended.json()["ended_at"])
+        self.assertEqual([], self.client.get(self.endpoint).json())
+
+    @parameterized.expand([("agent", True, status.HTTP_409_CONFLICT), ("person", False, status.HTTP_201_CREATED)])
+    def test_only_a_person_can_change_a_managed_role_with_a_personal_key(self, _name, via_agent, expected):
+        definition = self._create_relationship_definition("Account executive")
+        ownership.set_controlled(self.team.id, definition.id, True)
+        enroll_account(self.account, definition)
+        value = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="agent",
+            user=self.user,
+            secure_value=hash_key_value(value),
+            scopes=["account:write"],
+            scoped_teams=[],
+            scoped_organizations=[],
+        )
+        user_agent = f"cursor/1.0 {MCP_USER_AGENT_MARKER}" if via_agent else "curl/8.0"
+
+        response = self.client.post(
+            self.endpoint,
+            {"definition": str(definition.id), "user": self.user.id},
+            headers={"authorization": f"Bearer {value}", "user-agent": user_agent},
+        )
+
+        self.assertEqual(expected, response.status_code, response.json())
+
+    def test_assign_with_unknown_definition_returns_400(self):
+        response = self.client.post(
+            self.endpoint, {"definition": "00000000-0000-0000-0000-000000000000", "user": self.user.id}
+        )
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        data = response.json()
+        self.assertEqual(data["attr"], "definition")
+        self.assertEqual(data["type"], "validation_error")
+
+    def test_assign_to_user_outside_organization_returns_400(self):
+        definition = self._create_relationship_definition()
+        outsider = User.objects.create_user("outsider@example.com", None, "")
+
+        response = self.client.post(self.endpoint, {"definition": str(definition.id), "user": outsider.id})
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code, response.json())
+        data = response.json()
+        self.assertEqual(data["attr"], "user")
+        self.assertEqual(data["type"], "validation_error")
+
+    def test_end_already_ended_relationship_returns_404(self):
+        definition = self._create_relationship_definition()
+        rel = self._assign(definition)
+        self._end(rel)
+
+        response = self.client.post(f"{self.endpoint}{rel.id}/end/")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    @parameterized.expand([("active", False), ("ended", True)])
+    def test_admin_hard_deletes_relationship(self, _case, ended):
+        OrganizationMembership.objects.filter(user=self.user, organization=self.organization).update(
+            level=OrganizationMembership.Level.ADMIN
+        )
+        definition = self._create_relationship_definition()
+        relationship = self._assign(definition)
+        if ended:
+            self._end(relationship)
+
+        response = self.client.delete(f"{self.endpoint}{relationship.id}/")
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code)
+        self.assertTrue(
+            ActivityLog.objects.filter(
+                team_id=self.team.id, activity="relationship_deleted", detail__context__source="human"
+            ).exists()
+        )
+        self.assertFalse(AccountRelationship.objects.for_team(self.team.id).filter(id=relationship.id).exists())
+
+    def test_non_admin_cannot_hard_delete_relationship(self):
+        definition = self._create_relationship_definition()
+        relationship = self._assign(definition)
+        member = User.objects.create_and_join(self.organization, "relationship-member@posthog.com", "testtest")
+        self.client.force_login(member)
+
+        response = self.client.delete(f"{self.endpoint}{relationship.id}/")
+
+        self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code)
+        self.assertTrue(AccountRelationship.objects.for_team(self.team.id).filter(id=relationship.id).exists())
+
+    def test_account_viewer_cannot_hard_delete_relationship_as_customer_analytics_editor(self):
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.save()
+        definition = self._create_relationship_definition()
+        relationship = self._assign(definition)
+        account_viewer = User.objects.create_and_join(
+            self.organization, "account-viewer-relationship-editor@example.com", "testtest"
+        )
+        membership = OrganizationMembership.objects.get(user=account_viewer, organization=self.organization)
+        AccessControl.objects.create(
+            team=self.team,
+            resource="customer_analytics",
+            resource_id=None,
+            access_level="editor",
+            organization_member=membership,
+        )
+        AccessControl.objects.create(
+            team=self.team,
+            resource="account",
+            resource_id=str(self.account.id),
+            access_level="viewer",
+            organization_member=membership,
+        )
+        self.client.force_login(account_viewer)
+
+        response = self.client.delete(f"{self.endpoint}{relationship.id}/")
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+        self.assertTrue(AccountRelationship.objects.for_team(self.team.id).filter(id=relationship.id).exists())
+
+
+class TestAccountSupportTicketViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.account = Account.objects.unscoped().create(team=self.team, name="Acme Corp", external_id="acme-1")
+        self.endpoint = f"/api/environments/{self.team.id}/accounts/{self.account.id}/support_tickets/"
+
+    def test_list_returns_tickets_for_the_accounts_org(self):
+        ticket = Ticket.objects.create(
+            team=self.team,
+            ticket_number=7,
+            widget_session_id="s7",
+            distinct_id="d7",
+            organization_id="acme-1",
+            status="open",
+            anonymous_traits={"name": "Example customer", "email": "customer@example.com"},
+        )
+        Comment.objects.create(
+            team=self.team,
+            scope="conversations_ticket",
+            item_id=str(ticket.id),
+            content="Latest question",
+            item_context={"author_type": "customer", "is_private": False},
+        )
+        Ticket.objects.create(
+            team=self.team, ticket_number=8, widget_session_id="s8", distinct_id="d8", organization_id="other-org"
+        )
+
+        response = self.client.get(self.endpoint)
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        data = response.json()
+        self.assertEqual([t["ticket_number"] for t in data], [7])
+        self.assertEqual(data[0]["status"], "open")
+        self.assertEqual(data[0]["last_message"]["sender"]["name"], "Example customer")
+        self.assertEqual(data[0]["last_message"]["direction"], "inbound")
+        self.assertTrue(data[0]["deep_link"].endswith(f"/project/{self.team.id}/support/tickets/7"))
+
+        detail_response = self.client.get(f"{self.endpoint}{ticket.id}/")
+        self.assertEqual(status.HTTP_200_OK, detail_response.status_code, detail_response.json())
+        self.assertEqual(detail_response.json()["count"], 1)
+        self.assertEqual(detail_response.json()["results"][0]["content"], "Latest question")
+        self.assertEqual(detail_response.json()["results"][0]["direction"], "inbound")
+
+    def test_list_is_empty_when_account_has_no_external_id(self):
+        unlinked = Account.objects.unscoped().create(team=self.team, name="Unlinked", external_id=None)
+
+        response = self.client.get(f"/api/environments/{self.team.id}/accounts/{unlinked.id}/support_tickets/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json(), [])
+
+    def test_ticket_object_denial_hides_list_metadata_and_message_bodies(self):
+        allowed_ticket = Ticket.objects.create(
+            team=self.team,
+            ticket_number=9,
+            widget_session_id="s9",
+            distinct_id="d9",
+            organization_id="acme-1",
+        )
+        denied_ticket = Ticket.objects.create(
+            team=self.team,
+            ticket_number=10,
+            widget_session_id="s10",
+            distinct_id="d10",
+            organization_id="acme-1",
+        )
+        for ticket in (allowed_ticket, denied_ticket):
+            Comment.objects.create(
+                team=self.team,
+                scope="conversations_ticket",
+                item_id=str(ticket.id),
+                content=f"Message for {ticket.ticket_number}",
+                item_context={"author_type": "customer", "is_private": False},
+            )
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.save()
+        viewer = User.objects.create_and_join(self.organization, "ticket-object-denied@posthog.com", "testtest")
+        membership = OrganizationMembership.objects.get(user=viewer, organization=self.organization)
+        AccessControl.objects.create(
+            team=self.team,
+            resource="customer_analytics",
+            resource_id=None,
+            access_level="viewer",
+            organization_member=membership,
+        )
+        AccessControl.objects.create(
+            team=self.team,
+            resource="ticket",
+            resource_id=None,
+            access_level="viewer",
+            organization_member=membership,
+        )
+        AccessControl.objects.create(
+            team=self.team,
+            resource="ticket",
+            resource_id=str(denied_ticket.id),
+            access_level="none",
+            organization_member=membership,
+        )
+        self.client.force_login(viewer)
+
+        list_response = self.client.get(self.endpoint)
+
+        self.assertEqual(status.HTTP_200_OK, list_response.status_code, list_response.json())
+        self.assertEqual([ticket["id"] for ticket in list_response.json()], [str(allowed_ticket.id)])
+        self.assertEqual(
+            status.HTTP_404_NOT_FOUND,
+            self.client.get(f"{self.endpoint}{denied_ticket.id}/").status_code,
+        )
+        self.assertEqual(
+            status.HTTP_200_OK,
+            self.client.get(f"{self.endpoint}{allowed_ticket.id}/").status_code,
+        )
+
+    def test_account_viewer_denied_tickets_cannot_read_them(self):
+        Ticket.objects.create(
+            team=self.team,
+            ticket_number=9,
+            widget_session_id="s9",
+            distinct_id="d9",
+            organization_id="acme-1",
+        )
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.save()
+        viewer = User.objects.create_and_join(self.organization, "ticket-denied@posthog.com", "testtest")
+        membership = OrganizationMembership.objects.get(user=viewer, organization=self.organization)
+        AccessControl.objects.create(
+            team=self.team,
+            resource="customer_analytics",
+            resource_id=None,
+            access_level="viewer",
+            organization_member=membership,
+        )
+        AccessControl.objects.create(
+            team=self.team,
+            resource="ticket",
+            resource_id=None,
+            access_level="none",
+            organization_member=membership,
+        )
+        self.client.force_login(viewer)
+
+        self.assertEqual(status.HTTP_403_FORBIDDEN, self.client.get(self.endpoint).status_code)
+
+
+class TestAccountEmailThreadViewSet(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.account = Account.objects.unscoped().create(team=self.team, name="Acme Corp", external_id="acme-1")
+        first_message_at = timezone.now() - timedelta(hours=1)
+        last_message_at = timezone.now()
+        self.thread = EmailThread.objects.for_team(self.team.id).create(
+            team=self.team,
+            canonical_thread_key="<account-email@example.com>",
+            subject="Renewal planning",
+            first_message_at=first_message_at,
+            last_message_at=last_message_at,
+            message_count=2,
+            preview="Latest reply",
+        )
+        EmailThreadAccountLink.objects.for_team(self.team.id).create(
+            team=self.team,
+            thread=self.thread,
+            account_id=str(self.account.id),
+            account_external_id=self.account.external_id,
+            match_source="email_domain",
+        )
+        EmailThreadParticipant.objects.for_team(self.team.id).create(
+            team=self.team,
+            thread=self.thread,
+            email="customer@example.com",
+            display_name="Customer",
+            kind=EmailThreadParticipantKind.CUSTOMER,
+        )
+        EmailThreadParticipant.objects.for_team(self.team.id).create(
+            team=self.team,
+            thread=self.thread,
+            email="agent@example.com",
+            display_name="Account manager",
+            kind=EmailThreadParticipantKind.INTERNAL,
+        )
+        for index, sent_at in enumerate([last_message_at, first_message_at], start=1):
+            comment = Comment.objects.create(
+                team=self.team,
+                scope=EMAIL_THREAD_COMMENT_SCOPE,
+                item_id=str(self.thread.id),
+                content=f"Message {index}",
+            )
+            EmailThreadMessage.objects.for_team(self.team.id).create(
+                team=self.team,
+                thread=self.thread,
+                comment=comment,
+                message_id=f"<message-{index}@example.com>",
+                sent_at=sent_at,
+                sender_email="customer@example.com",
+                sender_name="Customer",
+                to_recipients=[{"name": "CSM", "email": "csm@example.com"}],
+                cc_recipients=[],
+                direction=EmailThreadMessageDirection.INBOUND,
+                source_type="mailgun",
+                source_id=f"message-{index}",
+            )
+        self.endpoint = f"/api/environments/{self.team.id}/accounts/{self.account.id}/email_threads/"
+
+    def test_list_keeps_messages_out_and_detail_paginates_by_source_time(self):
+        list_response = self.client.get(self.endpoint)
+
+        self.assertEqual(status.HTTP_200_OK, list_response.status_code, list_response.json())
+        payload = list_response.json()
+        self.assertEqual(payload["count"], 1)
+        summary = payload["results"][0]
+        self.assertEqual(summary["subject"], "Renewal planning")
+        self.assertEqual(summary["message_count"], 2)
+        self.assertEqual(summary["first_message"]["sender"]["name"], "Customer")
+        self.assertEqual(summary["last_message"]["sender"]["name"], "Customer")
+        self.assertEqual(summary["last_message"]["direction"], "inbound")
+        self.assertNotIn("messages", summary)
+
+        detail_response = self.client.get(f"{self.endpoint}{self.thread.id}/?limit=1&offset=0")
+
+        self.assertEqual(status.HTTP_200_OK, detail_response.status_code, detail_response.json())
+        self.assertEqual(detail_response.json()["count"], 2)
+        self.assertEqual(
+            [message["content"] for message in detail_response.json()["results"]],
+            ["Message 2"],
+        )
+
+        second_page_response = self.client.get(f"{self.endpoint}{self.thread.id}/?limit=1&offset=1")
+        self.assertEqual(status.HTTP_200_OK, second_page_response.status_code, second_page_response.json())
+        self.assertEqual(
+            [message["content"] for message in second_page_response.json()["results"]],
+            ["Message 1"],
+        )
+
+        with patch(
+            "products.customer_analytics.backend.presentation.views.views.AccountEmailThreadMessagePagination.max_limit",
+            1,
+        ):
+            capped_response = self.client.get(f"{self.endpoint}{self.thread.id}/?limit=10000")
+        self.assertEqual(status.HTTP_200_OK, capped_response.status_code, capped_response.json())
+        self.assertEqual(capped_response.json()["count"], 2)
+        self.assertEqual(len(capped_response.json()["results"]), 1)
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, self.client.get(f"{self.endpoint}not-a-uuid/").status_code)
+
+    def test_user_without_ticket_access_cannot_read_email_summaries_or_bodies(self):
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.save()
+        viewer = User.objects.create_and_join(self.organization, "email-denied@posthog.com", "testtest")
+        membership = OrganizationMembership.objects.get(user=viewer, organization=self.organization)
+        AccessControl.objects.create(
+            team=self.team,
+            resource="customer_analytics",
+            resource_id=None,
+            access_level="viewer",
+            organization_member=membership,
+        )
+        AccessControl.objects.create(
+            team=self.team,
+            resource="ticket",
+            resource_id=None,
+            access_level="none",
+            organization_member=membership,
+        )
+        self.client.force_login(viewer)
+
+        self.assertEqual(status.HTTP_403_FORBIDDEN, self.client.get(self.endpoint).status_code)
+        self.assertEqual(status.HTTP_403_FORBIDDEN, self.client.get(f"{self.endpoint}{self.thread.id}/").status_code)
+
+
+class TestCalendarSyncViewSet(APIBaseTest):
+    def _become_admin(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+    def _create_syncable_integration(self, *, team: Team | None = None) -> Integration:
+        return Integration.objects.create(
+            team=team or self.team,
+            kind=Integration.IntegrationKind.GOOGLE_CALENDAR,
+            integration_id="syncable-google-account",
+            created_by=self.user,
+            config={
+                "email": self.user.email,
+                "scope": "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.readonly",
+            },
+        )
+
+    def test_sync_interval_defaults_and_is_scoped_to_one_account(self):
+        self._become_admin()
+        first = self._create_syncable_integration()
+        second = Integration.objects.create(team=self.team, kind="google-calendar", integration_id="second-account")
+        endpoint = f"/api/environments/{self.team.id}/calendar_sync/"
+        initial = self.client.get(endpoint)
+        self.assertEqual({row["sync_interval_minutes"] for row in initial.json()}, {60})
+
+        response = self.client.post(f"{endpoint}interval/", {"integration_id": first.id, "sync_interval_minutes": 15})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {row["integration_id"]: row["sync_interval_minutes"] for row in self.client.get(endpoint).json()},
+            {first.id: 15, second.id: 60},
+        )
+
+    def test_sync_interval_rejects_invalid_or_unowned_integrations(self):
+        self._become_admin()
+        integration = self._create_syncable_integration()
+        endpoint = f"/api/environments/{self.team.id}/calendar_sync/interval/"
+        self.assertEqual(
+            self.client.post(endpoint, {"integration_id": integration.id, "sync_interval_minutes": 10}).status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        other_team = Team.objects.create(organization=self.organization, name="Other team")
+        other = self._create_syncable_integration(team=other_team)
+        wrong_kind = Integration.objects.create(team=self.team, kind="slack", integration_id="wrong-kind")
+        for integration_id in (other.id, wrong_kind.id):
+            self.assertEqual(
+                self.client.post(endpoint, {"integration_id": integration_id, "sync_interval_minutes": 5}).status_code,
+                status.HTTP_404_NOT_FOUND,
+            )
+
+    def test_sync_interval_requires_project_admin(self):
+        integration = self._create_syncable_integration()
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/calendar_sync/interval/",
+            {"integration_id": integration.id, "sync_interval_minutes": 5},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_sync_now_starts_the_workflow_for_a_team_owned_integration(self):
+        self._become_admin()
+        integration = Integration.objects.create(team=self.team, kind="google-calendar", integration_id="sub-1")
+        with patch("posthog.temporal.common.client.sync_connect") as mock_connect:
+            mock_connect.return_value.start_workflow.return_value = _immediate_future()
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/calendar_sync/sync_now/",
+                {"integration_id": integration.id},
+            )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json(), {"status": "started"})
+        workflow_kwargs = mock_connect.return_value.start_workflow.call_args.kwargs
+        self.assertEqual(workflow_kwargs["id"], f"google-calendar-sync-{integration.id}")
+
+    @time_machine.travel("2026-04-10T12:00:00Z", tick=False)
+    def test_backfill_starts_both_sources_for_an_inclusive_date_range(self) -> None:
+        self._become_admin()
+        integration = self._create_syncable_integration()
+
+        with patch("posthog.temporal.common.client.sync_connect") as mock_connect:
+            mock_connect.return_value.start_workflow.return_value = _immediate_future()
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/calendar_sync/backfill/",
+                {"integration_id": integration.id, "start_date": "2026-01-11", "end_date": "2026-04-10"},
+            )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json(), {"status": "started"})
+        workflow_input = mock_connect.return_value.start_workflow.call_args.args[1]
+        self.assertEqual(workflow_input.start_at, "2026-01-11T00:00:00+00:00")
+        self.assertEqual(workflow_input.end_at, "2026-04-11T00:00:00+00:00")
+        self.assertEqual(
+            mock_connect.return_value.start_workflow.call_args.kwargs["id"],
+            f"google-calendar-sync-{integration.id}",
+        )
+
+    def test_backfill_rejects_the_connection_creator_without_admin_access(self) -> None:
+        integration = self._create_syncable_integration()
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/calendar_sync/backfill/",
+            {"integration_id": integration.id, "start_date": "2026-01-01", "end_date": "2026-01-31"},
+        )
+
+        self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code)
+
+    @parameterized.expand(
+        [
+            ("too_old", "2025-04-09", "2026-04-10"),
+            ("future", "2026-04-10", "2026-04-11"),
+            ("reversed", "2026-04-10", "2026-04-09"),
+        ]
+    )
+    @time_machine.travel("2026-04-10T12:00:00Z", tick=False)
+    def test_backfill_rejects_dates_outside_the_allowed_range(self, _name: str, start_date: str, end_date: str) -> None:
+        self._become_admin()
+        integration = self._create_syncable_integration()
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/calendar_sync/backfill/",
+            {"integration_id": integration.id, "start_date": start_date, "end_date": end_date},
+        )
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+
+    def test_backfill_rejects_an_account_without_gmail_permission(self) -> None:
+        self._become_admin()
+        integration = self._create_syncable_integration()
+        integration.config["scope"] = "https://www.googleapis.com/auth/calendar.readonly"
+        integration.save(update_fields=["config"])
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/calendar_sync/backfill/",
+            {"integration_id": integration.id, "start_date": "2026-01-01", "end_date": "2026-01-31"},
+        )
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+
+    def test_sync_now_allows_the_connection_creator(self) -> None:
+        integration = Integration.objects.create(
+            team=self.team,
+            kind=Integration.IntegrationKind.GOOGLE_CALENDAR,
+            integration_id="sub-owned",
+            created_by=self.user,
+        )
+        with patch("posthog.temporal.common.client.sync_connect") as mock_connect:
+            mock_connect.return_value.start_workflow.return_value = _immediate_future()
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/calendar_sync/sync_now/",
+                {"integration_id": integration.id},
+            )
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json(), {"status": "started"})
+
+    def test_list_reports_last_synced_and_in_flight_runs(self):
+        now = timezone.now()
+        synced = Integration.objects.create(
+            team=self.team,
+            kind="google-calendar",
+            integration_id="sub-synced",
+            config={
+                "calendar_sync_started_at": (now - timedelta(minutes=5)).isoformat(),
+                "calendar_last_synced_at": (now - timedelta(minutes=4)).isoformat(),
+            },
+        )
+        syncing = Integration.objects.create(
+            team=self.team,
+            kind="google-calendar",
+            integration_id="sub-syncing",
+            config={"calendar_sync_started_at": (now - timedelta(minutes=1)).isoformat()},
+        )
+        stale = Integration.objects.create(
+            team=self.team,
+            kind="google-calendar",
+            integration_id="sub-stale",
+            config={"calendar_sync_started_at": (now - timedelta(hours=2)).isoformat()},
+        )
+        retrying = Integration.objects.create(
+            team=self.team,
+            kind="google-calendar",
+            integration_id="sub-retrying",
+            config={
+                "calendar_sync_started_at": (now - timedelta(hours=2)).isoformat(),
+                "calendar_last_synced_at": (now - timedelta(hours=1)).isoformat(),
+                "calendar_sync_retry_at": (now + timedelta(minutes=45)).isoformat(),
+            },
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.id}/calendar_sync/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        by_id = {row["integration_id"]: row for row in response.json()}
+        self.assertFalse(by_id[synced.id]["is_syncing"])
+        self.assertIsNotNone(by_id[synced.id]["last_synced_at"])
+        self.assertTrue(by_id[syncing.id]["is_syncing"])
+        self.assertFalse(by_id[stale.id]["is_syncing"])
+        self.assertTrue(by_id[retrying.id]["is_syncing"])
+
+    @parameterized.expand(
+        [
+            ("sync_now", {"integration_id": "placeholder"}),
+            (
+                "backfill",
+                {"integration_id": "placeholder", "start_date": "2026-01-01", "end_date": "2026-01-31"},
+            ),
+        ]
+    )
+    def test_sync_actions_404_for_another_teams_integration(self, action: str, payload: dict[str, str]) -> None:
+        self._become_admin()
+        other_team = Team.objects.create(organization=self.organization, name="other")
+        integration = self._create_syncable_integration(team=other_team)
+        payload["integration_id"] = str(integration.id)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/calendar_sync/{action}/",
+            payload,
+        )
+
+        self.assertEqual(status.HTTP_404_NOT_FOUND, response.status_code)
+
+    @parameterized.expand(
+        [
+            ("ownerless", False),
+            ("another_member", True),
+        ]
+    )
+    def test_sync_now_rejects_members_who_do_not_own_the_connection(
+        self, _name: str, create_another_owner: bool
+    ) -> None:
+        creator = (
+            User.objects.create_and_join(self.organization, "calendar-owner@example.com", "test")
+            if create_another_owner
+            else None
+        )
+        integration = Integration.objects.create(
+            team=self.team,
+            kind=Integration.IntegrationKind.GOOGLE_CALENDAR,
+            integration_id=f"sub-{_name}",
+            created_by=creator,
+        )
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/calendar_sync/sync_now/",
+            {"integration_id": integration.id},
+        )
+        self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code)
+
+
+def _immediate_future():
+    async def _done():
+        return None
+
+    return _done()
+
+
+class TestAccountMeetingViewSet(APIBaseTest):
+    def test_list_returns_the_accounts_meetings_newest_first_with_participants(self):
+        account = Account.objects.unscoped().create(team=self.team, name="Acme Corp", external_id="acme-1")
+        other = Account.objects.unscoped().create(team=self.team, name="Other", external_id="other-1")
+        older = Meeting.objects.unscoped().create(
+            team=self.team, account=account, ical_uid="uid-old", start_time="2026-08-01T15:00:00Z", title="Kickoff"
+        )
+        newer = Meeting.objects.unscoped().create(
+            team=self.team, account=account, ical_uid="uid-new", start_time="2026-08-03T15:00:00Z", title="Review"
+        )
+        Meeting.objects.unscoped().create(
+            team=self.team, account=other, ical_uid="uid-other", start_time="2026-08-02T15:00:00Z"
+        )
+        MeetingParticipant.objects.unscoped().create(
+            team=self.team, meeting=newer, email="jane@acme.com", response_status="accepted"
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.id}/accounts/{account.id}/meetings/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        payload = response.json()
+        self.assertEqual(payload["count"], 2)
+        data = payload["results"]
+        self.assertEqual([m["id"] for m in data], [str(newer.id), str(older.id)])
+        self.assertEqual(
+            data[0]["participants"],
+            [
+                {
+                    "email": "jane@acme.com",
+                    "display_name": "",
+                    "response_status": "accepted",
+                    "is_organizer": False,
+                    "person_id": None,
+                }
+            ],
+        )
+
+    @patch("products.customer_analytics.backend.logic.gong.execute_hogql_query")
+    def test_list_includes_the_gong_url_for_a_matching_calendar_event(
+        self, mock_execute_hogql_query: MagicMock
+    ) -> None:
+        account = Account.objects.unscoped().create(team=self.team, name="Acme Corp", external_id="acme-gong")
+        meeting = Meeting.objects.unscoped().create(
+            team=self.team,
+            account=account,
+            ical_uid="calendar-event@google.com",
+            recurrence_instance_id="2026-08-03T15:00:00Z",
+            start_time="2026-08-03T15:00:00Z",
+            title="Review",
+        )
+        source = ExternalDataSource.objects.create(
+            team=self.team,
+            source_id="gong-source",
+            connection_id="gong-connection",
+            status="Completed",
+            source_type="Gong",
+        )
+        table = DataWarehouseTable.objects.create(
+            team=self.team,
+            name="gong_calls",
+            format=DataWarehouseTable.TableFormat.DeltaS3Wrapper,
+            url_pattern="https://example.com/gong_calls/*",
+            external_data_source=source,
+            columns={"calendar_event_id": {}, "url": {}},
+        )
+        ExternalDataSchema.objects.create(
+            team=self.team,
+            source=source,
+            table=table,
+            name="calls",
+            should_sync=True,
+            status="Completed",
+        )
+        mock_execute_hogql_query.return_value.results = [
+            [
+                "calendar-event@google.com_2026-08-03T15:00:00Z",
+                "https://app.gong.io/call?id=123",
+            ]
+        ]
+
+        response = self.client.get(f"/api/environments/{self.team.id}/accounts/{account.id}/meetings/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.json())
+        self.assertEqual(response.json()["results"][0]["id"], str(meeting.id))
+        self.assertEqual(response.json()["results"][0]["gong_url"], "https://app.gong.io/call?id=123")
+
+    @time_machine.travel("2026-08-10T12:00:00Z", tick=False)
+    def test_list_collapses_upcoming_occurrences_of_a_recurring_series(self):
+        account = Account.objects.unscoped().create(team=self.team, name="Acme Corp", external_id="acme-recurring")
+
+        def occurrence(start: str, status: str = "confirmed") -> Meeting:
+            return Meeting.objects.unscoped().create(
+                team=self.team,
+                account=account,
+                ical_uid="uid-weekly",
+                recurrence_instance_id=start,
+                start_time=start,
+                status=status,
+                title="Weekly sync",
+            )
+
+        past_1 = occurrence("2026-08-03T15:00:00Z")
+        past_2 = occurrence("2026-08-06T15:00:00Z")
+        occurrence("2026-08-13T15:00:00Z", status="cancelled")
+        next_up = occurrence("2026-08-20T15:00:00Z")
+        occurrence("2026-08-27T15:00:00Z")
+        one_off = Meeting.objects.unscoped().create(
+            team=self.team, account=account, ical_uid="uid-one-off", start_time="2026-09-01T15:00:00Z"
+        )
+
+        payload = self.client.get(f"/api/environments/{self.team.id}/accounts/{account.id}/meetings/").json()
+
+        self.assertEqual(payload["count"], 4)
+        self.assertEqual(
+            [(m["id"], m["is_recurring"]) for m in payload["results"]],
+            [
+                (str(one_off.id), False),
+                (str(next_up.id), True),
+                (str(past_2.id), True),
+                (str(past_1.id), True),
+            ],
+        )
+
+    def test_search_filters_by_title_or_attendee(self):
+        account = Account.objects.unscoped().create(team=self.team, name="Acme Corp", external_id="acme-2")
+        review = Meeting.objects.unscoped().create(
+            team=self.team, account=account, ical_uid="uid-r", start_time="2026-08-01T15:00:00Z", title="Review"
+        )
+        kickoff = Meeting.objects.unscoped().create(
+            team=self.team, account=account, ical_uid="uid-k", start_time="2026-08-02T15:00:00Z", title="Kickoff"
+        )
+        MeetingParticipant.objects.unscoped().create(team=self.team, meeting=kickoff, email="jane@acme.com")
+
+        endpoint = f"/api/environments/{self.team.id}/accounts/{account.id}/meetings/"
+        by_title = self.client.get(endpoint, {"search": "review"}).json()
+        self.assertEqual([m["id"] for m in by_title["results"]], [str(review.id)])
+        by_attendee = self.client.get(endpoint, {"search": "jane"}).json()
+        self.assertEqual([m["id"] for m in by_attendee["results"]], [str(kickoff.id)])
+
+
+class TestAccountNoteScope(APIBaseTest):
+    """Account notes have their own `account_note` scope, so a scout can be granted notes without the rest of `account`."""
+
+    def setUp(self):
+        super().setUp()
+        self.account = Account.objects.unscoped().create(team=self.team, name="Acme Corp")
+        self.endpoint_base = f"/api/environments/{self.team.id}/accounts/{self.account.id}/notebooks/"
+        self.application = OAuthApplication.objects.create(
+            name="Signals scout sandbox",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            algorithm="RS256",
+            redirect_uris="https://example.com/callback",
+            organization=self.organization,
+            user=self.user,
+        )
+
+    def _authenticate(self, scope: str, *, sandbox_task_id=None) -> None:
+        token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=self.application,
+            token=f"pha_account_note_scope_{uuid4().hex}",
+            scope=scope,
+            expires=timezone.now() + timedelta(hours=1),
+            scoped_teams=[self.team.id],
+            sandbox_task_id=sandbox_task_id,
+        )
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+    def _authenticate_as_scout(self, *, writes: str = "account_note:write", sandbox_task_id=None) -> None:
+        # A real scout token carries the scout marker and `task:write` from the internal scopes.
+        self._authenticate(
+            f"account:read account_note:read {writes} signal_scout_internal:write task:write",
+            sandbox_task_id=sandbox_task_id,
+        )
+
+    def _link_note(self, title: str = "Note", tags: tuple[str, ...] = ()) -> Notebook:
+        notebook = Notebook.objects.create(team=self.team, title=title, visibility=Notebook.Visibility.INTERNAL)
+        ResourceNotebook.objects.create(notebook=notebook, account=self.account)
+        for name in tags:
+            tag, _ = Tag.objects.get_or_create(name=name, team=self.team)
+            TaggedItem.for_content_object(tag, notebook).save()
+        return notebook
+
+    @parameterized.expand(
+        [
+            ("note_scope", "account_note:write", status.HTTP_201_CREATED),
+            # Keys and tokens issued before the split carry `account:write`, which still covers notes.
+            ("legacy_account_scope", "account:write", status.HTTP_201_CREATED),
+            ("read_only", "account_note:read account:read", status.HTTP_403_FORBIDDEN),
+        ]
+    )
+    def test_create_requires_a_note_write_scope(self, _name: str, scope: str, expected: int) -> None:
+        self._authenticate(scope)
+
+        response = self.client.post(self.endpoint_base, {"title": "Kickoff", "text_content": "notes"}, format="json")
+
+        self.assertEqual(expected, response.status_code, response.content)
+
+    def test_note_scope_does_not_reach_the_account_itself(self) -> None:
+        self._authenticate("account:read account_note:write")
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/accounts/{self.account.id}/", {"name": "Renamed"}, format="json"
+        )
+
+        self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code, response.content)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.name, "Acme Corp")
+
+    def test_team_notes_list_takes_the_note_read_scope(self) -> None:
+        self._link_note(title="Visible")
+        self._authenticate("account_note:read")
+
+        response = self.client.get(f"/api/projects/{self.team.id}/account_notes/")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.content)
+        self.assertEqual([row["title"] for row in response.json()["results"]], ["Visible"])
+
+    def test_scout_note_is_tagged_with_the_scout_and_its_skill(self) -> None:
+        with patch("posthog.auth.resolve_scout_client_tag", return_value="scout:billing-watch"):
+            self._authenticate_as_scout(sandbox_task_id=uuid4())
+            response = self.client.post(
+                self.endpoint_base,
+                {"title": "Usage shift", "text_content": "Replay spend doubled", "tags": ["billing-shift"]},
+                format="json",
+            )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.content)
+        self.assertEqual(response.json()["tags"], ["billing-shift", "scout", "scout-billing-watch"])
+
+    def test_scout_skill_tag_drops_the_signals_scout_prefix(self) -> None:
+        # Built-in scouts' skill names all start `signals-scout-`, which would read `scout-signals-scout-...`.
+        with patch("posthog.auth.resolve_scout_client_tag", return_value="scout:signals-scout-billing-watch"):
+            self._authenticate_as_scout(sandbox_task_id=uuid4())
+            response = self.client.post(self.endpoint_base, {"title": "Finding", "text_content": "x"}, format="json")
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.content)
+        self.assertEqual(response.json()["tags"], ["scout", "scout-billing-watch"])
+
+    def test_scout_update_without_tags_leaves_the_tags_alone(self) -> None:
+        notebook = self._link_note(tags=("context-core", "risk"))
+        with patch("posthog.auth.resolve_scout_client_tag", return_value="scout:billing-watch"):
+            self._authenticate_as_scout(sandbox_task_id=uuid4())
+            response = self.client.patch(f"{self.endpoint_base}{notebook.short_id}/", {}, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.content)
+        self.assertEqual(response.json()["tags"], ["context-core", "risk"])
+
+    @parameterized.expand(
+        [
+            ("no_tags", {}, ["scout"]),
+            # DRF coerces a number to a string; the raw request value is an int that tagging cannot handle.
+            ("numeric_tag", {"tags": [123]}, ["123", "scout"]),
+        ]
+    )
+    def test_scout_note_without_a_known_skill_still_gets_the_scout_tag(
+        self, _name: str, extra: dict, expected_tags: list[str]
+    ) -> None:
+        self._authenticate_as_scout()
+
+        response = self.client.post(
+            self.endpoint_base, {"title": "Finding", "text_content": "x", **extra}, format="json"
+        )
+
+        self.assertEqual(status.HTTP_201_CREATED, response.status_code, response.content)
+        self.assertEqual(response.json()["tags"], expected_tags)
+
+    def test_scout_cannot_strip_its_own_tag(self) -> None:
+        notebook = self._link_note(tags=("scout", "scout-billing-watch", "billing-shift"))
+        with patch("posthog.auth.resolve_scout_client_tag", return_value="scout:billing-watch"):
+            self._authenticate_as_scout(sandbox_task_id=uuid4())
+            response = self.client.patch(f"{self.endpoint_base}{notebook.short_id}/", {"tags": []}, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.content)
+        self.assertEqual(response.json()["tags"], ["scout", "scout-billing-watch"])
+
+    def test_scout_cannot_retag_a_note_a_person_wrote(self) -> None:
+        notebook = self._link_note(tags=("context-core", "risk"))
+        with patch("posthog.auth.resolve_scout_client_tag", return_value="scout:billing-watch"):
+            self._authenticate_as_scout(sandbox_task_id=uuid4())
+            response = self.client.patch(
+                f"{self.endpoint_base}{notebook.short_id}/", {"tags": ["billing-shift"]}, format="json"
+            )
+
+        self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code, response.content)
+        self.assertEqual(sorted(notebook.tagged_items.values_list("tag__name", flat=True)), ["context-core", "risk"])
+
+    def test_a_person_can_remove_the_scout_tag(self) -> None:
+        notebook = self._link_note(tags=("scout", "billing-shift"))
+
+        response = self.client.patch(f"{self.endpoint_base}{notebook.short_id}/", {"tags": ["reviewed"]}, format="json")
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.content)
+        self.assertEqual(response.json()["tags"], ["reviewed"])
+
+    def test_scout_cannot_delete_a_note(self) -> None:
+        notebook = self._link_note()
+        self._authenticate_as_scout()
+
+        response = self.client.delete(f"{self.endpoint_base}{notebook.short_id}/")
+
+        self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code, response.content)
+        self.assertTrue(Notebook.objects.filter(id=notebook.id, deleted=False).exists())
+
+    def test_a_person_can_still_delete_a_note(self) -> None:
+        notebook = self._link_note()
+
+        response = self.client.delete(f"{self.endpoint_base}{notebook.short_id}/")
+
+        self.assertEqual(status.HTTP_204_NO_CONTENT, response.status_code, response.content)

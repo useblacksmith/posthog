@@ -1,0 +1,527 @@
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, cast
+from uuid import UUID
+
+from django.db import connection, models, transaction
+
+import structlog
+
+from posthog.hogql.database.models import (
+    BooleanDatabaseField,
+    DateDatabaseField,
+    DateTimeDatabaseField,
+    DecimalDatabaseField,
+    FieldOrTable,
+    FloatArrayDatabaseField,
+    FloatDatabaseField,
+    IntegerDatabaseField,
+    MapStringDatabaseField,
+    StringDatabaseField,
+    TableNode,
+)
+
+from posthog.exceptions_capture import capture_exception
+from posthog.models.utils import CreatedMetaFields, UpdatedMetaFields, UUIDTModel, sane_repr
+
+from products.data_modeling.backend.facade.managed_viewset_hooks import get_expected_views_provider
+from products.data_modeling.backend.facade.system_tables import DATA_MODELING_ALLOWED_SYSTEM_TABLES
+from products.data_modeling.backend.logic.incremental import clear_incremental_state, parse_incremental_config
+from products.data_modeling.backend.models.dag import DAG
+from products.data_modeling.backend.models.datawarehouse_saved_query import DataWarehouseSavedQuery
+from products.data_modeling.backend.models.edge import Edge
+from products.data_modeling.backend.models.node import Node
+from products.revenue_analytics.backend.views.schemas import SCHEMAS as REVENUE_ANALYTICS_SCHEMAS
+from products.warehouse_sources.backend.facade.types import DataWarehouseManagedViewSetKind
+
+if TYPE_CHECKING:
+    from posthog.hogql.database.database import Database
+
+    from products.data_modeling.backend.facade.contracts import SavedQueryNodeState
+
+logger = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ExpectedView:
+    name: str
+    query: dict[str, Any]
+    columns: dict[str, dict[str, Any]]
+    # Materialized views get a sync schedule. A non-materialized view (e.g. engineering
+    # analytics) is computed at query time — no schedule, no S3 table.
+    materialized: bool
+    sync_frequency: timedelta
+    incremental_config: dict[str, Any] | None
+
+
+class DataWarehouseManagedViewSet(CreatedMetaFields, UpdatedMetaFields, UUIDTModel):
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+")
+    kind = models.CharField(max_length=64, choices=DataWarehouseManagedViewSetKind.choices)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["team", "kind"],
+                name="datawarehouse_unique_managed_viewset_team_kind",
+            )
+        ]
+        db_table = "posthog_datawarehousemanagedviewset"
+
+    class UnsupportedViewsetKind(ValueError):
+        kind: DataWarehouseManagedViewSetKind
+
+        def __init__(self, kind: DataWarehouseManagedViewSetKind):
+            self.kind = kind
+            super().__init__(f"Unsupported viewset kind: {self.kind}")
+
+    def __str__(self) -> str:
+        return f"DataWarehouseManagedViewSet({self.kind}) for Team {self.team.id}"
+
+    __repr__ = sane_repr("team", "kind")
+
+    def sync_views(self) -> None:
+        """
+        Syncs the views for the managed viewset.
+
+        Updates managed_viewset_id on all created/updated views.
+        Deletes views that are no longer referenced.
+        Materializes views by default.
+        """
+        # Deferred: schedule_reconcile pulls in temporalio; a module-level import would drag it onto django.setup()
+        from products.data_modeling.backend.logic.node_frequency import node_states_by_saved_query  # noqa: PLC0415
+        from products.data_modeling.backend.logic.saved_query_dag_sync import sync_saved_query_to_dag  # noqa: PLC0415
+        from products.data_modeling.backend.logic.schedule_reconcile import (  # noqa: PLC0415 keeps temporalio off django.setup()
+            apply_managed_view_frequency_targets,
+            maybe_reconcile_dag,
+        )
+
+        provider = get_expected_views_provider(self.kind)
+        if provider is None:
+            raise DataWarehouseManagedViewSet.UnsupportedViewsetKind(cast(DataWarehouseManagedViewSetKind, self.kind))
+
+        expected_views = [
+            ExpectedView(
+                name=view.name,
+                query={"kind": "HogQLQuery", "query": view.query},
+                columns=self._get_columns_from_fields(view.fields),
+                materialized=view.materialized,
+                sync_frequency=view.sync_frequency,
+                incremental_config=view.incremental_config,
+            )
+            for view in provider(self.team)
+        ]
+
+        # NOTE: Views that depend on other views MUST be placed AFTER the views they depend on
+        # or else we'll fail to build the paths properly.
+        expected_view_names = [view.name for view in expected_views]
+
+        # Pre-compute external_tables OUTSIDE the transaction. get_s3_tables is expensive:
+        # it builds a HogQL Database context, parses, and resolves each query. Doing
+        # this inside the transaction held row locks for seconds across all 6 views.
+        # Build the database once and reuse it for all views.
+        from posthog.hogql.database.database import Database
+
+        # Internal managed-view construction (no user); bypass warehouse HogQL access control.
+        database = Database.create_for(
+            self.team.pk,
+            bypass_warehouse_access_control=True,
+            allowed_system_tables=DATA_MODELING_ALLOWED_SYSTEM_TABLES,
+        )
+        external_tables_by_view: dict[str, list] = {}
+        for view in expected_views:
+            temp_sq = DataWarehouseSavedQuery(
+                name=view.name,
+                team=self.team,
+                query=view.query,
+                columns=view.columns,
+            )
+            try:
+                external_tables_by_view[view.name] = temp_sq.get_s3_tables(database=database)
+            except Exception as e:
+                capture_exception(e, {"view_name": view.name, "team_id": self.team.pk})
+                logger.warning(
+                    "failed_to_compute_s3_tables",
+                    team_id=self.team_id,
+                    view_name=view.name,
+                    error=str(e),
+                )
+                external_tables_by_view[view.name] = []
+            # Eligibility must see updated upstream definitions, even before this batch is saved.
+            database.tables.add_child(
+                TableNode.create_nested_for_chain(view.name.split("."), table=temp_sq.hogql_definition()),
+                table_conflict_mode="override",
+            )
+
+        incremental_config_by_view = {
+            view.name: self._eligible_incremental_config(view, database) for view in expected_views
+        }
+
+        views_created = 0
+        views_updated = 0
+        views_unchanged = 0
+        saved_queries_to_sync: list[DataWarehouseSavedQuery] = []
+        frequency_targets: dict[str, timedelta | None] = {}
+        orphaned_views_to_revert: list[DataWarehouseSavedQuery] = []
+        redefined_ids: set[UUID] = set()
+
+        # Keep this transaction short: persist DB changes only. The post-commit work
+        # (schedule_materialization → Temporal RPCs,
+        # and orphan revert_materialization) runs outside the atomic block so row
+        # locks on posthog_datawarehousesavedquery aren't held across synchronous
+        # Temporal RPCs.
+        with transaction.atomic():
+            # Serialize concurrent sync_views calls for the same team+kind to prevent
+            # deadlocks when multiple data source schemas complete simultaneously and
+            # each tries to update the same set of saved queries.
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s)::bigint)",
+                    [f"{self.team_id}_sync_views_{self.kind}"],
+                )
+
+            # Read under the lock, so a row a concurrent sync just created is seen as stored.
+            stored_views = {saved_query.name: saved_query for saved_query in self.saved_queries.exclude(deleted=True)}
+            node_states = node_states_by_saved_query(self.team_id, [v.id for v in stored_views.values()])
+
+            for view in expected_views:
+                stored_view = stored_views.get(view.name)
+                created = stored_view is None
+                if stored_view is None:
+                    saved_query = DataWarehouseSavedQuery(
+                        name=view.name,
+                        team=self.team,
+                        managed_viewset=self,
+                        origin=DataWarehouseSavedQuery.Origin.MANAGED_VIEWSET,
+                    )
+                elif self._stores_view(
+                    stored_view,
+                    view,
+                    external_tables_by_view[view.name],
+                    incremental_config_by_view[view.name],
+                    node_states.get(str(stored_view.id)),
+                ):
+                    # Most syncs follow a load that changed nothing: no write, no DAG or schedule work.
+                    views_unchanged += 1
+                    continue
+                else:
+                    saved_query = stored_view
+                    if saved_query.query != view.query:
+                        redefined_ids.add(saved_query.id)
+
+                # Do NOT use get_columns because it runs the query, and these are possibly heavy
+                saved_query.query = view.query
+                saved_query.set_columns(view.columns)
+                saved_query.external_tables = external_tables_by_view[view.name]
+                saved_query.is_materialized = view.materialized
+                # The cadence goes straight onto the DAG node below, not through this one-shot field.
+                saved_query.sync_frequency_interval = None
+                saved_query.incremental_config = incremental_config_by_view[view.name]
+
+                if created:
+                    saved_query.save()
+                else:
+                    # Only the columns this sync sets. A materialization run writes incremental_state
+                    # concurrently, and a whole-row save would put the stale copy read above back.
+                    saved_query.save(
+                        update_fields=[
+                            "query",
+                            "columns",
+                            "column_order",
+                            "external_tables",
+                            "is_materialized",
+                            "sync_frequency_interval",
+                            "incremental_config",
+                            "updated_at",
+                        ]
+                    )
+                saved_queries_to_sync.append(saved_query)
+                # A non-materialized view is computed at query time, so it has no cadence and no schedule.
+                frequency_targets[str(saved_query.id)] = view.sync_frequency if view.materialized else None
+
+                if created:
+                    views_created += 1
+                else:
+                    views_updated += 1
+
+            orphaned_views_to_revert = [
+                saved_query for name, saved_query in stored_views.items() if name not in expected_view_names
+            ]
+
+            # In the transaction that writes the new queries, so a failure rolls the redefinition back
+            # and the next sync retries it. The edges are the ones from before this sync, which still
+            # reach every view whose stored rows came from the old upstream.
+            self._rebuild_downstream_of(DAG.get_or_create_default(self.team), redefined_ids)
+
+        # No cross-call advisory lock here on purpose: a SESSION-level pg_advisory_lock acquired and
+        # released across separate autocommit statements leaks under transaction-mode PgBouncer — the
+        # unlock can be routed to a different backend than the one that holds the lock, stranding it
+        # and eventually exhausting the connection pool. Concurrent sync_views for the same team+kind
+        # can therefore race on node/edge placement; that is tolerated for now, pending a pooling-safe
+        # guard. The transaction-scoped lock above still serializes the saved-query writes.
+        dag = DAG.get_or_create_default(self.team)
+        if saved_queries_to_sync:
+            dag_database = Database.create_for(
+                team=self.team,
+                bypass_warehouse_access_control=True,
+                allowed_system_tables=DATA_MODELING_ALLOWED_SYSTEM_TABLES,
+            )
+            for saved_query in saved_queries_to_sync:
+                try:
+                    # reconcile once after both loops, not once per view
+                    sync_saved_query_to_dag(saved_query, reconcile=False, database=dag_database)
+                except Exception as e:
+                    capture_exception(e, {"managed_viewset_id": self.id, "view_name": saved_query.name})
+                    logger.warning(
+                        "failed_to_sync_managed_view_to_dag",
+                        team_id=self.team_id,
+                        view_name=saved_query.name,
+                        error=str(e),
+                    )
+            try:
+                # After every node exists, so the whole batch lands together.
+                apply_managed_view_frequency_targets(self.team_id, frequency_targets)
+            except Exception as e:
+                capture_exception(e, {"managed_viewset_id": self.id})
+                logger.warning("failed_to_apply_managed_view_cadences", team_id=self.team_id, error=str(e))
+
+        for saved_query in saved_queries_to_sync:
+            if not saved_query.is_materialized:
+                continue
+            try:
+                # Carries no interval, so this only puts a brand-new DAG onto cadence tiers.
+                saved_query.schedule_materialization(reconcile=False)
+            except Exception as e:
+                capture_exception(e, {"managed_viewset_id": self.id, "view_name": saved_query.name})
+                logger.warning(
+                    "failed_to_schedule_managed_view",
+                    team_id=self.team_id,
+                    view_name=saved_query.name,
+                    error=str(e),
+                )
+
+        if saved_queries_to_sync:
+            maybe_reconcile_dag(dag)
+
+        views_deleted = 0
+        for orphaned_view in orphaned_views_to_revert:
+            try:
+                # Unconditional on purpose: revert_materialization is idempotent for a
+                # never-materialized view (no table to drop; schedule deletion swallows NOT_FOUND),
+                # and skipping it on a heuristic can strand the Temporal schedule of a view whose
+                # materialization failed midway (is_materialized already reset to False).
+                orphaned_view.revert_materialization()
+                orphaned_view.soft_delete()
+                views_deleted += 1
+            except Exception as e:
+                capture_exception(e, {"managed_viewset_id": self.id, "view_name": orphaned_view.name})
+                logger.warning(
+                    "failed_to_delete_orphaned_view",
+                    team_id=self.team_id,
+                    view_name=orphaned_view.name,
+                    error=str(e),
+                )
+
+        logger.info(
+            "sync_views_completed",
+            team_id=self.team_id,
+            kind=self.kind,
+            views_created=views_created,
+            views_updated=views_updated,
+            views_unchanged=views_unchanged,
+            views_deleted=views_deleted,
+        )
+
+    def delete_with_views(self) -> int:
+        """
+        Delete the managed viewset and soft delete all related views.
+        Reverts materialization for each view before soft deletion.
+        Returns the number of views deleted.
+        """
+        related_views = self.saved_queries.exclude(deleted=True)
+
+        views_deleted = 0
+        with transaction.atomic():
+            for view in related_views:
+                try:
+                    view.revert_materialization()
+                    view.soft_delete()
+                    views_deleted += 1
+                except Exception as e:
+                    logger.warning(
+                        "failed_to_delete_managed_view",
+                        team_id=self.team_id,
+                        view_name=view.name,
+                        error=str(e),
+                    )
+
+                    capture_exception(e, {"managed_viewset_id": self.id, "view_name": view.name})
+
+            logger.info(
+                "managed_viewset_deleted_with_views",
+                team_id=self.team_id,
+                kind=self.kind,
+                views_deleted=views_deleted,
+            )
+
+            self.delete()
+        return views_deleted
+
+    def to_saved_query_metadata(self, name: str) -> dict[str, Any]:
+        # Called from DataWarehouseSavedQuery.hogql_definition for every managed view, so it must
+        # degrade gracefully for any kind rather than raise — an unhandled kind here would break
+        # resolving the saved query. Only revenue analytics carries the extra per-schema kind.
+        if self.kind != DataWarehouseManagedViewSetKind.REVENUE_ANALYTICS:
+            return {"managed_viewset_kind": self.kind}
+
+        return {
+            "managed_viewset_kind": self.kind,
+            "revenue_analytics_kind": next(
+                (
+                    schema.kind
+                    for schema in REVENUE_ANALYTICS_SCHEMAS.values()
+                    if name.endswith(schema.events_suffix) or name.endswith(schema.source_suffix)
+                ),
+                None,
+            ),
+        }
+
+    @staticmethod
+    def _stores_view(
+        saved_query: DataWarehouseSavedQuery,
+        view: ExpectedView,
+        external_tables: list[str],
+        incremental_config: dict[str, Any] | None,
+        node_state: "SavedQueryNodeState | None",
+    ) -> bool:
+        """Whether this sync's writes for ``view`` would leave ``saved_query`` and its DAG cadence as they are.
+
+        Covers each field the sync writes and the cadence it stores on the DAG node. A view without a
+        node is not stored: its DAG placement failed earlier and the sync repairs it.
+        """
+        return (
+            node_state is not None
+            and node_state.declared_target == (view.sync_frequency if view.materialized else None)
+            and saved_query.query == view.query
+            and saved_query.stores_columns(view.columns)
+            and set(saved_query.external_tables or []) == set(external_tables)
+            and saved_query.is_materialized == view.materialized
+            and saved_query.sync_frequency_interval is None
+            and saved_query.incremental_config == incremental_config
+        )
+
+    def _rebuild_downstream_of(self, dag: DAG, redefined_ids: set[UUID]) -> None:
+        """Clear the watermark of every incremental view downstream of a redefined view.
+
+        A view's own definition fingerprint resets its watermark when its query changes, but not when
+        an upstream query changes. Its stored rows came from the old upstream, so it must rebuild.
+        """
+        if not redefined_ids:
+            return
+        children: dict[UUID, list[UUID]] = defaultdict(list)
+        for source_id, target_id in Edge.objects.filter(team_id=self.team_id, dag=dag).values_list(
+            "source_id", "target_id"
+        ):
+            children[source_id].append(target_id)
+        frontier = list(
+            Node.objects.filter(team_id=self.team_id, dag=dag, saved_query_id__in=redefined_ids).values_list(
+                "id", flat=True
+            )
+        )
+        reached: set[UUID] = set()
+        while frontier:
+            for child in children[frontier.pop()]:
+                if child not in reached:
+                    reached.add(child)
+                    frontier.append(child)
+        downstream = DataWarehouseSavedQuery.objects.filter(
+            team_id=self.team_id,
+            id__in=Node.objects.filter(id__in=reached).values("saved_query_id"),
+            deleted=False,
+        )
+        for saved_query in downstream:
+            if saved_query.incremental_state:
+                clear_incremental_state(saved_query)
+
+    def _eligible_incremental_config(self, view: ExpectedView, database: "Database") -> dict[str, Any] | None:
+        """The provider's incremental config, or None when the query cannot carry it.
+
+        The API runs this check before it saves a config. Without it a key the query does not
+        output only fails on the second run, and every later run alternates a rebuild and a failure.
+        """
+        from products.data_modeling.backend.logic.incremental_eligibility import (  # noqa: PLC0415 keeps posthog.schema off django.setup()
+            check_incremental_eligibility,
+        )
+
+        if view.incremental_config is None or not view.materialized:
+            return None
+        config = parse_incremental_config(view.incremental_config)
+        if config is None:
+            logger.warning("managed_view_incremental_config_malformed", team_id=self.team_id, view_name=view.name)
+            return None
+        result = check_incremental_eligibility(view.query["query"], config, database=database)
+        if not result.eligible:
+            logger.warning(
+                "managed_view_not_incremental",
+                team_id=self.team_id,
+                view_name=view.name,
+                blockers=result.blockers,
+            )
+            return None
+        return view.incremental_config
+
+    @staticmethod
+    def _get_columns_from_fields(fields: dict[str, FieldOrTable]) -> dict[str, dict[str, Any]]:
+        return {
+            field_name: {
+                "hogql": type(field_obj).__name__,
+                "clickhouse": DataWarehouseManagedViewSet._get_clickhouse_type(field_obj),
+                "valid": True,
+            }
+            for field_name, field_obj in fields.items()
+        }
+
+    @staticmethod
+    def _get_clickhouse_type(field) -> str:
+        """Convert HogQL field type to ClickHouse type string."""
+
+        # NOTE: This function has a really bad smell
+        # These types won't usually map appropriately because it's hard to predict what Clickhouse is actually storing
+        # but we need these to exist if we want the `SavedQuery` to be saved correctly.
+        # We do NOT use these types extensively so it's not a big deal if they aren't 100% accurate,
+        # but we should be mindful of this function and consider removing the need for it in the future.
+        #
+        # If the types here prove to be wrong, we can easily run the following script to update the types:
+        # ```python
+        # from products.data_modeling.backend.models.datawarehouse_managed_viewset import DataWarehouseManagedViewSet
+        # for viewset in DataWarehouseManagedViewSet.objects.iterator():
+        #     viewset.sync_views()
+        # ```
+
+        # ClickHouse rejects Nullable() around Array and Map, so these return before the nullable wrap.
+        if isinstance(field, FloatArrayDatabaseField):
+            return "Array(Float64)"
+        if isinstance(field, MapStringDatabaseField):
+            return "Map(String, String)"
+
+        if isinstance(field, StringDatabaseField):
+            type = "String"
+        elif isinstance(field, IntegerDatabaseField):
+            type = "Int64"
+        elif isinstance(field, FloatDatabaseField):
+            type = "Float64"
+        elif isinstance(field, DecimalDatabaseField):
+            type = "Decimal64(10)"
+        elif isinstance(field, DateTimeDatabaseField):
+            type = "DateTime64(6, 'UTC')"
+        elif isinstance(field, BooleanDatabaseField):
+            type = "Boolean"
+        elif isinstance(field, DateDatabaseField):
+            type = "Date"
+        else:
+            type = "String"
+
+        if field.is_nullable():
+            type = f"Nullable({type})"
+
+        return type

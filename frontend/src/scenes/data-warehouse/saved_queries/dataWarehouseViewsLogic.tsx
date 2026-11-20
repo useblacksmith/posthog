@@ -1,0 +1,1002 @@
+import { MakeLogicType, actions, connect, events, kea, listeners, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { router } from 'kea-router'
+import posthog from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import api, { ApiConfig } from 'lib/api'
+import { isUnavailableEndpointError } from 'lib/api-error'
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
+import { databaseTableListLogic } from 'scenes/data-management/database/databaseTableListLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import {
+    DataModelingSyncInterval,
+    DataWarehouseSavedQuery,
+    DataWarehouseSavedQueryFolder,
+    DataWarehouseSavedQueryIncremental,
+} from '~/types'
+
+import { dataModelingNodesLineageRetrieve } from 'products/data_modeling/frontend/generated/api'
+import type { LineageResponseApi, NodeApi } from 'products/data_modeling/frontend/generated/api.schemas'
+import {
+    warehouseSavedQueriesList,
+    warehouseSavedQueriesMaterializeCreate,
+    warehouseSavedQueriesPartialUpdate,
+} from 'products/data_warehouse/frontend/generated/api'
+
+import type { DatabaseSchemaViewTable } from '../../../queries/schema/schema-general'
+import type { UserType } from '../../../types'
+import {
+    BreakingColumnChangeDeclinedError,
+    confirmBreakingColumnChange,
+    getBreakingColumnChange,
+} from '../editor/BreakingColumnChangeDialog'
+
+// Materialization is async: enabling it flips `is_materialized` either synchronously (the
+// /materialize action) or later, when the Temporal job runs (scheduled sync frequency). After
+// kicking it off we reload the saved-query list a few times so the sidebar reflects the settled
+// state without a manual refresh, then stop.
+const MATERIALIZATION_POLL_INTERVAL_MS = 5000
+
+// The catalog keys views by name, so only an added, removed or renamed view needs a catalog refresh.
+function savedQueryCatalogKey(views: DataWarehouseSavedQuerySummary[]): string {
+    return views
+        .map((view) => `${view.id}:${view.name}`)
+        .sort()
+        .join('\n')
+}
+const MATERIALIZATION_POLL_MAX_ATTEMPTS = 12
+
+/** Mirrors the server's default for the materialize action, so the picker opens on what it would pick. */
+export const DEFAULT_MATERIALIZE_SYNC_FREQUENCY: DataModelingSyncInterval = '24hour'
+
+export type DataWarehouseSavedQuerySummary = Omit<DataWarehouseSavedQuery, 'columns' | 'query'>
+
+export type DataWarehouseSavedQueryDownstreamReference = Pick<NodeApi, 'id' | 'name' | 'type'>
+
+export interface DataWarehouseSavedQueryDownstreamReferenceState {
+    error: boolean
+    loading: boolean
+    references: DataWarehouseSavedQueryDownstreamReference[]
+}
+
+function getDataWarehouseSavedQueryDownstreamReferences(
+    lineage: LineageResponseApi,
+    viewId: string
+): DataWarehouseSavedQueryDownstreamReference[] {
+    const source = lineage.nodes.find((node) => node.saved_query_id === viewId)
+    if (!source) {
+        return []
+    }
+
+    const downstreamBySource = new Map<string, string[]>()
+    for (const edge of lineage.edges) {
+        downstreamBySource.set(edge.source_id, [...(downstreamBySource.get(edge.source_id) ?? []), edge.target_id])
+    }
+
+    const downstreamIds = new Set<string>([source.id])
+    const queue = [source.id]
+    while (queue.length > 0) {
+        const currentId = queue.shift()!
+        for (const downstreamId of downstreamBySource.get(currentId) ?? []) {
+            if (!downstreamIds.has(downstreamId)) {
+                downstreamIds.add(downstreamId)
+                queue.push(downstreamId)
+            }
+        }
+    }
+
+    return lineage.nodes
+        .filter((node) => node.id !== source.id && downstreamIds.has(node.id))
+        .map(({ id, name, type }) => ({ id, name, type }))
+}
+
+export interface DataWarehouseSavedQueryUpdate extends Partial<DataWarehouseSavedQuery> {
+    id: string
+    types?: string[][]
+    sync_frequency?: string
+    lifecycle?: string
+    shouldRematerialize?: boolean
+    edited_history_id?: string
+    folder_id?: string | null
+    soft_update?: boolean
+    acknowledge_breaking_changes?: boolean
+}
+
+export async function renameDataWarehouseSavedQuery(viewId: string, name: string): Promise<void> {
+    await warehouseSavedQueriesPartialUpdate(String(ApiConfig.getCurrentTeamId()), viewId, { name })
+}
+
+// A plain function, not a logic action: the toast that calls it can outlive the logic, and an
+// unmounted logic has no listeners.
+async function openViewPage(viewId: string): Promise<void> {
+    // The view page is keyed by the data modeling node, and the saved query response carries no node id.
+    let nodeId: string | undefined
+    try {
+        const lineage = await dataModelingNodesLineageRetrieve(String(ApiConfig.getCurrentTeamId()), {
+            saved_query_id: viewId,
+        })
+        nodeId = lineage.nodes.find((node) => node.saved_query_id === viewId)?.id
+    } catch {
+        // A view with no node still opens in the SQL editor.
+    }
+    posthog.capture('view page opened from created toast', { destination: nodeId ? 'model' : 'sql_editor' })
+    router.actions.push(nodeId ? urls.nodeDetail(nodeId) : urls.sqlEditor({ view_id: viewId }))
+}
+
+function goToViewButton(viewId: string): { label: string; action: () => Promise<void> } {
+    return {
+        label: 'Go to view',
+        action: () => openViewPage(viewId),
+    }
+}
+
+function showViewCreatedToast(
+    viewId: string,
+    viewName: string | null | undefined,
+    materialized: boolean = false
+): void {
+    lemonToast.success(`${viewName ?? 'View'} successfully created${materialized ? ' and materialized' : ''}`, {
+        button: goToViewButton(viewId),
+    })
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface dataWarehouseViewsLogicValues {
+    databaseLoading: boolean // databaseTableListLogic
+    views: DatabaseSchemaViewTable[] // databaseTableListLogic
+    user: UserType | null // userLogic
+    dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]
+    dataWarehouseSavedQueriesFailed: boolean
+    dataWarehouseSavedQueriesLoaded: boolean
+    dataWarehouseSavedQueriesLoading: boolean
+    dataWarehouseSavedQueryDownstreamReferences: Record<string, DataWarehouseSavedQueryDownstreamReferenceState>
+    dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[]
+    dataWarehouseSavedQueryFoldersById: Record<string, DataWarehouseSavedQueryFolder>
+    dataWarehouseSavedQueryFoldersLoading: boolean
+    dataWarehouseSavedQueryMap: Record<string, DataWarehouseSavedQuerySummary>
+    dataWarehouseSavedQueryMapById: Record<string, DataWarehouseSavedQuerySummary>
+    dataWarehouseSavedQueryMapByIdStringMap: Record<string, DataWarehouseSavedQuerySummary>
+    initialDataWarehouseSavedQueryLoading: boolean
+    materializationAction: null
+    materializationActionLoading: boolean
+    materializingViewIds: string[]
+    shouldShowEmptyState: boolean
+    updatingDataWarehouseSavedQuery: boolean
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface dataWarehouseViewsLogicActions {
+    refreshDatabaseSchema: () => {
+        value: true
+    } // databaseTableListLogic
+    addMaterializingViews: (viewIds: string[]) => {
+        viewIds: string[]
+    }
+    cancelDataWarehouseSavedQuery: (viewId: string) => {
+        viewId: string
+    }
+    cancelDataWarehouseSavedQueryFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    cancelDataWarehouseSavedQuerySuccess: (
+        materializationAction: null,
+        payload?: {
+            viewId: string
+        }
+    ) => {
+        materializationAction: null
+        payload?: {
+            viewId: string
+        }
+    }
+    clearMaterializingView: (viewId: string) => {
+        viewId: string
+    }
+    createDataWarehouseSavedQuery: (
+        payload: Partial<DataWarehouseSavedQuery> & {
+            // The caller must then pass the view name to `materializeDataWarehouseSavedQuery`, which shows the toast.
+            deferCreatedToast?: boolean
+            folder_id?: string | null
+            types: string[][]
+        }
+    ) => Partial<DataWarehouseSavedQuery> & {
+        types: string[][]
+        folder_id?: string | null
+        deferCreatedToast?: boolean
+    }
+    createDataWarehouseSavedQueryFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    createDataWarehouseSavedQueryFolder: (name: string) => string
+    createDataWarehouseSavedQueryFolderFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    createDataWarehouseSavedQueryFolderSuccess: (
+        dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[],
+        payload?: string
+    ) => {
+        dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[]
+        payload?: string
+    }
+    createDataWarehouseSavedQuerySuccess: (
+        dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[],
+        payload?: Partial<DataWarehouseSavedQuery> & {
+            types: string[][]
+            folder_id?: string | null
+            deferCreatedToast?: boolean
+        }
+    ) => {
+        dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]
+        payload?: Partial<DataWarehouseSavedQuery> & {
+            types: string[][]
+            folder_id?: string | null
+            deferCreatedToast?: boolean
+        }
+    }
+    deleteDataWarehouseSavedQuery: (viewId: string) => string
+    deleteDataWarehouseSavedQueryFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    deleteDataWarehouseSavedQueryFolder: (folderId: string) => string
+    deleteDataWarehouseSavedQueryFolderFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    deleteDataWarehouseSavedQueryFolderSuccess: (
+        dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[],
+        payload?: string
+    ) => {
+        dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[]
+        payload?: string
+    }
+    deleteDataWarehouseSavedQuerySuccess: (
+        dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[],
+        payload?: string
+    ) => {
+        dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]
+        payload?: string
+    }
+    loadDataWarehouseSavedQueries: () => any
+    loadDataWarehouseSavedQueriesFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadDataWarehouseSavedQueriesSuccess: (
+        dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[],
+        payload?: any
+    ) => {
+        dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]
+        payload?: any
+    }
+    loadDataWarehouseSavedQueryDownstreamReferences: (viewId: string) => {
+        viewId: string
+    }
+    loadDataWarehouseSavedQueryDownstreamReferencesFailure: (viewId: string) => {
+        viewId: string
+    }
+    loadDataWarehouseSavedQueryDownstreamReferencesSuccess: (
+        viewId: string,
+        references: DataWarehouseSavedQueryDownstreamReference[]
+    ) => {
+        references: DataWarehouseSavedQueryDownstreamReference[]
+        viewId: string
+    }
+    loadDataWarehouseSavedQueryFolders: () => any
+    loadDataWarehouseSavedQueryFoldersFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadDataWarehouseSavedQueryFoldersSuccess: (
+        dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[],
+        payload?: any
+    ) => {
+        dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[]
+        payload?: any
+    }
+    materializationChanged: (viewId: string) => {
+        viewId: string
+    }
+    materializeDataWarehouseSavedQuery: (
+        viewId: string,
+        syncFrequency?: DataModelingSyncInterval,
+        incremental?: DataWarehouseSavedQueryIncremental | null,
+        createdViewName?: string
+    ) => {
+        createdViewName: string | undefined
+        incremental: DataWarehouseSavedQueryIncremental | null | undefined
+        syncFrequency: DataModelingSyncInterval | undefined
+        viewId: string
+    }
+    materializeDataWarehouseSavedQueryFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    materializeDataWarehouseSavedQuerySuccess: (
+        materializationAction: null,
+        payload?: {
+            createdViewName: string | undefined
+            incremental: DataWarehouseSavedQueryIncremental | null | undefined
+            syncFrequency: DataModelingSyncInterval | undefined
+            viewId: string
+        }
+    ) => {
+        materializationAction: null
+        payload?: {
+            createdViewName: string | undefined
+            incremental: DataWarehouseSavedQueryIncremental | null | undefined
+            syncFrequency: DataModelingSyncInterval | undefined
+            viewId: string
+        }
+    }
+    refreshAfterWindowFocus: () => {
+        value: true
+    }
+    revertMaterialization: (viewId: string) => {
+        viewId: string
+    }
+    revertMaterializationFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    revertMaterializationSuccess: (
+        materializationAction: null,
+        payload?: {
+            viewId: string
+        }
+    ) => {
+        materializationAction: null
+        payload?: {
+            viewId: string
+        }
+    }
+    runDataWarehouseSavedQuery: (
+        viewId: string,
+        fullRefresh?: boolean
+    ) => {
+        fullRefresh: boolean | undefined
+        viewId: string
+    }
+    runDataWarehouseSavedQueryFailure: (viewId: string) => {
+        viewId: string
+    }
+    runDataWarehouseSavedQuerySuccess: (viewId: string) => {
+        viewId: string
+    }
+    updateDataWarehouseSavedQuery: (view: DataWarehouseSavedQueryUpdate) => DataWarehouseSavedQueryUpdate
+    updateDataWarehouseSavedQueryFailed: (viewId: string) => {
+        viewId: string
+    }
+    updateDataWarehouseSavedQueryFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    updateDataWarehouseSavedQueryFolder: ({ id, name }: { id: string; name: string }) => {
+        id: string
+        name: string
+    }
+    updateDataWarehouseSavedQueryFolderFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    updateDataWarehouseSavedQueryFolderSuccess: (
+        dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[],
+        payload?: {
+            id: string
+            name: string
+        }
+    ) => {
+        dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[]
+        payload?: {
+            id: string
+            name: string
+        }
+    }
+    updateDataWarehouseSavedQuerySuccess: (
+        dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[],
+        payload?: DataWarehouseSavedQueryUpdate
+    ) => {
+        dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]
+        payload?: DataWarehouseSavedQueryUpdate
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface dataWarehouseViewsLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        shouldShowEmptyState: (views: DatabaseSchemaViewTable[], databaseLoading: boolean) => boolean
+        dataWarehouseSavedQueryMapById: (
+            dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]
+        ) => Record<string, DataWarehouseSavedQuerySummary>
+        dataWarehouseSavedQueryMapByIdStringMap: (
+            dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]
+        ) => Record<string, DataWarehouseSavedQuerySummary>
+        dataWarehouseSavedQueryMap: (
+            dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]
+        ) => Record<string, DataWarehouseSavedQuerySummary>
+        dataWarehouseSavedQueryFoldersById: (
+            dataWarehouseSavedQueryFolders: DataWarehouseSavedQueryFolder[]
+        ) => Record<string, DataWarehouseSavedQueryFolder>
+    }
+}
+
+export type dataWarehouseViewsLogicType = MakeLogicType<
+    dataWarehouseViewsLogicValues,
+    dataWarehouseViewsLogicActions,
+    Record<string, any>,
+    dataWarehouseViewsLogicMeta
+>
+
+export const dataWarehouseViewsLogic = kea<dataWarehouseViewsLogicType>([
+    path(['scenes', 'warehouse', 'dataWarehouseSavedQueriesLogic']),
+    connect(() => ({
+        values: [userLogic, ['user'], databaseTableListLogic, ['views', 'databaseLoading']],
+        actions: [databaseTableListLogic, ['refreshDatabaseSchema']],
+    })),
+    reducers({
+        initialDataWarehouseSavedQueryLoading: [
+            true,
+            {
+                loadDataWarehouseSavedQueriesSuccess: () => false,
+                loadDataWarehouseSavedQueriesFailure: () => false,
+            },
+        ],
+        dataWarehouseSavedQueriesLoaded: [
+            false,
+            {
+                loadDataWarehouseSavedQueriesSuccess: () => true,
+                loadDataWarehouseSavedQueriesFailure: () => false,
+            },
+        ],
+        dataWarehouseSavedQueriesFailed: [
+            false,
+            {
+                loadDataWarehouseSavedQueries: () => false,
+                loadDataWarehouseSavedQueriesSuccess: () => false,
+                loadDataWarehouseSavedQueriesFailure: () => true,
+            },
+        ],
+        updatingDataWarehouseSavedQuery: [
+            false,
+            {
+                updateDataWarehouseSavedQuery: () => true,
+                updateDataWarehouseSavedQuerySuccess: () => false,
+                updateDataWarehouseSavedQueryFailure: () => false,
+            },
+        ],
+        dataWarehouseSavedQueryDownstreamReferences: [
+            {} as Record<string, DataWarehouseSavedQueryDownstreamReferenceState>,
+            {
+                loadDataWarehouseSavedQueryDownstreamReferences: (state, { viewId }) => ({
+                    ...state,
+                    [viewId]: { error: false, loading: true, references: [] },
+                }),
+                loadDataWarehouseSavedQueryDownstreamReferencesFailure: (state, { viewId }) => ({
+                    ...state,
+                    [viewId]: { error: true, loading: false, references: [] },
+                }),
+                loadDataWarehouseSavedQueryDownstreamReferencesSuccess: (state, { viewId, references }) => ({
+                    ...state,
+                    [viewId]: { error: false, loading: false, references },
+                }),
+            },
+        ],
+        // Views whose materialization is in flight. Reactive so the sidebar can show a spinner in
+        // place of the view icon while it materializes (a stable state, unlike the transient list
+        // loading flag), then flip to the materialized icon once it settles.
+        materializingViewIds: [
+            [] as string[],
+            {
+                addMaterializingViews: (state, { viewIds }) => Array.from(new Set([...state, ...viewIds])),
+                clearMaterializingView: (state, { viewId }) => state.filter((id) => id !== viewId),
+            },
+        ],
+    }),
+    actions({
+        refreshAfterWindowFocus: true,
+        loadDataWarehouseSavedQueryDownstreamReferences: (viewId: string) => ({ viewId }),
+        loadDataWarehouseSavedQueryDownstreamReferencesFailure: (viewId: string) => ({ viewId }),
+        loadDataWarehouseSavedQueryDownstreamReferencesSuccess: (
+            viewId: string,
+            references: DataWarehouseSavedQueryDownstreamReference[]
+        ) => ({ viewId, references }),
+        updateDataWarehouseSavedQueryFailed: (viewId: string) => ({ viewId }),
+        materializationChanged: (viewId: string) => ({ viewId }),
+        runDataWarehouseSavedQuerySuccess: (viewId: string) => ({ viewId }),
+        runDataWarehouseSavedQuery: (viewId: string, fullRefresh?: boolean) => ({ viewId, fullRefresh }),
+        runDataWarehouseSavedQueryFailure: (viewId: string) => ({ viewId }),
+        cancelDataWarehouseSavedQuery: (viewId: string) => ({ viewId }),
+        materializeDataWarehouseSavedQuery: (
+            viewId: string,
+            syncFrequency?: DataModelingSyncInterval,
+            incremental?: DataWarehouseSavedQueryIncremental | null,
+            createdViewName?: string
+        ) => ({
+            viewId,
+            syncFrequency,
+            incremental,
+            createdViewName,
+        }),
+        revertMaterialization: (viewId: string) => ({ viewId }),
+        addMaterializingViews: (viewIds: string[]) => ({ viewIds }),
+        clearMaterializingView: (viewId: string) => ({ viewId }),
+    }),
+    loaders(({ values, actions }) => ({
+        materializationAction: [
+            null as null,
+            {
+                materializeDataWarehouseSavedQuery: async ({ viewId, syncFrequency, incremental, createdViewName }) => {
+                    const requestedFrequency = syncFrequency ?? DEFAULT_MATERIALIZE_SYNC_FREQUENCY
+                    const followsCreation = createdViewName !== undefined
+                    const reportFailure = (detail: string | null | undefined, fallback: string): null => {
+                        if (followsCreation) {
+                            // The view exists, so a single warning names it and says it is not materialized.
+                            // A server reason such as a cadence refusal does not say "materialize" on its own.
+                            lemonToast.warning(
+                                `${createdViewName} was created but not materialized. ${detail || 'Open the view to try again.'}`,
+                                { button: goToViewButton(viewId) }
+                            )
+                        } else {
+                            lemonToast.error(detail || fallback)
+                        }
+                        return null
+                    }
+                    if (incremental !== undefined) {
+                        // Write the config first so the materialization run picks it up. Same shape as the
+                        // save-as-view flow, which creates the view with the config before materializing.
+                        // Null clears a config left behind by an earlier materialization, so choosing
+                        // full refresh is not overridden by the stored settings at the next run.
+                        try {
+                            await api.dataWarehouseSavedQueries.update(viewId, { incremental })
+                        } catch (error: any) {
+                            // The server names the construct blocking incremental — surface it over a generic failure.
+                            return reportFailure(error?.detail, 'Failed to save incremental settings')
+                        }
+                    }
+                    try {
+                        await warehouseSavedQueriesMaterializeCreate(String(ApiConfig.getCurrentTeamId()), viewId, {
+                            sync_frequency: requestedFrequency,
+                        })
+                        actions.materializationChanged(viewId)
+                        if (followsCreation) {
+                            showViewCreatedToast(viewId, createdViewName, true)
+                        } else {
+                            lemonToast.success('View materialized successfully')
+                        }
+                        posthog.capture('materialized view created', {
+                            sync_frequency: requestedFrequency,
+                            incremental: !!incremental,
+                            with_view_creation: followsCreation,
+                        })
+                        actions.addMaterializingViews([viewId])
+                        actions.loadDataWarehouseSavedQueries()
+                        actions.refreshDatabaseSchema()
+                    } catch (error: any) {
+                        // The server rejects a cadence the query's lineage can't support and says which one
+                        // to pick instead, so the reason has to reach the user rather than a generic failure.
+                        return reportFailure(error?.detail, 'Failed to materialize view')
+                    }
+                    return null
+                },
+                cancelDataWarehouseSavedQuery: async ({ viewId }) => {
+                    try {
+                        await api.dataWarehouseSavedQueries.cancel(viewId)
+                        actions.materializationChanged(viewId)
+                        lemonToast.success('Materialization cancelled')
+                        actions.loadDataWarehouseSavedQueries()
+                    } catch {
+                        lemonToast.error(`Failed to cancel materialization`)
+                    }
+                    return null
+                },
+                revertMaterialization: async ({ viewId }) => {
+                    try {
+                        await api.dataWarehouseSavedQueries.revertMaterialization(viewId)
+                        actions.materializationChanged(viewId)
+                        lemonToast.success('Materialization reverted')
+                        // No longer materializing — drop it so the spinner stops and we don't wait for a
+                        // flag that will never flip.
+                        actions.clearMaterializingView(viewId)
+                        actions.loadDataWarehouseSavedQueries()
+                        actions.refreshDatabaseSchema()
+                    } catch {
+                        lemonToast.error(`Failed to revert materialization`)
+                    }
+                    return null
+                },
+            },
+        ],
+        dataWarehouseSavedQueries: [
+            [] as DataWarehouseSavedQuerySummary[],
+            {
+                loadDataWarehouseSavedQueries: async () => {
+                    const savedQueries = await warehouseSavedQueriesList(String(ApiConfig.getCurrentTeamId()), {
+                        include_columns: false,
+                    })
+                    return savedQueries.results.map(
+                        ({ columns: _columns, ...view }) => view
+                    ) as unknown as DataWarehouseSavedQuerySummary[]
+                },
+                createDataWarehouseSavedQuery: async (
+                    payload: Partial<DataWarehouseSavedQuery> & {
+                        types: string[][]
+                        folder_id?: string | null
+                        // The caller must then pass the view name to `materializeDataWarehouseSavedQuery`, which shows the toast.
+                        deferCreatedToast?: boolean
+                    }
+                ) => {
+                    const { deferCreatedToast, ...view } = payload
+                    const newView = await api.dataWarehouseSavedQueries.create(view)
+
+                    if (!deferCreatedToast) {
+                        showViewCreatedToast(newView.id, newView.name)
+                    }
+                    posthog.capture('view created')
+                    globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.CreateSavedView)
+
+                    return [...values.dataWarehouseSavedQueries, newView]
+                },
+                deleteDataWarehouseSavedQuery: async (viewId: string) => {
+                    try {
+                        await api.dataWarehouseSavedQueries.delete(viewId)
+                    } catch (error: any) {
+                        // A view that's already gone is the outcome the user asked for, so treat a
+                        // 404 as success. This also covers a stale list or a double-click.
+                        if (error?.status !== 404) {
+                            throw error
+                        }
+                    }
+                    return values.dataWarehouseSavedQueries.filter((view) => view.id !== viewId)
+                },
+                updateDataWarehouseSavedQuery: async (view: DataWarehouseSavedQueryUpdate) => {
+                    try {
+                        const save = async (
+                            payload: DataWarehouseSavedQueryUpdate
+                        ): Promise<DataWarehouseSavedQuerySummary> =>
+                            (await warehouseSavedQueriesPartialUpdate(
+                                String(ApiConfig.getCurrentTeamId()),
+                                payload.id,
+                                payload as Parameters<typeof warehouseSavedQueriesPartialUpdate>[2]
+                            )) as unknown as DataWarehouseSavedQuerySummary
+                        let newView: DataWarehouseSavedQuerySummary
+                        try {
+                            newView = await save(view)
+                        } catch (error) {
+                            const breakingChange = getBreakingColumnChange(error)
+                            if (!breakingChange) {
+                                throw error
+                            }
+                            if (!(await confirmBreakingColumnChange(breakingChange))) {
+                                lemonToast.info('View was not saved')
+                                throw new BreakingColumnChangeDeclinedError()
+                            }
+                            newView = await save({ ...view, acknowledge_breaking_changes: true })
+                        }
+                        return values.dataWarehouseSavedQueries.map((savedQuery) => {
+                            if (savedQuery.id === view.id) {
+                                return newView
+                            }
+                            return savedQuery
+                        })
+                    } catch (error) {
+                        actions.updateDataWarehouseSavedQueryFailed(view.id)
+                        throw error
+                    }
+                },
+            },
+        ],
+        dataWarehouseSavedQueryFolders: [
+            [] as DataWarehouseSavedQueryFolder[],
+            {
+                loadDataWarehouseSavedQueryFolders: async () => {
+                    return await api.dataWarehouseSavedQueryFolders.list()
+                },
+                createDataWarehouseSavedQueryFolder: async (name: string) => {
+                    const folder = await api.dataWarehouseSavedQueryFolders.create({ name })
+                    lemonToast.success('Folder created')
+                    return [...values.dataWarehouseSavedQueryFolders, folder].sort((a, b) =>
+                        a.name.localeCompare(b.name)
+                    )
+                },
+                updateDataWarehouseSavedQueryFolder: async ({ id, name }: { id: string; name: string }) => {
+                    const updatedFolder = await api.dataWarehouseSavedQueryFolders.update(id, { name })
+                    return values.dataWarehouseSavedQueryFolders
+                        .map((folder) => (folder.id === id ? updatedFolder : folder))
+                        .sort((a, b) => a.name.localeCompare(b.name))
+                },
+                deleteDataWarehouseSavedQueryFolder: async (folderId: string) => {
+                    await api.dataWarehouseSavedQueryFolders.delete(folderId)
+                    return values.dataWarehouseSavedQueryFolders.filter((folder) => folder.id !== folderId)
+                },
+            },
+        ],
+    })),
+    listeners(({ actions, asyncActions, values, cache }) => ({
+        refreshAfterWindowFocus: async () => {
+            const catalogKeyBefore = savedQueryCatalogKey(values.dataWarehouseSavedQueries)
+            actions.loadDataWarehouseSavedQueryFolders()
+            try {
+                await asyncActions.loadDataWarehouseSavedQueries()
+            } catch {
+                return
+            }
+            if (cache.disposables.isDisposed) {
+                return
+            }
+            // A full catalog reload empties the schema tree while it runs, so skip it when no view changed.
+            if (savedQueryCatalogKey(values.dataWarehouseSavedQueries) !== catalogKeyBefore) {
+                actions.refreshDatabaseSchema()
+            }
+        },
+        loadDataWarehouseSavedQueryDownstreamReferences: async ({ viewId }) => {
+            try {
+                const lineage = await dataModelingNodesLineageRetrieve(String(ApiConfig.getCurrentTeamId()), {
+                    saved_query_id: viewId,
+                })
+                actions.loadDataWarehouseSavedQueryDownstreamReferencesSuccess(
+                    viewId,
+                    getDataWarehouseSavedQueryDownstreamReferences(lineage, viewId)
+                )
+            } catch (error) {
+                if (isUnavailableEndpointError(error)) {
+                    actions.loadDataWarehouseSavedQueryDownstreamReferencesSuccess(viewId, [])
+                } else {
+                    actions.loadDataWarehouseSavedQueryDownstreamReferencesFailure(viewId)
+                }
+            }
+        },
+        loadDataWarehouseSavedQueriesSuccess: ({ dataWarehouseSavedQueries }) => {
+            const materializing = values.materializingViewIds
+            if (materializing.length === 0) {
+                return
+            }
+            const settledIds = new Set(
+                dataWarehouseSavedQueries.filter((view) => view.id && view.is_materialized).map((view) => view.id)
+            )
+            // Per-view attempt counts so concurrent materializations don't share a budget — one view
+            // settling or capping out never clears another view's spinner early.
+            const attempts: Record<string, number> = cache.materializationPollAttempts ?? {}
+            const stillPending: string[] = []
+            for (const id of materializing) {
+                if (settledIds.has(id)) {
+                    // Settled → spinner flips to the materialized icon.
+                    actions.clearMaterializingView(id)
+                    delete attempts[id]
+                    continue
+                }
+                const nextAttempt = (attempts[id] ?? 0) + 1
+                if (nextAttempt >= MATERIALIZATION_POLL_MAX_ATTEMPTS) {
+                    // Give up waiting on this view so its spinner doesn't get stuck forever.
+                    actions.clearMaterializingView(id)
+                    delete attempts[id]
+                } else {
+                    attempts[id] = nextAttempt
+                    stillPending.push(id)
+                }
+            }
+            cache.materializationPollAttempts = attempts
+            if (stillPending.length === 0) {
+                cache.disposables.dispose('materializationPoll')
+                return
+            }
+            cache.disposables.add(() => {
+                const timeoutId = setTimeout(
+                    () => actions.loadDataWarehouseSavedQueries(),
+                    MATERIALIZATION_POLL_INTERVAL_MS
+                )
+                return () => clearTimeout(timeoutId)
+            }, 'materializationPoll')
+        },
+        createDataWarehouseSavedQuerySuccess: () => {
+            // The create loader already appends the new view optimistically, so the row appears
+            // without an extra reload. A reload here would also race the materialize reload below
+            // (create-with-materialize) and could revert is_materialized back to false.
+            actions.refreshDatabaseSchema()
+        },
+        createDataWarehouseSavedQueryFolderSuccess: () => {
+            actions.loadDataWarehouseSavedQueries()
+        },
+        updateDataWarehouseSavedQueryFolderSuccess: () => {
+            lemonToast.success('Folder renamed')
+        },
+        updateDataWarehouseSavedQueryFolderFailure: () => {
+            lemonToast.error('Failed to rename folder')
+        },
+        updateDataWarehouseSavedQuerySuccess: ({ payload }) => {
+            // in the case where we are scheduling a materialized view, send an event
+            if (payload && payload.lifecycle && payload.sync_frequency) {
+                // this function exists as an upsert, so we need to check if the view was created or updated
+                posthog.capture(`materialized view ${payload.lifecycle === 'update' ? 'updated' : 'created'}`, {
+                    sync_frequency: payload.sync_frequency,
+                })
+                if (payload.lifecycle === 'update') {
+                    lemonToast.success('Sync frequency updated')
+                }
+            }
+
+            if (payload?.shouldRematerialize) {
+                actions.runDataWarehouseSavedQuery(payload.id)
+            }
+
+            // Enabling a sync frequency schedules materialization, whose is_materialized flip can
+            // land asynchronously — mark it materializing (spinner) and poll until it settles.
+            if (payload?.id && payload.sync_frequency) {
+                actions.addMaterializingViews([payload.id])
+            }
+
+            actions.loadDataWarehouseSavedQueries()
+            actions.refreshDatabaseSchema()
+        },
+        updateDataWarehouseSavedQueryFailure: ({ errorObject }) => {
+            lemonToast.error(errorObject?.detail || 'Failed to update view')
+            actions.loadDataWarehouseSavedQueries()
+        },
+        deleteDataWarehouseSavedQueryFailure: ({ errorObject }) => {
+            // The blocked node's id rides on the response body's `extra`, and ApiError keeps the
+            // parsed body on `data` instead of lifting that key onto itself.
+            const nodeId = errorObject?.data?.extra?.node_id
+            lemonToast.error(errorObject?.detail || 'Failed to delete view', {
+                button: nodeId
+                    ? {
+                          label: 'Open lineage',
+                          action: () => router.actions.push(urls.nodeDetail(nodeId, 'lineage')),
+                      }
+                    : undefined,
+            })
+        },
+        deleteDataWarehouseSavedQuerySuccess: () => {
+            lemonToast.success('View deleted')
+            // The delete loader already filters the view out of the list, so the sidebar row leaves
+            // immediately. Reloading the whole list here just replaces every row's identity and
+            // makes the tree flash — skip it and let refreshDatabaseSchema update the picker.
+            actions.refreshDatabaseSchema()
+        },
+        deleteDataWarehouseSavedQueryFolderSuccess: () => {
+            lemonToast.success('Folder deleted')
+            actions.loadDataWarehouseSavedQueries()
+            actions.refreshDatabaseSchema()
+        },
+        runDataWarehouseSavedQuery: async ({ viewId, fullRefresh }) => {
+            try {
+                await api.dataWarehouseSavedQueries.run(viewId, fullRefresh)
+                actions.runDataWarehouseSavedQuerySuccess(viewId)
+                lemonToast.success(fullRefresh ? 'Full refresh started' : 'Materialization started')
+                actions.loadDataWarehouseSavedQueries()
+            } catch (error: any) {
+                const retryAfter = error?.formattedRetryAfter
+                lemonToast.error(
+                    retryAfter
+                        ? `This view can't run again yet. Try again ${retryAfter}.`
+                        : error?.detail ||
+                              (fullRefresh ? 'Failed to start full refresh' : 'Failed to run materialization')
+                )
+                actions.runDataWarehouseSavedQueryFailure(viewId)
+            }
+        },
+    })),
+    selectors({
+        shouldShowEmptyState: [
+            (s) => [s.views, s.databaseLoading],
+            (views: import('../../../queries/schema').DatabaseSchemaViewTable[], databaseLoading: boolean): boolean => {
+                return views?.length == 0 && !databaseLoading
+            },
+        ],
+        dataWarehouseSavedQueryMapById: [
+            (s) => [s.dataWarehouseSavedQueries],
+            (dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]) => {
+                return (
+                    dataWarehouseSavedQueries?.reduce(
+                        (acc, cur) => {
+                            acc[cur.id] = cur
+                            return acc
+                        },
+                        {} as Record<string, DataWarehouseSavedQuerySummary>
+                    ) ?? {}
+                )
+            },
+        ],
+        // id hyphens are removed. Used for hex'd id paths in DAG
+        dataWarehouseSavedQueryMapByIdStringMap: [
+            (s) => [s.dataWarehouseSavedQueries],
+            (dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]) => {
+                return (
+                    dataWarehouseSavedQueries?.reduce(
+                        (acc, cur) => {
+                            acc[cur.id.replace(/-/g, '')] = cur
+                            return acc
+                        },
+                        {} as Record<string, DataWarehouseSavedQuerySummary>
+                    ) ?? {}
+                )
+            },
+        ],
+        dataWarehouseSavedQueryMap: [
+            (s) => [s.dataWarehouseSavedQueries],
+            (dataWarehouseSavedQueries: DataWarehouseSavedQuerySummary[]) => {
+                return (
+                    dataWarehouseSavedQueries?.reduce(
+                        (acc, cur) => {
+                            acc[cur.name] = cur
+                            return acc
+                        },
+                        {} as Record<string, DataWarehouseSavedQuerySummary>
+                    ) ?? {}
+                )
+            },
+        ],
+        dataWarehouseSavedQueryFoldersById: [
+            (s) => [s.dataWarehouseSavedQueryFolders],
+            (folders: DataWarehouseSavedQueryFolder[]) => {
+                return folders.reduce(
+                    (acc, folder) => {
+                        acc[folder.id] = folder
+                        return acc
+                    },
+                    {} as Record<string, DataWarehouseSavedQueryFolder>
+                )
+            },
+        ],
+    }),
+    events(({ actions, values, cache }) => ({
+        afterMount: () => {
+            actions.loadDataWarehouseSavedQueries()
+            actions.loadDataWarehouseSavedQueryFolders()
+            // A view saved in another browser tab reaches this tab only on a reload, so refresh on focus.
+            cache.disposables.add(
+                () => {
+                    const onFocus = (): void => {
+                        // A failed load clears `dataWarehouseSavedQueriesLoaded`, so do not gate on it, or one
+                        // failed refresh would stop every later one.
+                        if (!values.dataWarehouseSavedQueriesLoading) {
+                            actions.refreshAfterWindowFocus()
+                        }
+                    }
+                    window.addEventListener('focus', onFocus)
+                    return () => window.removeEventListener('focus', onFocus)
+                },
+                'focusRefetch',
+                { pauseOnPageHidden: false }
+            )
+        },
+    })),
+])

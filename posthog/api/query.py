@@ -1,0 +1,827 @@
+import re
+from time import perf_counter
+from typing import Any, NoReturn, cast
+
+from django.core.cache import cache
+from django.http import HttpRequest, JsonResponse
+from django.http.response import HttpResponseBase
+
+import orjson
+import structlog
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse
+from opentelemetry import trace
+from prometheus_client import Counter
+from pydantic import BaseModel
+from rest_framework import status, viewsets
+from rest_framework.exceptions import (
+    APIException,
+    NotAuthenticated,
+    NotFound,
+    PermissionDenied,
+    Throttled,
+    ValidationError,
+)
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from posthog.schema import (
+    HogQLQuery,
+    HogQLQueryModifiers,
+    LimitContext as SchemaLimitContext,
+    QueryRequest,
+    QueryResponseAlternative,
+    QueryScanResponse,
+    QueryStatusResponse,
+    QueryUpgradeRequest,
+    QueryUpgradeResponse,
+)
+
+from posthog.hogql.ai import PromptUnclear, write_sql_from_prompt
+from posthog.hogql.constants import LimitContext
+from posthog.hogql.errors import ExposedHogQLError, ResolutionError
+from posthog.hogql.metadata import enrich_hogql_validation_error
+
+from posthog import settings
+from posthog.api.documentation import _FallbackSerializer, extend_schema
+from posthog.api.mixins import PydanticModelMixin
+from posthog.api.monitoring import (
+    Feature as MonitoringFeature,
+    monitor,
+)
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.api.services.query import process_query_model
+from posthog.api.streaming import sse_streaming_response
+from posthog.api.utils import action, is_async_query, is_insight_actors_options_query, is_insight_actors_query
+from posthog.api_queries_budget import get_request_query_cost, reset_request_query_cost
+from posthog.clickhouse.client.execute_async import QueryNotFoundError, cancel_query, get_query_status
+from posthog.clickhouse.client.limit import ConcurrencyLimitExceeded
+from posthog.clickhouse.query_tagging import get_http_request_id, get_query_tag_value, get_query_tags, tag_queries
+from posthog.constants import AvailableFeature
+from posthog.errors import (
+    GENERIC_INTERNAL_CH_ERROR_MESSAGE,
+    ExposedCHQueryError,
+    InternalCHQueryError,
+    internal_ch_error_user_message,
+    look_up_clickhouse_error_code_meta,
+)
+from posthog.event_usage import (
+    AnalyticsProps,
+    EventSource,
+    get_request_analytics_properties,
+    report_user_or_team_action,
+)
+from posthog.exceptions import InsufficientScope
+from posthog.exceptions_capture import capture_exception
+from posthog.hogql_queries.apply_dashboard_filters import apply_dashboard_filters, apply_dashboard_variables
+from posthog.hogql_queries.hogql_query_runner import HogQLQueryRunner
+from posthog.hogql_queries.query_failure_handling import captured_elsewhere
+from posthog.hogql_queries.query_runner import ExecutionMode, execution_mode_from_refresh
+from posthog.hogql_queries.warehouse_suggestion_notes import credential_access
+from posthog.models.user import User
+from posthog.models.utils import uuid7
+from posthog.permissions import get_authenticator_scopes, scopes_caller_lacks, scopes_missing_after_legacy_fallback
+from posthog.query_scan import slot as query_scan_slot
+from posthog.query_scan.flag import QueryScanMode, get_query_scan_flag
+from posthog.query_scan.serve import analysis_with_prompt
+from posthog.rate_limit import (
+    AIBurstRateThrottle,
+    AISustainedRateThrottle,
+    APIQueriesBurstThrottle,
+    APIQueriesSustainedThrottle,
+    ClickHouseBurstRateThrottle,
+    ClickHouseSustainedRateThrottle,
+    ErrorTrackingFingerprintProjectionBurstRateThrottle,
+    ErrorTrackingFingerprintProjectionSustainedRateThrottle,
+    HogQLQueryThrottle,
+)
+from posthog.schema_migrations.upgrade import upgrade
+from posthog.scopes.catalog import APIScopeObject
+
+from products.access_control.backend.facade.user_access_control import UserAccessControlError
+from products.customer_analytics.backend.facade.api import (
+    get_activity_query_status_scopes,
+    validate_account_activity_access,
+    validate_account_users_access,
+    validate_activity_query_property_access,
+    validate_book_activity_access,
+    validate_book_activity_accounts_access,
+    validate_book_activity_people_access,
+)
+from products.customer_analytics.backend.facade.constants import (
+    ACCOUNT_ACTIVITY_MATRIX_QUERY_STATUS_LABEL_PREFIX,
+    ACCOUNT_USERS_QUERY_STATUS_LABEL_PREFIX,
+    BOOK_ACTIVITY_ACCOUNTS_QUERY_STATUS_LABEL_PREFIX,
+    BOOK_ACTIVITY_MATRIX_QUERY_STATUS_LABEL_PREFIX,
+    BOOK_ACTIVITY_PEOPLE_QUERY_STATUS_LABEL_PREFIX,
+)
+from products.experiments.backend.facade.warehouse_native_access import (
+    WAREHOUSE_NATIVE_QUERY_STATUS_LABEL_PREFIX,
+    validate_warehouse_native_connection_access,
+)
+from products.managed_warehouse.backend.facade import query_labels as managed_warehouse_query_labels
+from products.managed_warehouse.backend.facade.query_execution import validate_managed_trino_raw_access
+from products.metrics.backend.facade.api import derived_metric_resources
+from products.metrics.backend.facade.contracts import DERIVED_SOURCE_QUERY_STATUS_LABEL_PREFIX
+from products.warehouse_sources.backend.facade.models import is_managed_warehouse_connection_ready
+
+from common.hogvm.python.utils import HogVMException
+
+logger = structlog.get_logger(__name__)
+
+tracer = trace.get_tracer(__name__)
+
+# Shown to the user when the org's concurrent-query limiter rejects a request. The raw limiter
+# exception embeds an internal Redis key + task id, so we log that for debugging and surface this
+# friendly message instead of leaking implementation details into the UI.
+CONCURRENCY_LIMIT_USER_MESSAGE = "Too many queries are running right now — please try again in a moment."
+CONCURRENCY_LIMIT_RETRY_AFTER_SECONDS = 5
+MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_MESSAGE = (
+    "This managed warehouse connection is no longer available. Select a source and run the query again."
+)
+MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_CODE = "managed_warehouse_connection_unavailable"
+
+QUERY_VALIDATION_ERROR_TOTAL = Counter(
+    "posthog_query_validation_error_total",
+    "Query validation failures returned from the query API.",
+    labelnames=["query_type", "validation_code"],
+)
+
+
+def _add_query_cost_headers(response: HttpResponseBase, bytes_read: int, remaining_bytes: int | None) -> None:
+    response["X-PostHog-Query-Bytes-Read"] = str(bytes_read)
+    if remaining_bytes is not None:
+        response["X-PostHog-Query-Budget-Remaining-Bytes"] = str(remaining_bytes)
+
+
+def _scan_extra(error: Exception) -> dict[str, Any]:
+    """The scan a stopped run left on the exception, for the error body's ``extra``."""
+    return {key: value for key in ("cache_key", "query_scan") if (value := getattr(error, key, None)) is not None}
+
+
+def _extract_validation_code(error: ValidationError) -> str:
+    validation_codes = error.get_codes()
+    if isinstance(validation_codes, list):
+        return validation_codes[0] if validation_codes and isinstance(validation_codes[0], str) else "unknown"
+    if isinstance(validation_codes, dict):
+        first_code = next(iter(validation_codes.values()), None)
+        if isinstance(first_code, str):
+            return first_code
+        if isinstance(first_code, list) and first_code and isinstance(first_code[0], str):
+            return first_code[0]
+    return "unknown"
+
+
+# Matches an absolute ISO date that carries an explicit time-of-day (e.g. `2026-07-09T00:00:00Z`,
+# `2026-07-09 05:00:00`), but not a bare calendar day (`2026-07-09`) or a relative token (`-7d`, `mStart`).
+_ISO_TIMESTAMP_WITH_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}")
+
+
+def _date_bound_has_explicit_time(value: object) -> bool:
+    return isinstance(value, str) and _ISO_TIMESTAMP_WITH_TIME_RE.match(value) is not None
+
+
+def _mark_explicit_date_boundaries(query: BaseModel) -> None:
+    """MCP query tools accept ISO timestamps in `dateRange.date_to`. When a caller passes a full
+    timestamp with a time-of-day (e.g. `2026-07-09T00:00:00Z`) rather than a bare calendar day, they
+    mean an exact boundary, so mark the range explicit instead of snapping `date_to` to end of day.
+
+    Scoped to the MCP entrypoint on purpose: the web UI serialises fixed calendar ranges as naive
+    `YYYY-MM-DDTHH:mm:ss` strings and relies on the default end-of-day rounding, so this must not
+    change that path.
+    """
+    date_range = getattr(query, "dateRange", None)
+    if date_range is None or not hasattr(date_range, "explicitDate") or date_range.explicitDate:
+        return
+    if _date_bound_has_explicit_time(getattr(date_range, "date_to", None)):
+        date_range.explicitDate = True
+
+
+def set_query_id_on_span(span: trace.Span, query_id: str) -> None:
+    # Client IDs are free text in the API, so only export opaque UUIDs to traces.
+    if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", query_id):
+        span.set_attribute("query.client_query_id", query_id)
+
+
+def _process_query_request(
+    request_data: QueryRequest, team, client_query_id: str | None = None, user=None
+) -> tuple[BaseModel, str, ExecutionMode]:
+    """Helper function to process query requests and return the necessary data for both sync and async endpoints."""
+    query = request_data.query
+
+    if request_data.filters_override is not None:
+        query = apply_dashboard_filters(query, request_data.filters_override, team)
+
+    if request_data.variables_override is not None:
+        query = apply_dashboard_variables(query, request_data.variables_override, team)
+
+    query_id = client_query_id or uuid7().hex
+    execution_mode = execution_mode_from_refresh(request_data.refresh)
+
+    if request_data.async_:  # TODO: Legacy async, use "refresh=async" instead
+        execution_mode = ExecutionMode.RECENT_CACHE_CALCULATE_ASYNC_IF_STALE
+
+    if execution_mode == ExecutionMode.CACHE_ONLY_NEVER_CALCULATE:
+        # Here in query endpoint we always want to calculate if the cache is stale
+        execution_mode = ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE
+
+    qt = get_query_tags()
+    if request_data.name:
+        qt.request_name = request_data.name
+    elif hasattr(request_data.query, "name") and isinstance(request_data.query.name, str):
+        qt.request_name = request_data.query.name
+    qt.query = query.model_dump()
+
+    return query, query_id, execution_mode
+
+
+# Query kinds whose product exposes its own scoped API keep scope parity here: an
+# API token must hold the product scope, not just query:read, to run them through
+# the generic endpoint.
+_QUERY_KIND_SCOPES: dict[str, list[str]] = {
+    "AccountActivityMatrixQuery": ["query:read", "account:read", "person:read"],
+    "BookActivityMatrixQuery": ["query:read", "account:read"],
+    "BookActivityPeopleQuery": ["query:read", "account:read", "person:read"],
+    "BookActivityFirstsQuery": ["query:read", "account:read", "person:read"],
+    "InboxUsageQuery": ["query:read", "signal_usage:read"],
+    "AccountUsersQuery": ["query:read", "account:read", "person:read"],
+    "AccountsTableQuery": ["query:read", "account:read"],
+    "ErrorTrackingFingerprintProjectionQuery": ["query:read", "error_tracking:read"],
+    "ErrorTrackingReleasesQuery": ["query:read", "error_tracking:read"],
+    "ErrorTrackingIssueEventsQuery": ["query:read", "error_tracking:read"],
+    "MetricsQuery": ["metrics:read"],
+    "MetricsHistogramQuery": ["metrics:read"],
+    # Both scopes listed: this result replaces the view's default query:read
+    # rather than adding to it, and a token must hold every listed scope.
+    "MCPDashboardQuery": ["query:read", "mcp_analytics:read"],
+    "MCPHarnessBreakdownQuery": ["query:read", "mcp_analytics:read"],
+    "MCPMissingCapabilitiesQuery": ["query:read", "mcp_analytics:read"],
+    "MCPModelBreakdownQuery": ["query:read", "mcp_analytics:read"],
+    "MCPProtocolVersionBreakdownQuery": ["query:read", "mcp_analytics:read"],
+    "MCPToolFailureOccurrencesQuery": ["query:read", "mcp_analytics:read"],
+    "MCPToolCallsAndErrorsQuery": ["query:read", "mcp_analytics:read"],
+    "MCPToolCallBreakdownQuery": ["query:read", "mcp_analytics:read"],
+    "MCPToolCategoryMapQuery": ["query:read", "mcp_analytics:read"],
+    "MCPToolQualityRowsQuery": ["query:read", "mcp_analytics:read"],
+}
+
+
+def required_scopes_for_query_payload(query: object) -> list[str] | None:
+    current_query = query
+    while isinstance(current_query, dict):
+        kind = current_query.get("kind")
+        # The experiment_exposure recordings filter reads experiment data, so it needs
+        # experiment:read on top of query:read — keyed on query content, not kind alone.
+        if kind == "RecordingsQuery" and current_query.get("experiment_exposure"):
+            return ["query:read", "experiment:read"]
+        if kind == "MetricsQuery":
+            return [*_QUERY_KIND_SCOPES[kind], *_derived_metric_source_scopes(current_query)]
+        if isinstance(kind, str) and kind in _QUERY_KIND_SCOPES:
+            return _QUERY_KIND_SCOPES[kind]
+        current_query = current_query.get("source")
+    return None
+
+
+def _derived_metric_source_scopes(query: dict) -> list[str]:
+    # A derived metric reads spans or logs, so the token also needs read access to that source.
+    clauses = query.get("clauses")
+    if not isinstance(clauses, list):
+        return []
+    names = [clause.get("metricName") for clause in clauses if isinstance(clause, dict)]
+    return [f"{resource}:read" for resource in derived_metric_resources(n for n in names if isinstance(n, str))]
+
+
+def add_query_response_identity_headers(response: Response) -> Response:
+    if http_request_id := get_http_request_id():
+        response["X-Request-ID"] = http_request_id
+        request_id_timing = f'request_id;desc="{http_request_id}"'
+        if existing_server_timing := response.get("Server-Timing"):
+            request_id_timing = f"{existing_server_timing}, {request_id_timing}"
+        response["Server-Timing"] = request_id_timing
+    return response
+
+
+def get_query_request_analytics_properties(request: HttpRequest | Request) -> AnalyticsProps:
+    analytics_props = get_request_analytics_properties(request)
+    if http_request_id := get_http_request_id():
+        analytics_props["http_request_id"] = http_request_id
+    return analytics_props
+
+
+class QueryViewSet(TeamAndOrgViewSetMixin, PydanticModelMixin, viewsets.ViewSet):
+    # NOTE: Do we need to override the scopes for the "create"
+    scope_object = "query"
+    serializer_class = _FallbackSerializer
+    # Special case for query - these are all essentially read actions
+    scope_object_read_actions = ["retrieve", "create", "list", "destroy"]
+    scope_object_write_actions: list[str] = []
+    sharing_enabled_actions = ["retrieve"]
+
+    def finalize_response(self, request: Request, response: Response, *args: Any, **kwargs: Any) -> Response:
+        return add_query_response_identity_headers(super().finalize_response(request, response, *args, **kwargs))
+
+    def dangerously_get_required_scopes(self, request, view) -> list[str] | None:
+        if getattr(view, "action", None) != "create":
+            return None
+        query = request.data.get("query") if isinstance(request.data, dict) else None
+        return required_scopes_for_query_payload(query)
+
+    def get_throttles(self):
+        if self.action == "draft_sql":
+            return [AIBurstRateThrottle(), AISustainedRateThrottle()]
+        if self.action == "get_query_log":
+            return [APIQueriesBurstThrottle(), APIQueriesSustainedThrottle()]
+        query = self.request.data.get("query")
+        if isinstance(query, dict) and query.get("kind") == "ErrorTrackingFingerprintProjectionQuery":
+            return [
+                ErrorTrackingFingerprintProjectionBurstRateThrottle(),
+                ErrorTrackingFingerprintProjectionSustainedRateThrottle(),
+            ]
+        if (
+            self.team_id in settings.API_QUERIES_PER_TEAM
+            or (settings.API_QUERIES_ENABLED and self.check_team_api_queries_concurrency())
+            or (settings.API_QUERIES_LEGACY_TEAM_LIST and self.team_id not in settings.API_QUERIES_LEGACY_TEAM_LIST)
+        ):
+            return [APIQueriesBurstThrottle(), APIQueriesSustainedThrottle()]
+        if isinstance(query, dict) and query.get("kind") == "HogQLQuery":
+            return [HogQLQueryThrottle()]
+        return [ClickHouseBurstRateThrottle(), ClickHouseSustainedRateThrottle()]
+
+    def check_team_api_queries_concurrency(self):
+        cache_key = f"team/{self.team_id}/feature/{AvailableFeature.API_QUERIES_CONCURRENCY}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if self.team:
+            new_val = self.team.organization.is_feature_available(AvailableFeature.API_QUERIES_CONCURRENCY)
+            cache.set(cache_key, new_val)
+            return new_val
+        return False
+
+    def _raise_concurrency_throttled(self, exc: ConcurrencyLimitExceeded) -> NoReturn:
+        # Log the raw detail (Redis key + task id) for Loki, but surface a clean message to the user.
+        logger.warning("query_concurrency_limit_exceeded", detail=str(exc))
+        raise Throttled(wait=CONCURRENCY_LIMIT_RETRY_AFTER_SECONDS, detail=CONCURRENCY_LIMIT_USER_MESSAGE)
+
+    @extend_schema(
+        request=QueryRequest,
+        responses={
+            200: QueryResponseAlternative,
+        },
+    )
+    @monitor(feature=MonitoringFeature.QUERY, endpoint="query", method="POST")
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        self._validate_query_kind(request, kwargs.get("query_kind"))
+        start_time = perf_counter()
+        with tracer.start_as_current_span("posthog.query.upgrade"):
+            upgraded_query = upgrade(request.data)
+        data = self.get_model(upgraded_query, QueryRequest)
+
+        query = None
+        try:
+            query, client_query_id, execution_mode = _process_query_request(
+                data, self.team, data.client_query_id, request.user
+            )
+
+            is_mcp_client = request.headers.get("x-posthog-client") == "mcp"
+            if is_mcp_client:
+                _mark_explicit_date_boundaries(query)
+
+            self._tag_client_query_id(client_query_id)
+            tag_queries(
+                warehouse_suggestion_access=credential_access(
+                    get_authenticator_scopes(request.successful_authenticator)
+                )
+            )
+            analytics_props = get_query_request_analytics_properties(request)
+            query_dict = query.model_dump()
+
+            if data.limit_context == SchemaLimitContext.POSTHOG_AI:
+                limit_context: LimitContext | None = LimitContext.POSTHOG_AI
+                # Max's insight tiles run in the browser, so the request looks like a session
+                # web request and get_event_source classifies it as "web". Attribute it to
+                # posthog_ai instead, matching the server-side executor's tagging.
+                analytics_props["source"] = EventSource.POSTHOG_AI
+            elif (
+                is_async_query(query_dict)
+                or is_insight_actors_query(query_dict)
+                or is_insight_actors_options_query(query_dict)
+            ) and get_query_tag_value("access_method") != "personal_api_key":
+                # QUERY_ASYNC provides extended max execution time for insight queries
+                limit_context = LimitContext.QUERY_ASYNC
+            else:
+                limit_context = None
+
+            reset_request_query_cost()
+            is_query_service = get_query_tag_value("access_method") == "personal_api_key"
+            if is_query_service:
+                tag_queries(api_queries_budgeted=True)
+            with tracer.start_as_current_span("posthog.query.process_query_model") as process_span:
+                process_span.set_attribute("team_id", self.team.pk)
+                process_span.set_attribute("query.kind", getattr(query, "kind", "Other"))
+                process_span.set_attribute("query.is_query_service", is_query_service)
+                set_query_id_on_span(process_span, client_query_id)
+                if limit_context is not None:
+                    process_span.set_attribute("query.limit_context", limit_context.value)
+                result = process_query_model(
+                    self.team,
+                    query,
+                    execution_mode=execution_mode,
+                    query_id=client_query_id,
+                    user=request.user,  # type: ignore[arg-type]
+                    is_query_service=is_query_service,
+                    limit_context=limit_context,
+                    analytics_props=analytics_props,
+                )
+                if isinstance(result, BaseModel):
+                    result = result.model_dump(by_alias=True)
+
+            total_time_ms = round((perf_counter() - start_time) * 1000, 2)
+            try:
+                with tracer.start_as_current_span("posthog.query.serialize_response") as serialize_span:
+                    response_bytes = len(orjson.dumps(result))
+                    serialize_span.set_attribute("response.bytes", response_bytes)
+                report_user_or_team_action(
+                    "query api response",
+                    {
+                        "query_type": getattr(query, "kind", "Other"),
+                        "is_cached": result.get("is_cached", False),
+                        "execution_mode": execution_mode.value,
+                        "total_time_ms": total_time_ms,
+                        "response_bytes": response_bytes,
+                        "client_query_id": client_query_id,
+                    },
+                    user=request.user if isinstance(request.user, User) else None,
+                    team=self.team,
+                    organization=self.team.organization,
+                    analytics_props=analytics_props,
+                )
+            except Exception:
+                pass
+
+            response_status = (
+                status.HTTP_202_ACCEPTED
+                if result.get("query_status") and result["query_status"].get("complete") is False
+                else status.HTTP_200_OK
+            )
+
+            if is_mcp_client:
+                with tracer.start_as_current_span("posthog.query.format_for_llm") as llm_span:
+                    formatted = self._try_format_for_llm(query, result)
+                    llm_span.set_attribute("query.formatted", formatted is not None)
+                    if formatted is not None:
+                        result["formatted_results"] = formatted
+
+            response = Response(result, status=response_status)
+            cost = get_request_query_cost()
+            if cost is not None and get_query_tag_value("access_method") == "personal_api_key":
+                _add_query_cost_headers(
+                    response,
+                    cost.bytes_read,
+                    int(cost.remaining_bytes) if cost.remaining_bytes is not None else None,
+                )
+            return response
+        except (ExposedHogQLError, ExposedCHQueryError, HogVMException) as e:
+            detail = str(e)
+            extra: dict | None = None
+            if isinstance(e, ExposedHogQLError):
+                request_user = request.user if isinstance(request.user, User) else None
+                detail, extra = enrich_hogql_validation_error(query, self.team, request_user, detail)
+            # A run ClickHouse stopped carries its scan, so the client can show the advice under
+            # the error.
+            scan_extra = _scan_extra(e)
+            if scan_extra:
+                extra = {**(extra or {}), **scan_extra}
+            validation_error = ValidationError(detail, getattr(e, "code_name", None))
+            if extra is not None:
+                validation_error.extra = extra  # type: ignore[attr-defined]
+            raise validation_error
+        except InternalCHQueryError as e:
+            self.handle_column_ch_error(e)
+            capture_exception(e)
+            error_code = look_up_clickhouse_error_code_meta(e).name
+            user_message = internal_ch_error_user_message(error_code)
+            replacement = APIException(user_message or GENERIC_INTERNAL_CH_ERROR_MESSAGE)
+            scan_extra = _scan_extra(e)
+            if scan_extra:
+                replacement.extra = scan_extra  # type: ignore[attr-defined]
+            raise replacement
+        except UserAccessControlError as e:
+            raise ValidationError(str(e))
+        except ResolutionError as e:
+            raise ValidationError(str(e))
+        except ValidationError as e:
+            query_type = getattr(query, "kind", "unknown")
+            QUERY_VALIDATION_ERROR_TOTAL.labels(
+                query_type=query_type,
+                validation_code=_extract_validation_code(e),
+            ).inc()
+            raise
+        except ConcurrencyLimitExceeded as c:
+            self._raise_concurrency_throttled(c)
+        except Throttled:
+            # Expected while a team is over its hourly query budget: a 429 with Retry-After is the
+            # caller's signal, not error noise.
+            raise
+        except Exception as e:
+            if not captured_elsewhere(e):
+                capture_exception(e)
+            # The timeout and memory-limit classes land here, which are the runs the scan
+            # exists for.
+            scan_extra = _scan_extra(e)
+            if scan_extra:
+                e.extra = {**(getattr(e, "extra", None) or {}), **scan_extra}  # type: ignore[attr-defined]
+            raise
+
+    @extend_schema(
+        description="(Experimental)",
+        parameters=[OpenApiParameter("id", OpenApiTypes.STR, OpenApiParameter.PATH)],
+        responses={200: QueryStatusResponse},
+    )
+    @monitor(feature=MonitoringFeature.QUERY, endpoint="query", method="GET")
+    def retrieve(self, request: Request, pk=None, *args, **kwargs) -> JsonResponse:
+        show_progress: bool = request.query_params.get("show_progress", False) == "true"
+        show_progress = (
+            show_progress or request.query_params.get("showProgress", False) == "true"
+        )  # TODO: Remove this once we have a consistent naming convention
+        query_status = get_query_status(team_id=self.team.pk, query_id=pk, show_progress=show_progress)
+        held_scopes = get_authenticator_scopes(getattr(request, "successful_authenticator", None))
+        required_scopes = get_activity_query_status_scopes(query_status.labels or [])
+        if (
+            held_scopes is not None
+            and "*" not in held_scopes
+            and required_scopes is not None
+            and scopes_missing_after_legacy_fallback(request, self, held_scopes, required_scopes)
+        ):
+            raise PermissionDenied("This API key does not have the required scopes to read this query.")
+        if required_scopes is not None:
+            try:
+                validate_activity_query_property_access(
+                    self.team, request.user if isinstance(request.user, User) else None, query_status.labels or []
+                )
+            except UserAccessControlError as error:
+                raise PermissionDenied(str(error)) from error
+        for label_prefix, validate_account_access in (
+            (ACCOUNT_USERS_QUERY_STATUS_LABEL_PREFIX, validate_account_users_access),
+            (ACCOUNT_ACTIVITY_MATRIX_QUERY_STATUS_LABEL_PREFIX, validate_account_activity_access),
+            (BOOK_ACTIVITY_MATRIX_QUERY_STATUS_LABEL_PREFIX, validate_book_activity_access),
+            (BOOK_ACTIVITY_ACCOUNTS_QUERY_STATUS_LABEL_PREFIX, validate_book_activity_accounts_access),
+            (BOOK_ACTIVITY_PEOPLE_QUERY_STATUS_LABEL_PREFIX, validate_book_activity_people_access),
+        ):
+            for labeled_account_id in (
+                label.removeprefix(label_prefix)
+                for label in query_status.labels or []
+                if label.startswith(label_prefix)
+            ):
+                try:
+                    validate_account_access(
+                        self.team,
+                        request.user if isinstance(request.user, User) else None,
+                        labeled_account_id,
+                        access=self.user_access_control,
+                    )
+                except UserAccessControlError as error:
+                    raise PermissionDenied(str(error)) from error
+        self._enforce_derived_metric_source_access(request, query_status.labels or [])
+        if managed_warehouse_query_labels.MANAGED_TRINO_RAW_QUERY_STATUS_LABEL in (query_status.labels or []):
+            try:
+                validate_managed_trino_raw_access(self.team, request.user if isinstance(request.user, User) else None)
+            except ExposedHogQLError as error:
+                raise PermissionDenied(str(error)) from error
+        for label in query_status.labels or []:
+            if label.startswith(WAREHOUSE_NATIVE_QUERY_STATUS_LABEL_PREFIX):
+                validate_warehouse_native_connection_access(
+                    self.team,
+                    request.user if isinstance(request.user, User) else None,
+                    label.removeprefix(WAREHOUSE_NATIVE_QUERY_STATUS_LABEL_PREFIX),
+                )
+        managed_connection_id = next(
+            (
+                label.removeprefix(managed_warehouse_query_labels.MANAGED_WAREHOUSE_QUERY_STATUS_LABEL_PREFIX)
+                for label in query_status.labels or []
+                if label.startswith(managed_warehouse_query_labels.MANAGED_WAREHOUSE_QUERY_STATUS_LABEL_PREFIX)
+            ),
+            None,
+        )
+        if managed_connection_id is not None and not is_managed_warehouse_connection_ready(
+            self.team.pk, managed_connection_id
+        ):
+            logger.info(
+                "Managed warehouse query result is unavailable",
+                team_id=self.team.pk,
+                query_id=pk,
+                connection_id=managed_connection_id,
+            )
+            raise QueryNotFoundError(
+                detail=MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_MESSAGE,
+                code=MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_CODE,
+            )
+        http_code: int = status.HTTP_202_ACCEPTED
+        if query_status.error:
+            if query_status.error_message:
+                http_code = status.HTTP_400_BAD_REQUEST  # An error where a user can likely take an action to resolve it
+            else:
+                http_code = status.HTTP_500_INTERNAL_SERVER_ERROR  # An internal surprise
+                # Add safe copy only after choosing the existing HTTP status; internal failures stay 500.
+                query_status.error_message = internal_ch_error_user_message(query_status.error_code)
+        elif query_status.complete:
+            http_code = status.HTTP_200_OK
+
+        query_status_response = QueryStatusResponse(query_status=query_status)
+        response = JsonResponse(query_status_response.model_dump(), safe=False, status=http_code)
+        if query_status.bytes_read is not None:
+            _add_query_cost_headers(response, query_status.bytes_read, query_status.budget_remaining_bytes)
+        return response
+
+    def _enforce_derived_metric_source_access(self, request: Request, labels: list[str]) -> None:
+        # A derived result holds span or log attributes, so retrieval needs the source access that creation checked.
+        resources = [
+            label.removeprefix(DERIVED_SOURCE_QUERY_STATUS_LABEL_PREFIX)
+            for label in labels
+            if label.startswith(DERIVED_SOURCE_QUERY_STATUS_LABEL_PREFIX)
+        ]
+        if not resources:
+            return
+        missing = scopes_caller_lacks(request, [f"{resource}:read" for resource in resources])
+        if missing:
+            raise InsufficientScope(
+                missing, detail=f"Derived metrics read spans or logs, so they also need: {', '.join(missing)}."
+            )
+        # A shared-link viewer has no user, and the share itself authorizes the result.
+        if isinstance(request.user, User):
+            for resource in resources:
+                if not self.user_access_control.check_access_level_for_resource(
+                    cast(APIScopeObject, resource), "viewer"
+                ):
+                    raise PermissionDenied(f"You do not have access to {resource}.")
+
+    @extend_schema(responses={200: OpenApiTypes.OBJECT})
+    @action(methods=["POST"], detail=False)
+    def check_auth_for_async(self, request: Request, *args, **kwargs):
+        return JsonResponse({"user": "ok"}, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        description="(Experimental)",
+        responses={
+            204: OpenApiResponse(description="Query cancelled"),
+        },
+    )
+    @monitor(feature=MonitoringFeature.QUERY, endpoint="query", method="DELETE")
+    def destroy(self, request, pk=None, *args, **kwargs):
+        dequeue_only = request.query_params.get("dequeue_only", False) == "true"
+        message = cancel_query(self.team.pk, pk, dequeue_only=dequeue_only)
+
+        return Response(status=200, data={"message": message})
+
+    @extend_schema(responses={200: OpenApiTypes.OBJECT})
+    @action(methods=["GET"], detail=False)
+    def draft_sql(self, request: Request, *args, **kwargs) -> Response:
+        if not isinstance(request.user, User):
+            raise NotAuthenticated()
+        prompt = request.GET.get("prompt")
+        current_query = request.GET.get("current_query")
+        if not prompt:
+            raise ValidationError({"prompt": ["This field is required."]}, code="required")
+        if len(prompt) > 400:
+            raise ValidationError({"prompt": ["This field is too long."]}, code="too_long")
+        try:
+            result = write_sql_from_prompt(
+                prompt, current_query=current_query, user=request.user, team=self.team, request=request
+            )
+        except PromptUnclear as e:
+            raise ValidationError({"prompt": [str(e)]}, code="unclear")
+        return Response({"sql": result})
+
+    @extend_schema(
+        request=QueryUpgradeRequest,
+        responses={
+            200: QueryUpgradeResponse,
+        },
+        description="Upgrades a query without executing it. Returns a query with all nodes migrated to the latest version.",
+    )
+    @action(methods=["POST"], detail=False, url_path="upgrade")
+    def upgrade(self, request: Request, *args, **kwargs) -> Response:
+        upgraded_query = upgrade(request.data)
+        return Response({"query": upgraded_query["query"]}, status=200)
+
+    @extend_schema(
+        description="Get query log details from query_log_archive table for a specific query_id, the query must have been issued in last 24 hours.",
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    @action(methods=["GET"], detail=True, url_path="log")
+    def get_query_log(self, request: Request, pk: str, *args, **kwargs) -> Response:
+        try:
+            query = HogQLQuery(
+                query="select * from query_log where query_id = {client_query_id} and event_date >= yesterday()",
+                values={
+                    "client_query_id": pk,
+                },
+                name="get_query_log",
+            )
+            hogql_runner = HogQLQueryRunner(
+                query=query,
+                team=self.team,
+                modifiers=HogQLQueryModifiers(),
+                limit_context=LimitContext.QUERY,
+            )
+            result = hogql_runner.calculate()
+            return Response(result.model_dump(), status=200)
+        except ConcurrencyLimitExceeded as c:
+            self._raise_concurrency_throttled(c)
+        except Throttled:
+            # Expected while a team is over its hourly query budget: a 429 with Retry-After is the
+            # caller's signal, not error noise.
+            raise
+        except Exception as e:
+            if not captured_elsewhere(e):
+                capture_exception(e)
+            raise
+
+    @extend_schema(
+        description=(
+            "Get the query scan for a cache key: the analysis of the last slow run of that query. The body "
+            "is empty while the analysis runs. 404 when the query has not been analyzed."
+        ),
+        responses={
+            200: QueryScanResponse,
+            404: OpenApiResponse(description="No query scan exists for this cache key."),
+        },
+    )
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path=r"scan/(?P<cache_key>[^/]+)",
+        required_scopes=["query:read"],
+    )
+    def get_query_scan(self, request: Request, cache_key: str, *args, **kwargs) -> Response:
+        # `log_only` collects the analysis without showing it to anyone, and with the flag off
+        # there is no current configuration to hold a stored analysis to.
+        flag = get_query_scan_flag(self.team)
+        if flag is None or flag.mode != QueryScanMode.SHOW:
+            raise NotFound("There is no query scan for this cache key.")
+        slot = query_scan_slot.get(self.team_id, cache_key, thresholds=flag.thresholds_fingerprint)
+        if slot is None:
+            raise NotFound("There is no query scan for this cache key.")
+        if slot.analysis is None:
+            return Response({}, status=status.HTTP_200_OK)
+        # Nothing here knows the run that asked, so the prompt carries the findings without a run line.
+        scan = QueryScanResponse(analysis=analysis_with_prompt(slot.analysis))
+        return Response(scan.model_dump(by_alias=True, exclude_none=True), status=status.HTTP_200_OK)
+
+    def handle_column_ch_error(self, error):
+        if getattr(error, "message", None):
+            match = re.search(r"There's no column.*in table", error.message)
+            if match:
+                # TODO: remove once we support all column types
+                raise ValidationError(
+                    match.group(0) + ". Note: While in beta, not all column types may be fully supported"
+                )
+        return
+
+    def _tag_client_query_id(self, query_id: str | None):
+        if query_id is None:
+            return
+
+        tag_queries(client_query_id=query_id)
+
+    @extend_schema(operation_id="query_create_with_kind")
+    @action(methods=["POST"], detail=False, url_path=r"(?P<query_kind>[A-Z][A-Za-z0-9]*)")
+    def create_with_kind(self, request: Request, *args, **kwargs) -> Response:
+        return self.create(request, *args, **kwargs)
+
+    def _validate_query_kind(self, request: Request, query_kind: str | None) -> None:
+        if not query_kind:
+            return
+        if not isinstance(request.data, dict):
+            raise ValidationError("Query body must be a JSON object.")
+        query_payload = request.data.get("query")
+        if query_payload is not None and not isinstance(query_payload, dict):
+            raise ValidationError("Query must be a JSON object.")
+        body_kind = query_payload.get("kind") if isinstance(query_payload, dict) else None
+        if query_kind != body_kind:
+            raise ValidationError(
+                f'Query kind mismatch: path kind "{query_kind}" does not match body kind "{body_kind}".'
+            )
+
+    def _try_format_for_llm(self, query: BaseModel, result: dict) -> str | None:
+        """Try to format query results as LLM-friendly text. Returns None on failure."""
+        if not settings.EE_AVAILABLE:
+            return None
+        try:
+            from ee.hogai.context.insight.format import format_query_results_for_llm
+
+            return format_query_results_for_llm(query, result, self.team)
+        except Exception:
+            logger.warning("mcp_llm_format_failed", exc_info=True)
+            return None
+
+
+MAX_QUERY_TIMEOUT = 600
+
+
+async def progress(request: Request, *args, **kwargs) -> HttpResponseBase:
+    # TEMPORARY endpoint to avoid breaking changes
+
+    return sse_streaming_response(
+        [], endpoint="query_progress_stub", status=status.HTTP_200_OK, headers={"Connection": "keep-alive"}
+    )

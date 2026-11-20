@@ -1,0 +1,1164 @@
+import { MOCK_TEAM_ID } from 'lib/api.mock'
+
+import '@testing-library/jest-dom'
+
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { BindLogic } from 'kea'
+import { expectLogic, partial } from 'kea-test-utils'
+import posthog from 'posthog-js'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { featureFlagsLogic } from 'scenes/feature-flags/featureFlagsLogic'
+
+import { useMocks } from '~/mocks/jest'
+import {
+    type ExperimentMetric,
+    type ExperimentMetricSource,
+    ExperimentMetricType,
+    type ExperimentWarehouseNativeExposureConfig,
+    ExperimentWarehouseNativeMathType,
+    NodeKind,
+} from '~/queries/schema/schema-general'
+import { initKeaTests } from '~/test/init'
+import { AccessControlLevel, AccessControlResourceType, type AppContext, type FeatureFlagType } from '~/types'
+
+import { NEW_EXPERIMENT } from 'products/experiments/frontend/constants'
+
+import { experimentsLogic } from '../../../../../products/experiments/frontend/scenes/experimentsLogic'
+import { createExperimentLogic } from '../ExperimentForm/createExperimentLogic'
+import { variantsPanelLogic } from '../ExperimentForm/variantsPanelLogic'
+import { experimentWizardLogic, stepStorageKey } from './experimentWizardLogic'
+import { AboutStep } from './steps/AboutStep'
+import { AnalyticsStep } from './steps/AnalyticsStep'
+import { VariantsStep } from './steps/VariantsStep'
+
+jest.mock('scenes/feature-flags/JSONEditorInput', () => ({
+    JSONEditorInput: ({ onChange, value, placeholder, readOnly }: any) => (
+        <input
+            data-testid="json-editor-mock"
+            value={value || ''}
+            onChange={(e) => onChange?.(e.target.value)}
+            placeholder={placeholder}
+            readOnly={readOnly}
+        />
+    ),
+}))
+
+// The consent gate reads a single selector; stubbing the logic lets each case pick the org's
+// consent state without standing up organizationLogic's loaders.
+jest.mock('~/layout/ai/aiConsentLogic', () => {
+    const { kea, selectors } = jest.requireActual('kea')
+    return {
+        aiConsentLogic: kea([
+            selectors({
+                dataProcessingAccepted: [() => [], () => (global as any).__consentAccepted ?? false],
+                dataProcessingDismissed: [() => [], () => false],
+                dataProcessingApprovalDisabledReason: [() => [], () => null],
+            }),
+        ]),
+    }
+})
+
+// The metric panels pull in the metric modals and their logics, which the consent-gate tests
+// don't exercise; stubbing them keeps the AnalyticsStep render scoped to the checkbox.
+jest.mock('../ExperimentForm/MetricsPanel', () => ({ MetricsPanel: () => null }))
+jest.mock('../ExperimentForm/ExposureCriteriaPanel', () => ({ ExposureCriteriaPanel: () => null }))
+
+beforeAll(() => {
+    const modalRoot = document.createElement('div')
+    modalRoot.setAttribute('id', 'root')
+    document.body.appendChild(modalRoot)
+})
+
+const mockEligibleFlags: Partial<FeatureFlagType>[] = [
+    {
+        id: 10,
+        key: 'existing-flag',
+        name: 'Existing Flag',
+        filters: {
+            groups: [],
+            multivariate: {
+                variants: [
+                    { key: 'control', rollout_percentage: 50 },
+                    { key: 'test', rollout_percentage: 50 },
+                ],
+            },
+        },
+        active: true,
+        deleted: false,
+    },
+    {
+        id: 20,
+        key: 'another-flag',
+        name: 'Another Flag',
+        filters: {
+            groups: [],
+            multivariate: {
+                variants: [
+                    { key: 'control', rollout_percentage: 33 },
+                    { key: 'variant-a', rollout_percentage: 33 },
+                    { key: 'variant-b', rollout_percentage: 34 },
+                ],
+            },
+        },
+        active: true,
+        deleted: false,
+    },
+]
+
+const apiMocks = {
+    get: {
+        '/api/projects/:team_id/feature_flags/': () => [200, { results: [], count: 0 }],
+        '/api/projects/:team_id/experiments': () => [200, { results: [], count: 0 }],
+    },
+}
+
+const warehouseExposure = (
+    overrides: Partial<ExperimentWarehouseNativeExposureConfig> = {}
+): ExperimentWarehouseNativeExposureConfig => ({
+    kind: NodeKind.ExperimentWarehouseNativeExposureConfig,
+    connection_id: 'connection-1',
+    unit: { unit_type: 'customer', id_namespace: 'billing_customer_id' },
+    query: 'SELECT customer_id AS entity_id, variant, assigned_at AS timestamp FROM billing.assignments',
+    ...overrides,
+})
+
+describe('experimentWizardLogic', () => {
+    describe('feature flag input flow', () => {
+        let logic: ReturnType<typeof experimentWizardLogic.build>
+        let createLogic: ReturnType<typeof createExperimentLogic.build>
+
+        beforeEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+            useMocks(apiMocks)
+            initKeaTests()
+
+            featureFlagsLogic.mount()
+            experimentsLogic.mount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+
+            logic = experimentWizardLogic()
+            logic.mount()
+        })
+
+        afterEach(() => {
+            cleanup()
+            logic?.unmount()
+            createLogic?.unmount()
+            experimentsLogic.unmount()
+            featureFlagsLogic.unmount()
+        })
+
+        it('typing a name auto-generates the feature flag key with sanitization', async () => {
+            render(
+                <BindLogic logic={experimentWizardLogic} props={{}}>
+                    <AboutStep />
+                </BindLogic>
+            )
+
+            const nameInput = screen.getByPlaceholderText('e.g. New checkout flow test')
+            await userEvent.type(nameInput, 'My Cool Experiment')
+
+            expect(screen.getByPlaceholderText('e.g. new-checkout-flow-test')).toHaveValue('my-cool-experiment')
+        })
+
+        it('selecting an existing flag sets key and variants from the flag', async () => {
+            const flag = mockEligibleFlags[1] as FeatureFlagType
+
+            logic.actions.setLinkedFeatureFlag(flag)
+            logic.actions.setFeatureFlagConfig({
+                feature_flag_key: flag.key,
+                variants: flag.filters?.multivariate?.variants || [],
+            })
+
+            await expectLogic(logic).toMatchValues({
+                linkedFeatureFlag: partial({ id: 20, key: 'another-flag' }),
+                experiment: partial({
+                    feature_flag_key: 'another-flag',
+                    feature_flag_config: partial({
+                        filters: partial({
+                            multivariate: {
+                                variants: [
+                                    partial({ key: 'control' }),
+                                    partial({ key: 'variant-a' }),
+                                    partial({ key: 'variant-b' }),
+                                ],
+                            },
+                        }),
+                    }),
+                }),
+            })
+        })
+
+        it('shows "Use this flag" button when feature flag key already exists', async () => {
+            // Set validation result with existingFlag BEFORE rendering
+            const vpLogic = variantsPanelLogic({ experiment: { ...NEW_EXPERIMENT }, disabled: false })
+            vpLogic.actions.validateFeatureFlagKeySuccess({
+                valid: false,
+                error: 'A feature flag with this key already exists.',
+                key: 'existing-flag',
+                existingFlag: mockEligibleFlags[0] as FeatureFlagType,
+            })
+
+            // Wait for the value to propagate through the kea connection chain
+            await expectLogic(logic).toMatchValues({
+                featureFlagKeyValidation: partial({
+                    valid: false,
+                    existingFlag: partial({ id: 10 }),
+                }),
+            })
+
+            render(
+                <BindLogic logic={experimentWizardLogic} props={{}}>
+                    <AboutStep />
+                </BindLogic>
+            )
+
+            await waitFor(() => {
+                expect(screen.getByText('A feature flag with this key already exists.')).toBeInTheDocument()
+                expect(screen.getByText('Use this flag')).toBeInTheDocument()
+            })
+        })
+
+        it('clicking "Use this flag" links the existing flag', async () => {
+            const flag = mockEligibleFlags[0] as FeatureFlagType
+
+            // Set validation result with existingFlag BEFORE rendering
+            const vpLogic = variantsPanelLogic({ experiment: { ...NEW_EXPERIMENT }, disabled: false })
+            vpLogic.actions.validateFeatureFlagKeySuccess({
+                valid: false,
+                error: 'A feature flag with this key already exists.',
+                key: 'existing-flag',
+                existingFlag: flag,
+            })
+
+            await expectLogic(logic).toMatchValues({
+                featureFlagKeyValidation: partial({
+                    valid: false,
+                    existingFlag: partial({ id: 10 }),
+                }),
+            })
+
+            render(
+                <BindLogic logic={experimentWizardLogic} props={{}}>
+                    <AboutStep />
+                </BindLogic>
+            )
+
+            await waitFor(() => {
+                expect(screen.getByText('Use this flag')).toBeInTheDocument()
+            })
+
+            await userEvent.click(screen.getByText('Use this flag'))
+
+            await expectLogic(logic).toMatchValues({
+                linkedFeatureFlag: partial({ id: 10, key: 'existing-flag' }),
+                experiment: partial({
+                    feature_flag_key: 'existing-flag',
+                }),
+            })
+        })
+
+        it('removing a linked flag clears the key', async () => {
+            logic.actions.setLinkedFeatureFlag(mockEligibleFlags[0] as FeatureFlagType)
+            logic.actions.setFeatureFlagConfig({
+                feature_flag_key: 'existing-flag',
+                variants: mockEligibleFlags[0].filters?.multivariate?.variants || [],
+            })
+
+            // Now remove it (mirrors AboutStep onRemove handler)
+            logic.actions.setLinkedFeatureFlag(null)
+            logic.actions.setExperimentValue('feature_flag_key', '')
+            logic.actions.clearFeatureFlagKeyValidation()
+
+            await expectLogic(logic).toMatchValues({
+                linkedFeatureFlag: null,
+                experiment: partial({ feature_flag_key: '' }),
+            })
+        })
+    })
+
+    describe('step navigation', () => {
+        let logic: ReturnType<typeof experimentWizardLogic.build>
+        let createLogic: ReturnType<typeof createExperimentLogic.build>
+
+        beforeEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+            useMocks(apiMocks)
+            initKeaTests()
+
+            featureFlagsLogic.mount()
+            experimentsLogic.mount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+
+            logic = experimentWizardLogic()
+            logic.mount()
+        })
+
+        afterEach(() => {
+            logic?.unmount()
+            createLogic?.unmount()
+            experimentsLogic.unmount()
+            featureFlagsLogic.unmount()
+        })
+
+        it.each([
+            { target: 'about' as const, expectedStepNumber: 0 },
+            { target: 'variants' as const, expectedStepNumber: 1 },
+            { target: 'analytics' as const, expectedStepNumber: 2 },
+        ])(
+            'can jump directly to "$target" step (no gating / blocking of steps)',
+            async ({ target, expectedStepNumber }) => {
+                logic.actions.setStep(target)
+
+                await expectLogic(logic).toMatchValues({
+                    currentStep: target,
+                    stepNumber: expectedStepNumber,
+                })
+            }
+        )
+
+        it('nextStep advances and prevStep goes back', async () => {
+            expect(logic.values.currentStep).toBe('about')
+
+            logic.actions.nextStep()
+            await expectLogic(logic).toMatchValues({ currentStep: 'variants' })
+
+            logic.actions.nextStep()
+            await expectLogic(logic).toMatchValues({ currentStep: 'analytics' })
+
+            logic.actions.prevStep()
+            await expectLogic(logic).toMatchValues({ currentStep: 'variants' })
+        })
+
+        it('nextStep/prevStep stay same at end/beginning', async () => {
+            logic.actions.setStep('analytics')
+            logic.actions.nextStep()
+            await expectLogic(logic).toMatchValues({ currentStep: 'analytics' })
+
+            logic.actions.setStep('about')
+            logic.actions.prevStep()
+            await expectLogic(logic).toMatchValues({ currentStep: 'about' })
+        })
+
+        it('marks departing step when navigating away', async () => {
+            logic.actions.nextStep()
+
+            await expectLogic(logic).toMatchValues({
+                departedSteps: { about: true },
+            })
+        })
+
+        it('preserves current step across unmount/remount', async () => {
+            logic.actions.nextStep()
+            await expectLogic(logic).toMatchValues({ currentStep: 'variants' })
+
+            logic.unmount()
+            createLogic.unmount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+            logic = experimentWizardLogic()
+            logic.mount()
+
+            await expectLogic(logic).toMatchValues({ currentStep: 'variants' })
+        })
+
+        it('wizard logic is a singleton that shares step state', async () => {
+            const wizardLogicA = experimentWizardLogic()
+            wizardLogicA.mount()
+            const wizardLogicB = experimentWizardLogic()
+            wizardLogicB.mount()
+
+            wizardLogicA.actions.setStep('variants')
+
+            // Both references resolve to the same singleton instance
+            await expectLogic(wizardLogicA).toMatchValues({ currentStep: 'variants' })
+            await expectLogic(wizardLogicB).toMatchValues({ currentStep: 'variants' })
+
+            wizardLogicB.actions.setStep('analytics')
+
+            await expectLogic(wizardLogicA).toMatchValues({ currentStep: 'analytics' })
+            await expectLogic(wizardLogicB).toMatchValues({ currentStep: 'analytics' })
+
+            wizardLogicA.unmount()
+            wizardLogicB.unmount()
+        })
+
+        it('resets step to about on saveExperimentSuccess', async () => {
+            logic.actions.setStep('analytics')
+            await expectLogic(logic).toMatchValues({ currentStep: 'analytics' })
+
+            logic.actions.saveExperimentSuccess()
+
+            await expectLogic(logic).toMatchValues({
+                currentStep: 'about',
+                linkedFeatureFlag: null,
+                departedSteps: {},
+            })
+            expect(sessionStorage.getItem(stepStorageKey())).toBeNull()
+        })
+
+        it('clears sessionStorage step on saveExperimentSuccess so remount starts fresh', async () => {
+            logic.actions.setStep('analytics')
+            expect(sessionStorage.getItem(stepStorageKey())).toBe('analytics')
+
+            logic.actions.saveExperimentSuccess()
+            logic.unmount()
+            createLogic.unmount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+            logic = experimentWizardLogic()
+            logic.mount()
+
+            await expectLogic(logic).toMatchValues({ currentStep: 'about' })
+        })
+
+        it('stale sessionStorage from previous session is cleared on fresh navigation', () => {
+            // Simulate stale state: step saved from a previous experiment session
+            sessionStorage.setItem(stepStorageKey(), 'analytics')
+
+            // Simulate what experimentSceneLogic does on fresh navigation to /experiments/new
+            sessionStorage.removeItem(stepStorageKey())
+
+            // Now mount the wizard — should start on 'about'
+            logic.unmount()
+            createLogic.unmount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+            logic = experimentWizardLogic()
+            logic.mount()
+
+            expect(logic.values.currentStep).toBe('about')
+        })
+
+        it('reports each step view with the step it came from and how it was reached', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.nextStep()
+                logic.actions.setStep('about')
+            }).toDispatchActions([
+                logic.actionCreators.reportExperimentWizardStepViewed('variants', 2, 'about', 'continue'),
+                logic.actionCreators.reportExperimentWizardStepViewed('about', 1, 'variants', 'stepper'),
+            ])
+
+            // Going back from the first step doesn't change the step, so it isn't a new view
+            await expectLogic(logic, () => {
+                logic.actions.prevStep()
+            }).toNotHaveDispatchedActions(['reportExperimentWizardStepViewed'])
+
+            await expectLogic(logic, () => {
+                logic.actions.nextStep()
+                logic.actions.prevStep()
+            }).toDispatchActions([
+                logic.actionCreators.reportExperimentWizardStepViewed('variants', 2, 'about', 'continue'),
+                logic.actionCreators.reportExperimentWizardStepViewed('about', 1, 'variants', 'back'),
+            ])
+        })
+
+        it('reports the first view as a start when the wizard opens on the first step', () => {
+            logic.unmount()
+            createLogic.unmount()
+
+            const capture = jest.spyOn(posthog, 'capture')
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+            logic = experimentWizardLogic()
+            logic.mount()
+
+            expect(capture).toHaveBeenCalledWith('experiment wizard step viewed', {
+                step: 'about',
+                step_number: 1,
+                previous_step: null,
+                navigation: 'start',
+            })
+            capture.mockRestore()
+        })
+
+        it('reports the first view as a resume when the wizard reopens on a later step', async () => {
+            logic.actions.setStep('analytics')
+            logic.unmount()
+            createLogic.unmount()
+
+            const capture = jest.spyOn(posthog, 'capture')
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+            logic = experimentWizardLogic()
+            logic.mount()
+
+            expect(capture).toHaveBeenCalledWith('experiment wizard step viewed', {
+                step: 'analytics',
+                step_number: 3,
+                previous_step: null,
+                navigation: 'resume',
+            })
+            capture.mockRestore()
+        })
+
+        it('remount preserves step when sessionStorage is not cleared', async () => {
+            logic.actions.setStep('variants')
+            await expectLogic(logic).toMatchValues({ currentStep: 'variants' })
+
+            // Unmount and remount without clearing sessionStorage
+            logic.unmount()
+            createLogic.unmount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+            logic = experimentWizardLogic()
+            logic.mount()
+
+            await expectLogic(logic).toMatchValues({ currentStep: 'variants' })
+        })
+    })
+
+    describe('validation', () => {
+        let logic: ReturnType<typeof experimentWizardLogic.build>
+        let createLogic: ReturnType<typeof createExperimentLogic.build>
+
+        beforeEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+            useMocks(apiMocks)
+            initKeaTests()
+
+            featureFlagsLogic.mount()
+            experimentsLogic.mount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+
+            logic = experimentWizardLogic()
+            logic.mount()
+        })
+
+        afterEach(() => {
+            logic?.unmount()
+            createLogic?.unmount()
+            experimentsLogic.unmount()
+            featureFlagsLogic.unmount()
+        })
+
+        it('shows no errors on initial load (before step departure)', async () => {
+            await expectLogic(logic).toMatchValues({
+                stepValidationErrors: { about: [], variants: [], analytics: [] },
+            })
+        })
+
+        it('reveals required-field errors on about step after departure', async () => {
+            // Before departure: no errors even though name/key are empty
+            expect(logic.values.stepValidationErrors.about).toEqual([])
+
+            // Depart the about step
+            logic.actions.markStepDeparted('about')
+
+            await expectLogic(logic).toMatchValues({
+                stepValidationErrors: partial({
+                    about: ['Name is required', 'Feature flag key is required'],
+                }),
+            })
+        })
+
+        it('variant split not summing to 100% triggers error on variants step', async () => {
+            createLogic.actions.setExperiment({
+                ...NEW_EXPERIMENT,
+                feature_flag_config: {
+                    filters: {
+                        multivariate: {
+                            variants: [
+                                { key: 'control', rollout_percentage: 40 },
+                                { key: 'test', rollout_percentage: 40 },
+                            ],
+                        },
+                    },
+                },
+            })
+
+            await expectLogic(logic).toMatchValues({
+                stepValidationErrors: partial({
+                    variants: ['Variant percentages must sum to 100%'],
+                }),
+            })
+        })
+
+        it.each([
+            {
+                desc: 'empty variant key',
+                variants: [
+                    { key: 'control', rollout_percentage: 50 },
+                    { key: '', rollout_percentage: 50 },
+                ],
+                expectedErrors: ['All variants must have a key'],
+            },
+            {
+                desc: 'duplicate variant keys',
+                variants: [
+                    { key: 'control', rollout_percentage: 50 },
+                    { key: 'control', rollout_percentage: 50 },
+                ],
+                expectedErrors: ['Variant keys must be unique'],
+            },
+            {
+                desc: 'valid variants',
+                variants: [
+                    { key: 'control', rollout_percentage: 50 },
+                    { key: 'test', rollout_percentage: 50 },
+                ],
+                expectedErrors: [],
+            },
+        ])('variants step: $desc', async ({ variants, expectedErrors }) => {
+            createLogic.actions.setExperiment({
+                ...NEW_EXPERIMENT,
+                feature_flag_config: { filters: { multivariate: { variants } } },
+            })
+
+            await expectLogic(logic).toMatchValues({
+                stepValidationErrors: partial({ variants: expectedErrors }),
+            })
+        })
+
+        it('existing feature flag key shows error when validation fails', async () => {
+            // Directly set the validation result on the variantsPanelLogic instance
+            // (the same instance createExperimentLogic connects to)
+            const vpLogic = variantsPanelLogic({ experiment: { ...NEW_EXPERIMENT }, disabled: false })
+            vpLogic.actions.validateFeatureFlagKeySuccess({
+                valid: false,
+                error: 'A feature flag with this key already exists.',
+                key: 'existing-flag',
+            })
+
+            await expectLogic(logic).toMatchValues({
+                featureFlagKeyValidation: {
+                    valid: false,
+                    error: 'A feature flag with this key already exists.',
+                    key: 'existing-flag',
+                },
+                stepValidationErrors: partial({
+                    about: ['A feature flag with this key already exists.'],
+                }),
+            })
+        })
+
+        it('blocks the save while a warehouse-native exposure is unfinished, and reports the exposure source once', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setExposureCriteria({ exposure_config: warehouseExposure({ connection_id: '' }) })
+            }).toDispatchActions([
+                logic.actionCreators.reportExperimentWizardExposureSourceSelected('warehouse_native'),
+            ])
+            // The stepper stays clean until the user leaves the step, but the save is blocked right away
+            expect(logic.values.stepValidationErrors.analytics).toEqual([])
+            expect(logic.values.saveDisabledReason).toBe('Select a BigQuery connection')
+
+            logic.actions.markStepDeparted('analytics')
+            expect(logic.values.stepValidationErrors.analytics).toEqual(['Select a BigQuery connection'])
+
+            // Filling in the exposure keeps the same source, so it is not a new selection
+            await expectLogic(logic, () => {
+                logic.actions.setExposureCriteria({ exposure_config: warehouseExposure() })
+            }).toNotHaveDispatchedActions(['reportExperimentWizardExposureSourceSelected'])
+            expect(logic.values.stepValidationErrors.analytics).toEqual([])
+            expect(logic.values.saveDisabledReason).toBeUndefined()
+        })
+
+        it('blocks the save while a shared metric cannot run with the exposure', () => {
+            const sharedMetric = (source: ExperimentMetricSource): ExperimentMetric =>
+                ({
+                    kind: NodeKind.ExperimentMetric,
+                    uuid: 'shared-1',
+                    metric_type: ExperimentMetricType.MEAN,
+                    source,
+                    isSharedMetric: true,
+                    sharedMetricId: 7,
+                }) as ExperimentMetric
+            const exposure = warehouseExposure()
+            const sharedWarehouseMetric = sharedMetric({
+                kind: NodeKind.ExperimentWarehouseNativeNode,
+                connection_id: exposure.connection_id,
+                unit: exposure.unit,
+                query: 'SELECT customer_id AS entity_id, paid_at AS timestamp FROM billing.payments',
+                math: ExperimentWarehouseNativeMathType.TotalCount,
+            })
+            logic.actions.setExposureCriteria({ exposure_config: exposure })
+
+            // The draft keeps shared metrics outside `experiment`, so they are easy to leave out of the check
+            createLogic.actions.setSharedMetrics({
+                primary: [],
+                secondary: [sharedMetric({ kind: NodeKind.EventsNode, event: '$pageview' })],
+            })
+            expect(logic.values.metricDataSources).toEqual({ warehouseNative: false, posthog: true })
+            expect(logic.values.saveDisabledReason).toMatch(/only works with warehouse-native metrics/)
+
+            createLogic.actions.setSharedMetrics({ primary: [sharedWarehouseMetric], secondary: [] })
+            expect(logic.values.saveDisabledReason).toBeUndefined()
+
+            // An exposure edit moves the draft's own metrics, but a shared metric keeps its connection
+            logic.actions.setExposureCriteria({ exposure_config: warehouseExposure({ connection_id: 'connection-2' }) })
+            expect(logic.values.saveDisabledReason).toMatch(/shared metric uses another connection/)
+        })
+
+        it('saveExperiment marks all steps as departed, revealing all errors', async () => {
+            // Experiment has empty name and key — errors hidden until departure
+            expect(logic.values.stepValidationErrors.about).toEqual([])
+
+            logic.actions.saveExperiment()
+
+            await expectLogic(logic).toMatchValues({
+                departedSteps: { about: true, variants: true, analytics: true },
+                stepValidationErrors: partial({
+                    about: ['Name is required', 'Feature flag key is required'],
+                }),
+            })
+        })
+    })
+
+    describe('form submission', () => {
+        let logic: ReturnType<typeof experimentWizardLogic.build>
+        let createLogic: ReturnType<typeof createExperimentLogic.build>
+        let capturedPayload: any
+
+        beforeEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+            capturedPayload = null
+
+            useMocks({
+                ...apiMocks,
+                post: {
+                    [`/api/projects/${MOCK_TEAM_ID}/experiments/`]: async ({ request }) => {
+                        capturedPayload = (await request.json()) as Record<string, any>
+                        return [
+                            200,
+                            {
+                                ...NEW_EXPERIMENT,
+                                id: 42,
+                                name: capturedPayload.name,
+                                feature_flag_key: capturedPayload.feature_flag_key,
+                                feature_flag: { id: 100, key: capturedPayload.feature_flag_key },
+                            },
+                        ]
+                    },
+                },
+                patch: {
+                    '/api/environments/:team_id/add_product_intent/': () => [200, {}],
+                },
+            })
+            initKeaTests()
+
+            featureFlagsLogic.mount()
+            experimentsLogic.mount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+
+            logic = experimentWizardLogic()
+            logic.mount()
+        })
+
+        afterEach(() => {
+            logic?.unmount()
+            createLogic?.unmount()
+            experimentsLogic.unmount()
+            featureFlagsLogic.unmount()
+        })
+
+        it('posts the experiment to the backend on save', async () => {
+            createLogic.actions.setExperimentValue('name', 'Ship it')
+            createLogic.actions.setExperimentValue('feature_flag_key', 'ship-it')
+            // The About step validates the key as the user types; a confirmed-available key is
+            // what makes the save send the flag config (via the feature_flag object).
+            logic.actions.validateFeatureFlagKey('ship-it')
+            await waitFor(() => {
+                expect(createLogic.values.featureFlagKeyValidation).toMatchObject({ valid: true })
+            })
+
+            logic.actions.saveExperiment()
+
+            await waitFor(() => {
+                expect(capturedPayload).not.toBeNull()
+            })
+
+            expect(capturedPayload).toMatchObject({
+                name: 'Ship it',
+                feature_flag_key: 'ship-it',
+                feature_flag: {
+                    filters: expect.objectContaining({
+                        multivariate: {
+                            variants: expect.arrayContaining([
+                                expect.objectContaining({ key: 'control' }),
+                                expect.objectContaining({ key: 'test' }),
+                            ]),
+                        },
+                    }),
+                },
+            })
+            // Flag config no longer travels through the deprecated parameters keys.
+            expect(capturedPayload.parameters).not.toHaveProperty('feature_flag_variants')
+        })
+
+        it('saves warehouse-native metrics on the connection and unit of the exposure as last edited', async () => {
+            createLogic.actions.setExperimentValue('name', 'Ship it')
+            createLogic.actions.setExperimentValue('feature_flag_key', 'ship-it')
+            logic.actions.validateFeatureFlagKey('ship-it')
+            await waitFor(() => {
+                expect(createLogic.values.featureFlagKeyValidation).toMatchObject({ valid: true })
+            })
+            const exposure = warehouseExposure()
+            logic.actions.setExposureCriteria({ exposure_config: exposure })
+            logic.actions.setExperiment({
+                ...createLogic.values.experiment,
+                metrics: [
+                    {
+                        kind: NodeKind.ExperimentMetric,
+                        uuid: 'metric-1',
+                        metric_type: ExperimentMetricType.MEAN,
+                        source: {
+                            kind: NodeKind.ExperimentWarehouseNativeNode,
+                            connection_id: exposure.connection_id,
+                            unit: exposure.unit,
+                            query: 'SELECT customer_id AS entity_id, paid_at AS timestamp FROM billing.payments',
+                            math: ExperimentWarehouseNativeMathType.TotalCount,
+                        },
+                    },
+                ],
+            })
+            // The metric was added first. The exposure then moves to another connection and unit.
+            const editedExposure = warehouseExposure({
+                connection_id: 'connection-2',
+                unit: { unit_type: 'account', id_namespace: 'crm_account_id' },
+            })
+            logic.actions.setExposureCriteria({ exposure_config: editedExposure })
+
+            logic.actions.saveExperiment()
+            await waitFor(() => {
+                expect(capturedPayload).not.toBeNull()
+            })
+
+            expect(capturedPayload.exposure_criteria.exposure_config).toEqual(editedExposure)
+            expect(capturedPayload.metrics[0].source).toMatchObject({
+                connection_id: 'connection-2',
+                unit: { unit_type: 'account', id_namespace: 'crm_account_id' },
+                query: 'SELECT customer_id AS entity_id, paid_at AS timestamp FROM billing.payments',
+            })
+        })
+    })
+
+    describe('VariantsStep with linked feature flag', () => {
+        let logic: ReturnType<typeof experimentWizardLogic.build>
+        let createLogic: ReturnType<typeof createExperimentLogic.build>
+
+        beforeEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+            useMocks(apiMocks)
+            initKeaTests()
+
+            featureFlagsLogic.mount()
+            experimentsLogic.mount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+
+            logic = experimentWizardLogic()
+            logic.mount()
+        })
+
+        afterEach(() => {
+            cleanup()
+            logic?.unmount()
+            createLogic?.unmount()
+            experimentsLogic.unmount()
+            featureFlagsLogic.unmount()
+        })
+
+        const renderVariantsStep = (): void => {
+            render(
+                <BindLogic logic={experimentWizardLogic} props={{}}>
+                    <VariantsStep />
+                </BindLogic>
+            )
+        }
+
+        const makeFlagWithVariantsAndRollout = (
+            variants: Array<{ key: string; rollout_percentage: number }>,
+            rolloutPercentage: number
+        ): Partial<FeatureFlagType> => ({
+            ...mockEligibleFlags[0],
+            filters: {
+                groups: [{ properties: [], rollout_percentage: rolloutPercentage }],
+                multivariate: { variants },
+            },
+        })
+
+        it('shows read-only banner when a linked flag is set', () => {
+            logic.actions.setLinkedFeatureFlag(mockEligibleFlags[0] as FeatureFlagType)
+
+            renderVariantsStep()
+
+            expect(screen.getByText(/For linked feature flags, this step is read-only/)).toBeInTheDocument()
+        })
+
+        it.each([
+            {
+                desc: '2 variants with 50/50 split at 100% rollout',
+                variants: [
+                    { key: 'control', rollout_percentage: 50 },
+                    { key: 'test', rollout_percentage: 50 },
+                ],
+                rollout: 100,
+                expectedKeys: ['control', 'test'],
+            },
+            {
+                desc: '3 variants with uneven split at 80% rollout',
+                variants: [
+                    { key: 'control', rollout_percentage: 34 },
+                    { key: 'variant-a', rollout_percentage: 33 },
+                    { key: 'variant-b', rollout_percentage: 33 },
+                ],
+                rollout: 80,
+                expectedKeys: ['control', 'variant-a', 'variant-b'],
+            },
+        ])('displays variant keys and rollout for $desc', ({ variants, rollout, expectedKeys }) => {
+            const flag = makeFlagWithVariantsAndRollout(variants, rollout)
+            logic.actions.setLinkedFeatureFlag(flag as FeatureFlagType)
+
+            renderVariantsStep()
+
+            for (const key of expectedKeys) {
+                expect(screen.getByText(key)).toBeInTheDocument()
+            }
+            expect(screen.getByText(`${rollout}%`)).toBeInTheDocument()
+        })
+
+        it('defaults rollout to 100% when groups have no rollout_percentage', () => {
+            const flag: Partial<FeatureFlagType> = {
+                ...mockEligibleFlags[0],
+                filters: {
+                    groups: [{ properties: [] }],
+                    multivariate: {
+                        variants: [
+                            { key: 'control', rollout_percentage: 50 },
+                            { key: 'test', rollout_percentage: 50 },
+                        ],
+                    },
+                },
+            }
+            logic.actions.setLinkedFeatureFlag(flag as FeatureFlagType)
+
+            renderVariantsStep()
+
+            expect(screen.getByText('100%')).toBeInTheDocument()
+        })
+
+        it('does not show read-only banner when no linked flag is set', () => {
+            renderVariantsStep()
+
+            expect(screen.queryByText(/For linked feature flags, this step is read-only/)).not.toBeInTheDocument()
+        })
+    })
+
+    describe('auto-link guard against the shared flag-load singleton', () => {
+        let createLogic: ReturnType<typeof createExperimentLogic.build>
+        let logic: ReturnType<typeof experimentWizardLogic.build>
+
+        beforeEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+            useMocks(apiMocks)
+            initKeaTests()
+
+            featureFlagsLogic.mount()
+            experimentsLogic.mount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+            logic = experimentWizardLogic()
+            logic.mount()
+        })
+
+        afterEach(() => {
+            logic?.unmount()
+            createLogic?.unmount()
+            experimentsLogic.unmount()
+            featureFlagsLogic.unmount()
+        })
+
+        it('a later flag load does not auto-link once the initial check is done', async () => {
+            // afterMount fires loadFeatureFlagsForAutocomplete; wait for the first
+            // success to mark the initial check done before a matching key is set.
+            await expectLogic(logic).toDispatchActions(['loadFeatureFlagsSuccess']).toMatchValues({
+                initialFlagCheckDone: true,
+            })
+
+            createLogic.actions.setExperimentValue('feature_flag_key', 'existing-flag')
+
+            // A subsequent flag load (e.g. from the shared selectExistingFeatureFlagModalLogic)
+            // must not retroactively auto-link the now-matching key.
+            await expectLogic(logic, () => {
+                logic.actions.loadFeatureFlagsForAutocomplete()
+            }).toDispatchActions(['loadFeatureFlagsSuccess'])
+
+            await expectLogic(logic).toMatchValues({
+                linkedFeatureFlag: null,
+            })
+        })
+    })
+
+    describe('AnalyticsStep Replay Vision scanner consent gate', () => {
+        let logic: ReturnType<typeof experimentWizardLogic.build>
+        let createLogic: ReturnType<typeof createExperimentLogic.build>
+        let appContextBeforeGrant: AppContext | undefined
+
+        beforeEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+            useMocks(apiMocks)
+            initKeaTests()
+            // The toggle's disabledReason fails closed when the app context carries no access
+            // levels, which would swallow every click; grant what the backend grants an editor.
+            appContextBeforeGrant = window.POSTHOG_APP_CONTEXT
+            window.POSTHOG_APP_CONTEXT = {
+                ...window.POSTHOG_APP_CONTEXT,
+                resource_access_control: {
+                    ...window.POSTHOG_APP_CONTEXT?.resource_access_control,
+                    [AccessControlResourceType.ReplayScanner]: AccessControlLevel.Editor,
+                    [AccessControlResourceType.SessionRecording]: AccessControlLevel.Viewer,
+                },
+            } as AppContext
+
+            featureFlagsLogic.mount()
+            experimentsLogic.mount()
+
+            createLogic = createExperimentLogic()
+            createLogic.mount()
+
+            logic = experimentWizardLogic()
+            logic.mount()
+            featureFlagLogic.actions.setFeatureFlags([], { [FEATURE_FLAGS.VISION_EXPERIMENT_SCANNER]: true })
+        })
+
+        afterEach(() => {
+            cleanup()
+            logic?.unmount()
+            createLogic?.unmount()
+            experimentsLogic.unmount()
+            featureFlagsLogic.unmount()
+            delete (global as any).__consentAccepted
+            // initKeaTests spreads the existing context, so the grant would otherwise leak into
+            // every later test in this file.
+            window.POSTHOG_APP_CONTEXT = appContextBeforeGrant
+        })
+
+        const renderAnalyticsStep = (): void => {
+            render(
+                <BindLogic logic={experimentWizardLogic} props={{}}>
+                    <AnalyticsStep />
+                </BindLogic>
+            )
+        }
+
+        const setArm = (arm: 'control' | 'test'): void => {
+            featureFlagLogic.actions.setFeatureFlags(
+                [FEATURE_FLAGS.EXPERIMENT_WIZARD_REPLAY_VISION_CARD, FEATURE_FLAGS.VISION_EXPERIMENT_SCANNER],
+                {
+                    [FEATURE_FLAGS.EXPERIMENT_WIZARD_REPLAY_VISION_CARD]: arm,
+                    [FEATURE_FLAGS.VISION_EXPERIMENT_SCANNER]: true,
+                }
+            )
+        }
+
+        // `control` keeps the checkbox, `test` shows the card with a toggle
+        const turnOn = async (arm: 'control' | 'test'): Promise<void> => {
+            await userEvent.click(
+                arm === 'test'
+                    ? screen.getByLabelText('Compare what users do in each variant')
+                    : screen.getByText('Compare what users do in each variant')
+            )
+        }
+
+        it.each([
+            { arm: 'control' as const, accepted: false, expectedArmed: false },
+            { arm: 'control' as const, accepted: true, expectedArmed: true },
+            { arm: 'test' as const, accepted: false, expectedArmed: false },
+            { arm: 'test' as const, accepted: true, expectedArmed: true },
+        ])(
+            'in $arm, turning it on with org AI consent $accepted arms the scanner: $expectedArmed',
+            async ({ arm, accepted, expectedArmed }) => {
+                ;(global as any).__consentAccepted = accepted
+                setArm(arm)
+
+                renderAnalyticsStep()
+                await turnOn(arm)
+
+                // Without the gate the unconsented click lands in the logic, and the save path then
+                // creates a scanner the backend refuses with the consent 400.
+                expect(logic.values.createReplayVisionScanner).toBe(expectedArmed)
+                const popoverPrompt = screen.queryByText(/needs your approval/)
+                if (accepted) {
+                    expect(popoverPrompt).not.toBeInTheDocument()
+                } else {
+                    expect(popoverPrompt).toBeInTheDocument()
+                }
+            }
+        )
+
+        it.each(['control' as const, 'test' as const])(
+            'anchors the consent popover to the option in %s',
+            async (arm) => {
+                ;(global as any).__consentAccepted = false
+                setArm(arm)
+
+                renderAnalyticsStep()
+                await turnOn(arm)
+
+                // The popover anchors to its child through a ref. Without one it never gets a position,
+                // so it sits at the top left of the page and its arrow points at nothing.
+                await waitFor(() =>
+                    expect(document.querySelector<HTMLElement>('.Popover__arrow')?.style.left).toMatch(/px$/)
+                )
+            }
+        )
+
+        it.each(['control' as const, 'test' as const])('shows the per-session price in %s', (arm) => {
+            ;(global as any).__consentAccepted = true
+            setArm(arm)
+
+            renderAnalyticsStep()
+
+            expect(screen.getByText(/Each scanned session costs/)).toBeInTheDocument()
+        })
+
+        it('shows the card with a toggle only in the test arm', () => {
+            ;(global as any).__consentAccepted = true
+            setArm('test')
+
+            renderAnalyticsStep()
+
+            expect(screen.getByLabelText('Compare what users do in each variant')).toHaveAttribute('role', 'switch')
+            expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
+            expect(screen.getByText('Learn more about Replay Vision')).toBeInTheDocument()
+        })
+
+        it.each(['control' as const, 'test' as const])(
+            'offers no scanner without the experiment-scanner flag in %s',
+            (arm) => {
+                ;(global as any).__consentAccepted = true
+                featureFlagLogic.actions.setFeatureFlags([FEATURE_FLAGS.EXPERIMENT_WIZARD_REPLAY_VISION_CARD], {
+                    [FEATURE_FLAGS.EXPERIMENT_WIZARD_REPLAY_VISION_CARD]: arm,
+                })
+
+                renderAnalyticsStep()
+
+                expect(screen.queryByText(/Each scanned session costs/)).not.toBeInTheDocument()
+            }
+        )
+    })
+})

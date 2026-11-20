@@ -1,0 +1,124 @@
+import { Counter, Histogram } from 'prom-client'
+
+export type ClickHousePasswordFallbackReason = 'unreadable' | 'empty' | 'expired'
+
+export class RecordingApiMetrics {
+    private static readonly getBlockDuration = new Histogram({
+        name: 'recording_api_get_block_duration_seconds',
+        help: 'Time taken to serve a getBlock request (S3 fetch + decrypt + optional decompress)',
+        labelNames: ['result', 'session_state', 'decompress'],
+        buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    })
+
+    private static readonly keyStoreDuration = new Histogram({
+        name: 'recording_api_keystore_duration_seconds',
+        help: 'Time taken by one call to the KMS and DynamoDB key store, below the Redis cache',
+        labelNames: ['operation', 'result'],
+        buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 10],
+    })
+
+    private static readonly deleteRecordingsDuration = new Histogram({
+        name: 'recording_api_delete_recordings_duration_seconds',
+        help: 'Time taken to delete recordings',
+        labelNames: ['result'],
+        buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+    })
+
+    public static observeKeyStore(
+        operation: 'generate' | 'get' | 'delete',
+        result: 'ok' | 'error',
+        seconds: number
+    ): void {
+        this.keyStoreDuration.observe({ operation, result }, seconds)
+    }
+
+    public static observeGetBlock(
+        result: string,
+        seconds: number,
+        sessionState: string,
+        decompress: boolean = false
+    ): void {
+        this.getBlockDuration
+            .labels({ result, session_state: sessionState, decompress: String(decompress) })
+            .observe(seconds)
+    }
+
+    private static readonly recordingsDeleted = new Counter({
+        name: 'recording_api_recordings_deleted_total',
+        help: 'Number of recordings deleted via the recording API',
+        labelNames: ['status'],
+    })
+
+    private static readonly cleanupFailures = new Counter({
+        name: 'recording_api_delete_cleanup_failures_total',
+        help: 'Cleanup step failures after successful key shred',
+        labelNames: ['step'],
+    })
+
+    public static observeDeleteRecordings(result: string, seconds: number): void {
+        this.deleteRecordingsDuration.labels({ result }).observe(seconds)
+    }
+
+    public static incrementRecordingsDeleted(
+        status: 'deleted' | 'already_deleted' | 'failed',
+        count: number = 1
+    ): void {
+        this.recordingsDeleted.labels({ status }).inc(count)
+    }
+
+    private static readonly listBlocksDuration = new Histogram({
+        name: 'recording_api_list_blocks_duration_seconds',
+        help: 'Time taken to list blocks for a session from ClickHouse',
+        labelNames: ['result'],
+        buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    })
+
+    public static observeListBlocks(result: 'success' | 'empty' | 'error', seconds: number): void {
+        this.listBlocksDuration.labels({ result }).observe(seconds)
+    }
+
+    public static incrementCleanupFailure(step: 'kafka' | 'postgres' | 'activity_log'): void {
+        this.cleanupFailures.labels({ step }).inc()
+    }
+
+    private static readonly clickhousePasswordFallbacks = new Counter({
+        name: 'recording_api_clickhouse_password_fallback_total',
+        help: 'ClickHouse queries that sent the static password instead of the token file',
+        labelNames: ['reason'],
+    })
+
+    public static incrementClickhousePasswordFallback(reason: ClickHousePasswordFallbackReason): void {
+        this.clickhousePasswordFallbacks.labels({ reason }).inc()
+    }
+
+    private static readonly replayBlockRequests = new Counter({
+        name: 'recording_api_replay_block_requests_total',
+        help: 'Browser block route requests by outcome',
+        labelNames: ['result'],
+    })
+
+    public static incrementReplayBlockRequest(
+        result:
+            | 'ok'
+            | 'not_found'
+            | 'deleted'
+            | 'too_large'
+            | 'busy'
+            | 'rate_limited'
+            | 'rate_limited_log_only'
+            | 'rate_limit_unavailable'
+            | 'error'
+    ): void {
+        this.replayBlockRequests.labels({ result }).inc()
+    }
+
+    private static readonly jwtVerificationFailures = new Counter({
+        name: 'recording_api_jwt_verification_failures_total',
+        help: 'Bearer tokens refused by signature, expiry or claims checks',
+        labelNames: ['audience', 'reason'],
+    })
+
+    public static incrementJwtVerificationFailure(audience: string, reason: string): void {
+        this.jwtVerificationFailures.labels({ audience, reason }).inc()
+    }
+}

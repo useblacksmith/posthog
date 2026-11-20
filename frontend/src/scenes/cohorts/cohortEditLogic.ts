@@ -1,0 +1,1607 @@
+import {
+    MakeLogicType,
+    actions,
+    afterMount,
+    beforeUnmount,
+    connect,
+    isBreakpoint,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    reducers,
+    selectors,
+} from 'kea'
+import { forms } from 'kea-forms'
+import type { DeepPartial, DeepPartialMap, FieldName, ValidationErrorType } from 'kea-forms'
+import { loaders } from 'kea-loaders'
+import { actionToUrl, router, urlToAction } from 'kea-router'
+import posthog from 'posthog-js'
+import { v4 as uuidv4 } from 'uuid'
+
+import api from 'lib/api'
+import { ApiError } from 'lib/api-error'
+import { tryShowMCPHint } from 'lib/components/MCPHint/mcpHintLogic'
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
+import { ENTITY_MATCH_TYPE, FEATURE_FLAGS } from 'lib/constants'
+import { scrollToFormError } from 'lib/forms/scrollToFormError'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { FeatureFlagsSet, featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { preflightLogic } from 'lib/logic/preflightLogic'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { getCurrentTeamId } from 'lib/utils/getAppContext'
+import { objectsEqual } from 'lib/utils/objects'
+import { isOperatorDate } from 'lib/utils/operators'
+import { COHORT_USED_BY_WORKFLOWS_ERROR_CODE, loadBlockingWorkflows } from 'scenes/cohorts/cohortBlockingWorkflows'
+import { cohortBlockingWorkflowsModalLogic } from 'scenes/cohorts/cohortBlockingWorkflowsModalLogic'
+import { NEW_COHORT, NEW_CRITERIA, NEW_CRITERIA_GROUP } from 'scenes/cohorts/CohortFilters/constants'
+import { BehavioralFilterKey } from 'scenes/cohorts/CohortFilters/types'
+import { emailCohortToastButton } from 'scenes/cohorts/cohortSavedToast'
+import {
+    applyAllCriteriaGroup,
+    cohortBroadcastDisabledReason,
+    applyAllNestedCriteria,
+    cleanCriteria,
+    createCohortDataNodeLogicKey,
+    createCohortFormData,
+    isCohortCriteriaGroup,
+    isPersonOperatorShown,
+    validateGroup,
+    cohortCsvMaxBytes,
+    cohortCsvTooLargeMessage,
+} from 'scenes/cohorts/cohortUtils'
+import { processCohort } from 'scenes/cohorts/processCohort'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { refreshTreeItem } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
+import { cohortsModel } from '~/models/cohortsModel'
+import { propertyDefinitionsModel } from '~/models/propertyDefinitionsModel'
+import { dataNodeLogic } from '~/queries/nodes/DataNode/dataNodeLogic'
+import { isDataTableNode } from '~/queries/schema/node-guards'
+import { ActorsQuery, DataTableNode, HogQLQuery, Node, NodeKind } from '~/queries/schema/schema-general'
+import {
+    AnyCohortCriteriaType,
+    AnyCohortGroupType,
+    AnyPersonScopeFilter,
+    CohortCriteriaGroupFilter,
+    CohortGroupType,
+    CohortType,
+    FilterLogicalOperator,
+    PropertyDefinitionType,
+    PropertyFilterType,
+    PropertyOperator,
+    PropertyType,
+} from '~/types'
+
+import { cohortsRealtimeCreate, cohortsUsedInRetrieve } from 'products/cohorts/frontend/generated/api'
+import type {
+    CohortApi,
+    CohortRealtimeReadinessApi,
+    CohortUsedInResponseApi,
+} from 'products/cohorts/frontend/generated/api.schemas'
+import type { CohortRealtimeSwitchAction } from 'products/cohorts/frontend/realtime/CohortRealtimeStatus'
+import {
+    READINESS_GRACE_POLLS,
+    REALTIME_POLL_INTERVAL_MS,
+    isBuildingHistory,
+} from 'products/cohorts/frontend/realtime/realtimeReadiness'
+import { personsLogic } from 'products/persons/frontend/logics/personsLogic'
+
+import type { CohortTypeEnumApi } from '../../../../products/cohorts/frontend/generated/api.schemas'
+import type { UserBasicType } from '../../types'
+import type { PreflightStatus } from '../../types'
+
+export type CohortLogicProps = {
+    id?: CohortType['id']
+}
+
+export type StaticCohortMode = 'criteria' | 'people'
+
+export type CohortEditTab = 'overview' | 'history'
+
+const isCohortEditTab = (value: unknown): value is CohortEditTab => value === 'overview' || value === 'history'
+
+const PAYLOAD_TOO_LARGE_STATUS = 413
+
+const checkIsPendingCalculation = (cohort: CohortType): boolean =>
+    cohort.pending_version != null &&
+    (cohort.version == null || cohort.pending_version !== cohort.version) &&
+    // A pending version that never catches up because every attempt failed is not pending, it's
+    // failed. Without this, `version` stays stuck behind `pending_version` forever (it only advances
+    // on success), so the cohort would show "pending" indefinitely and mask the calculation error.
+    // A genuine in-progress retry still flips `is_calculating`, which keeps the calculating banner up.
+    !cohort.errors_calculating
+
+const hasFilterCriteria = (cohort: CohortType): boolean =>
+    Array.isArray(cohort.filters?.properties?.values) && cohort.filters.properties.values.length > 0
+
+const inferStaticCohortMode = (cohort: CohortType): StaticCohortMode =>
+    cohort.id === 'new' || cohort.id == null
+        ? 'people'
+        : cohort.is_static && hasFilterCriteria(cohort)
+          ? 'criteria'
+          : 'people'
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface cohortEditLogicValues {
+    featureFlags: FeatureFlagsSet // featureFlagLogic
+    preflight: PreflightStatus | null // preflightLogic
+    currentProjectId: number | string // teamLogic
+    activeTab: CohortEditTab
+    canRemovePersonFromCohort: boolean | undefined
+    cohort: CohortType
+    cohortAllErrors: Record<string, any>
+    cohortChanged: boolean
+    cohortErrors: DeepPartialMap<CohortType, ValidationErrorType>
+    cohortHasErrors: boolean
+    cohortLoading: boolean
+    cohortManualErrors: Record<string, any>
+    cohortMissing: boolean
+    cohortTouched: boolean
+    cohortTouches: Record<string, boolean>
+    cohortValidationErrors: DeepPartialMap<CohortType, ValidationErrorType>
+    creationPersonQuery: ActorsQuery
+    csvMaxBytes: number
+    csvUploadModalOpen: boolean
+    duplicatedCohort: CohortType | null
+    duplicatedCohortLoading: boolean
+    effectiveQuery: DataTableNode
+    hasAddUsersMenu: boolean
+    isCalculatingOrPending: boolean
+    isCohortSubmitting: boolean
+    isCohortValid: boolean
+    isPendingCalculation: boolean
+    persistedColumns: string[] | null
+    personsToCreateStaticCohort: Record<string, string | null>
+    pollTimeout: number | null
+    query: DataTableNode
+    realtimeSwitch: CohortApi | null
+    realtimeSwitchAction: CohortRealtimeSwitchAction | null
+    realtimeSwitchLoading: boolean
+    showCohortErrors: boolean
+    staticCohortMode: StaticCohortMode
+    usedIn: CohortUsedInResponseApi | null
+    usedInExpanded: boolean
+    usedInLoading: boolean
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface cohortEditLogicActions {
+    openBlockingWorkflowsModal: (
+        blocking: import('scenes/cohorts/cohortBlockingWorkflowsModalLogic').CohortBlockingWorkflows
+    ) => {
+        blocking: import('scenes/cohorts/cohortBlockingWorkflowsModalLogic').CohortBlockingWorkflows
+    } // cohortBlockingWorkflowsModalLogic
+    reportExperimentExposureCohortEdited: (
+        existingCohort: CohortType,
+        newCohort: CohortType
+    ) => {
+        existingCohort: CohortType
+        newCohort: CohortType
+    } // eventUsageLogic
+    refreshCurrentTeam: () => any // teamLogic
+    addFilter: (groupIndex?: number) => {
+        groupIndex: number | undefined
+    }
+    addPersonToCreateStaticCohort: (
+        personId: string,
+        displayName: string | null
+    ) => {
+        displayName: string | null
+        personId: string
+    }
+    armRealtimeReadinessPoll: () => {
+        value: true
+    }
+    checkIfFinishedCalculating: (cohort: CohortType) => {
+        cohort: CohortType
+    }
+    deleteCohort: () => {
+        value: true
+    }
+    duplicateCohort: (asStatic: boolean) => {
+        asStatic: boolean
+    }
+    duplicateCohortFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    duplicateCohortSuccess: (
+        duplicatedCohort: CohortType | null,
+        payload?: {
+            asStatic: boolean
+        }
+    ) => {
+        duplicatedCohort: CohortType | null
+        payload?: {
+            asStatic: boolean
+        }
+    }
+    duplicateFilter: (
+        groupIndex: number,
+        criteriaIndex?: number
+    ) => {
+        criteriaIndex: number | undefined
+        groupIndex: number
+    }
+    fetchCohort: (id: CohortType['id']) => {
+        id: number | 'new'
+    }
+    fetchCohortFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    fetchCohortSuccess: (
+        cohort: CohortType,
+        payload?: {
+            id: number | 'new'
+        }
+    ) => {
+        cohort: CohortType
+        payload?: {
+            id: number | 'new'
+        }
+    }
+    loadUsedIn: () => any
+    loadUsedInFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadUsedInSuccess: (
+        usedIn: CohortUsedInResponseApi | null,
+        payload?: any
+    ) => {
+        usedIn: CohortUsedInResponseApi | null
+        payload?: any
+    }
+    onCriteriaChange: (
+        newGroup: Partial<CohortGroupType>,
+        id: string
+    ) => {
+        id: string
+        newGroup: Partial<CohortGroupType>
+    }
+    onCriteriaChangeFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    onCriteriaChangeSuccess: (
+        cohort: CohortType,
+        payload?: {
+            id: string
+            newGroup: Partial<CohortGroupType>
+        }
+    ) => {
+        cohort: CohortType
+        payload?: {
+            id: string
+            newGroup: Partial<CohortGroupType>
+        }
+    }
+    pollRealtimeReadiness: () => {
+        value: true
+    }
+    refreshPersonsData: () => {
+        value: true
+    }
+    removeFilter: (
+        groupIndex: number,
+        criteriaIndex?: number
+    ) => {
+        criteriaIndex: number | undefined
+        groupIndex: number
+    }
+    removePersonFromCohort: (personId: string) => {
+        personId: string
+    }
+    removePersonFromCreateStaticCohort: (personId: string) => {
+        personId: string
+    }
+    resetCohort: (values?: CohortType) => {
+        values?: CohortType
+    }
+    resetPersonsToCreateStaticCohort: () => {
+        value: true
+    }
+    restoreCohort: () => {
+        value: true
+    }
+    restoreCohortFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    restoreCohortSuccess: (
+        cohort: CohortType,
+        payload?: {
+            value: true
+        }
+    ) => {
+        cohort: CohortType
+        payload?: {
+            value: true
+        }
+    }
+    saveCohort: (
+        cohortParams?: any,
+        csvOnlyFormData?: FormData
+    ) => {
+        cohortParams: any
+        csvOnlyFormData: FormData | undefined
+    }
+    saveCohortFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    saveCohortSuccess: (
+        cohort: CohortType,
+        payload?: {
+            cohortParams: any
+            csvOnlyFormData: FormData | undefined
+        }
+    ) => {
+        cohort: CohortType
+        payload?: {
+            cohortParams: any
+            csvOnlyFormData: FormData | undefined
+        }
+    }
+    setActiveTab: (tab: CohortEditTab) => {
+        tab: CohortEditTab
+    }
+    setCohort: (cohort: CohortType) => {
+        cohort: CohortType
+    }
+    setCohortFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    setCohortManualErrors: (errors: Record<string, any>) => {
+        errors: Record<string, any>
+    }
+    setCohortMissing: () => {
+        value: true
+    }
+    setCohortSuccess: (
+        cohort: CohortType,
+        payload?: {
+            cohort: CohortType
+        }
+    ) => {
+        cohort: CohortType
+        payload?: {
+            cohort: CohortType
+        }
+    }
+    setCohortValue: (
+        key: FieldName,
+        value: any
+    ) => {
+        name: FieldName
+        value: any
+    }
+    setCohortValues: (values: DeepPartial<CohortType>) => {
+        values: DeepPartial<CohortType>
+    }
+    setCreationPersonQuery: (query: ActorsQuery) => {
+        query: ActorsQuery
+    }
+    setCriteria: (
+        newCriteria: AnyCohortCriteriaType,
+        groupIndex: number,
+        criteriaIndex: number
+    ) => {
+        criteriaIndex: number
+        groupIndex: number
+        newCriteria: AnyCohortCriteriaType
+    }
+    setCsvUploadModalOpen: (open: boolean) => {
+        open: boolean
+    }
+    setFilterTestAccounts: (filterTestAccounts: boolean) => {
+        filterTestAccounts: boolean
+    }
+    setInnerGroupType: (
+        type: FilterLogicalOperator,
+        groupIndex: number
+    ) => {
+        groupIndex: number
+        type: FilterLogicalOperator
+    }
+    setOuterGroupsType: (type: FilterLogicalOperator) => {
+        type: FilterLogicalOperator
+    }
+    setPollTimeout: (pollTimeout: number | null) => {
+        pollTimeout: number | null
+    }
+    setQuery: (query: Node) => {
+        query: Node<Record<string, any>>
+    }
+    setRealtimeReadiness: (realtime: CohortType['realtime']) => {
+        realtime: CohortRealtimeReadinessApi | null | undefined
+    }
+    setRealtimeSwitch: (
+        realtimeEnabled: boolean,
+        realtime: CohortType['realtime']
+    ) => {
+        realtime: CohortRealtimeReadinessApi | null | undefined
+        realtimeEnabled: boolean
+    }
+    setStaticCohortMode: (mode: StaticCohortMode) => {
+        mode: StaticCohortMode
+    }
+    setUsedInExpanded: (expanded: boolean) => {
+        expanded: boolean
+    }
+    submitCohort: () => {
+        value: boolean
+    }
+    submitCohortFailure: (
+        error: Error,
+        errors: Record<string, any>
+    ) => {
+        error: Error
+        errors: Record<string, any>
+    }
+    submitCohortRequest: (cohort: CohortType) => {
+        cohort: CohortType
+    }
+    submitCohortSuccess: (cohort: CohortType) => {
+        cohort: CohortType
+    }
+    switchRealtime: (enabled: boolean) => boolean
+    switchRealtimeFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    switchRealtimeSuccess: (
+        realtimeSwitch: CohortApi,
+        payload?: boolean
+    ) => {
+        realtimeSwitch: CohortApi
+        payload?: boolean
+    }
+    touchCohortField: (key: string) => {
+        key: string
+    }
+    updateCohortCount: () => {
+        value: true
+    }
+    updateCohortCountFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    updateCohortCountSuccess: (
+        cohort: {
+            _create_in_folder?: string | null | undefined
+            _create_static_person_ids?: string[] | undefined
+            cohort_type?: CohortTypeEnumApi | '' | null | undefined
+            count: number | undefined
+            created_at?: string | undefined
+            created_by?: UserBasicType | null | undefined
+            csv?: File | undefined
+            deleted?: boolean | undefined
+            description?: string | undefined
+            errors_calculating?: number | undefined
+            experiment_set?: number[] | undefined
+            filters: {
+                filterTestAccounts?: boolean | undefined
+                properties: CohortCriteriaGroupFilter
+            }
+            groups: CohortGroupType[]
+            id: number | 'new'
+            is_calculating?: boolean | undefined
+            is_static?: boolean | undefined
+            last_calculation?: string | undefined
+            last_error_message?: string | null | undefined
+            last_import_total_count?: number | null | undefined
+            last_import_unmatched_count?: number | null | undefined
+            name?: string | undefined
+            pending_version?: number | null | undefined
+            realtime?: CohortRealtimeReadinessApi | null | undefined
+            realtime_enabled?: boolean | undefined
+            version?: number | null | undefined
+        },
+        payload?: {
+            value: true
+        }
+    ) => {
+        cohort: {
+            _create_in_folder?: string | null | undefined
+            _create_static_person_ids?: string[] | undefined
+            cohort_type?: CohortTypeEnumApi | '' | null | undefined
+            count: number | undefined
+            created_at?: string | undefined
+            created_by?: UserBasicType | null | undefined
+            csv?: File | undefined
+            deleted?: boolean | undefined
+            description?: string | undefined
+            errors_calculating?: number | undefined
+            experiment_set?: number[] | undefined
+            filters: {
+                filterTestAccounts?: boolean | undefined
+                properties: CohortCriteriaGroupFilter
+            }
+            groups: CohortGroupType[]
+            id: number | 'new'
+            is_calculating?: boolean | undefined
+            is_static?: boolean | undefined
+            last_calculation?: string | undefined
+            last_error_message?: string | null | undefined
+            last_import_total_count?: number | null | undefined
+            last_import_unmatched_count?: number | null | undefined
+            name?: string | undefined
+            pending_version?: number | null | undefined
+            realtime?: CohortRealtimeReadinessApi | null | undefined
+            realtime_enabled?: boolean | undefined
+            version?: number | null | undefined
+        }
+        payload?: {
+            value: true
+        }
+    }
+    uploadCohortCsv: () => {
+        value: true
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface cohortEditLogicMeta {
+    key: number | 'new'
+    __keaTypeGenInternalSelectorTypes: {
+        effectiveQuery: (query: DataTableNode, persistedColumns: string[] | null) => DataTableNode
+        canRemovePersonFromCohort: (cohort: CohortType) => boolean | undefined
+        isPendingCalculation: (cohort: CohortType) => boolean
+        csvMaxBytes: (preflight: PreflightStatus | null) => number
+        hasAddUsersMenu: (cohort: CohortType, staticCohortMode: StaticCohortMode) => boolean
+        isCalculatingOrPending: (cohort: CohortType, isPendingCalculation: boolean) => boolean
+        realtimeSwitchAction: (cohort: CohortType, featureFlags: FeatureFlagsSet) => CohortRealtimeSwitchAction | null
+    }
+}
+
+export type cohortEditLogicType = MakeLogicType<
+    cohortEditLogicValues,
+    cohortEditLogicActions,
+    CohortLogicProps,
+    cohortEditLogicMeta
+>
+
+// A draft cohort has no id, so the persons table gets no cohort filter until `setCohort` supplies
+// a saved id. A filter with a missing id serializes to null, which the API rejects.
+function cohortFixedProperties(id: CohortType['id'] | undefined): AnyPersonScopeFilter[] {
+    return typeof id === 'number'
+        ? [{ type: PropertyFilterType.Cohort, key: 'id', value: id, operator: PropertyOperator.In }]
+        : []
+}
+
+export const cohortEditLogic = kea<cohortEditLogicType>([
+    props({} as CohortLogicProps),
+    key((props) => (props.id === 'new' || !props.id ? 'new' : props.id)),
+    path(['scenes', 'cohorts', 'cohortLogicEdit']),
+    connect(() => ({
+        values: [teamLogic, ['currentProjectId'], preflightLogic, ['preflight'], featureFlagLogic, ['featureFlags']],
+        actions: [
+            teamLogic,
+            ['refreshCurrentTeam'],
+            eventUsageLogic,
+            ['reportExperimentExposureCohortEdited'],
+            cohortBlockingWorkflowsModalLogic,
+            ['openBlockingWorkflowsModal'],
+        ],
+        logic: [cohortsModel],
+    })),
+
+    actions({
+        saveCohort: (cohortParams = {}, csvOnlyFormData?: FormData) => ({ cohortParams, csvOnlyFormData }),
+        setCohort: (cohort: CohortType) => ({ cohort }),
+        deleteCohort: true,
+        restoreCohort: true,
+        fetchCohort: (id: CohortType['id']) => ({ id }),
+        setCohortMissing: true,
+        onCriteriaChange: (newGroup: Partial<CohortGroupType>, id: string) => ({ newGroup, id }),
+        setPollTimeout: (pollTimeout: number | null) => ({ pollTimeout }),
+        checkIfFinishedCalculating: (cohort: CohortType) => ({ cohort }),
+        armRealtimeReadinessPoll: true,
+        pollRealtimeReadiness: true,
+        setRealtimeReadiness: (realtime: CohortType['realtime']) => ({ realtime }),
+        setRealtimeSwitch: (realtimeEnabled: boolean, realtime: CohortType['realtime']) => ({
+            realtimeEnabled,
+            realtime,
+        }),
+
+        setOuterGroupsType: (type: FilterLogicalOperator) => ({ type }),
+        setFilterTestAccounts: (filterTestAccounts: boolean) => ({ filterTestAccounts }),
+        setInnerGroupType: (type: FilterLogicalOperator, groupIndex: number) => ({ type, groupIndex }),
+        duplicateFilter: (groupIndex: number, criteriaIndex?: number) => ({ groupIndex, criteriaIndex }),
+        addFilter: (groupIndex?: number) => ({ groupIndex }),
+        removeFilter: (groupIndex: number, criteriaIndex?: number) => ({ groupIndex, criteriaIndex }),
+        setCriteria: (newCriteria: AnyCohortCriteriaType, groupIndex: number, criteriaIndex: number) => ({
+            newCriteria,
+            groupIndex,
+            criteriaIndex,
+        }),
+        setQuery: (query: Node) => ({ query }),
+        duplicateCohort: (asStatic: boolean) => ({ asStatic }),
+        updateCohortCount: true,
+        uploadCohortCsv: true,
+        setCreationPersonQuery: (query: ActorsQuery) => ({ query }),
+        addPersonToCreateStaticCohort: (personId: string, displayName: string | null) => ({ personId, displayName }),
+        removePersonFromCreateStaticCohort: (personId: string) => ({ personId }),
+        removePersonFromCohort: (personId: string) => ({ personId }),
+        resetPersonsToCreateStaticCohort: true,
+        refreshPersonsData: true,
+        setStaticCohortMode: (mode: StaticCohortMode) => ({ mode }),
+        setActiveTab: (tab: CohortEditTab) => ({ tab }),
+        setUsedInExpanded: (expanded: boolean) => ({ expanded }),
+        setCsvUploadModalOpen: (open: boolean) => ({ open }),
+    }),
+
+    reducers(({ props }) => ({
+        cohort: [
+            NEW_COHORT,
+            {
+                setRealtimeReadiness: (state, { realtime }) => ({ ...state, realtime }),
+                setRealtimeSwitch: (state, { realtimeEnabled, realtime }) => ({
+                    ...state,
+                    realtime_enabled: realtimeEnabled,
+                    realtime,
+                }),
+                setOuterGroupsType: (state, { type }) => ({
+                    ...state,
+                    filters: {
+                        ...state.filters,
+                        properties: {
+                            ...state.filters.properties,
+                            type,
+                        },
+                    },
+                }),
+                setFilterTestAccounts: (state, { filterTestAccounts }) => ({
+                    ...state,
+                    filters: {
+                        ...state.filters,
+                        filterTestAccounts,
+                    },
+                }),
+                setInnerGroupType: (state, { type, groupIndex }) =>
+                    applyAllCriteriaGroup(
+                        state,
+                        (groupList) =>
+                            groupList.map((group, groupI) =>
+                                groupI === groupIndex ? { ...group, type } : group
+                            ) as CohortCriteriaGroupFilter[]
+                    ),
+                duplicateFilter: (state, { groupIndex, criteriaIndex }) => {
+                    if (criteriaIndex !== undefined) {
+                        return applyAllNestedCriteria(
+                            state,
+                            (criteriaList) => [
+                                ...criteriaList.slice(0, criteriaIndex),
+                                {
+                                    ...criteriaList[criteriaIndex],
+                                    sort_key: uuidv4(),
+                                },
+                                ...criteriaList.slice(criteriaIndex),
+                            ],
+                            groupIndex
+                        )
+                    }
+                    return applyAllCriteriaGroup(state, (groupList) => [
+                        ...groupList.slice(0, groupIndex),
+                        {
+                            ...groupList[groupIndex],
+                            sort_key: uuidv4(),
+                        },
+                        ...groupList.slice(groupIndex),
+                    ])
+                },
+                addFilter: (state, { groupIndex }) => {
+                    if (groupIndex !== undefined) {
+                        return applyAllNestedCriteria(
+                            state,
+                            (criteriaList) => [...criteriaList, { ...NEW_CRITERIA, sort_key: uuidv4() }],
+                            groupIndex
+                        )
+                    }
+                    return applyAllCriteriaGroup(state, (groupList) => [
+                        ...groupList,
+                        { ...NEW_CRITERIA_GROUP, sort_key: uuidv4() },
+                    ])
+                },
+                removeFilter: (state, { groupIndex, criteriaIndex }) => {
+                    if (criteriaIndex !== undefined) {
+                        return applyAllNestedCriteria(
+                            state,
+                            (criteriaList) => [
+                                ...criteriaList.slice(0, criteriaIndex),
+                                ...criteriaList.slice(criteriaIndex + 1),
+                            ],
+                            groupIndex
+                        )
+                    }
+                    return applyAllCriteriaGroup(state, (groupList) => [
+                        ...groupList.slice(0, groupIndex),
+                        ...groupList.slice(groupIndex + 1),
+                    ])
+                },
+                setCriteria: (state, { newCriteria, groupIndex, criteriaIndex }) =>
+                    applyAllNestedCriteria(
+                        state,
+                        (criteriaList) =>
+                            criteriaList.map((oldCriteria, criteriaI) =>
+                                isCohortCriteriaGroup(oldCriteria)
+                                    ? oldCriteria
+                                    : criteriaI === criteriaIndex
+                                      ? cleanCriteria({ ...oldCriteria, ...newCriteria })
+                                      : oldCriteria
+                            ),
+                        groupIndex
+                    ),
+            },
+        ],
+        cohortMissing: [
+            false,
+            {
+                setCohortMissing: () => true,
+            },
+        ],
+        pollTimeout: [
+            null as number | null,
+            {
+                setPollTimeout: (_, { pollTimeout }) => pollTimeout,
+            },
+        ],
+        query: [
+            {
+                kind: NodeKind.DataTableNode,
+                source: {
+                    kind: NodeKind.ActorsQuery,
+                    fixedProperties: cohortFixedProperties(props.id),
+                },
+                full: true,
+                showPropertyFilter: false,
+                showEventFilter: false,
+                ...(props.id && props.id !== 'new'
+                    ? { showPersistentColumnConfigurator: true, contextKey: `cohort:${props.id}` }
+                    : {}),
+            } as DataTableNode,
+            {
+                setQuery: (state, { query }) => (isDataTableNode(query) ? query : state),
+                setCohort: (state, { cohort }) => {
+                    const source = state.source as ActorsQuery
+                    const defaultSelect = cohort.is_static
+                        ? ['person_display_name -- Person', 'id', 'created_at', 'person.$delete']
+                        : ['person_display_name -- Person', 'id', 'created_at']
+                    return {
+                        ...state,
+                        source: {
+                            ...source,
+                            select: source.select ?? defaultSelect,
+                            fixedProperties: cohortFixedProperties(cohort.id),
+                        },
+                    }
+                },
+            },
+        ],
+        // User's column selection for this cohort's persons table, persisted per-cohort in
+        // localStorage. Lets a refresh restore the columns even when the user hasn't saved them
+        // as a team-wide default. This is a local-only fallback that sits alongside the
+        // server-side column persistence in `columnConfiguratorLogic` (the persons table sets
+        // `showPersistentColumnConfigurator` and `contextKey: cohort:<id>` in the query above) —
+        // if you're extending column persistence, prefer doing it there.
+        persistedColumns: [
+            null as string[] | null,
+            {
+                persist: true,
+                // Scope by team so columns don't leak across projects (e.g. after impersonation).
+                storageKey: `scenes.cohorts.cohortEditLogic.${getCurrentTeamId()}.${props.id}.persistedColumns`,
+            },
+            {
+                setQuery: (state, { query }) => {
+                    // Don't capture for unsaved drafts — every new cohort shares the 'new' logic
+                    // key, so persisting here would bleed columns from one draft into the next.
+                    if (!props.id || props.id === 'new' || !isDataTableNode(query)) {
+                        return state
+                    }
+                    return (query.source as ActorsQuery).select ?? state
+                },
+            },
+        ],
+        creationPersonQuery: [
+            {
+                kind: NodeKind.ActorsQuery,
+                fixedProperties: [],
+                select: ['id', 'person_display_name -- Person'],
+            } as ActorsQuery,
+            {
+                setCreationPersonQuery: (_state, { query }) => query,
+            },
+        ],
+        personsToCreateStaticCohort: [
+            {} as Record<string, string | null>,
+            {
+                addPersonToCreateStaticCohort: (state, { personId, displayName }) => ({
+                    ...state,
+                    [personId]: displayName,
+                }),
+                removePersonFromCreateStaticCohort: (state, { personId }) => {
+                    const newState = { ...state }
+                    delete newState[personId]
+                    return newState
+                },
+                resetPersonsToCreateStaticCohort: () => ({}),
+            },
+        ],
+        staticCohortMode: [
+            'people' as StaticCohortMode,
+            {
+                setCohort: (_, { cohort }) => inferStaticCohortMode(cohort),
+                setStaticCohortMode: (_, { mode }) => mode,
+            },
+        ],
+        activeTab: [
+            'overview' as CohortEditTab,
+            {
+                setActiveTab: (_, { tab }) => tab,
+            },
+        ],
+        usedInExpanded: [
+            false,
+            {
+                setUsedInExpanded: (_, { expanded }) => expanded,
+            },
+        ],
+        csvUploadModalOpen: [
+            false,
+            {
+                setCsvUploadModalOpen: (_, { open }) => open,
+                // A failed save returns the cohort with the CSV still attached, so the modal stays open for a retry.
+                saveCohortSuccess: (state, { cohort }) => (cohort.csv ? state : false),
+            },
+        ],
+    })),
+
+    selectors({
+        // The persons table query with the user's persisted column selection applied. Deriving
+        // this in a selector (instead of dispatching a corrective `setQuery` from a listener)
+        // avoids a render with default columns before the persisted ones kick in.
+        effectiveQuery: [
+            (s) => [s.query, s.persistedColumns],
+            (query: DataTableNode, persistedColumns: string[] | null): DataTableNode => {
+                if (persistedColumns && isDataTableNode(query)) {
+                    const source = query.source as ActorsQuery
+                    if (!objectsEqual(source.select, persistedColumns)) {
+                        return { ...query, source: { ...source, select: persistedColumns } }
+                    }
+                }
+                return query
+            },
+        ],
+        canRemovePersonFromCohort: [
+            (s) => [s.cohort],
+            (cohort: CohortType) => {
+                return cohort.is_static && typeof cohort.id === 'number'
+            },
+        ],
+        isPendingCalculation: [(s) => [s.cohort], (cohort: CohortType) => checkIsPendingCalculation(cohort)],
+        csvMaxBytes: [(s) => [s.preflight], (preflight: PreflightStatus | null) => cohortCsvMaxBytes(preflight)],
+        // Single source for when the add-users controls collapse into a menu, read by both the
+        // title actions in CohortEdit and the Edit menu in CohortSceneMenuBar.
+        hasAddUsersMenu: [
+            (s) => [s.cohort, s.staticCohortMode],
+            (cohort: CohortType, staticCohortMode: StaticCohortMode) =>
+                typeof cohort.id === 'number' &&
+                !!cohort.is_static &&
+                staticCohortMode === 'people' &&
+                (cohort.count ?? 0) > 0,
+        ],
+        isCalculatingOrPending: [
+            (s) => [s.cohort, s.isPendingCalculation],
+            (cohort: CohortType, isPendingCalculation: boolean) => {
+                return cohort.is_calculating || isPendingCalculation
+            },
+        ],
+        realtimeSwitchAction: [
+            (s) => [s.cohort, s.featureFlags],
+            (cohort: CohortType, featureFlags: FeatureFlagsSet): CohortRealtimeSwitchAction | null => {
+                switch (cohort.realtime?.state) {
+                    case 'off':
+                        return 'turn_on'
+                    case 'ready':
+                    case 'building':
+                    case 'rebuilding':
+                    case 'needs_attention':
+                        return 'turn_off'
+                    case 'person_properties':
+                        // A cohort that is on counts against the plan's limit, so anyone who sees it can turn it off.
+                        if (cohort.realtime_enabled) {
+                            return 'turn_off'
+                        }
+                        // Flags read person criteria straight off the person, so only workflows read this
+                        // cohort's realtime membership. A cohort whose criteria can't be realtime can't be turned on.
+                        if (
+                            !featureFlags[FEATURE_FLAGS.WORKFLOWS_COHORT_CONDITIONS] ||
+                            cohort.cohort_type !== 'realtime'
+                        ) {
+                            return null
+                        }
+                        return 'turn_on'
+                    default:
+                        return null
+                }
+            },
+        ],
+    }),
+
+    forms(({ actions, values }) => ({
+        cohort: {
+            defaults: NEW_COHORT,
+            errors: ({ name, is_static, filters, csv }) => ({
+                name: !name ? 'Cohort name cannot be empty' : undefined,
+                csv:
+                    is_static && csv && csv.size > values.csvMaxBytes
+                        ? cohortCsvTooLargeMessage(values.csvMaxBytes)
+                        : undefined,
+                filters: {
+                    properties: {
+                        values:
+                            is_static && values.staticCohortMode !== 'criteria'
+                                ? undefined
+                                : filters.properties.values.map((group, index, groups) =>
+                                      validateGroup(
+                                          group,
+                                          filters.properties.type,
+                                          groups.filter((_, i) => i !== index)
+                                      )
+                                  ),
+                    },
+                },
+            }),
+            submit: (cohort) => {
+                // Prevent multiple concurrent saves
+                if (values.cohortLoading) {
+                    return
+                }
+
+                if (cohort.id !== 'new') {
+                    actions.saveCohort(cohort)
+                } else {
+                    const personIds = Object.keys(values.personsToCreateStaticCohort)
+                    if (
+                        cohort.is_static &&
+                        values.staticCohortMode === 'people' &&
+                        cohort.csv == null &&
+                        personIds.length === 0
+                    ) {
+                        lemonToast.error('You need to upload a csv file or add a person manually.')
+                        return
+                    }
+                    if (
+                        cohort.is_static &&
+                        values.staticCohortMode === 'criteria' &&
+                        !((cohort.filters?.properties as Record<string, any>)?.values?.length > 0)
+                    ) {
+                        lemonToast.error('You need to add at least one filter criterion.')
+                        return
+                    }
+                    actions.saveCohort({
+                        ...cohort,
+                        _create_in_folder: 'Unfiled/Cohorts',
+                        _create_static_person_ids: personIds.length > 0 ? personIds : undefined,
+                    })
+                }
+            },
+        },
+    })),
+
+    loaders(({ actions, values, key, props }) => ({
+        cohort: [
+            NEW_COHORT,
+            {
+                setCohort: ({ cohort }) => processCohort(cohort),
+                fetchCohort: async ({ id }, breakpoint) => {
+                    try {
+                        const cohort = await api.cohorts.get(id)
+                        breakpoint()
+                        cohortsModel.actions.updateCohort(cohort)
+                        actions.setCohort(cohort)
+                        actions.checkIfFinishedCalculating(cohort)
+                        return processCohort(cohort)
+                    } catch (error: any) {
+                        lemonToast.error(error.detail || 'Failed to fetch cohort')
+
+                        actions.setCohortMissing()
+                        return values.cohort
+                    }
+                },
+                restoreCohort: async () => {
+                    try {
+                        const restoredCohort = await api.cohorts.update(values.cohort.id, {
+                            deleted: false,
+                        })
+                        actions.setCohort(restoredCohort)
+                        lemonToast.success('Cohort restored successfully.')
+                        return restoredCohort
+                    } catch (error) {
+                        lemonToast.error(`Failed to restore cohort: '${error}'`)
+                        return values.cohort
+                    }
+                },
+                saveCohort: async ({ cohortParams, csvOnlyFormData }, breakpoint) => {
+                    const existingCohort = values.cohort
+                    let cohort = { ...existingCohort, ...cohortParams }
+                    const cohortFormData =
+                        csvOnlyFormData ??
+                        createCohortFormData(cohort, {
+                            preserveStaticFilters: cohort.is_static && values.staticCohortMode === 'criteria',
+                        })
+
+                    try {
+                        if (cohort.id !== 'new') {
+                            // The generated client only sends JSON, and this call uploads the CSV as
+                            // multipart FormData, so there is no generated equivalent.
+                            // nosemgrep: prefer-codegen-api-namespaced-cohorts
+                            const savedCohort = await api.cohorts.update(
+                                cohort.id,
+                                cohortFormData as Partial<CohortType>
+                            )
+                            cohortsModel.actions.updateCohort(savedCohort)
+                            // Saving the criteria of a cohort that is on can turn on the cohorts they include, and the
+                            // usage line reads `cohorts_used` from the current team, so reload it.
+                            if (savedCohort.realtime_enabled) {
+                                actions.refreshCurrentTeam()
+                            }
+
+                            if (
+                                !csvOnlyFormData &&
+                                savedCohort.experiment_set &&
+                                savedCohort.experiment_set.length > 0
+                            ) {
+                                // someone edited an exposure cohort. Track what kind of updates were made
+                                actions.reportExperimentExposureCohortEdited(existingCohort, savedCohort)
+                            }
+
+                            // A CSV-only PATCH doesn't send the name or description, so the server
+                            // response carries the saved values; keep the editor's unsaved drafts.
+                            cohort = csvOnlyFormData
+                                ? {
+                                      ...savedCohort,
+                                      name: existingCohort.name,
+                                      description: existingCohort.description,
+                                  }
+                                : savedCohort
+                        } else {
+                            cohort = await api.cohorts.create(cohortFormData as Partial<CohortType>)
+                            cohortsModel.actions.cohortCreated(cohort)
+                            globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.SetUpCohorts)
+                            if (cohortFormData.get('realtime_enabled')) {
+                                // The usage line reads `cohorts_used` from the current team, so reload it.
+                                actions.refreshCurrentTeam()
+                                if (!cohort.realtime_enabled) {
+                                    lemonToast.warning(
+                                        "The cohort was saved, but realtime couldn't be turned on for it. Its page says why."
+                                    )
+                                }
+                            }
+                        }
+                    } catch (error: any) {
+                        breakpoint()
+
+                        // Only capture exception if we don't have proper error details
+                        // This indicates an unexpected failure (network, timeout, etc.)
+                        if (!error.detail) {
+                            console.error('Cohort creation failed unexpectedly:', error, {
+                                cohort_name: cohort.name,
+                                operation_type: cohort.id === 'new' ? 'create' : 'update',
+                                is_static: cohort.is_static,
+                            })
+                            posthog.captureException(error, {
+                                cohort_operation: 'Cohort creation failed unexpectedly',
+                                // Cohort context (most valuable)
+                                cohort_name: cohort.name,
+                                is_static: cohort.is_static,
+                                operation_type: cohort.id === 'new' ? 'create' : 'update',
+                                has_csv: !!cohortFormData.get?.('csv'),
+                                file_size: (() => {
+                                    const csvFile = cohortFormData.get?.('csv')
+                                    return csvFile instanceof File ? csvFile.size : undefined
+                                })(),
+
+                                // Error context
+                                error_status: error.status,
+                                error_status_text: error.statusText,
+                                error_message: error.message,
+                                error_name: error.name,
+                                error_type: typeof error,
+
+                                // Browser context
+                                user_agent: navigator.userAgent.substring(0, 100),
+                                is_online: navigator.onLine,
+
+                                // Request context
+                                timestamp: new Date().toISOString(),
+                            })
+                        }
+
+                        if (error.code === COHORT_USED_BY_WORKFLOWS_ERROR_CODE && typeof cohort.id === 'number') {
+                            const workflows = await loadBlockingWorkflows(values.currentProjectId, cohort.id)
+                            breakpoint()
+                            if (workflows) {
+                                actions.openBlockingWorkflowsModal({
+                                    action: 'edit',
+                                    workflows,
+                                })
+                                return values.cohort
+                            }
+                        }
+
+                        if (error.status === PAYLOAD_TOO_LARGE_STATUS) {
+                            lemonToast.error(cohortCsvTooLargeMessage(values.csvMaxBytes))
+                            return values.cohort
+                        }
+
+                        lemonToast.error(error.detail || 'Failed to save cohort')
+                        return values.cohort
+                    }
+
+                    cohort.is_calculating = true // this will ensure there is always a polling period to allow for backend calculation task to run
+                    breakpoint()
+
+                    delete cohort['csv']
+                    actions.setCohort(cohort)
+                    refreshTreeItem('cohort', cohort.id)
+                    lemonToast.success('Cohort saved. Please wait up to a few minutes for it to be calculated', {
+                        toastId: `cohort-saved-${key}`,
+                        // A cohort the broadcast launch would reject, such as one with event conditions, gets no button.
+                        button:
+                            existingCohort.id === 'new' && !cohortBroadcastDisabledReason(cohort)
+                                ? emailCohortToastButton(
+                                      { id: cohort.id as number, name: cohort.name },
+                                      'cohort_created'
+                                  )
+                                : undefined,
+                    })
+                    actions.checkIfFinishedCalculating(cohort)
+                    if (existingCohort.id === 'new') {
+                        tryShowMCPHint('cohorts.create', {
+                            derivedPrompt: cohort.name ? `Build a cohort called ${cohort.name}` : undefined,
+                        })
+                    }
+                    if (cohort.id !== 'new') {
+                        actions.refreshPersonsData()
+                    }
+                    if (existingCohort.id === 'new') {
+                        router.actions.push(urls.cohort(cohort.id))
+                        if (existingCohort.is_static) {
+                            actions.resetPersonsToCreateStaticCohort()
+                        }
+                        return { ...NEW_COHORT }
+                    }
+                    return processCohort(cohort)
+                },
+                onCriteriaChange: ({ newGroup, id }) => {
+                    const cohort = { ...values.cohort }
+                    const index = cohort.groups.findIndex((group: AnyCohortGroupType) => group.id === id)
+                    if (newGroup.matchType) {
+                        cohort.groups[index] = {
+                            id: cohort.groups[index].id,
+                            matchType: ENTITY_MATCH_TYPE,
+                            ...newGroup,
+                        }
+                    } else {
+                        cohort.groups[index] = {
+                            ...cohort.groups[index],
+                            ...newGroup,
+                        }
+                    }
+                    return processCohort(cohort)
+                },
+                updateCohortCount: async () => {
+                    const cohort = await api.cohorts.get(values.cohort.id)
+                    return {
+                        ...values.cohort,
+                        count: cohort.count,
+                    }
+                },
+            },
+        ],
+        duplicatedCohort: [
+            null as CohortType | null,
+            {
+                duplicateCohort: async ({ asStatic }: { asStatic: boolean }, breakpoint) => {
+                    let cohort: CohortType
+                    try {
+                        await breakpoint(200)
+                        if (asStatic) {
+                            const sourceTable = values.cohort.is_static ? 'static_cohort_people' : 'cohort_people'
+                            const query: HogQLQuery = {
+                                kind: NodeKind.HogQLQuery,
+                                query: `SELECT person_id FROM ${sourceTable} WHERE cohort_id = ${values.cohort.id}`,
+                            }
+                            // nosemgrep: prefer-codegen-api -- Legacy raw API call with a hand-written URL and an unchecked response type. Use cohortsCreate() from 'products/cohorts/frontend/generated/api' instead.
+                            cohort = await api.create('api/cohort', {
+                                is_static: true,
+                                name: `${values.cohort.name} (static copy)`,
+                                query,
+                            })
+                        } else {
+                            const data = { ...values.cohort }
+                            data.name += ' (dynamic copy)'
+                            const cohortFormData = createCohortFormData(data)
+                            cohort = await api.cohorts.create(cohortFormData as Partial<CohortType>)
+                        }
+                        lemonToast.success(
+                            'Cohort duplicated. Please wait up to a few minutes for it to be calculated',
+                            {
+                                toastId: `cohort-duplicated-${cohort.id}`,
+                                button: {
+                                    label: 'View cohort',
+                                    action: () => {
+                                        router.actions.push(urls.cohort(cohort.id))
+                                    },
+                                },
+                            }
+                        )
+                        return cohort
+                    } catch (error: any) {
+                        lemonToast.error(error.detail || 'Failed to duplicate cohort')
+                        return null
+                    }
+                },
+            },
+        ],
+
+        realtimeSwitch: [
+            null as CohortApi | null,
+            {
+                switchRealtime: async (enabled: boolean) => {
+                    return await cohortsRealtimeCreate(String(values.currentProjectId), Number(values.cohort.id), {
+                        enabled,
+                    })
+                },
+            },
+        ],
+
+        usedIn: [
+            null as CohortUsedInResponseApi | null,
+            {
+                loadUsedIn: async () => {
+                    // On mount `values.cohort` is still NEW_COHORT (fetchCohort hasn't resolved),
+                    // so fall back to the id from props.
+                    const id = values.cohort.id !== 'new' ? values.cohort.id : props.id
+                    if (!id || id === 'new') {
+                        return null
+                    }
+                    try {
+                        const usedIn = await cohortsUsedInRetrieve(String(values.currentProjectId), Number(id))
+                        // A backend from before the workflows block returns no `workflows` key during a deploy.
+                        return {
+                            ...usedIn,
+                            workflows: usedIn.workflows ?? { results: [], total: 0, hidden: 0, has_more: false },
+                        }
+                    } catch (error) {
+                        // A 404 just means the endpoint isn't deployed yet (deploy skew) or the
+                        // cohort is gone; neither is worth reporting.
+                        if (!(error instanceof ApiError) || error.status !== 404) {
+                            posthog.captureException(error, { feature: 'cohort-used-in' })
+                        }
+                        // Keep any previously loaded value so a failed refresh doesn't blank the banner.
+                        return values.usedIn
+                    }
+                },
+            },
+        ],
+    })),
+    listeners(({ actions, values, cache }) => ({
+        uploadCohortCsv: () => {
+            if (values.cohortLoading) {
+                return
+            }
+
+            if (values.cohort.id === 'new') {
+                actions.submitCohort()
+                return
+            }
+
+            if (!values.cohort.csv) {
+                return
+            }
+
+            // The CSV-only path skips form validation, so the size limit from `forms.cohort.errors`
+            // must be enforced here; the modal shows the limit and disables Upload.
+            if (values.cohort.csv.size > values.csvMaxBytes) {
+                return
+            }
+
+            const csvOnlyFormData = new FormData()
+            csvOnlyFormData.append('csv', values.cohort.csv)
+            actions.saveCohort({}, csvOnlyFormData)
+        },
+        setCriteria: ({ newCriteria, groupIndex, criteriaIndex }) => {
+            // When the person property key changes, auto-reset the operator to match the
+            // property type (DateTime → "on the date", non-DateTime → "equals").
+            if (!('key' in newCriteria)) {
+                return
+            }
+
+            const groups = values.cohort.filters.properties.values
+            const group = groups[groupIndex]
+            if (!isCohortCriteriaGroup(group)) {
+                return
+            }
+            const criteria = group.values[criteriaIndex]
+            if (!criteria || isCohortCriteriaGroup(criteria)) {
+                return
+            }
+
+            if (criteria.type !== BehavioralFilterKey.Person && criteria.type !== BehavioralFilterKey.PersonMetadata) {
+                return
+            }
+
+            const definitionType =
+                criteria.type === BehavioralFilterKey.PersonMetadata
+                    ? PropertyDefinitionType.PersonMetadata
+                    : PropertyDefinitionType.Person
+            const propDef = newCriteria.key
+                ? propertyDefinitionsModel.findMounted()?.values.getPropertyDefinition(newCriteria.key, definitionType)
+                : null
+            const isDateTime = propDef?.property_type === PropertyType.DateTime
+            const currentOperator = criteria.operator as PropertyOperator | undefined
+
+            if (isDateTime && (!currentOperator || !isPersonOperatorShown(currentOperator, PropertyType.DateTime))) {
+                actions.setCriteria({ operator: PropertyOperator.IsDateExact }, groupIndex, criteriaIndex)
+            } else if (!isDateTime && currentOperator && isOperatorDate(currentOperator)) {
+                actions.setCriteria({ operator: PropertyOperator.Exact }, groupIndex, criteriaIndex)
+            }
+        },
+        deleteCohort: () => {
+            // The editor already loaded what uses the cohort, so blocking workflows show without another request.
+            const workflows = values.usedIn?.workflows
+            if (workflows?.total) {
+                actions.openBlockingWorkflowsModal({ action: 'delete', workflows })
+                // Workflows can change in another tab, so refresh what the next delete attempt checks.
+                actions.loadUsedIn()
+                return
+            }
+            cohortsModel.actions.deleteCohort({ id: values.cohort.id, name: values.cohort.name })
+        },
+        removePersonFromCohort: async ({ personId }) => {
+            if (!values.cohort.id || values.cohort.id === 'new') {
+                lemonToast.error('Cannot remove a person from an unsaved cohort')
+                return
+            }
+
+            try {
+                await api.cohorts.removePersonFromCohort(values.cohort.id, personId)
+            } catch (error: any) {
+                lemonToast.error(error.detail || 'Failed to remove person from cohort')
+                posthog.captureException(error, { feature: 'cohort-remove-person' })
+                return
+            }
+
+            lemonToast.success('Person removed from cohort')
+            // Refresh cohort data + count
+            actions.refreshPersonsData()
+            actions.updateCohortCount()
+        },
+        submitCohortFailure: () => {
+            scrollToFormError({
+                extraErrorSelectors: ['.CohortCriteriaRow__Criteria--error'],
+                fallbackErrorMessage:
+                    'There was an error submitting this cohort. Make sure the cohort filters are correct.',
+            })
+        },
+        armRealtimeReadinessPoll: () => {
+            // No feature flag check here. The API sends `realtime` only inside the rollout, so a
+            // build state on the cohort is itself the answer, and flags that arrive after the
+            // fetch cannot leave a running build unwatched.
+            if (isBuildingHistory(values.cohort)) {
+                cache.readinessGracePolls = READINESS_GRACE_POLLS
+            } else if (values.cohort.realtime?.state === 'needs_attention' && cache.readinessGracePolls > 0) {
+                cache.readinessGracePolls -= 1
+            } else {
+                // Disposing rather than just returning. The manager re-runs a registered setup
+                // every time the tab comes back, so a poll left on it would refetch the cohort
+                // 15 seconds after each return to a page whose build finished long ago.
+                cache.disposables.dispose('realtimeReadinessPoll')
+                return
+            }
+            cache.disposables.add(() => {
+                const timeoutId = window.setTimeout(() => actions.pollRealtimeReadiness(), REALTIME_POLL_INTERVAL_MS)
+                return () => window.clearTimeout(timeoutId)
+            }, 'realtimeReadinessPoll')
+        },
+        pollRealtimeReadiness: async (_, breakpoint) => {
+            const id = values.cohort.id
+            if (typeof id !== 'number') {
+                return
+            }
+
+            const wasBuilding = isBuildingHistory(values.cohort)
+            // A save lands a fresher readiness than a request already in flight, so a response
+            // that crosses one is dropped. `breakpoint()` cannot catch that: a save dispatches
+            // its own actions, never this one.
+            const generation = cache.realtimeReadinessGeneration ?? 0
+            try {
+                const fetched = await api.cohorts.get(id)
+                breakpoint()
+                if (generation !== (cache.realtimeReadinessGeneration ?? 0)) {
+                    return
+                }
+                // Only the readiness merges back, and not through the cohort loader: the user may
+                // be part-way through editing the criteria, and the loader's normalization mints a
+                // new React key for every criteria group, remounting the fields they are typing in.
+                actions.setRealtimeReadiness(fetched.realtime ?? null)
+                // The flag condition chip reads readiness off the shared model, so it would keep
+                // showing this cohort as unprepared for the rest of the session otherwise.
+                cohortsModel.actions.updateCohort(fetched)
+                if (wasBuilding && fetched.realtime?.state === 'ready') {
+                    lemonToast.success('This cohort is ready. Feature flags can target it now.')
+                }
+            } catch (error: any) {
+                if (isBreakpoint(error)) {
+                    return
+                }
+                // Keep watching: a failed request says nothing about the build, and dropping the
+                // banner would read as the build having finished.
+            }
+            actions.armRealtimeReadinessPoll()
+        },
+        switchRealtimeSuccess: ({ realtimeSwitch }) => {
+            if (!realtimeSwitch) {
+                return
+            }
+            const realtimeEnabled = realtimeSwitch.realtime_enabled ?? false
+            // Only the switch merges back, so criteria the user is part-way through editing survive.
+            actions.setRealtimeSwitch(realtimeEnabled, realtimeSwitch.realtime)
+            const saved = cohortsModel.values.cohortsById[realtimeSwitch.id]
+            if (saved) {
+                cohortsModel.actions.updateCohort({
+                    ...saved,
+                    realtime_enabled: realtimeEnabled,
+                    realtime: realtimeSwitch.realtime,
+                })
+            }
+            cache.realtimeReadinessGeneration = (cache.realtimeReadinessGeneration ?? 0) + 1
+            actions.armRealtimeReadinessPoll()
+            // Turning one cohort on can turn on the cohorts it includes, and the usage line reads `cohorts_used` from the
+            // current team, so reload it.
+            actions.refreshCurrentTeam()
+        },
+        // A refusal at the plan's limit can come from usage that changed since the team loaded.
+        switchRealtimeFailure: () => {
+            actions.refreshCurrentTeam()
+        },
+        // Both entry points already carry a fresh readiness, the fetch from the page load and the
+        // save from its own response, so they only have to start the clock. Bumping the generation
+        // retires whatever poll was in flight, whose answer describes the definition before this one.
+        fetchCohortSuccess: () => {
+            cache.realtimeReadinessGeneration = (cache.realtimeReadinessGeneration ?? 0) + 1
+            actions.armRealtimeReadinessPoll()
+        },
+        saveCohortSuccess: () => {
+            cache.realtimeReadinessGeneration = (cache.realtimeReadinessGeneration ?? 0) + 1
+            actions.armRealtimeReadinessPoll()
+        },
+        checkIfFinishedCalculating: async ({ cohort }, breakpoint) => {
+            const isPendingCalculation = checkIsPendingCalculation(cohort)
+            const isCalculatingOrPending = cohort.is_calculating || isPendingCalculation
+
+            if (isCalculatingOrPending) {
+                actions.setPollTimeout(
+                    window.setTimeout(async () => {
+                        try {
+                            const newCohort = await api.cohorts.get(cohort.id)
+                            // breakpoint() throws to abort once the logic unmounts. Because this runs
+                            // in a detached setTimeout callback (not the listener body), that throw
+                            // would otherwise surface as an unhandled rejection — keep it contained.
+                            breakpoint()
+                            actions.checkIfFinishedCalculating(newCohort)
+                        } catch (e: any) {
+                            if (!isBreakpoint(e)) {
+                                throw e
+                            }
+                            // Poll superseded or logic unmounted — stop quietly.
+                        }
+                    }, 1000)
+                )
+            } else {
+                // Only update calculation-related fields, preserve user edits for other fields
+                const calculationFields = {
+                    is_calculating: cohort.is_calculating,
+                    errors_calculating: cohort.errors_calculating,
+                    last_error_message: cohort.last_error_message,
+                    last_calculation: cohort.last_calculation,
+                    count: cohort.count,
+                    last_import_total_count: cohort.last_import_total_count,
+                    last_import_unmatched_count: cohort.last_import_unmatched_count,
+                    version: cohort.version,
+                    pending_version: cohort.pending_version,
+                }
+                actions.setCohort({ ...values.cohort, ...calculationFields })
+                cohortsModel.actions.updateCohort(cohort)
+                personsLogic.findMounted({ syncWithUrl: true })?.actions.loadCohorts() // To ensure sync on person page
+                actions.refreshPersonsData()
+                if (values.pollTimeout) {
+                    clearTimeout(values.pollTimeout)
+                    actions.setPollTimeout(null)
+                }
+            }
+        },
+        refreshPersonsData: async (_, breakpoint) => {
+            await breakpoint(100)
+            // Refresh the persons data table
+            const dataNodeLogicKey = createCohortDataNodeLogicKey(values.cohort.id)
+            dataNodeLogic.findMounted({ key: dataNodeLogicKey })?.actions.loadData('force_blocking')
+        },
+    })),
+
+    actionToUrl(({ values }) => ({
+        setActiveTab: () => {
+            const { tab: _, ...restHash } = router.values.hashParams
+            const nextHash = values.activeTab === 'overview' ? restHash : { ...restHash, tab: values.activeTab }
+            return [router.values.location.pathname, router.values.searchParams, nextHash, { replace: true }]
+        },
+    })),
+
+    urlToAction(({ actions, values }) => ({
+        '/cohorts/:id': (_, __, { tab }) => {
+            const next = isCohortEditTab(tab) ? tab : 'overview'
+            if (values.activeTab !== next) {
+                actions.setActiveTab(next)
+            }
+        },
+    })),
+
+    afterMount(({ actions, props, values }) => {
+        if (!props.id || props.id === 'new') {
+            actions.setCohort(NEW_COHORT)
+            // Tabs aren't shown for new cohorts; clear any stale `#tab=…` hash so the URL reflects reality
+            // and reset the in-memory tab so the Overview content (the only thing rendered for new cohorts)
+            // is actually visible — otherwise the user lands on a blank page.
+            if (router.values.hashParams.tab) {
+                const { tab: _, ...restHash } = router.values.hashParams
+                router.actions.replace(router.values.location.pathname, router.values.searchParams, restHash)
+            }
+            if (values.activeTab !== 'overview') {
+                actions.setActiveTab('overview')
+            }
+        } else {
+            actions.fetchCohort(props.id)
+            actions.loadUsedIn()
+        }
+    }),
+    beforeUnmount(({ values }) => {
+        if (values.pollTimeout) {
+            clearTimeout(values.pollTimeout)
+        }
+    }),
+])

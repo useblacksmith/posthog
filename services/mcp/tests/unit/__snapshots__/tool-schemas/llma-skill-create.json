@@ -1,0 +1,85 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Create serializer — accepts bundled files and owners as write-only input on POST.",
+    "properties": {
+        "allowed_tools": {
+            "description": "Tools the skill asks to use. Tool names cannot contain whitespace. A harness that reads the skill from a file (zip export, git marketplace, a content=full bundle) treats the list as pre-approved. A harness that loads the skill over MCP, including the default content=stub bundle, ignores the list until the user approves that grant.",
+            "items": {
+                "type": "string"
+            },
+            "type": "array"
+        },
+        "body": {
+            "description": "The SKILL.md instruction content (markdown).",
+            "type": "string"
+        },
+        "compatibility": {
+            "description": "Environment requirements (intended product, system packages, network access, etc.).",
+            "maxLength": 500,
+            "type": "string"
+        },
+        "description": {
+            "description": "What this skill does and when to use it. Max 1024 characters.",
+            "maxLength": 1024,
+            "type": "string"
+        },
+        "files": {
+            "description": "Bundled files to include with the initial version (scripts, references, assets).",
+            "items": {
+                "properties": {
+                    "content": {
+                        "description": "Text content of the file.",
+                        "type": "string"
+                    },
+                    "content_type": {
+                        "default": "text/plain",
+                        "description": "MIME type of the file content.",
+                        "maxLength": 100,
+                        "type": "string"
+                    },
+                    "path": {
+                        "description": "File path relative to skill root, e.g. 'scripts/setup.sh' or 'references/guide.md'.",
+                        "maxLength": 500,
+                        "type": "string"
+                    }
+                },
+                "required": ["path", "content"],
+                "type": "object"
+            },
+            "type": "array"
+        },
+        "license": {
+            "description": "License name or reference to a bundled license file.",
+            "maxLength": 255,
+            "type": "string"
+        },
+        "metadata": {
+            "additionalProperties": {},
+            "description": "Arbitrary key-value metadata.",
+            "propertyNames": {
+                "type": "string"
+            },
+            "type": "object"
+        },
+        "name": {
+            "description": "Unique skill name. Lowercase letters, numbers, and hyphens only. Max 64 characters. Cannot be the name of a skill PostHog ships.",
+            "maxLength": 64,
+            "type": "string"
+        },
+        "owners": {
+            "description": "User UUIDs to set as the skill's owners. Each must be a member of this project. Defaults to the creating user when omitted; pass an empty list to create with no owners.",
+            "items": {
+                "type": "string"
+            },
+            "maxItems": 25,
+            "type": "array"
+        },
+        "version_description": {
+            "description": "Optional note on where this skill came from, such as written from scratch or ported from another skill. Stored on version 1 and shown in the version history.",
+            "maxLength": 400,
+            "type": "string"
+        }
+    },
+    "required": ["name", "description", "body"],
+    "type": "object"
+}

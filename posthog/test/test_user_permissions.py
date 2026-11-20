@@ -1,0 +1,800 @@
+from posthog.test.base import BaseTest
+
+from parameterized import parameterized
+
+from posthog.constants import AvailableFeature
+from posthog.models.organization import Organization, OrganizationMembership
+from posthog.models.team.team import Team
+from posthog.models.user import User
+from posthog.test.project_access import enable_access_control, restrict_project
+from posthog.user_permissions import UserPermissions
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.access_control.backend.models.role import Role, RoleMembership
+
+
+class WithPermissionsBase:
+    user: User
+    team: Team
+
+    def permissions(self):
+        return UserPermissions(user=self.user, team=self.team)
+
+
+class TestUserTeamPermissions(BaseTest, WithPermissionsBase):
+    def setUp(self):
+        super().setUp()
+        self.organization.available_product_features = [
+            {
+                "name": AvailableFeature.ACCESS_CONTROL,
+                "key": AvailableFeature.ACCESS_CONTROL,
+            },
+            {
+                "name": AvailableFeature.ROLE_BASED_ACCESS,
+                "key": AvailableFeature.ROLE_BASED_ACCESS,
+            },
+        ]
+        self.organization.save()
+
+    def test_team_effective_membership_level(self):
+        # When no AccessControl rows exist, the default project access level is "admin"
+        # so all org members get ADMIN effective membership level
+        with self.assertNumQueries(3):
+            assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_effective_membership_level_updated(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        with self.assertNumQueries(1):
+            assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_effective_membership_level_does_not_belong(self):
+        self.organization_membership.delete()
+
+        permissions = UserPermissions(user=self.user)
+        with self.assertNumQueries(1):
+            assert permissions.team(self.team).effective_membership_level is None
+
+    def test_team_effective_membership_level_with_explicit_membership_returns_current_level(self):
+        from products.access_control.backend.models.access_control import AccessControl
+
+        # Make the team private using new access control system
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="none",
+        )
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        with self.assertNumQueries(1):
+            assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_ids_visible_for_user(self):
+        assert self.team.id in self.permissions().team_ids_visible_for_user
+
+    def test_team_ids_visible_for_user_no_explicit_permissions(self):
+        from products.access_control.backend.models.access_control import AccessControl
+
+        # Make the team private using new access control system
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="none",
+        )
+
+        assert self.team.id not in self.permissions().team_ids_visible_for_user
+
+    def test_team_ids_visible_for_user_explicit_permission(self):
+        from products.access_control.backend.models.access_control import AccessControl
+
+        # Make the team private using new access control system
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="none",
+        )
+
+        # ExplicitTeamMembership deprecated - now using AccessControl for granular permissions
+        from products.access_control.backend.models.access_control import AccessControl
+
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=self.organization_membership,
+            access_level="admin",
+        )
+
+        assert self.team.id in self.permissions().team_ids_visible_for_user
+
+    def test_team_effective_membership_level_new_access_control_non_private_team(self):
+        """Test that all organization members have access to a non-private team with the new access control system.
+        When no AccessControl rows exist, the default project access level is "admin",
+        so all org members get ADMIN effective membership level."""
+
+        # Set up team with new access control system
+        # Team is not private (no AccessControl objects), default access level is admin
+
+        # Set up user as a member
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Check effective membership level - defaults to ADMIN when no access controls exist
+        with self.assertNumQueries(3):
+            assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_effective_membership_level_new_access_control_private_team_admin(self):
+        """Test that organization admins have access to a private team with the new access control system"""
+        from products.access_control.backend.models.access_control import AccessControl
+
+        # Set up team with new access control system
+        # Team is not private (no AccessControl objects), so organization level is used
+
+        # Make the team private
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="none",
+        )
+
+        # Set up user as an admin
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        # Check effective membership level
+        with self.assertNumQueries(1):
+            assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_effective_membership_level_new_access_control_private_team_member_no_access(self):
+        """Test that regular members don't have access to a private team with the new access control system"""
+        from products.access_control.backend.models.access_control import AccessControl
+
+        # Set up team with new access control system
+        # Team is not private (no AccessControl objects), so organization level is used
+
+        # Make the team private
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="none",
+        )
+
+        # Set up user as a member
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Check effective membership level
+        with self.assertNumQueries(3):
+            assert self.permissions().current_team.effective_membership_level is None
+
+    def test_team_effective_membership_level_new_access_control_private_team_with_member_access(self):
+        """Test that users with specific member access have access to a private team with the new access control system"""
+        from products.access_control.backend.models.access_control import AccessControl
+
+        # Set up team with new access control system
+        # Team is not private (no AccessControl objects), so organization level is used
+
+        # Make the team private
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="none",
+        )
+
+        # Set up user as a member
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Give the member user access to the team
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=self.organization_membership,
+            access_level="member",
+        )
+
+        # Check effective membership level
+        with self.assertNumQueries(3):
+            assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.MEMBER
+
+    def test_team_effective_membership_level_new_access_control_private_team_with_role_access(self):
+        """Test that users with role-based access have access to a private team with the new access control system"""
+        from products.access_control.backend.models.access_control import AccessControl
+        from products.access_control.backend.models.role import Role, RoleMembership
+
+        # Set up team with new access control system
+        # Team is not private (no AccessControl objects), so organization level is used
+
+        # Make the team private
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="none",
+        )
+
+        # Set up user as a member
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Create a role
+        role = Role.objects.create(name="Test Role", organization=self.organization)
+
+        # Assign the member to the role
+        RoleMembership.objects.create(
+            role=role,
+            user=self.user,
+            organization_member=self.organization_membership,
+        )
+
+        # Give the role access to the team
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            role=role,
+            access_level="member",
+        )
+
+        # Check effective membership level
+        with self.assertNumQueries(3):
+            assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.MEMBER
+
+    def test_team_effective_membership_level_higher_project_membership_than_org_membership(self):
+        """Test that users with admin project access will have its effective membership level at admin"""
+        from products.access_control.backend.models.access_control import AccessControl
+
+        # Set up user as a member
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Give the member admin access to the team
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=self.organization_membership,
+            access_level="admin",
+        )
+
+        assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_effective_membership_level_with_higher_role_based_access(self):
+        """Test that users with admin role-based access have its effective membership level at admin"""
+        from products.access_control.backend.models.access_control import AccessControl
+        from products.access_control.backend.models.role import Role, RoleMembership
+
+        # Set up user as a member
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Create a role
+        role = Role.objects.create(name="Test Role", organization=self.organization)
+
+        # Assign the member to the role
+        RoleMembership.objects.create(
+            role=role,
+            user=self.user,
+            organization_member=self.organization_membership,
+        )
+
+        # Give the role access to the team
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            role=role,
+            access_level="admin",
+        )
+
+        # Check effective membership level
+        with self.assertNumQueries(3):
+            assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_effective_membership_level_role_based_access_inert_without_role_based_access_feature(self):
+        """Role-backed project AccessControl rows must NOT take effect when the org lacks
+        ROLE_BASED_ACCESS — mirrors the UI gate on the project access settings page."""
+        from products.access_control.backend.models.access_control import AccessControl
+        from products.access_control.backend.models.role import Role, RoleMembership
+
+        # Drop ROLE_BASED_ACCESS, keep ACCESS_CONTROL
+        self.organization.available_product_features = [
+            {"name": AvailableFeature.ACCESS_CONTROL, "key": AvailableFeature.ACCESS_CONTROL}
+        ]
+        self.organization.save()
+
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        role = Role.objects.create(name="Test Role", organization=self.organization)
+        RoleMembership.objects.create(role=role, user=self.user, organization_member=self.organization_membership)
+
+        # Make the team private and grant the role admin via project-level role override
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="none",
+        )
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            role=role,
+            access_level="admin",
+        )
+
+        # Without ROLE_BASED_ACCESS the role override is inert, so the private-team default ("none") applies
+        assert self.permissions().current_team.effective_membership_level is None
+
+    def test_team_effective_membership_level_lower_project_membership_than_org_membership(self):
+        """Test that users with admin org access maintain their admin level even with lower member project access"""
+        from products.access_control.backend.models.access_control import AccessControl
+
+        # Set up user as admin
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        # Give the user member access to the team
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=self.organization_membership,
+            access_level="member",
+        )
+
+        assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_effective_membership_level_default_access_level_admin(self):
+        """Test that org members get admin level when the project default access level is set to admin"""
+        from products.access_control.backend.models.access_control import AccessControl
+
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Set the project's default access level to admin (no specific member or role)
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="admin",
+        )
+
+        assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_team_effective_membership_level_default_access_level_member(self):
+        """Test that org members get member level when the project default access level is set to member"""
+        from products.access_control.backend.models.access_control import AccessControl
+
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Set the project's default access level to member
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="member",
+        )
+
+        assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.MEMBER
+
+    def test_team_effective_membership_level_direct_access_overrides_default(self):
+        """Test that direct user access overrides the project default access level"""
+        from products.access_control.backend.models.access_control import AccessControl
+
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # Set the project's default access level to member
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="member",
+        )
+
+        # Give the user direct admin access, which should override the default
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=self.organization_membership,
+            access_level="admin",
+        )
+
+        assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    def test_direct_member_grant_is_not_overridden_by_role_admin_grant(self):
+        """A direct member rule decides on its own under most-specific resolution — a role
+        grant on the same project does not override it. Mirrors `_most_specific_rows_decision`
+        in `products/access_control/backend/facade/user_access_control.py`, so the enforced
+        API gate and this resolver cannot disagree."""
+        from products.access_control.backend.models.access_control import AccessControl
+        from products.access_control.backend.models.role import Role, RoleMembership
+
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=self.organization_membership,
+            access_level="member",
+        )
+
+        admin_role = Role.objects.create(name="Project Admin Role", organization=self.organization)
+        RoleMembership.objects.create(
+            role=admin_role,
+            user=self.user,
+            organization_member=self.organization_membership,
+        )
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            role=admin_role,
+            access_level="admin",
+        )
+
+        assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.MEMBER
+
+    def _grant_project_access(self, access_level: str, *, member=None, role=None) -> None:
+        from products.access_control.backend.models.access_control import AccessControl
+
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=member,
+            role=role,
+            access_level=access_level,
+        )
+
+    def _grant_project_access_via_new_role(self, access_level: str, *, legacy_membership: bool = False) -> None:
+        from products.access_control.backend.models.role import Role, RoleMembership
+
+        role = Role.objects.create(name=f"Role {access_level}", organization=self.organization)
+        RoleMembership.objects.create(
+            role=role,
+            user=self.user,
+            organization_member=None if legacy_membership else self.organization_membership,
+        )
+        self._grant_project_access(access_level, role=role)
+
+    @parameterized.expand(
+        [
+            ("denial", "none", "member", OrganizationMembership.Level.MEMBER),
+            ("grant", "admin", "none", None),
+        ]
+    )
+    def test_role_rule_from_another_organization_is_ignored(self, _name, role_level, default_level, expected_level):
+        # Nothing scopes the role on an AccessControl row to the project's organization, so a rule
+        # can name a role the user holds in an unrelated organization
+        from products.access_control.backend.models.access_control import AccessControl
+        from products.access_control.backend.models.role import Role, RoleMembership
+
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        self._grant_project_access(default_level)
+
+        other_organization = Organization.objects.create(name="Other organization")
+        other_membership = OrganizationMembership.objects.create(
+            organization=other_organization, user=self.user, level=OrganizationMembership.Level.MEMBER
+        )
+        foreign_role = Role.objects.create(name="Foreign role", organization=other_organization)
+        RoleMembership.objects.create(role=foreign_role, user=self.user, organization_member=other_membership)
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            role=foreign_role,
+            access_level=role_level,
+        )
+
+        assert self.permissions().current_team.effective_membership_level == expected_level
+
+    def test_role_membership_linked_to_another_organization_is_ignored(self):
+        from products.access_control.backend.models.role import Role, RoleMembership
+
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        self._grant_project_access("none")
+        role = Role.objects.create(name="Target organization role", organization=self.organization)
+        other_organization = Organization.objects.create(name="Other organization")
+        other_membership = OrganizationMembership.objects.create(
+            organization=other_organization, user=self.user, level=OrganizationMembership.Level.MEMBER
+        )
+        RoleMembership.objects.create(role=role, user=self.user, organization_member=other_membership)
+        self._grant_project_access("admin", role=role)
+
+        assert self.permissions().current_team.effective_membership_level is None
+
+    @parameterized.expand(
+        [
+            ("denial", "none", "member", OrganizationMembership.Level.MEMBER),
+            ("grant", "admin", "none", None),
+        ]
+    )
+    def test_member_rule_from_another_organization_is_ignored(self, _name, member_level, default_level, expected_level):
+        # Same as above for the member arm: nothing scopes `organization_member` on an AccessControl
+        # row to the project's organization, so a rule can name a membership the user holds elsewhere
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        self._grant_project_access(default_level)
+
+        other_organization = Organization.objects.create(name="Other organization")
+        other_membership = OrganizationMembership.objects.create(
+            organization=other_organization, user=self.user, level=OrganizationMembership.Level.MEMBER
+        )
+        self._grant_project_access(member_level, member=other_membership)
+
+        assert self.permissions().current_team.effective_membership_level == expected_level
+
+    def test_effective_membership_level_rejects_a_membership_from_another_user(self):
+        # Roles are resolved through the UserPermissions principal, so a mismatched membership would
+        # mix one user's roles into another user's resolution
+        other_user = User.objects.create_and_join(self.organization, "other@posthog.com", None)
+        other_membership = OrganizationMembership.objects.get(user=other_user, organization=self.organization)
+
+        permissions = self.permissions()
+        with self.assertRaises(ValueError):
+            permissions.current_team.effective_membership_level_for_parent_membership(
+                self.organization, other_membership
+            )
+
+    @parameterized.expand(
+        [
+            ("with_access_control", True),
+            ("without_access_control", False),
+        ]
+    )
+    def test_effective_membership_level_caps_organization_owner_at_admin(self, _name, access_control_available):
+        # Project access tops out at admin, so OWNER must not leak out of a project-level resolver
+        if not access_control_available:
+            self.organization.available_product_features = []
+            self.organization.save()
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    @parameterized.expand(
+        [
+            ("denial", "none", None),
+            ("grant", "admin", OrganizationMembership.Level.ADMIN),
+        ]
+    )
+    def test_role_rule_applies_through_a_role_membership_without_organization_member(
+        self, _name, role_level, expected_level
+    ):
+        # RoleMembership.organization_member is nullable and legacy rows have it NULL, so resolving
+        # roles through that FK drops those rows' rules
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        self._grant_project_access("member")
+        self._grant_project_access_via_new_role(role_level, legacy_membership=True)
+
+        assert self.permissions().current_team.effective_membership_level == expected_level
+
+    @parameterized.expand(
+        [
+            ("member_none_without_default", "none", None, None, None),
+            ("member_none_with_admin_default", "none", None, "admin", None),
+            ("role_none_without_default", None, "none", None, None),
+            ("role_none_with_member_default", None, "none", "member", None),
+            ("member_none_role_admin", "none", "admin", None, None),
+            ("member_admin_role_none", "admin", "none", None, OrganizationMembership.Level.ADMIN),
+            ("member_none_role_member", "none", "member", "none", None),
+        ]
+    )
+    def test_team_effective_membership_level_explicit_denial(
+        self, _name, member_level, role_level, default_level, expected_level
+    ):
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        if default_level is not None:
+            self._grant_project_access(default_level)
+        if member_level is not None:
+            self._grant_project_access(member_level, member=self.organization_membership)
+        if role_level is not None:
+            self._grant_project_access_via_new_role(role_level)
+
+        assert self.permissions().current_team.effective_membership_level == expected_level
+
+    def test_team_effective_membership_level_stale_role_denial_inert_without_role_based_access(self):
+        self.organization.available_product_features = [
+            {"name": AvailableFeature.ACCESS_CONTROL, "key": AvailableFeature.ACCESS_CONTROL}
+        ]
+        self.organization.save()
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        self._grant_project_access_via_new_role("none")
+
+        assert self.permissions().current_team.effective_membership_level == OrganizationMembership.Level.ADMIN
+
+    @parameterized.expand([("member_specific", True), ("role_based", False)])
+    def test_team_denied_by_explicit_rule_is_not_visible(self, _name, via_member):
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        if via_member:
+            self._grant_project_access("none", member=self.organization_membership)
+        else:
+            self._grant_project_access_via_new_role("none")
+
+        assert self.team.id not in self.permissions().team_ids_visible_for_user
+        assert self.team.project_id not in self.permissions().project_ids_visible_for_user
+
+    @parameterized.expand([("member_specific", True), ("role_based", False)])
+    def test_team_effective_membership_level_agrees_with_user_access_control(self, _name, via_member):
+        from products.access_control.backend.facade.user_access_control import UserAccessControl
+
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        # An open project default, so only the explicit denial can deny
+        self._grant_project_access("admin")
+        if via_member:
+            self._grant_project_access("none", member=self.organization_membership)
+        else:
+            self._grant_project_access_via_new_role("none")
+
+        # `get_user_access_level` is what `check_access_level_for_object` gates project API access
+        # on, so an effective membership level here must not contradict it
+        user_access_control = UserAccessControl(user=self.user, team=self.team)
+        assert user_access_control.get_user_access_level(self.team) == "none"
+        assert self.permissions().current_team.effective_membership_level is None
+
+
+class TestUserPermissionsEfficiency(BaseTest, WithPermissionsBase):
+    def test_project_ids_visible_for_user_queries_teams_once(self):
+        teams = [self.team]
+        teams.extend(Team.objects.create(organization=self.organization) for _ in range(3))
+
+        user_permissions = self.permissions()
+        _ = user_permissions.organization_memberships
+
+        with self.assertNumQueries(1):
+            project_ids = user_permissions.project_ids_visible_for_user
+
+        assert set(project_ids) == {team.project_id for team in teams}
+
+
+class TestProjectAccessResolversAgree(BaseTest):
+    def _plain_member(self) -> None:
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+    def _role_held_by_user(self) -> Role:
+        role = Role.objects.create(name="Engineering", organization=self.organization)
+        RoleMembership.objects.create(role=role, user=self.user, organization_member=self.organization_membership)
+        return role
+
+    def _rule(self, access_level: str, **subject: object) -> None:
+        AccessControl.objects.create(
+            team=self.team, resource="project", resource_id=str(self.team.id), access_level=access_level, **subject
+        )
+
+    def _restricted_project_in_a_newer_organization(self) -> Team:
+        self.organization.available_product_features = []
+        self.organization.save()
+        newer_organization = Organization.objects.create(name="Newer")
+        membership = OrganizationMembership.objects.create(
+            organization=newer_organization, user=self.user, level=OrganizationMembership.Level.MEMBER
+        )
+        team = Team.objects.create(organization=newer_organization, name="Restricted")
+        restrict_project(team, plain_members=[membership])
+        return team
+
+    def _member_rule_of_none_without_default(self) -> Team:
+        enable_access_control(self.organization)
+        self._plain_member()
+        self._rule("none", organization_member=self.organization_membership)
+        return self.team
+
+    def _role_rule_of_none_with_member_default(self) -> Team:
+        enable_access_control(self.organization, role_based=True)
+        self._plain_member()
+        self._rule("member")
+        self._rule("none", role=self._role_held_by_user())
+        return self.team
+
+    def _role_grant_without_role_based_access(self) -> Team:
+        enable_access_control(self.organization)
+        self._plain_member()
+        self._rule("none")
+        self._rule("member", role=self._role_held_by_user())
+        return self.team
+
+    def _member_rule_of_none_with_role_grant(self) -> Team:
+        enable_access_control(self.organization, role_based=True)
+        self._plain_member()
+        self._rule("none", organization_member=self.organization_membership)
+        self._rule("member", role=self._role_held_by_user())
+        return self.team
+
+    def _org_admin_on_restricted_project(self) -> Team:
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        restrict_project(self.team)
+        return self.team
+
+    def _no_rules(self) -> Team:
+        enable_access_control(self.organization)
+        self._plain_member()
+        return self.team
+
+    def _member_grant_on_restricted_project(self) -> Team:
+        restrict_project(
+            self.team, plain_members=[self.organization_membership], granted_members=[self.organization_membership]
+        )
+        return self.team
+
+    def _rule_without_access_control(self) -> Team:
+        self.organization.available_product_features = []
+        self.organization.save()
+        self._plain_member()
+        self._rule("none")
+        return self.team
+
+    @parameterized.expand(
+        [
+            ("restricted_project_in_a_newer_organization", False),
+            ("member_rule_of_none_without_default", False),
+            ("role_rule_of_none_with_member_default", False),
+            ("role_grant_without_role_based_access", False),
+            ("member_rule_of_none_with_role_grant", False),
+            ("org_admin_on_restricted_project", True),
+            ("no_rules", True),
+            ("member_grant_on_restricted_project", True),
+            ("rule_without_access_control", True),
+        ]
+    )
+    def test_project_access_resolvers_agree(self, scenario: str, expected: bool) -> None:
+        team = getattr(self, f"_{scenario}")()
+        user = User.objects.get(pk=self.user.pk)
+
+        answers = {
+            "effective_membership_level": UserPermissions(user).team(team).effective_membership_level is not None,
+            "user.teams": team in user.teams,
+            "all_users_with_access": team.all_users_with_access().filter(pk=user.pk).exists(),
+        }
+
+        assert answers == dict.fromkeys(answers, expected)

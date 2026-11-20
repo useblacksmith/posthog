@@ -1,0 +1,1725 @@
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * MCP service uses these Zod schemas for generated tool handlers.
+ * To regenerate: hogli build:openapi
+ *
+ * PostHog API - MCP 29 enabled ops
+ * OpenAPI spec version: 1.0.0
+ */
+import * as zod from 'zod'
+
+export const FeatureFlagsCopyFlagsCreateParams = () => zod.object({
+    organization_id: zod
+        .string()
+        .describe(
+            "ID of the organization you're trying to access. To find the ID of the organization, make a call to \/api\/organizations\/."
+        ),
+})
+
+export const featureFlagsCopyFlagsCreateBodyTargetProjectIdsMax = 50
+
+export const featureFlagsCopyFlagsCreateBodyCopyScheduleDefault = false
+export const featureFlagsCopyFlagsCreateBodyDisableCopiedFlagDefault = false
+export const featureFlagsCopyFlagsCreateBodyCopyDependenciesDefault = false
+
+export const FeatureFlagsCopyFlagsCreateBody = () => zod.object({
+    feature_flag_key: zod.string().describe('Key of the feature flag to copy'),
+    from_project: zod.number().describe('Source project ID to copy the flag from'),
+    target_project_ids: zod
+        .array(zod.number())
+        .min(1)
+        .max(featureFlagsCopyFlagsCreateBodyTargetProjectIdsMax)
+        .describe('List of target project IDs to copy the flag to'),
+    copy_schedule: zod
+        .boolean()
+        .default(featureFlagsCopyFlagsCreateBodyCopyScheduleDefault)
+        .describe('Whether to also copy scheduled changes for this flag'),
+    disable_copied_flag: zod
+        .boolean()
+        .default(featureFlagsCopyFlagsCreateBodyDisableCopiedFlagDefault)
+        .describe(
+            "Whether to force the copied flag to be disabled in target projects, ignoring the source flag's enabled status"
+        ),
+    copy_dependencies: zod
+        .boolean()
+        .default(featureFlagsCopyFlagsCreateBodyCopyDependenciesDefault)
+        .describe('Whether to also copy missing feature flags that this flag depends on'),
+})
+
+export const FeatureFlagsCopyFlagsDependencyRequirementsCreateParams = () => zod.object({
+    organization_id: zod
+        .string()
+        .describe(
+            "ID of the organization you're trying to access. To find the ID of the organization, make a call to \/api\/organizations\/."
+        ),
+})
+
+export const featureFlagsCopyFlagsDependencyRequirementsCreateBodyTargetProjectIdsMax = 50
+
+export const FeatureFlagsCopyFlagsDependencyRequirementsCreateBody = () => zod.object({
+    feature_flag_key: zod.string().describe('Key of the feature flag to check'),
+    from_project: zod.number().describe('Source project ID to copy the flag from'),
+    target_project_ids: zod
+        .array(zod.number())
+        .min(1)
+        .max(featureFlagsCopyFlagsDependencyRequirementsCreateBodyTargetProjectIdsMax)
+        .describe('List of target project IDs to check dependency copy eligibility for'),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsListParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const FeatureFlagsListQueryParams = () => zod.object({
+    active: zod
+        .enum(['STALE', 'false', 'true'])
+        .optional()
+        .describe(
+            "'true' and 'false' filter on serving state, the flag's `active` column. 'STALE' returns enabled flags only, so a disabled flag is never STALE. An enabled flag matches when its last recorded `$feature_flag_called` event is more than 30 days old. With no recorded event, it matches when it is at least 30 days old and either stores `filters` as `{}` or serves one result to everyone through a release condition at 100% with no property filters. A flag with no recorded event and an empty `groups` list does not match, even when its `status` reads STALE. The reverse also happens: a multivariate flag matches when a variant is at 100% under a release condition at 100% with no property filters, or when that condition names a variant. Its `status` can still read ACTIVE, because an earlier variant in the list or an earlier targeted condition can serve a different result. In a flag of either type that mixes person and group aggregation, the filter also counts a group-aggregated condition at 100% with no property filters, which `status` does not. An SDK that sends no `$feature_flag_called` event leaves no record, so a STALE flag can still be in use."
+        ),
+    archived: zod
+        .enum(['false', 'true'])
+        .optional()
+        .describe('Filter by archived state. When omitted, archived flags are excluded.'),
+    created_by_id: zod
+        .string()
+        .optional()
+        .describe(
+            'Filter by the user(s) who created the feature flag. Accepts a single user ID, or a JSON-encoded \/ comma-separated list of user IDs to match any of them.'
+        ),
+    deleted: zod
+        .enum(['false', 'true'])
+        .optional()
+        .describe(
+            'Pass `true` to list only soft-deleted flags, which can be restored, archived or not. When omitted, deleted flags are excluded.'
+        ),
+    eligible_for_experiment: zod
+        .enum(['true'])
+        .optional()
+        .describe(
+            "When 'true', only return flags that can back an experiment: multivariate with 2-20 variants. Any other value is ignored."
+        ),
+    evaluation_runtime: zod
+        .enum(['all', 'client', 'server'])
+        .optional()
+        .describe('Filter feature flags by their evaluation runtime.'),
+    excluded_properties: zod
+        .string()
+        .optional()
+        .describe('JSON-encoded list of feature flag keys to exclude from the results.'),
+    excluded_tags: zod
+        .string()
+        .optional()
+        .describe('JSON-encoded list of tag names to exclude. Flags carrying any of these tags are filtered out.'),
+    has_evaluation_contexts: zod
+        .enum(['false', 'true'])
+        .optional()
+        .describe(
+            "Filter feature flags by presence of evaluation contexts. 'true' returns only flags with at least one evaluation context, 'false' returns only flags without."
+        ),
+    ids: zod
+        .string()
+        .optional()
+        .describe(
+            'Comma-separated flag IDs, at most 200. Returns exactly those flags, including archived flags and flags that surveys or product tours own. Other filters are ignored, and soft-deleted flags are left out unless deleted=true.'
+        ),
+    key: zod.string().optional().describe('Filter by exact feature flag key match. Case insensitive.'),
+    limit: zod.number().optional().describe('Number of results to return per page.'),
+    offset: zod.number().optional().describe('The initial index from which to return the results.'),
+    search: zod
+        .string()
+        .optional()
+        .describe(
+            'Search by feature flag key or name. Case insensitive. Spaces, underscores, and hyphens count as the same separator. The words of the term must appear together and in order, so a shorter term matches more flags.'
+        ),
+    tags: zod.string().optional().describe('JSON-encoded list of tag names to filter feature flags by.'),
+    type: zod.enum(['boolean', 'experiment', 'multivariant', 'remote_config']).optional(),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsCreateBodyFiltersOneEarlyExitDefault = false
+
+export const FeatureFlagsCreateBody = () => zod.object({
+    key: zod.string().optional().describe('Feature flag key.'),
+    name: zod
+        .string()
+        .optional()
+        .describe('Feature flag description (stored in the `name` field for backwards compatibility).'),
+    filters: zod
+        .object({
+            groups: zod
+                .array(
+                    zod.object({
+                        properties: zod
+                            .array(
+                                zod.union([
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        value: zod
+                                            .unknown()
+                                            .describe(
+                                                'Comparison value for the property filter. Supports strings, numbers, booleans, and arrays.'
+                                            ),
+                                        operator: zod
+                                            .enum([
+                                                'exact',
+                                                'is_not',
+                                                'icontains',
+                                                'not_icontains',
+                                                'starts_with',
+                                                'not_starts_with',
+                                                'ends_with',
+                                                'not_ends_with',
+                                                'regex',
+                                                'not_regex',
+                                                'gt',
+                                                'gte',
+                                                'lt',
+                                                'lte',
+                                            ])
+                                            .describe(
+                                                '\* `exact` - exact\n\* `is_not` - is_not\n\* `icontains` - icontains\n\* `not_icontains` - not_icontains\n\* `starts_with` - starts_with\n\* `not_starts_with` - not_starts_with\n\* `ends_with` - ends_with\n\* `not_ends_with` - not_ends_with\n\* `regex` - regex\n\* `not_regex` - not_regex\n\* `gt` - gt\n\* `gte` - gte\n\* `lt` - lt\n\* `lte` - lte'
+                                            )
+                                            .describe(
+                                                'Operator used to compare the property value.\n\n\* `exact` - exact\n\* `is_not` - is_not\n\* `icontains` - icontains\n\* `not_icontains` - not_icontains\n\* `starts_with` - starts_with\n\* `not_starts_with` - not_starts_with\n\* `ends_with` - ends_with\n\* `not_ends_with` - not_ends_with\n\* `regex` - regex\n\* `not_regex` - not_regex\n\* `gt` - gt\n\* `gte` - gte\n\* `lt` - lt\n\* `lte` - lte'
+                                            ),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['is_set', 'is_not_set'])
+                                            .describe('\* `is_set` - is_set\n\* `is_not_set` - is_not_set')
+                                            .describe(
+                                                'Existence operator.\n\n\* `is_set` - is_set\n\* `is_not_set` - is_not_set'
+                                            ),
+                                        value: zod
+                                            .unknown()
+                                            .optional()
+                                            .describe(
+                                                'Optional value. Runtime behavior determines whether this is ignored.'
+                                            ),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['is_date_exact', 'is_date_before', 'is_date_after'])
+                                            .describe(
+                                                '\* `is_date_exact` - is_date_exact\n\* `is_date_before` - is_date_before\n\* `is_date_after` - is_date_after'
+                                            )
+                                            .describe(
+                                                'Date comparison operator.\n\n\* `is_date_exact` - is_date_exact\n\* `is_date_after` - is_date_after\n\* `is_date_before` - is_date_before'
+                                            ),
+                                        value: zod
+                                            .string()
+                                            .describe('Date value in ISO format or relative date expression.'),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum([
+                                                'semver_eq',
+                                                'semver_neq',
+                                                'semver_gt',
+                                                'semver_gte',
+                                                'semver_lt',
+                                                'semver_lte',
+                                                'semver_tilde',
+                                                'semver_caret',
+                                                'semver_wildcard',
+                                            ])
+                                            .describe(
+                                                '\* `semver_eq` - semver_eq\n\* `semver_neq` - semver_neq\n\* `semver_gt` - semver_gt\n\* `semver_gte` - semver_gte\n\* `semver_lt` - semver_lt\n\* `semver_lte` - semver_lte\n\* `semver_tilde` - semver_tilde\n\* `semver_caret` - semver_caret\n\* `semver_wildcard` - semver_wildcard'
+                                            )
+                                            .describe(
+                                                'Semantic version comparison operator.\n\n\* `semver_eq` - semver_eq\n\* `semver_neq` - semver_neq\n\* `semver_gt` - semver_gt\n\* `semver_gte` - semver_gte\n\* `semver_lt` - semver_lt\n\* `semver_lte` - semver_lte\n\* `semver_tilde` - semver_tilde\n\* `semver_caret` - semver_caret\n\* `semver_wildcard` - semver_wildcard'
+                                            ),
+                                        value: zod.string().describe('Semantic version string.'),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['icontains_multi', 'not_icontains_multi'])
+                                            .describe(
+                                                '\* `icontains_multi` - icontains_multi\n\* `not_icontains_multi` - not_icontains_multi'
+                                            )
+                                            .describe(
+                                                'Multi-contains operator.\n\n\* `icontains_multi` - icontains_multi\n\* `not_icontains_multi` - not_icontains_multi'
+                                            ),
+                                        value: zod.array(zod.string()).describe('List of strings to evaluate against.'),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort'])
+                                            .describe('\* `cohort` - cohort')
+                                            .describe(
+                                                'Cohort property type required for in\/not_in operators.\n\n\* `cohort` - cohort'
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['in', 'not_in'])
+                                            .describe('\* `in` - in\n\* `not_in` - not_in')
+                                            .describe(
+                                                'Membership operator for cohort properties.\n\n\* `in` - in\n\* `not_in` - not_in'
+                                            ),
+                                        value: zod
+                                            .unknown()
+                                            .describe('Cohort comparison value (single or list, depending on usage).'),
+                                        cohort_deleted: zod
+                                            .boolean()
+                                            .optional()
+                                            .describe(
+                                                'Set to true in responses when the cohort is deleted or does not exist. The flag cannot evaluate this condition. Ignored on write.'
+                                            ),
+                                        cohort_missing: zod
+                                            .boolean()
+                                            .optional()
+                                            .describe(
+                                                'Set to true in responses when no cohort with this id exists in the project, so it cannot be restored. `cohort_deleted` is also true. Absent for a soft-deleted cohort. Ignored on write.'
+                                            ),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['flag'])
+                                            .describe('\* `flag` - flag')
+                                            .describe(
+                                                'Flag property type required for flag dependency checks.\n\n\* `flag` - flag'
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['flag_evaluates_to'])
+                                            .describe('\* `flag_evaluates_to` - flag_evaluates_to')
+                                            .describe(
+                                                'Operator for feature flag dependency evaluation.\n\n\* `flag_evaluates_to` - flag_evaluates_to'
+                                            ),
+                                        value: zod.unknown().describe('Value to compare flag evaluation against.'),
+                                    }),
+                                ])
+                            )
+                            .optional()
+                            .describe('Property conditions for this release condition group.'),
+                        rollout_percentage: zod
+                            .number()
+                            .optional()
+                            .describe('Rollout percentage for this release condition group.'),
+                        variant: zod.string().nullish().describe('Variant key override for multivariate flags.'),
+                        aggregation_group_type_index: zod
+                            .number()
+                            .nullish()
+                            .describe('Group type index for this condition set. None means person-level aggregation.'),
+                    })
+                )
+                .optional()
+                .describe('Release condition groups for the feature flag.'),
+            multivariate: zod
+                .union([
+                    zod.object({
+                        variants: zod
+                            .array(
+                                zod.object({
+                                    key: zod.string().describe('Unique key for this variant.'),
+                                    name: zod.string().optional().describe('Human-readable name for this variant.'),
+                                    rollout_percentage: zod.number().describe('Variant rollout percentage.'),
+                                })
+                            )
+                            .describe('Variant definitions for multivariate feature flags.'),
+                    }),
+                    zod.null(),
+                ])
+                .optional()
+                .describe('Multivariate configuration for variant-based rollouts.'),
+            aggregation_group_type_index: zod
+                .number()
+                .nullish()
+                .describe('Group type index for group-based feature flags.'),
+            payloads: zod
+                .record(zod.string(), zod.string())
+                .optional()
+                .describe('Optional payload values keyed by variant key.'),
+            feature_enrollment: zod
+                .boolean()
+                .nullish()
+                .describe(
+                    'Whether this flag has early access feature enrollment enabled. When true, the flag is evaluated against the person property $feature_enrollment\/{flag_key}.'
+                ),
+            early_exit: zod
+                .boolean()
+                .default(featureFlagsCreateBodyFiltersOneEarlyExitDefault)
+                .describe(
+                    'When true, condition evaluation stops at the first matching condition set rather than continuing to evaluate subsequent groups.'
+                ),
+        })
+        .optional()
+        .describe('Feature flag targeting configuration.'),
+    active: zod.boolean().optional().describe('Whether the feature flag is active.'),
+    archived: zod
+        .boolean()
+        .optional()
+        .describe(
+            'Whether the flag is archived. Archived flags are hidden from the flag list by default and must be disabled (`active: false`).'
+        ),
+    tags: zod.array(zod.string()).optional().describe('Organizational tags for this feature flag.'),
+    evaluation_contexts: zod
+        .array(zod.string())
+        .optional()
+        .describe('Evaluation contexts that control where this flag evaluates at runtime.'),
+    is_remote_configuration: zod
+        .boolean()
+        .nullish()
+        .describe(
+            'Whether this flag is a remote configuration flag that delivers a payload rather than gating a feature.'
+        ),
+    ensure_experience_continuity: zod
+        .boolean()
+        .nullish()
+        .describe(
+            "Whether to persist a user's flag value across the anonymous-to-identified transition (the 'persist across authentication steps' option). Incompatible with device_id bucketing."
+        ),
+    evaluation_runtime: zod
+        .union([
+            zod
+                .enum(['server', 'client', 'all'])
+                .describe('\* `server` - Server\n\* `client` - Client\n\* `all` - All'),
+            zod.null(),
+        ])
+        .optional()
+        .describe(
+            "Where this flag is allowed to evaluate: 'server' (server-side SDKs only), 'client' (client-side SDKs only), or 'all' (both). Defaults to 'all'.\n\n\* `server` - Server\n\* `client` - Client\n\* `all` - All"
+        ),
+    bucketing_identifier: zod
+        .union([
+            zod
+                .enum(['distinct_id', 'device_id'])
+                .describe('\* `distinct_id` - User ID (default)\n\* `device_id` - Device ID'),
+            zod.null(),
+        ])
+        .optional()
+        .describe(
+            "Identifier used to bucket users into rollout percentages and variants: 'distinct_id' (user ID, the default) or 'device_id'. Using 'device_id' is incompatible with ensure_experience_continuity=True.\n\n\* `distinct_id` - User ID (default)\n\* `device_id` - Device ID"
+        ),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsPartialUpdateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsPartialUpdateBodyRollbackReasonNoteMax = 1000
+
+export const featureFlagsPartialUpdateBodyFiltersOneEarlyExitDefault = false
+export const featureFlagsPartialUpdateBodyVersionMin = 0
+
+export const FeatureFlagsPartialUpdateBody = () => zod.object({
+    ask_rollback_reason: zod
+        .boolean()
+        .optional()
+        .describe(
+            "When true, the edit lowers the flag's exposure, and the request sends no `rollback_reason`, the flag is not saved and the response is a 409 with the code `rollback_reason_required`. Send the edit again without this field to save it, with or without a `rollback_reason`. Ignored for an edit that needs approval and for a config version 2 flag."
+        ),
+    rollback_reason: zod
+        .union([
+            zod
+                .enum(['errors', 'metrics', 'planned', 'wrong_configuration', 'other'])
+                .describe(
+                    '\* `errors` - Errors or bugs\n\* `metrics` - Metrics got worse\n\* `planned` - It was planned\n\* `wrong_configuration` - Wrong configuration\n\* `other` - Other'
+                ),
+            zod.null(),
+        ])
+        .optional()
+        .describe(
+            "Why this edit lowers the flag's exposure, for example a rollback after errors. Stored on the activity log entry of the edit. Not stored for an edit that needs approval or for a config version 2 flag.\n\n\* `errors` - Errors or bugs\n\* `metrics` - Metrics got worse\n\* `planned` - It was planned\n\* `wrong_configuration` - Wrong configuration\n\* `other` - Other"
+        ),
+    rollback_reason_note: zod
+        .string()
+        .max(featureFlagsPartialUpdateBodyRollbackReasonNoteMax)
+        .nullish()
+        .describe('A free-text note for `rollback_reason`. Requires `rollback_reason`.'),
+    key: zod.string().optional().describe('Feature flag key.'),
+    name: zod
+        .string()
+        .optional()
+        .describe('Feature flag description (stored in the `name` field for backwards compatibility).'),
+    filters: zod
+        .object({
+            groups: zod
+                .array(
+                    zod.object({
+                        properties: zod
+                            .array(
+                                zod.union([
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        value: zod
+                                            .unknown()
+                                            .describe(
+                                                'Comparison value for the property filter. Supports strings, numbers, booleans, and arrays.'
+                                            ),
+                                        operator: zod
+                                            .enum([
+                                                'exact',
+                                                'is_not',
+                                                'icontains',
+                                                'not_icontains',
+                                                'starts_with',
+                                                'not_starts_with',
+                                                'ends_with',
+                                                'not_ends_with',
+                                                'regex',
+                                                'not_regex',
+                                                'gt',
+                                                'gte',
+                                                'lt',
+                                                'lte',
+                                            ])
+                                            .describe(
+                                                '\* `exact` - exact\n\* `is_not` - is_not\n\* `icontains` - icontains\n\* `not_icontains` - not_icontains\n\* `starts_with` - starts_with\n\* `not_starts_with` - not_starts_with\n\* `ends_with` - ends_with\n\* `not_ends_with` - not_ends_with\n\* `regex` - regex\n\* `not_regex` - not_regex\n\* `gt` - gt\n\* `gte` - gte\n\* `lt` - lt\n\* `lte` - lte'
+                                            )
+                                            .describe(
+                                                'Operator used to compare the property value.\n\n\* `exact` - exact\n\* `is_not` - is_not\n\* `icontains` - icontains\n\* `not_icontains` - not_icontains\n\* `starts_with` - starts_with\n\* `not_starts_with` - not_starts_with\n\* `ends_with` - ends_with\n\* `not_ends_with` - not_ends_with\n\* `regex` - regex\n\* `not_regex` - not_regex\n\* `gt` - gt\n\* `gte` - gte\n\* `lt` - lt\n\* `lte` - lte'
+                                            ),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['is_set', 'is_not_set'])
+                                            .describe('\* `is_set` - is_set\n\* `is_not_set` - is_not_set')
+                                            .describe(
+                                                'Existence operator.\n\n\* `is_set` - is_set\n\* `is_not_set` - is_not_set'
+                                            ),
+                                        value: zod
+                                            .unknown()
+                                            .optional()
+                                            .describe(
+                                                'Optional value. Runtime behavior determines whether this is ignored.'
+                                            ),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['is_date_exact', 'is_date_before', 'is_date_after'])
+                                            .describe(
+                                                '\* `is_date_exact` - is_date_exact\n\* `is_date_before` - is_date_before\n\* `is_date_after` - is_date_after'
+                                            )
+                                            .describe(
+                                                'Date comparison operator.\n\n\* `is_date_exact` - is_date_exact\n\* `is_date_after` - is_date_after\n\* `is_date_before` - is_date_before'
+                                            ),
+                                        value: zod
+                                            .string()
+                                            .describe('Date value in ISO format or relative date expression.'),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum([
+                                                'semver_eq',
+                                                'semver_neq',
+                                                'semver_gt',
+                                                'semver_gte',
+                                                'semver_lt',
+                                                'semver_lte',
+                                                'semver_tilde',
+                                                'semver_caret',
+                                                'semver_wildcard',
+                                            ])
+                                            .describe(
+                                                '\* `semver_eq` - semver_eq\n\* `semver_neq` - semver_neq\n\* `semver_gt` - semver_gt\n\* `semver_gte` - semver_gte\n\* `semver_lt` - semver_lt\n\* `semver_lte` - semver_lte\n\* `semver_tilde` - semver_tilde\n\* `semver_caret` - semver_caret\n\* `semver_wildcard` - semver_wildcard'
+                                            )
+                                            .describe(
+                                                'Semantic version comparison operator.\n\n\* `semver_eq` - semver_eq\n\* `semver_neq` - semver_neq\n\* `semver_gt` - semver_gt\n\* `semver_gte` - semver_gte\n\* `semver_lt` - semver_lt\n\* `semver_lte` - semver_lte\n\* `semver_tilde` - semver_tilde\n\* `semver_caret` - semver_caret\n\* `semver_wildcard` - semver_wildcard'
+                                            ),
+                                        value: zod.string().describe('Semantic version string.'),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort', 'person', 'group'])
+                                            .describe('\* `cohort` - cohort\n\* `person` - person\n\* `group` - group')
+                                            .optional()
+                                            .describe(
+                                                "Property filter type. Set it on every property. Use `group` with `group_type_index` to filter on a group's properties.\n\n\* `cohort` - cohort\n\* `person` - person\n\* `group` - group"
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['icontains_multi', 'not_icontains_multi'])
+                                            .describe(
+                                                '\* `icontains_multi` - icontains_multi\n\* `not_icontains_multi` - not_icontains_multi'
+                                            )
+                                            .describe(
+                                                'Multi-contains operator.\n\n\* `icontains_multi` - icontains_multi\n\* `not_icontains_multi` - not_icontains_multi'
+                                            ),
+                                        value: zod.array(zod.string()).describe('List of strings to evaluate against.'),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['cohort'])
+                                            .describe('\* `cohort` - cohort')
+                                            .describe(
+                                                'Cohort property type required for in\/not_in operators.\n\n\* `cohort` - cohort'
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['in', 'not_in'])
+                                            .describe('\* `in` - in\n\* `not_in` - not_in')
+                                            .describe(
+                                                'Membership operator for cohort properties.\n\n\* `in` - in\n\* `not_in` - not_in'
+                                            ),
+                                        value: zod
+                                            .unknown()
+                                            .describe('Cohort comparison value (single or list, depending on usage).'),
+                                        cohort_deleted: zod
+                                            .boolean()
+                                            .optional()
+                                            .describe(
+                                                'Set to true in responses when the cohort is deleted or does not exist. The flag cannot evaluate this condition. Ignored on write.'
+                                            ),
+                                        cohort_missing: zod
+                                            .boolean()
+                                            .optional()
+                                            .describe(
+                                                'Set to true in responses when no cohort with this id exists in the project, so it cannot be restored. `cohort_deleted` is also true. Absent for a soft-deleted cohort. Ignored on write.'
+                                            ),
+                                    }),
+                                    zod.object({
+                                        key: zod.string().describe('Property key used in this feature flag condition.'),
+                                        type: zod
+                                            .enum(['flag'])
+                                            .describe('\* `flag` - flag')
+                                            .describe(
+                                                'Flag property type required for flag dependency checks.\n\n\* `flag` - flag'
+                                            ),
+                                        cohort_name: zod
+                                            .string()
+                                            .nullish()
+                                            .describe('Resolved cohort name for cohort-type filters.'),
+                                        group_type_index: zod
+                                            .number()
+                                            .nullish()
+                                            .describe(
+                                                "Group type index a `group` filter reads properties from. Defaults to the condition set's `aggregation_group_type_index`."
+                                            ),
+                                        operator: zod
+                                            .enum(['flag_evaluates_to'])
+                                            .describe('\* `flag_evaluates_to` - flag_evaluates_to')
+                                            .describe(
+                                                'Operator for feature flag dependency evaluation.\n\n\* `flag_evaluates_to` - flag_evaluates_to'
+                                            ),
+                                        value: zod.unknown().describe('Value to compare flag evaluation against.'),
+                                    }),
+                                ])
+                            )
+                            .optional()
+                            .describe('Property conditions for this release condition group.'),
+                        rollout_percentage: zod
+                            .number()
+                            .optional()
+                            .describe('Rollout percentage for this release condition group.'),
+                        variant: zod.string().nullish().describe('Variant key override for multivariate flags.'),
+                        aggregation_group_type_index: zod
+                            .number()
+                            .nullish()
+                            .describe('Group type index for this condition set. None means person-level aggregation.'),
+                    })
+                )
+                .optional()
+                .describe('Release condition groups for the feature flag.'),
+            multivariate: zod
+                .union([
+                    zod.object({
+                        variants: zod
+                            .array(
+                                zod.object({
+                                    key: zod.string().describe('Unique key for this variant.'),
+                                    name: zod.string().optional().describe('Human-readable name for this variant.'),
+                                    rollout_percentage: zod.number().describe('Variant rollout percentage.'),
+                                })
+                            )
+                            .describe('Variant definitions for multivariate feature flags.'),
+                    }),
+                    zod.null(),
+                ])
+                .optional()
+                .describe('Multivariate configuration for variant-based rollouts.'),
+            aggregation_group_type_index: zod
+                .number()
+                .nullish()
+                .describe('Group type index for group-based feature flags.'),
+            payloads: zod
+                .record(zod.string(), zod.string())
+                .optional()
+                .describe('Optional payload values keyed by variant key.'),
+            feature_enrollment: zod
+                .boolean()
+                .nullish()
+                .describe(
+                    'Whether this flag has early access feature enrollment enabled. When true, the flag is evaluated against the person property $feature_enrollment\/{flag_key}.'
+                ),
+            early_exit: zod
+                .boolean()
+                .default(featureFlagsPartialUpdateBodyFiltersOneEarlyExitDefault)
+                .describe(
+                    'When true, condition evaluation stops at the first matching condition set rather than continuing to evaluate subsequent groups.'
+                ),
+        })
+        .optional()
+        .describe('Feature flag targeting configuration.'),
+    active: zod.boolean().optional().describe('Whether the feature flag is active.'),
+    archived: zod
+        .boolean()
+        .optional()
+        .describe(
+            'Whether the flag is archived. Archived flags are hidden from the flag list by default and must be disabled (`active: false`).'
+        ),
+    tags: zod.array(zod.string()).optional().describe('Organizational tags for this feature flag.'),
+    evaluation_contexts: zod
+        .array(zod.string())
+        .optional()
+        .describe('Evaluation contexts that control where this flag evaluates at runtime.'),
+    is_remote_configuration: zod
+        .boolean()
+        .nullish()
+        .describe(
+            'Whether this flag is a remote configuration flag that delivers a payload rather than gating a feature.'
+        ),
+    ensure_experience_continuity: zod
+        .boolean()
+        .nullish()
+        .describe(
+            "Whether to persist a user's flag value across the anonymous-to-identified transition (the 'persist across authentication steps' option). Incompatible with device_id bucketing."
+        ),
+    evaluation_runtime: zod
+        .union([
+            zod
+                .enum(['server', 'client', 'all'])
+                .describe('\* `server` - Server\n\* `client` - Client\n\* `all` - All'),
+            zod.null(),
+        ])
+        .optional()
+        .describe(
+            "Where this flag is allowed to evaluate: 'server' (server-side SDKs only), 'client' (client-side SDKs only), or 'all' (both). Defaults to 'all'.\n\n\* `server` - Server\n\* `client` - Client\n\* `all` - All"
+        ),
+    bucketing_identifier: zod
+        .union([
+            zod
+                .enum(['distinct_id', 'device_id'])
+                .describe('\* `distinct_id` - User ID (default)\n\* `device_id` - Device ID'),
+            zod.null(),
+        ])
+        .optional()
+        .describe(
+            "Identifier used to bucket users into rollout percentages and variants: 'distinct_id' (user ID, the default) or 'device_id'. Using 'device_id' is incompatible with ensure_experience_continuity=True.\n\n\* `distinct_id` - User ID (default)\n\* `device_id` - Device ID"
+        ),
+    version: zod
+        .number()
+        .min(featureFlagsPartialUpdateBodyVersionMin)
+        .optional()
+        .describe(
+            "The `version` from your most recent read of this flag. Required when the flag's `filters.version` is 2: the update is then refused with 409 if anyone else changed the flag after that version. Other flags do not check it."
+        ),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsActivityRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsActivityRetrieveQueryLimitDefault = 10
+
+export const featureFlagsActivityRetrieveQueryPageDefault = 1
+
+export const FeatureFlagsActivityRetrieveQueryParams = () => zod.object({
+    limit: zod
+        .number()
+        .min(1)
+        .default(featureFlagsActivityRetrieveQueryLimitDefault)
+        .describe('Number of items per page'),
+    page: zod.number().min(1).default(featureFlagsActivityRetrieveQueryPageDefault).describe('Page number'),
+})
+
+/**
+ * Archive a feature flag, hiding it from the default flag list.
+ *
+ * Sets `archived` to true. An archived flag must be disabled, so an enabled flag also gets
+ * `active` set to false in the same write. Targeting, variants and payloads are left as
+ * they are, and linked experiment and survey history is preserved. Archiving an enabled
+ * flag is refused when other active flags depend on it. An already-archived flag is
+ * returned unchanged.
+ */
+export const FeatureFlagsArchiveCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Get other active flags that depend on this flag.
+ */
+export const FeatureFlagsDependentFlagsListParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Disable a feature flag.
+ *
+ * Sets `active` to false and changes nothing else. Targeting, variants, payloads, tags and
+ * archived state are left as they are. Refused when other active flags depend on this one.
+ * An already-disabled flag is returned unchanged.
+ *
+ * A disabled flag stops evaluating for every consumer, including a linked experiment or a
+ * session replay setting. Read the full definition first to report that impact.
+ *
+ * Send the `version` your last read returned. A flag whose `filters.version` is 2 requires
+ * it, and for any flag a change after that version is refused with 409.
+ */
+export const FeatureFlagsDisableCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsDisableCreateBodyVersionMin = 0
+
+export const FeatureFlagsDisableCreateBody = () => zod.object({
+    version: zod
+        .number()
+        .min(featureFlagsDisableCreateBodyVersionMin)
+        .nullish()
+        .describe(
+            "The `version` from your most recent read of this flag. Required when the flag's `filters.version` is 2, optional otherwise. When sent, the change is refused with 409 if anyone else changed the flag after that version. Null is the same as leaving it out."
+        ),
+})
+
+/**
+ * Enable a feature flag.
+ *
+ * Sets `active` to true and changes nothing else. Targeting, variants, payloads, tags and
+ * archived state are left as they are. An archived flag is refused: unarchive it first. A
+ * flag whose own flag dependencies are disabled or use an unsupported configuration
+ * format is also refused, as is a flag whose release conditions target a deleted cohort.
+ * An already-enabled flag is returned unchanged.
+ *
+ * Send the `version` your last read returned. A flag whose `filters.version` is 2 requires
+ * it, and for any flag a change after that version is refused with 409.
+ */
+export const FeatureFlagsEnableCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsEnableCreateBodyVersionMin = 0
+
+export const FeatureFlagsEnableCreateBody = () => zod.object({
+    version: zod
+        .number()
+        .min(featureFlagsEnableCreateBodyVersionMin)
+        .nullish()
+        .describe(
+            "The `version` from your most recent read of this flag. Required when the flag's `filters.version` is 2, optional otherwise. When sent, the change is refused with 409 if anyone else changed the flag after that version. Null is the same as leaving it out."
+        ),
+})
+
+/**
+ * Serve a feature flag to every user.
+ *
+ * Adds a release condition with no property filters at 100% and keeps the existing
+ * conditions below it. Payloads, holdout and every other field are left as they are. On a
+ * boolean flag, removing the new condition restores the previous targeting. On a
+ * multivariate flag the variant distribution is rewritten as well, so removing the
+ * condition restores the audience but not the old split. A flag that already leads with
+ * such a condition gains no second one.
+ *
+ * This changes targeting only. A disabled flag still serves nobody, and a holdout is
+ * evaluated before release conditions, so users in one keep getting the holdout variant
+ * instead of the rollout. A flag gated on early access enrollment is refused, because that
+ * gate is evaluated before release conditions too and no targeting change gets past it.
+ *
+ * A multivariate flag needs `variant_key`, and every other flag rejects it. A release
+ * condition decides who the flag serves, not which variant they get, so rolling a
+ * multivariate flag out to everyone also gives the named variant 100% of the variant
+ * distribution and every other variant 0%. To serve everyone and keep the current split
+ * between variants, update the flag instead.
+ *
+ * Send the `version` your last read returned. A change to the flag after that version is
+ * refused with 409. Read the flag again and decide the rollout against its current
+ * definition.
+ */
+export const FeatureFlagsRollOutToEveryoneCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsRollOutToEveryoneCreateBodyVersionMin = 0
+
+export const FeatureFlagsRollOutToEveryoneCreateBody = () => zod.object({
+    version: zod
+        .number()
+        .min(featureFlagsRollOutToEveryoneCreateBodyVersionMin)
+        .nullable()
+        .describe(
+            'The `version` from your most recent read of this flag. The change is refused with 409 if anyone else changed the flag after that version. A flag written before versioning reads as `null`; send that back unchanged and it is read as 0, so the value a read returns is always one this accepts.'
+        ),
+    variant_key: zod
+        .string()
+        .nullish()
+        .describe(
+            'The variant every user gets. Required for a multivariate flag and rejected for any other flag, because a release condition decides who the flag serves and not which variant they get.'
+        ),
+})
+
+/**
+ * Set what percentage of one release condition's audience a feature flag is served to.
+ *
+ * Changes `rollout_percentage` on the release condition at `condition_index` and nothing
+ * else. The condition's property filters, every other condition, the variants, payloads,
+ * holdout and every remaining field are left as they are.
+ *
+ * Send the `version` your last read returned. A change to the flag after that version is
+ * refused with 409, because a condition index only names the condition you read. Read the
+ * flag again and decide the percentage against its current definition.
+ *
+ * On a multivariate flag this sets how many of the matching users get a variant at all. It
+ * does not change how the variants are split between them.
+ */
+export const FeatureFlagsSetReleaseConditionRolloutCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsSetReleaseConditionRolloutCreateBodyConditionIndexMin = 0
+
+export const featureFlagsSetReleaseConditionRolloutCreateBodyRolloutPercentageMin = 0
+export const featureFlagsSetReleaseConditionRolloutCreateBodyRolloutPercentageMax = 100
+
+export const featureFlagsSetReleaseConditionRolloutCreateBodyVersionMin = 0
+
+export const FeatureFlagsSetReleaseConditionRolloutCreateBody = () => zod.object({
+    condition_index: zod
+        .number()
+        .min(featureFlagsSetReleaseConditionRolloutCreateBodyConditionIndexMin)
+        .describe(
+            'Zero-based position of the release condition in `filters.groups`, counted from the read that produced `version`.'
+        ),
+    rollout_percentage: zod
+        .number()
+        .min(featureFlagsSetReleaseConditionRolloutCreateBodyRolloutPercentageMin)
+        .max(featureFlagsSetReleaseConditionRolloutCreateBodyRolloutPercentageMax)
+        .describe(
+            'Percentage of the users matching that condition who are served the flag, 0 through 100. On a multivariate flag this is how many matching users get a variant at all, not how the variants are split between them. Fractional percentages such as 0.5 are accepted, the same as a write that sends `filters`.'
+        ),
+    version: zod
+        .number()
+        .min(featureFlagsSetReleaseConditionRolloutCreateBodyVersionMin)
+        .nullable()
+        .describe(
+            'The `version` from your most recent read of this flag. The change is refused with 409 if anyone else changed the flag after that version. A flag written before versioning reads as `null`; send that back unchanged and it is read as 0, so the value a read returns is always one this accepts.'
+        ),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsStatusRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Test feature flag evaluation against a specific user at an optional point in time.
+ *
+ * This endpoint allows testing how a feature flag would evaluate for a specific user,
+ * optionally at a historical timestamp. When a timestamp is provided, both the flag
+ * conditions and person properties are evaluated as they existed at that time.
+ */
+export const FeatureFlagsTestEvaluationCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const FeatureFlagsTestEvaluationCreateBody = () => zod.object({
+    distinct_id: zod
+        .string()
+        .optional()
+        .describe('User distinct ID to test against (mutually exclusive with person_id)'),
+    person_id: zod.string().optional().describe('Person ID to test against (mutually exclusive with distinct_id)'),
+    timestamp: zod.iso
+        .datetime({ offset: true })
+        .nullish()
+        .describe(
+            'Optional point-in-time to evaluate the flag against — both flag conditions and person properties are reconstructed as they existed at that timestamp. ISO 8601 with timezone, e.g. ``2026-04-29T15:30:00Z`` or ``2026-04-29T15:30:00+00:00``. Naive timestamps (no timezone) are interpreted as UTC.'
+        ),
+    groups: zod
+        .unknown()
+        .optional()
+        .describe('Groups for feature flag evaluation (JSON object, defaults to empty dict)'),
+})
+
+/**
+ * Restore an archived feature flag to the default flag list.
+ *
+ * Sets `archived` to false and changes nothing else. The flag stays disabled; enable it
+ * with a separate call. A flag whose release conditions target a deleted cohort is
+ * refused: remove that condition first. An already-unarchived flag is returned unchanged.
+ */
+export const FeatureFlagsUnarchiveCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsVersionsRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+    version_number: zod.number().describe('The version number to reconstruct.'),
+})
+
+/**
+ * Restore a past version of a feature flag.
+ *
+ * Sets the flag's release conditions, variants, payloads, name and evaluation options back to
+ * what they were at `version_number`. Read that version first with the versions endpoint to see
+ * what will change. The flag's key, its enabled state, and its archived state stay as they are,
+ * as do tags, evaluation contexts and how its cohorts are defined. The restore is saved as a new
+ * version, so it can be undone by restoring the version before it.
+ *
+ * Send the flag's current `version`. A change after that version is refused with 409. An
+ * approval policy that gates the change opens a change request instead. A restore to a version
+ * that matches the current configuration writes nothing and returns the flag.
+ */
+export const FeatureFlagsVersionsRestoreCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this feature flag.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+    version_number: zod.number().describe('The past version to restore.'),
+})
+
+export const featureFlagsVersionsRestoreCreateBodyAskRollbackReasonDefault = false
+export const featureFlagsVersionsRestoreCreateBodyRollbackReasonNoteMax = 1000
+
+export const featureFlagsVersionsRestoreCreateBodyVersionMin = 0
+
+export const FeatureFlagsVersionsRestoreCreateBody = () => zod.object({
+    ask_rollback_reason: zod
+        .boolean()
+        .default(featureFlagsVersionsRestoreCreateBodyAskRollbackReasonDefault)
+        .describe(
+            "When true, the edit lowers the flag's exposure, and the request sends no `rollback_reason`, the flag is not saved and the response is a 409 with the code `rollback_reason_required`. Send the edit again without this field to save it, with or without a `rollback_reason`. Ignored for an edit that needs approval and for a config version 2 flag."
+        ),
+    rollback_reason: zod
+        .union([
+            zod
+                .enum(['errors', 'metrics', 'planned', 'wrong_configuration', 'other'])
+                .describe(
+                    '\* `errors` - Errors or bugs\n\* `metrics` - Metrics got worse\n\* `planned` - It was planned\n\* `wrong_configuration` - Wrong configuration\n\* `other` - Other'
+                ),
+            zod.null(),
+        ])
+        .optional()
+        .describe(
+            "Why this edit lowers the flag's exposure, for example a rollback after errors. Stored on the activity log entry of the edit. Not stored for an edit that needs approval or for a config version 2 flag.\n\n\* `errors` - Errors or bugs\n\* `metrics` - Metrics got worse\n\* `planned` - It was planned\n\* `wrong_configuration` - Wrong configuration\n\* `other` - Other"
+        ),
+    rollback_reason_note: zod
+        .string()
+        .max(featureFlagsVersionsRestoreCreateBodyRollbackReasonNoteMax)
+        .nullish()
+        .describe('A free-text note for `rollback_reason`. Requires `rollback_reason`.'),
+    version: zod
+        .number()
+        .min(featureFlagsVersionsRestoreCreateBodyVersionMin)
+        .nullable()
+        .describe(
+            "The flag's current `version`, from your most recent read of it. This is not the version to restore, which goes in the URL. The restore is refused with 409 if anyone changed the flag after this version. A flag written before versioning reads as `null`; send that back unchanged and it is read as 0."
+        ),
+})
+
+/**
+ * Bulk delete feature flags by filter criteria or explicit IDs.
+ *
+ * Accepts either:
+ * - {"filters": {...}} - Same filter params as list endpoint (search, active, type, etc.)
+ * - {"ids": [...]} - Explicit list of flag IDs (no limit)
+ *
+ * Returns same format as bulk_delete for UI compatibility.
+ *
+ * Config version 1 flags are deleted with batched updates, and cache invalidation
+ * runs once at the end. Config version 2 flags are deleted one at a time through
+ * ``update_flag``. Each one bumps its ``version`` and commits on its own.
+ */
+export const FeatureFlagsBulkDeleteCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const FeatureFlagsBulkDeleteCreateBody = () => zod.object({
+    filters: zod
+        .object({
+            active: zod
+                .enum(['true', 'false', 'STALE'])
+                .describe('\* `true` - true\n\* `false` - false\n\* `STALE` - STALE')
+                .optional()
+                .describe(
+                    "'true' and 'false' filter on serving state, the flag's `active` column. 'STALE' returns enabled flags only, so a disabled flag is never STALE. An enabled flag matches when its last recorded `$feature_flag_called` event is more than 30 days old. With no recorded event, it matches when it is at least 30 days old and either stores `filters` as `{}` or serves one result to everyone through a release condition at 100% with no property filters. A flag with no recorded event and an empty `groups` list does not match, even when its `status` reads STALE. The reverse also happens: a multivariate flag matches when a variant is at 100% under a release condition at 100% with no property filters, or when that condition names a variant. Its `status` can still read ACTIVE, because an earlier variant in the list or an earlier targeted condition can serve a different result. In a flag of either type that mixes person and group aggregation, the filter also counts a group-aggregated condition at 100% with no property filters, which `status` does not. An SDK that sends no `$feature_flag_called` event leaves no record, so a STALE flag can still be in use.\n\n\* `true` - true\n\* `false` - false\n\* `STALE` - STALE"
+                ),
+            created_by_id: zod.number().optional().describe('Filter to flags created by a specific user ID.'),
+            search: zod
+                .string()
+                .optional()
+                .describe(
+                    'Search by feature flag key or name (case-insensitive). Spaces, underscores, and hyphens count as the same separator. The words of the term must appear together and in order, so a shorter term matches more flags.'
+                ),
+            type: zod
+                .enum(['boolean', 'multivariant', 'experiment', 'remote_config'])
+                .describe(
+                    '\* `boolean` - boolean\n\* `multivariant` - multivariant\n\* `experiment` - experiment\n\* `remote_config` - remote_config'
+                )
+                .optional()
+                .describe(
+                    'Filter by flag type.\n\n\* `boolean` - boolean\n\* `multivariant` - multivariant\n\* `experiment` - experiment\n\* `remote_config` - remote_config'
+                ),
+            evaluation_runtime: zod
+                .enum(['server', 'client', 'all'])
+                .describe('\* `server` - Server\n\* `client` - Client\n\* `all` - All')
+                .optional()
+                .describe(
+                    'Filter by evaluation runtime.\n\n\* `server` - Server\n\* `client` - Client\n\* `all` - All'
+                ),
+            excluded_properties: zod
+                .string()
+                .optional()
+                .describe('JSON-encoded property filter to exclude. Same shape as the list endpoint.'),
+            tags: zod
+                .array(zod.string())
+                .optional()
+                .describe('Tag names to filter by. Flags carrying at least one of these tags match.'),
+            excluded_tags: zod
+                .array(zod.string())
+                .optional()
+                .describe('Tag names to exclude. Flags carrying any of these tags are filtered out.'),
+            has_evaluation_contexts: zod
+                .boolean()
+                .optional()
+                .describe('When true, only matches flags with at least one evaluation context.'),
+            archived: zod
+                .boolean()
+                .optional()
+                .describe('Filter by archived state. When omitted, archived flags are excluded.'),
+        })
+        .describe("Allowed filter keys for bulk_delete — same shape as the list endpoint's query params.")
+        .optional()
+        .describe(
+            "Filter criteria — same shape as the list endpoint's query params. Mutually exclusive with `ids`. Use this to bulk-delete by search\/active\/tags\/etc. instead of supplying explicit IDs."
+        ),
+    ids: zod
+        .array(zod.number().min(1))
+        .optional()
+        .describe('Explicit feature flag IDs to soft-delete. Mutually exclusive with `filters`.'),
+})
+
+/**
+ * Get feature flag keys by IDs.
+ * Accepts a list of feature flag IDs and returns a mapping of ID to key.
+ */
+export const FeatureFlagsBulkKeysRetrieveParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const FeatureFlagsBulkKeysRetrieveBody = () => zod.object({
+    ids: zod
+        .array(zod.unknown())
+        .optional()
+        .describe(
+            'Feature flag IDs to look up keys for. Strings of digits are also accepted; any other value is reported in the response `warning` field and otherwise ignored.'
+        ),
+})
+
+/**
+ * Bulk update tags on multiple objects.
+ *
+ * PAT access: this action has no ``required_scopes=`` on the decorator —
+ * inheriting viewsets must add ``"bulk_update_tags"`` to their
+ * ``scope_object_write_actions`` list to accept personal API keys.
+ * Without that opt-in, ``APIScopePermission`` rejects PAT requests with
+ * "This action does not support personal API key access". Done per-viewset
+ * so granting ``<scope>:write`` for one resource doesn't leak access to
+ * sibling resources that share this mixin.
+ *
+ * Accepts:
+ * - {"ids": [...], "action": "add"|"remove"|"set", "tags": ["tag1", "tag2"]}
+ *
+ * Actions:
+ * - "add": Add tags to existing tags on each object
+ * - "remove": Remove specific tags from each object
+ * - "set": Replace all tags on each object with the provided list
+ */
+export const FeatureFlagsBulkUpdateTagsCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsBulkUpdateTagsCreateBodyIdsMax = 500
+
+export const featureFlagsBulkUpdateTagsCreateBodyTagsItemMax = 255
+
+export const featureFlagsBulkUpdateTagsCreateBodyTagsMax = 100
+
+export const FeatureFlagsBulkUpdateTagsCreateBody = () => zod.object({
+    ids: zod
+        .array(zod.number())
+        .max(featureFlagsBulkUpdateTagsCreateBodyIdsMax)
+        .describe('List of object IDs to update tags on.'),
+    action: zod
+        .enum(['add', 'remove', 'set'])
+        .describe('\* `add` - add\n\* `remove` - remove\n\* `set` - set')
+        .describe(
+            "'add' merges with existing tags, 'remove' deletes specific tags, 'set' replaces all tags.\n\n\* `add` - add\n\* `remove` - remove\n\* `set` - set"
+        ),
+    tags: zod
+        .array(zod.string().max(featureFlagsBulkUpdateTagsCreateBodyTagsItemMax))
+        .max(featureFlagsBulkUpdateTagsCreateBodyTagsMax)
+        .describe('Tag names to add, remove, or set (up to 100 per request, 255 characters each).'),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsEvaluationReasonsRetrieveParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsEvaluationReasonsRetrieveQueryGroupsDefault = `{}`
+
+export const FeatureFlagsEvaluationReasonsRetrieveQueryParams = () => zod.object({
+    distinct_id: zod.string().min(1).describe('User distinct ID'),
+    flag_keys: zod
+        .array(zod.string())
+        .optional()
+        .describe(
+            'Optional list of flag keys to scope the response to. When omitted, evaluation reasons are returned for every flag in the project, which can be a very large payload on projects with many flags. Pass the specific flag(s) you are debugging to keep the response small. Accepts either repeated query params (flag_keys=a&flag_keys=b) or a JSON array string (flag_keys=[\"a\",\"b\"]).'
+        ),
+    groups: zod
+        .string()
+        .default(featureFlagsEvaluationReasonsRetrieveQueryGroupsDefault)
+        .describe('Groups for feature flag evaluation (JSON object string)'),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsMyFlagsRetrieveParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const featureFlagsMyFlagsRetrieveQueryGroupsDefault = `{}`
+
+export const FeatureFlagsMyFlagsRetrieveQueryParams = () => zod.object({
+    flag_keys: zod
+        .array(zod.string())
+        .optional()
+        .describe(
+            'Optional list of flag keys to scope the response to. When omitted, every flag in the project is returned with its evaluated value, which can be a very large payload on projects with many flags. Pass the specific flag(s) you want to check to keep the response small. Accepts either repeated query params (flag_keys=a&flag_keys=b) or a JSON array string (flag_keys=[\"a\",\"b\"]).'
+        ),
+    groups: zod
+        .string()
+        .default(featureFlagsMyFlagsRetrieveQueryGroupsDefault)
+        .describe('Groups for feature flag evaluation (JSON object string)'),
+})
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const FeatureFlagsUserBlastRadiusCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const FeatureFlagsUserBlastRadiusCreateBody = () => zod.object({
+    condition: zod.record(zod.string(), zod.unknown()).describe('The release condition to evaluate'),
+    group_type_index: zod
+        .number()
+        .nullish()
+        .describe('Group type index for group-based flags (null for person-based flags)'),
+})
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const ScheduledChangesListParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const ScheduledChangesListQueryParams = () => zod.object({
+    limit: zod.number().optional().describe('Number of results to return per page.'),
+    model_name: zod
+        .string()
+        .optional()
+        .describe('Filter by model type. Use \"FeatureFlag\" to see feature flag schedules.'),
+    offset: zod.number().optional().describe('The initial index from which to return the results.'),
+    record_id: zod.string().optional().describe('Filter by the ID of a specific feature flag.'),
+    record_ids: zod
+        .string()
+        .optional()
+        .describe('Comma-separated feature flag IDs. Returns the schedules of any of them, at most 200 IDs.'),
+})
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const ScheduledChangesCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const scheduledChangesCreateBodyRecordIdMax = 200
+
+export const scheduledChangesCreateBodyIsRecurringDefault = false
+export const scheduledChangesCreateBodyCronExpressionMax = 100
+
+export const ScheduledChangesCreateBody = () => zod.object({
+    record_id: zod
+        .string()
+        .max(scheduledChangesCreateBodyRecordIdMax)
+        .describe('The ID of the record to modify (e.g. the feature flag ID).'),
+    model_name: zod
+        .enum(['FeatureFlag'])
+        .describe('\* `FeatureFlag` - feature flag')
+        .describe(
+            'The type of record to modify. Currently only \"FeatureFlag\" is supported.\n\n\* `FeatureFlag` - feature flag'
+        ),
+    payload: zod
+        .unknown()
+        .describe(
+            "The change to apply. Must include an 'operation' key and a 'value' key. Supported operations: 'update_status' (value: true\/false to enable\/disable the flag), 'add_release_condition' (value: object with 'groups', 'payloads', and 'multivariate' keys), 'update_variants' (value: object with 'variants' and 'payloads' keys)."
+        ),
+    scheduled_at: zod.iso
+        .datetime({ offset: true })
+        .describe("ISO 8601 datetime when the change should be applied (e.g. '2025-06-01T14:00:00Z')."),
+    is_recurring: zod
+        .boolean()
+        .default(scheduledChangesCreateBodyIsRecurringDefault)
+        .describe("Whether this schedule repeats. Only the 'update_status' operation supports recurring schedules."),
+    recurrence_interval: zod
+        .union([
+            zod
+                .enum(['daily', 'weekly', 'monthly', 'yearly'])
+                .describe('\* `daily` - daily\n\* `weekly` - weekly\n\* `monthly` - monthly\n\* `yearly` - yearly'),
+            zod.null(),
+        ])
+        .optional()
+        .describe(
+            'How often the schedule repeats. Required when is_recurring is true. One of: daily, weekly, monthly, yearly.\n\n\* `daily` - daily\n\* `weekly` - weekly\n\* `monthly` - monthly\n\* `yearly` - yearly'
+        ),
+    cron_expression: zod.string().max(scheduledChangesCreateBodyCronExpressionMax).nullish(),
+    end_date: zod.iso
+        .datetime({ offset: true })
+        .nullish()
+        .describe('Optional ISO 8601 datetime after which a recurring schedule stops executing.'),
+})
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const ScheduledChangesRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this scheduled change.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const ScheduledChangesPartialUpdateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this scheduled change.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const scheduledChangesPartialUpdateBodyRecordIdMax = 200
+
+export const scheduledChangesPartialUpdateBodyCronExpressionMax = 100
+
+export const ScheduledChangesPartialUpdateBody = () => zod.object({
+    record_id: zod
+        .string()
+        .max(scheduledChangesPartialUpdateBodyRecordIdMax)
+        .optional()
+        .describe('The ID of the record to modify (e.g. the feature flag ID).'),
+    model_name: zod
+        .enum(['FeatureFlag'])
+        .describe('\* `FeatureFlag` - feature flag')
+        .optional()
+        .describe(
+            'The type of record to modify. Currently only \"FeatureFlag\" is supported.\n\n\* `FeatureFlag` - feature flag'
+        ),
+    payload: zod
+        .unknown()
+        .optional()
+        .describe(
+            "The change to apply. Must include an 'operation' key and a 'value' key. Supported operations: 'update_status' (value: true\/false to enable\/disable the flag), 'add_release_condition' (value: object with 'groups', 'payloads', and 'multivariate' keys), 'update_variants' (value: object with 'variants' and 'payloads' keys)."
+        ),
+    scheduled_at: zod.iso
+        .datetime({ offset: true })
+        .optional()
+        .describe("ISO 8601 datetime when the change should be applied (e.g. '2025-06-01T14:00:00Z')."),
+    is_recurring: zod
+        .boolean()
+        .optional()
+        .describe("Whether this schedule repeats. Only the 'update_status' operation supports recurring schedules."),
+    recurrence_interval: zod
+        .union([
+            zod
+                .enum(['daily', 'weekly', 'monthly', 'yearly'])
+                .describe('\* `daily` - daily\n\* `weekly` - weekly\n\* `monthly` - monthly\n\* `yearly` - yearly'),
+            zod.null(),
+        ])
+        .optional()
+        .describe(
+            'How often the schedule repeats. Required when is_recurring is true. One of: daily, weekly, monthly, yearly.\n\n\* `daily` - daily\n\* `weekly` - weekly\n\* `monthly` - monthly\n\* `yearly` - yearly'
+        ),
+    cron_expression: zod.string().max(scheduledChangesPartialUpdateBodyCronExpressionMax).nullish(),
+    end_date: zod.iso
+        .datetime({ offset: true })
+        .nullish()
+        .describe('Optional ISO 8601 datetime after which a recurring schedule stops executing.'),
+})
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const ScheduledChangesDestroyParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this scheduled change.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})

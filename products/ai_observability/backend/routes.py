@@ -1,0 +1,189 @@
+from posthog.api.routing import RouterRegistry
+from posthog.settings import CLOUD_DEPLOYMENT, DEBUG, TEST
+
+from products.ai_observability.backend.api import (
+    AIBlobViewSet,
+    AIObservabilityClusteringRunViewSet,
+    AIObservabilityInstrumentationChecklistViewSet,
+    AIObservabilitySummarizationViewSet,
+    AIObservabilityTextReprViewSet,
+    AIObservabilityTranslateViewSet,
+    ClusteringConfigViewSet,
+    ClusteringJobViewSet,
+    DatasetItemViewSet,
+    DatasetViewSet,
+    EvalSuggestionViewSet,
+    EvaluationBackfillViewSet,
+    EvaluationConfigViewSet,
+    EvaluationDirectoryViewSet,
+    EvaluationReportViewSet,
+    EvaluationRunViewSet,
+    EvaluationViewSet,
+    LLMModelsViewSet,
+    LLMProviderKeyValidationViewSet,
+    LLMProviderKeyViewSet,
+    LLMProxyViewSet,
+    OfflineExperimentViewSet,
+    OfflineScorerViewSet,
+    ParserRecipeViewSet,
+    PersonalSpendInternalViewSet,
+    PersonalSpendViewSet,
+    ReviewQueueItemViewSet,
+    ReviewQueueViewSet,
+    ScoreDefinitionViewSet,
+    TaggerViewSet,
+    TraceReviewViewSet,
+)
+from products.ai_observability.backend.presentation.views.trace_clusters import TraceClustersViewSet
+from products.ai_observability.backend.presentation.views.trace_evaluations import TraceEvaluationsViewSet
+from products.ai_observability.backend.presentation.views.trace_exports import TraceExportViewSet
+from products.ai_observability.backend.presentation.views.trace_feedback import TraceFeedbackViewSet
+from products.ai_observability.backend.presentation.views.trace_nodes import TraceNodeViewSet
+from products.ai_observability.backend.presentation.views.trace_pull_request import TracePullRequestViewSet
+from products.ai_observability.backend.presentation.views.trace_resource import TRACE_LOOKUP
+from products.ai_observability.backend.presentation.views.trace_review import TraceReviewStatusViewSet
+from products.ai_observability.backend.presentation.views.trace_search import TraceSearchViewSet
+from products.ai_observability.backend.presentation.views.trace_summary import TraceSummaryViewSet
+from products.ai_observability.backend.presentation.views.traces import TraceViewSet
+
+
+def register_routes(routers: RouterRegistry) -> None:
+    routers.projects.register(
+        r"ai_observability/offline_experiments",
+        OfflineExperimentViewSet,
+        "project_ai_observability_offline_experiments",
+        ["team_id"],
+    )
+    routers.projects.register(
+        r"ai_observability/offline_scorers",
+        OfflineScorerViewSet,
+        "project_ai_observability_offline_scorers",
+        ["team_id"],
+    )
+    routers.projects.register(r"ai_blob", AIBlobViewSet, "project_ai_blob", ["project_id"])
+    # `ai_observability` is the canonical name; the `llm_analytics/` prefixes below are the
+    # unfinished half of a rename the frontend scene URLs already completed.
+    routers.projects.register(
+        r"ai_observability/instrumentation_checklist",
+        AIObservabilityInstrumentationChecklistViewSet,
+        "project_ai_observability_instrumentation_checklist",
+        ["team_id"],
+    )
+    traces_router = routers.projects.register(
+        r"ai_observability/traces",
+        TraceViewSet,
+        "project_ai_observability_traces",
+        ["team_id"],
+    )
+    for prefix, viewset, basename in [
+        ("nodes", TraceNodeViewSet, "project_ai_observability_trace_nodes"),
+        ("evaluations", TraceEvaluationsViewSet, "project_ai_observability_trace_evaluations"),
+        ("clusters", TraceClustersViewSet, "project_ai_observability_trace_clusters"),
+        ("feedback", TraceFeedbackViewSet, "project_ai_observability_trace_feedback"),
+        ("review", TraceReviewStatusViewSet, "project_ai_observability_trace_review"),
+        ("search", TraceSearchViewSet, "project_ai_observability_trace_search"),
+        ("summary", TraceSummaryViewSet, "project_ai_observability_trace_summary"),
+        ("pull_request", TracePullRequestViewSet, "project_ai_observability_trace_pull_request"),
+        ("exports", TraceExportViewSet, "project_ai_observability_trace_exports"),
+    ]:
+        traces_router.register(prefix, viewset, basename, ["team_id", TRACE_LOOKUP])
+    routers.root.register(r"llm_proxy", LLMProxyViewSet, "llm_proxy")
+    # @me/spend is only useful where billing data is available; mirrors the
+    # CLOUD/DEBUG/TEST gate the registration carried inline.
+    if CLOUD_DEPLOYMENT == "US" or DEBUG or TEST:
+        routers.root.register(r"llm_analytics/@me/spend", PersonalSpendViewSet, "personal_spend")
+        # HMAC-authenticated receiver for the EU→US personal-spend proxy.
+        routers.root.register(r"llm_analytics/internal/spend", PersonalSpendInternalViewSet, "personal_spend_internal")
+
+    routers.projects.register(
+        r"llm_analytics/parser_recipes", ParserRecipeViewSet, "project_llm_analytics_parser_recipes", ["team_id"]
+    )
+    routers.projects.register(r"datasets", DatasetViewSet, "project_datasets", ["team_id"])
+    routers.projects.register(r"dataset_items", DatasetItemViewSet, "project_dataset_items", ["team_id"])
+    project_evaluations_router = routers.projects.register(
+        r"evaluations", EvaluationViewSet, "project_evaluations", ["team_id"]
+    )
+    project_evaluations_router.register(
+        r"backfills",
+        EvaluationBackfillViewSet,
+        "project_evaluation_backfills",
+        ["team_id", "evaluation_id"],
+    )
+    routers.projects.register(
+        r"evaluation_suggestions", EvalSuggestionViewSet, "project_evaluation_suggestions", ["team_id"]
+    )
+    routers.projects.register(
+        r"evaluation_directories",
+        EvaluationDirectoryViewSet,
+        "project_evaluation_directories",
+        ["team_id"],
+    )
+    routers.projects.register(r"taggers", TaggerViewSet, "project_taggers", ["team_id"])
+    routers.projects.register(r"evaluation_runs", EvaluationRunViewSet, "project_evaluation_runs", ["team_id"])
+    routers.projects.register(
+        r"llm_analytics/text_repr", AIObservabilityTextReprViewSet, "project_llm_analytics_text_repr", ["team_id"]
+    )
+    routers.projects.register(
+        r"llm_analytics/summarization",
+        AIObservabilitySummarizationViewSet,
+        "project_llm_analytics_summarization",
+        ["team_id"],
+    )
+    routers.projects.register(
+        r"llm_analytics/translate", AIObservabilityTranslateViewSet, "project_llm_analytics_translate", ["team_id"]
+    )
+    routers.projects.register(
+        r"llm_analytics/provider_keys", LLMProviderKeyViewSet, "project_llm_analytics_provider_keys", ["team_id"]
+    )
+    routers.projects.register(
+        r"llm_analytics/provider_key_validations",
+        LLMProviderKeyValidationViewSet,
+        "project_llm_analytics_provider_key_validations",
+        ["team_id"],
+    )
+    routers.projects.register(r"llm_analytics/models", LLMModelsViewSet, "project_llm_analytics_models", ["team_id"])
+    routers.projects.register(
+        r"llm_analytics/evaluation_config",
+        EvaluationConfigViewSet,
+        "project_llm_analytics_evaluation_config",
+        ["team_id"],
+    )
+    routers.projects.register(
+        r"llm_analytics/clustering_runs",
+        AIObservabilityClusteringRunViewSet,
+        "project_llm_analytics_clustering_runs",
+        ["team_id"],
+    )
+    routers.projects.register(
+        r"llm_analytics/clustering_config",
+        ClusteringConfigViewSet,
+        "project_llm_analytics_clustering_config",
+        ["team_id"],
+    )
+    routers.projects.register(
+        r"llm_analytics/clustering_jobs", ClusteringJobViewSet, "project_llm_analytics_clustering_jobs", ["team_id"]
+    )
+    routers.projects.register(
+        r"llm_analytics/review_queue_items",
+        ReviewQueueItemViewSet,
+        "project_llm_analytics_review_queue_items",
+        ["team_id"],
+    )
+    routers.projects.register(
+        r"llm_analytics/review_queues", ReviewQueueViewSet, "project_llm_analytics_review_queues", ["team_id"]
+    )
+    routers.projects.register(
+        r"llm_analytics/score_definitions",
+        ScoreDefinitionViewSet,
+        "project_llm_analytics_score_definitions",
+        ["team_id"],
+    )
+    routers.projects.register(
+        r"llm_analytics/trace_reviews", TraceReviewViewSet, "project_llm_analytics_trace_reviews", ["team_id"]
+    )
+    routers.projects.register(
+        r"llm_analytics/evaluation_reports",
+        EvaluationReportViewSet,
+        "project_llm_analytics_evaluation_reports",
+        ["team_id"],
+    )

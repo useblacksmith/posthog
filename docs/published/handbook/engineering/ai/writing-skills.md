@@ -1,0 +1,510 @@
+---
+title: Writing skills
+sidebar: Docs
+showTitle: true
+---
+
+Skills are job-to-be-done templates that teach agents _how_ to use capabilities to achieve a goal.
+They should read like how an experienced person would approach a job,
+not like a rigid script of commands to run.
+Describe the workflow, the reasoning behind each step, and what to watch out for –
+then trust the agent to adapt.
+Overly strict instructions break when context changes;
+a well-explained approach generalizes.
+
+This page covers what skills are, how to write them, and how the build pipeline works.
+For adding MCP tools (the capabilities themselves), see [Adding tools to the MCP server](/handbook/engineering/ai/implementing-mcp-tools).
+
+## TL;DR
+
+```sh
+# 1. Scaffold a new skill in your product
+hogli init:skill
+
+# 2. Write your skill in products/{product}/skills/{skill-name}/SKILL.md
+#    Add references/ for detailed content, use .md.j2 for templates
+
+# 3. Lint (fast, no Django needed)
+hogli lint:skills
+
+# 4. Build locally to verify rendered output
+hogli build:skills
+
+# 5. Test locally with PostHog Desktop or a coding agent
+hogli sync:skill -- --name <skill-name>
+
+# 6. Delete the test skill (optional)
+hogli unsync:skill -- --name <skill-name>
+
+# 7. Merge to master – CI builds and distributes automatically
+```
+
+## Where the skill lives
+
+Choose the location by the work the skill requires:
+
+- `products/<product>/skills/` contains skills that users can run through PostHog tools, APIs, or their own code. The build publishes these skills.
+- `.agents/skills/` contains skills that require a checkout of the PostHog repository to develop, test, or debug PostHog itself. These skills stay in the repository.
+
+Staff-only access does not determine placement.
+For example, `checking-deploy-timing` works through MCP without a checkout, so it stays in the published catalog.
+A skill that changes a customer's application also stays published; it does not require PostHog source code.
+
+If a skill mixes customer diagnosis with PostHog development, keep the diagnosis published and move the development guidance into an existing internal skill or reference.
+For example, `debugging-surveys` covers configuration and responses, while the internal `survey-sdk-audit` skill covers changes across the backend and SDKs.
+Published skills must not require internal skill files to complete their main workflow.
+
+`hogli init:skill` scaffolds published product skills.
+For internal guidance, extend an existing `.agents/skills/` entry where possible.
+Both locations use `SKILL.md` with `name` and `description` frontmatter, and `hogli lint:skills` checks both.
+
+## Skills vs tools
+
+**Tools** are atomic capabilities – CRUD operations and simple actions exposed via the MCP server.
+They answer "what can I do?" (list feature flags, execute SQL, create a survey).
+
+**Skills** answer "how do I accomplish X?"
+They combine tools, domain knowledge, query patterns, and step-by-step workflows
+into a template that agents follow to solve a class of problems.
+
+A skill might reference multiple tools, include HogQL query examples,
+explain what data to verify before querying,
+and describe the desired outcome for the customer.
+
+This separation matters because agents are good at composing simple tools
+but need guidance on _which_ tools to use, in _what order_, with _what constraints_.
+
+### Query selection guidance
+
+Query skills should choose methods from the requested calculation and output, not require typed queries or SQL for every task.
+Reuse matching approved metrics or saved queries when they define the requested measure.
+Default to typed runners for new product analytics and dashboard insights when their schemas support the requested calculation, including simple event counts, unique users, property sums, breakdowns, and time series.
+Use SQL for record inspection, custom calculations, joins, existing SQL, or requests for SQL.
+When both methods fit a new event-analytics query, use the typed runner. SQL examples and SQL discovery calls do not determine the final analysis method. Save supported dashboard analyses as native query nodes.
+Keep valid existing SQL when it fits the task. A task that needs SQL does not require a failed typed-query attempt first.
+Reassess when the task changes. Neither the previous tool call nor a request for a chart determines the next method.
+
+Tool descriptions should state capabilities and limits. Skill examples should show direct inputs for the method they teach.
+Keep SQL examples for SQL tasks rather than requiring agents to reconstruct typed inputs from generated SQL.
+
+Rendering guidance must account for the harness: direct tools and some exec hosts display query apps inline, while other exec hosts need the separate top-level `render-ui` tool. Skip duplicate rendering only when the harness or response indicates that the view is already displayed. Otherwise, if `render-ui` is available and its enum includes the query tool, render with the same tool name and validated input after the query succeeds. If no UI path is available, summarize or follow the harness's presentation instructions; do not change a supported typed query to SQL just to display a chart.
+
+### When to write a skill
+
+The decision flow:
+
+1. **Ask PostHog Desktop or Claude Code to do X.** If it works on its own, you don't need a skill.
+2. **If it can't do X, fix the tool prompts first.**
+   Tool names, descriptions, and schemas are the cheapest lever — most "the agent doesn't know how to do X" problems are really "the tool description doesn't explain how to do X."
+   See [Adding tools to the MCP server](/handbook/engineering/ai/implementing-mcp-tools).
+3. **If improving tool prompts doesn't unlock the task — or the agent burns significant tokens figuring out which work to do — write a skill.**
+
+Additional signals that a skill is the right answer even when tool prompts are already solid:
+
+- **Complex inputs or outputs.** AI observability, logs, and other query-style endpoints have nested or non-obvious payload shapes the agent has to reason over. Ship a skill so it doesn't rediscover that shape every conversation.
+- **The guidance naturally splits into entry point plus references.**
+  SQL skills are the canonical example — a top-level workflow with optional schemas, query patterns, and function indexes loaded on demand. If your guidance has that shape, structure it as a skill with `references/`.
+
+Don't write a skill for something the agent already one-shots from generic knowledge. A few real examples from review: `creating-isolated-project` or `finding-experiments` were unnecessary — the agent can do it without help. `setting-up-reverse-proxy` was the right call — the agent failed at it, and the skill needed to ship code snippets it couldn't derive. The bar is PostHog-specific judgement that a smart generalist agent wouldn't have, not project setup it can already handle.
+
+### Docs or skill?
+
+A skill holds the steps an agent follows for one job: the order of tool calls, the checks to run before it reports done, and the decisions it must not make alone.
+Most of that is detail a person doing the same job would skip.
+
+Everything else goes in docs, because people need it too.
+That covers how a system works, how to set it up or run it, its options, and its gotchas.
+Put it in a README next to the code or in an existing page under `docs/`, and have the skill link to it with a line on when to read it.
+A published product skill links to the public page on posthog.com.
+If an engineer would look something up without an agent, it belongs in docs.
+
+The `working-with-charts` skill is the model.
+The chart API docs live in the package. The skill keeps how to pick a chart, a few rules for its data, and what to check before calling the work done, and links to the package docs for the rest.
+
+### How many skills is too many?
+
+A common worry when shipping a set of skills is "am I adding too many?" — and it's the right worry. Skill count is a budgeted, shared resource, not a free axis to expand. Agents pick skills from a list of _all_ available descriptions, and many harnesses **truncate that list** once it grows long. Every extra skill dilutes discovery for every other skill, so a bloated set makes each individual skill _less_ likely to fire, not more.
+
+So the number of skills is a cost to weigh, not just the content of each one. Before adding another skill, decide whether you have a genuinely new job-to-be-done or just more detail for a job you've already covered:
+
+- **New trigger → new skill.** A skill earns its own entry point only when it has a distinct trigger an agent would match against on its own. If you can't write a description whose "when to use it" is clearly different from an existing skill's, it isn't a separate skill.
+- **More detail → `references/`, not a new skill.** When the extra material is depth on an existing workflow (another failure mode, an SDK-specific variant, a longer query catalog), add it to that skill's [`references/`](#progressive-disclosure) rather than spinning up a sibling. The entry point stays lean and the detail loads on demand — you get coverage without spending a skill slot.
+- **Consolidate near-duplicate siblings.** If two skills share the same diagnosis, bug class, or trigger and differ only in a detail, merge them into one skill with references. Splitting the same job across two files adds a slot for no discovery benefit — reviewers will (and should) push back on it.
+
+The rule of thumb: prefer a small set of focused skills, each with rich `references/`, over a large set of thin ones. Reach for a reference file first; add a whole new skill only when the job and its trigger are genuinely distinct.
+
+### Referencing MCP tools in skills
+
+When a skill references an MCP tool, use the `posthog:` namespace prefix
+(e.g. `posthog:execute-sql`, `posthog:feature-flag-get-all`).
+This matches how tools appear to agents consuming the PostHog MCP server
+and helps agents resolve tool names unambiguously.
+
+## Skill structure
+
+Published skills live in `products/*/skills/` and come in two forms.
+If your product hasn't moved to the `products/` folder yet,
+create a product folder and add skills there –
+skills are designed to work from within the products folder structure.
+
+### Simple skill (single file)
+
+```text
+products/{product}/skills/
+    analyzing-llm-traces.md          # or .md.j2 for Jinja2 templates
+```
+
+The skill name is the filename stem.
+
+### Directory skill (with references)
+
+```text
+products/{product}/skills/{skill-name}/
+    SKILL.md                         # entry point (required)
+    references/                      # optional, collected recursively
+        guidelines.md
+        models-actions.md
+        example-trends.md.j2
+    scripts/                         # optional, collected recursively
+        setup.sh
+```
+
+The skill name is the directory name.
+Only `references/` and `scripts/` subdirectories are included in the output –
+other subdirectories are ignored.
+
+### Frontmatter
+
+Every skill entry point must have YAML frontmatter with `name` and `description`:
+
+```yaml
+---
+name: querying-posthog-data
+description: 'Required reading before writing any HogQL/SQL or calling execute-sql against PostHog...'
+---
+```
+
+Both fields are required and validated at build time.
+
+### Progressive disclosure
+
+`SKILL.md` serves as an overview that points agents to detailed materials as needed.
+Reference files are loaded on demand – only the entry point is read initially.
+Keep `SKILL.md` under 500 lines and split detailed content into `references/`.
+
+See [`querying-posthog-data/SKILL.md`](https://github.com/PostHog/posthog/blob/master/products/posthog_ai/skills/querying-posthog-data/SKILL.md)
+for how this works in practice –
+the entry point links to 30+ reference files
+covering model schemas, query patterns, and HogQL extensions.
+
+## Naming and description guidelines
+
+Follow [Anthropic's skill authoring best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices).
+Key points are summarized below.
+
+### Naming conventions
+
+Use lowercase kebab-case. Prefer gerund form (verb + -ing):
+
+| Pattern                   | Examples                                                                  |
+| ------------------------- | ------------------------------------------------------------------------- |
+| Gerund form (preferred)   | `querying-posthog-data`, `exploring-llm-traces`, `managing-feature-flags` |
+| Noun phrases (acceptable) | `error-tracking-guide`                                                    |
+
+Skills **must not** be prefixed with `posthog-*`.
+The `posthog-` prefix is added automatically depending on the consumer agent.
+
+Skills also **must not** contain the reserved words `anthropic` or `claude` in the name.
+
+The `name` field: lowercase letters, numbers, and hyphens only. Max 64 characters.
+
+### Writing descriptions
+
+The `description` field is critical for skill discovery –
+agents use it to decide which skill to activate from potentially many available skills.
+Max 1024 characters.
+
+**Rules:**
+
+- Write in **third person** ("Analyzes LLM traces...", not "I can help you analyze...").
+- Include both **what** the skill does and **when** to use it.
+- Be specific – include key terms agents would match against.
+
+**Good descriptions:**
+
+```yaml
+# Specific, includes triggers and key terms
+description: >
+  HogQL query examples and reference material for PostHog data.
+  Read when writing SQL queries to find patterns for analytics
+  (trends, funnels, retention, lifecycle, paths, stickiness,
+  web analytics, error tracking, logs, sessions, LLM traces)
+  and system data (insights, dashboards, cohorts, feature flags,
+  experiments, surveys, data warehouse).
+
+description: >
+  Debug and inspect LLM/AI agent traces using PostHog's MCP tools.
+  Use when the user pastes a trace URL (e.g. /ai-observability/traces/<id>),
+  asks to debug a trace, figure out what went wrong, check if an agent used a tool correctly,
+  verify context/files were surfaced, inspect subagent behavior, investigate LLM decisions,
+  or analyze token usage and costs.
+```
+
+**Bad descriptions:**
+
+```yaml
+# Too vague – agents can't determine when to use it
+description: 'Helps with AI observability'
+
+# Too broad – an umbrella for everything isn't a skill
+description: 'Everything about PostHog AI features'
+```
+
+## Good and bad skill examples
+
+### Good: `exploring-llm-traces`
+
+A focused skill that guides the agent through a specific workflow –
+see [`exploring-llm-traces/SKILL.md`](https://github.com/PostHog/posthog/blob/master/products/ai_observability/skills/exploring-llm-traces/SKILL.md):
+
+- Declares the exact MCP tools it relies on (`posthog:query-llm-traces-list`, `posthog:query-llm-trace`, `posthog:execute-sql`).
+- Explains the `$ai_trace` / `$ai_span` / `$ai_generation` / `$ai_embedding` event hierarchy
+  and how events link via `$ai_parent_id`.
+- Walks through concrete workflows (debugging a trace from a URL, cost analysis, tool-use verification)
+  rather than listing generic instructions.
+- Uses progressive disclosure – details like the full event schema live in `references/`
+  so the entry point stays focused.
+- Ships with pre-written Python helpers in
+  [`scripts/`](https://github.com/PostHog/posthog/tree/master/products/ai_observability/skills/exploring-llm-traces/scripts)
+  that cover the common workflows.
+  The agent runs these instead of re-deriving the shape of the trace JSON,
+  slicing nested payloads by hand, or burning tokens on exploratory parsing –
+  which streamlines its trajectory and keeps the context window clean.
+
+The agent knows _which_ tools to use, _in what order_, and what a successful result looks like –
+which is exactly what separates a skill from a generic prompt.
+
+### Good: `querying-posthog-data`
+
+A reference skill with a clear entry point and 30+ reference files:
+
+- Entry point ([`SKILL.md`](https://github.com/PostHog/posthog/blob/master/products/posthog_ai/skills/querying-posthog-data/SKILL.md))
+  links to model schemas, query patterns, and HogQL extensions.
+- Guidelines file ([`references/guidelines.md`](https://github.com/PostHog/posthog/blob/master/products/posthog_ai/skills/querying-posthog-data/references/guidelines.md))
+  explains schema verification workflow, time ranges, joins, and HogQL differences.
+- Uses progressive disclosure – agents load only the references they need.
+
+### Bad: `llm-analytics`
+
+An umbrella skill that tries to cover everything:
+traces, experiments, evaluations, cost tracking, prompt management.
+Too broad to be useful – agents can't determine _when_ to activate it
+and the instructions are too generic to guide any specific workflow.
+Break it into focused skills instead.
+
+### Bad: poor descriptions
+
+```yaml
+# Name is vague
+name: helper
+description: 'Helps with stuff'
+
+# Name uses reserved prefix
+name: posthog-queries
+description: 'Query helper'
+```
+
+## Template engine
+
+Skills support [Jinja2](https://jinja.palletsprojects.com/) templates.
+Any file ending in `.j2` is rendered at build time,
+and the `.j2` suffix is stripped from the output path.
+Plain `.md` files pass through unchanged.
+
+The Jinja2 environment uses `StrictUndefined` (undefined variables raise errors),
+`lstrip_blocks`, and `trim_blocks` for clean whitespace handling.
+
+### Built-in template functions
+
+Three global functions are available in all `.j2` templates:
+
+#### `pydantic_schema(dotted_path, indent=2)`
+
+Imports a Pydantic model by its fully-qualified path and returns its JSON Schema:
+
+```jinja2
+{{ pydantic_schema("products.feature_flags.backend.max_tools.FeatureFlagCreationSchema") }}
+```
+
+Changes to the Pydantic model automatically update the skill output on the next build.
+
+#### `render_hogql_example(query_dict)`
+
+Takes a PostHog query spec and renders it to HogQL SQL:
+
+```jinja2
+{{ render_hogql_example({"kind": "TrendsQuery", "series": [{"kind": "EventsNode", "event": "$pageview"}], "dateRange": {"date_from": "-7d"}}) }}
+```
+
+Time is frozen to `2025-12-10T00:00:00` for deterministic output.
+
+#### `hogql_functions()`
+
+Returns a sorted list of all public HogQL function names:
+
+```jinja2
+{% for fn in hogql_functions() %}
+{{ fn }}
+{% endfor %}
+```
+
+### Extending the template engine
+
+The build pipeline should be extended so the monorepo remains the source of truth
+for all skill content.
+When domain knowledge lives in code (Pydantic models, query runners, function registries),
+add a template function to extract it at build time
+rather than duplicating it as static markdown that drifts.
+
+To add a new template function:
+
+1. Create a module under `products/posthog_ai/scripts/`
+   (follow existing patterns like `pydantic_schema/`, `hogql_example/`).
+2. Register it in `SkillRenderer.__init__()`
+   by adding to `self.env.globals` via `_create_jinja_env(**extra_globals)`.
+
+## Build pipeline
+
+The pipeline discovers, renders, and packages skills.
+Source of truth: [`products/posthog_ai/scripts/build_skills/`](https://github.com/PostHog/posthog/tree/master/products/posthog_ai/scripts/build_skills/).
+
+### Pipeline steps
+
+```text
+Discovery     Scan products/*/skills/ for skills (loose files or directories with SKILL.md)
+    │
+    ▼
+Rendering     Render .j2 files through Jinja2, pass .md files through unchanged
+    │
+    ▼
+Building      Collect entry point + references/scripts into SkillResource with frontmatter metadata
+    │
+    ▼
+Output        Write to dist/skills/{skill-name}/ and package into dist/skills.zip
+```
+
+### CLI commands
+
+```sh
+hogli build:skills          # Build all skills and create dist/skills.zip
+hogli build:skills --list   # List discovered skills without building
+hogli lint:skills           # Validate skill sources (no Django required)
+hogli init:skill            # Scaffold a new skill directory
+hogli sync:skill            # Build + sync a skill to .agents/skills/ for local testing
+hogli unsync:skill          # Remove a synced skill from .agents/skills/
+```
+
+`lint:skills` validates syntax, frontmatter, binary file detection, and duplicate names.
+It runs without Django, so it's fast in CI.
+
+`build:skills` requires the full Python environment
+because template functions import Django models and Pydantic schemas.
+
+### Output
+
+Built skills are written to `products/posthog_ai/dist/skills/` (gitignored)
+and packaged into `dist/skills.zip` with deterministic timestamps for reproducible builds.
+
+## Distribution
+
+Distribution is automatic – once a skill lands on `master`,
+`ci-agent-skills.yml` builds `dist/skills.zip` and publishes it as the `agent-skills-latest` GitHub release.
+The MCP server's `learn` catalog serves skills from that release, so agents connected to the MCP server get the "how" and the "what" together.
+
+One downstream repository pulls that release, together with context-mill's, in a daily sync at 12:00 UTC:
+
+- [`PostHog/skills`](https://github.com/PostHog/skills) –
+  a mirror with each built skill as a standalone directory,
+  for agents that load skills without a plugin.
+  It also hosts a Claude Code plugin marketplace for skills authored there.
+
+PostHog Desktop and the Tasks sandbox pull `agent-skills-latest` themselves (see the table below).
+You don't need to handle distribution yourself:
+a merged skill reaches the MCP server and the mirror without any further step.
+
+### Context-mill skills override this repo's
+
+This repo is not the only source of shipped skills.
+[`PostHog/context-mill`](https://github.com/PostHog/context-mill) assembles the "omnibus" skills
+from posthog.com docs and publishes them as `skills-mcp-resources.zip`:
+`instrument-integration`, `instrument-product-analytics`, `instrument-feature-flags`,
+`instrument-error-tracking`, `instrument-llm-analytics`, `instrument-logs`, `instrument-metrics`, and `instrument-tracing`.
+These are the skills behind PostHog Desktop's setup buttons and the wizard.
+
+Every consumer below unzips `dist/skills.zip` first and then unzips context-mill on top,
+so **context-mill wins on any skill they both define**.
+A same-named skill added here would have its `SKILL.md` overwritten
+while its extra reference files survived as orphans in the other source's directory.
+The Desktop harness bundle is the exception: it packages context-mill alone,
+so a skill from this repo is absent there rather than overwritten.
+The MCP server's `learn` catalog overlays them at runtime:
+the context-mill resource refresh repacks the omnibus skills from the release it already downloads,
+and the skill catalog service merges that copy over `skills.zip` on its next poll,
+keeping the product skill when a name collides and serving no overlay on a pinned archive.
+`learn -s` scores an omnibus skill by its name, description, and `SKILL.md` only,
+because its references are docs snapshots that would crowd out workflow skills;
+`learn posthog:<skill> <path>` still reads any reference.
+
+| Consumer                              | Merge site                                                                                                                  |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| MCP server `learn` catalog            | `services/mcp/src/hono/skill-catalog-service.ts` – overlays the copy `ContextMillResourceCache` publishes to Redis          |
+| PostHog Desktop build                 | `products/desktop/apps/code/vite-main-plugins.mts` (`copyPosthogPlugin`)                                                    |
+| PostHog Desktop runtime, every 30 min | `products/desktop/packages/workspace-server/src/services/posthog-plugin/update-skills-saga.ts`                              |
+| Desktop harness bundle                | `packages/agent/packages/harness/tsup.config.ts` – context-mill only, this repo's skills are absent rather than overwritten |
+| Tasks sandbox base image              | `.github/workflows/cd-sandbox-base-image.yml`                                                                               |
+| `PostHog/skills` mirror               | that repo's `.github/workflows/sync-omnibus.yml`                                                                            |
+
+Note what is missing from that list: local builds.
+`LocalSkillsCache.ensure_built()` renders only `products/*/skills/` and wipes the dist dir first,
+so a locally built sandbox has no omnibus skills at all.
+An eval or manual run that depends on one has to overlay context-mill itself,
+or check for the skill and fail loudly – see `products/feature_flags/evals/eval_instrument_flags.py`.
+
+So before you write a skill, check the omnibus names above.
+If your job is one of them, change the context-mill source.
+Product teams take ownership of a skill tree there with a CODEOWNERS entry;
+several already have.
+
+## Testing
+
+To test a product skill locally with Claude Code, sync it to `.agents/skills/`:
+
+```sh
+# Build and sync a specific skill
+hogli sync:skill -- --name querying-posthog-data
+
+# The skill is now available at .agents/skills/querying-posthog-data/
+# Claude Code picks it up via the .claude/skills -> .agents/skills symlink
+
+# When done testing, remove the synced copy
+hogli unsync:skill -- --name querying-posthog-data
+```
+
+Synced skills are automatically gitignored and should not be committed.
+Both `sync:skill` and `unsync:skill` accept `--name` to identify the skill
+by its source directory name (the folder name under `products/*/skills/`).
+
+See [How to develop and test](/handbook/engineering/ai/implementation#how-to-develop-and-test)
+for instructions on running the MCP server locally and verifying skills end-to-end.
+
+## Writing effective skills
+
+The context window is a shared resource.
+Your skill competes with the system prompt, conversation history, other skills, and the user's request.
+
+**Default assumption:** the agent is already very smart.
+Only include context it doesn't already have.
+Challenge each piece of information: does the agent really need this explanation?
+
+See [Anthropic's full best practices guide](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices)
+for detailed advice on progressive disclosure, feedback loops, workflows, and evaluation-driven development.

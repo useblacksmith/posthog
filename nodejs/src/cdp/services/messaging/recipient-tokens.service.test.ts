@@ -1,0 +1,83 @@
+import { DateTime } from 'luxon'
+
+import { PosthogJwtAudience } from '../../utils/jwt-utils'
+import { RecipientTokensService } from './recipient-tokens.service'
+
+describe('RecipientTokensService', () => {
+    let service: RecipientTokensService
+    let fixedTime: DateTime
+    beforeEach(() => {
+        service = new RecipientTokensService('test-secret', 'https://test.com')
+        fixedTime = DateTime.fromObject({ year: 2025, month: 1, day: 1 }, { zone: 'UTC' })
+        jest.spyOn(Date, 'now').mockReturnValue(fixedTime.toMillis())
+    })
+    it('should generate a valid token', () => {
+        const token = service.generatePreferencesToken({ team_id: 1, identifier: 'test@test.com' })
+        expect(token).toBeDefined()
+        expect(token).toMatchInlineSnapshot(
+            `"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0ZWFtX2lkIjoxLCJpZGVudGlmaWVyIjoidGVzdEB0ZXN0LmNvbSIsImlhdCI6MTczNTY4OTYwMCwiZXhwIjoxNzQwODczNjAwLCJhdWQiOiJwb3N0aG9nOm1lc3NhZ2luZzpzdWJzY3JpcHRpb25fcHJlZmVyZW5jZXMifQ.GJOdyHjjiySuycHf3ux_rixHAmFyxwcW8JvYqW1pprw"`
+        )
+    })
+    it.each([
+        { name: 'no source', source: undefined, claims: {} },
+        {
+            name: 'a workflow source',
+            source: {
+                appSourceId: 'flow-1',
+                instanceId: 'action-1',
+                workflowId: 'flow-1',
+                invocationId: 'run-1',
+                workflowVersion: 3,
+            },
+            claims: {
+                app_source_id: 'flow-1',
+                instance_id: 'action-1',
+                workflow_id: 'flow-1',
+                invocation_id: 'run-1',
+                workflow_version: 3,
+            },
+        },
+        {
+            name: 'a source without an action or version',
+            source: { appSourceId: 'batch-run-1', workflowId: 'flow-1', invocationId: 'run-1' },
+            claims: { app_source_id: 'batch-run-1', workflow_id: 'flow-1', invocation_id: 'run-1' },
+        },
+    ])('should validate a token minted with $name', ({ source, claims }) => {
+        const token = service.generatePreferencesToken({ team_id: 1, identifier: 'test@test.com' }, source)
+        const result = service.validatePreferencesToken(token)
+        expect(result).toEqual({ valid: true, team_id: 1, identifier: 'test@test.com', ...claims })
+    })
+    it('should not accept a valid token with a different audience', () => {
+        const token = service['jwt'].sign({ team_id: 1, identifier: 'test@test.com' }, 'other' as any, {
+            expiresIn: '7d',
+        })
+        const result = service.validatePreferencesToken(token)
+        expect(result).toEqual({ valid: false })
+    })
+    it.each([
+        { days: 8, valid: true },
+        { days: 30, valid: true },
+        { days: 59, valid: true },
+        { days: 61, valid: false },
+    ])('should treat a token as valid=$valid after $days days', ({ days, valid }) => {
+        const token = service.generatePreferencesToken({ team_id: 1, identifier: 'test@test.com' })
+        jest.spyOn(Date, 'now').mockReturnValue(fixedTime.plus({ days }).toMillis())
+        const result = service.validatePreferencesToken(token)
+        expect(result).toEqual(valid ? { valid: true, team_id: 1, identifier: 'test@test.com' } : { valid: false })
+    })
+    it('should accept a token minted with the old 7 day expiry for up to 60 days', () => {
+        const token = service['jwt'].sign(
+            { team_id: 1, identifier: 'test@test.com' },
+            PosthogJwtAudience.SUBSCRIPTION_PREFERENCES,
+            { expiresIn: '7d' }
+        )
+        jest.spyOn(Date, 'now').mockReturnValue(fixedTime.plus({ days: 30 }).toMillis())
+        expect(service.validatePreferencesToken(token)).toEqual({
+            valid: true,
+            team_id: 1,
+            identifier: 'test@test.com',
+        })
+        jest.spyOn(Date, 'now').mockReturnValue(fixedTime.plus({ days: 61 }).toMillis())
+        expect(service.validatePreferencesToken(token)).toEqual({ valid: false })
+    })
+})

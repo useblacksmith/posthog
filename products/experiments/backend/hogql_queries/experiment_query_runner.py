@@ -1,0 +1,856 @@
+import json
+import uuid
+from datetime import UTC, datetime, timedelta
+from functools import cached_property
+from typing import Optional
+
+import structlog
+import posthoganalytics
+from rest_framework.exceptions import ValidationError
+
+from posthog.schema import (
+    CachedExperimentQueryResponse,
+    ExperimentActorsQuery,
+    ExperimentBreakdownResult,
+    ExperimentFunnelMetric,
+    ExperimentMeanMetric,
+    ExperimentQuantileMetric,
+    ExperimentQuery,
+    ExperimentQueryResponse,
+    ExperimentRatioMetric,
+    ExperimentRetentionMetric,
+    ExperimentStatsBase,
+    ExperimentWarehouseNativeExposureConfig,
+    HogQLQueryModifiers,
+    IntervalType,
+    MultipleVariantHandling,
+)
+
+from posthog.hogql import ast
+from posthog.hogql.constants import HogQLGlobalSettings
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.database.database import Database
+from posthog.hogql.errors import ExposedHogQLError, InternalHogQLError, QueryError, TableAccessDeniedError
+from posthog.hogql.query import HogQLQueryExecutor, execute_hogql_query
+
+from posthog.clickhouse.query_tagging import Product, tag_queries, tags_context
+from posthog.exceptions import ClickHouseAtCapacity
+from posthog.exceptions_capture import capture_exception
+from posthog.hogql_queries.query_runner import QueryRunner
+from posthog.hogql_queries.utils.query_date_range import QueryDateRange
+from posthog.models.team.extensions import get_or_create_team_extension
+from posthog.models.user import User
+
+from products.ai_observability.backend.facade.api import mentions_evaluation_pass_markers
+from products.analytics_platform.backend.lazy_computation.lazy_computation_executor import LazyComputationResult
+from products.experiments.backend.facade.enums import ExposuresPath, PrecomputeSkipReason
+from products.experiments.backend.facade.warehouse_native_access import WAREHOUSE_NATIVE_QUERY_STATUS_LABEL_PREFIX
+from products.experiments.backend.hogql_queries import MULTIPLE_VARIANT_KEY, get_baseline_variant_key
+from products.experiments.backend.hogql_queries.base_query_utils import (
+    experiment_window,
+    experiment_window_end,
+    rule_for_query,
+)
+from products.experiments.backend.hogql_queries.cuped_config import get_cuped_config
+from products.experiments.backend.hogql_queries.error_handling import experiment_error_handler
+from products.experiments.backend.hogql_queries.experiment_actors_query import build_experiment_actors_query
+from products.experiments.backend.hogql_queries.experiment_query_builder import (
+    ExperimentQueryBuilder,
+    get_exposure_config_params_for_builder,
+)
+from products.experiments.backend.hogql_queries.experiment_query_context import ExperimentPrecomputationContext
+from products.experiments.backend.hogql_queries.exposure_query_logic import (
+    applies_test_account_filters,
+    get_entity_key,
+    get_multiple_variant_handling_from_experiment,
+    normalize_to_exposure_criteria,
+)
+from products.experiments.backend.hogql_queries.exposures_precompute import ExposuresPrecompute
+from products.experiments.backend.hogql_queries.metric_events_precompute import (
+    MetricEventsPrecompute,
+    RatioPrecomputeResults,
+)
+from products.experiments.backend.hogql_queries.utils import (
+    aggregate_variants_across_breakdowns,
+    get_bayesian_experiment_result,
+    get_experiment_query_debug,
+    get_experiment_stats_method,
+    get_frequentist_experiment_result,
+    get_overall_variant_results,
+    get_variant_results,
+    split_baseline_and_test_variants,
+)
+from products.experiments.backend.metric_calculation.config import (
+    CALCULATION_KEY_VERSION,
+    ExperimentCalculationSettings,
+    MetricCalculationConfig,
+)
+from products.experiments.backend.metric_resolution import (
+    metric_dict_source_nodes,
+    metric_reads_data_warehouse,
+    metric_uses_warehouse_native_source,
+)
+from products.experiments.backend.metric_utils import get_default_metric_title
+from products.experiments.backend.models.experiment import Experiment, exposure_flag_key
+from products.experiments.backend.models.team_experiments_config import TeamExperimentsConfig
+from products.experiments.backend.warehouse_native_query_builder import WarehouseNativeQueryBuilder
+from products.experiments.backend.warehouse_native_sources import (
+    WAREHOUSE_NATIVE_NODE_KIND,
+    validate_experiment_warehouse_native_sources,
+    warehouse_native_exposure_config,
+)
+from products.experiments.backend.warehouse_timestamp_validation import enforce_warehouse_metric_timestamp_types
+
+logger = structlog.get_logger(__name__)
+
+MAX_EXECUTION_TIME = 600
+MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY = 37 * 1024 * 1024 * 1024  # 37 GB
+
+
+class ExperimentResultsCacheMixin:
+    """24-hour result cache, shared by the experiment query runners."""
+
+    def cache_target_age(self, last_refresh: Optional[datetime], lazy: bool = False) -> Optional[datetime]:
+        if last_refresh is None:
+            return None
+        return last_refresh + timedelta(hours=24)
+
+    def _is_stale(self, last_refresh: Optional[datetime], lazy: bool = False) -> bool:
+        if not last_refresh:
+            return True
+        return (datetime.now(UTC) - last_refresh) > timedelta(hours=24)
+
+
+class ExperimentQueryRunner(ExperimentResultsCacheMixin, QueryRunner):
+    query: ExperimentQuery
+    cached_response: CachedExperimentQueryResponse
+    actors_query: Optional[ExperimentActorsQuery] = None
+
+    def __init__(
+        self,
+        *args,
+        as_of: Optional[datetime] = None,
+        user_facing: bool = True,
+        max_execution_time: Optional[int] = None,
+        bypass_warehouse_access_control: bool = False,
+        error_event_context: Optional[str] = "ui",
+        experiment: Optional[Experiment] = None,
+        team_experiments_config: Optional[TeamExperimentsConfig] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.user_facing = user_facing
+        self.max_execution_time = max_execution_time if max_execution_time is not None else MAX_EXECUTION_TIME
+        self.bypass_warehouse_access_control = bypass_warehouse_access_control
+        self._requested_as_of = as_of
+        # Tags the terminal `experiment metric error` event with where the load came from. Defaults to "ui"
+        # because the generic /query API path constructs runners without kwargs; internal callers that own
+        # their own retries/telemetry (recalc, warming, canary, backfills) must pass None or user_facing=False
+        # so the error boundary stays silent for them. See error_handling._emit_runner_terminal_error_event.
+        self.error_event_context = error_event_context
+
+        if not self.query.experiment_id:
+            raise ValidationError("experiment_id is required")
+
+        # A caller that runs several metrics of one experiment passes the experiment, with its flag loaded, and the
+        # team's settings, so each runner doesn't read them again.
+        if team_experiments_config is not None:
+            self._team_experiments_config = team_experiments_config
+        if experiment is not None:
+            if experiment.id != self.query.experiment_id or experiment.team_id != self.team.pk:
+                raise ValueError("The experiment doesn't match the query's experiment and team")
+            self.experiment = experiment
+        else:
+            try:
+                self.experiment = Experiment.objects.get(id=self.query.experiment_id, team=self.team)
+            except Experiment.DoesNotExist:
+                raise ValidationError(f"Experiment with id {self.query.experiment_id} not found")
+
+        # Evaluation point for the analysis window; experiment_window_end caps it at end_date. An
+        # explicit as_of is a recalc's frozen run snapshot or a timeseries backfill's per-day point.
+        # The default is end_date for a stopped experiment, else now, so that a plain results query
+        # covers the full [start, end_date] window, or [start, now] while the experiment runs.
+        self.as_of = as_of if as_of is not None else (self.experiment.end_date or datetime.now(UTC))
+        self.feature_flag = self.experiment.feature_flag
+        rule = rule_for_query(self.experiment)
+        self.feature_flag_key = exposure_flag_key(self.feature_flag, rule)
+        self.feature_flag_rule_id = rule.rule_id if rule is not None else None
+        self.group_type_index = (
+            rule.assign_variant_by if rule is not None else self.feature_flag.aggregation_group_type_index
+        )
+        self.entity_key = get_entity_key(self.group_type_index)
+
+        # Holdout is intentionally not appended: holdout users were never exposed to
+        # the experiment, so they don't belong in the metric scorecard.
+        # self.experiment.holdout is still readable for code paths that need it
+        # (e.g. the Distribution table on the Variants tab).
+        excluded_variants = set(self.experiment.excluded_variants or [])
+        flag_variants = rule.variants if rule is not None else self.feature_flag.variants
+        self.variants = [variant["key"] for variant in flag_variants if variant["key"] not in excluded_variants]
+
+        stats_config = self.experiment.stats_config or {}
+        self.baseline_variant_key = get_baseline_variant_key(stats_config, self.variants)
+
+        self.date_range = experiment_window(self.experiment, self.team, self.as_of)
+        self.date_range_query = QueryDateRange(
+            date_range=self.date_range,
+            team=self.team,
+            interval=IntervalType.DAY,
+            now=datetime.now(),
+        )
+        self.is_data_warehouse_query = metric_reads_data_warehouse(self.query.metric)
+        # A warehouse-native metric runs in the customer's warehouse. It has no ClickHouse query and no precompute.
+        self.is_warehouse_native_query = (
+            metric_uses_warehouse_native_source(self.query.metric)
+            or warehouse_native_exposure_config(self.experiment.exposure_criteria) is not None
+        )
+
+        self.stats_method = get_experiment_stats_method(self.experiment)
+
+        self.multiple_variant_handling = get_multiple_variant_handling_from_experiment(
+            self.experiment.exposure_criteria
+        )
+
+        self.metric = self.query.metric
+        self.cuped_config = get_cuped_config(
+            self.experiment.stats_config,
+            self.metric,
+            team_default_enabled=self._team_experiments_config.default_cuped_enabled,
+            team_default_lookback_days=self._team_experiments_config.default_cuped_lookback_days,
+        )
+
+        self.clickhouse_sql: str | None = None
+        self.hogql: str | None = None
+        self._is_precomputed: bool = False  # exposures precompute
+        self.exposures_path: ExposuresPath | None = None
+        self._metric_events_precomputed: bool = False
+
+    def _get_breakdowns_for_builder(self) -> list | None:
+        breakdown_filter = getattr(self.metric, "breakdownFilter", None)
+        if not breakdown_filter:
+            return None
+
+        breakdowns = getattr(breakdown_filter, "breakdowns", None)
+        if not breakdowns or len(breakdowns) == 0:
+            return None
+
+        if len(breakdowns) > 3:
+            raise ValidationError("Maximum of 3 breakdowns are supported for experiment metrics")
+
+        if any(breakdown.type == "element" for breakdown in breakdowns):
+            # BreakdownInjector has no element-specific expression, so an element breakdown would
+            # silently fall back to reading the same-named event property instead.
+            raise ValidationError(
+                "Element breakdowns are not supported for experiment metrics. Use an event or person property instead."
+            )
+
+        return breakdowns
+
+    @cached_property
+    def _exposures_precompute(self) -> ExposuresPrecompute:
+        return ExposuresPrecompute(
+            team=self.team,
+            team_experiments_config=self._team_experiments_config,
+            experiment=self.experiment,
+            window_start=self.experiment.start_date,
+            window_end=experiment_window_end(self.experiment, self.as_of),
+            exposure_criteria=self.experiment.exposure_criteria,
+            cohort_filter_sources=(self.metric,),
+            precomputation_mode=self.query.precomputation_mode,
+            is_data_warehouse_query=self.is_data_warehouse_query,
+            group_type_index=self.group_type_index,
+            is_rule_linked=self.feature_flag_rule_id is not None,
+        )
+
+    def _ensure_exposures_precomputed(self, builder: ExperimentQueryBuilder) -> LazyComputationResult:
+        return self._exposures_precompute.ensure_precomputed(builder)
+
+    @cached_property
+    def _metric_events_precompute(self) -> MetricEventsPrecompute:
+        return MetricEventsPrecompute(
+            team=self.team,
+            experiment=self.experiment,
+            as_of=self.as_of,
+            metric=self.metric,
+            group_type_index=self.group_type_index,
+            has_breakdowns=bool(self._get_breakdowns_for_builder()),
+            cuped_enabled=self.cuped_config.enabled,
+            is_data_warehouse_query=self.is_data_warehouse_query,
+        )
+
+    def _ensure_metric_events_precomputed(self, builder: ExperimentQueryBuilder) -> LazyComputationResult:
+        return self._metric_events_precompute.ensure_precomputed(builder)
+
+    def _ensure_ratio_metric_events_precomputed(self, builder: ExperimentQueryBuilder) -> RatioPrecomputeResults:
+        return self._metric_events_precompute.ensure_ratio_precomputed(builder)
+
+    @cached_property
+    def _team_experiments_config(self) -> TeamExperimentsConfig:
+        return get_or_create_team_extension(self.team, TeamExperimentsConfig)
+
+    def _exposures_precompute_applicable(self) -> bool:
+        return not self.is_warehouse_native_query and self._exposures_precompute.applicable
+
+    def _precompute_skip_reason(self) -> Optional[PrecomputeSkipReason]:
+        """Why precompute was not used, for the query-performance UI. None when it was attempted."""
+        return self._exposures_precompute.ineligibility_reason()
+
+    def _metric_events_precompute_applicable(self) -> bool:
+        return not self.is_warehouse_native_query and self._metric_events_precompute.applicable
+
+    def _metric_events_ineligibility_reason(self) -> Optional[str]:
+        return self._metric_events_precompute.ineligibility_reason()
+
+    @property
+    def metric_events_path(self) -> str:
+        """
+        Which source fed the metric-events side of the built query: "precomputed",
+        "direct_scan", or "not_applicable". Meaningful after _get_experiment_query()
+        has run. The exposures side is reported separately (response.is_precomputed).
+        """
+        if not self._metric_events_precompute_applicable():
+            return "not_applicable"
+        return "precomputed" if self._metric_events_precomputed else "direct_scan"
+
+    def _query_builder(self, *, with_metric: bool = True) -> ExperimentQueryBuilder:
+        assert isinstance(
+            self.metric,
+            ExperimentFunnelMetric
+            | ExperimentMeanMetric
+            | ExperimentRatioMetric
+            | ExperimentRetentionMetric
+            | ExperimentQuantileMetric,
+        )
+
+        exposure_params = get_exposure_config_params_for_builder(
+            self.experiment.exposure_criteria, self.team, self.experiment.start_date
+        )
+
+        return ExperimentQueryBuilder(
+            team=self.team,
+            feature_flag_key=self.feature_flag_key,
+            exposure_config=exposure_params.exposure_config,
+            filter_test_accounts=exposure_params.filter_test_accounts,
+            multiple_variant_handling=exposure_params.multiple_variant_handling,
+            variants=self.variants,
+            date_range_query=self.date_range_query,
+            entity_key=self.entity_key,
+            metric=self.metric if with_metric else None,
+            breakdowns=self._get_breakdowns_for_builder() if with_metric else None,
+            only_count_matured_users=self.experiment.only_count_matured_users,
+            cuped_config=self.cuped_config,
+            activation_config=exposure_params.activation_config,
+            feature_flag_rule_id=self.feature_flag_rule_id,
+        )
+
+    def _get_experiment_query(self) -> ast.SelectQuery:
+        builder = self._query_builder()
+
+        exposure_job_ids: list[str] | None = None
+        metric_events_job_ids: list[str] | None = None
+        numerator_job_ids: list[str] | None = None
+        denominator_job_ids: list[str] | None = None
+
+        if self._exposures_precompute_applicable():
+            try:
+                with tags_context(experiment_query_surface="precompute_build", experiment_precompute_table="exposures"):
+                    result = self._ensure_exposures_precomputed(builder)
+                if result.ready:
+                    exposure_job_ids = [str(job_id) for job_id in result.job_ids]
+                    self._is_precomputed = builder.reads_precomputed_exposures(exposure_job_ids)
+                elif result.capacity_rejected:
+                    # ClickHouse refused the build because the pool is full. The direct scan
+                    # below would hold a slot for minutes and starve the next builds too, so
+                    # surface the capacity error and let the caller retry once the pool frees up.
+                    raise ClickHouseAtCapacity()
+                else:
+                    logger.warning("exposure_lazy_computation_not_ready", experiment_id=self.experiment.id)
+            except ClickHouseAtCapacity:
+                raise
+            except Exception as e:
+                # Swallowed: the direct-scan fallback below still returns results, which would
+                # otherwise hide a broken precomputation path. Report so it isn't silent.
+                capture_exception(
+                    e,
+                    additional_properties={
+                        "tag": "exposure_lazy_computation_failed",
+                        "experiment_id": self.experiment.id,
+                        "precomputation_path": "exposure",
+                        "metric_type": self.metric.metric_type,
+                    },
+                )
+
+            if self._metric_events_precompute_applicable():
+                try:
+                    with tags_context(
+                        experiment_query_surface="precompute_build", experiment_precompute_table="metric_events"
+                    ):
+                        if isinstance(self.metric, ExperimentRatioMetric):
+                            ratio_result = self._ensure_ratio_metric_events_precomputed(builder)
+                            # Both sides or neither: a half-served read would report a
+                            # metric_events_path that is neither precomputed nor direct_scan.
+                            if ratio_result.ready:
+                                numerator_job_ids = [str(job_id) for job_id in ratio_result.numerator.job_ids]
+                                denominator_job_ids = [str(job_id) for job_id in ratio_result.denominator.job_ids]
+                                self._metric_events_precomputed = True
+                            elif ratio_result.capacity_rejected:
+                                raise ClickHouseAtCapacity()
+                        else:
+                            metric_result = self._ensure_metric_events_precomputed(builder)
+                            if metric_result.ready:
+                                metric_events_job_ids = [str(job_id) for job_id in metric_result.job_ids]
+                                self._metric_events_precomputed = True
+                            elif metric_result.capacity_rejected:
+                                raise ClickHouseAtCapacity()
+                    if not self._metric_events_precomputed:
+                        logger.warning("metric_events_lazy_computation_not_ready", experiment_id=self.experiment.id)
+                except ClickHouseAtCapacity:
+                    raise
+                except Exception as e:
+                    capture_exception(
+                        e,
+                        additional_properties={
+                            "tag": "metric_events_lazy_computation_failed",
+                            "experiment_id": self.experiment.id,
+                            "precomputation_path": "metric_events",
+                            "metric_type": self.metric.metric_type,
+                        },
+                    )
+
+        return builder.build_query(
+            precomputation_context=ExperimentPrecomputationContext(
+                exposure_job_ids=exposure_job_ids,
+                metric_events_job_ids=metric_events_job_ids,
+                numerator_job_ids=numerator_job_ids,
+                denominator_job_ids=denominator_job_ids,
+            )
+        )
+
+    def query_modifiers(self) -> HogQLQueryModifiers:
+        modifiers = self.modifiers.model_copy()
+        if posthoganalytics.feature_enabled(
+            "hogql-session-id-pushdown",
+            str(self.team.id),
+            groups={"project": str(self.team.id)},
+            group_properties={"project": {"id": str(self.team.id)}},
+            only_evaluate_locally=True,
+            send_feature_flag_events=False,
+        ):
+            modifiers.sessionIdPushdown = True
+        return modifiers
+
+    def create_database(self, modifiers: HogQLQueryModifiers, *, use_cached_sources: bool = False) -> Database:
+        return Database.create_for(
+            team=self.team,
+            user=self.user,
+            modifiers=modifiers,
+            timings=self.timings,
+            bypass_warehouse_access_control=self.bypass_warehouse_access_control,
+            use_cached_sources=use_cached_sources,
+        )
+
+    def compile_query(self, database: Database) -> None:
+        """
+        Build the query and compile it to ClickHouse SQL without running it or a precompute. Raises what a calculation
+        raises before ClickHouse receives the query. A calculation can still fail in ClickHouse, for example on a type
+        that the data holds.
+
+        `database` comes from `create_database(query_modifiers())` of a runner with the same team, user and warehouse
+        access, so a caller that compiles several metrics builds it once.
+        """
+        self._compile(self._query_builder().build_query(), database)
+        enforce_warehouse_metric_timestamp_types([self.metric.model_dump(mode="json")], database)
+
+    def compile_exposure_query(self, database: Database) -> None:
+        """Compile the exposure query without the metric and its breakdowns, as `compile_query` compiles the whole
+        query. When the whole query fails and this one compiles, the cause is in the metric."""
+        self._compile(self._query_builder(with_metric=False).get_exposure_timeseries_query(), database)
+
+    def _compile(self, query: ast.SelectQuery, database: Database) -> None:
+        context = HogQLContext(
+            team_id=self.team.pk,
+            user=self.user,
+            bypass_warehouse_access_control=self.bypass_warehouse_access_control,
+            database=database,
+        )
+        modifiers = self.query_modifiers()
+        # With this modifier, the executor writes preaggregated results to ClickHouse and waits for them before it
+        # prints the query, and a compile must run nothing. When no results are ready, the executor keeps the query
+        # unchanged, so the compile of the unchanged query checks what a calculation can fall back to.
+        modifiers.usePreaggregatedIntermediateResults = False
+        try:
+            HogQLQueryExecutor(
+                query_type="ExperimentQuery",
+                query=query,
+                team=self.team,
+                user=self.user,
+                bypass_warehouse_access_control=self.bypass_warehouse_access_control,
+                context=context,
+                timings=self.timings,
+                modifiers=modifiers,
+                workload=self.workload,
+            ).generate_clickhouse_sql()
+        except TableAccessDeniedError:
+            # A denied table must reach the caller as a denial, not as a field error that the HogQL pass recorded.
+            raise
+        except ExposedHogQLError as error:
+            # The HogQL pass records a field that it can't resolve and goes on. A later reference to the column that
+            # holds the field then raises an error that names the column, such as "Field not found: entity_id".
+            if context.errors:
+                raise QueryError(context.errors[0].message) from error
+            raise
+
+    def _evaluate_experiment_query(
+        self,
+    ) -> tuple[list[tuple], list[str]]:
+        metric_name = self.metric.name or get_default_metric_title(self.metric.model_dump())
+        tag_queries(
+            product=Product.EXPERIMENTS,
+            experiment_query_surface="metric",
+            # Generated before _get_experiment_query() runs the precompute builds, so those build
+            # sub-queries inherit this id via the tag context and can be grouped under this read.
+            experiment_query_group_id=uuid.uuid4(),
+            experiment_id=self.experiment.id,
+            experiment_name=self.experiment.name,
+            experiment_feature_flag_key=self.feature_flag_key,
+            experiment_is_data_warehouse_query=self.is_data_warehouse_query,
+            experiment_metric_uuid=self.metric.uuid,
+            experiment_metric_name=metric_name,
+            experiment_metric_type=self.metric.metric_type,
+        )
+        if isinstance(self.metric, ExperimentFunnelMetric):
+            tag_queries(experiment_funnel_order_type=self.metric.funnel_order_type or "ordered")
+
+        experiment_query_ast = self._get_experiment_query()
+
+        # Tag after _get_experiment_query() which sets the precompute flags
+        self.exposures_path = ExposuresPath.PRECOMPUTED if self._is_precomputed else ExposuresPath.DIRECT_SCAN
+        metric_events_path = self.metric_events_path
+        skip_reason = self._precompute_skip_reason()
+        tag_queries(
+            experiment_exposures_path=self.exposures_path.value,
+            experiment_metric_events_path=metric_events_path,
+            experiment_metric_events_skip_reason=self._metric_events_ineligibility_reason(),
+            experiment_execution_path=self.exposures_path.value,
+            experiment_precompute_skip_reason=skip_reason.value if skip_reason is not None else None,
+            experiment_scan_date_from=self.date_range.date_from,
+            experiment_scan_date_to=self.date_range.date_to,
+        )
+        modifiers = self.query_modifiers()
+
+        # The debug SQL would expose the evaluation rules that the markers keep out of the browser.
+        if not self._uses_evaluation_pass_markers():
+            experiment_query_debug = get_experiment_query_debug(
+                experiment_query_ast,
+                self.team,
+                user=self.user,
+                bypass_warehouse_access_control=self.bypass_warehouse_access_control,
+                modifiers=modifiers,
+            )
+            self.hogql = experiment_query_debug[0]
+            self.clickhouse_sql = experiment_query_debug[1]
+
+        settings = HogQLGlobalSettings(
+            max_execution_time=self.max_execution_time,
+            max_bytes_before_external_group_by=MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY,
+        )
+        # Mean metric queries join exposures with a potentially large metric-events table and
+        # can exceed memory with the default hash join. grace_hash spills to disk when needed.
+        if isinstance(self.metric, ExperimentMeanMetric):
+            settings.join_algorithm = "grace_hash"
+            settings.grace_hash_join_initial_buckets = 2
+
+        # Built once here and handed to the executor, so the timestamp check reads the same catalog
+        # the query runs against. The column can change type after the metric was saved.
+        database = self.create_database(modifiers)
+        enforce_warehouse_metric_timestamp_types([self.metric.model_dump(mode="json")], database)
+
+        response = execute_hogql_query(
+            query_type="ExperimentQuery",
+            query=experiment_query_ast,
+            team=self.team,
+            user=self.user,
+            bypass_warehouse_access_control=self.bypass_warehouse_access_control,
+            context=HogQLContext(
+                team_id=self.team.pk,
+                user=self.user,
+                bypass_warehouse_access_control=self.bypass_warehouse_access_control,
+                database=database,
+            ),
+            timings=self.timings,
+            modifiers=modifiers,
+            settings=settings,
+            workload=self.workload,
+        )
+
+        return self._variant_rows(response.results, response.columns or [])
+
+    def _evaluate_warehouse_native_query(self) -> tuple[list[tuple], list[str]]:
+        """Runs the metric in the customer's warehouse. Only the totals per variant come back."""
+        if self.experiment.only_count_matured_users:
+            raise ExposedHogQLError(
+                "Warehouse-native metrics cannot exclude participants whose conversion window has not elapsed yet. "
+                "Turn that setting off in the experiment settings."
+            )
+        connection_id = self._validate_warehouse_native_sources(self.user)
+        criteria = normalize_to_exposure_criteria(self.experiment.exposure_criteria)
+        exposure = criteria.exposure_config if criteria else None
+        # The source check above refuses every other combination, and the schema allows a warehouse-native node
+        # on a mean or ratio metric only. The checks here narrow the types for the builder.
+        if (
+            connection_id is None
+            or not isinstance(exposure, ExperimentWarehouseNativeExposureConfig)
+            or not isinstance(self.metric, ExperimentMeanMetric | ExperimentRatioMetric)
+        ):
+            raise InternalHogQLError("The warehouse-native source check passed an unsupported experiment.")
+        # Test account filters match PostHog persons and events. The warehouse rows have neither, so a result
+        # that claimed to apply them would be wrong. A save turns the setting off for a warehouse-native exposure,
+        # so only an experiment saved before that rule still carries it on.
+        if applies_test_account_filters(self.team, self.experiment.exposure_criteria):
+            raise ExposedHogQLError(
+                "Warehouse-native metrics cannot filter test accounts. "
+                "Open the exposure criteria and save them again to turn the filter off."
+            )
+
+        statement = WarehouseNativeQueryBuilder(
+            exposure=exposure,
+            metric=self.metric,
+            variants=tuple(self.variants),
+            date_from=self.date_range_query.date_from(),
+            date_to=self.date_range_query.date_to(),
+            multiple_variant_handling=self.multiple_variant_handling,
+        ).build()
+        response = execute_hogql_query(
+            query_type="ExperimentQuery",
+            query=statement,
+            team=self.team,
+            user=self.user,
+            # A background run has no user. Without the bypass a project that enforces warehouse table access
+            # refuses the statement, as it would on the ClickHouse path.
+            bypass_warehouse_access_control=self.bypass_warehouse_access_control,
+            send_raw_query=True,
+            connection_id=connection_id,
+            timings=self.timings,
+            settings=HogQLGlobalSettings(max_execution_time=self.max_execution_time),
+        )
+        return self._variant_rows(response.results, response.columns or [])
+
+    def _validate_warehouse_native_sources(self, user: User | None) -> str | None:
+        """The connection id of the experiment's warehouse-native sources, after the same checks as a save.
+
+        A shared metric can change after the experiment was saved, and a user can lose access to the connection.
+        """
+        return validate_experiment_warehouse_native_sources(
+            exposure_criteria=self.experiment.exposure_criteria,
+            metrics=[self.metric.model_dump(mode="json")],
+            team=self.team,
+            user=user,
+        )
+
+    def validate_query_runner_access(self, user: User) -> bool:
+        # A cached result is shared by every user of the team, so the connection access check runs before
+        # the cache lookup, not only when the statement runs.
+        if self.is_warehouse_native_query:
+            self._validate_warehouse_native_sources(user)
+        return True
+
+    def query_status_labels(self) -> list[str] | None:
+        # Retrieving an async result skips validate_query_runner_access, so the status carries the connection
+        # for the status endpoint to check.
+        if not self.is_warehouse_native_query:
+            return None
+        sources = [
+            warehouse_native_exposure_config(self.experiment.exposure_criteria),
+            *(
+                node
+                for node in metric_dict_source_nodes(self.metric.model_dump(mode="json"))
+                if isinstance(node, dict) and node.get("kind") == WAREHOUSE_NATIVE_NODE_KIND
+            ),
+        ]
+        connection_ids = sorted(
+            {str(source["connection_id"]) for source in sources if source and source.get("connection_id")}
+        )
+        return [
+            f"{WAREHOUSE_NATIVE_QUERY_STATUS_LABEL_PREFIX}{connection_id}" for connection_id in connection_ids
+        ] or None
+
+    def _variant_rows(self, rows: list[tuple], columns: list[str]) -> tuple[list[tuple], list[str]]:
+        if self.multiple_variant_handling == MultipleVariantHandling.EXCLUDE:
+            rows = [row for row in rows if row[0] != MULTIPLE_VARIANT_KEY]
+        return sorted(rows, key=lambda row: self.variants.index(row[0])), columns
+
+    @experiment_error_handler
+    def _calculate(self) -> ExperimentQueryResponse:
+        if self.is_warehouse_native_query:
+            sorted_results, columns = self._evaluate_warehouse_native_query()
+        else:
+            sorted_results, columns = self._evaluate_experiment_query()
+        variant_results = self._add_missing_variants(get_variant_results(sorted_results, columns))
+
+        if self._has_breakdown(variant_results):
+            breakdown_results = self._process_breakdown_results(variant_results)
+            overall_variant_results = self._add_missing_variants(get_overall_variant_results(sorted_results, columns))
+            variants = aggregate_variants_across_breakdowns(overall_variant_results)
+        else:
+            breakdown_results = None
+            variants = [v for _, v in variant_results]
+
+        result = self._calculate_statistics_for_variants(variants)
+
+        if breakdown_results is not None:
+            result.breakdown_results = breakdown_results
+
+        result.clickhouse_sql = self.clickhouse_sql
+        result.hogql = self.hogql
+        result.is_precomputed = self._is_precomputed
+
+        return result
+
+    def _has_breakdown(self, variant_results: list[tuple[tuple[str, ...] | None, ExperimentStatsBase]]) -> bool:
+        return any(bv is not None for bv, _ in variant_results)
+
+    def _calculate_statistics_for_variants(self, variants: list[ExperimentStatsBase]) -> ExperimentQueryResponse:
+        control_variant, test_variants = split_baseline_and_test_variants(variants, self.baseline_variant_key)
+
+        if self.stats_method == "frequentist":
+            return get_frequentist_experiment_result(
+                metric=self.metric,
+                control_variant=control_variant,
+                test_variants=test_variants,
+                stats_config=self.experiment.stats_config,
+                cuped_config=self.cuped_config,
+                team_default_sequential_testing_enabled=self._team_experiments_config.default_sequential_testing_enabled,
+                team_default_sequential_tuning_parameter=self._team_experiments_config.default_sequential_tuning_parameter,
+            )
+
+        return get_bayesian_experiment_result(
+            metric=self.metric,
+            control_variant=control_variant,
+            test_variants=test_variants,
+            stats_config=self.experiment.stats_config,
+            cuped_config=self.cuped_config,
+        )
+
+    def _process_breakdown_results(
+        self, variant_results: list[tuple[tuple[str, ...] | None, ExperimentStatsBase]]
+    ) -> list[ExperimentBreakdownResult]:
+        breakdown_tuples = sorted({bv for bv, _ in variant_results if bv is not None})
+
+        return [
+            self._compute_breakdown_statistics(breakdown_tuple, variant_results) for breakdown_tuple in breakdown_tuples
+        ]
+
+    def _compute_breakdown_statistics(
+        self,
+        breakdown_tuple: tuple[str, ...],
+        variant_results: list[tuple[tuple[str, ...] | None, ExperimentStatsBase]],
+    ) -> ExperimentBreakdownResult:
+        breakdown_variants = [v for bv, v in variant_results if bv == breakdown_tuple]
+
+        # A breakdown group can lack a variant, for example when no control user has a specific
+        # browser. The statistics fail without a control variant, so add the missing variants
+        # with zero stats.
+        variants_present = {v.key for v in breakdown_variants}
+        for expected_variant in self.variants:
+            if expected_variant not in variants_present:
+                breakdown_variants.append(
+                    ExperimentStatsBase(
+                        key=expected_variant,
+                        number_of_samples=0,
+                        sum=0,
+                        sum_squares=0,
+                    )
+                )
+
+        stats = self._calculate_statistics_for_variants(breakdown_variants)
+
+        return ExperimentBreakdownResult(
+            breakdown_value=list(breakdown_tuple),
+            baseline=stats.baseline,
+            variants=stats.variant_results,
+        )
+
+    def _add_missing_variants(
+        self, variants: list[tuple[tuple[str, ...] | None, ExperimentStatsBase]]
+    ) -> list[tuple[tuple[str, ...] | None, ExperimentStatsBase]]:
+        """Adds a zero-stats row for each configured variant that is missing from the results."""
+        variants_seen = [v.key for _, v in variants]
+
+        # Fan out over the breakdown combinations actually present in the results, not over the
+        # metric's breakdown config: a metric can declare breakdowns and still come back with no
+        # rows at all (no data yet), and there is then nothing to fan out over. In that case, fall
+        # back to the single breakdown-less zero row, so that the baseline variant still exists.
+        breakdown_tuples = {bv for bv, _ in variants if bv is not None}
+
+        variants_missing: list[tuple[tuple[str, ...] | None, ExperimentStatsBase]] = []
+        for key in self.variants:
+            if key not in variants_seen:
+                if breakdown_tuples:
+                    # A missing variant needs a zero row in every breakdown combination
+                    variants_missing.extend(
+                        [
+                            (bv, ExperimentStatsBase(key=key, number_of_samples=0, sum=0, sum_squares=0))
+                            for bv in breakdown_tuples
+                        ]
+                    )
+                else:
+                    variants_missing.append(
+                        (None, ExperimentStatsBase(key=key, number_of_samples=0, sum=0, sum_squares=0))
+                    )
+
+        return variants + variants_missing
+
+    def to_actors_query(self) -> ast.SelectQuery:
+        # The actors response returns its generated SQL, which would expose the evaluation rules.
+        if self._uses_evaluation_pass_markers():
+            raise ValidationError("Persons are not available for evaluation pass rate metrics.")
+        if self.is_warehouse_native_query:
+            raise ValidationError("Persons are not available for warehouse-native metrics.")
+        return build_experiment_actors_query(self)
+
+    def _uses_evaluation_pass_markers(self) -> bool:
+        return mentions_evaluation_pass_markers(
+            self.metric.model_dump_json()
+            + json.dumps(self.experiment.exposure_criteria or {})
+            + (self.actors_query.model_dump_json() if self.actors_query else "")
+        )
+
+    def to_query(self) -> ast.SelectQuery:
+        raise ValidationError(f"Cannot convert source query of type {self.query.metric.kind} to query")
+
+    def single_flight_variant(self) -> str:
+        # A recalculation passes its own window end, warehouse access, and execution time. None of
+        # them reach the cache key, so a recalculation must not pair with a results request.
+        as_of = self._requested_as_of.isoformat() if self._requested_as_of else ""
+        return (
+            f"{super().single_flight_variant()}:as_of={as_of}"
+            f":bypass_warehouse_access_control={self.bypass_warehouse_access_control}"
+            f":max_execution_time={self.max_execution_time}"
+        )
+
+    @cached_property
+    def calculation_config(self) -> MetricCalculationConfig:
+        self.experiment.team = self.team
+        settings = ExperimentCalculationSettings.from_experiment(
+            self.experiment, team_config=self._team_experiments_config
+        )
+        return settings.build_metric_config(
+            metric_id=self.query.metric.uuid or "",
+            role="primary",
+            definition=self.query.metric.model_dump(mode="json", exclude_none=True),
+        )
+
+    def get_cache_payload(self) -> dict:
+        payload = super().get_cache_payload()
+        payload["experiment_response_version"] = 2
+        payload["stats_method"] = self.stats_method
+        # The window ends at the experiment's end date, which the query does not carry, so a new end date must miss
+        # the result of the earlier window. A running experiment adds nothing, so its key stays the same and the cache
+        # age limit refreshes its moving window end.
+        if self.experiment.end_date is not None:
+            payload["end_date"] = self.experiment.end_date.isoformat()
+        # Version 1 leaves the payload as it was, so the release that adds version 2 keeps every cached response.
+        calculation_config = self.calculation_config
+        if calculation_config.settings.key_version == CALCULATION_KEY_VERSION:
+            payload["calculation_key"] = calculation_config.calculation_key()
+        return payload

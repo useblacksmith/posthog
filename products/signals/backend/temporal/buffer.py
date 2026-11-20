@@ -1,0 +1,355 @@
+import json
+import uuid
+import random
+import asyncio
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
+from typing import NoReturn
+
+from django.conf import settings
+
+import structlog
+import temporalio
+import posthoganalytics
+from asgiref.sync import sync_to_async
+from temporalio import activity, workflow
+from temporalio.common import MetricCounter, RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
+
+from posthog.dataclasses import frozen
+from posthog.storage import object_storage
+from posthog.temporal.common.client import async_connect
+from posthog.temporal.common.scoped import scoped_temporal
+from posthog.temporal.common.utils import close_db_connections
+
+from products.signals.backend.temporal import metrics
+from products.signals.backend.temporal.grouping import _complete_signal_batch
+from products.signals.backend.temporal.grouping_v2 import TeamSignalGroupingV2Workflow
+from products.signals.backend.temporal.safety_filter import (
+    PROVIDER_USAGE_LIMIT_ERROR_TYPE,
+    PROVIDER_USAGE_LIMIT_RETRY_DELAY,
+    SafetyFilterInput,
+    safety_filter_activity,
+)
+from products.signals.backend.temporal.types import BufferSignalsInput, EmitSignalInputs, TeamSignalGroupingV2Input
+
+logger = structlog.get_logger(__name__)
+
+# TODO: Check if the size of the buffer doesn't overload memory for the Temporal workflow handling the batch
+BUFFER_MAX_SIZE = 20
+BUFFER_FLUSH_TIMEOUT_SECONDS = 5
+SAFETY_FILTER_RETRY_DELAY_SECONDS = 5
+BUFFER_MAX_SIGNAL_AGE = timedelta(days=7)
+
+# Guards the ingestion quota gate so runs that recorded history before it was added replay
+# deterministically. Switch to workflow.deprecate_patch() once those have drained, then remove.
+_PATCH_QUOTA_INGESTION_GATE = "signals-quota-ingestion-gate-v1"
+
+OBJECT_STORAGE_SIGNALS_PREFIX = "signals/signal_batches"
+
+
+def _is_provider_usage_limit(error: ActivityError) -> bool:
+    return isinstance(error.cause, ApplicationError) and error.cause.type == PROVIDER_USAGE_LIMIT_ERROR_TYPE
+
+
+def _is_batch_expired(batch: list[EmitSignalInputs], now: datetime) -> bool:
+    return any(
+        signal.buffered_at is not None and now - datetime.fromisoformat(signal.buffered_at) > BUFFER_MAX_SIGNAL_AGE
+        for signal in batch
+    )
+
+
+@dataclass
+class FlushBufferInput:
+    team_id: int
+    signals: list[EmitSignalInputs]
+
+
+@dataclass
+class FlushBufferOutput:
+    object_key: str
+    signal_count: int
+
+
+@activity.defn
+@scoped_temporal()
+async def flush_signals_to_s3_activity(input: FlushBufferInput) -> FlushBufferOutput:
+    batch_id = str(uuid.uuid4())
+    object_key = f"{OBJECT_STORAGE_SIGNALS_PREFIX}/{batch_id}"
+
+    payload = json.dumps([asdict(s) for s in input.signals])
+    await sync_to_async(object_storage.write, thread_sensitive=False)(object_key, payload)
+
+    logger.info(
+        "signals_buffer.flushed_to_s3",
+        team_id=input.team_id,
+        object_key=object_key,
+        signal_count=len(input.signals),
+    )
+
+    return FlushBufferOutput(object_key=object_key, signal_count=len(input.signals))
+
+
+@frozen
+class CheckSignalsQuotaInput:
+    team_id: int
+    # Defaults so activity inputs recorded before the field existed still decode on replay.
+    signal_count: int = 0
+    signals: list[EmitSignalInputs] = field(default_factory=list)
+
+
+@activity.defn
+@scoped_temporal()
+@close_db_connections
+async def check_signals_quota_limited_activity(input: CheckSignalsQuotaInput) -> bool:
+    """Recorded histories still call this activity; accepted signals must continue."""
+    return False
+
+
+@dataclass
+class SignalWithStartGroupingV2Input:
+    team_id: int
+    object_key: str
+
+
+@activity.defn
+@scoped_temporal()
+async def signal_with_start_grouping_v2_activity(input: SignalWithStartGroupingV2Input) -> None:
+    """Signal-with-start the grouping v2 workflow, creating it if it doesn't exist."""
+    client = await async_connect()
+    await client.start_workflow(
+        TeamSignalGroupingV2Workflow.run,
+        TeamSignalGroupingV2Input(team_id=input.team_id),
+        id=TeamSignalGroupingV2Workflow.workflow_id_for(input.team_id),
+        task_queue=settings.VIDEO_EXPORT_TASK_QUEUE,
+        run_timeout=timedelta(hours=3),
+        start_signal="submit_batch",
+        start_signal_args=[input.object_key],
+    )
+
+
+@dataclass
+class SubmitSignalToBufferInput:
+    team_id: int
+    signal: EmitSignalInputs
+
+
+BACKPRESSURE_POLL_INTERVAL_SECONDS = 1
+
+
+@activity.defn
+@scoped_temporal()
+async def submit_signal_to_buffer_activity(input: SubmitSignalToBufferInput) -> None:
+    """Poll the buffer workflow's size via query, then send the signal once there's space."""
+    client = await async_connect()
+    handle = client.get_workflow_handle(BufferSignalsWorkflow.workflow_id_for(input.team_id))
+
+    while True:
+        activity.heartbeat()
+        buffer_size = await handle.query(BufferSignalsWorkflow.get_buffer_size)
+        if buffer_size < BUFFER_MAX_SIZE:
+            break
+        jitter = random.uniform(0, BACKPRESSURE_POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(BACKPRESSURE_POLL_INTERVAL_SECONDS + jitter)
+
+    await handle.signal(BufferSignalsWorkflow.submit_signal, input.signal)
+
+
+@temporalio.workflow.defn(name="buffer-signals")
+class BufferSignalsWorkflow:
+    """
+    Buffers signals and flushes batch object keys to grouping v2.
+
+    One instance per team (workflow ID: buffer-signals-{team_id}).
+    Uses continue_as_new after each flush to keep history bounded.
+    """
+
+    def __init__(self) -> None:
+        self._signal_buffer: list[EmitSignalInputs] = []
+        self._signals_emitted_counters: dict[tuple[str, str], MetricCounter] = {}
+
+    @staticmethod
+    def workflow_id_for(team_id: int) -> str:
+        return f"buffer-signals-{team_id}"
+
+    @temporalio.workflow.query
+    def get_buffer_size(self) -> int:
+        return len(self._signal_buffer)
+
+    def _buffer_signal(self, signal: EmitSignalInputs) -> None:
+        if signal.buffered_at is None:
+            signal.buffered_at = workflow.now().isoformat()
+        self._signal_buffer.append(signal)
+
+    def _continue_as_new(self, team_id: int, *, provider_usage_limited: bool = False) -> NoReturn:
+        workflow.continue_as_new(
+            BufferSignalsInput(
+                team_id=team_id,
+                pending_signals=list(self._signal_buffer),
+                provider_usage_limited=provider_usage_limited,
+            )
+        )
+
+    def _get_emitted_counter(self, team_id: int, source_product: str, source_type: str) -> MetricCounter:
+        key = (source_product, source_type)
+        if key not in self._signals_emitted_counters:
+            meter = workflow.metric_meter().with_additional_attributes(
+                {
+                    "team_id": str(team_id),
+                    "source_product": source_product,
+                    "source_type": source_type,
+                }
+            )
+            self._signals_emitted_counters[key] = meter.create_counter(
+                "signals_emitted",
+                "Number of signals emitted",
+            )
+        return self._signals_emitted_counters[key]
+
+    @temporalio.workflow.signal
+    async def submit_signal(self, signal: EmitSignalInputs) -> None:
+        self._get_emitted_counter(signal.team_id, signal.source_product, signal.source_type).add(1)
+        metrics.increment_funnel(metrics.FUNNEL_STAGE_EMITTED, signal.source_product)
+        self._buffer_signal(signal)
+
+    @temporalio.workflow.run
+    async def run(self, input: BufferSignalsInput) -> None:
+        with posthoganalytics.new_context(capture_exceptions=False):
+            posthoganalytics.tag("team_id", input.team_id)
+            posthoganalytics.tag("product", "signals")
+            await self._run_impl(input)
+
+    async def _run_impl(self, input: BufferSignalsInput) -> None:
+        for signal in input.pending_signals:
+            self._buffer_signal(signal)
+        if input.provider_usage_limited:
+            # A fresh run keeps the cooldown inside the buffer's one-hour run timeout.
+            await workflow.sleep(PROVIDER_USAGE_LIMIT_RETRY_DELAY)
+
+        while True:
+            # Wait for at least one signal
+            await workflow.wait_condition(lambda: len(self._signal_buffer) > 0)
+
+            # Wait until buffer is full or timeout expires since oldest signal arrived
+            if len(self._signal_buffer) < BUFFER_MAX_SIZE:
+                try:
+                    await workflow.wait_condition(
+                        lambda: len(self._signal_buffer) >= BUFFER_MAX_SIZE,
+                        timeout=timedelta(seconds=BUFFER_FLUSH_TIMEOUT_SECONDS),
+                    )
+                except TimeoutError:
+                    pass
+
+            # Drain buffer
+            batch = list(self._signal_buffer)
+            self._signal_buffer.clear()
+
+            if workflow.patched("signals-buffer-expire-batches-v1") and _is_batch_expired(batch, workflow.now()):
+                metrics.increment_dropped(stage="buffer", reason="expired", count=len(batch))
+                logger.warning("signals_buffer.expired_batch_dropped", team_id=input.team_id, signal_count=len(batch))
+                await _complete_signal_batch(batch, {})
+                self._continue_as_new(input.team_id)
+
+            # Preserve the recorded command; admission already checked the limits.
+            if workflow.patched(_PATCH_QUOTA_INGESTION_GATE):
+                over_limit = await workflow.execute_activity(
+                    check_signals_quota_limited_activity,
+                    CheckSignalsQuotaInput(team_id=input.team_id, signal_count=len(batch), signals=batch),
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                if over_limit:
+                    # Compact history like the empty-batch path so a sustained over-limit stream
+                    # doesn't grow Temporal history unboundedly.
+                    if len(self._signal_buffer) < BUFFER_MAX_SIZE:
+                        self._continue_as_new(input.team_id)
+                    continue
+
+            # Filter out malicious signals
+            try:
+                safety_results = await asyncio.gather(
+                    *[
+                        workflow.execute_activity(
+                            safety_filter_activity,
+                            SafetyFilterInput(
+                                signal_id=s.signal_id,
+                                team_id=s.team_id,
+                                description=s.description,
+                                source_product=s.source_product,
+                                source_type=s.source_type,
+                                source_id=s.source_id,
+                                weight=s.weight,
+                                extra=s.extra,
+                            ),
+                            start_to_close_timeout=timedelta(minutes=5),
+                            retry_policy=RetryPolicy(maximum_attempts=3),
+                        )
+                        for s in batch
+                    ],
+                    return_exceptions=workflow.patched("signals-retry-failed-safety-only"),
+                )
+            except ActivityError as error:
+                self._signal_buffer[:0] = batch
+                logger.warning(
+                    "signals_buffer.safety_filter_failed_requeued",
+                    team_id=input.team_id,
+                    signal_count=len(batch),
+                )
+                if _is_provider_usage_limit(error):
+                    self._continue_as_new(input.team_id, provider_usage_limited=True)
+                await workflow.sleep(timedelta(seconds=SAFETY_FILTER_RETRY_DELAY_SECONDS))
+                continue
+            safe_signals: list[EmitSignalInputs] = []
+            failed_signals: list[EmitSignalInputs] = []
+            provider_usage_limited = False
+            for signal, result in zip(batch, safety_results):
+                if isinstance(result, ActivityError):
+                    failed_signals.append(signal)
+                    provider_usage_limited = provider_usage_limited or _is_provider_usage_limit(result)
+                elif isinstance(result, BaseException):
+                    raise result
+                elif result.safe:
+                    safe_signals.append(signal)
+                else:
+                    logger.warning(
+                        "Safety filter dropped signal",
+                        threat_type=result.threat_type,
+                        team_id=signal.team_id,
+                        source_product=signal.source_product,
+                        source_type=signal.source_type,
+                        source_id=signal.source_id,
+                    )
+            if failed_signals:
+                self._signal_buffer[:0] = failed_signals
+                if not provider_usage_limited:
+                    await workflow.sleep(timedelta(seconds=SAFETY_FILTER_RETRY_DELAY_SECONDS))
+            batch = safe_signals
+
+            if not batch:
+                # Compact history even when no safe signals remain — without
+                # continue_as_new, repeated all-unsafe batches would grow
+                # Temporal history unboundedly.
+                if provider_usage_limited or len(self._signal_buffer) < BUFFER_MAX_SIZE:
+                    self._continue_as_new(input.team_id, provider_usage_limited=provider_usage_limited)
+                continue
+
+            # Flush to object storage
+            flush_result: FlushBufferOutput = await workflow.execute_activity(
+                flush_signals_to_s3_activity,
+                FlushBufferInput(team_id=input.team_id, signals=batch),
+                start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+
+            # Signal-with-start the grouping v2 workflow (creates it if not running)
+            await workflow.execute_activity(
+                signal_with_start_grouping_v2_activity,
+                SignalWithStartGroupingV2Input(team_id=input.team_id, object_key=flush_result.object_key),
+                start_to_close_timeout=timedelta(minutes=1),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+
+            # If the buffer is already full again, loop to flush immediately
+            # rather than continue_as_new (avoids losing throughput to workflow restart).
+            if provider_usage_limited or len(self._signal_buffer) < BUFFER_MAX_SIZE:
+                self._continue_as_new(input.team_id, provider_usage_limited=provider_usage_limited)

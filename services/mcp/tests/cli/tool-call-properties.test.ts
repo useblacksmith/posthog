@@ -1,0 +1,149 @@
+import { describe, expect, it } from 'vitest'
+
+import { buildToolCallProperties } from '@/cli/tool-call-properties'
+import { MCPToolResultError, PostHogValidationError } from '@/lib/errors'
+import type { ExecInnerCallProperties } from '@/tools/exec'
+import { getToolCategory, getToolDescription } from '@/tools/toolDefinitions'
+
+// The CLI flushes these events on the error path, so anything value-carrying
+// here (raw error messages, inputs) would ship caller content and API response
+// bodies to usage analytics. `toEqual` pins the exact shape: reintroducing
+// `error_message` or `input` fails every case below. Catalog metadata
+// (category, clipped description) is safe by construction: it comes from the
+// tool registry, never from the caller.
+describe('buildToolCallProperties', () => {
+    const base: ExecInnerCallProperties = {
+        duration_ms: 42,
+        success: false,
+        output_format: 'text',
+        error_message: 'API error: {"detail": "secret notebook content …"}',
+        error: new Error('Private backend error details'),
+        input: { markdown: 'private caller-supplied text' },
+    }
+
+    function catalogMetadata(toolName: string): Record<string, unknown> {
+        return {
+            $mcp_tool_category: getToolCategory(toolName),
+            $mcp_tool_description: getToolDescription(toolName),
+        }
+    }
+
+    it('never forwards error_message or input, only a value-free classification', () => {
+        expect(buildToolCallProperties('notebooks-update-cell', base)).toEqual({
+            tool_name: 'notebooks-update-cell',
+            $mcp_tool_name: 'notebooks-update-cell',
+            $mcp_duration_ms: 42,
+            $mcp_is_error: true,
+            output_format: 'text',
+            error_class: 'error',
+            $mcp_error_type: 'internal',
+            ...catalogMetadata('notebooks-update-cell'),
+        })
+    })
+
+    // `$mcp_error_type`/`$mcp_error_status` mirror the hosted server's vocabulary so
+    // the MCP analytics failure tools can bucket CLI errors instead of showing them
+    // as typeless.
+    it.each([
+        [
+            'schema rejection',
+            { validation_error: true },
+            { error_class: 'validation_error', $mcp_error_type: 'validation' },
+        ],
+        [
+            'rate-limited API failure',
+            { error_status: 429 },
+            { error_class: 'api_error', error_status: 429, $mcp_error_type: 'rate_limited', $mcp_error_status: 429 },
+        ],
+        [
+            'permission API failure',
+            { error_status: 403 },
+            { error_class: 'api_error', error_status: 403, $mcp_error_type: 'permission', $mcp_error_status: 403 },
+        ],
+        [
+            'client API failure',
+            { error_status: 404 },
+            { error_class: 'api_error', error_status: 404, $mcp_error_type: 'api_4xx', $mcp_error_status: 404 },
+        ],
+        [
+            'server API failure',
+            { error_status: 502 },
+            { error_class: 'api_error', error_status: 502, $mcp_error_type: 'api_5xx', $mcp_error_status: 502 },
+        ],
+        [
+            'backend validation failure',
+            { error: new MCPToolResultError('Private SQL input', 'validation') },
+            { error_class: 'error', $mcp_error_type: 'validation' },
+        ],
+        [
+            'backend query timeout',
+            { error: new MCPToolResultError('Private query details', 'timeout') },
+            { error_class: 'error', $mcp_error_type: 'timeout' },
+        ],
+        [
+            'backend query memory failure',
+            { error: new MCPToolResultError('Private query details', 'memory_limit') },
+            { error_class: 'error', $mcp_error_type: 'memory_limit' },
+        ],
+        [
+            'backend failure with a malformed error code',
+            { error: new MCPToolResultError('Private SQL input', 'validation', ' query_\nsyntax\x00 ') },
+            { error_class: 'error', $mcp_error_type: 'validation', $mcp_error_code: 'query_syntax' },
+        ],
+        [
+            'backend API validation failure',
+            {
+                error_status: 400,
+                error: new PostHogValidationError({
+                    detail: 'Private field value',
+                    attr: 'name',
+                    code: 'required',
+                    extra: undefined,
+                    url: 'https://example.com/api/projects/1/feature_flags/',
+                    method: 'POST',
+                }),
+            },
+            {
+                error_class: 'api_error',
+                error_status: 400,
+                $mcp_error_type: 'api_4xx',
+                $mcp_error_status: 400,
+                $mcp_error_code: 'required',
+            },
+        ],
+    ])('classifies a %s without carrying the message', (_name, extra, expected) => {
+        expect(buildToolCallProperties('execute-sql', { ...base, ...extra })).toEqual({
+            tool_name: 'execute-sql',
+            $mcp_tool_name: 'execute-sql',
+            $mcp_duration_ms: 42,
+            $mcp_is_error: true,
+            output_format: 'text',
+            ...catalogMetadata('execute-sql'),
+            ...expected,
+        })
+    })
+
+    it('omits error fields entirely on success', () => {
+        const coded = new MCPToolResultError('Private details', 'validation', 'unknown_identifier')
+        expect(buildToolCallProperties('feature-flag-get-all', { ...base, success: true, error: coded })).toEqual({
+            tool_name: 'feature-flag-get-all',
+            $mcp_tool_name: 'feature-flag-get-all',
+            $mcp_duration_ms: 42,
+            $mcp_is_error: false,
+            output_format: 'text',
+            ...catalogMetadata('feature-flag-get-all'),
+        })
+    })
+
+    it('stamps catalog metadata on catalogued tools and omits it for unknown names', () => {
+        // The CLI path silently shipped without category or description while the
+        // hosted server stamped both; this pins the two paths to the same catalog.
+        const catalogued = buildToolCallProperties('feature-flag-get-all', { ...base, success: true })
+        expect(catalogued.$mcp_tool_category).toBeTruthy()
+        expect(catalogued.$mcp_tool_description).toBeTruthy()
+
+        const unknown = buildToolCallProperties('not-a-real-tool', { ...base, success: true })
+        expect(unknown).not.toHaveProperty('$mcp_tool_category')
+        expect(unknown).not.toHaveProperty('$mcp_tool_description')
+    })
+})

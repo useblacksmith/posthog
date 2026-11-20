@@ -1,0 +1,1417 @@
+"""Pre-extraction Temporal activity that performs a pending in-place repartition.
+
+Runs inside `ExternalDataJobWorkflow` after the pipeline lock is held and before extraction, so it is
+the sole writer for the schema (the schedule's OnlyOne overlap policy + the v3 pipeline lock guarantee
+no concurrent sync). Acting on a pending target *before* the merge means the merge that follows in the
+same run uses the new, memory-safe layout. A repartition failure never fails the workflow — the sync
+just proceeds on the old layout (status quo) and the table is retried on a later run. Two nuances: a
+transient infra error during an admin-staged rewrite re-raises retryable so the activity's retry
+policy re-runs it in this run (the workflow swallows the failure if retries exhaust); and a failure
+once the swap has landed leaves the `repartition_swap` marker set, which pauses the sync that follows
+rather than letting it merge against settings that no longer describe the data.
+"""
+
+import time
+import uuid
+import socket
+import asyncio
+import datetime as dt
+from typing import Any
+
+from django.db import InterfaceError, InternalError, OperationalError, close_old_connections
+from django.utils import timezone
+
+import psycopg.errors
+from asgiref.sync import async_to_sync
+from structlog.contextvars import bind_contextvars
+from structlog.types import FilteringBoundLogger
+from temporalio import activity
+from temporalio.exceptions import ApplicationError
+
+from posthog.dataclasses import frozen
+from posthog.exceptions_capture import capture_exception
+from posthog.temporal.common.activity_context import current_activity_attempt
+from posthog.temporal.common.heartbeat_sync import HeartbeaterSync
+from posthog.temporal.common.logger import get_logger
+from posthog.temporal.common.shutdown import ShutdownMonitor, WorkerShuttingDownError
+from posthog.temporal.common.utils import retry_on_db_connection_drop
+
+from products.warehouse_sources.backend.models.external_data_job import ExternalDataJob
+from products.warehouse_sources.backend.models.external_data_schema import (
+    ExternalDataSchema,
+    clear_repartition_checkpoint_if_claimed,
+    mark_repartition_dropping_if_claimed,
+    release_repartition_hold_if_claimed,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.common.extract import import_replaces_table
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.delta.errors import (
+    is_transient_maintenance_error,
+    is_transient_object_store_error,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.delta.table import DeltaTableRef
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.repartition import (
+    RepartitionAttemptsExhausted,
+    RepartitionBudgetExceededError,
+    RepartitionSchemePersistError,
+    RepartitionSliceEndedError,
+    RepartitionStoppedError,
+    RepartitionSupersededError,
+    RepartitionTarget,
+    RepartitionTooLargeForBudgetError,
+    RepartitionUnpartitionableError,
+    defer_repartition_to_full_refresh,
+    purge_abandoned_rewrite_temp,
+    repartition_table_in_place,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.repartition_controller import (
+    MAX_REPARTITION_ATTEMPTS,
+    base_event_props,
+    capture_repartition_event,
+    is_automatic_split_of_append_table,
+    is_repartition_hold_enabled,
+    is_stale_size_split,
+    maybe_flag_for_repartition,
+    needs_pre_extraction_detection,
+    pre_extraction_measurement_is_redundant,
+    target_partition_bytes,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline_v3.load.metrics import (
+    DELTA_REPARTITION_DURATION_SECONDS,
+    DELTA_REPARTITION_TOTAL,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.job_context import bind_job_context
+from products.warehouse_sources.backend.temporal.data_imports.workload_report import workload_reporting
+
+LOGGER = get_logger(__name__)
+
+
+@frozen
+class RepartitionActivityInputs:
+    team_id: int
+    schema_id: str
+    job_id: str
+    source_id: str
+    # The reset that the workflow input asks for. It never reaches `sync_type_config`, and the import
+    # reads it too. Defaults None so the payload of a workflow that predates the field still loads.
+    reset_pipeline: bool | None = None
+
+
+def _is_cancellation(error: BaseException) -> bool:
+    """Whether `error` is an activity cancellation, however it surfaced.
+
+    `async_to_sync` can wrap a worker-shutdown `asyncio.CancelledError` (a `BaseException` since 3.8) so
+    it arrives Exception-derived; match on the type name too so it's never mistaken for a real failure.
+    """
+    return isinstance(error, asyncio.CancelledError) or type(error).__name__ == "CancelledError"
+
+
+def _activity_cancelled() -> bool:
+    """Whether Temporal cancelled this activity, which includes an attempt that ran past its timeout.
+
+    A sync activity keeps its thread after a timeout, and learns of it only from the next heartbeat.
+    False outside an activity context (direct calls from tests).
+    """
+    try:
+        return activity.is_cancelled()
+    except RuntimeError:
+        return False
+
+
+def _is_native_panic(error: BaseException) -> bool:
+    """Whether `error` is a panic that escaped the native Delta/Arrow stack.
+
+    pyo3 surfaces a Rust panic as `PanicException`, which derives from `BaseException`, so it passes
+    straight through an `except Exception` handler. Matched on the type name because the module that
+    defines it (`pyo3_runtime`) only exists once an extension module has loaded it.
+    """
+    return type(error).__name__ == "PanicException"
+
+
+# Infra noise observed escaping the rewrite as generic OSError/HTTPClientError — none of these are
+# repartition bugs, and the marker-idempotent swap means the next sync simply retries.
+_TRANSIENT_ERROR_SNIPPETS = (
+    "reduce your request rate",  # S3 503 SlowDown surfaced by the delta kernel as OSError
+    "error occurred while loading credentials",  # IMDS/credential-provider timeout inside the kernel
+    "event loop is closed",  # s3fs client bound to an already-completed async_to_sync loop
+    # S3 NoSuchKey from an s3fs purge/swap op (`_copy`/`_rm`/`_find`) that raced a concurrent delete —
+    # a temp file swept by another attempt, not a bug. A hollow *live* table surfaces the missing file
+    # with its path embedded and is routed to a revive inside `repartition_table_in_place` before it
+    # ever reaches here, so this bare, pathless variant only ever means a raced object-store operation.
+    "the specified key does not exist",
+)
+
+
+# How much of the activity's budget to leave unused when the rewrite gives up, so the failed attempt
+# can still be recorded before Temporal kills the activity. Only the bookkeeping needs covering: a
+# couple of writes to the schema row and one event.
+REWRITE_DEADLINE_MARGIN = dt.timedelta(minutes=5)
+
+
+def _rewrite_deadline(activity_started: float) -> float | None:
+    """Monotonic time by which the rewrite must stop to leave room to record its own failure.
+
+    `activity_started` is the `time.monotonic()` reading taken when the activity began. The deadline
+    is anchored to it, not to now: the budget is measured from `start_to_close_timeout`, which Temporal
+    counts from the same start, so the pre-rewrite work (job fetch, the pre-extraction Delta-log
+    measurement, temp validation) has to be charged against it too. Anchoring to now instead
+    hands the rewrite a deadline later than the activity's own timeout by however long that pre-work
+    took, so on the heavily-fragmented tables this path exists to rescue — where reading the log alone
+    runs into minutes — Temporal kills the rewrite mid-stream before it can record an outcome, and the
+    hard-killed attempt counts toward the give-up cap.
+
+    None when there is no budget to derive one from: outside an activity context (direct calls from
+    tests), when the activity declares no `start_to_close_timeout`, or when that timeout is shorter
+    than the margin. In each case the rewrite runs unbounded, which is the behavior that predates
+    this deadline rather than an instant give-up.
+    """
+    try:
+        info = activity.info()
+    except RuntimeError:
+        return None
+    if info.start_to_close_timeout is None:
+        return None
+    budget = (info.start_to_close_timeout - REWRITE_DEADLINE_MARGIN).total_seconds()
+    if budget <= 0:
+        return None
+    return activity_started + budget
+
+
+# Each slice pays for a resume, which lists the live table and the temp table again.
+MIN_REWRITE_SLICE = dt.timedelta(minutes=30)
+
+
+def _rewrite_slice_seconds(
+    schema: ExternalDataSchema,
+    pending: dict[str, Any] | None,
+    trigger_reason: str,
+    *,
+    activity_started: float,
+    deadline: float | None,
+    logger: FilteringBoundLogger,
+) -> float | None:
+    """How long the rewrite streams before it pauses so that this sync can import, or None for no slice.
+
+    No slice for an operator target, because the operator wants that rewrite done first. No slice
+    when the schema holds its imports for the rewrite, because the import would not run anyway.
+    """
+    if trigger_reason == "admin" or (pending or {}).get("slice_disabled"):
+        return None
+    interval = schema.sync_frequency_interval
+    if interval is None:
+        return None
+    slice_seconds = max(interval, MIN_REWRITE_SLICE).total_seconds()
+    if deadline is not None and activity_started + slice_seconds >= deadline:
+        return None
+    try:
+        if is_repartition_hold_enabled(schema):
+            return None
+    except Exception:
+        logger.warning("repartition: could not evaluate the repartition hold flag; slicing", exc_info=True)
+    return slice_seconds
+
+
+def _is_transient_infra_error(error: Exception) -> bool:
+    if isinstance(error, OperationalError | InterfaceError):
+        return True
+    # A primary-DB failover briefly routes one of the rewrite's own writes (checkpoint, swap marker)
+    # onto a connection that has become a read-only standby: Postgres raises
+    # ReadOnlySqlTransaction (SQLSTATE 25006), which psycopg classifies under InternalError rather than
+    # OperationalError, so it needs its own check. Matched on the cause, not a bare InternalError
+    # isinstance, so real corruption errors sharing the base class are still reported. Mirrors the same
+    # classification in delta.errors.is_transient_maintenance_error.
+    if isinstance(error, InternalError) and isinstance(error.__cause__, psycopg.errors.ReadOnlySqlTransaction):
+        return True
+    # s3fs collapses every S3 auth-failure response code (AccessDenied, ExpiredToken, InvalidAccessKeyId)
+    # into a bare PermissionError, and a 403 carries no code in its body to tell them apart. The rewrite
+    # only ever touches our own instance-role-authenticated data-warehouse bucket, so a denial here is
+    # the same transient IMDS/STS credential-resolution race already recognized as retryable in
+    # delta.table._is_retryable_purge_error — not a customer credential problem. Retrying on the next
+    # sync self-heals it; burning an attempt and reporting it instead abandons the table after the cap.
+    if isinstance(error, PermissionError):
+        return True
+    # Same object-store blips (`Generic S3 error`, SlowDown, S3's internal-error response) that
+    # `is_transient_maintenance_error` already recognizes for the maintenance path — the rewrite hits
+    # the same data-warehouse bucket the same way, so an OSError/DeltaError matching one of those
+    # needles here is exactly as transient.
+    if is_transient_object_store_error(error):
+        return True
+    message = str(error).lower()
+    return any(snippet in message for snippet in _TRANSIENT_ERROR_SNIPPETS)
+
+
+def _still_claimant(schema: ExternalDataSchema, claim_token: str) -> bool:
+    """Whether this attempt still holds the schema's repartition claim.
+
+    Conservative on doubt: if the claim can't be read (DB blip), report True so a real failure is
+    never silently dropped.
+    """
+    try:
+        schema.refresh_from_db(fields=["sync_type_config"])
+        claim = schema.repartition_claim
+        return bool(claim and claim.get("token") == claim_token)
+    except Exception:
+        return True
+
+
+def _target_from_schema(schema: ExternalDataSchema) -> RepartitionTarget:
+    """Fallback target reconstructed from the schema's current settings (resume-with-no-pending)."""
+    return RepartitionTarget(
+        partition_keys=schema.partitioning_keys or schema.primary_key_columns or [],
+        trigger_reason="resume",
+        partition_mode=schema.partition_mode,
+        partition_format=schema.partition_format,
+        partition_count=schema.partition_count,
+        partition_size=schema.partition_size,
+    )
+
+
+def _measurement_is_redundant(schema: ExternalDataSchema, job: ExternalDataJob, logger: FilteringBoundLogger) -> bool:
+    """Whether the last recorded measurement makes the on-disk read unnecessary. Never raises.
+
+    Any doubt gives False, and the activity then reads the table as before.
+    """
+    try:
+        return pre_extraction_measurement_is_redundant(schema, job)
+    except Exception:
+        logger.warning("repartition: could not check the last measurement, measuring on disk", exc_info=True)
+        return False
+
+
+def _maybe_flag_pre_extraction(
+    schema: ExternalDataSchema,
+    job: ExternalDataJob,
+    table_ref: DeltaTableRef,
+    logger: FilteringBoundLogger,
+) -> dict[str, Any] | None:
+    """Measure the on-disk table before extraction and flag a repartition if it's over budget.
+
+    The post-load detector (`maybe_flag_for_repartition`) only runs after a merge completes, so a table
+    whose merge OOMs every run can never flag itself for repair — the classic chicken-and-egg. Running
+    the same detection (same budget and cooldown gating) here, pre-extraction, closes
+    that gap: the on-disk table already reflects the over-budget layout, so we can flag and — in this
+    same run — rewrite it before the merge that would OOM. Returns the pending target set by detection,
+    or None if nothing was flagged (or the table couldn't be measured). Never raises.
+    """
+    try:
+        delta_table = async_to_sync(table_ref.get_delta_table)()
+        if delta_table is None:
+            logger.debug("repartition: no delta table on disk, cannot measure for repartition")
+            return None
+        async_to_sync(maybe_flag_for_repartition)(schema, schema.source, job, delta_table, logger)
+    except Exception as e:
+        # Detection is best-effort; a failure here must not block the sync. `get_delta_table` re-raises
+        # transient object-store blips (S3/credential-provider timeouts) rather than swallowing them —
+        # see its own docstring — and resolving `job.folder_path()` on a pooled app-DB connection can
+        # raise OperationalError/InterfaceError the same way. `is_transient_maintenance_error` covers
+        # both, so this is the layer that must apply it before reporting, same as the other best-effort
+        # call sites around this table.
+        if is_transient_maintenance_error(e):
+            logger.warning("repartition: pre-extraction detection failed with a transient infra error")
+        else:
+            logger.warning("repartition: pre-extraction detection failed", exc_info=True)
+            capture_exception(e)
+        return None
+    return schema.repartition_pending
+
+
+@activity.defn
+def maybe_repartition_table_activity(inputs: RepartitionActivityInputs) -> None:
+    # Sync activity (runs in the worker's thread pool) so its ORM access is safe off the event loop;
+    # the async repartition primitive is driven via async_to_sync, like import_data_activity_sync.
+    bind_contextvars(team_id=inputs.team_id, schema_id=inputs.schema_id)
+    logger = LOGGER.bind()
+    close_old_connections()
+
+    # Always bracket the run with start/finish INFO lines so the Syncs UI shows the activity ran even
+    # on the healthy no-op path (which otherwise only logs at DEBUG). The finally guarantees the finish
+    # line regardless of which branch returns, including swallowed failures.
+    logger.info(
+        f"repartition: activity started job_id={inputs.job_id} source_id={inputs.source_id}",
+        job_id=inputs.job_id,
+        source_id=inputs.source_id,
+    )
+    try:
+        _maybe_repartition_table(inputs, logger)
+    finally:
+        logger.info("repartition: activity finished")
+
+
+def _maybe_repartition_table(inputs: RepartitionActivityInputs, logger: FilteringBoundLogger) -> None:
+    # Anchor the rewrite deadline to when the activity began, so the pre-rewrite work below (job fetch,
+    # pre-extraction Delta-log measurement) is charged against the activity's timeout
+    # rather than handed to the rewrite on top of it. See `_rewrite_deadline`.
+    activity_started = time.monotonic()
+    try:
+        schema = retry_on_db_connection_drop(
+            lambda: ExternalDataSchema.objects.select_related("source").get(id=inputs.schema_id)
+        )
+    except ExternalDataSchema.DoesNotExist:
+        logger.warning(
+            f"repartition: schema not found, skipping activity schema_id={inputs.schema_id}",
+            schema_id=inputs.schema_id,
+        )
+        return
+    except Exception as e:
+        # retry_on_db_connection_drop already retried once; a second failure here (e.g. the worker
+        # briefly exhausting its file descriptors under load) is the same transient-infra shape the
+        # rewrite itself stands down on below, just hit before a run has even started. No claim has
+        # been staked and no attempt charged yet, so standing down costs nothing: the table is simply
+        # picked up again on the next sync.
+        if not _is_transient_infra_error(e):
+            raise
+        logger.warning("repartition: database unavailable while fetching schema, standing down", exc_info=True)
+        return
+
+    # A table with a pending corruption revive must heal first — the extract activity resets it and
+    # rebuilds from source. Repartitioning it here would interleave with that heal and re-hollow the
+    # table, re-arming the revive marker every run (a non-billable revive loop). Skip until the revive
+    # clears the marker; the healed table is repartitioned normally on a later run.
+    if schema.delta_revive_required is not None:
+        logger.info(
+            f"repartition: skipped, table pending corruption revive schema_id={schema.id}",
+            schema_id=str(schema.id),
+        )
+        return
+
+    # Log the recorded and budget sizes so the Syncs UI shows what the controller started from. Note
+    # `max_partition_bytes` here is the last *recorded* value (can be stale); the gate does not trust
+    # it, the live size is read below.
+    recorded_max_partition_bytes = schema.max_partition_bytes
+    budget = target_partition_bytes()
+    logger.info(
+        f"repartition: evaluating max_partition_bytes={recorded_max_partition_bytes} target_partition_bytes={budget}",
+        max_partition_bytes=recorded_max_partition_bytes,
+        target_partition_bytes=budget,
+    )
+
+    pending = schema.repartition_pending
+    swap = schema.repartition_swap
+
+    # Fast no-op path: nothing queued and the gate says no on-disk measurement is needed (CDC).
+    # Return here — before fetching the job and reading the delta log — so the common healthy
+    # invocation avoids all on-disk I/O. Other tables fall through and measure the live size below.
+    if pending is None and swap is None and not needs_pre_extraction_detection(schema):
+        logger.info("repartition: nothing queued and no detection needed, nothing to do")
+        return
+
+    try:
+        job = retry_on_db_connection_drop(lambda: ExternalDataJob.objects.get(id=inputs.job_id))
+    except ExternalDataJob.DoesNotExist:
+        logger.warning(
+            f"repartition: job not found, skipping activity job_id={inputs.job_id}",
+            job_id=inputs.job_id,
+        )
+        return
+    except Exception as e:
+        # See the matching comment on the schema fetch above: a second connection failure after
+        # retry_on_db_connection_drop's own retry is transient infra, not a repartition bug, and
+        # nothing has been claimed or charged yet.
+        if not _is_transient_infra_error(e):
+            raise
+        logger.warning("repartition: database unavailable while fetching job, standing down", exc_info=True)
+        return
+
+    # Attach the same source/schema identity the import activity does, so an exception captured
+    # anywhere below (budget exhaustion, an unexpected rewrite failure) can be attributed to a
+    # connector and table instead of landing in error tracking with no sync context.
+    bind_job_context(
+        team_id=inputs.team_id,
+        source_type=schema.source.source_type,
+        external_data_source_id=inputs.source_id,
+        external_data_schema_id=inputs.schema_id,
+        external_data_job_id=inputs.job_id,
+        schema_name=schema.name,
+        sync_type=schema.sync_type,
+        pipeline_version=job.pipeline_version,
+    )
+
+    # `resolved_s3_folder_name` is authoritative for the Delta folder, not the row's own name: a row
+    # renamed during the multi-schema migration keeps its folder pinned to the original path (name
+    # `public.users`, folder `users`), and the pipeline writes there too. Deriving the folder from
+    # `name` alone probes a path that was never written and the repartition skips as `no_delta_table`.
+    if pending is None and swap is None and _measurement_is_redundant(schema, job, logger):
+        logger.info("repartition: no data reached the table since the last healthy measurement, nothing to do")
+        return
+
+    resource_name = schema.resolved_s3_folder_name or schema.name
+    table_ref = DeltaTableRef(
+        resource_name=resource_name, job=job, logger=logger, expect_missing=schema.table_id is None
+    )
+
+    replaces_table = swap is None and _import_replaces_table(schema, job, inputs, logger)
+
+    if pending is None and swap is None:
+        if replaces_table and not schema.initial_sync_complete:
+            # A reset that an earlier run started left a part of the table on disk. A target sized
+            # from that part is too small for the full table, and the import deletes the part.
+            logger.info("repartition: the import replaces a table that is not fully loaded, not measuring it")
+            return
+        # Nothing was queued by a prior run's post-load detection. Measure now and self-flag if it's
+        # over budget — the only path that can rescue a table which OOMs its merge every run (and so
+        # never reaches post-load detection).
+        pending = _maybe_flag_pre_extraction(schema, job, table_ref, logger)
+        if pending is None:
+            logger.debug("repartition: pre-extraction measurement found no repartition needed")
+            return
+
+    if replaces_table:
+        # The marker snapshot predates the job fetch and Delta-log work above. A heartbeat-timed-out
+        # predecessor can stage a swap in that window, making temp the only intact copy; deferring
+        # from the stale snapshot would purge that temp and erase its recovery marker.
+        schema.refresh_from_db(fields=["sync_type_config"])
+        swap = schema.repartition_swap
+        pending = schema.repartition_pending or pending
+        # The reset can be cleared in the same window, and the table then needs its rewrite.
+        replaces_table = swap is None and _import_replaces_table(schema, job, inputs, logger)
+
+    # A pending marker carrying only bookkeeping (an attempt count written when nothing was queued)
+    # has no keys to rebuild a target from, and `from_dict` would raise before the rewrite even
+    # starts — every run, forever. Fall back to the schema's own settings, which is what a resume
+    # with no pending target uses anyway.
+    target = (
+        RepartitionTarget.from_dict(pending)
+        if pending is not None and pending.get("partition_keys") is not None
+        else _target_from_schema(schema)
+    )
+    trigger_reason = (pending or {}).get("trigger_reason", "resume")
+
+    # Drop unneeded splits before the reset deferral, or the reset would write them into the new table.
+    if swap is None and is_automatic_split_of_append_table(schema, trigger_reason):
+        _drop_queued_split(inputs, schema, table_ref, trigger_reason, "append_never_merges", logger)
+        return
+    if swap is None and is_stale_size_split(schema, trigger_reason):
+        _drop_queued_split(inputs, schema, table_ref, trigger_reason, "under_merge_split_budget", logger)
+        return
+
+    # Never while a swap is staged: live may already be deleted, and temp is then the only intact copy.
+    if replaces_table:
+        if schema.sync_type == ExternalDataSchema.SyncType.FULL_REFRESH:
+            _defer_to_full_refresh(inputs, schema, table_ref, target, trigger_reason, logger)
+        else:
+            _defer_to_reset(inputs, schema, table_ref, trigger_reason, logger)
+        return
+
+    # `_handle_failure` also gives up at the cap, but only for an attempt that survives to run it.
+    # A rewrite whose worker is OOM-killed never reaches it, so the count has to be read here too.
+    # Never while a swap is staged: an interrupted swap may already have deleted live, leaving temp
+    # the only intact copy, and `_give_up` clears the marker that points at it. A ready swap has to be
+    # completed however many attempts it took to get here.
+    if swap is None and _exhausted_attempts(pending, inputs.job_id):
+        # Re-read the markers before acting on them. They were read before the job fetch and the
+        # Delta-log work above, and the attempts that got us here are by definition ones that died
+        # without recording an outcome — a heartbeat timeout among them leaves a predecessor still
+        # running across that window, which is what the fresh claim `_give_up` stakes is for. Each
+        # marker write persists the whole in-memory `sync_type_config`, so deciding on the stale copy
+        # would erase a swap the predecessor staged in between: the only record of which scheme the
+        # data on disk carries, and the marker that holds this schema's imports until it resolves.
+        schema.refresh_from_db(fields=["sync_type_config"])
+        swap = schema.repartition_swap
+        pending = schema.repartition_pending or pending
+        if swap is None and _exhausted_attempts(pending, inputs.job_id):
+            # A killed attempt that still moved the checkpoint on is forward progress, not evidence
+            # the rewrite is doomed, which is the distinction `_handle_budget_exceeded` already draws
+            # for an attempt that ran out of budget. The checkpoint is the only signal available here,
+            # because a killed attempt records no outcome of its own. Otherwise a large table that
+            # converges one worker death per sync is abandoned at the cap, and `_give_up` discards its
+            # progress too.
+            if _last_run_advanced_rewrite(schema, pending):
+                logger.warning(
+                    f"repartition: attempts are spent but the rewrite advanced to "
+                    f"{_rewrite_rows_written(schema)} rows, resetting the count and resuming "
+                    f"schema_id={schema.id}",
+                    schema_id=str(schema.id),
+                    rewrite_rows=_rewrite_rows_written(schema),
+                )
+                pending = _clear_attempts_after_progress(schema, pending, logger)
+            else:
+                _give_up(inputs, schema, table_ref, pending, trigger_reason, logger)
+                return
+
+    # Never while a swap is staged: that recovery runs no rewrite, so the checkpoint says nothing
+    # about it, and temp is the only intact copy until it completes.
+    if swap is None and _retrying_a_killed_attempt(schema, pending, inputs.job_id):
+        # Stake a fresh claim on the way out, the same way `_give_up` does. A retry also starts when
+        # the predecessor is only heartbeat-timed-out, and that one keeps running as a zombie holding
+        # the claim it minted; standing down without rotating it would leave the zombie free to swap
+        # the live table while the sync this run releases merges into it.
+        if not schema.set_repartition_claim(
+            {"token": str(uuid.uuid4()), "job_id": inputs.job_id, "claimed_at": timezone.now().isoformat()}
+        ):
+            logger.info("repartition: killed-attempt stand-down superseded by a newer claim")
+            return
+        logger.warning(
+            f"repartition: the attempt this run retries wrote nothing before it stopped, standing "
+            f"down until the next sync schema_id={schema.id}",
+            schema_id=str(schema.id),
+        )
+        DELTA_REPARTITION_TOTAL.labels(outcome="killed").inc()
+        _capture_stood_down(schema, inputs, trigger_reason, "attempt_killed_without_progress", logger)
+        return
+
+    started_props = base_event_props(schema, schema.source, inputs.job_id)
+    started_props["trigger_reason"] = trigger_reason
+    capture_repartition_event("warehouse_repartition_started", started_props)
+    logger.info(f"repartition: starting trigger_reason={trigger_reason}", trigger_reason=trigger_reason)
+
+    # Fencing claim: if we get heartbeat-timed-out mid-rewrite, this activity keeps running as a
+    # zombie (heartbeat failures are swallowed) while Temporal starts a retry. The retry's newer claim
+    # makes every claim re-check inside the rewrite/swap raise RepartitionSupersededError in the
+    # zombie, so exactly one writer ever touches the table's S3 state.
+    claim_token = str(uuid.uuid4())
+    if not schema.set_repartition_claim(
+        {"token": claim_token, "job_id": inputs.job_id, "claimed_at": timezone.now().isoformat()}
+    ):
+        logger.info("repartition: rewrite superseded before it claimed the schema")
+        _capture_stood_down(schema, inputs, trigger_reason, "claim_superseded", logger)
+        return
+
+    # Charged before the rewrite and refunded on the stand-down paths below. Charging on failure
+    # instead bounds nothing: a worker killed mid-rewrite records no outcome, so the cap never moves.
+    # A staged swap runs no rewrite (temp is already complete), so its recovery is not a rewrite
+    # attempt and is not charged, the same reason the give-up above exempts it.
+    charged_attempts = None if swap is not None else _charge_attempt(schema, pending, inputs.job_id, logger)
+
+    deadline = _rewrite_deadline(activity_started)
+    rewrite_slice_seconds = (
+        None
+        if swap is not None
+        else _rewrite_slice_seconds(
+            schema, pending, trigger_reason, activity_started=activity_started, deadline=deadline, logger=logger
+        )
+    )
+
+    start = time.monotonic()
+    try:
+        # HeartbeaterSync heartbeats on a background thread while the (possibly long) rewrite streams,
+        # so Temporal does not time the activity out. The shutdown monitor lets the rewrite stop at
+        # its next commit, and the swap after its current group of files, when the worker shuts
+        # down, so neither holds a draining worker for hours. A cancelled attempt stops the same
+        # way, so an attempt that Temporal already timed out does not keep working beside its retry.
+        # The workload reporter makes the rewrite visible to pod co-tenant accounting (see
+        # `workload_report.py`): without it a rewrite-heavy pod looks idle to the OOM classifier's
+        # culprit rule. The run_id is prefixed because the sync's import activity reports under the
+        # bare job id on this same pod, and sharing its key would let a death during that import
+        # read this rewrite's report as its own last words.
+        with (
+            HeartbeaterSync(logger=logger),
+            ShutdownMonitor() as shutdown_monitor,
+            workload_reporting(
+                team_id=inputs.team_id,
+                schema_id=inputs.schema_id,
+                run_id=f"repartition:{inputs.job_id}",
+                host=socket.gethostname(),
+                initial_phase="repartition",
+                attempt=current_activity_attempt(),
+            ),
+        ):
+            result = async_to_sync(repartition_table_in_place)(
+                table_ref=table_ref,
+                schema=schema,
+                target=target,
+                logger=logger,
+                claim_token=claim_token,
+                deadline=deadline,
+                should_stop=lambda: shutdown_monitor.is_worker_shutdown() or _activity_cancelled(),
+                rewrite_slice_seconds=rewrite_slice_seconds,
+            )
+    except RepartitionSliceEndedError as e:
+        logger.info(
+            f"repartition: rewrite slice ended, resuming on the next sync rows_written={e.rows_written}",
+            rows_written=e.rows_written,
+        )
+        DELTA_REPARTITION_TOTAL.labels(outcome="sliced").inc()
+        _refund_attempt(schema, charged_attempts, logger)
+        _capture_stood_down(schema, inputs, trigger_reason, "sync_slice_ended", logger)
+        return
+    except RepartitionStoppedError as e:
+        # The rewrite stopped at a commit, or the swap between two groups of files. Temp and its
+        # checkpoint or swap marker stay, so the next attempt copies only what is left. This is not
+        # a failed attempt, so it must not count toward the give-up cap.
+        if _activity_cancelled() and not shutdown_monitor.is_worker_shutdown():
+            logger.info(f"repartition: stopped for activity cancellation: {e}")
+            _refund_attempt(schema, charged_attempts, logger)
+            raise asyncio.CancelledError() from e
+        logger.info(
+            f"repartition: stopped at a commit for worker shutdown, handing off rows_written={e.rows_written}: {e}",
+            rows_written=e.rows_written,
+        )
+        DELTA_REPARTITION_TOTAL.labels(outcome="handed_off").inc()
+        _refund_attempt(schema, charged_attempts, logger)
+        _capture_stood_down(schema, inputs, trigger_reason, "worker_shutdown", logger)
+        raise WorkerShuttingDownError.from_activity_context() from e
+    except RepartitionBudgetExceededError as e:
+        # The rewrite didn't fit in one activity's budget. Checkpoint/resume lets a large table
+        # converge across runs, so an attempt that advanced the checkpoint is progress, not a failure,
+        # and must not burn an attempt (see `_handle_budget_exceeded`); only a stuck one that made no
+        # progress counts toward `MAX_REPARTITION_ATTEMPTS` so a doomed rewrite still gives up.
+        logger.warning(f"repartition: {e}")
+        DELTA_REPARTITION_TOTAL.labels(
+            outcome=_handle_budget_exceeded(
+                inputs, schema, pending, trigger_reason, e, claim_token, logger, charged_attempts
+            ),
+        ).inc()
+        return
+    except RepartitionSupersededError:
+        # A newer attempt claimed the schema and owns the table now. Stop without recording a *failure*
+        # (that would burn an attempt and double-report the run the newer claimant is already handling),
+        # but still emit the skip: a started event with no terminal event leaves `repartition_pending`
+        # set and no way to tell a stood-down attempt from one that vanished.
+        logger.info("repartition: superseded by a newer attempt, standing down")
+        DELTA_REPARTITION_TOTAL.labels(outcome="superseded").inc()
+        _refund_attempt(schema, charged_attempts, logger)
+        _capture_stood_down(schema, inputs, trigger_reason, "superseded", logger)
+        return
+    except RepartitionSchemePersistError as e:
+        # The rewrite worked and the swap landed; only the write recording the new scheme was lost. The
+        # table's data now carries partition keys the schema row does not describe, so this is never
+        # transient noise however transient the database error under it was: the merge that would run
+        # next scopes its predicate to a partition the table no longer has and inserts every fetched
+        # row instead of upserting it. Record it as a real failure and leave the swap marker set — it
+        # carries the scheme, so the next run finishes the write without rebuilding, and it holds this
+        # schema's imports until then (see `_import_held_for_repartition`).
+        logger.error("repartition: the swap landed but its scheme could not be saved; imports stay held", exc_info=True)
+        DELTA_REPARTITION_TOTAL.labels(
+            outcome=_handle_failure(
+                inputs, schema, pending, trigger_reason, e, claim_token, logger, charged_attempts, table_ref
+            ),
+        ).inc()
+        return
+    except (RepartitionUnpartitionableError, RepartitionTooLargeForBudgetError) as e:
+        # Terminal: the table can't be partitioned on its keys, or one activity budget can't cover it
+        # and its checkpoint can't be resumed. Clear the flag AND engage the cooldown —
+        # clearing `repartition_pending` alone re-arms the loop, because detection re-flags on the very
+        # next sync (the OOM/size trigger is still true and the table's scheme is unchanged), so the
+        # table churns flag → start → skip every 5 minutes forever. The cooldown re-evaluates at most
+        # daily instead.
+        schema.refresh_from_db(fields=["sync_type_config"])
+        _purge_abandoned_temp(schema, table_ref, claim_token, logger)
+        schema.clear_repartition_pending()
+        schema.clear_repartition_rewrite()
+        schema.stamp_last_repartition_at()
+        props = base_event_props(schema, schema.source, inputs.job_id)
+        props.update({"trigger_reason": trigger_reason, "reason": str(e)})
+        capture_repartition_event("warehouse_repartition_skipped", props)
+        DELTA_REPARTITION_TOTAL.labels(outcome="skipped").inc()
+        capture_exception(e)
+        return
+    except asyncio.CancelledError:
+        # Worker shutdown / deploy interrupted the (possibly long) rewrite. Not a repartition failure —
+        # Temporal reschedules the activity — so propagate rather than record it, else every deploy fills
+        # error tracking with `warehouse_repartition_failed` noise and burns a repartition attempt.
+        logger.info("repartition: cancelled mid-run, will be retried")
+        _refund_attempt(schema, charged_attempts, logger)
+        raise
+    except Exception as e:
+        # Do NOT re-raise: a repartition failure must not block the sync — the table is retried on a
+        # later run, on the old layout in the meantime.
+        if _is_cancellation(e):
+            # Some cancellations surface through async_to_sync as an Exception-derived CancelledError.
+            # Treat identically to the branch above: propagate, never record it as a failure.
+            logger.info("repartition: cancelled mid-run, will be retried")
+            _refund_attempt(schema, charged_attempts, logger)
+            raise
+        if not _still_claimant(schema, claim_token):
+            # The error is almost certainly collateral from the newer claimant clobbering our S3 state
+            # (e.g. it swept our temp mid-write). It owns the retry; recording our wreckage as a
+            # failure would burn an attempt and pollute error tracking with self-inflicted noise.
+            logger.info("repartition: failed after being superseded, standing down", exc_info=True)
+            DELTA_REPARTITION_TOTAL.labels(outcome="superseded").inc()
+            _refund_attempt(schema, charged_attempts, logger)
+            _capture_stood_down(schema, inputs, trigger_reason, "superseded_after_error", logger)
+            return
+        if _is_transient_infra_error(e):
+            # Transient infra noise mid-repartition (app-DB pooler drop, S3 rate limit, credential
+            # timeout) — not a repartition bug. The rewrite/swap is idempotent via the swap marker, so
+            # retrying is always safe. Don't consume an attempt, emit a failure event, or report to
+            # error tracking — a condition nobody can act on (e.g. a pgbouncer login-retry cooldown)
+            # shouldn't trip an issue there; the log line, the transient metric, and the skipped
+            # event's reason="transient_infra_error" already carry the visibility.
+            DELTA_REPARTITION_TOTAL.labels(outcome="transient").inc()
+            if trigger_reason == "admin":
+                # An operator staged this rewrite precisely because syncing on the old layout is
+                # pathological (e.g. a badly over-partitioned table merging one commit per partition
+                # for hours). Deferring to the next sync would run that crawl first, so re-raise
+                # retryable and let the activity's retry policy re-run the rewrite now; the claim
+                # fencing handles any zombie, and if attempts exhaust the workflow still swallows the
+                # failure and syncs on the old layout. No capture_exception here and the error type is
+                # exempted in EXPECTED_CONTROL_FLOW_ERROR_TYPES: retries are expected control flow,
+                # and error-tracking events here would spam (and can trigger automated remediation);
+                # the log line and the transient metric carry the visibility.
+                logger.warning("repartition: transient infra error, re-raising for activity retry", exc_info=True)
+                _refund_attempt(schema, charged_attempts, logger)
+                raise ApplicationError(
+                    f"Transient infra error during admin-staged repartition: {e}",
+                    type="TransientRepartitionError",
+                ) from e
+            logger.warning("repartition: transient infra error, will retry on next sync", exc_info=True)
+            _refund_attempt(schema, charged_attempts, logger)
+            _capture_stood_down(schema, inputs, trigger_reason, "transient_infra_error", logger)
+            return
+        failure_outcome = _handle_failure(
+            inputs, schema, pending, trigger_reason, e, claim_token, logger, charged_attempts, table_ref
+        )
+        DELTA_REPARTITION_TOTAL.labels(outcome=failure_outcome).inc()
+        return
+    except BaseException as e:
+        if not _is_native_panic(e):
+            raise
+        # Letting the panic escape records nothing: the attempt is charged but reports no outcome, so
+        # the cap is spent by attempts that read as worker deaths and the table ends up abandoned with
+        # `RepartitionAttemptsExhausted`, which carries none of the panic's detail. It is a property
+        # of the table too (the same read panics the same way), so failing the activity only spends
+        # the remaining retries on it and holds the sync behind a rewrite that cannot finish.
+        logger.error("repartition: the rewrite panicked inside the native delta stack", exc_info=True)
+        DELTA_REPARTITION_TOTAL.labels(
+            outcome=_handle_failure(
+                inputs, schema, pending, trigger_reason, e, claim_token, logger, charged_attempts, table_ref
+            ),
+        ).inc()
+        return
+
+    duration = time.monotonic() - start
+    DELTA_REPARTITION_DURATION_SECONDS.observe(duration)
+    DELTA_REPARTITION_TOTAL.labels(outcome=result.get("outcome", "completed")).inc()
+
+    if result.get("outcome") != "completed":
+        # A non-completed result is a skip that ran no rewrite (live unreadable or no delta table on
+        # disk), and those paths leave `repartition_pending` set so a later run retries once the table
+        # is revived. The attempt was charged up front, so without this refund three such skips would
+        # spend the whole cap without a rewrite ever running, and the next run would `_give_up`,
+        # discarding the queued rewrite and stamping the cooldown that blocks re-detection. A skip is
+        # not a failed attempt, so it must not count. (A completed rewrite clears the marker itself.)
+        _refund_attempt(schema, charged_attempts, logger)
+
+    props = base_event_props(schema, schema.source, inputs.job_id)
+    props["trigger_reason"] = trigger_reason
+    props["duration_seconds"] = duration
+    props.update({k: v for k, v in result.items() if k != "outcome"})
+    event = (
+        "warehouse_repartition_completed" if result.get("outcome") == "completed" else "warehouse_repartition_skipped"
+    )
+    capture_repartition_event(event, props)
+    outcome = result.get("outcome")
+    logger.info(
+        f"repartition: finished outcome={outcome} duration_seconds={duration}",
+        outcome=outcome,
+        duration_seconds=duration,
+    )
+
+
+def _defer_to_full_refresh(
+    inputs: RepartitionActivityInputs,
+    schema: ExternalDataSchema,
+    table_ref: DeltaTableRef,
+    target: RepartitionTarget,
+    trigger_reason: str,
+    logger: FilteringBoundLogger,
+) -> None:
+    """Hand the new scheme to the full refresh that runs next, instead of rewriting the table.
+
+    The fresh claim fences out a rewrite attempt that may still run as a zombie. Without it, that
+    attempt could finish its swap after the full refresh and put its stale copy back over live.
+    """
+    try:
+        claim_token = str(uuid.uuid4())
+        if not schema.set_repartition_claim(
+            {"token": claim_token, "job_id": inputs.job_id, "claimed_at": timezone.now().isoformat()}
+        ):
+            logger.info("repartition: full-refresh deferral superseded before it claimed the schema")
+            return
+        result = async_to_sync(defer_repartition_to_full_refresh)(
+            table_ref=table_ref, schema=schema, target=target, logger=logger, claim_token=claim_token
+        )
+    except RepartitionSupersededError:
+        logger.info("repartition: full-refresh deferral superseded by a newer claim")
+        return
+    except Exception as e:
+        # `async_to_sync` can surface cancellation as an Exception-derived wrapper. It must retain
+        # Temporal's cancellation semantics rather than being swallowed as a failed deferral.
+        if _is_cancellation(e):
+            raise
+        # Like a failed rewrite, this must not block the sync: the table keeps its layout and the
+        # next run tries again.
+        transient = _is_transient_infra_error(e)
+        if not transient:
+            capture_exception(e)
+        logger.warning("repartition: could not stage the scheme for the next full refresh", exc_info=True)
+        DELTA_REPARTITION_TOTAL.labels(outcome="transient" if transient else "failed").inc()
+        return
+    DELTA_REPARTITION_TOTAL.labels(outcome="deferred").inc()
+    props = base_event_props(schema, schema.source, inputs.job_id)
+    props.update({"trigger_reason": trigger_reason, **result})
+    capture_repartition_event("warehouse_repartition_skipped", props)
+
+
+def _import_replaces_table(
+    schema: ExternalDataSchema, job: ExternalDataJob, inputs: RepartitionActivityInputs, logger: FilteringBoundLogger
+) -> bool:
+    """Whether the import that runs next deletes the table and loads it again. Never raises.
+
+    Any doubt gives False, and the activity then does what it does for a table that stays.
+    """
+    try:
+        return import_replaces_table(
+            schema, workflow_reset_pipeline=inputs.reset_pipeline, job_created_at=job.created_at
+        )
+    except Exception:
+        logger.warning("repartition: could not tell if the import replaces the table", exc_info=True)
+        return False
+
+
+def _defer_to_reset(
+    inputs: RepartitionActivityInputs,
+    schema: ExternalDataSchema,
+    table_ref: DeltaTableRef,
+    trigger_reason: str,
+    logger: FilteringBoundLogger,
+) -> None:
+    """Leave the queued scheme for the reset that runs next, instead of rewriting the table.
+
+    The import deletes the table and loads every row again, so a rewrite only copies data that the
+    import deletes. `repartition_pending` stays as it is. The reset turns it into the scheme of the new
+    table (see `promote_pending_repartition_for_replaced_table`). A reset that does not happen leaves
+    the marker in place, and a later run does the rewrite.
+
+    The fresh claim fences out a rewrite attempt that may still run as a zombie. The checkpoint of
+    an earlier rewrite describes a table that the import deletes, so its temp table goes now.
+    """
+    claim_token = str(uuid.uuid4())
+    if not schema.set_repartition_claim(
+        {"token": claim_token, "job_id": inputs.job_id, "claimed_at": timezone.now().isoformat()}
+    ):
+        logger.info("repartition: reset deferral superseded before it claimed the schema")
+        return
+    if schema.repartition_rewrite is not None:
+        # First, so that a failed delete cannot hold the import that does the reset.
+        release_repartition_hold_if_claimed(schema, claim_token=claim_token)
+        _purge_abandoned_temp(schema, table_ref, claim_token, logger, clear_checkpoint=True)
+    logger.info(
+        f"repartition: the import replaces the table, left the queued scheme for it to write schema_id={schema.id}",
+        schema_id=str(schema.id),
+    )
+    DELTA_REPARTITION_TOTAL.labels(outcome="deferred").inc()
+    _capture_stood_down(schema, inputs, trigger_reason, "reset_replaces_the_table", logger)
+
+
+def _purge_abandoned_temp(
+    schema: ExternalDataSchema,
+    table_ref: DeltaTableRef,
+    claim_token: str,
+    logger: FilteringBoundLogger,
+    *,
+    clear_checkpoint: bool = False,
+) -> bool:
+    """Delete the temp table that the rewrite checkpoint names. Best effort; returns whether it is gone.
+
+    A failure leaves the checkpoint in place when this function owns its removal, so the next run
+    tries the delete again. It must not block the sync.
+    """
+    temp_uri = _rewrite_checkpoint_id(schema)
+    if not temp_uri:
+        return True
+    try:
+        # A large temp table takes longer to delete than the heartbeat timeout.
+        with HeartbeaterSync(logger=logger):
+            purged = async_to_sync(purge_abandoned_rewrite_temp)(
+                table_ref, schema, temp_uri, logger, claim_token=claim_token
+            )
+        if purged and clear_checkpoint:
+            clear_repartition_checkpoint_if_claimed(schema, claim_token=claim_token, temp_uri=temp_uri)
+        return purged
+    except RepartitionSupersededError:
+        logger.info("repartition: temp cleanup superseded by a newer claim")
+    except Exception as e:
+        if _is_cancellation(e):
+            raise
+        if not _is_transient_infra_error(e):
+            capture_exception(e)
+        logger.warning("repartition: could not delete the temp table of an abandoned rewrite", exc_info=True)
+    return False
+
+
+def _capture_stood_down(
+    schema: ExternalDataSchema,
+    inputs: RepartitionActivityInputs,
+    trigger_reason: str,
+    reason: str,
+    logger: FilteringBoundLogger,
+) -> None:
+    """Emit the closing event for an attempt that stopped without finishing or failing.
+
+    These paths deliberately record no failure, but without a closing event a rewrite that stood down
+    is indistinguishable from one that disappeared mid-flight — both leave `repartition_pending` set
+    and a lone `warehouse_repartition_started`. Reported as skipped so failure dashboards stay clean,
+    and `terminal=False` because the pending marker survives: a later run retries the rewrite, unlike
+    the skips that clear it.
+    """
+    props = base_event_props(schema, schema.source, inputs.job_id)
+    props.update({"trigger_reason": trigger_reason, "reason": reason, "terminal": False})
+    try:
+        capture_repartition_event("warehouse_repartition_skipped", props)
+    except Exception:
+        # Every caller is an except-handler whose contract is to swallow, so a telemetry failure must
+        # not escape: it would fail an activity that deliberately stood down and trigger a retry.
+        logger.warning("repartition: failed to capture stand-down event", exc_info=True)
+
+
+def _handle_budget_exceeded(
+    inputs: RepartitionActivityInputs,
+    schema: ExternalDataSchema,
+    pending: dict[str, Any] | None,
+    trigger_reason: str,
+    error: RepartitionBudgetExceededError,
+    claim_token: str,
+    logger: FilteringBoundLogger,
+    charged_attempts: int | None = None,
+) -> str:
+    """Record a rewrite that ran out of one activity's budget, distinguishing progress from a stall.
+
+    Checkpoint/resume lets a table too large to rewrite in one activity converge across runs (see
+    `RepartitionBudgetExceededError`), so an attempt that appended new rows is forward progress, not a
+    failure: counting it against the finite `MAX_REPARTITION_ATTEMPTS` would abandon a table that simply
+    needs more than three budgets mid-convergence and leave it un-repartitioned. Only an attempt that
+    appended nothing this run is stuck; that one falls through to `_handle_failure` so a rewrite which
+    genuinely can't advance in one budget still gives up.
+
+    Progress means this attempt left the rewrite further along than it found it. Neither row count
+    alone can say that. A cumulative temp size against a stored high-water mark is not monotonic,
+    because the rewrite restarts from row 0 whenever its checkpoint is discarded (the source's Delta
+    version moved between runs), so a fresh rebuild reading back below an earlier attempt's mark was
+    charged a spurious failure. But the rows written this attempt cannot say it either: a rewrite that
+    restarts every run writes hundreds of millions of rows each time, clears any `> 0` test, and ends
+    exactly where it began. Three schemas sat in that loop for six weeks, each burning a full budget per
+    run and finishing nothing, because the cap could never count to three.
+
+    Two shapes count as progress. A resumed attempt that appended rows extended what it inherited. And
+    a genuine first attempt — one with no checkpoint it could build on — that persisted a checkpoint the
+    next run resumes from broke new ground, even though `resumed_from` is 0. `had_prior_checkpoint`
+    keeps that first attempt apart from a restart that inherited nothing because it discarded a
+    checkpoint it could have resumed: the restart re-covered ground the last attempt already covered,
+    however much it wrote, so only it (and an attempt that saved no checkpoint at all) falls through to
+    `_handle_failure`. A checkpoint the resume path rejected does not make an attempt a restart, because
+    it was left by an attempt killed at an arbitrary point and the rows it covered measure nothing.
+
+    Returns the metric outcome: "superseded" when a newer attempt owns the claim, "progressing" when
+    the rewrite broke new ground, otherwise whatever `_handle_failure` returns.
+    """
+    schema.refresh_from_db(fields=["sync_type_config"])
+    claim = schema.repartition_claim
+    if not (claim and claim.get("token") == claim_token):
+        logger.info("repartition: superseded (claim changed under us), standing down without recording failure")
+        _refund_attempt(schema, charged_attempts, logger)
+        return "superseded"
+
+    pending = schema.repartition_pending or pending or {}
+    resumed_and_advanced = error.resumed_from > 0 and error.rows_written > 0
+    # A first attempt inherits nothing, so `resumed_from` is 0, but saving a fresh checkpoint the next
+    # run resumes from is still forward progress. Only a restart that discarded an existing checkpoint
+    # (`had_prior_checkpoint`) re-covered ground already covered — that one is the treadmill to stop.
+    fresh_and_checkpointed = not error.had_prior_checkpoint and error.checkpoint_saved
+    if resumed_and_advanced or fresh_and_checkpointed:
+        # Forward progress this attempt: keep the checkpoint and reset the failure counter — a rewrite
+        # still advancing is not the doomed one the cap exists to stop. The next run resumes from the
+        # checkpoint rather than giving up.
+        schema.set_repartition_pending({**pending, "attempts": 0})
+        logger.info(
+            f"repartition: over budget but rewrite advanced {error.rows_written} rows past the "
+            f"{error.resumed_from} it inherited, resuming next run",
+            rows_written=error.rows_written,
+            resumed_from=error.resumed_from,
+        )
+        _capture_stood_down(schema, inputs, trigger_reason, "rewrite_progressing", logger)
+        return "progressing"
+
+    # Either this attempt inherited nothing (so it re-streamed ground already covered) or it inherited
+    # a checkpoint and appended nothing. Both mean the rewrite can't converge on the budget it has, so
+    # count a real failed attempt and let `MAX_REPARTITION_ATTEMPTS` eventually give up on it.
+    logger.info(
+        f"repartition: over budget without converging (resumed_from={error.resumed_from} "
+        f"rows_written={error.rows_written})",
+        rows_written=error.rows_written,
+        resumed_from=error.resumed_from,
+    )
+    return _handle_failure(inputs, schema, pending, trigger_reason, error, claim_token, logger, charged_attempts)
+
+
+def _exhausted_attempts(pending: dict[str, Any] | None, job_id: str) -> bool:
+    """Whether earlier sync runs already spent the whole retry cap on this rewrite.
+
+    Discounts a charge this run made itself. An attempt is charged before the rewrite (see
+    `_charge_attempt`), and Temporal retries the activity inside one sync, so on the run that charges
+    the last attempt the persisted count already reads the cap when that run's own retry re-reads it.
+    Giving up there abandons the table before the retry runs the rewrite at all, because the cap
+    counts the sync runs that failed and not the retries within one.
+    """
+    if pending is None:
+        return False
+    attempts = int(pending.get("attempts", 0))
+    if pending.get("charged_job_id") == job_id:
+        attempts -= 1
+    return attempts >= MAX_REPARTITION_ATTEMPTS
+
+
+def _rewrite_rows_written(schema: ExternalDataSchema) -> int:
+    """Rows the rewrite checkpoint says temp already holds, or 0 when there is no checkpoint."""
+    return int((schema.repartition_rewrite or {}).get("rows_written") or 0)
+
+
+def _rewrite_checkpoint_id(schema: ExternalDataSchema) -> str | None:
+    """Which rewrite the current checkpoint belongs to, or None when there is no checkpoint.
+
+    The temp table is claim-scoped, so a rewrite that discards its checkpoint and restarts from row 0
+    builds a different one while a resume keeps the URI it inherited — which makes the URI the
+    identity of a rewrite across runs. Compared only, never reported: it carries the team's bucket and
+    table names.
+    """
+    return (schema.repartition_rewrite or {}).get("temp_uri")
+
+
+def _rewrite_advanced_past(
+    schema: ExternalDataSchema, pending: dict[str, Any], rows_key: str, rewrite_key: str
+) -> bool:
+    """Whether the checkpoint now stands further on than the stamp under `rows_key`/`rewrite_key`.
+
+    A cumulative row count alone cannot answer this, because it is not monotonic across runs. A
+    checkpoint is only resumable while live is byte-identical to when it was written, and the sync's
+    own merge commits to live after every swallowed repartition failure, so a later run routinely
+    discards it and rebuilds from row 0. The fresh checkpoint then reads *below* the stamp, and an
+    attempt that streamed hundreds of thousands of rows records as a stall — the same
+    non-monotonicity `_handle_budget_exceeded` weighs `had_prior_checkpoint` against. So a checkpoint
+    belonging to a different rewrite than the stamp's is ground this attempt broke, and only one on
+    the same rewrite is judged by its row count.
+
+    A stamp written before the rewrite id existed carries nothing to compare, so it keeps the
+    row-count reading it was written for.
+    """
+    rows_stamp = pending.get(rows_key)
+    if rows_stamp is None:
+        return False
+    current = _rewrite_checkpoint_id(schema)
+    if rewrite_key in pending and current is not None and current != pending[rewrite_key]:
+        return _rewrite_rows_written(schema) > 0
+    return _rewrite_rows_written(schema) > int(rows_stamp)
+
+
+def _last_run_advanced_rewrite(schema: ExternalDataSchema, pending: dict[str, Any] | None) -> bool:
+    """Whether the last sync run left the rewrite checkpoint further along than it found it.
+
+    A checkpoint reading past the stamp the run began on is the only trace an attempt killed
+    outright can leave of the rows it committed. The stamp has to be the run's, because the cap
+    counts sync runs and not the Temporal retries inside one (see `_charge_attempt`): `attempt_rows`
+    is re-stamped by every retry, so measuring against it asks only whether the run's *last* retry
+    moved anything. A run whose first retry streams for an hour and whose second dies on arrival
+    reads as stalled on that stamp, so a rewrite converging a budget per sync is abandoned
+    mid-flight. `run_rows` is written once per charged run and answers for the whole of it.
+
+    Strictly past: a checkpoint standing exactly where the run began is the stalled rewrite the cap
+    exists to stop. A marker written before `run_rows` existed falls back to `attempt_rows`, and one
+    carrying neither claims no progress.
+    """
+    if pending is None:
+        return False
+    if pending.get("run_rows") is not None:
+        return _rewrite_advanced_past(schema, pending, "run_rows", "run_rewrite_id")
+    return _rewrite_advanced_past(schema, pending, "attempt_rows", "attempt_rewrite_id")
+
+
+def _clear_attempts_after_progress(
+    schema: ExternalDataSchema, pending: dict[str, Any] | None, logger: FilteringBoundLogger
+) -> dict[str, Any] | None:
+    """Reset the failure count for a rewrite that is still advancing; return the marker now in force.
+
+    Resets rather than refunds, the same way `_handle_budget_exceeded` treats an attempt that
+    advanced: the count records consecutive attempts that got nowhere. A failed write leaves the
+    spent count in place, so the rewrite still runs this time and the next run re-reads the cap,
+    because bookkeeping must never block it.
+    """
+    if pending is None:
+        return None
+    marker = {**pending, "attempts": 0}
+    try:
+        schema.set_repartition_pending(marker)
+    except Exception:
+        logger.warning("repartition: could not reset the attempt count, proceeding on the spent one", exc_info=True)
+        return pending
+    return marker
+
+
+def _retrying_a_killed_attempt(schema: ExternalDataSchema, pending: dict[str, Any] | None, job_id: str) -> bool:
+    """Whether this run retries an attempt that was killed without moving the rewrite on.
+
+    Temporal re-runs the activity only when the previous attempt neither finished nor recorded an
+    outcome, because every handled failure returns normally. A retry whose charge is still
+    outstanding is therefore retrying an attempt that was killed outright — a SIGKILLed worker runs
+    no `except` and no `finally` — rather than one that deliberately re-raised, since those refund
+    the charge on their way out (`_refund_attempt`). Running the same rewrite again costs the sync
+    another activity budget for the same death, so it is only worth doing while the dead attempt
+    left the checkpoint further along than it found it; the checkpoint keeps whatever it did write
+    for the next sync either way.
+    """
+    if current_activity_attempt() <= 1 or pending is None:
+        return False
+    if pending.get("charged_job_id") != job_id:
+        return False
+    if pending.get("attempt_rows") is None:
+        return False
+    return not _rewrite_advanced_past(schema, pending, "attempt_rows", "attempt_rewrite_id")
+
+
+def _give_up(
+    inputs: RepartitionActivityInputs,
+    schema: ExternalDataSchema,
+    table_ref: DeltaTableRef,
+    pending: dict[str, Any] | None,
+    trigger_reason: str,
+    logger: FilteringBoundLogger,
+) -> None:
+    """Abandon a rewrite whose attempts are spent, clearing the markers that would re-arm it.
+
+    Stamps the cooldown as well, or detection re-flags the table on the next sync and the attempts
+    start over — same reason `_handle_failure` does.
+    """
+    # Read before the markers are cleared below. An attempt killed outright leaves the checkpoint as
+    # its only trace, so this count is all the terminal record can say about how far the rewrite got.
+    # The count alone: the checkpoint's temp URI carries the team's bucket and table names.
+    rewrite_rows = _rewrite_rows_written(schema)
+    logger.warning(
+        f"repartition: giving up after {MAX_REPARTITION_ATTEMPTS} attempts that did not survive to "
+        f"record an outcome, rewrite stuck at {rewrite_rows} rows schema_id={inputs.schema_id}",
+        schema_id=inputs.schema_id,
+        rewrite_rows=rewrite_rows,
+    )
+    # Stake a fresh claim before clearing anything. This runs before the activity mints its own, so a
+    # timed-out predecessor may still be running and still hold the old token; leaving it valid would
+    # let it pass `ensure_claim` and go on mutating live after we declared the rewrite abandoned.
+    claim_token = str(uuid.uuid4())
+    if not schema.set_repartition_claim(
+        {"token": claim_token, "job_id": inputs.job_id, "claimed_at": timezone.now().isoformat()}
+    ):
+        logger.info("repartition: give-up superseded by a newer claim")
+        return
+    # Before the checkpoint goes, because it is the only record of where the temp table is.
+    _purge_abandoned_temp(schema, table_ref, claim_token, logger)
+    if not schema.abandon_repartition_if_claimed(claim_token):
+        logger.info("repartition: give-up superseded by a newer claim")
+        return
+    error = RepartitionAttemptsExhausted(
+        f"repartition gave up after {MAX_REPARTITION_ATTEMPTS} attempts that did not survive to record "
+        f"an outcome, with the rewrite stuck at {rewrite_rows} rows (trigger_reason={trigger_reason})"
+    )
+    props = base_event_props(schema, schema.source, inputs.job_id)
+    props.update(
+        {
+            "trigger_reason": trigger_reason,
+            "attempts": int((pending or {}).get("attempts", 0)),
+            "rewrite_rows": rewrite_rows,
+            "final": True,
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+        }
+    )
+    capture_repartition_event("warehouse_repartition_failed", props)
+    # Terminal, and the only terminal path that did not already report to error tracking: every attempt
+    # was hard-killed before it could run `_handle_failure` (which captures). Capture here too so a table
+    # the controller has abandoned surfaces as an issue instead of only a metric — the sync context is
+    # already bound (bind_job_context) so the issue is attributed to the connector and table.
+    capture_exception(error)
+    DELTA_REPARTITION_TOTAL.labels(outcome="failed").inc()
+
+
+def _drop_queued_split(
+    inputs: RepartitionActivityInputs,
+    schema: ExternalDataSchema,
+    table_ref: DeltaTableRef,
+    trigger_reason: str,
+    reason: str,
+    logger: FilteringBoundLogger,
+) -> None:
+    """Discard an automatic split queued for a table that does not need it, with its temp table.
+
+    Same order as `_give_up`: the fresh claim fences out a predecessor that may still run as a
+    zombie, and the temp table goes before the checkpoint that records where it is.
+    """
+    claim_token = str(uuid.uuid4())
+    if not schema.set_repartition_claim(
+        {"token": claim_token, "job_id": inputs.job_id, "claimed_at": timezone.now().isoformat()}
+    ):
+        logger.info("repartition: queued split drop superseded by a newer claim")
+        return
+    # A predecessor can stage a swap before the claim above fences it out. Temp is then the only
+    # intact copy, so the swap must finish, and the next run drops nothing. The claim write reloaded
+    # the config under the row lock, so this reads the current markers.
+    if schema.repartition_swap is not None:
+        logger.info("repartition: a swap is staged, so the queued split stays until it lands")
+        return
+    rewrite_rows = _rewrite_rows_written(schema)
+    # First, so that a delete that keeps failing cannot hold the import of a rewrite that never resumes.
+    release_repartition_hold_if_claimed(schema, claim_token=claim_token)
+    if not _purge_abandoned_temp(schema, table_ref, claim_token, logger):
+        # The checkpoint is the only record of the temp table, so a failed delete must retry on later
+        # runs, up to the attempt cap.
+        drop_attempts = mark_repartition_dropping_if_claimed(schema, claim_token=claim_token)
+        if drop_attempts is None:
+            logger.info("repartition: queued split drop superseded by a newer claim")
+            return
+        if drop_attempts < MAX_REPARTITION_ATTEMPTS:
+            logger.info(f"repartition: queued split drop waits for the temp table delete, attempt {drop_attempts}")
+            return
+        capture_exception(
+            Exception(f"repartition: could not delete the temp table of a dropped queued split schema_id={schema.id}")
+        )
+    if not schema.abandon_repartition_if_claimed(claim_token, stamp_cooldown=False):
+        logger.info("repartition: queued split drop superseded by a newer claim")
+        return
+    logger.info(
+        f"repartition: dropped a queued split that the table does not need reason={reason} "
+        f"schema_id={schema.id} trigger_reason={trigger_reason} rewrite_rows={rewrite_rows}",
+        schema_id=str(schema.id),
+        trigger_reason=trigger_reason,
+        reason=reason,
+        rewrite_rows=rewrite_rows,
+    )
+    DELTA_REPARTITION_TOTAL.labels(outcome="skipped").inc()
+    props = base_event_props(schema, schema.source, inputs.job_id)
+    props.update({"trigger_reason": trigger_reason, "reason": reason, "rewrite_rows": rewrite_rows})
+    capture_repartition_event("warehouse_repartition_skipped", props)
+
+
+def _charge_attempt(
+    schema: ExternalDataSchema, pending: dict[str, Any] | None, job_id: str, logger: FilteringBoundLogger
+) -> int | None:
+    """Record this sync run against the retry cap before the rewrite runs; return the prior count.
+
+    Charged at most once per run, keyed on `job_id`. Temporal retries this activity up to three times
+    inside a single sync, and an attempt that is hard-killed records no outcome, so charging each
+    retry lets one bad sync spend the whole cap: the table is then abandoned by the give-up on the
+    next run, before any later sync ever retries the rewrite. The cap counts syncs that failed, not
+    the retries within one.
+
+    `_refund_attempt` restores the prior count and releases the run's charge. None means nothing was
+    charged (no pending marker, or a DB failure) — bookkeeping must never block the rewrite.
+
+    Every attempt also stamps `attempt_rows`, the rewrite checkpoint it is about to run from, charged
+    or not: an attempt killed outright records nothing itself, so that stamp is the only thing a
+    retry can judge the attempt it retries against (see `_retrying_a_killed_attempt`). `run_rows` is
+    the same reading kept once per sync run, so the give-up check weighs the run the cap actually
+    counted rather than whichever retry happened to end it (see `_last_run_advanced_rewrite`). Each
+    stamp records which rewrite that reading came from too, because the reading alone is not
+    comparable across a restart (see `_rewrite_advanced_past`).
+    """
+    if pending is None:
+        return None
+    prior = int(pending.get("attempts", 0))
+    already_charged = pending.get("charged_job_id") == job_id
+    rows_at_start = _rewrite_rows_written(schema)
+    rewrite_at_start = _rewrite_checkpoint_id(schema)
+    marker = {**pending, "attempt_rows": rows_at_start, "attempt_rewrite_id": rewrite_at_start}
+    if not already_charged:
+        marker |= {"attempts": prior + 1, "charged_job_id": job_id}
+        # A stand-down mid-run (a worker shutdown hand-off) refunds the charge and the run's next retry
+        # charges again. That is still the same run, so it keeps the reading taken when the run began.
+        if pending.get("run_job_id") != job_id:
+            marker |= {"run_rows": rows_at_start, "run_rewrite_id": rewrite_at_start, "run_job_id": job_id}
+    try:
+        schema.set_repartition_pending(marker)
+    except Exception:
+        logger.warning("repartition: could not charge attempt, proceeding uncharged", exc_info=True)
+        return None
+    # A retry of a run that already paid: the persisted count already includes its charge.
+    return max(prior - 1, 0) if already_charged else prior
+
+
+def _refund_attempt(schema: ExternalDataSchema, prior: int | None, logger: FilteringBoundLogger) -> None:
+    """Undo `_charge_attempt` for a stand-down that must not count against the retry cap.
+
+    Supersession, transient infra and a checkpoint that advanced are noise or progress, not evidence
+    the rewrite is doomed. Refunds only when the persisted count is still the one this attempt wrote:
+    overlapping attempts otherwise let each refund erase the other's charge, and a cap that never
+    counts up is the loop this whole change exists to stop. Releases the run's charge marker too, so
+    a later retry within the same run charges again rather than riding a refunded charge.
+    """
+    if prior is None:
+        return
+    try:
+        schema.refresh_from_db(fields=["sync_type_config"])
+        pending = schema.repartition_pending
+        if pending is not None and int(pending.get("attempts", 0)) == prior + 1:
+            schema.set_repartition_pending({**pending, "attempts": prior, "charged_job_id": None})
+    except Exception:
+        logger.warning("repartition: could not refund attempt", exc_info=True)
+
+
+def _handle_failure(
+    inputs: RepartitionActivityInputs,
+    schema: ExternalDataSchema,
+    pending: dict[str, Any] | None,
+    trigger_reason: str,
+    error: BaseException,
+    claim_token: str,
+    logger: FilteringBoundLogger,
+    charged_attempts: int | None = None,
+    table_ref: DeltaTableRef | None = None,
+) -> str:
+    """Record a failed attempt; give up (and clear the flag) after MAX_REPARTITION_ATTEMPTS.
+
+    Returns the metric outcome: "failed" normally, or "superseded" when the authoritative post-refresh
+    read shows a newer attempt now owns the claim. `_still_claimant` is conservative and reports True on
+    a transient DB blip, so a zombie could reach here after a newer claimant already finished; the
+    refresh below is the authoritative read (the DB is reachable again), so re-checking the claim here
+    stops us recording a spurious failure and re-queueing `repartition_pending` the newer attempt cleared.
+    """
+    schema.refresh_from_db(fields=["sync_type_config"])
+    claim = schema.repartition_claim
+    if not (claim and claim.get("token") == claim_token):
+        logger.info("repartition: superseded (claim changed under us), standing down without recording failure")
+        _refund_attempt(schema, charged_attempts, logger)
+        return "superseded"
+    pending = schema.repartition_pending or pending or {}
+    # Use the charge this attempt made rather than re-reading it: the persisted value is only visible
+    # after a round trip, and the count must not depend on that landing. Falls back to incrementing
+    # what was read when nothing was charged.
+    attempts = (charged_attempts + 1) if charged_attempts is not None else int(pending.get("attempts", 0)) + 1
+
+    props = base_event_props(schema, schema.source, inputs.job_id)
+    props.update(
+        {
+            "trigger_reason": trigger_reason,
+            "attempts": attempts,
+            "error_type": type(error).__name__,
+            "error_message": str(error)[:1000],
+        }
+    )
+
+    if attempts >= MAX_REPARTITION_ATTEMPTS:
+        props["final"] = True
+        schema.clear_repartition_pending()
+        if schema.repartition_swap is not None:
+            # Giving up cannot include forgetting a staged swap. Until one completes, the table's
+            # on-disk layout is either the old scheme or the new one and the marker is the only record
+            # of which scheme was staged; dropping it would let the next merge run against settings
+            # that may no longer describe the data and duplicate the whole lookback window. Leaving it
+            # keeps this schema's imports held (see `_import_held_for_repartition`) and keeps the
+            # recovery available — stale beats silently corrupted.
+            props["swap_unresolved"] = True
+            logger.error(
+                f"repartition: giving up with a staged swap still unresolved; imports stay held for "
+                f"schema_id={schema.id}",
+                schema_id=str(schema.id),
+            )
+        # Drop any partial-rewrite checkpoint too: leaving it set would make the next flag cycle
+        # resume the same doomed temp instead of giving up, so the give-up would never take effect.
+        if table_ref is not None:
+            _purge_abandoned_temp(schema, table_ref, claim_token, logger)
+        schema.clear_repartition_rewrite()
+        # Engage the cooldown as well, or the give-up never takes effect: the trigger that queued
+        # this rewrite (the largest partition is over budget) is just as true on the next sync and
+        # the layout is unchanged, so detection re-flags the table immediately with `attempts` back
+        # at 0 and the three attempts start over. The cooldown re-evaluates at most daily instead.
+        schema.stamp_last_repartition_at()
+    elif pending:
+        # Only when something was queued. A staged swap being driven to completion has no pending
+        # marker, and writing an attempt count onto an empty one invents a target with no partition
+        # keys — which the next run cannot rebuild a `RepartitionTarget` from.
+        schema.set_repartition_pending({**pending, "attempts": attempts})
+
+    capture_repartition_event("warehouse_repartition_failed", props)
+    capture_exception(error)
+    return "failed"

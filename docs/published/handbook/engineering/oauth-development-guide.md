@@ -1,0 +1,538 @@
+---
+title: OAuth Development Guide
+sidebar: Handbook
+showTitle: true
+---
+
+# OAuth Development Guide
+
+This guide helps developers set up and test PostHog's OAuth apps locally.
+
+## Quick Start
+
+### 1. Configure RSA Keys
+
+OAuth uses RS256 for signing JWT tokens. Copy the RSA private key from the example file:
+
+```bash
+# Copy the OIDC_RSA_PRIVATE_KEY from .env.example to your .env file
+grep OIDC_RSA_PRIVATE_KEY .env.example >> .env
+```
+
+Or generate a new key pair:
+
+```bash
+# Generate a new RSA private key
+openssl genrsa 2048 | openssl pkcs8 -topk8 -nocrypt -outform PEM | \
+  awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}'
+
+# Add to .env as OIDC_RSA_PRIVATE_KEY="<generated_key>"
+```
+
+Without this key, PostHog cannot create OAuth applications.
+Django's system checks print warning `posthog.oauth.W001` at startup.
+Client ID metadata document clients, dynamic client registration and toolbar sign-in get an OAuth `server_error` that names the missing setting.
+
+### 2. Set Up Your Environment
+
+First, generate demo data which includes a test OAuth application:
+
+```bash
+python manage.py generate_demo_data
+```
+
+### 3. Access the Demo Application
+
+After running `generate_demo_data`, a test OAuth application is created with these credentials:
+
+- **Client ID**: `DC5uRLVbGI02YQ82grxgnK6Qn12SXWpCqdPb60oZ`
+- **Client Secret**: `GQItUP4GqE6t5kjcWIRfWO9c0GXPCY8QDV4eszH4PnxXwCVxIMVSil4Agit7yay249jasnzHEkkVqHnFMxI1YTXSrh8Bj1sl1IDfNi1S95sv208NOc0eoUBP3TdA7vf0`
+- **Redirect URIs**: `http://localhost:3000/callback`, `https://example.com/callback`, `http://localhost:8237/callback`, `http://localhost:8239/callback`
+
+You can view and test the OAuth flow from Django admin:
+
+1. Navigate to `http://localhost:8010/admin/posthog/oauthapplication/`
+2. Click "View on site" to see an example authorization URL with PKCE parameters
+
+## Creating an OAuth Application
+
+### Via Django Admin
+
+1. Navigate to `http://localhost:8010/admin/posthog/oauthapplication/`
+2. Click "Add OAuth Application"
+3. Configure the application fields (see below)
+
+### Application Fields
+
+#### Basic Information
+
+**Name** (required)
+
+- Display name for the application
+- Shown to users during authorization
+- Example: "PostHog Mobile App", "Analytics Dashboard"
+
+**Client ID** (auto-generated)
+
+- Unique identifier for your application
+- Automatically generated but can be customized
+- Used in authorization requests
+- Example: `DC5uRLVbGI02YQ82grxgnK6Qn12SXWpCqdPb60oZ`
+
+**Client Secret** (auto-generated)
+
+- Confidential credential for the application
+- Only shown once during creation
+- Gets hashed after saving
+- Only used by confidential clients
+- ⚠️ **Copy this before you save the application - you cannot view it again after creation**
+
+**Client Type** (required)
+
+- `Confidential`: For server-side applications that can securely store secrets
+- `Public`: For client-side apps (mobile, SPA) that cannot securely store secrets
+
+See [Client Types](#client-types) section for detailed explanation.
+
+#### Authorization Settings
+
+**Authorization Grant Type** (required, fixed)
+
+- Only `Authorization code` is supported
+
+**Redirect URIs** (required)
+
+- Whitespace-separated list of valid redirect URIs
+- PostHog will only redirect to these URIs after authorization
+- **HTTPS required** for non-localhost URIs
+- **HTTP allowed** only for localhost/loopback addresses (127.0.0.1)
+- No fragments (#) allowed
+- Examples:
+
+  ```text
+  https://app.example.com/oauth/callback
+  http://localhost:3000/callback
+  http://127.0.0.1:8080/auth
+  ```
+
+**Algorithm** (required, fixed)
+
+- Only `RS256` (RSA with SHA-256) is supported
+- Used for signing ID tokens
+- More secure than symmetric algorithms (HS256)
+- Cannot be changed
+
+#### Ownership
+
+**User**
+
+- The PostHog user who created the application
+- Not used for access control
+- Helps track who created the app
+
+**Organization**
+
+- The organization that owns this application
+- In the future, we will allow organizations to manage their apps in their settings
+- If organization is deleted, app becomes orphaned but remains active.
+
+## Client Types
+
+### Confidential Clients
+
+**Use for**: Server-side applications, backend services, traditional web apps
+
+**Characteristics**:
+
+- Can securely store the client secret
+- Runs in a trusted environment (your servers)
+- Must authenticate with both client_id and client_secret when exchanging authorization code for tokens
+
+**Examples**:
+
+- Django/Rails/Express web applications
+- Backend services
+- Server-to-server integrations
+
+**Security**: Higher - the secret never leaves your secure server environment
+
+### Public Clients
+
+**Use for**: Single-page apps (SPAs), mobile apps, desktop apps
+
+**Characteristics**:
+
+- Cannot securely store secrets (code is distributed to users)
+- Relies on PKCE for security instead of client secret
+- Only needs client_id for token exchange
+
+**Examples**:
+
+- React/Vue/Angular applications
+- iOS/Android mobile apps
+- Electron desktop applications
+
+## OAuth Flow
+
+### Standard Authorization Code Flow with PKCE
+
+1. **Generate PKCE parameters** (client-side):
+
+   ```python
+   import secrets
+   import hashlib
+   import base64
+
+   # Generate random code_verifier
+   code_verifier = secrets.token_urlsafe(32)
+
+   # Create code_challenge
+   digest = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+   code_challenge = base64.urlsafe_b64encode(digest).decode('utf-8').replace('=', '')
+   ```
+
+2. **Redirect user to authorization URL**:
+
+   ```text
+   GET /oauth/authorize/
+     ?response_type=code
+     &client_id=DC5uRLVbGI02YQ82grxgnK6Qn12SXWpCqdPb60oZ
+     &redirect_uri=http://localhost:3000/callback
+     &scope=openid experiment:read query:read
+     &code_challenge=<generated_code_challenge>
+     &code_challenge_method=S256
+     &state=<random_state_value>
+   ```
+
+3. **User authorizes** the application and selects access level
+
+4. **Receive authorization code** at redirect_uri:
+
+   ```text
+   http://localhost:3000/callback?code=<authorization_code>&state=<state_value>
+   ```
+
+5. **Exchange code for tokens**:
+
+   ```bash
+   POST /oauth/token/
+   Content-Type: application/x-www-form-urlencoded
+
+   grant_type=authorization_code
+   &code=<authorization_code>
+   &redirect_uri=http://localhost:3000/callback
+   &client_id=DC5uRLVbGI02YQ82grxgnK6Qn12SXWpCqdPb60oZ
+   &client_secret=<client_secret>  # Only for confidential clients
+   &code_verifier=<original_code_verifier>
+   ```
+
+6. **Response includes**:
+
+   ```json
+   {
+     "access_token": "...",
+     "token_type": "Bearer",
+     "expires_in": 3600,
+     "refresh_token": "...",
+     "id_token": "...",
+     "scope": "openid experiment:read query:read",
+     "scoped_teams": [1, 2],
+     "scoped_organizations": ["org-uuid"]
+   }
+   ```
+
+   An access token expires after 1 hour.
+   Before it expires, use the refresh token to get a new one.
+
+## Available Scopes
+
+OAuth supports all the same scopes as Personal API Keys. Each scope has a `read` and/or `write` action (e.g., `experiment:read`, `experiment:write`).
+
+Project and environment detail responses return `live_events_token` only when the authenticated caller can read queries. For scoped credentials, this requires `query:read`, `query:write`, or `*`. A key with only `project:read` receives `null` for this field. List responses do not include `live_events_token`.
+
+For a complete list of available scopes, see [frontend/src/lib/scopes.tsx](https://github.com/PostHog/posthog/blob/master/frontend/src/lib/scopes.tsx#L15).
+
+### OpenID Connect Scopes
+
+Standard OpenID Connect scopes are also supported:
+
+- `openid` - Required for OpenID Connect (provides ID token with user identity claims)
+- `profile` - Access to user profile information (name, username, etc.)
+- `email` - Access to user email address
+
+## Access Levels
+
+When authorizing an application, users can scope access to:
+
+1. **All**: Access to all organizations and teams the user is a member of
+2. **Organization**: Access limited to specific organizations
+3. **Team**: Access limited to specific teams/projects
+
+This is configured during the authorization step, not in the application settings.
+
+OAuth bearer requests, including provisioning requests, must satisfy the IP policy of the organization targeted by the request. Credential scopes still limit which organizations and projects a token can reach. OAuth consent, automatic approval, and first-party approval check every organization reachable by the grant before issuing an authorization code. Declining consent remains available. Device and CLI approvals check the selected project before issuing scoped credentials. Setup runs and account-linking actions check the resolved project or organization before starting work. Staff impersonation retains its existing exemption.
+
+Personal API key creation, scope changes, expiry changes, and rotation check the organizations named by both organization and project scopes. Unscoped keys check all of the owner's current organizations. A denied request leaves the credential unchanged. New GitHub team integrations require project membership; updating an existing integration requires management access. Both paths check the target organization's IP policy before consuming authorization state.
+
+Organization listing and account recovery remain available from a blocked IP. Blocked organizations expose only their ID, name, slug, and membership level in these responses; their team and project lists are empty, and their credentials and settings are omitted. The selected team is null when its organization blocks the request. Plain app and toolbar requests enforce the current team's organization policy even when the selected organization differs. Creating a project or environment updates both selections together. Updating an allowlist rechecks the resulting policy under its configuration-row lock before saving. GitHub team OAuth returns recheck project access and the target organization's policy before consuming authorization state. MCP OAuth callbacks check the installation's organization before consuming state or exchanging the authorization code, including development callbacks.
+
+The blocked-organization decision is reused only within the same request, principal, authentication context, and client IP.
+
+The native `/oauth/userinfo/` endpoint verifies the access token and `openid` scope before applying the same IP policy to the token's user. This applies to both GET and POST requests. A policy denial returns HTTP 403 with `error: access_denied` and `code: ip_not_allowed`; invalid or expired tokens retain the OAuth provider's error responses.
+
+If you would like to force the user to pick a single team or an organization you can use the `required_access_level=project` or `required_access_level=organization` query parameter in the authorization url.
+
+## Testing Your OAuth Application
+
+### Using the Admin Interface
+
+1. Go to `http://localhost:8010/admin/posthog/oauthapplication/`
+2. Click your application
+3. Click "View on site" - this generates a test authorization URL with:
+   - Proper PKCE code_challenge (using code_verifier="test")
+   - First configured redirect_uri
+   - Example scopes
+
+### Manual Testing
+
+Use the demo application credentials to test the full flow:
+
+```python
+# Example using requests library
+import requests
+import secrets
+import hashlib
+import base64
+
+# Step 1: Generate PKCE
+code_verifier = "test"  # Use something random in production
+digest = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+code_challenge = base64.urlsafe_b64encode(digest).decode('utf-8').replace('=', '')
+
+# Step 2: Build authorization URL
+auth_url = (
+    "http://localhost:8010/oauth/authorize/"
+    "?response_type=code"
+    "&client_id=DC5uRLVbGI02YQ82grxgnK6Qn12SXWpCqdPb60oZ"
+    "&redirect_uri=http://localhost:3000/callback"
+    "&scope=openid+experiment:read"
+    f"&code_challenge={code_challenge}"
+    "&code_challenge_method=S256"
+    "&state=random_state_123"
+)
+
+print(f"Visit: {auth_url}")
+
+# Step 3: After authorization, extract code from redirect
+# Step 4: Exchange for tokens
+token_response = requests.post(
+    "http://localhost:8010/oauth/token/",
+    data={
+        "grant_type": "authorization_code",
+        "code": "<code_from_redirect>",
+        "redirect_uri": "http://localhost:3000/callback",
+        "client_id": "DC5uRLVbGI02YQ82grxgnK6Qn12SXWpCqdPb60oZ",
+        "client_secret": "GQItUP4GqE6t5kjcWIRfWO9c0GXPCY8QDV4eszH4PnxXwCVxIMVSil4Agit7yay249jasnzHEkkVqHnFMxI1YTXSrh8Bj1sl1IDfNi1S95sv208NOc0eoUBP3TdA7vf0",
+        "code_verifier": code_verifier,
+    }
+)
+
+tokens = token_response.json()
+print(tokens)
+```
+
+## First-party client metadata documents
+
+PostHog's own public clients (hogli, the Visual Review Chrome extension, and internal tools) authenticate with client ID metadata documents (CIMD) rather than a registered application or dynamic client registration. Their documents live in the [posthog.com repo](https://github.com/PostHog/posthog.com) at `static/.well-known/oauth/<app>/client-metadata.json`, served at `https://posthog.com/.well-known/oauth/<app>/client-metadata.json`. That URL is the `client_id`, so one ID works on US, EU, and self-hosted.
+
+To add one, create a JSON file there with `client_id` set to its own URL. The CIMD fetcher follows no redirects, so the URL has to answer with a 200 directly. Put the scope ceiling in `com.posthog.scopes`. A client that only signs people in can list only `openid`, `profile`, and `email`, and gets no resource scope. A new document is an unverified, not-first-party client until someone sets `is_verified` or `is_first_party` on its application in Django admin, in each region.
+
+## Self-registered client logos
+
+Both self-registration paths accept a `logo_uri`, and PostHog shows it on the consent screen and on the login, signup, and email verification screens. A client without a logo gets the first letter of its name instead.
+
+- Dynamic client registration (`POST /oauth/register/`, RFC 7591): send `logo_uri` alongside `redirect_uris`. The response echoes it back.
+- Client ID metadata documents: put `logo_uri` in the document. A document without one gets `https://<client_id host>/apple-touch-icon.png`, the touch icon of the host that serves the document. It never comes from `client_uri`, which the document asserts about itself, so a client cannot borrow another site's icon. Where the host has no such icon, the screens fall back to the first letter. A refresh keeps a stored logo when the document still has none.
+
+The URI must be `https` and must pass `is_url_allowed`, the same SSRF guard the rest of the codebase uses. That rejects a loopback, private, metadata or internal-domain host, and it resolves the name, so a public hostname pointing at a private address is rejected too. A URI that fails either check is dropped and left out of the registration response. It never fails the registration, since a client can complete every OAuth flow without a logo.
+
+The host check protects the visitor rather than PostHog. PostHog never fetches a logo: the browser does, and a self-hosted deployment renders these pages to people inside a trusted network. An unchecked logo would make each of those browsers probe its own network from a PostHog page.
+
+## Signed-out visitors
+
+`/oauth/authorize/` needs a session. A visitor without one is redirected to `/login?next=<the authorize URL>`. The login, signup, and email verification screens keep `next`, so the visitor lands on the consent screen once they have a session, and `/oauth` paths are exempt from the onboarding redirect.
+
+The redirect also sets the `ph_pending_oauth_connection` cookie so those screens can name the application:
+
+- Value: percent-encoded JSON with `client_name` and `client_id`, plus `logo_uri` and `redirect_host` (host of the registered redirect URI, web redirects only) when known. It holds public application metadata only, the same the consent screen shows.
+- Scope: `Domain=posthog.com` on PostHog Cloud, so the website can read it too. Host-only on any other host. `SameSite=Lax`, readable by JavaScript, lifetime 60 minutes.
+- Cleared when the person grants or denies the authorization.
+- A CIMD client seen for the first time has no application row yet, so the cookie carries the host of its `client_id` URL as the name.
+
+An account created while the cookie is present skips in-app onboarding. Signup sets `onboarding_skipped_reason` to `connector`, pinned to the signup organization, so another organization the person joins later still shows onboarding. A delegated invitee keeps onboarding, because running it is the reason for the invite. Until the project ingests its first event, opening the project homepage sends that person to `/welcome`. Other pages open as linked, so a deep link from the connecting application still works.
+
+While the cookie is present, the auth page pins the data region to the region the form is served from. An OAuth client is registered in one region only, so an account created in the other region could not finish the connection.
+
+To try these screens locally, run `generate_demo_data`. It registers the Claude and ChatGPT connectors from their public client ID metadata documents, the same way production registers them. Then open **Login tools** on `/login` and pick a connector under **Start an OAuth connection**. That sets the cookie and a `next` link to the consent screen, as the redirect above does. **Clear** deletes the cookie again.
+
+Analytics: `/login` and `/signup` render the same page, which asks for the email first and then opens the login or the signup password under it. The frontend captures `auth step viewed` for every step, with `step` (`email`, `login`, `login_code`, `signup_credentials`, `signup_profile`, `signup_pending_invite`, or `verify_email`), `entry` (`login` or `signup`), and `oauth_client_name` and `oauth_client_id` while the cookie is present. `auth email submitted` records the routing decision with `routed_to` and `account_exists`. `user signed up` carries `signup_oauth_client_name` and `signup_oauth_client_id`, which are also set as person properties, so a signup can be traced back to the application that started it. When the signup creates a new organization, the project group also gets `created_via_oauth_client` and `created_via_oauth_client_id`.
+
+### Signed-out device logins
+
+The device approval page `/device` follows the same path. A visitor without a session who opens `/device?code=<user code>` is redirected to `/login?next=<the device URL>`, so the code comes back with them after login, signup, and email verification. A visitor who opens `/device` without a code sees the code form first, and submitting it loads `/device?code=<user code>`, which redirects the same way.
+
+- The redirect sets the same cookie when the code belongs to a pending grant of a verified app. It adds `"flow": "device"`, and it never carries the user code.
+- The redirect looks up the code without a session, so it is limited per IP address. Past the limit, the redirect still happens, without the cookie.
+- An account created while that cookie is present gets `onboarding_skipped_reason` set to `device_login` instead of `connector`. It skips onboarding and goes to `/welcome` the same way.
+- Approving or denying the device login clears the cookie.
+
+## Endpoints
+
+- **Authorization**: `/oauth/authorize/`
+- **Token Exchange**: `/oauth/token/`
+- **Token Introspection**: `/oauth/introspect/`
+- **User Info**: `/oauth/userinfo/`
+- **JWKS (Public Keys)**: `/oauth/.well-known/jwks.json`
+- **OpenID Configuration**: `/oauth/.well-known/openid-configuration/`
+
+## Token Introspection
+
+The introspection endpoint (`/oauth/introspect/`) allows you to check if a token is active and retrieve metadata about it. This is useful for validating tokens, checking their scopes or their scoped_teams and scoped_organizations.
+
+### Authentication Methods
+
+The introspection endpoint supports three authentication methods:
+
+#### 1. HTTP Basic Authentication (Recommended)
+
+```bash
+curl -X POST http://localhost:8010/oauth/introspect/ \
+  -u "CLIENT_ID:CLIENT_SECRET" \
+  -d "token=ACCESS_TOKEN_TO_INTROSPECT"
+```
+
+#### 2. Client Credentials in Request Body
+
+```bash
+curl -X POST http://localhost:8010/oauth/introspect/ \
+  -d "client_id=CLIENT_ID" \
+  -d "client_secret=CLIENT_SECRET" \
+  -d "token=ACCESS_TOKEN_TO_INTROSPECT"
+```
+
+#### 3. Bearer Token Authentication
+
+```bash
+curl -X POST http://localhost:8010/oauth/introspect/ \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -d "token=TOKEN_TO_INTROSPECT"
+```
+
+**Important**: When using Bearer token authentication (method 3), the bearer token **must have the `introspection` scope**. Client authentication methods (1 and 2) do not require any scopes.
+
+### Scope Requirements
+
+- **Client Authentication (HTTP Basic or Credentials)**: No scope required
+- **Bearer Token Authentication**: Requires `introspection` scope
+
+You only see tokens that belong to your own application, whichever method you use. The `introspection` scope lets an access token introspect other tokens from the same application. A token can always introspect itself, with or without the scope.
+
+### Response Format
+
+**Active Token Response**:
+
+```json
+{
+  "active": true,
+  "is_impersonated": false,
+  "scope": "openid experiment:read query:read",
+  "client_id": "DC5uRLVbGI02YQ82grxgnK6Qn12SXWpCqdPb60oZ",
+  "scoped_teams": [1, 2],
+  "scoped_organizations": ["org-uuid-1", "org-uuid-2"],
+  "exp": 1704067200
+}
+```
+
+`is_impersonated` is `true` when a staff member issued the access token during impersonation.
+This field describes the token, not the browser session.
+
+**Inactive/Invalid Token Response**:
+
+```json
+{
+  "active": false
+}
+```
+
+### Token Types
+
+- **Access Tokens**: Return `"active": true` if valid and not expired
+- **Refresh Tokens**: Always return `"active": false` (refresh tokens cannot be introspected)
+
+### Example: Introspecting with Client Credentials
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8010/oauth/introspect/",
+    auth=("DC5uRLVbGI02YQ82grxgnK6Qn12SXWpCqdPb60oZ", "CLIENT_SECRET"),
+    data={"token": "access_token_to_check"}
+)
+
+data = response.json()
+if data.get("active"):
+    print(f"Token is active with scopes: {data['scope']}")
+    print(f"Token has access to teams: {data['scoped_teams']}")
+else:
+    print("Token is inactive or invalid")
+```
+
+### Example: Introspecting with Bearer Token
+
+To introspect tokens using another access token, ensure the bearer token has the `introspection` scope:
+
+```python
+# First, get an access token WITH introspection scope
+# scope=openid+introspection
+
+import requests
+
+response = requests.post(
+    "http://localhost:8010/oauth/introspect/",
+    headers={"Authorization": f"Bearer {access_token_with_introspection_scope}"},
+    data={"token": "token_to_check"}
+)
+
+data = response.json()
+print(f"Token active: {data.get('active')}")
+```
+
+## Troubleshooting
+
+### "Invalid client_id"
+
+- Check the client_id matches exactly
+- Verify the application exists in `https://localhost:8010/admin/posthog/oauthapplication/`
+
+### "Redirect URI mismatch"
+
+- Ensure redirect_uri in request matches one configured in application, make sure you included the path and not just the base url
+- Check for trailing slashes
+- Verify HTTP vs HTTPS
+
+### "Invalid code_verifier"
+
+- The code_verifier used in token exchange must match the one used to generate code_challenge
+- Ensure code_challenge was generated correctly using SHA256, you should send the hashed version as the code_challenge in the authorize request, and the original as the code_verifier in the token request
+
+### "Invalid client_secret"
+
+- For confidential clients, ensure you saved the secret during creation, after creation you will see a hashed version in Django admin which is not your client secret
+- Secrets cannot be retrieved after creation - you'll need to create a new application
+
+## Additional Resources
+
+- OAuth 2.0 RFC: https://tools.ietf.org/html/rfc6749
+- OpenID Connect Core: https://openid.net/specs/openid-connect-core-1_0.html
+- PKCE RFC: https://tools.ietf.org/html/rfc7636

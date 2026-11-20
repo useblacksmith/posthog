@@ -1,0 +1,152 @@
+import { HogFunctionTemplate } from '~/cdp/types'
+
+export const template: HogFunctionTemplate = {
+    free: false,
+    status: 'stable',
+    type: 'destination',
+    id: 'template-webhook',
+    name: 'HTTP Webhook',
+    description: 'Sends a webhook templated by the incoming event data',
+    icon_url: '/static/services/webhook.svg',
+    category: ['Custom'],
+    code_language: 'hog',
+    code: `
+let payload := {
+  'headers': inputs.headers,
+  'body': inputs.body,
+  'method': inputs.method
+}
+
+if (not empty(inputs.signing_secret)) {
+  let signing := inputs.signing_format == 'hmac_sha256' ? 'hmac_sha256' : 'standard_webhooks'
+  payload[signing] := {
+    'secret_input': 'signing_secret'
+  }
+}
+
+if (not empty(inputs.secret_headers)) {
+  payload['secret_headers_input'] := 'secret_headers'
+}
+
+if (inputs.debug) {
+  print('Request', inputs.url, payload)
+}
+
+let res := fetch(inputs.url, payload);
+
+if (res.status >= 400) {
+  throw Error(f'Webhook failed with status {res.status}: {res.body}');
+}
+
+if (inputs.debug) {
+  print('Response', res.status, res.body);
+}
+`,
+    inputs_schema: [
+        {
+            key: 'url',
+            type: 'string',
+            label: 'Webhook URL',
+            secret: false,
+            required: true,
+            description: 'Endpoint URL to send event data to.',
+        },
+        {
+            key: 'method',
+            type: 'choice',
+            label: 'Method',
+            secret: false,
+            choices: [
+                {
+                    label: 'POST',
+                    value: 'POST',
+                },
+                {
+                    label: 'PUT',
+                    value: 'PUT',
+                },
+                {
+                    label: 'PATCH',
+                    value: 'PATCH',
+                },
+                {
+                    label: 'GET',
+                    value: 'GET',
+                },
+                {
+                    label: 'DELETE',
+                    value: 'DELETE',
+                },
+            ],
+            default: 'POST',
+            required: false,
+            description: 'HTTP method to use for the request.',
+        },
+        {
+            key: 'body',
+            type: 'json',
+            label: 'JSON Body',
+            default: { event: '{event}', person: '{person}' },
+            secret: false,
+            required: false,
+            description: 'JSON payload to send in the request body.',
+        },
+        {
+            key: 'headers',
+            type: 'dictionary',
+            label: 'Headers',
+            secret: false,
+            required: false,
+            default: { 'Content-Type': 'application/json' },
+            description:
+                'HTTP headers to send in the request. Put API tokens and other credentials in Secret headers instead.',
+        },
+        {
+            key: 'secret_headers',
+            type: 'dictionary',
+            label: 'Secret headers',
+            secret: true,
+            required: false,
+            templating: false,
+            description:
+                'HTTP headers that hold a credential, such as an API token. These are encrypted, hidden after saving, and kept out of the logs. Values are sent exactly as entered, without templating, and replace a plaintext header of the same name.',
+        },
+        {
+            key: 'signing_secret',
+            type: 'string',
+            label: 'Signing secret',
+            secret: true,
+            required: false,
+            description: 'Signs each request in the signature format below.',
+        },
+        {
+            key: 'signing_format',
+            type: 'choice',
+            label: 'Signature format',
+            secret: false,
+            choices: [
+                {
+                    label: 'Standard Webhooks',
+                    value: 'standard_webhooks',
+                },
+                {
+                    label: 'HMAC-SHA256 of the body',
+                    value: 'hmac_sha256',
+                },
+            ],
+            default: 'standard_webhooks',
+            required: false,
+            description:
+                'Only applies when a signing secret is set. [Standard Webhooks](https://www.standardwebhooks.com) sends the webhook-id, webhook-timestamp and webhook-signature headers. HMAC-SHA256 of the body sends the hex digest as `X-Hub-Signature-256: sha256=<digest>` and a webhook-id header that stays the same across retries. It needs a request body, so it does not work with GET, and a secret of at least 24 characters.',
+        },
+        {
+            key: 'debug',
+            type: 'boolean',
+            label: 'Log responses',
+            description: 'Logs the response of http calls for debugging.',
+            secret: false,
+            required: false,
+            default: false,
+        },
+    ],
+}

@@ -1,0 +1,428 @@
+import itertools
+from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
+from typing import Optional
+
+from django.db.models import Q
+
+import structlog
+import posthoganalytics
+from celery import shared_task
+from celery.canvas import chain
+from prometheus_client import Counter, Gauge
+
+from posthog.hogql.errors import ExposedHogQLError, TableAccessDeniedError
+
+from posthog.caching.calculate_results import calculate_for_query_based_insight
+from posthog.caching.utils import largest_teams
+from posthog.clickhouse.client.limit import ConcurrencyLimitExceeded
+from posthog.clickhouse.query_tagging import Feature, get_team_query_tags, tag_queries
+from posthog.errors import CH_TRANSIENT_ERRORS
+from posthog.event_usage import EventSource
+from posthog.exceptions_capture import capture_exception
+from posthog.hogql_queries.query_runner import ExecutionMode
+from posthog.models import Team
+from posthog.permissions import posthog_feature_flag_enabled
+from posthog.ph_client import ph_scoped_capture
+from posthog.query_cache import (
+    clean_up_stale_insights,
+    days_read_at_this_time,
+    get_stale_insights,
+    last_read_hours,
+    last_refreshes,
+    read_since,
+    stale_among,
+)
+from posthog.query_creator_access import creator_access_revoked, report_creator_access_revoked
+from posthog.scheduling.jitter import deterministic_offset
+from posthog.schema_migrations.upgrade_manager import upgrade_insight
+from posthog.scoping_audit import skip_team_scope_audit
+from posthog.tasks.utils import CeleryQueue
+from posthog.utils import variables_override_requested_by_client
+
+from products.access_control.backend.facade.contracts import UserNotOrganizationMemberError
+from products.dashboards.backend.facade import api as dashboards_api
+from products.dashboards.backend.facade.contracts import InsightPlacement
+from products.product_analytics.backend.facade.api import insight_variables_for_team
+from products.product_analytics.backend.facade.models import Insight
+
+logger = structlog.get_logger(__name__)
+
+STALE_INSIGHTS_GAUGE = Gauge(
+    "posthog_cache_warming_stale_insights_gauge",
+    "Number of stale insights present",
+    ["team_id"],
+    multiprocess_mode="max",
+)
+PRIORITY_INSIGHTS_COUNTER = Counter(
+    "posthog_cache_warming_priority_insights",
+    "Number of priority insights warmed",
+    ["team_id", "dashboard", "is_cached"],
+)
+
+LAST_VIEWED_THRESHOLD = timedelta(days=7)
+SHARED_INSIGHTS_LAST_VIEWED_THRESHOLD = timedelta(days=3)
+STALE_INSIGHTS_LIMIT = 500
+TIME_OF_DAY_CANDIDATES_LIMIT = 5000
+READ_DAYS_REQUIRED = 2
+TIME_OF_DAY_FLAG = "cache-warming-time-of-day"
+DASHBOARD_V2_FLAG = "dashboard-v2"
+# No interval stays fresh longer than a day, so a tile nobody read in that time is not being followed.
+RECENT_READ_WINDOW = timedelta(hours=24)
+
+# Each team's chain starts at its own offset inside this window, so the largest teams do not all
+# send their insight queries to ClickHouse in the same minute.
+WARMING_START_WINDOW = timedelta(minutes=10)
+# How long a team's chain may run after it starts. A team starts at the same offset every hour, so its
+# chain has expired before the next hourly dispatch starts that team again.
+WARMING_CHAIN_LIFETIME = timedelta(minutes=50)
+DASHBOARD_V2_WARMING_START_WINDOW = timedelta(minutes=50)
+
+# ClickHouse capacity/concurrency errors that should retry with backoff rather than fail the task.
+# ClickHouseAtCapacity is included via CH_TRANSIENT_ERRORS (it's what codes 202/439 surface as).
+RETRIABLE_WARMING_ERRORS = (*CH_TRANSIENT_ERRORS, ConcurrencyLimitExceeded)
+
+
+def _flag_enabled_for_team(flag: str, *, team_id: int, organization_id: object, uuid: object) -> bool:
+    return bool(
+        posthoganalytics.feature_enabled(
+            flag,
+            str(uuid),
+            groups={
+                "organization": str(organization_id),
+                "project": str(team_id),
+            },
+            group_properties={
+                "organization": {
+                    "id": str(organization_id),
+                },
+                "project": {
+                    "id": str(team_id),
+                },
+            },
+            only_evaluate_locally=True,
+            send_feature_flag_events=False,
+        )
+    )
+
+
+def teams_enabled_for_cache_warming() -> list[int]:
+    return [
+        team_id
+        for team_id, organization_id, uuid in Team.objects.values_list(
+            "id",
+            "organization_id",
+            "uuid",
+        ).iterator(chunk_size=1000)
+        if _flag_enabled_for_team("cache-warming", team_id=team_id, organization_id=organization_id, uuid=uuid)
+    ]
+
+
+def _stale_combos(team_id: int, *, read_at_this_time_only: bool, read_recently_only: bool) -> list[str]:
+    if not read_at_this_time_only and not read_recently_only:
+        return get_stale_insights(team_id=team_id, limit=STALE_INSIGHTS_LIMIT)
+    now = datetime.now(UTC)
+    if read_recently_only:
+        # Start from the reads, not a capped page of stale entries, so unread entries cannot crowd out read tiles.
+        recently_read = read_since(team_id=team_id, since=now - RECENT_READ_WINDOW, now=now)
+        combos = stale_among(team_id=team_id, identifiers=recently_read)
+    else:
+        combos = get_stale_insights(team_id=team_id, limit=TIME_OF_DAY_CANDIDATES_LIMIT)
+    # Batched so one Redis round trip never checks more than TIME_OF_DAY_CANDIDATES_LIMIT identifiers.
+    kept: list[str] = []
+    for start in range(0, len(combos), TIME_OF_DAY_CANDIDATES_LIMIT):
+        batch = combos[start : start + TIME_OF_DAY_CANDIDATES_LIMIT]
+        if read_recently_only:
+            batch = _read_since_last_refresh(team_id, batch, since=now - RECENT_READ_WINDOW, now=now)
+        if read_at_this_time_only:
+            days_read = days_read_at_this_time(team_id=team_id, identifiers=batch, now=now)
+            batch = [combo for combo in batch if days_read[combo] >= READ_DAYS_REQUIRED]
+        kept.extend(batch)
+        if len(kept) >= STALE_INSIGHTS_LIMIT:
+            break
+    return kept[:STALE_INSIGHTS_LIMIT]
+
+
+def _read_since_last_refresh(team_id: int, combos: list[str], *, since: datetime, now: datetime) -> list[str]:
+    """The combos read after their cached result was last computed, so a warm nobody has looked at is not repeated.
+
+    Reads are recorded per hour, so a read in the same hour as the computation counts as later: one extra warm
+    costs less than serving a result older than its interval allows. A combo with no recorded computation is kept.
+    """
+    last_refreshed = last_refreshes(team_id=team_id, identifiers=combos)
+    last_read = last_read_hours(team_id=team_id, identifiers=combos, since=since, now=now)
+    kept = []
+    for combo in combos:
+        refreshed_at, read_hour = last_refreshed[combo], last_read[combo]
+        if refreshed_at is None or (read_hour is not None and read_hour + timedelta(hours=1) > refreshed_at):
+            kept.append(combo)
+    return kept
+
+
+def insights_to_keep_fresh(
+    team: Team, shared_only: bool = False, read_at_this_time_only: bool = False, read_recently_only: bool = False
+) -> Generator[tuple[int, Optional[int]]]:
+    """
+    This is the place to decide which insights should be kept warm for the provided team.
+    The reasoning is that this will be a yes or no decision. If we need to keep it warm, we try our best
+    to not let the cache go stale. There isn't any middle ground, like trying to refresh it once a day, since
+    that would be like clock that's only right twice a day.
+    """
+    # for shared insights, use a lower cut off
+    threshold = datetime.now(UTC) - (
+        LAST_VIEWED_THRESHOLD if not shared_only else SHARED_INSIGHTS_LAST_VIEWED_THRESHOLD
+    )
+
+    clean_up_stale_insights(team_id=team.pk, threshold=threshold)
+
+    # get all insights currently in the cache for the team
+    combos = _stale_combos(
+        team.pk, read_at_this_time_only=read_at_this_time_only, read_recently_only=read_recently_only
+    )
+
+    STALE_INSIGHTS_GAUGE.labels(team_id=team.pk).set(len(combos))
+
+    placements: list[InsightPlacement] = []
+    insight_ids_single = set()
+
+    for insight_id, dashboard_id in (combo.split(":") for combo in combos):
+        if dashboard_id:
+            placements.append(InsightPlacement(insight_id=int(insight_id), dashboard_id=int(dashboard_id)))
+        else:
+            insight_ids_single.add(insight_id)
+
+    if insight_ids_single:
+        single_insight_q_filter = Q(
+            team=team,
+            insightviewed__last_viewed_at__gte=threshold,
+            pk__in=insight_ids_single,
+        )
+        if shared_only:
+            single_insight_q_filter &= Q(sharingconfiguration__enabled=True)
+
+        single_insight_ids = Insight.objects.filter(single_insight_q_filter).distinct().values_list("id", flat=True)
+        for single_insight_id in single_insight_ids:
+            yield single_insight_id, None
+
+    if not placements:
+        return
+
+    for placement in dashboards_api.placements_on_dashboards_accessed_since(
+        placements=placements, since=threshold, shared_only=shared_only
+    ):
+        yield placement.insight_id, placement.dashboard_id
+
+
+@shared_task(ignore_result=True, expires=60 * 15)
+@skip_team_scope_audit
+def schedule_warming_for_teams_task():
+    """
+    Runs every hour and schedule warming for all insights (picked from insights_to_cache)
+    for each team enabled for cache warming. Each team's warming starts at a stable
+    offset within WARMING_START_WINDOW, or DASHBOARD_V2_WARMING_START_WINDOW for teams
+    on dashboard-v2, which also warm only tiles read within RECENT_READ_WINDOW and since their last computation.
+
+    We trigger recalculation using ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE
+    so even though we might pick all insights for a team to recalculate,
+    only the stale ones (determined by `staleness_threshold_map`) get recalculated.
+    """
+    from posthog.clickhouse.client.execute import KillSwitchLevel, get_kill_switch_level
+
+    kill_switch_level = get_kill_switch_level()
+    if kill_switch_level != KillSwitchLevel.OFF:
+        logger.info("kill_switch_on_skipping_cache_warming", level=kill_switch_level)
+        return
+
+    team_ids = largest_teams(limit=10)
+    threshold = datetime.now(UTC) - LAST_VIEWED_THRESHOLD
+
+    enabled_teams = Team.objects.filter(
+        Q(pk__in=team_ids)
+        | Q(extra_settings__insights_cache_warming=True)
+        | Q(pk__in=teams_enabled_for_cache_warming())
+    )
+    teams_with_recently_viewed_shared = Team.objects.filter(
+        Q(
+            Q(sharingconfiguration__dashboard__last_accessed_at__gte=threshold)
+            | Q(sharingconfiguration__insight__insightviewed__last_viewed_at__gte=threshold)
+        ),
+        sharingconfiguration__enabled=True,
+    ).difference(enabled_teams)
+
+    all_teams = itertools.chain(
+        zip(enabled_teams, [False] * len(enabled_teams)),
+        zip(teams_with_recently_viewed_shared, [True] * len(teams_with_recently_viewed_shared)),
+    )
+
+    dispatched_at = datetime.now(UTC)
+
+    with ph_scoped_capture() as capture_ph_event:
+        for team, shared_only in all_teams:
+            read_at_this_time_only = _flag_enabled_for_team(
+                TIME_OF_DAY_FLAG, team_id=team.pk, organization_id=team.organization_id, uuid=team.uuid
+            )
+            dashboard_v2 = posthog_feature_flag_enabled(
+                DASHBOARD_V2_FLAG,
+                str(team.uuid),
+                organization_id=team.organization_id,
+                team_id=team.pk,
+                only_evaluate_locally=True,
+            )
+            insight_tuples = list(
+                insights_to_keep_fresh(
+                    team,
+                    shared_only=shared_only,
+                    read_at_this_time_only=read_at_this_time_only,
+                    read_recently_only=dashboard_v2,
+                )
+            )
+
+            capture_ph_event(
+                distinct_id=str(team.uuid),
+                event="cache warming - insights to cache",
+                properties={
+                    "count": len(insight_tuples),
+                    "standalone_count": sum(dashboard_id is None for _, dashboard_id in insight_tuples),
+                    "dashboard_count": sum(dashboard_id is not None for _, dashboard_id in insight_tuples),
+                    "team_id": team.id,
+                    "organization_id": team.organization_id,
+                    "shared_only": shared_only,
+                    "read_at_this_time_only": read_at_this_time_only,
+                    "read_recently_only": dashboard_v2,
+                },
+            )
+
+            # Anchored to the dispatch time, so the time this loop spends on earlier teams does not delay
+            # this team. A start time that has already passed runs at once.
+            start_window = DASHBOARD_V2_WARMING_START_WINDOW if dashboard_v2 else WARMING_START_WINDOW
+            start_at = dispatched_at + deterministic_offset(str(team.pk), start_window)
+            # Use a fixed expiration time since tasks in the chain are executed sequentially
+            expire_after = start_at + WARMING_CHAIN_LIFETIME
+
+            # We chain the task execution to prevent queries *for a single team* running at the same time
+            chain(
+                *(
+                    warm_insight_cache_task.si(*insight_tuple).set(expires=expire_after)
+                    for insight_tuple in insight_tuples
+                )
+            ).apply_async(eta=start_at)
+
+
+@shared_task(
+    queue=CeleryQueue.ANALYTICS_LIMITED.value,  # Important! Prevents Clickhouse from being overwhelmed
+    ignore_result=True,
+    expires=60 * 60,
+    autoretry_for=RETRIABLE_WARMING_ERRORS,
+    retry_backoff=2,
+    retry_backoff_max=3,
+    max_retries=3,
+)
+def warm_insight_cache_task(insight_id: int, dashboard_id: Optional[int]):
+    try:
+        # nosemgrep: idor-lookup-without-team (Celery task, ID from internal scheduling)
+        insight = Insight.objects.select_related("team__organization").get(pk=insight_id)
+    except Insight.DoesNotExist:
+        logger.info(f"Warming insight cache failed 404 insight not found: {insight_id}")
+        return
+
+    if insight.query is None:
+        logger.info(f"Warming insight cache skipped, insight has no query: {insight_id}")
+        return
+
+    dashboard = None
+
+    tag_queries(
+        **get_team_query_tags(insight.team),
+        insight_id=insight.pk,
+        trigger="warmingV2",
+        feature=Feature.CACHE_WARMUP,
+    )
+    if dashboard_id:
+        tag_queries(dashboard_id=dashboard_id)
+        dashboard = insight.dashboards.filter(pk=dashboard_id).first()
+
+    with upgrade_insight(insight):
+        logger.info(f"Warming insight cache: {insight.pk} for team {insight.team_id} and dashboard {dashboard_id}")
+
+        try:
+            tile_filters_override = (
+                dashboards_api.tile_filters_overrides(dashboard_id=dashboard.id, insight_id=insight.pk)
+                if dashboard is not None
+                else None
+            )
+            variables_override = (
+                variables_override_requested_by_client(None, dashboard, insight_variables_for_team(insight.team_id))
+                if dashboard is not None and dashboard.variables
+                else None
+            )
+            # The same call a dashboard load makes, so warming writes the cache key the page reads.
+            results = calculate_for_query_based_insight(
+                insight,
+                team=insight.team,
+                dashboard=dashboard,
+                # We need an execution mode with recent cache:
+                # - in case someone refreshed after this task was triggered
+                # - if insight + dashboard combinations have the same cache key, we prevent needless recalculations
+                execution_mode=ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE,
+                user=insight.created_by,
+                variables_override=variables_override,
+                tile_filters_override=tile_filters_override,
+                analytics_props={"source": EventSource.CACHE_WARMING},
+            )
+
+            is_cached = results.is_cached
+
+            PRIORITY_INSIGHTS_COUNTER.labels(
+                team_id=insight.team_id,
+                dashboard=dashboard_id is not None,
+                is_cached=is_cached,
+            ).inc()
+
+            with ph_scoped_capture() as capture_ph_event:
+                capture_ph_event(
+                    distinct_id=str(insight.team.uuid),
+                    event="cache warming - warming insight",
+                    properties={
+                        "insight_id": insight.pk,
+                        "insight_short_id": insight.short_id,
+                        "dashboard_id": dashboard_id,
+                        "is_cached": is_cached,
+                        "team_id": insight.team_id,
+                        "organization_id": insight.team.organization_id,
+                    },
+                )
+
+        except RETRIABLE_WARMING_ERRORS:
+            raise
+        except Exception as e:
+            # A revoked creator's access error is a known limitation - report it as an event
+            # rather than surfacing it in error tracking.
+            if isinstance(e, (TableAccessDeniedError, UserNotOrganizationMemberError)) and creator_access_revoked(
+                insight.created_by, insight.team
+            ):
+                report_creator_access_revoked(
+                    user=insight.created_by,
+                    team=insight.team,
+                    source="cache_warming",
+                    error=e,
+                    properties={"insight_id": insight.pk, "dashboard_id": dashboard_id},
+                )
+            elif isinstance(e, ExposedHogQLError):
+                # The query itself is wrong, and only its author can correct it. Report it as an
+                # event so it stays with the team instead of becoming an issue in our error tracking.
+                with ph_scoped_capture() as capture_ph_event:
+                    capture_ph_event(
+                        distinct_id=str(insight.team.uuid),
+                        event="cache warming - insight query error",
+                        properties={
+                            "insight_id": insight.pk,
+                            "insight_short_id": insight.short_id,
+                            "dashboard_id": dashboard_id,
+                            "team_id": insight.team_id,
+                            "organization_id": str(insight.team.organization_id),
+                            "error_code": e.code_name,
+                            "error": str(e),
+                        },
+                    )
+            else:
+                capture_exception(e)

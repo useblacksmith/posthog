@@ -1,0 +1,327 @@
+//! The get-or-create pipeline: batch-resolve distinct ids on the primary,
+//! create person stubs for misses in one multi-row transaction, then apply
+//! initial properties through the leader with bounded concurrency.
+//!
+//! `created = true` in a result means the stub row is committed in Postgres
+//! AND the initial properties (when provided) are durable in the leader's
+//! changelog — the single ack covers both planes.
+
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt};
+use tonic::{Code, Status};
+
+use personhog_common::grpc::current_client_name;
+use personhog_proto::personhog::identity::v1::GetOrCreatePersonEntry;
+use personhog_proto::personhog::types::v1::{Person as ProtoPerson, UpdatePersonPropertiesRequest};
+
+use crate::service::error::log_and_convert_error;
+use crate::service::validation::validate_entry;
+use crate::service::PersonHogIdentityService;
+use crate::storage::{Person, PersonStub, StubOutcome};
+
+const GET_OR_CREATE_TOTAL: &str = "personhog_identity_get_or_create_total";
+const GET_OR_CREATE_PHASE_DURATION: &str = "personhog_identity_get_or_create_phase_duration_ms";
+const GET_OR_CREATE_ENTRIES_PER_CALL: &str = "personhog_identity_get_or_create_entries_per_call";
+const CREATE_STUB_LOST_TOTAL: &str = "personhog_identity_create_stub_lost_total";
+const CREATED_AT_FALLBACK_TOTAL: &str = "personhog_identity_created_at_fallback_total";
+
+fn count_outcome(outcome: &str) {
+    common_metrics::inc(
+        GET_OR_CREATE_TOTAL,
+        &[("outcome".to_string(), outcome.to_string())],
+        1,
+    );
+}
+
+fn record_phase(phase: &'static str, start: Instant) {
+    common_metrics::histogram(
+        GET_OR_CREATE_PHASE_DURATION,
+        &[
+            ("phase".to_string(), phase.to_string()),
+            ("client".to_string(), current_client_name().to_string()),
+        ],
+        start.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+fn count_stub_lost(resolution: &'static str) {
+    common_metrics::inc(
+        CREATE_STUB_LOST_TOTAL,
+        &[("resolution".to_string(), resolution.to_string())],
+        1,
+    );
+}
+
+fn count_created_at_fallback(reason: &'static str) {
+    common_metrics::inc(
+        CREATED_AT_FALLBACK_TOTAL,
+        &[("reason".to_string(), reason.to_string())],
+        1,
+    );
+}
+
+/// Empty bytes and an empty JSON object both mean "no properties to apply".
+fn has_properties(raw: &[u8]) -> bool {
+    !raw.is_empty() && raw.trim_ascii() != b"{}"
+}
+
+fn entry_created_at(entry: &GetOrCreatePersonEntry) -> DateTime<Utc> {
+    if entry.created_at <= 0 {
+        count_created_at_fallback("missing");
+        return Utc::now();
+    }
+    DateTime::from_timestamp_millis(entry.created_at).unwrap_or_else(|| {
+        count_created_at_fallback("invalid");
+        Utc::now()
+    })
+}
+
+/// How each entry proceeds after the resolve phase.
+enum Plan {
+    /// Terminal before stub creation: invalid entry, or the key resolved.
+    Done(Result<(ProtoPerson, bool), Status>),
+    /// First entry for a missing key; owns the stub at this index.
+    Owner(usize),
+    /// Duplicate of a missing key earlier in the batch; shares its outcome
+    /// but never reports created = true (exactly one entry creates).
+    Follower(usize),
+}
+
+impl PersonHogIdentityService {
+    /// Runs the get-or-create pipeline for a set of entries: one batched
+    /// resolve, one multi-row stub-create transaction for the misses, one
+    /// batched re-resolve for lost races, then the leader property fan-out.
+    /// Per-key conflicts and failures never affect other keys. Results are in
+    /// entry order.
+    pub(crate) async fn get_or_create_entries(
+        &self,
+        entries: Vec<GetOrCreatePersonEntry>,
+    ) -> Result<Vec<Result<(ProtoPerson, bool), Status>>, Status> {
+        common_metrics::histogram(GET_OR_CREATE_ENTRIES_PER_CALL, &[], entries.len() as f64);
+        // One pass: rejected() counts each failure, so the key filter and the plan share it.
+        let validations: Vec<Result<(), Status>> = entries
+            .iter()
+            .map(|entry| validate_entry(&self.limits, entry))
+            .collect();
+        let keys: Vec<(i64, String)> = entries
+            .iter()
+            .zip(&validations)
+            .filter(|(_, validation)| validation.is_ok())
+            .map(|(entry, _)| (entry.team_id, entry.distinct_id.clone()))
+            .collect();
+        let phase = Instant::now();
+        let resolved = self.storage.resolve_distinct_ids(&keys).await;
+        record_phase("resolve", phase);
+        let resolved = resolved.map_err(|e| log_and_convert_error(e, "resolve_distinct_ids"))?;
+
+        // Plan each entry and collect one stub per missing key.
+        let mut stubs: Vec<PersonStub> = Vec::new();
+        let mut stub_index: HashMap<(i64, String), usize> = HashMap::new();
+        let plans: Vec<Plan> = entries
+            .iter()
+            .zip(validations)
+            .map(|(entry, validation)| {
+                if let Err(status) = validation {
+                    return Plan::Done(Err(status));
+                }
+                let key = (entry.team_id, entry.distinct_id.clone());
+                if let Some(person) = resolved.get(&key) {
+                    count_outcome("exists");
+                    return Plan::Done(Ok((person.clone().into(), false)));
+                }
+                if let Some(&index) = stub_index.get(&key) {
+                    return Plan::Follower(index);
+                }
+                stub_index.insert(key, stubs.len());
+                stubs.push(build_stub(entry));
+                Plan::Owner(stubs.len() - 1)
+            })
+            .collect();
+
+        let phase = Instant::now();
+        let outcomes = if stubs.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.storage.create_person_stubs(&stubs).await
+        };
+        record_phase("create_stubs", phase);
+        let outcomes = outcomes.map_err(|e| log_and_convert_error(e, "create_person_stubs"))?;
+
+        // Lost races re-resolve in one batch: the winner's mapping committed,
+        // so a fresh resolve finds it.
+        let lost_keys: Vec<(i64, String)> = stub_index
+            .iter()
+            .filter(|(_, &index)| matches!(outcomes[index], StubOutcome::LostRace))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let phase = Instant::now();
+        let lost_resolved = if lost_keys.is_empty() {
+            Ok(HashMap::new())
+        } else {
+            self.storage.resolve_distinct_ids(&lost_keys).await
+        };
+        record_phase("resolve_lost_race", phase);
+        let lost_resolved =
+            lost_resolved.map_err(|e| log_and_convert_error(e, "resolve_after_lost_race"))?;
+
+        // Assemble results; created owners go through the leader fan-out.
+        let lost_race_result = |i: usize| {
+            let key = (entries[i].team_id, entries[i].distinct_id.clone());
+            match lost_resolved.get(&key) {
+                Some(person) => {
+                    count_outcome("lost_race_resolved");
+                    Ok((person.clone().into(), false))
+                }
+                None => {
+                    count_outcome("lost_race_unresolved");
+                    Err(Status::aborted(
+                        "concurrent identity operation on distinct id; retry",
+                    ))
+                }
+            }
+        };
+        let mut results: Vec<Option<Result<(ProtoPerson, bool), Status>>> = Vec::new();
+        let mut property_writes: Vec<(usize, Person)> = Vec::new();
+        for (i, plan) in plans.into_iter().enumerate() {
+            let result = match plan {
+                Plan::Done(result) => Some(result),
+                Plan::Owner(index) => match &outcomes[index] {
+                    StubOutcome::Committed {
+                        person,
+                        created: true,
+                    } => {
+                        property_writes.push((i, person.clone()));
+                        None
+                    }
+                    StubOutcome::Committed {
+                        person,
+                        created: false,
+                    } => {
+                        count_outcome("exists");
+                        Some(Ok((person.clone().into(), false)))
+                    }
+                    StubOutcome::LostRace => Some(lost_race_result(i)),
+                },
+                Plan::Follower(index) => match &outcomes[index] {
+                    StubOutcome::Committed { person, .. } => {
+                        count_outcome("exists");
+                        Some(Ok((person.clone().into(), false)))
+                    }
+                    StubOutcome::LostRace => Some(lost_race_result(i)),
+                },
+            };
+            results.push(result);
+        }
+
+        let phase = Instant::now();
+        let applied: Vec<(usize, Result<ProtoPerson, Status>)> =
+            stream::iter(property_writes.into_iter().map(|(i, person)| {
+                let entry = &entries[i];
+                async move { (i, self.apply_initial_properties(entry, person).await) }
+            }))
+            .buffered(self.property_write_concurrency)
+            .collect()
+            .await;
+        record_phase("apply_properties", phase);
+        for (i, result) in applied {
+            let result = result.map(|person| (person, true));
+            count_outcome(if result.is_ok() {
+                "created"
+            } else {
+                "properties_failed"
+            });
+            results[i] = Some(result);
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|result| result.expect("every entry has a result"))
+            .collect())
+    }
+
+    /// Applies the entry's $set/$set_once to a freshly created stub through
+    /// the leader (via the router). Success means the properties are durable
+    /// in the changelog — only then may the RPC report created = true.
+    async fn apply_initial_properties(
+        &self,
+        entry: &GetOrCreatePersonEntry,
+        person: Person,
+    ) -> Result<ProtoPerson, Status> {
+        if !has_properties(&entry.set_properties) && !has_properties(&entry.set_once_properties) {
+            return Ok(person.into());
+        }
+
+        let request = UpdatePersonPropertiesRequest {
+            // Creation properties persist regardless of the filtered list.
+            force_update: true,
+            team_id: person.team_id,
+            person_id: person.id,
+            event_name: entry.event_name.clone(),
+            set_properties: entry.set_properties.clone(),
+            set_once_properties: entry.set_once_properties.clone(),
+            unset_properties: Vec::new(),
+            is_identified: None,
+            last_seen_at: None,
+        };
+
+        match self
+            .property_writer
+            .update_person_properties(request.clone())
+            .await
+        {
+            Ok(response) => Ok(response.person.unwrap_or_else(|| person.into())),
+            Err(status) if status.code() == Code::NotFound => {
+                // The stub was destroyed (merged or deleted) between commit and
+                // the property write. Re-resolve and apply to the person the
+                // distinct id now maps to.
+                let key = (entry.team_id, entry.distinct_id.clone());
+                let mut resolved = self
+                    .storage
+                    .resolve_distinct_ids(std::slice::from_ref(&key))
+                    .await
+                    .map_err(|e| log_and_convert_error(e, "resolve_after_leader_not_found"))?;
+                let Some(current) = resolved.remove(&key) else {
+                    count_stub_lost("unresolved");
+                    return Err(status);
+                };
+                if current.id == person.id {
+                    count_stub_lost("unchanged");
+                    return Err(status);
+                }
+                count_stub_lost("moved");
+                let retry = UpdatePersonPropertiesRequest {
+                    // Creation properties persist regardless of the filtered list.
+                    force_update: true,
+                    team_id: current.team_id,
+                    person_id: current.id,
+                    ..request
+                };
+                let response = self.property_writer.update_person_properties(retry).await?;
+                Ok(response.person.unwrap_or_else(|| current.into()))
+            }
+            Err(status) => Err(status),
+        }
+    }
+}
+
+/// Builds the storage stub for an entry, deduping extras and dropping the
+/// primary from them — the storage layer requires unique distinct ids.
+fn build_stub(entry: &GetOrCreatePersonEntry) -> PersonStub {
+    let mut seen: HashSet<&str> = HashSet::from([entry.distinct_id.as_str()]);
+    let extra_distinct_ids: Vec<String> = entry
+        .extra_distinct_ids
+        .iter()
+        .filter(|d| seen.insert(d.as_str()))
+        .cloned()
+        .collect();
+    PersonStub {
+        team_id: entry.team_id,
+        distinct_id: entry.distinct_id.clone(),
+        extra_distinct_ids,
+        created_at: entry_created_at(entry),
+        is_identified: entry.is_identified,
+    }
+}

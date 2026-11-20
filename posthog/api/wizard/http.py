@@ -1,0 +1,458 @@
+from __future__ import annotations
+
+import time
+from typing import Any, NoReturn, cast
+
+from django.conf import settings
+from django.core.cache import cache
+
+import structlog
+from drf_spectacular.utils import extend_schema
+from prometheus_client import Counter
+from rest_framework import exceptions, serializers, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import AuthenticationFailed, ErrorDetail
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from posthog.api.email_verification import email_verification_pending
+from posthog.auth import OAuthAccessTokenAuthentication, SessionAuthentication
+from posthog.exceptions_capture import capture_exception
+from posthog.ip_restrictions import enforce_ip_restrictions
+from posthog.llm.wizard_blocklist import WIZARD_BLOCKED_DETAIL
+from posthog.llm.wizard_gateway_token import (
+    WizardGatewayMintError,
+    WizardPosture,
+    mint_wizard_gateway_token,
+    wizard_gateway_base_url,
+    wizard_gateway_configured,
+    wizard_gateway_policy,
+    wizard_limit_override,
+    wizard_posture,
+    wizard_product_node,
+    wizard_tier_limits,
+)
+from posthog.models import Team, User
+from posthog.models.project import Project
+from posthog.rate_limit import (
+    SetupWizardCloudRunBurstRateThrottle,
+    SetupWizardCloudRunSustainedRateThrottle,
+    SetupWizardGatewayTokenRateThrottle,
+    refund_wizard_mint,
+    reserve_wizard_mint,
+)
+from posthog.storage.gateway_credential_cache import (
+    GATEWAY_CREDENTIAL_REQUIRED_SCOPE as RequiredGatewayScope,
+    oauth_credential_authorized,
+)
+from posthog.user_permissions import UserPermissions
+from posthog.utils import get_trusted_client_ip
+
+from products.security.backend.facade.api import access_refused as security_access_refused
+from products.security.backend.facade.contracts import SubjectInput as SecuritySubject
+from products.security.backend.facade.enums import Surface as SecuritySurface
+from products.tasks.backend.facade import api as tasks_facade
+
+logger = structlog.get_logger(__name__)
+ERROR_PROJECT_NOT_FOUND = "This project does not exist."
+
+# Absolute ceiling on sandbox boots per user per day, reserved atomically right before run
+# creation. The DB-counted throttles above the view are read-then-create and can be raced by
+# parallel requests; this cache.incr cannot, so it is the hard bound a start-cancel or crash
+# loop lands on. Only requests that reach creation consume it.
+WIZARD_CLOUD_RUN_DAILY_ATTEMPT_CAP = 15
+
+WIZARD_EMAIL_UNVERIFIED_DETAIL = (
+    "Verify your email address, then run the wizard again. The link is in the welcome email from PostHog."
+)
+
+WIZARD_GATEWAY_TOKEN_REQUESTS_TOTAL = Counter(
+    "posthog_wizard_gateway_token_requests_total",
+    "Wizard gateway-token mint requests, by outcome (minted/unconfigured/invalid_token/"
+    "not_wizard_app/scope_missing/team_ambiguous/team_missing/unauthorized/blocked/"
+    "program_unknown/throttled/mint_failed)",
+    labelnames=["outcome"],
+)
+
+WIZARD_CLOUD_RUN_REQUESTS_TOTAL = Counter(
+    "posthog_wizard_cloud_run_requests_total",
+    "Cloud-run wizard kickoff requests, by outcome (created/unavailable/invalid/permission_denied/throttled)",
+    labelnames=["outcome"],
+)
+
+
+def _refuse_mint(
+    outcome: str,
+    exc: exceptions.APIException,
+    *,
+    program: object,
+    product_node: str | None,
+    user: User | None = None,
+    team: Team | None = None,
+) -> NoReturn:
+    """Count and raise one mint refusal, so no exit can skip the counter.
+
+    The outcome rides as the body's `code`: the exception handler renders every
+    APIException as {type, code, detail, attr}, so a dict detail would be
+    flattened and a separate key dropped. The CLI shows `detail` and reports `code`.
+    """
+    WIZARD_GATEWAY_TOKEN_REQUESTS_TOTAL.labels(outcome=outcome).inc()
+    detail = ErrorDetail(_detail_text(exc), code=outcome)
+    # The handler reads a ValidationError's codes as a list, every other class's as a string.
+    exc.detail = [detail] if isinstance(exc, exceptions.ValidationError) else detail
+    raise exc
+
+
+def _detail_text(exc: exceptions.APIException) -> str:
+    detail = exc.detail
+    if isinstance(detail, list):
+        return str(detail[0]) if detail else str(exc.default_detail)
+    return str(detail)
+
+
+class SetupWizardCloudRunSerializer(serializers.Serializer):
+    project_id = serializers.IntegerField(
+        help_text="ID of the PostHog project to integrate PostHog into. The authenticated user must have access to it."
+    )
+    repository = serializers.CharField(
+        help_text=(
+            "GitHub repository to set up PostHog in, as 'owner/repo' (e.g. 'posthog/posthog-js'). The user "
+            "must have a connected GitHub integration with access to it."
+        )
+    )
+    branch = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Base branch the wizard's pull request should target. Defaults to the repository's default branch.",
+    )
+
+    def validate_repository(self, value: str) -> str:
+        repository = value.strip()
+        parts = repository.split("/")
+        if len(parts) != 2 or not all(parts):
+            raise serializers.ValidationError("Repository must be in 'owner/repo' format.")
+        return repository
+
+
+class SetupWizardCloudRunResponseSerializer(serializers.Serializer):
+    task_id = serializers.CharField(
+        help_text="ID of the created task. Poll the tasks API for its status and the resulting pull request URL."
+    )
+    run_id = serializers.CharField(help_text="ID of the task's run.")
+    status = serializers.CharField(help_text="Initial status of the run (e.g. 'queued').")
+
+
+class SetupWizardViewSet(viewsets.ViewSet):
+    # Each action resolves its target from the submitted project or validated OAuth token.
+    _ip_restrictions_use_view_scope = True
+
+    permission_classes = ()
+
+    def throttled(self, request: Request, wait: float) -> NoReturn:
+        # A rejection from DRF's own throttle check returns before the action body, so
+        # it counts here. A reservation that raises inside a body counts there instead.
+        if self.action == "cloud_run":
+            WIZARD_CLOUD_RUN_REQUESTS_TOTAL.labels(outcome="throttled").inc()
+        if self.action == "gateway_token":
+            WIZARD_GATEWAY_TOKEN_REQUESTS_TOTAL.labels(outcome="throttled").inc()
+        super().throttled(request, wait)
+
+    @action(
+        methods=["POST"],
+        detail=False,
+        url_path="gateway_token",
+        throttle_classes=[SetupWizardGatewayTokenRateThrottle],
+    )
+    def gateway_token(self, request: Request) -> Response:
+        """Mint a scoped gateway token for a wizard run.
+
+        The CLI uses the returned phe_ (pinned product=wizard / obo=<customer team id>,
+        capped, expiring) as its gateway bearer and re-calls near expiry. There is
+        no other gateway: every refusal ends the run, with the body's `detail`
+        shown to the user and its `code` naming the outcome.
+        """
+        # Resolved above the first gate so every refusal names the program. The
+        # product node waits for the policy, which is read after authentication.
+        body = request.data if isinstance(request.data, dict) else {}
+        program = body.get("program")
+        product: str | None = None
+        # Only a literal true: any other truthy shape keeps the 404 a fallback needs.
+        reads_reason = body.get("reads_refusal_reason") is True
+
+        def refuse(outcome: str, exc: exceptions.APIException, *, user: User | None = None) -> NoReturn:
+            _refuse_mint(outcome, exc, program=program, product_node=product, user=user, team=team)
+
+        def refuse_absent_gateway(outcome: str, message: str, *, user: User | None = None) -> NoReturn:
+            """Refuse one of the outcomes the CLI's legacy fallback absorbed.
+
+            A build that still falls back needs the 404 to reach the legacy
+            gateway, which carries its own retirement message; it renders a 403
+            as revoked project access instead. Only a client that says it reads
+            the reason gets one. Drop this once those builds are gone.
+            """
+            exc = exceptions.PermissionDenied(message) if reads_reason else exceptions.NotFound(message)
+            refuse(outcome, exc, user=user)
+
+        team: Team | None = None
+        posture: WizardPosture | None = None
+        if not wizard_gateway_configured():
+            refuse_absent_gateway("unconfigured", "The PostHog AI gateway is not configured on this instance.")
+
+        authenticator = OAuthAccessTokenAuthentication()
+        # authenticate() raises its own AuthenticationFailed, so the count wraps the
+        # call rather than only the two checks below.
+        try:
+            result = authenticator.authenticate(request)
+            if not result:
+                raise AuthenticationFailed("Invalid access token.")
+            user, _ = result
+            if not user:
+                raise AuthenticationFailed("Invalid access token.")
+        except AuthenticationFailed as e:
+            refuse("invalid_token", e)
+
+        access_token = authenticator.access_token
+        # llm_gateway:read is on every sandbox and agent token, so the scope alone
+        # cannot identify the wizard.
+        application = getattr(access_token, "application", None)
+        client_id = getattr(application, "client_id", None)
+        if not client_id or client_id not in settings.WIZARD_GATEWAY_CLIENT_IDS:
+            refuse("not_wizard_app", AuthenticationFailed("Access token was not issued to the wizard."), user=user)
+
+        # The token's own scope text: the `scopes` property filters through
+        # OAUTH2_PROVIDER["SCOPES"], where a narrowing would silently drop the scope.
+        if RequiredGatewayScope not in (access_token.scope or "").split():
+            refuse("scope_missing", AuthenticationFailed("Access token lacks the gateway scope."), user=user)
+
+        scoped_team_ids = access_token.scoped_teams or []
+        if len(scoped_team_ids) != 1:
+            refuse(
+                "team_ambiguous",
+                exceptions.ValidationError("Access token must be scoped to exactly one team."),
+                user=user,
+            )
+        team = Team.objects.select_related("organization").filter(id=scoped_team_ids[0]).first()
+        if team is None:
+            # 403: a vanished team is an authorization failure, not a missing route.
+            refuse("team_missing", exceptions.PermissionDenied(ERROR_PROJECT_NOT_FOUND), user=user)
+        enforce_ip_restrictions(request, user, authenticator, organization_id=str(team.organization_id))
+        posture = wizard_posture(team.organization, team)
+
+        # Named ahead of the generic authorization check so the CLI can tell the user what to do.
+        if email_verification_pending(user):
+            WIZARD_GATEWAY_TOKEN_REQUESTS_TOTAL.labels(outcome="email_unverified").inc()
+            raise exceptions.PermissionDenied(WIZARD_EMAIL_UNVERIFIED_DETAIL)
+
+        # scoped_teams is frozen at consent, so re-check what it cannot see.
+        if not oauth_credential_authorized(access_token, team):
+            refuse(
+                "unauthorized",
+                exceptions.PermissionDenied("Access token is no longer authorized for this project."),
+                user=user,
+            )
+
+        distinct_id = str(user.distinct_id)
+        try:
+            refused = security_access_refused(
+                SecuritySubject(
+                    email=user.email,
+                    user_uuid=str(user.uuid),
+                    organization_ids=(str(team.organization_id),),
+                    ip=get_trusted_client_ip(getattr(request, "_request", request)),
+                ),
+                SecuritySurface.AI_GATEWAY,
+                call_site="wizard_gateway_token",
+            )
+        except Exception:
+            logger.exception("security_access_check_site_failed", call_site="wizard_gateway_token")
+            refused = False
+        if refused:
+            refuse("blocked", exceptions.PermissionDenied(WIZARD_BLOCKED_DETAIL), user=user)
+
+        # Read once, after every gate that needs no flag, so an unauthenticated or
+        # refused request costs no flag read. A policy flag that is off or broken
+        # degrades the pin and never refuses the mint.
+        policy = wizard_gateway_policy(
+            distinct_id=distinct_id,
+            email=user.email,
+            organization_id=str(team.organization_id),
+            team_id=team.id,
+        )
+
+        # A closed set: refusing keeps every pinned node one that carries a budget.
+        product = wizard_product_node(program, policy)
+        if product is None:
+            refuse_absent_gateway(
+                "program_unknown", "Unrecognized wizard program. Upgrade with: npx @posthog/wizard@latest", user=user
+            )
+        # The override flag outranks the tier; the tier outranks the flat rate.
+        override = wizard_limit_override(
+            distinct_id=distinct_id,
+            email=user.email,
+            organization_id=str(team.organization_id),
+            team_id=team.id,
+        )
+        mints_per_week = override.mints_per_week
+        if mints_per_week is None:
+            mints_per_week = wizard_tier_limits(posture).mints_per_week
+        try:
+            reserved = reserve_wizard_mint(request, self, limit=mints_per_week)
+        except exceptions.Throttled as e:
+            # The reservation raises after check_throttles ran, so the throttled()
+            # hook never sees it.
+            refuse("throttled", e, user=user)
+        try:
+            minted = mint_wizard_gateway_token(
+                obo=str(team.id),
+                user=distinct_id,
+                policy=policy,
+                product=product,
+                cap_usd=override.cap_usd,
+                program=program,
+                posture=posture,
+            )
+        except WizardGatewayMintError as e:
+            # An ambiguous failure keeps the slot rather than risk the ceiling.
+            if not e.token_may_exist:
+                refund_wizard_mint(reserved)
+            WIZARD_GATEWAY_TOKEN_REQUESTS_TOTAL.labels(outcome="mint_failed").inc()
+            capture_exception(e, {"ai_product": "wizard", "team_id": team.id})
+            return Response({"error": "Gateway token mint failed."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        WIZARD_GATEWAY_TOKEN_REQUESTS_TOTAL.labels(outcome="minted").inc()
+        payload: dict[str, Any] = {
+            "token": minted["token"],
+            "expires_at": minted["expires_at"],
+            "cap_usd": minted.get("cap_usd"),
+            "gateway_url": wizard_gateway_base_url(),
+            # The CLI stamps this on each generation as `team_id`.
+            "team_id": team.id,
+        }
+        return Response(payload, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        request=SetupWizardCloudRunSerializer,
+        responses={200: SetupWizardCloudRunResponseSerializer},
+    )
+    @action(
+        methods=["POST"],
+        detail=False,
+        url_path="cloud_run",
+        authentication_classes=[SessionAuthentication],
+        permission_classes=[IsAuthenticated],
+        throttle_classes=[
+            SetupWizardCloudRunBurstRateThrottle,
+            SetupWizardCloudRunSustainedRateThrottle,
+        ],
+    )
+    def cloud_run(self, request: Request) -> Response:
+        """Run the PostHog setup wizard in the cloud against the user's GitHub repository.
+
+        Provisions a task-run sandbox that runs the published wizard headlessly to integrate PostHog,
+        then hands off to the task agent to open the pull request and keep it green. The wizard
+        authenticates with a dedicated, scoped token minted under the wizard's own OAuth app — distinct
+        from the agent's sandbox token. This is the cloud alternative to copy-pasting the wizard command
+        to run locally; it is intentionally rate limited heavily because each run starts a sandbox.
+        """
+        try:
+            response = self._cloud_run(request)
+        except exceptions.NotFound:
+            WIZARD_CLOUD_RUN_REQUESTS_TOTAL.labels(outcome="unavailable").inc()
+            raise
+        except exceptions.PermissionDenied:
+            WIZARD_CLOUD_RUN_REQUESTS_TOTAL.labels(outcome="permission_denied").inc()
+            raise
+        except exceptions.ValidationError:
+            WIZARD_CLOUD_RUN_REQUESTS_TOTAL.labels(outcome="invalid").inc()
+            raise
+        except exceptions.Throttled:
+            # The atomic attempt reservation inside _cloud_run raises after check_throttles
+            # ran, so the throttled() hook below never sees it.
+            WIZARD_CLOUD_RUN_REQUESTS_TOTAL.labels(outcome="throttled").inc()
+            raise
+        WIZARD_CLOUD_RUN_REQUESTS_TOTAL.labels(outcome="created").inc()
+        return response
+
+    @staticmethod
+    def _reserve_cloud_run_attempt(user_id: int) -> None:
+        """Atomically consume one of the user's daily cloud-run attempts or raise Throttled.
+
+        Runs after validation and project access checks, immediately before run creation, so
+        rejected requests never consume the budget — while parallel requests cannot all slip
+        under the ceiling the way they can with the read-then-create DB throttles.
+        """
+        window = int(time.time()) // 86400
+        key = f"wizard_cloud_run_attempts:{user_id}:{window}"
+        cache.add(key, 0, timeout=86400)
+        try:
+            count = cache.incr(key)
+        except ValueError:
+            # The key expired between add and incr; this request is the window's first.
+            count = 1
+        if count > WIZARD_CLOUD_RUN_DAILY_ATTEMPT_CAP:
+            raise exceptions.Throttled(detail="You've reached today's limit for cloud setup runs. Try again tomorrow.")
+
+    def _cloud_run(self, request: Request) -> Response:
+        if not bool(settings.WIZARD_CLOUD_RUN_OAUTH_CLIENT_ID):
+            raise exceptions.NotFound("Running the setup wizard in the cloud is not available.")
+
+        serializer = SetupWizardCloudRunSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        project_id = serializer.validated_data["project_id"]
+        repository = serializer.validated_data["repository"]
+        branch = serializer.validated_data.get("branch") or None
+
+        try:
+            # nosemgrep: idor-lookup-without-org, idor-taint-user-input-to-org-model (permission check below)
+            project = Project.objects.get(id=project_id)
+        except Project.DoesNotExist:
+            raise serializers.ValidationError({"project_id": [ERROR_PROJECT_NOT_FOUND]}, code="not_found")
+        user = cast(User, request.user)
+        enforce_ip_restrictions(
+            request, user, request.successful_authenticator, organization_id=str(project.organization_id)
+        )
+        if project.id not in UserPermissions(user).project_ids_visible_for_user:
+            raise exceptions.PermissionDenied("You don't have access to this project.")
+        # The sandbox this starts mints its own gateway token. Refused before the
+        # attempt is reserved, so a ban does not also cost a daily slot.
+        try:
+            refused = security_access_refused(
+                SecuritySubject(
+                    email=user.email,
+                    user_uuid=str(user.uuid),
+                    organization_ids=(str(project.organization_id),),
+                    ip=get_trusted_client_ip(getattr(request, "_request", request)),
+                ),
+                SecuritySurface.AI_GATEWAY,
+                call_site="wizard_cloud_run",
+            )
+        except Exception:
+            logger.exception("security_access_check_site_failed", call_site="wizard_cloud_run")
+            refused = False
+        if refused:
+            # No outcome label: `cloud_run` already counts every PermissionDenied as
+            # permission_denied.
+            raise exceptions.PermissionDenied(WIZARD_BLOCKED_DETAIL)
+
+        self._reserve_cloud_run_attempt(user.id)
+
+        try:
+            result = tasks_facade.create_wizard_cloud_run(
+                team=project.passthrough_team,
+                user_id=cast(User, request.user).id,
+                repository=repository,
+                branch=branch,
+            )
+        except ValueError as e:
+            # e.g. the team/user has no GitHub integration with access to the repository.
+            raise exceptions.ValidationError(str(e))
+
+        latest_run = result.latest_run
+        return Response(
+            {
+                "task_id": str(result.task_id),
+                "run_id": str(latest_run.id) if latest_run else "",
+                "status": latest_run.status if latest_run else "queued",
+            }
+        )

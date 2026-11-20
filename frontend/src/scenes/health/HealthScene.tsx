@@ -1,0 +1,141 @@
+import { useActions, useValues } from 'kea'
+
+import { IconBell, IconCheck, IconEllipsis, IconRefresh, IconSparkles, IconSupport } from '@posthog/icons'
+import { LemonButton, LemonMenu } from '@posthog/lemon-ui'
+
+import { supportLogic } from 'lib/components/Support/supportLogic'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { humanFriendlyDuration } from 'lib/utils/durations'
+import { SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { sidePanelStateLogic } from '~/layout/navigation-3000/sidepanel/sidePanelStateLogic'
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { SidePanelTab } from '~/types'
+
+import { HealthIssueList } from './components/HealthIssueList'
+import { HealthIssueSummaryCards } from './components/HealthIssueSummaryCards'
+import { PlatformStatusBanner } from './components/PlatformStatusBanner'
+import { healthSceneLogic } from './healthSceneLogic'
+import { buildHealthOverviewPrompt, HEALTH_OVERVIEW_QUESTIONS } from './healthUtils'
+import { QuillHealthSceneActions } from './QuillHealthSceneActions'
+
+export const HealthScene = (): JSX.Element => {
+    const { showDismissed, healthIssuesLoading, isRefreshInFlight, nextRefreshAvailableAt, issues } =
+        useValues(healthSceneLogic)
+    const { refreshHealthData, setShowDismissed } = useActions(healthSceneLogic)
+    const { openSupportForm } = useActions(supportLogic)
+    const { openSidePanel } = useActions(sidePanelStateLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+
+    const askAiEnabled = !!featureFlags[FEATURE_FLAGS.HEALTH_ASK_AI]
+
+    const now = Date.now()
+    const inCooldown = nextRefreshAvailableAt !== null && nextRefreshAvailableAt > now
+    const cooldownLabel = inCooldown
+        ? `Refresh available in ${humanFriendlyDuration(Math.ceil((nextRefreshAvailableAt! - now) / 1000), {
+              maxUnits: 2,
+          })}`
+        : undefined
+    const refreshTooltip = isRefreshInFlight
+        ? 'Refreshing health checks...'
+        : (cooldownLabel ?? 'Re-run all health checks for this project')
+
+    return (
+        <SceneContent>
+            <SceneTitleSection
+                name="Health"
+                description="See an at-a-glance view of the health of your project."
+                resourceType={{ type: 'health' }}
+                actions={
+                    todayRailNav ? (
+                        <QuillHealthSceneActions
+                            askAiEnabled={askAiEnabled}
+                            refreshTooltip={refreshTooltip}
+                            cooldownLabel={cooldownLabel}
+                        />
+                    ) : (
+                        <>
+                            <LemonButton
+                                icon={<IconBell />}
+                                type="secondary"
+                                size="small"
+                                to={urls.healthAlerts()}
+                                tooltip="Subscribe to alerts when any health check fires"
+                            >
+                                Alerts
+                            </LemonButton>
+
+                            {askAiEnabled && (
+                                <LemonMenu
+                                    items={HEALTH_OVERVIEW_QUESTIONS.map((question) => ({
+                                        label: question,
+                                        onClick: () =>
+                                            openSidePanel(
+                                                SidePanelTab.Max,
+                                                `!${buildHealthOverviewPrompt(issues, question)}`
+                                            ),
+                                    }))}
+                                    placement="bottom-end"
+                                >
+                                    <LemonButton
+                                        icon={<IconSparkles />}
+                                        type="secondary"
+                                        size="small"
+                                        tooltip="Ask PostHog AI about your health issues"
+                                    >
+                                        Ask PostHog AI
+                                    </LemonButton>
+                                </LemonMenu>
+                            )}
+                            <LemonButton
+                                icon={<IconSupport />}
+                                type="secondary"
+                                size="small"
+                                onClick={() => openSupportForm({ kind: 'support' })}
+                            >
+                                Get help from our team
+                            </LemonButton>
+                            <LemonButton
+                                icon={<IconRefresh />}
+                                type="tertiary"
+                                size="small"
+                                tooltip={refreshTooltip}
+                                loading={isRefreshInFlight || healthIssuesLoading}
+                                disabledReason={cooldownLabel}
+                                onClick={() => refreshHealthData()}
+                            />
+                            <LemonMenu
+                                items={[
+                                    {
+                                        label: 'Show dismissed',
+                                        icon: showDismissed ? <IconCheck /> : undefined,
+                                        onClick: () => setShowDismissed(!showDismissed),
+                                    },
+                                ]}
+                                placement="bottom-end"
+                            >
+                                <LemonButton icon={<IconEllipsis />} type="tertiary" size="small" />
+                            </LemonMenu>
+                        </>
+                    )
+                }
+            />
+
+            <div className="flex flex-col gap-6">
+                <PlatformStatusBanner />
+                <HealthIssueSummaryCards />
+                <HealthIssueList />
+            </div>
+        </SceneContent>
+    )
+}
+
+export const scene: SceneExport = {
+    component: HealthScene,
+    logic: healthSceneLogic,
+}

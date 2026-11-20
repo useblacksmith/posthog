@@ -1,0 +1,281 @@
+import { DateTime } from 'luxon'
+
+import { HogFlow } from '~/cdp/schema/hogflow'
+import { instrumentFn, instrumented } from '~/common/tracing/tracing-utils'
+import { logger } from '~/common/utils/logger'
+import { captureException } from '~/common/utils/posthog'
+
+import { RedisV2 } from '../../common/redis/redis-v2'
+import { KeyedRateLimitRequest, KeyedRateLimiterService } from '../../common/services/keyed-rate-limiter.service'
+import { QuotaLimiting } from '../../common/services/quota-limiting.service'
+import { CdpValkeyShadowPools } from '../cdp-services'
+import { counterRateLimited } from '../consumers/metrics'
+import {
+    CyclotronJobInvocation,
+    CyclotronJobInvocationHogFlow,
+    HogFunctionInvocationGlobals,
+    LogEntry,
+    MinimalAppMetric,
+} from '../types'
+import { dualRead } from '../utils/dual-store'
+import { InvocationFailureSink } from './dead-letter/cdp-dead-letter.service'
+import { HogFlowExecutorService } from './hogflows/hogflow-executor.service'
+import { HogFlowManagerService } from './hogflows/hogflow-manager.service'
+import { shouldBlockHogFlowDueToQuota } from './hogflows/hogflow-quota-limiting'
+import { HogFunctionMonitoringService } from './monitoring/hog-function-monitoring.service'
+import { HogMaskerService } from './monitoring/hog-masker.service'
+import { HogWatcherService, HogWatcherState, sameWatcherStates } from './monitoring/hog-watcher.service'
+import { WorkflowsActivationReporter } from './monitoring/workflows-activation-reporter'
+
+export interface HogFlowInvocationPipelineConfig {
+    CDP_RATE_LIMITER_BUCKET_SIZE: number
+    CDP_RATE_LIMITER_REFILL_RATE: number
+    CDP_RATE_LIMITER_TTL: number
+}
+
+export interface HogFlowInvocationPipelineDeps {
+    hogFlowManager: HogFlowManagerService
+    hogFlowExecutor: HogFlowExecutorService
+    hogWatcher: HogWatcherService
+    hogWatcherMirror: HogWatcherService
+    hogMasker: HogMaskerService
+    hogFunctionMonitoringService: HogFunctionMonitoringService
+    workflowsActivationReporter: Pick<WorkflowsActivationReporter, 'report'>
+    quotaLimiting: QuotaLimiting
+    redis: RedisV2
+    valkeyShadow: CdpValkeyShadowPools
+    /** Absent for consumers that have no dead-letter topic; their build failures stay metrics-only. */
+    deadLetterService?: InvocationFailureSink
+}
+
+/**
+ * Encapsulates the pipeline that turns event globals into hog flow invocations:
+ * load hogflows → execute filters → watcher state → rate limit → quota → masking → metrics.
+ *
+ * Consumers compose this service rather than inheriting it.
+ */
+export class HogFlowInvocationPipeline {
+    private hogRateLimiter: KeyedRateLimiterService
+    private hogRateLimiterMirror: KeyedRateLimiterService
+
+    constructor(
+        private config: HogFlowInvocationPipelineConfig,
+        private deps: HogFlowInvocationPipelineDeps
+    ) {
+        const rateLimiterConfig = {
+            name: 'hog-rate-limiter',
+            bucketSize: config.CDP_RATE_LIMITER_BUCKET_SIZE,
+            refillRate: config.CDP_RATE_LIMITER_REFILL_RATE,
+            ttlSeconds: config.CDP_RATE_LIMITER_TTL,
+        }
+        this.hogRateLimiter = new KeyedRateLimiterService(rateLimiterConfig, deps.redis)
+        this.hogRateLimiterMirror = new KeyedRateLimiterService(rateLimiterConfig, deps.valkeyShadow.writer)
+    }
+
+    public async buildInvocations(
+        invocationGlobals: HogFunctionInvocationGlobals[],
+        options?: { eligibilityFn?: (hogFlow: HogFlow, globals: HogFunctionInvocationGlobals) => boolean }
+    ): Promise<CyclotronJobInvocation[]> {
+        return (await this.buildInvocationsWithRelease(invocationGlobals, options)).invocations
+    }
+
+    /**
+     * Also returns the masker's `release`. Masking claims are written before the caller queues the runs,
+     * so a caller that retries after a failed queue must release them, or the retry masks every run.
+     */
+    @instrumented('cdpConsumer.handleEachBatch.queueMatchingFlows')
+    public async buildInvocationsWithRelease(
+        invocationGlobals: HogFunctionInvocationGlobals[],
+        options?: {
+            // Predicate evaluated per (flow, globals) before the executor runs filter bytecode.
+            // The consumer is the natural layer to decide trigger-source compatibility because it
+            // knows its own source (events consumer → event triggers; DWH consumer → matching
+            // warehouse-table triggers). Flows that fail the predicate are skipped without
+            // touching the executor.
+            eligibilityFn?: (hogFlow: HogFlow, globals: HogFunctionInvocationGlobals) => boolean
+        }
+    ): Promise<{
+        invocations: CyclotronJobInvocation[]
+        release: (persisted?: CyclotronJobInvocation[]) => Promise<void>
+    }> {
+        const teamsToLoad = [...new Set(invocationGlobals.map((x) => x.project.id))]
+        const hogFlowsByTeam = await this.deps.hogFlowManager.getHogFlowsForTeams(teamsToLoad)
+        const eligibilityFn = options?.eligibilityFn
+
+        const possibleInvocations = (
+            await Promise.all(
+                invocationGlobals.map(async (globals) => {
+                    const teamHogFlows = hogFlowsByTeam[globals.project.id]
+                    const eligibleFlows = eligibilityFn
+                        ? teamHogFlows.filter((flow) => eligibilityFn(flow, globals))
+                        : teamHogFlows
+
+                    try {
+                        const { invocations, metrics, logs, buildFailures } =
+                            await this.deps.hogFlowExecutor.buildHogFlowInvocations(eligibleFlows, globals)
+
+                        this.deps.hogFunctionMonitoringService.queueAppMetrics(metrics, 'hog_flow')
+                        this.deps.hogFunctionMonitoringService.queueLogs(logs, 'hog_flow')
+                        this.deps.deadLetterService?.recordBuildFailures(globals, buildFailures)
+
+                        return invocations
+                    } catch (error) {
+                        // See the same guard in HogFunctionInvocationPipeline: one workflow that
+                        // throws unexpectedly must not stall the partition for everyone else.
+                        if (error?.isRetriable === true) {
+                            throw error
+                        }
+                        if (!this.deps.deadLetterService?.recordProcessFailure(globals, error, 'hog_flow')) {
+                            throw error
+                        }
+                        return []
+                    }
+                })
+            )
+        ).flat()
+
+        const hogFlowIds = possibleInvocations.map((x) => x.hogFlow.id)
+        const states = await dualRead(
+            'hog-watcher.getEffectiveStates',
+            () =>
+                instrumentFn('cdpConsumer.handleEachBatch.hogWatcher.getEffectiveStates', async () => {
+                    return await this.deps.hogWatcher.getEffectiveStates(hogFlowIds)
+                }),
+            () => this.deps.hogWatcherMirror.getEffectiveStates(hogFlowIds),
+            sameWatcherStates
+        )
+
+        const rateLimitInputs: KeyedRateLimitRequest[] = possibleInvocations.map((x) => ({
+            id: x.hogFlow.id,
+            cost: 1,
+        }))
+        const rateLimits = await dualRead(
+            'hog-flow-rate-limiter.rateLimitGrouped',
+            () =>
+                instrumentFn('cdpConsumer.handleEachBatch.hogRateLimiter.rateLimitGrouped', async () => {
+                    return await this.hogRateLimiter.rateLimitGrouped(rateLimitInputs)
+                }),
+            () => this.hogRateLimiterMirror.rateLimitGrouped(rateLimitInputs),
+            (primary, secondary) =>
+                primary.every(([, result], index) => result.isRateLimited === secondary[index]?.[1].isRateLimited)
+        )
+        const validInvocations: CyclotronJobInvocationHogFlow[] = []
+
+        await Promise.all(
+            possibleInvocations.map(async (item, index) => {
+                try {
+                    const rateLimit = rateLimits[index][1]
+                    if (rateLimit.isRateLimited) {
+                        counterRateLimited.labels({ kind: 'hog_flow', function_id: item.functionId }).inc()
+                        this.deps.hogFunctionMonitoringService.queueAppMetric(
+                            {
+                                team_id: item.teamId,
+                                app_source_id: item.functionId,
+                                metric_kind: 'failure',
+                                metric_name: 'rate_limited',
+                                count: 1,
+                                app_source_version: { id: item.hogFlow.id, version: item.hogFlow.version },
+                            },
+                            'hog_flow'
+                        )
+
+                        const eventUuid = item.state?.event?.uuid
+                        const personId = item.person?.id
+
+                        const logEntry: LogEntry = {
+                            timestamp: DateTime.now(),
+                            level: 'warn',
+                            message: `Workflow invocation dropped due to rate limiting for [Person:${personId ?? 'unknown'}] on [Event:${eventUuid ?? 'unknown'}]`,
+                            team_id: item.teamId,
+                            log_source: 'hog_flow',
+                            log_source_id: item.functionId,
+                            instance_id: item.id,
+                        }
+                        this.deps.hogFunctionMonitoringService.queueLogs([logEntry], 'hog_flow')
+
+                        logger.warn('⚠️', 'Hogflow invocation rate limited', {
+                            teamId: item.teamId,
+                            hogFlowId: item.functionId,
+                            hogFlowName: item.hogFlow.name,
+                            eventUuid,
+                            personId,
+                        })
+
+                        return
+                    }
+                } catch (e) {
+                    captureException(e)
+                    logger.error('🔴', 'Error checking rate limit for hog flow', { err: e })
+                }
+
+                // Check quota limits for workflow actions
+                const isQuotaLimited = await shouldBlockHogFlowDueToQuota(item, {
+                    quotaLimiting: this.deps.quotaLimiting,
+                    hogFunctionMonitoringService: this.deps.hogFunctionMonitoringService,
+                    workflowsActivationReporter: this.deps.workflowsActivationReporter,
+                })
+
+                if (isQuotaLimited) {
+                    return
+                }
+
+                const state = states[item.hogFlow.id].state
+                if (state === HogWatcherState.disabled) {
+                    this.deps.hogFunctionMonitoringService.queueAppMetric(
+                        {
+                            team_id: item.teamId,
+                            app_source_id: item.functionId,
+                            metric_kind: 'failure',
+                            metric_name: 'disabled_permanently',
+                            count: 1,
+                            app_source_version: { id: item.hogFlow.id, version: item.hogFlow.version },
+                        },
+                        'hog_flow'
+                    )
+                    return
+                }
+
+                if (state === HogWatcherState.degraded) {
+                    item.queuePriority = 2
+                }
+
+                validInvocations.push(item)
+            })
+        )
+
+        const {
+            masked,
+            notMasked: notMaskedInvocations,
+            release,
+        } = await this.deps.hogMasker.filterByMasking(validInvocations)
+
+        this.deps.hogFunctionMonitoringService.queueAppMetrics(
+            masked.map((item) => ({
+                team_id: item.teamId,
+                app_source_id: item.functionId,
+                metric_kind: 'other',
+                metric_name: 'masked',
+                count: 1,
+                app_source_version: { id: item.hogFlow.id, version: item.hogFlow.version },
+            })),
+            'hog_flow'
+        )
+
+        const triggeredInvocationsMetrics: MinimalAppMetric[] = []
+
+        notMaskedInvocations.forEach((item) => {
+            triggeredInvocationsMetrics.push({
+                team_id: item.teamId,
+                app_source_id: item.functionId,
+                metric_kind: 'other',
+                metric_name: 'triggered',
+                count: 1,
+                app_source_version: { id: item.hogFlow.id, version: item.hogFlow.version },
+            })
+        })
+
+        this.deps.hogFunctionMonitoringService.queueAppMetrics(triggeredInvocationsMetrics, 'hog_flow')
+
+        return { invocations: notMaskedInvocations, release }
+    }
+}

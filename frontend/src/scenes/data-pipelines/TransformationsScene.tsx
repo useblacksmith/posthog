@@ -1,0 +1,77 @@
+import { IconPlus, IconPlusSmall } from '@posthog/icons'
+import { LemonButton } from '@posthog/lemon-ui'
+import { Button } from '@posthog/quill'
+
+import { Shortcut } from 'lib/components/Shortcuts/Shortcut'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { LinkPrimitive } from 'lib/lemon-ui/Link'
+import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { ProductKey } from '~/queries/schema/schema-general'
+
+import { transformationsEmptyState } from 'products/cdp/frontend/emptyState/transformationsEmptyState'
+
+import { DataPipelinesHogFunctions } from './DataPipelinesHogFunctions'
+import { transformationsSceneLogic } from './transformationsSceneLogic'
+
+export const scene: SceneExport = {
+    component: TransformationsScene,
+    logic: transformationsSceneLogic,
+    productKey: ProductKey.PIPELINE_TRANSFORMATIONS,
+    emptyState: transformationsEmptyState,
+}
+
+export function TransformationsScene(): JSX.Element {
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+    const action = (
+        <Shortcut
+            name="NewPipelineTransformation"
+            keybind={[keyBinds.new]}
+            intent="New transformation"
+            interaction="click"
+            scope={Scene.Transformations}
+        >
+            {todayRailNav ? (
+                <Button
+                    variant="primary"
+                    render={<LinkPrimitive to={urls.dataPipelinesNew('transformation')} />}
+                    tooltip="New transformation"
+                    data-attr="new-transformation"
+                >
+                    <IconPlus />
+                    New transformation
+                </Button>
+            ) : (
+                <LemonButton
+                    type="primary"
+                    to={urls.dataPipelinesNew('transformation')}
+                    icon={<IconPlusSmall />}
+                    size="small"
+                    tooltip="New transformation"
+                    data-attr="new-transformation"
+                >
+                    New transformation
+                </LemonButton>
+            )}
+        </Shortcut>
+    )
+
+    return (
+        <SceneContent>
+            <SceneTitleSection
+                name={sceneConfigurations[Scene.Transformations].name}
+                description={sceneConfigurations[Scene.Transformations].description}
+                resourceType={{
+                    type: sceneConfigurations[Scene.Transformations].iconType || 'default_icon_type',
+                }}
+                actions={action}
+            />
+            <DataPipelinesHogFunctions kind="transformation" />
+        </SceneContent>
+    )
+}
