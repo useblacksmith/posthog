@@ -1,0 +1,659 @@
+import { BindLogic, useActions, useValues } from 'kea'
+import { router } from 'kea-router'
+import posthog from 'posthog-js'
+import { ReactNode, RefObject, useEffect, useRef, useState } from 'react'
+
+import {
+    IconCheckbox,
+    IconChevronDown,
+    IconEllipsis,
+    IconFolderPlus,
+    IconHome,
+    IconPlusSmall,
+    IconStar,
+} from '@posthog/icons'
+
+import { itemSelectModalLogic } from 'lib/components/FileSystem/ItemSelectModal/itemSelectModalLogic'
+import { dayjs } from 'lib/dayjs'
+import { useLocalStorage } from 'lib/hooks/useLocalStorage'
+import { LemonTag } from 'lib/lemon-ui/LemonTag'
+import { LemonTree, LemonTreeRef, LemonTreeSize, TreeDataItem } from 'lib/lemon-ui/LemonTree/LemonTree'
+import { TreeNodeDisplayIcon } from 'lib/lemon-ui/LemonTree/LemonTreeUtils'
+import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture/ProfilePicture'
+import { ScrollableShadows } from 'lib/lemon-ui/ScrollableShadows/ScrollableShadows'
+import { ButtonPrimitive } from 'lib/ui/Button/ButtonPrimitives'
+import { ContextMenuGroup, ContextMenuItem } from 'lib/ui/ContextMenu/ContextMenu'
+import { DropdownMenuGroup } from 'lib/ui/DropdownMenu/DropdownMenu'
+import { cn } from 'lib/utils/css-classes'
+import { removeProjectIdIfPresent } from 'lib/utils/kea-router'
+import { sceneConfigurations } from 'scenes/scenes'
+
+import { panelLayoutLogic } from '~/layout/panel-layout/panelLayoutLogic'
+import { projectTreeDataLogic } from '~/layout/panel-layout/ProjectTree/projectTreeDataLogic'
+import { FileSystemEntry } from '~/queries/schema/schema-general'
+import { UserBasicType } from '~/types'
+
+import { PanelLayoutPanel } from '../PanelLayoutPanel'
+import { getSidebarProduct } from './defaultTree'
+import { isHomeFolder, withHomeFolderEmptyState } from './homeFolderUtils'
+import { MenuItems } from './menus/MenuItems'
+import { projectTreeLogic } from './projectTreeLogic'
+import { TreeFiltersDropdownMenu } from './TreeFiltersDropdownMenu'
+import { TreeSearchField } from './TreeSearchField'
+import { TreeSortMenuItems } from './TreeSortMenuItems'
+import { calculateMovePath, isProjectTreeItemActive, resolveProjectTreeDrop, shortcutTelemetryName } from './utils'
+
+// Product menus that open on a create action or a picker show a matching hint instead of the ellipsis
+const PRODUCT_MENU_BUTTON_ICONS: Record<string, JSX.Element> = {
+    'Product analytics': <IconPlusSmall className="text-tertiary" />,
+    Dashboards: <IconPlusSmall className="text-tertiary" />,
+    'Session replay': <IconChevronDown className="text-tertiary" />,
+}
+
+interface ProjectTreeBaseProps {
+    layout?: 'panel' | 'inline'
+    beforeTree?: ReactNode
+    renderTree?: (tree: JSX.Element) => ReactNode
+    showShortcutHelp?: boolean
+    logicKey?: string // key override?
+    root?: string
+    shortcutScope?: 'products' | 'files'
+    shareDragAndDropContext?: boolean
+    showRecents?: boolean // whether to show recents in the tree
+    searchPlaceholder?: string
+    treeSize?: LemonTreeSize
+    disableScroll?: boolean
+    /**
+     * Runs in addition to the tree's own click handling, not instead of it. A caller that renders
+     * the tree inside a larger surface uses this to report the click in that surface's own terms.
+     */
+    onItemClicked?: (item: TreeDataItem | undefined) => void
+    /** Replaces the tree's own tooltip, so a caller can match the tooltips of the rows around the tree. */
+    renderItemTooltip?: (item: TreeDataItem) => ReactNode | undefined
+    /** A docs link under the item's tooltip, for callers whose rows link to a product's docs. */
+    renderItemTooltipDocLink?: (item: TreeDataItem) => string | undefined
+    /** True while this tree's nav panel is active — refocuses search on panel re-activation. */
+    isActiveInPanel?: boolean
+}
+
+/** A bare tree has no panel to label, so `panelName` is only required when the panel renders. */
+export type ProjectTreeProps = ProjectTreeBaseProps &
+    (
+        | { onlyTree: true; panelName?: string }
+        | {
+              onlyTree?: false
+              /** Names the panel in the DOM. Pin it at the call site; a `data-attr` value is API and must not change. */
+              panelName: string
+          }
+    )
+
+let counter = 0
+
+const SHORTCUT_DISMISSAL_LOCAL_STORAGE_KEY = 'shortcut-dismissal'
+
+export function ProjectTree(props: ProjectTreeProps): JSX.Element {
+    const {
+        logicKey,
+        root,
+        shortcutScope,
+        onlyTree = false,
+        disableScroll = onlyTree || !!props.beforeTree || !!props.renderTree,
+        searchPlaceholder,
+        treeSize = 'default',
+        showRecents,
+        onItemClicked,
+        isActiveInPanel,
+    } = props
+    const [uniqueKey] = useState(() => `project-tree-${counter++}`)
+    const { viableItems, shortcutData, shortcutEntryIdMap, currentHomeFolder } = useValues(projectTreeDataLogic)
+    const { addShortcutItem, moveShortcutToFolder, reorderShortcutByDrag, setStarredNavigationRef } =
+        useActions(projectTreeDataLogic)
+    const projectTreeLogicProps = { key: logicKey ?? uniqueKey, root, shortcutScope, isActiveInPanel }
+    const {
+        fullFileSystemFiltered,
+        lastViewedId,
+        projectTreeRef,
+        expandedFolders,
+        expandedSearchFolders,
+        searchTerm,
+        searchResults,
+        checkedItems,
+        checkedItemCountNumeric,
+        scrollTargetId,
+        editingItemId,
+        sortMethod: projectSortMethod,
+        selectMode,
+        sortMethod,
+    } = useValues(projectTreeLogic(projectTreeLogicProps))
+    const {
+        createFolder,
+        rename,
+        moveItem,
+        toggleFolderOpen,
+        setLastViewedId,
+        setExpandedFolders,
+        setExpandedSearchFolders,
+        loadFolder,
+        onItemChecked,
+        moveCheckedItems,
+        clearScrollTarget,
+        setEditingItemId,
+        setSortMethod,
+        setSelectMode,
+    } = useActions(projectTreeLogic(projectTreeLogicProps))
+
+    const { resetPanelLayout } = useActions(panelLayoutLogic)
+    const { mainContentRef } = useValues(panelLayoutLogic)
+    const treeRef = useRef<LemonTreeRef>(null)
+    const { openItemSelectModal } = useActions(itemSelectModalLogic)
+
+    const [shortcutHelperDismissed, setShortcutHelperDismissed] = useLocalStorage<boolean>(
+        SHORTCUT_DISMISSAL_LOCAL_STORAGE_KEY,
+        false
+    )
+
+    const showFilterDropdown = root === 'project://'
+    const showSortMenuItems = root === 'project://'
+
+    const treeData: TreeDataItem[] = withHomeFolderEmptyState([...fullFileSystemFiltered], currentHomeFolder)
+
+    if (fullFileSystemFiltered.length <= 5) {
+        if (
+            props.showShortcutHelp !== false &&
+            root === 'shortcuts://' &&
+            (fullFileSystemFiltered.length === 0 || !shortcutHelperDismissed)
+        ) {
+            treeData.push({
+                id: 'products/shortcuts-helper-category',
+                name: 'Starred items',
+                type: 'category',
+                displayName: (
+                    <div className={cn('border border-primary text-xs font-normal rounded-xs p-2 -mx-1')}>
+                        Add a starred item by clicking{' '}
+                        <IconEllipsis className="size-3 border border-[var(--color-neutral-500)] rounded-xs" /> next to
+                        an item in the Files sidebar, then selecting "
+                        <IconStar className="size-3 border border-[var(--color-neutral-500)] rounded-xs" /> Add to
+                        starred". You can also add a starred item by opening a resource, clicking its project name in
+                        the side panel, and selecting "
+                        <IconStar className="size-3 border border-[var(--color-neutral-500)] rounded-xs" /> Add to
+                        starred".{' '}
+                        {fullFileSystemFiltered.length > 0 && (
+                            <span className="cursor-pointer underline" onClick={() => setShortcutHelperDismissed(true)}>
+                                Dismiss.
+                            </span>
+                        )}
+                    </div>
+                ),
+            })
+        }
+    }
+
+    useEffect(() => {
+        if (projectSortMethod !== (sortMethod ?? 'folder')) {
+            setSortMethod(sortMethod ?? 'folder')
+        }
+    }, [sortMethod, projectSortMethod, setSortMethod])
+
+    // When logic requests a scroll, focus the item and clear the request
+    useEffect(() => {
+        if (scrollTargetId && treeRef.current) {
+            treeRef.current.focusItem(scrollTargetId)
+            setLastViewedId(scrollTargetId) // keeps selection in sync
+            clearScrollTarget()
+        }
+    }, [scrollTargetId, treeRef, clearScrollTarget, setLastViewedId])
+
+    const tree = (
+        <LemonTree
+            ref={treeRef}
+            contentRef={mainContentRef as RefObject<HTMLElement>}
+            className="px-0 py-1"
+            data={treeData}
+            selectMode={selectMode}
+            defaultSelectedFolderOrNodeId={lastViewedId || undefined}
+            isItemActive={(item) =>
+                isProjectTreeItemActive(item, removeProjectIdIfPresent(window.location.pathname), projectTreeRef)
+            }
+            size={treeSize}
+            onItemChecked={onItemChecked}
+            checkedItemCount={checkedItemCountNumeric}
+            disableScroll={disableScroll}
+            onItemClick={(item, event) => {
+                event.preventDefault()
+                if (item?.type === 'empty-folder' || item?.type === 'loading-indicator') {
+                    return
+                }
+
+                if (item?.id.startsWith('project://-load-more/')) {
+                    const path = item.id.substring('project://-load-more/'.length)
+                    if (path) {
+                        loadFolder(path)
+                    }
+                    return
+                }
+
+                posthog.capture('project tree item clicked', {
+                    root: root ?? 'project://',
+                    item_type: item?.type ?? null,
+                    record_type: item?.record?.type ?? null,
+                    has_href: !!item?.record?.href,
+                    name: item?.name ?? null,
+                })
+
+                onItemClicked?.(item)
+
+                if (item?.record?.href) {
+                    const href =
+                        typeof item.record.href === 'function' ? item.record.href(item.record.ref) : item.record.href
+                    setStarredNavigationRef(
+                        root === 'shortcuts://' && shortcutScope === 'files' && item.record.type && item.record.ref
+                            ? { type: item.record.type, ref: item.record.ref }
+                            : null,
+                        href
+                    )
+                    router.actions.push(href)
+                }
+
+                if (item?.record?.path) {
+                    setLastViewedId(item?.id || '')
+                }
+
+                if (item?.id.startsWith('shortcuts')) {
+                    posthog.capture('navbar starred item clicked', {
+                        item_type: item?.record?.type || 'unknown',
+                        item_name: shortcutTelemetryName(item?.record?.type, item?.name || 'unknown'),
+                    })
+                }
+
+                // False, because we handle focus of content in LemonTree with mainContentRef prop
+                resetPanelLayout(false)
+            }}
+            onFolderClick={(folder, isExpanded) => {
+                if (folder) {
+                    posthog.capture('project tree folder toggled', {
+                        root: root ?? 'project://',
+                        is_expanded: isExpanded,
+                        name: folder.name ?? null,
+                    })
+                    toggleFolderOpen(folder?.id || '', isExpanded)
+                }
+            }}
+            isItemEditing={(item) => {
+                return editingItemId === item.id
+            }}
+            onItemNameChange={(item, name) => {
+                if (item.name !== name) {
+                    rename(name, item.record as unknown as FileSystemEntry)
+                }
+                // Clear the editing item id when the name changes
+                setEditingItemId('')
+            }}
+            expandedItemIds={searchTerm ? expandedSearchFolders : expandedFolders}
+            onSetExpandedItemIds={searchTerm ? setExpandedSearchFolders : setExpandedFolders}
+            enableDragAndDrop={!sortMethod || sortMethod === 'folder'}
+            dragAndDropScope={props.shareDragAndDropContext ? (logicKey ?? uniqueKey) : undefined}
+            rootDropId={root === 'shortcuts://' ? 'shortcuts://' : ''}
+            onDragEnd={(dragEvent) => {
+                const oldId = String(dragEvent.active.id)
+                const drop = resolveProjectTreeDrop(
+                    oldId,
+                    dragEvent.over ? String(dragEvent.over.id) : null,
+                    searchTerm && searchResults.results ? [...searchResults.results, ...viableItems] : viableItems,
+                    shortcutData,
+                    dragEvent.position
+                )
+                if (!drop) {
+                    return
+                }
+                if (drop.type === 'reorder') {
+                    reorderShortcutByDrag(
+                        drop.activeId,
+                        drop.overId,
+                        dragEvent.position === 'after' ? 'after' : 'before'
+                    )
+                    return
+                }
+                if (drop.type === 'move-shortcut') {
+                    moveShortcutToFolder(drop.item, drop.folder, logicKey ?? uniqueKey)
+                    return
+                }
+                if (drop.type === 'star') {
+                    addShortcutItem(drop.item)
+                    return
+                }
+                const { item: oldItem, folder } = drop
+
+                if (checkedItems[oldId]) {
+                    moveCheckedItems(folder)
+                } else {
+                    const { newPath, isValidMove } = calculateMovePath(oldItem, folder)
+                    if (isValidMove) {
+                        posthog.capture('project tree item moved', {
+                            root: root ?? 'project://',
+                            item_type: oldItem.type ?? null,
+                            method: 'drag',
+                        })
+                        moveItem(oldItem, newPath, false, logicKey ?? uniqueKey)
+                    }
+                }
+            }}
+            isItemDraggable={(item) => {
+                if (shortcutEntryIdMap.has(item.id)) {
+                    return true
+                }
+                return (item.id.startsWith('project/') || item.id.startsWith('project://')) && item.record?.path
+            }}
+            getItemDropMode={(item, activeId) =>
+                shortcutEntryIdMap.has(item.id)
+                    ? item.record?.type === 'folder'
+                        ? 'onto-or-reorder'
+                        : activeId && shortcutEntryIdMap.has(activeId)
+                          ? 'reorder'
+                          : 'onto'
+                    : 'onto'
+            }
+            isItemDroppable={(item) => {
+                const path = item.record?.path || ''
+
+                // Allow dropping onto other top-level starred items to reorder them.
+                if (shortcutEntryIdMap.has(item.id)) {
+                    return true
+                }
+
+                // disable dropping for these IDS
+                if (!item.id.startsWith('project://')) {
+                    return false
+                }
+
+                // hacky, if the item has a href, it should not be droppable
+                if (item.record?.href) {
+                    return false
+                }
+
+                if (path) {
+                    return true
+                }
+                return false
+            }}
+            itemContextMenu={(item) => {
+                if (item.record?.type !== 'folder') {
+                    return undefined
+                }
+                if (item.id.startsWith('project-folder-empty/')) {
+                    return undefined
+                }
+
+                return (
+                    <ContextMenuGroup className="group/colorful-product-icons colorful-product-icons-true">
+                        <MenuItems
+                            item={item}
+                            type="context"
+                            root={root}
+                            onlyTree={onlyTree}
+                            logicKey={logicKey}
+                            isActiveInPanel={isActiveInPanel}
+                        />
+                    </ContextMenuGroup>
+                )
+            }}
+            itemSideAction={(item) => {
+                if (selectMode === 'multi') {
+                    return undefined
+                }
+                if (item.id.startsWith('project-folder-empty/')) {
+                    return undefined
+                }
+
+                return (
+                    <DropdownMenuGroup className="group/colorful-product-icons colorful-product-icons-true">
+                        <MenuItems
+                            item={item}
+                            type="dropdown"
+                            root={root}
+                            onlyTree={onlyTree}
+                            logicKey={logicKey}
+                            isActiveInPanel={isActiveInPanel}
+                        />
+                    </DropdownMenuGroup>
+                )
+            }}
+            itemSideActionButton={(item) => {
+                if (selectMode === 'multi') {
+                    return undefined
+                }
+
+                const showDropdownMenu =
+                    root === 'products://' || (root === 'shortcuts://' && !!getSidebarProduct(item.record?.href))
+
+                const menuButtonIcon = showDropdownMenu ? PRODUCT_MENU_BUTTON_ICONS[item.name] : undefined
+                if (menuButtonIcon) {
+                    return (
+                        <ButtonPrimitive
+                            iconOnly
+                            isSideActionRight
+                            className="z-2 -outline-offset-2"
+                            data-attr={`menu-item-${item.name.toLowerCase().replace(/\s+/g, '-')}-menu-button`}
+                        >
+                            {menuButtonIcon}
+                        </ButtonPrimitive>
+                    )
+                }
+            }}
+            emptySpaceContextMenu={() => {
+                return (
+                    <ContextMenuGroup>
+                        <ContextMenuItem
+                            asChild
+                            onClick={(e) => {
+                                e.stopPropagation()
+                                createFolder('')
+                            }}
+                        >
+                            <ButtonPrimitive menuItem>New folder</ButtonPrimitive>
+                        </ContextMenuItem>
+                    </ContextMenuGroup>
+                )
+            }}
+            renderItemTooltipDocLink={props.renderItemTooltipDocLink}
+            renderItemTooltip={(item) => {
+                if (props.renderItemTooltip) {
+                    return props.renderItemTooltip(item)
+                }
+                const nameNode: JSX.Element = <span className="font-semibold">{item.displayName}</span>
+
+                if (root === 'products://' || root === 'data://' || root === 'persons://') {
+                    const key = item.record?.sceneKey
+
+                    return (
+                        <>
+                            {root === 'products://' && treeSize === 'narrow' && (
+                                <>
+                                    <p className="mb-1 font-semibold">{item.displayName}</p>
+                                </>
+                            )}
+                            {sceneConfigurations[key]?.description || item.name}
+                        </>
+                    )
+                }
+
+                if (root === 'persons://') {
+                    return nameNode
+                }
+
+                if (root === 'new://') {
+                    if (item.children) {
+                        return <>View all</>
+                    }
+                    return <>Create a new {nameNode}</>
+                }
+
+                if (root === 'project://' || root === 'shortcuts://') {
+                    const key = item.record?.sceneKey
+                    const description = sceneConfigurations[key]?.description
+                    if (description) {
+                        return <>{description}</>
+                    }
+                    return undefined
+                }
+
+                return undefined
+            }}
+            renderItemIcon={(item) => {
+                return (
+                    <>
+                        {sortMethod === 'recent' && item.type !== 'loading-indicator' && (
+                            <ProfilePicture
+                                user={item.record?.user as UserBasicType | undefined}
+                                size="xs"
+                                className="ml-[4px]"
+                            />
+                        )}
+                        <TreeNodeDisplayIcon
+                            item={item}
+                            expandedItemIds={expandedFolders}
+                            defaultFolderIcon={isHomeFolder(item, currentHomeFolder) ? <IconHome /> : undefined}
+                        />
+                    </>
+                )
+            }}
+            renderItem={(item) => {
+                if (item.type === 'empty-folder') {
+                    return item.displayName
+                }
+                // A shortcut's created_at is when it was starred, not when the item was created.
+                const isNew =
+                    root !== 'shortcuts://' &&
+                    item.record?.created_at &&
+                    dayjs().diff(dayjs(item.record?.created_at), 'minutes') < 3
+
+                return (
+                    <span className="flex w-full min-w-0 items-center gap-1.5">
+                        <span className="flex-1 truncate">
+                            <span
+                                className={cn('truncate', {
+                                    'font-semibold': item.record?.type === 'folder',
+                                })}
+                            >
+                                {item.displayName}{' '}
+                                {isNew ? (
+                                    <LemonTag type="highlight" size="small" className="ml-1 relative top-[-1px]">
+                                        New
+                                    </LemonTag>
+                                ) : null}
+                            </span>
+
+                            {sortMethod === 'recent' && item.type !== 'loading-indicator' && (
+                                <span className="text-tertiary text-xxs pt-[3px] ml-1">
+                                    {dayjs(item.record?.created_at).fromNow()}
+                                </span>
+                            )}
+                        </span>
+                    </span>
+                )
+            }}
+        />
+    )
+
+    if (props.onlyTree) {
+        return tree
+    }
+
+    return (
+        <PanelLayoutPanel
+            panelName={props.panelName}
+            layout={props.layout}
+            searchField={
+                <BindLogic logic={projectTreeLogic} props={projectTreeLogicProps}>
+                    <TreeSearchField
+                        root={root}
+                        placeholder={searchPlaceholder}
+                        treeRef={treeRef}
+                        isActive={isActiveInPanel}
+                    />
+                </BindLogic>
+            }
+            filterDropdown={showFilterDropdown ? <TreeFiltersDropdownMenu logicProps={projectTreeLogicProps} /> : null}
+            panelMenuItems={
+                showSortMenuItems ? <TreeSortMenuItems sortMethod={sortMethod} setSortMethod={setSortMethod} /> : null
+            }
+            panelActionsNewSceneLayout={[
+                {
+                    ...(root === 'project://' &&
+                        sortMethod !== 'recent' && {
+                            tooltip: 'New root folder',
+                            'data-attr': 'tree-panel-new-root-folder-button',
+                            onClick: () => createFolder(''),
+                            children: (
+                                <>
+                                    <IconFolderPlus className="text-tertiary size-3" />
+                                    New root folder
+                                </>
+                            ),
+                        }),
+                },
+                {
+                    ...(root === 'project://' &&
+                        sortMethod !== 'recent' && {
+                            tooltip: selectMode === 'default' ? 'Enable multi-select' : 'Disable multi-select',
+                            'data-attr': 'tree-panel-enable-multi-select-button',
+                            onClick: () => {
+                                posthog.capture('project tree multi-select toggled', {
+                                    root: root ?? 'project://',
+                                    enabled: selectMode === 'default',
+                                })
+                                setSelectMode(selectMode === 'default' ? 'multi' : 'default')
+                            },
+                            active: selectMode === 'multi',
+                            'aria-pressed': selectMode === 'multi',
+                            children: (
+                                <>
+                                    <IconCheckbox
+                                        className={cn('size-3', {
+                                            'text-tertiary': selectMode === 'default',
+                                            'text-primary': selectMode === 'multi',
+                                        })}
+                                    />
+                                    {selectMode === 'default' ? 'Enable multi-select' : 'Disable multi-select'}
+                                </>
+                            ),
+                        }),
+                },
+                {
+                    ...(root === 'shortcuts://' &&
+                        sortMethod !== 'recent' && {
+                            'data-attr': 'shortcuts-panel-add-button',
+                            onClick: openItemSelectModal,
+                            children: (
+                                <>
+                                    <IconPlusSmall
+                                        className={cn('size-3', {
+                                            'text-tertiary': selectMode === 'default',
+                                            'text-primary': selectMode === 'multi',
+                                        })}
+                                    />
+                                    Add to starred
+                                </>
+                            ),
+                        }),
+                },
+            ]}
+        >
+            {showRecents && (
+                <>
+                    <div role="status" aria-live="polite" className="sr-only">
+                        Sorted {sortMethod === 'recent' ? 'by creation date' : 'alphabetically'}
+                    </div>
+                </>
+            )}
+
+            {props.beforeTree || props.renderTree ? (
+                <ScrollableShadows direction="vertical" className="flex-1 min-h-0" styledScrollbars>
+                    {props.beforeTree}
+                    {props.renderTree ? props.renderTree(tree) : tree}
+                </ScrollableShadows>
+            ) : (
+                tree
+            )}
+        </PanelLayoutPanel>
+    )
+}

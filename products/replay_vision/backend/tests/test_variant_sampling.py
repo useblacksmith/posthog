@@ -1,0 +1,186 @@
+import pytest
+from posthog.test.base import BaseTest
+from unittest.mock import patch
+
+from posthog.hogql import ast
+
+from products.replay_vision.backend.queries.scanner_candidate_query import (
+    SAMPLE_RATE_PRECISION,
+    variant_sampling_predicate,
+)
+from products.replay_vision.backend.queries.variant_sampling import plan_variant_sampling
+from products.replay_vision.backend.scope.experiment import ExperimentScope, ExperimentScopeSettings
+
+
+class TestPlanVariantSampling:
+    def test_uneven_split_gets_even_coverage_at_the_same_total(self) -> None:
+        # The doc's example: 10% over a 90/10 split keeps ~50 of each per 1,000 exposed sessions,
+        # not 90 and 10, and the total budget is unchanged.
+        plan = plan_variant_sampling(0.1, {"control": 0.9, "test": 0.1}, None)
+
+        assert plan is not None
+        assert plan.rates["control"] == pytest.approx(0.05 / 0.9)
+        assert plan.rates["test"] == pytest.approx(0.5)
+        assert plan.effective_rate == pytest.approx(0.1)
+        # Equal coverage: each variant contributes the same absolute fraction.
+        assert plan.population_shares["control"] * plan.rates["control"] == pytest.approx(
+            plan.population_shares["test"] * plan.rates["test"]
+        )
+
+    def test_a_capped_small_variant_frees_its_budget_for_the_others(self) -> None:
+        # 95/5 at 20%: the small arm is sampled whole (rate 1) and cannot supply more, so the
+        # leftover budget flows to control instead of shrinking the total.
+        plan = plan_variant_sampling(0.2, {"control": 0.95, "test": 0.05}, None)
+
+        assert plan is not None
+        assert plan.rates["test"] == 1.0
+        assert plan.rates["control"] == pytest.approx(0.15 / 0.95)
+        assert plan.effective_rate == pytest.approx(0.2)
+
+    def test_selected_variants_normalize_within_the_watched_set(self) -> None:
+        plan = plan_variant_sampling(0.5, {"control": 0.5, "test": 0.4, "beta": 0.1}, ["control", "test"])
+
+        assert plan is not None
+        assert set(plan.rates) == {"control", "test"}
+        assert plan.population_shares["control"] == pytest.approx(5 / 9)
+
+    @pytest.mark.parametrize(
+        "selected,shares",
+        [
+            (["test"], {"control": 0.5, "test": 0.5}),
+            (None, {}),
+        ],
+    )
+    def test_no_plan_when_balancing_changes_nothing(self, selected, shares) -> None:
+        assert plan_variant_sampling(0.1, shares, selected) is None
+
+    def test_a_zero_share_variant_is_sampled_whole_without_eating_budget(self) -> None:
+        plan = plan_variant_sampling(0.1, {"control": 1.0, "test": 0.0}, None)
+
+        assert plan is not None
+        assert plan.rates["test"] == 1.0
+        assert plan.rates["control"] == pytest.approx(0.1)
+
+    def test_a_paused_scanner_samples_nothing(self) -> None:
+        # Rate 0 means paused; the cap must not turn "no budget" into sampling a zero-share
+        # variant whole.
+        plan = plan_variant_sampling(0.0, {"control": 1.0, "test": 0.0}, None)
+
+        assert plan is not None
+        assert plan.rates == {"control": 0.0, "test": 0.0}
+        assert plan.effective_rate == 0.0
+
+    @pytest.mark.parametrize(
+        "rate,weights",
+        [
+            (0.1, {"control": 900, "test": 100}),
+            # The cap binds on the small arm; redistribution still spends the whole budget.
+            (0.2, {"control": 950, "test": 50}),
+            (0.5, {"control": 500, "test": 400, "beta": 100}),
+        ],
+    )
+    def test_balancing_never_changes_the_projected_volume(self, rate, weights) -> None:
+        # This invariant is what lets the volume estimate (and the scout cost check) project with
+        # the plain rate whether balancing is on or off, cap or no cap.
+        from products.replay_vision.backend.queries.scanner_volume_estimate import (
+            ScannerVolumeEstimate,
+            project_monthly_observations,
+        )
+
+        plan = plan_variant_sampling(rate, weights, None)
+
+        assert plan is not None
+        assert plan.effective_rate == pytest.approx(rate)
+        estimate = ScannerVolumeEstimate(matched_sessions=7_000, effective_window_days=7)
+        assert project_monthly_observations(estimate, plan.effective_rate) == project_monthly_observations(
+            estimate, rate
+        )
+
+
+class TestVariantSamplingPredicate:
+    def test_builds_one_threshold_arm_per_variant_over_the_shared_hash(self) -> None:
+        predicate = variant_sampling_predicate({"control": 0.25, "test": 1.0}, "salt-1")
+
+        assert isinstance(predicate, ast.Call) and predicate.name == "multiIf"
+        # Two (condition, then) pairs plus the fall-through.
+        assert len(predicate.args) == 5
+        thresholds = [
+            arg.right.value
+            for arg in predicate.args[1::2]
+            if isinstance(arg, ast.CompareOperation) and isinstance(arg.right, ast.Constant)
+        ]
+        assert thresholds == [round(0.25 * SAMPLE_RATE_PRECISION), SAMPLE_RATE_PRECISION]
+        fall_through = predicate.args[-1]
+        assert isinstance(fall_through, ast.Constant) and fall_through.value is False
+
+    def test_no_predicate_when_every_variant_is_sampled_whole(self) -> None:
+        assert variant_sampling_predicate({"control": 1.0, "test": 1.0}, "salt-1") is None
+
+
+class TestVariantSamplingPlanForScope(BaseTest):
+    def _plan(self, *, scope, counts, scanner_config=None):
+        from products.replay_vision.backend.queries.variant_sampling import variant_sampling_plan_for_scope
+
+        with patch(
+            "products.replay_vision.backend.queries.variant_sampling._variant_exposure_counts",
+            return_value=counts,
+        ):
+            return variant_sampling_plan_for_scope(
+                self.team,
+                scope=scope,
+                scanner_config=scanner_config if scanner_config is not None else {"prompt": "p"},
+                sampling_rate=0.1,
+                user=self.user,
+            )
+
+    def _scope(self, **settings) -> ExperimentScope:
+        return ExperimentScope(ExperimentScopeSettings(**settings))
+
+    def test_a_scope_watching_one_arm_gets_no_plan_without_counting_exposures(self) -> None:
+        # Balancing spreads a budget across arms, so one watched arm has nothing to spread.
+        # `scope_for` has already folded a legacy singular `variant` into this one-item list.
+        #
+        # The count is skipped rather than run and discarded: it aggregates the experiment's
+        # exposure history and reads the team's identity mapping, on every sweep and backfill tick
+        # of a scanner whose answer cannot depend on it.
+        counts = {"control": 60.0, "test": 40.0}
+
+        with patch("products.replay_vision.backend.queries.variant_sampling._variant_exposure_counts") as counted:
+            one_arm = self._plan(scope=self._scope(experiment_id=42, variants=["test"]), counts=counts)
+
+        assert one_arm is None
+        counted.assert_not_called()
+
+        both = self._plan(scope=self._scope(experiment_id=42, variants=["control", "test"]), counts=counts)
+        assert both is not None and set(both.rates) == {"control", "test"}
+
+    def test_a_scanner_of_any_type_balances_when_its_scope_names_an_experiment(self) -> None:
+        # The plan is judged on the scope, not the scanner type. Before, a non-experiment type
+        # returned None here, so a scope-based scanner silently kept plain sampling.
+        plan = self._plan(
+            scope=self._scope(experiment_id=42, variants=["control", "test"]),
+            counts={"control": 60.0, "test": 40.0},
+        )
+        assert plan is not None and set(plan.rates) == {"control", "test"}
+
+    def test_no_scope_gets_no_plan(self) -> None:
+        assert self._plan(scope=None, counts={"control": 60.0, "test": 40.0}) is None
+
+    def test_balancing_turned_off_in_the_scope_gets_no_plan(self) -> None:
+        # Read from the scope, not `scanner_config["balance_variants"]`, so the answer survives the
+        # migration that strips the scope keys out of the config.
+        plan = self._plan(
+            scope=self._scope(experiment_id=42, variants=["control", "test"], balance=False),
+            counts={"control": 60.0, "test": 40.0},
+        )
+        assert plan is None
+
+    def test_a_config_that_still_says_balance_variants_no_longer_decides(self) -> None:
+        # The config key is the pre-migration store. A row whose scope says balance is balanced
+        # even while the stale key sits in its config, so the two stores cannot disagree.
+        plan = self._plan(
+            scope=self._scope(experiment_id=42, variants=["control", "test"]),
+            counts={"control": 60.0, "test": 40.0},
+            scanner_config={"prompt": "p", "balance_variants": False},
+        )
+        assert plan is not None and set(plan.rates) == {"control", "test"}

@@ -1,0 +1,164 @@
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * MCP service uses these Zod schemas for generated tool handlers.
+ * To regenerate: hogli build:openapi
+ *
+ * PostHog API - MCP 5 enabled ops
+ * OpenAPI spec version: 1.0.0
+ */
+import * as zod from 'zod'
+
+export const EarlyAccessFeatureListParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const EarlyAccessFeatureListQueryParams = () => zod.object({
+    created_by_id: zod
+        .string()
+        .optional()
+        .describe('Comma-separated user IDs. Only features created by one of them are listed.'),
+    ids: zod.string().optional().describe('Comma-separated early access feature IDs, at most 200.'),
+    limit: zod.number().optional().describe('Number of results to return per page.'),
+    offset: zod.number().optional().describe('The initial index from which to return the results.'),
+    order: zod
+        .string()
+        .optional()
+        .describe('Sort by creation time: -created_at (default) for newest first, created_at for oldest first.'),
+    search: zod.string().optional().describe('Case-insensitive match on the feature name.'),
+})
+
+export const EarlyAccessFeatureCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const earlyAccessFeatureCreateBodyNameMax = 200
+
+export const earlyAccessFeatureCreateBodyDocumentationUrlOneMax = 800
+
+export const earlyAccessFeatureCreateBodyDocumentationUrlTwoMax = 0
+
+export const earlyAccessFeatureCreateBodyImageUrlOneMax = 800
+
+export const earlyAccessFeatureCreateBodyImageUrlTwoMax = 0
+
+export const EarlyAccessFeatureCreateBody = () => zod
+    .object({
+        name: zod.string().max(earlyAccessFeatureCreateBodyNameMax).describe('The name of the early access feature.'),
+        description: zod
+            .string()
+            .optional()
+            .describe('A longer description of what this early access feature does, shown to users in the opt-in UI.'),
+        stage: zod
+            .enum(['draft', 'concept', 'alpha', 'beta', 'general-availability', 'archived'])
+            .describe(
+                '\* `draft` - draft\n\* `concept` - concept\n\* `alpha` - alpha\n\* `beta` - beta\n\* `general-availability` - general availability\n\* `archived` - archived'
+            )
+            .describe(
+                'Lifecycle stage. Valid values: draft, concept, alpha, beta, general-availability, archived. Moving to an active stage (alpha\/beta\/general-availability) enables the feature flag for opted-in users.\n\n\* `draft` - draft\n\* `concept` - concept\n\* `alpha` - alpha\n\* `beta` - beta\n\* `general-availability` - general availability\n\* `archived` - archived'
+            ),
+        documentation_url: zod
+            .union([
+                zod.url().max(earlyAccessFeatureCreateBodyDocumentationUrlOneMax),
+                zod.string().max(earlyAccessFeatureCreateBodyDocumentationUrlTwoMax),
+            ])
+            .optional()
+            .describe('URL to external documentation for this feature. Shown to users in the opt-in UI.'),
+        image_url: zod
+            .union([
+                zod.url().max(earlyAccessFeatureCreateBodyImageUrlOneMax),
+                zod.string().max(earlyAccessFeatureCreateBodyImageUrlTwoMax),
+            ])
+            .optional()
+            .describe('URL of an image that shows the feature, such as a screenshot. Shown to users in the opt-in UI.'),
+        payload: zod.unknown().optional().describe('Arbitrary JSON metadata associated with this feature.'),
+        feature_flag_id: zod
+            .number()
+            .optional()
+            .describe(
+                'Optional ID of an existing feature flag to link. If omitted, a new flag is auto-created from the feature name. The flag must not already be linked to another feature, must not belong to another product such as a survey or experiment, must not be group-based, and must not be multivariate.'
+            ),
+        _create_in_folder: zod.string().optional(),
+    })
+    .describe('Mixin for serializers to add user access control fields')
+
+export const EarlyAccessFeatureRetrieveParams = () => zod.object({
+    id: zod.string().describe('A UUID string identifying this early access feature.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const EarlyAccessFeaturePartialUpdateParams = () => zod.object({
+    id: zod.string().describe('A UUID string identifying this early access feature.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const earlyAccessFeaturePartialUpdateBodyNameMax = 200
+
+export const earlyAccessFeaturePartialUpdateBodyDocumentationUrlOneMax = 800
+
+export const earlyAccessFeaturePartialUpdateBodyDocumentationUrlTwoMax = 0
+
+export const earlyAccessFeaturePartialUpdateBodyImageUrlOneMax = 800
+
+export const earlyAccessFeaturePartialUpdateBodyImageUrlTwoMax = 0
+
+export const EarlyAccessFeaturePartialUpdateBody = () => zod
+    .object({
+        name: zod
+            .string()
+            .max(earlyAccessFeaturePartialUpdateBodyNameMax)
+            .optional()
+            .describe('The name of the early access feature.'),
+        description: zod
+            .string()
+            .optional()
+            .describe('A longer description of what this early access feature does, shown to users in the opt-in UI.'),
+        stage: zod
+            .enum(['draft', 'concept', 'alpha', 'beta', 'general-availability', 'archived'])
+            .describe(
+                '\* `draft` - draft\n\* `concept` - concept\n\* `alpha` - alpha\n\* `beta` - beta\n\* `general-availability` - general availability\n\* `archived` - archived'
+            )
+            .optional()
+            .describe(
+                'Lifecycle stage. Valid values: draft, concept, alpha, beta, general-availability, archived. Moving to an active stage (alpha\/beta\/general-availability) enables the feature flag for opted-in users.\n\n\* `draft` - draft\n\* `concept` - concept\n\* `alpha` - alpha\n\* `beta` - beta\n\* `general-availability` - general availability\n\* `archived` - archived'
+            ),
+        documentation_url: zod
+            .union([
+                zod.url().max(earlyAccessFeaturePartialUpdateBodyDocumentationUrlOneMax),
+                zod.string().max(earlyAccessFeaturePartialUpdateBodyDocumentationUrlTwoMax),
+            ])
+            .optional()
+            .describe('URL to external documentation for this feature. Shown to users in the opt-in UI.'),
+        image_url: zod
+            .union([
+                zod.url().max(earlyAccessFeaturePartialUpdateBodyImageUrlOneMax),
+                zod.string().max(earlyAccessFeaturePartialUpdateBodyImageUrlTwoMax),
+            ])
+            .optional()
+            .describe('URL of an image that shows the feature, such as a screenshot. Shown to users in the opt-in UI.'),
+    })
+    .describe('Mixin for serializers to add user access control fields')
+
+export const EarlyAccessFeatureDestroyParams = () => zod.object({
+    id: zod.string().describe('A UUID string identifying this early access feature.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})

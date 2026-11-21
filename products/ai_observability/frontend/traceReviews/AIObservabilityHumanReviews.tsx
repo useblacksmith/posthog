@@ -1,0 +1,73 @@
+import { useActions, useValues } from 'kea'
+import { combineUrl, router } from 'kea-router'
+
+import { LemonTab, LemonTabs } from '@posthog/lemon-ui'
+
+import { urls } from '~/scenes/urls'
+
+import { withoutTraceDrawerParams } from '../redesign/trace/traceDrawerRows'
+import { AIObservabilityReviewQueues } from '../reviewQueues/AIObservabilityReviewQueues'
+import { AIObservabilityReviews } from './AIObservabilityReviews'
+
+const HUMAN_REVIEWS_TAB_PARAM = 'human_reviews_tab'
+
+export function AIObservabilityHumanReviews(): JSX.Element {
+    const { searchParams } = useValues(router)
+    const { push } = useActions(router)
+    const tabParams = withoutTraceDrawerParams(searchParams)
+
+    const activeHumanReviewsTab =
+        searchParams[HUMAN_REVIEWS_TAB_PARAM] === 'reviews'
+            ? 'reviews'
+            : searchParams[HUMAN_REVIEWS_TAB_PARAM] === 'scorers'
+              ? 'scorers'
+              : 'queues'
+
+    const tabs: LemonTab<string>[] = [
+        {
+            key: 'queues',
+            label: 'Queues',
+            content: <AIObservabilityReviewQueues />,
+            link: combineUrl(urls.aiObservabilityReviews(), {
+                ...tabParams,
+                [HUMAN_REVIEWS_TAB_PARAM]: undefined,
+            }).url,
+            'data-attr': 'llma-review-queues-tab',
+        },
+        {
+            key: 'reviews',
+            label: 'Reviews',
+            content: <AIObservabilityReviews />,
+            link: combineUrl(urls.aiObservabilityReviews(), {
+                ...tabParams,
+                [HUMAN_REVIEWS_TAB_PARAM]: 'reviews',
+            }).url,
+            'data-attr': 'llma-trace-reviews-tab',
+        },
+        {
+            key: 'scorers',
+            label: 'Scorers',
+            content: <></>,
+            link: urls.aiObservabilityScorers(),
+            'data-attr': 'llma-scorers-tab',
+        },
+    ]
+
+    return (
+        <LemonTabs
+            activeKey={activeHumanReviewsTab}
+            data-attr="llma-reviews-tabs"
+            tabs={tabs}
+            onChange={(tab) =>
+                push(
+                    tab === 'scorers'
+                        ? urls.aiObservabilityScorers()
+                        : combineUrl(urls.aiObservabilityReviews(), {
+                              ...tabParams,
+                              [HUMAN_REVIEWS_TAB_PARAM]: tab === 'reviews' ? 'reviews' : undefined,
+                          }).url
+                )
+            }
+        />
+    )
+}

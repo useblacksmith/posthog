@@ -1,0 +1,20 @@
+# MCP tool definitions. Tools are opt-in: an operation is exposed only when it has an entry here.
+# List operations without an entry: pnpm --filter=@posthog/mcp run scaffold-yaml -- --candidates --product docs
+# Add one: pnpm --filter=@posthog/mcp run scaffold-yaml -- --add <operationId> --product docs
+# To keep an operation off on purpose, set enabled: false and give a disabled_reason.
+category: Docs
+feature: docs
+url_prefix: /
+ui_apps: {}
+tools:
+    docs-search:
+        operation: docs_search
+        enabled: true
+        scopes:
+            - project:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Search documentation
+        description_file: ./prompts/docs-search.md

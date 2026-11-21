@@ -1,0 +1,411 @@
+import { HogQLQueryString, escapeHogQLString, hogql } from 'lib/utils/hogql'
+
+import { setLatestVersionsOnQuery } from '~/queries/schema/query-versions'
+import {
+    DataTableNode,
+    DateRange,
+    DocumentSimilarityQuery,
+    ErrorTrackingBreakdownsQuery,
+    ErrorTrackingIssueCorrelationQuery,
+    ErrorTrackingIssueEventsQuery,
+    ErrorTrackingPendingFingerprintIssueStateUpdate,
+    ErrorTrackingQuery,
+    ErrorTrackingReleasesOrderBy,
+    ErrorTrackingReleasesQuery,
+    EventsQuery,
+    InsightVizNode,
+    NodeKind,
+    ProductKey,
+} from '~/queries/schema/schema-general'
+import {
+    AnyPropertyFilter,
+    BaseMathType,
+    ChartDisplayType,
+    PropertyFilterType,
+    PropertyGroupFilter,
+    UniversalFiltersGroup,
+} from '~/types'
+
+import { LIMIT_ITEMS } from './components/Breakdowns/consts'
+import { RELEASE_TIMELINE_RESOLUTION } from './components/IssueReleases/issueReleases'
+import {
+    ERROR_TRACKING_DETAILS_RESOLUTION,
+    ERROR_TRACKING_LISTING_RESOLUTION,
+    SEARCHABLE_EXCEPTION_PROPERTIES,
+} from './utils'
+
+export const errorTrackingQuery = ({
+    orderBy,
+    status,
+    severity,
+    issueTag,
+    dateRange,
+    assignee,
+    filterTestAccounts,
+    filterGroup,
+    searchQuery,
+    volumeResolution = ERROR_TRACKING_LISTING_RESOLUTION,
+    columns,
+    orderDirection,
+    personId,
+    groupKey,
+    groupTypeIndex,
+    limit = 50,
+    pendingFingerprintIssueStateUpdates,
+}: Pick<
+    ErrorTrackingQuery,
+    | 'orderBy'
+    | 'status'
+    | 'severity'
+    | 'issueTag'
+    | 'dateRange'
+    | 'assignee'
+    | 'filterTestAccounts'
+    | 'limit'
+    | 'searchQuery'
+    | 'orderDirection'
+    | 'personId'
+    | 'groupKey'
+    | 'groupTypeIndex'
+> & {
+    filterGroup: UniversalFiltersGroup
+    columns: string[]
+    volumeResolution?: number
+    pendingFingerprintIssueStateUpdates?: ErrorTrackingPendingFingerprintIssueStateUpdate[]
+}): DataTableNode => {
+    return {
+        kind: NodeKind.DataTableNode,
+        source: {
+            kind: NodeKind.ErrorTrackingQuery,
+            orderBy,
+            status,
+            ...(severity ? { severity } : {}),
+            ...(issueTag ? { issueTag } : {}),
+            dateRange,
+            assignee,
+            volumeResolution,
+            filterGroup: filterGroup as PropertyGroupFilter,
+            filterTestAccounts: filterTestAccounts,
+            searchQuery: searchQuery,
+            limit: limit,
+            orderDirection,
+            withAggregations: true,
+            withFirstEvent: false,
+            personId,
+            groupKey,
+            groupTypeIndex,
+            // Omit when empty so cache keys stay stable.
+            ...(pendingFingerprintIssueStateUpdates && pendingFingerprintIssueStateUpdates.length > 0
+                ? { pendingFingerprintIssueStateUpdates }
+                : {}),
+            tags: {
+                productKey: ProductKey.ERROR_TRACKING,
+            },
+        },
+        showActions: false,
+        showTimings: false,
+        columns: columns,
+    }
+}
+
+export const errorTrackingIssueQuery = ({
+    issueId,
+    dateRange,
+    filterGroup,
+    filterTestAccounts,
+    searchQuery,
+    volumeResolution = ERROR_TRACKING_DETAILS_RESOLUTION,
+    withFirstEvent = false,
+    withLastEvent = false,
+    withAggregations = false,
+}: {
+    issueId: string
+    dateRange: DateRange
+    filterGroup?: UniversalFiltersGroup
+    filterTestAccounts: boolean
+    searchQuery?: string
+    volumeResolution?: number
+    withFirstEvent?: boolean
+    withLastEvent?: boolean
+    withAggregations?: boolean
+}): ErrorTrackingQuery => {
+    return setLatestVersionsOnQuery<ErrorTrackingQuery>({
+        kind: NodeKind.ErrorTrackingQuery,
+        issueId,
+        dateRange,
+        filterGroup: filterGroup as PropertyGroupFilter,
+        orderBy: 'last_seen',
+        filterTestAccounts,
+        searchQuery,
+        volumeResolution,
+        withFirstEvent,
+        withAggregations,
+        withLastEvent,
+        tags: {
+            productKey: ProductKey.ERROR_TRACKING,
+        },
+    })
+}
+
+export const errorTrackingIssueEventsQuery = ({
+    issueId,
+    filterTestAccounts,
+    filterGroup,
+    searchQuery,
+    dateRange,
+    columns,
+}: {
+    issueId: string
+    filterTestAccounts: boolean
+    filterGroup: UniversalFiltersGroup
+    searchQuery: string
+    dateRange: DateRange
+    columns: string[]
+}): EventsQuery => {
+    const group = filterGroup.values[0] as UniversalFiltersGroup
+    const properties = [...group.values] as AnyPropertyFilter[]
+
+    let where_string = `issue_id = toUUID(${escapeHogQLString(issueId)})`
+    if (searchQuery) {
+        // This is an ugly hack for the fact I don't think we support nested property filters in
+        // the eventsquery
+        where_string += ' AND ('
+        const chunks: string[] = []
+        SEARCHABLE_EXCEPTION_PROPERTIES.forEach((prop) => {
+            chunks.push(`ilike(toString(properties.${prop}), ${escapeHogQLString(`%${searchQuery}%`)})`)
+        })
+        where_string += chunks.join(' OR ')
+        where_string += ')'
+    }
+
+    const where = [where_string]
+
+    const eventsQuery: EventsQuery = {
+        kind: NodeKind.EventsQuery,
+        event: '$exception',
+        select: columns,
+        where,
+        properties,
+        filterTestAccounts: filterTestAccounts,
+        after: dateRange.date_from ?? undefined,
+        before: dateRange.date_to ?? undefined,
+        tags: { productKey: ProductKey.ERROR_TRACKING },
+    }
+
+    return eventsQuery
+}
+
+export const errorTrackingIssueEventsListQuery = ({
+    issueId,
+    source,
+    onlyWithRecording,
+}: {
+    issueId: string
+    source: EventsQuery
+    onlyWithRecording: boolean
+}): ErrorTrackingIssueEventsQuery => {
+    return setLatestVersionsOnQuery<ErrorTrackingIssueEventsQuery>({
+        kind: NodeKind.ErrorTrackingIssueEventsQuery,
+        issueId,
+        source,
+        onlyWithRecording,
+        tags: { productKey: ProductKey.ERROR_TRACKING },
+    })
+}
+
+export const errorTrackingIssueCorrelationQuery = ({
+    events,
+}: {
+    events: string[]
+}): ErrorTrackingIssueCorrelationQuery => {
+    return setLatestVersionsOnQuery<ErrorTrackingIssueCorrelationQuery>({
+        kind: NodeKind.ErrorTrackingIssueCorrelationQuery,
+        events,
+        tags: { productKey: ProductKey.ERROR_TRACKING },
+    })
+}
+
+// Must match the fingerprint projection runner's defaults, or similarity reads a set of embeddings
+// that the fingerprint map never populated.
+export const FINGERPRINT_EMBEDDING_MODEL = 'text-embedding-3-large-3072'
+export const FINGERPRINT_EMBEDDING_RENDERING = 'type_message_and_stack'
+
+export const errorTrackingDocumentSimilarityQuery = ({
+    documentId,
+    timestamp,
+    limit,
+}: {
+    documentId: string
+    timestamp: string
+    limit?: number
+}): DocumentSimilarityQuery => {
+    return setLatestVersionsOnQuery<DocumentSimilarityQuery>({
+        kind: NodeKind.DocumentSimilarityQuery,
+        origin: {
+            product: 'error_tracking',
+            document_type: 'fingerprint',
+            document_id: documentId,
+            timestamp,
+        },
+        dateRange: {},
+        order_by: 'distance',
+        order_direction: 'asc',
+        distance_func: 'cosineDistance',
+        model: FINGERPRINT_EMBEDDING_MODEL,
+        products: ['error_tracking'],
+        document_types: ['fingerprint'],
+        renderings: [FINGERPRINT_EMBEDDING_RENDERING],
+        limit,
+        tags: { productKey: ProductKey.ERROR_TRACKING },
+    })
+}
+
+export const errorTrackingIssueFingerprintsQuery = (
+    issue_id: string,
+    first_seen: string,
+    fingerprints: string[]
+): HogQLQueryString => {
+    return hogql`SELECT properties.$exception_fingerprint as fingerprint, count() as c, groupUniqArray(map('type', properties.$exception_types[1], 'value', properties.$exception_values[1], 'lib', properties.$lib)) as samples
+                FROM events
+                WHERE event = '$exception' and issue_id = ${issue_id} and has(${fingerprints}, properties.$exception_fingerprint) and timestamp >= toDateTime(${first_seen})
+                GROUP BY properties.$exception_fingerprint`
+}
+
+export const errorTrackingFingerprintSamplesQuery = (fingerprints: string[], since: string): HogQLQueryString => {
+    return hogql`SELECT properties.$exception_fingerprint as fingerprint, any(issue_id) as issue_id, groupUniqArray(map('type', properties.$exception_types[1], 'value', properties.$exception_values[1], 'lib', properties.$lib)) as samples
+                FROM events
+                WHERE event = '$exception' and has(${fingerprints}, properties.$exception_fingerprint) and timestamp >= toDateTime(${since})
+                GROUP BY properties.$exception_fingerprint`
+}
+
+export const errorTrackingFingerprintEventQuery = ({
+    fingerprint,
+    after,
+    before,
+}: {
+    fingerprint: string
+    after?: string
+    before?: string
+}): EventsQuery => ({
+    kind: NodeKind.EventsQuery,
+    event: '$exception',
+    select: ['uuid', 'properties', 'timestamp', 'distinct_id'],
+    // The window around the fingerprint's first sighting keeps this off a full retention scan.
+    after,
+    before,
+    where: [`properties.$exception_fingerprint = ${escapeHogQLString(fingerprint)}`],
+    orderBy: ['timestamp ASC'],
+    limit: 1,
+    tags: { productKey: ProductKey.ERROR_TRACKING },
+})
+
+export const errorTrackingIssueBreakdownQuery = ({
+    breakdownProperty,
+    dateRange,
+    filterTestAccounts,
+    filterGroup,
+    issueId,
+}: {
+    breakdownProperty: string
+    dateRange: DateRange
+    filterTestAccounts: boolean
+    filterGroup: UniversalFiltersGroup
+    issueId: string
+}): InsightVizNode => {
+    const group = filterGroup.values[0] as UniversalFiltersGroup
+    const properties = [...group.values] as AnyPropertyFilter[]
+
+    const query: InsightVizNode = {
+        kind: NodeKind.InsightVizNode,
+        source: {
+            kind: NodeKind.TrendsQuery,
+            trendsFilter: {
+                display: ChartDisplayType.ActionsBarValue,
+            },
+            breakdownFilter: {
+                breakdown_type: 'event',
+                breakdown: breakdownProperty,
+                breakdown_limit: LIMIT_ITEMS,
+            },
+            series: [
+                {
+                    kind: NodeKind.EventsNode,
+                    event: '$exception',
+                    math: BaseMathType.TotalCount,
+                    properties: [
+                        {
+                            key: `issue_id = ${escapeHogQLString(issueId)}`,
+                            type: PropertyFilterType.HogQL,
+                        },
+                        ...properties,
+                    ],
+                },
+            ],
+            dateRange: dateRange,
+            filterTestAccounts,
+            tags: { productKey: ProductKey.ERROR_TRACKING },
+        },
+    }
+
+    return query
+}
+
+export const errorTrackingBreakdownsQuery = ({
+    issueId,
+    breakdownProperties,
+    dateRange,
+    filterGroup,
+    filterTestAccounts,
+    maxValuesPerProperty = LIMIT_ITEMS,
+}: {
+    issueId: string
+    breakdownProperties: string[]
+    dateRange: DateRange
+    filterGroup: UniversalFiltersGroup
+    filterTestAccounts: boolean
+    maxValuesPerProperty?: number
+}): ErrorTrackingBreakdownsQuery => {
+    return setLatestVersionsOnQuery({
+        kind: NodeKind.ErrorTrackingBreakdownsQuery,
+        issueId,
+        breakdownProperties,
+        dateRange,
+        filterGroup: filterGroup as PropertyGroupFilter,
+        filterTestAccounts,
+        maxValuesPerProperty,
+        tags: {
+            productKey: ProductKey.ERROR_TRACKING,
+        },
+    })
+}
+
+export const errorTrackingReleasesQuery = ({
+    issueId,
+    dateRange,
+    filterGroup,
+    filterTestAccounts,
+    appNamespace,
+    maxReleases,
+    orderBy,
+}: {
+    issueId: string
+    dateRange: DateRange
+    filterGroup: UniversalFiltersGroup
+    filterTestAccounts: boolean
+    appNamespace?: string
+    maxReleases: number
+    orderBy: ErrorTrackingReleasesOrderBy
+}): ErrorTrackingReleasesQuery => {
+    return setLatestVersionsOnQuery({
+        kind: NodeKind.ErrorTrackingReleasesQuery,
+        issueId,
+        dateRange,
+        filterGroup: filterGroup as PropertyGroupFilter,
+        filterTestAccounts,
+        appNamespace,
+        maxReleases,
+        orderBy,
+        resolution: RELEASE_TIMELINE_RESOLUTION,
+        tags: { productKey: ProductKey.ERROR_TRACKING },
+    })
+}

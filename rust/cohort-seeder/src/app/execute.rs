@@ -1,0 +1,495 @@
+//! App layer: one chunk's `scan → record → enqueue → mark → await → confirm` pipeline and the single
+//! recovery resolver. Depends on `clickhouse`, `kafka`, `store`, `domain`, and its `app` siblings.
+//!
+//! The store's `mark_produced` sits between the two deliver phases: deliver owns Kafka,
+//! execute owns the store gating. Every halt funnels through [`resolve_halt`], which applies the
+//! exact recovery matrix — a pre-mark halt during shutdown unclaims (no attempt spent); everything
+//! else fails for retry — encoded once in [`FailureDisposition::resolve`] and pinned by its unit
+//! test.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use metrics::counter;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+use crate::clickhouse::scanner::ChunkScanner;
+use crate::clickhouse::ResourceError;
+use crate::domain::{
+    ChunkLease, ChunkSpec, ClaimedChunk, EnqueuedChunk, HaltReason, Halted, ProducedChunk,
+    RetryBackoffPolicy, ScannedChunk, StreamedChunk,
+};
+use crate::kafka::pacing::TilePacer;
+use crate::kafka::producer::SeedTileProducer;
+use crate::observability::metrics::{
+    CHUNKS_CONFIRMED, CHUNKS_FAILED, CLICKHOUSE_RESOURCE_ERRORS, TILES_PRODUCED, TILES_SKIPPED,
+};
+use crate::store::chunks::{ChunkStoreError, PgChunkStore};
+use crate::store::lease::LeaseHandle;
+use crate::store::runs::RunKind;
+use crate::store::RenderedError;
+
+use super::deliver::{self, ProduceError};
+use super::newest_day::NewestDayIndex;
+use super::person_execute::PersonChunkStats;
+use super::prepare::PreparedBehavioral;
+use super::settings::ProducerSettings;
+
+/// The owned inputs to one chunk's processing task, bundled so the spawn stays tidy.
+pub(super) struct ChunkTaskContext {
+    pub(super) chunk: ClaimedChunk,
+    pub(super) lease: LeaseHandle,
+    pub(super) prepared: Arc<PreparedBehavioral>,
+    pub(super) newest_day: Arc<NewestDayIndex>,
+    pub(super) store: PgChunkStore,
+    pub(super) scanner: ChunkScanner,
+    pub(super) producer: SeedTileProducer,
+    pub(super) pacer: TilePacer,
+    pub(super) producer_settings: ProducerSettings,
+    pub(super) retry_backoff: RetryBackoffPolicy,
+}
+
+pub(super) async fn execute_chunk(
+    ctx: ChunkTaskContext,
+    shutdown: CancellationToken,
+) -> ChunkOutcome {
+    let ChunkTaskContext {
+        chunk,
+        lease,
+        prepared,
+        newest_day,
+        store,
+        scanner,
+        producer,
+        pacer,
+        producer_settings,
+        retry_backoff,
+    } = ctx;
+    let lease_cancel = lease.cancellation_token();
+
+    // PreMark: scan history into tiles.
+    let scanned = match scanner
+        .scan(
+            chunk,
+            &prepared.run,
+            &prepared.analyses,
+            &lease_cancel,
+            &shutdown,
+        )
+        .await
+    {
+        Ok(scanned) => scanned,
+        Err(halt) => return resolve_halt(&store, halt, &shutdown, retry_backoff).await,
+    };
+    // PreMark: record this scan's days before enqueuing, so an older day's chunk skips its tiles.
+    // A large chunk takes seconds, so the worker's other tasks move to another thread meanwhile.
+    tokio::task::block_in_place(|| newest_day.record(scanned.tiles()));
+    let scanned_tiles = scanned.tiles().len() as u64;
+    // PreMark: pace and enqueue every tile not superseded by a newer day, holding the in-flight
+    // deliveries.
+    let (streamed, inflight) = match deliver::enqueue_tiles(
+        &producer,
+        scanned,
+        &newest_day,
+        &pacer,
+        producer_settings,
+        &lease_cancel,
+        &shutdown,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(halt) => return resolve_halt(&store, halt, &shutdown, retry_backoff).await,
+    };
+    // PreMark: CAS `scanning`→`produced` — the row is still `scanning` on failure.
+    let enqueued = match store.mark_produced(streamed).await {
+        Ok(enqueued) => enqueued,
+        Err(halt) => {
+            return resolve_halt(&store, mark_produced_halt(halt), &shutdown, retry_backoff).await
+        }
+    };
+    // PostMark: drain the remaining delivery acks and fold the high-water marks.
+    let produced = match deliver::await_deliveries(enqueued, inflight, &lease_cancel).await {
+        Ok(produced) => {
+            counter!(TILES_PRODUCED).increment(produced.tiles_produced());
+            counter!(TILES_SKIPPED).increment(scanned_tiles - produced.tiles_produced());
+            produced
+        }
+        Err(halt) => return resolve_halt(&store, halt, &shutdown, retry_backoff).await,
+    };
+    // PostMark: the terminal confirm — on failure the row is `produced`, so it is failed for retry.
+    let lease = produced.spec().lease;
+    let tiles_produced = produced.tiles_produced();
+    match store.confirm(produced).await {
+        Ok(_) => ChunkOutcome::Confirmed {
+            lease,
+            tiles_produced,
+            detail: ConfirmedDetail::Behavioral,
+        },
+        Err(halt) => resolve_halt(&store, halt, &shutdown, retry_backoff).await,
+    }
+}
+
+/// Whether a halt struck before or after the store marked the chunk `produced` — the discriminator
+/// the recovery matrix turns on. Each chunk state names its stage as a `const` via [`ChunkState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailureStage {
+    PreMark,
+    PostMark,
+}
+
+/// The pipeline states seen by recovery: their [`FailureStage`] and their lease-bearing spec.
+pub(super) trait ChunkState {
+    const STAGE: FailureStage;
+    fn spec(&self) -> ChunkSpec;
+}
+
+impl ChunkState for ClaimedChunk {
+    const STAGE: FailureStage = FailureStage::PreMark;
+    fn spec(&self) -> ChunkSpec {
+        self.spec()
+    }
+}
+
+impl ChunkState for ScannedChunk {
+    const STAGE: FailureStage = FailureStage::PreMark;
+    fn spec(&self) -> ChunkSpec {
+        self.spec()
+    }
+}
+
+/// Pre-mark like [`ScannedChunk`]: a pre-mark unclaim with already-enqueued seeds keeps the same
+/// at-least-once semantics — the consumer's LWW/idempotent apply absorbs the re-scan.
+impl ChunkState for StreamedChunk {
+    const STAGE: FailureStage = FailureStage::PreMark;
+    fn spec(&self) -> ChunkSpec {
+        self.spec()
+    }
+}
+
+impl ChunkState for EnqueuedChunk {
+    const STAGE: FailureStage = FailureStage::PostMark;
+    fn spec(&self) -> ChunkSpec {
+        self.spec()
+    }
+}
+
+impl ChunkState for ProducedChunk {
+    const STAGE: FailureStage = FailureStage::PostMark;
+    fn spec(&self) -> ChunkSpec {
+        self.spec()
+    }
+}
+
+/// The recovery decision: unclaim the chunk (refunding the attempt) or fail it for retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureDisposition {
+    Unclaim,
+    Fail,
+}
+
+impl FailureDisposition {
+    /// Today's exact matrix: a pre-mark halt during shutdown unclaims; every other case fails —
+    /// post-mark never unclaims, since the row is already `produced`.
+    const fn resolve(stage: FailureStage, shutting_down: bool) -> Self {
+        match (stage, shutting_down) {
+            (FailureStage::PreMark, true) => Self::Unclaim,
+            (FailureStage::PreMark, false) => Self::Fail,
+            (FailureStage::PostMark, _) => Self::Fail,
+        }
+    }
+}
+
+/// Apply the recovery matrix to a halted state: render the operator detail, decide the disposition
+/// from the state's stage and the shutdown flag, and drive the fencing store write.
+///
+/// The retry wait is drawn from the chunk's own attempt count, so a chunk failing repeatedly waits
+/// longer each time while a first failure retries almost immediately. An unclaim draws none: it
+/// refunds the attempt and is not a failure.
+pub(super) async fn resolve_halt<S: ChunkState, E: std::error::Error + 'static>(
+    store: &PgChunkStore,
+    halt: Halted<S, E>,
+    shutdown: &CancellationToken,
+    retry_backoff: RetryBackoffPolicy,
+) -> ChunkOutcome {
+    let spec = halt.state.spec();
+    let lease = spec.lease;
+    let detail = render_reason(&halt.reason);
+    let resource = match &halt.reason {
+        HaltReason::Failed(error) => ResourceError::classify(error),
+        HaltReason::Cancelled(_) => None,
+    };
+    match FailureDisposition::resolve(S::STAGE, shutdown.is_cancelled()) {
+        FailureDisposition::Unclaim => match store.unclaim(lease).await {
+            Ok(()) => ChunkOutcome::Unclaimed { lease },
+            Err(recovery) => ChunkOutcome::RecoveryFailed {
+                lease,
+                detail: detail.as_str().to_string(),
+                resource,
+                recovery,
+            },
+        },
+        FailureDisposition::Fail => {
+            let retry_delay = retry_backoff.delay_after(spec.attempt);
+            match store.fail(lease, &detail, retry_delay).await {
+                Ok(()) => ChunkOutcome::Failed {
+                    lease,
+                    detail: detail.as_str().to_string(),
+                    resource,
+                    retry_delay,
+                },
+                Err(recovery) => ChunkOutcome::RecoveryFailed {
+                    lease,
+                    detail: detail.as_str().to_string(),
+                    resource,
+                    recovery,
+                },
+            }
+        }
+    }
+}
+
+/// Re-wrap the store's mark error as the produce error the recovery path renders, preserving the
+/// persisted `marking the chunk produced failed: …` text while the store stays store-typed.
+pub(super) fn mark_produced_halt<S>(halt: Halted<S, ChunkStoreError>) -> Halted<S, ProduceError> {
+    let Halted { state, reason } = halt;
+    let reason = match reason {
+        HaltReason::Failed(error) => HaltReason::Failed(ProduceError::MarkProduced(error)),
+        HaltReason::Cancelled(cause) => HaltReason::Cancelled(cause),
+    };
+    Halted { state, reason }
+}
+
+fn render_reason<E: std::error::Error>(reason: &HaltReason<E>) -> RenderedError {
+    match reason {
+        HaltReason::Failed(error) => RenderedError::render(error),
+        HaltReason::Cancelled(cause) => RenderedError::from_message(cause.as_str()),
+    }
+}
+
+/// What a confirmed chunk's log line says beyond its tile count. The behavioral path's counters
+/// already read per day and band, so only the person path carries a payload.
+#[derive(Debug)]
+pub(super) enum ConfirmedDetail {
+    Behavioral,
+    Person(PersonChunkStats),
+}
+
+#[derive(Debug)]
+pub(super) enum ChunkOutcome {
+    Confirmed {
+        lease: ChunkLease,
+        tiles_produced: u64,
+        detail: ConfirmedDetail,
+    },
+    Failed {
+        lease: ChunkLease,
+        detail: String,
+        resource: Option<ResourceError>,
+        retry_delay: Duration,
+    },
+    Unclaimed {
+        lease: ChunkLease,
+    },
+    /// The failure still counts toward the breaker like `Failed`.
+    RecoveryFailed {
+        lease: ChunkLease,
+        detail: String,
+        resource: Option<ResourceError>,
+        recovery: ChunkStoreError,
+    },
+}
+
+/// What a settled chunk tells its run's breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BreakerSignal {
+    Success,
+    ResourceFailure(ResourceError),
+    /// An unclaim refunds the attempt, and any other failure says nothing about ClickHouse load.
+    Ignore,
+}
+
+impl ChunkOutcome {
+    pub(super) fn run_id(&self) -> crate::domain::RunId {
+        match self {
+            Self::Confirmed { lease, .. }
+            | Self::Failed { lease, .. }
+            | Self::Unclaimed { lease }
+            | Self::RecoveryFailed { lease, .. } => lease.run_id(),
+        }
+    }
+
+    pub(super) fn breaker_signal(&self) -> BreakerSignal {
+        match self {
+            Self::Confirmed { .. } => BreakerSignal::Success,
+            Self::Failed {
+                resource: Some(resource),
+                ..
+            }
+            | Self::RecoveryFailed {
+                resource: Some(resource),
+                ..
+            } => BreakerSignal::ResourceFailure(*resource),
+            Self::Failed { resource: None, .. }
+            | Self::RecoveryFailed { resource: None, .. }
+            | Self::Unclaimed { .. } => BreakerSignal::Ignore,
+        }
+    }
+}
+
+pub(super) fn record_task_result(
+    result: &Result<ChunkOutcome, tokio::task::JoinError>,
+    kind: RunKind,
+) {
+    match result {
+        Ok(ChunkOutcome::Confirmed {
+            lease,
+            tiles_produced,
+            detail,
+        }) => {
+            counter!(CHUNKS_CONFIRMED, "kind" => kind.as_str()).increment(1);
+            match detail {
+                ConfirmedDetail::Behavioral => info!(?lease, tiles_produced, "chunk confirmed"),
+                ConfirmedDetail::Person(stats) => info!(
+                    ?lease,
+                    tiles_produced,
+                    persons_scanned = stats.persons_scanned,
+                    nonmatchers = stats.nonmatchers,
+                    pruned = stats.pruned,
+                    shortcut_evaluations = stats.shortcut_evaluations,
+                    "chunk confirmed",
+                ),
+            }
+        }
+        Ok(ChunkOutcome::Failed {
+            lease,
+            detail,
+            resource,
+            retry_delay,
+        }) => {
+            counter!(CHUNKS_FAILED, "kind" => kind.as_str()).increment(1);
+            record_resource_error(kind, *resource);
+            warn!(
+                ?lease,
+                error = %detail,
+                clickhouse_code = resource.map(ResourceError::as_str),
+                retry_delay_secs = retry_delay.as_secs_f64(),
+                "chunk failed and was released for retry"
+            );
+        }
+        Ok(ChunkOutcome::Unclaimed { lease }) => {
+            info!(?lease, "chunk unclaimed during shutdown");
+        }
+        Ok(ChunkOutcome::RecoveryFailed {
+            lease,
+            detail,
+            resource,
+            recovery,
+        }) => {
+            counter!(CHUNKS_FAILED, "kind" => kind.as_str()).increment(1);
+            record_resource_error(kind, *resource);
+            warn!(
+                ?lease,
+                error = %detail,
+                clickhouse_code = resource.map(ResourceError::as_str),
+                recovery_error = %recovery,
+                "chunk recovery update did not apply"
+            );
+        }
+        Err(error) => {
+            counter!(CHUNKS_FAILED, "kind" => kind.as_str()).increment(1);
+            warn!(error = %error, "chunk task failed unexpectedly");
+        }
+    }
+}
+
+fn record_resource_error(kind: RunKind, resource: Option<ResourceError>) {
+    if let Some(resource) = resource {
+        counter!(
+            CLICKHOUSE_RESOURCE_ERRORS,
+            "kind" => kind.as_str(),
+            "code" => resource.as_str(),
+        )
+        .increment(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which stage a state declares is the other half of the matrix, and the half the matrix test
+    /// cannot see: flipping [`StreamedChunk`] to `PostMark` would fail every person chunk caught by
+    /// a shutdown instead of unclaiming it, with the matrix test still green.
+    #[test]
+    fn chunk_states_declare_their_recovery_stage() {
+        assert_eq!(<ClaimedChunk as ChunkState>::STAGE, FailureStage::PreMark);
+        assert_eq!(<ScannedChunk as ChunkState>::STAGE, FailureStage::PreMark);
+        assert_eq!(<StreamedChunk as ChunkState>::STAGE, FailureStage::PreMark);
+        assert_eq!(<EnqueuedChunk as ChunkState>::STAGE, FailureStage::PostMark);
+        assert_eq!(<ProducedChunk as ChunkState>::STAGE, FailureStage::PostMark);
+    }
+
+    #[test]
+    fn only_a_confirmed_chunk_or_a_resource_failure_reaches_the_breaker() {
+        let lease = ChunkLease::new(
+            crate::domain::ChunkId(uuid::Uuid::from_u128(1)),
+            crate::domain::RunId(uuid::Uuid::from_u128(2)),
+            crate::domain::ClaimEpoch(1),
+        );
+        let memory = ResourceError::MemoryLimitExceeded;
+        let failed = |resource| ChunkOutcome::Failed {
+            lease,
+            detail: String::new(),
+            resource,
+            retry_delay: Duration::ZERO,
+        };
+        let recovery_failed = |resource| ChunkOutcome::RecoveryFailed {
+            lease,
+            detail: String::new(),
+            resource,
+            recovery: ChunkStoreError::TilesProducedOutOfRange(0),
+        };
+        for (outcome, expected) in [
+            (
+                ChunkOutcome::Confirmed {
+                    lease,
+                    tiles_produced: 0,
+                    detail: ConfirmedDetail::Behavioral,
+                },
+                BreakerSignal::Success,
+            ),
+            (failed(Some(memory)), BreakerSignal::ResourceFailure(memory)),
+            (
+                recovery_failed(Some(memory)),
+                BreakerSignal::ResourceFailure(memory),
+            ),
+            (failed(None), BreakerSignal::Ignore),
+            (recovery_failed(None), BreakerSignal::Ignore),
+            (ChunkOutcome::Unclaimed { lease }, BreakerSignal::Ignore),
+        ] {
+            assert_eq!(outcome.breaker_signal(), expected, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn failure_disposition_encodes_the_recovery_matrix() {
+        assert_eq!(
+            FailureDisposition::resolve(FailureStage::PreMark, true),
+            FailureDisposition::Unclaim
+        );
+        assert_eq!(
+            FailureDisposition::resolve(FailureStage::PreMark, false),
+            FailureDisposition::Fail
+        );
+        assert_eq!(
+            FailureDisposition::resolve(FailureStage::PostMark, true),
+            FailureDisposition::Fail
+        );
+        assert_eq!(
+            FailureDisposition::resolve(FailureStage::PostMark, false),
+            FailureDisposition::Fail
+        );
+    }
+}

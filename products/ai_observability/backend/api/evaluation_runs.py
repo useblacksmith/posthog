@@ -1,0 +1,206 @@
+import time
+import asyncio
+from datetime import timedelta
+
+from django.conf import settings
+
+import structlog
+from drf_spectacular.utils import extend_schema
+from rest_framework import serializers, viewsets
+from rest_framework.exceptions import APIException, NotFound, ValidationError
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
+from rest_framework.response import Response
+from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
+
+from posthog.api.monitoring import monitor
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.event_usage import report_user_action
+from posthog.hogql_queries.ai.ai_table_resolver import AIEventsExpiredError, AIEventsNotFoundError
+from posthog.permissions import AccessControlPermission
+from posthog.temporal.ai_observability.evaluation_types import EVALUATION_WORKFLOW_PREFIXES
+from posthog.temporal.ai_observability.run_evaluation import RunEvaluationInputs
+from posthog.temporal.common.client import sync_connect
+
+from products.ai_observability.backend.ai_event_lookup import fetch_ai_event
+from products.ai_observability.backend.api.metrics import llma_track_latency
+
+from ..models.evaluations import Evaluation, EvaluationTarget
+
+logger = structlog.get_logger(__name__)
+
+
+def _evaluation_workflow_prefix(evaluation_type: str) -> str:
+    try:
+        return EVALUATION_WORKFLOW_PREFIXES[evaluation_type]
+    except KeyError:
+        raise ValueError(f"Unsupported evaluation type for workflow prefix: {evaluation_type}") from None
+
+
+class EvaluationRunRequestSerializer(serializers.Serializer):
+    evaluation_id = serializers.UUIDField(required=True, help_text="UUID of the evaluation to run.")
+    target_event_id = serializers.UUIDField(required=True, help_text="UUID of the $ai_generation event to evaluate.")
+    timestamp = serializers.DateTimeField(
+        required=True, help_text="ISO 8601 timestamp of the target event (needed for efficient ClickHouse lookup)."
+    )
+    event = serializers.CharField(
+        required=False, default="$ai_generation", help_text="Event name. Defaults to '$ai_generation'."
+    )
+    distinct_id = serializers.CharField(
+        required=False, allow_null=True, help_text="Distinct ID of the event (optional, improves lookup performance)."
+    )
+
+
+class EvaluationRunEvaluationSerializer(serializers.Serializer):
+    id = serializers.UUIDField(help_text="UUID of the evaluation being run.")
+    name = serializers.CharField(help_text="Display name of the evaluation being run.")
+
+
+class EvaluationRunResponseSerializer(serializers.Serializer):
+    workflow_id = serializers.CharField(help_text="Temporal workflow ID of the enqueued run.")
+    status = serializers.CharField(help_text="Workflow status at the time of the response.")
+    evaluation = EvaluationRunEvaluationSerializer(help_text="Evaluation selected for this run.")
+    target_event_id = serializers.UUIDField(help_text="UUID of the event being evaluated.")
+
+
+class EvaluationRunViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
+    scope_object = "evaluation"
+    permission_classes = [IsAuthenticated, AccessControlPermission]
+
+    @extend_schema(request=EvaluationRunRequestSerializer, responses={202: EvaluationRunResponseSerializer})
+    @llma_track_latency("llma_evaluation_runs_create")
+    @monitor(feature=None, endpoint="llma_evaluation_runs_create", method="POST")
+    def create(self, request: Request, **kwargs) -> Response:
+        """
+        Create a new evaluation run.
+
+        This endpoint validates the request and enqueues a Temporal workflow
+        to asynchronously execute the evaluation.
+        """
+        serializer = EvaluationRunRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        evaluation_id = str(serializer.validated_data["evaluation_id"])
+        target_event_id = str(serializer.validated_data["target_event_id"])
+        timestamp = serializer.validated_data["timestamp"]
+        event = serializer.validated_data["event"]
+        distinct_id = serializer.validated_data.get("distinct_id")
+
+        # Verify evaluation exists and belongs to this team
+        try:
+            evaluation = Evaluation.objects.get(id=evaluation_id, team_id=self.team_id, deleted=False)
+        except Evaluation.DoesNotExist:
+            raise NotFound(f"Evaluation {evaluation_id} not found")
+
+        self.check_object_permissions(request, evaluation)
+
+        # This endpoint runs one $ai_generation through the generation workflow. Without this check
+        # a trace- or session-target evaluation is accepted and run as a generation, emitting a
+        # verdict with $ai_target_type "generation_uuid" under that evaluation's name — which then
+        # counts towards its pass rate while being invisible on the trace or session it belongs to.
+        if evaluation.target != EvaluationTarget.GENERATION.value:
+            raise ValidationError(
+                f"This evaluation runs on the whole {evaluation.target}, so it can't be re-run against a "
+                "single generation.",
+                code="evaluation_target_mismatch",
+            )
+
+        # Fetch event data from ClickHouse using available keys
+        where_clauses = [
+            "team_id = %(team_id)s",
+            "toDate(timestamp) = toDate(%(timestamp)s)",
+            "event = %(event)s",
+            "uuid = %(event_id)s",
+        ]
+        params: dict[str, object] = {
+            "team_id": self.team_id,
+            "event_id": target_event_id.replace("-", ""),
+            "timestamp": timestamp,
+            "event": event,
+        }
+
+        if distinct_id:
+            where_clauses.append("distinct_id = %(distinct_id)s")
+            params["distinct_id"] = distinct_id
+
+        try:
+            event_data = fetch_ai_event(self.team_id, where_clauses, params)
+        except AIEventsExpiredError:
+            raise NotFound(
+                f"Event {target_event_id} is past the ai_events retention window and can no longer be evaluated"
+            )
+        except AIEventsNotFoundError:
+            raise NotFound(f"Event {target_event_id} not found")
+
+        # Build workflow inputs
+        inputs = RunEvaluationInputs(
+            evaluation_id=evaluation_id,
+            event_data=event_data,
+        )
+
+        # Generate unique workflow ID
+        prefix = _evaluation_workflow_prefix(evaluation.evaluation_type)
+        workflow_id = f"{prefix}-{evaluation_id}-{target_event_id}-manual-{int(time.time() * 1000)}"
+
+        # Start Temporal workflow
+        try:
+            client = sync_connect()
+            asyncio.run(
+                client.start_workflow(
+                    "run-evaluation",
+                    inputs,
+                    id=workflow_id,
+                    task_queue=settings.LLMA_EVALS_TASK_QUEUE,
+                    id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                    task_timeout=timedelta(minutes=2),
+                )
+            )
+
+            logger.info(
+                "Started evaluation workflow",
+                workflow_id=workflow_id,
+                evaluation_id=evaluation_id,
+                target_event_id=target_event_id,
+                team_id=self.team_id,
+            )
+
+            # Track evaluation run triggered
+            report_user_action(
+                request.user,
+                "llma evaluation run triggered",
+                {
+                    "evaluation_id": evaluation_id,
+                    "evaluation_name": evaluation.name,
+                    "evaluation_type": evaluation.evaluation_type,
+                    "target_event_id": target_event_id,
+                    "workflow_id": workflow_id,
+                    "trigger_type": "manual",
+                },
+                team=self.team,
+                request=self.request,
+            )
+
+            return Response(
+                {
+                    "workflow_id": workflow_id,
+                    "status": "started",
+                    "evaluation": {
+                        "id": str(evaluation.id),
+                        "name": evaluation.name,
+                    },
+                    "target_event_id": target_event_id,
+                },
+                status=202,
+            )
+
+        except Exception as e:
+            logger.exception(
+                "Failed to start evaluation workflow",
+                evaluation_id=evaluation_id,
+                target_event_id=target_event_id,
+                error=str(e),
+            )
+            # The frontend prefixes this with the action name, so "Failed to start evaluation" here
+            # would read back as "Run evaluation failed: Failed to start evaluation".
+            raise APIException("The evaluation service is unavailable. Try again in a moment.") from e

@@ -1,0 +1,1014 @@
+from datetime import UTC, datetime
+from itertools import count
+from typing import Optional
+
+import pytest
+from unittest import TestCase
+from unittest.mock import MagicMock, call, patch
+
+from django.test import override_settings
+
+import boto3
+import dns.name
+import dns.resolver
+from botocore.exceptions import ClientError
+from parameterized import parameterized
+
+from products.workflows.backend.providers.ses import (
+    ISP_IDENTITY_TOTAL,
+    ISP_OTHER,
+    METRIC_QUERY_BUDGET_SECONDS,
+    SESProvider,
+)
+from products.workflows.backend.services.email_domain_dns import PublishedRecords
+from products.workflows.backend.tests.fakes.world import EmailDomainWorld
+
+TEST_DOMAIN = "test.posthog.com"
+
+
+class TestSESProvider(TestCase):
+    boto3_client_patcher: Optional[patch] = None  # type: ignore
+    mock_boto3_client: Optional[MagicMock] = None
+
+    @classmethod
+    def setUpClass(cls):
+        # Patch boto3.client for all tests in this class. addClassCleanup ensures the patch
+        # is stopped after the class finishes, so it doesn't leak into other test classes.
+        patcher = patch("products.workflows.backend.providers.ses.boto3.client")
+        cls.boto3_client_patcher = patcher
+        cls.mock_boto3_client = patcher.start()
+        cls.addClassCleanup(patcher.stop)
+
+        # These tests fake DNS by replacing `Resolver`, which the zone lookup behind the apex SPF check cannot run against.
+        spf_patcher = patch(
+            "products.workflows.backend.providers.ses.find_published_records",
+            return_value=PublishedRecords(records=frozenset()),
+        )
+        spf_patcher.start()
+        cls.addClassCleanup(spf_patcher.stop)
+
+        # Set up a default mock client with safe return values
+        mock_client_instance = cls.mock_boto3_client.return_value
+        mock_client_instance.list_identities.return_value = {"Identities": []}
+        mock_client_instance.delete_identity.return_value = None
+        mock_client_instance.get_identity_verification_attributes.return_value = {"VerificationAttributes": {}}
+        mock_client_instance.get_identity_dkim_attributes.return_value = {"DkimAttributes": {}}
+        mock_client_instance.verify_domain_identity.return_value = {"VerificationToken": "test-token-123"}
+        mock_client_instance.verify_domain_dkim.return_value = {"DkimTokens": ["token1", "token2", "token3"]}
+        mock_client_instance.get_caller_identity.return_value = {"Account": "123456789012"}
+
+    def setUp(self):
+        # Remove all domains from SES (mocked)
+        ses_provider = SESProvider()
+        if TEST_DOMAIN in ses_provider.ses_client.list_identities()["Identities"]:
+            ses_provider.delete_identity(TEST_DOMAIN)
+
+    def test_init_with_valid_credentials(self):
+        with override_settings(
+            SES_ACCESS_KEY_ID="test_access_key",
+            SES_SECRET_ACCESS_KEY="test_secret_key",
+            SES_REGION="us-east-1",
+            SES_ENDPOINT="",
+        ):
+            provider = SESProvider()
+            assert provider.ses_client
+            assert provider.ses_v2_client
+            assert provider.sts_client
+
+    @patch("products.workflows.backend.providers.ses.dns.resolver.Resolver")
+    def test_create_email_domain_success(self, mock_resolver_cls):
+        mock_resolver_cls.return_value.resolve.side_effect = dns.resolver.NXDOMAIN()
+        provider = SESProvider()
+
+        # Mock the SES and SESv2 clients on the provider instance
+        with (
+            patch.object(provider, "ses_client") as mock_ses_client,
+            patch.object(provider, "ses_v2_client") as mock_ses_v2_client,
+        ):
+            # Mock the verification attributes to return a success status
+            mock_ses_client.get_identity_verification_attributes.return_value = {
+                "VerificationAttributes": {
+                    TEST_DOMAIN: {
+                        "VerificationStatus": "Success",
+                        "VerificationToken": "test-token-123",
+                    }
+                }
+            }
+
+            # Mock DKIM attributes to return a success status
+            mock_ses_client.get_identity_dkim_attributes.return_value = {
+                "DkimAttributes": {TEST_DOMAIN: {"DkimVerificationStatus": "Success"}}
+            }
+
+            # Mock the domain verification and DKIM setup calls
+            mock_ses_client.verify_domain_identity.return_value = {"VerificationToken": "test-token-123"}
+            mock_ses_client.verify_domain_dkim.return_value = {"DkimTokens": ["token1", "token2", "token3"]}
+
+            # Mock tenant client methods
+            mock_ses_v2_client.create_tenant.return_value = {}
+            mock_ses_v2_client.get_caller_identity.return_value = {"Account": "123456789012"}
+            mock_ses_v2_client.create_tenant_resource_association.return_value = {}
+
+            provider.create_email_domain(TEST_DOMAIN, mail_from_subdomain="mail", team_id=1)
+
+            # Attributed sends fail unless every referenced resource is tenant-associated, so the
+            # configuration set must be associated alongside the identity.
+            associated = {
+                call.kwargs["ResourceArn"]
+                for call in mock_ses_v2_client.create_tenant_resource_association.call_args_list
+            }
+            assert any(arn.endswith(f"identity/{TEST_DOMAIN}") for arn in associated)
+            assert any(arn.endswith("configuration-set/posthog-messaging") for arn in associated)
+            assert any(arn.endswith("configuration-set/posthog-messaging-untracked") for arn in associated)
+            mock_ses_v2_client.put_email_identity_feedback_attributes.assert_called_with(
+                EmailIdentity=TEST_DOMAIN, EmailForwardingEnabled=False
+            )
+
+            # An unprovisioned config set must not fail the customer's add-domain request —
+            # only the identity association (self-created above) is allowed to raise.
+            def fail_config_set_associations(TenantName: str, ResourceArn: str) -> dict:
+                if "configuration-set" in ResourceArn:
+                    raise ClientError({"Error": {"Code": "NotFoundException"}}, "CreateTenantResourceAssociation")
+                return {}
+
+            mock_ses_v2_client.create_tenant_resource_association.side_effect = fail_config_set_associations
+            provider.create_email_domain(TEST_DOMAIN, mail_from_subdomain="mail", team_id=1)
+
+            # The configuration sets already report bounces, so a forwarding failure must not fail it either.
+            mock_ses_v2_client.put_email_identity_feedback_attributes.side_effect = ClientError(
+                {"Error": {"Code": "TooManyRequestsException"}}, "PutEmailIdentityFeedbackAttributes"
+            )
+            provider.create_email_domain(TEST_DOMAIN, mail_from_subdomain="mail", team_id=1)
+
+    @patch("products.workflows.backend.providers.ses.boto3.client")
+    def test_create_email_domain_invalid_domain(self, mock_boto_client):
+        mock_boto_client.return_value.get_caller_identity.return_value = {"Account": "123456789012"}
+        with override_settings(
+            SES_ACCESS_KEY_ID="test_access_key", SES_SECRET_ACCESS_KEY="test_secret_key", SES_REGION="us-east-1"
+        ):
+            provider = SESProvider()
+            with pytest.raises(Exception, match="Please enter a valid domain"):
+                provider.create_email_domain("invalid-domain", mail_from_subdomain="mail", team_id=1)
+
+    @patch("products.workflows.backend.providers.ses.dns.resolver.Resolver")
+    def test_verify_email_domain_initial_setup(self, mock_resolver_cls):
+        mock_resolver_cls.return_value.resolve.side_effect = dns.resolver.NXDOMAIN()
+        provider = SESProvider()
+
+        # Mock the SES client on the provider instance
+        with (
+            patch.object(provider, "ses_client") as mock_ses_client,
+        ):
+            # Mock the verification attributes to return a non-success status
+            mock_ses_client.get_identity_verification_attributes.return_value = {
+                "VerificationAttributes": {
+                    TEST_DOMAIN: {
+                        "VerificationStatus": "Pending",  # Non-success status
+                        "VerificationToken": "test-token-123",
+                    }
+                }
+            }
+
+            # Mock DKIM attributes to return a non-success status
+            mock_ses_client.get_identity_dkim_attributes.return_value = {
+                "DkimAttributes": {
+                    TEST_DOMAIN: {
+                        "DkimVerificationStatus": "Pending"  # Non-success status
+                    }
+                }
+            }
+
+            # Mock the domain verification and DKIM setup calls
+            mock_ses_client.verify_domain_identity.return_value = {"VerificationToken": "test-token-123"}
+            mock_ses_client.verify_domain_dkim.return_value = {"DkimTokens": ["token1", "token2", "token3"]}
+
+            result = provider.verify_email_domain(TEST_DOMAIN, mail_from_subdomain="mail", team_id=1)
+
+        # Should return pending status with DNS records
+        assert result == {
+            "status": "pending",
+            "dnsRecords": [
+                {
+                    "type": "verification",
+                    "recordType": "TXT",
+                    "recordHostname": "_amazonses.test.posthog.com",
+                    "recordValue": "test-token-123",
+                    "status": "pending",
+                },
+                {
+                    "type": "dkim",
+                    "recordType": "CNAME",
+                    "recordHostname": "token1._domainkey.test.posthog.com",
+                    "recordValue": "token1.dkim.amazonses.com",
+                    "status": "pending",
+                },
+                {
+                    "type": "dkim",
+                    "recordType": "CNAME",
+                    "recordHostname": "token2._domainkey.test.posthog.com",
+                    "recordValue": "token2.dkim.amazonses.com",
+                    "status": "pending",
+                },
+                {
+                    "type": "dkim",
+                    "recordType": "CNAME",
+                    "recordHostname": "token3._domainkey.test.posthog.com",
+                    "recordValue": "token3.dkim.amazonses.com",
+                    "status": "pending",
+                },
+                {
+                    "type": "verification",
+                    "recordType": "TXT",
+                    "recordHostname": "@",
+                    "recordValue": "v=spf1 include:amazonses.com ~all",
+                    "status": "pending",
+                },
+                {
+                    "recordHostname": "mail.test.posthog.com",
+                    "recordType": "MX",
+                    "recordValue": "feedback-smtp.us-east-1.amazonses.com",
+                    "status": "pending",
+                    "type": "mail_from",
+                    "priority": 10,
+                },
+                {
+                    "recordHostname": "mail.test.posthog.com",
+                    "recordType": "TXT",
+                    "recordValue": "v=spf1 include:amazonses.com ~all",
+                    "status": "pending",
+                    "type": "mail_from",
+                },
+                {
+                    "type": "dmarc",
+                    "recordType": "TXT",
+                    "recordHostname": "_dmarc.test.posthog.com",
+                    "recordValue": "v=DMARC1; p=none;",
+                    "status": "pending",
+                },
+            ],
+        }
+
+    @patch("products.workflows.backend.providers.ses.is_cloud", return_value=True)
+    @patch("products.workflows.backend.providers.ses.dns.resolver.Resolver")
+    def test_verify_email_domain_looks_up_no_records_for_an_out_of_band_domain(self, mock_resolver_cls, _mock_is_cloud):
+        listed = "abc.oast.live"
+        provider = SESProvider()
+
+        with (
+            patch.object(provider.ses_client, "get_identity_verification_attributes") as mock_verif_attrs,
+            patch.object(provider.ses_client, "get_identity_dkim_attributes") as mock_dkim_attrs,
+            patch.object(provider.ses_client, "get_identity_mail_from_domain_attributes") as mock_mail_from_attrs,
+        ):
+            mock_verif_attrs.return_value = {"VerificationAttributes": {listed: {"VerificationStatus": "Success"}}}
+            mock_dkim_attrs.return_value = {"DkimAttributes": {listed: {"DkimVerificationStatus": "Pending"}}}
+            mock_mail_from_attrs.return_value = {
+                "MailFromDomainAttributes": {listed: {"MailFromDomainStatus": "Success"}}
+            }
+
+            result = provider.verify_email_domain(listed, mail_from_subdomain="mail", team_id=1)
+
+        mock_resolver_cls.assert_not_called()
+        assert result["status"] == "pending"
+
+    @patch("products.workflows.backend.providers.ses.dns.resolver.Resolver")
+    def test_verify_email_domain_success(self, mock_resolver_cls):
+        mock_rdata = MagicMock()
+        mock_rdata.strings = [b"v=DMARC1; p=none;"]
+        mock_resolver_cls.return_value.resolve.return_value = [mock_rdata]
+        provider = SESProvider()
+
+        # Patch the SES client to return 'Success' for both verification and DKIM
+        with (
+            patch.object(provider.ses_client, "get_identity_verification_attributes") as mock_verif_attrs,
+            patch.object(provider.ses_client, "get_identity_dkim_attributes") as mock_dkim_attrs,
+            patch.object(provider.ses_client, "get_identity_mail_from_domain_attributes") as mock_mail_from_attrs,
+            patch.object(provider.ses_v2_client, "list_resource_tenants") as mock_list_tenants,
+        ):
+            mock_verif_attrs.return_value = {
+                "VerificationAttributes": {
+                    TEST_DOMAIN: {
+                        "VerificationStatus": "Success",
+                        "VerificationToken": "test-token-123",
+                    }
+                }
+            }
+            mock_dkim_attrs.return_value = {"DkimAttributes": {TEST_DOMAIN: {"DkimVerificationStatus": "Success"}}}
+            mock_mail_from_attrs.return_value = {
+                "MailFromDomainAttributes": {TEST_DOMAIN: {"MailFromDomainStatus": "Success"}}
+            }
+            mock_list_tenants.return_value = {"ResourceTenants": [{"TenantName": "team-1"}]}
+
+            result = provider.verify_email_domain(TEST_DOMAIN, mail_from_subdomain="mail", team_id=1)
+
+            # Should return verified status with DNS records
+            assert result["status"] == "success"
+            assert len(result["dnsRecords"]) > 0  # Records are now always returned
+
+    @patch("products.workflows.backend.providers.ses.dns.resolver.Resolver")
+    def test_verify_email_domain_pending_when_dmarc_missing(self, mock_resolver_cls):
+        """All SES checks pass but DMARC lookup fails → overall status is pending."""
+        mock_resolver_cls.return_value.resolve.side_effect = dns.resolver.NXDOMAIN()
+        provider = SESProvider()
+
+        with (
+            patch.object(provider.ses_client, "get_identity_verification_attributes") as mock_verif_attrs,
+            patch.object(provider.ses_client, "get_identity_dkim_attributes") as mock_dkim_attrs,
+            patch.object(provider.ses_client, "get_identity_mail_from_domain_attributes") as mock_mail_from_attrs,
+        ):
+            mock_verif_attrs.return_value = {"VerificationAttributes": {TEST_DOMAIN: {"VerificationStatus": "Success"}}}
+            mock_dkim_attrs.return_value = {"DkimAttributes": {TEST_DOMAIN: {"DkimVerificationStatus": "Success"}}}
+            mock_mail_from_attrs.return_value = {
+                "MailFromDomainAttributes": {TEST_DOMAIN: {"MailFromDomainStatus": "Success"}}
+            }
+
+            result = provider.verify_email_domain(TEST_DOMAIN, mail_from_subdomain="mail", team_id=1)
+
+            assert result["status"] == "pending"
+
+    @parameterized.expand(
+        [
+            ("valid_dmarc_record", None, [b"v=DMARC1; p=none;"], "success", "v=DMARC1; p=none;"),
+            ("lowercase_dmarc_tag", None, [b"v=dmarc1; p=quarantine;"], "success", "v=dmarc1; p=quarantine;"),
+            ("leading_whitespace", None, [b" V=DMARC1; p=reject;"], "success", "V=DMARC1; p=reject;"),
+            ("no_dns_record", dns.resolver.NXDOMAIN(), None, "pending", "v=DMARC1; p=none;"),
+            ("non_dmarc_txt_record", None, [b"some random txt value"], "pending", "v=DMARC1; p=none;"),
+        ]
+    )
+    def test_verify_email_domain_dmarc_status(
+        self, _name, dns_side_effect, dns_strings, expected_dmarc_status, expected_record_value
+    ):
+        provider = SESProvider()
+
+        with (
+            patch.object(provider.ses_client, "get_identity_verification_attributes") as mock_verif_attrs,
+            patch.object(provider.ses_client, "get_identity_dkim_attributes") as mock_dkim_attrs,
+            patch.object(provider.ses_client, "get_identity_mail_from_domain_attributes") as mock_mail_from_attrs,
+            patch("products.workflows.backend.providers.ses.dns.resolver.Resolver") as mock_resolver_cls,
+        ):
+            mock_resolver = mock_resolver_cls.return_value
+            if dns_side_effect:
+                mock_resolver.resolve.side_effect = dns_side_effect
+            else:
+                mock_rdata = MagicMock()
+                mock_rdata.strings = dns_strings
+                mock_resolver.resolve.return_value = [mock_rdata]
+
+            mock_verif_attrs.return_value = {"VerificationAttributes": {TEST_DOMAIN: {"VerificationStatus": "Pending"}}}
+            mock_dkim_attrs.return_value = {"DkimAttributes": {TEST_DOMAIN: {"DkimVerificationStatus": "Pending"}}}
+            mock_mail_from_attrs.return_value = {
+                "MailFromDomainAttributes": {TEST_DOMAIN: {"MailFromDomainStatus": "Pending"}}
+            }
+
+            result = provider.verify_email_domain(TEST_DOMAIN, mail_from_subdomain="mail", team_id=1)
+
+            dmarc_records = [r for r in result["dnsRecords"] if r["type"] == "dmarc"]
+            assert len(dmarc_records) == 1
+            assert dmarc_records[0]["status"] == expected_dmarc_status
+            assert dmarc_records[0]["recordValue"] == expected_record_value
+            assert result["status"] == "pending"  # SES statuses are Pending, so overall stays pending
+
+    @parameterized.expand(
+        [
+            ("set", {TEST_DOMAIN: {"MailFromDomain": f"bounces.{TEST_DOMAIN}"}}, "bounces"),
+            ("nested", {TEST_DOMAIN: {"MailFromDomain": f"mail.out.{TEST_DOMAIN}"}}, "mail.out"),
+            ("identity_without_mail_from", {TEST_DOMAIN: {}}, None),
+            ("unknown_identity", {}, None),
+            ("outside_domain", {TEST_DOMAIN: {"MailFromDomain": "bounces.other.example.com"}}, None),
+        ]
+    )
+    def test_get_mail_from_subdomain(self, _name, attributes, expected):
+        provider = SESProvider()
+        with patch.object(provider.ses_client, "get_identity_mail_from_domain_attributes") as mock_mail_from_attrs:
+            mock_mail_from_attrs.return_value = {"MailFromDomainAttributes": attributes}
+            assert provider.get_mail_from_subdomain(TEST_DOMAIN) == expected
+
+    @parameterized.expand(
+        [
+            ("all_missing", set()),
+            ("partial_present", {"token2", "token3"}),
+            ("all_present", {"token1", "token2", "token3"}),
+        ]
+    )
+    def test_verify_dkim_partial_shows_per_record_status(self, _name, present_tokens):
+        """When DKIM is not fully verified, individual CNAME lookups show which records are present."""
+        provider = SESProvider()
+
+        def resolve_side_effect(hostname, rdtype=None):
+            for token in present_tokens:
+                if rdtype == "CNAME" and f"{token}._domainkey" in hostname:
+                    rdata = MagicMock()
+                    rdata.target = dns.name.from_text(f"{token}.dkim.amazonses.com.")
+                    return [rdata]
+            raise dns.resolver.NXDOMAIN()
+
+        with (
+            patch.object(provider.ses_client, "get_identity_verification_attributes") as mock_verif,
+            patch.object(provider.ses_client, "get_identity_dkim_attributes") as mock_dkim,
+            patch.object(provider.ses_client, "get_identity_mail_from_domain_attributes") as mock_mail,
+            patch("products.workflows.backend.providers.ses.dns.resolver.Resolver") as mock_resolver_cls,
+        ):
+            mock_resolver_cls.return_value.resolve.side_effect = resolve_side_effect
+            mock_verif.return_value = {"VerificationAttributes": {TEST_DOMAIN: {"VerificationStatus": "Success"}}}
+            mock_dkim.return_value = {"DkimAttributes": {TEST_DOMAIN: {"DkimVerificationStatus": "Failed"}}}
+            mock_mail.return_value = {"MailFromDomainAttributes": {TEST_DOMAIN: {"MailFromDomainStatus": "Success"}}}
+
+            result = provider.verify_email_domain(TEST_DOMAIN, mail_from_subdomain="mail", team_id=1)
+
+        # DkimVerificationStatus=Failed always produces overall "failed", regardless of per-record DNS state
+        assert result["status"] == "failed"
+        dkim_records = [r for r in result["dnsRecords"] if r["type"] == "dkim"]
+        assert len(dkim_records) == 3
+        statuses = {r["recordHostname"].split(".")[0]: r["status"] for r in dkim_records}
+        for token in ("token1", "token2", "token3"):
+            expected = "success" if token in present_tokens else "pending"
+            assert statuses[token] == expected, f"{token}: expected {expected}, got {statuses[token]}"
+
+
+class TestSESResponseShapeContract(TestCase):
+    """Pin the response shapes we read from boto3 against the live SDK service model.
+
+    Tests in this class deliberately do NOT use the class-level `boto3.client` patcher —
+    the SDK introspection needs a real, unpatched client to read the actual operation shape.
+    Mock-based unit tests can't catch a key rename (or a copy-paste typo) because the test
+    mock and the production code can agree with each other and disagree with reality.
+    Regression for #62844 — `_list_identity_tenants` previously read `Tenants` instead of the
+    real `ResourceTenants` key, bricking the SES verify path for every customer.
+    """
+
+    @parameterized.expand(
+        [
+            (
+                "list_resource_tenants_response_key",
+                "ResourceTenants",
+                lambda m: m.operation_model("ListResourceTenants").output_shape.members.keys(),
+                "AWS SES v2 ListResourceTenants response no longer exposes `ResourceTenants`. "
+                "Update _list_identity_tenants in products/workflows/backend/providers/ses.py.",
+            ),
+            (
+                "resource_tenant_metadata_field",
+                "TenantName",
+                lambda m: m.shape_for("ResourceTenantMetadata").members.keys(),
+                "AWS SES v2 ResourceTenantMetadata no longer exposes `TenantName`. "
+                "Update _list_identity_tenants in products/workflows/backend/providers/ses.py.",
+            ),
+            (
+                "get_account_enforcement_status",
+                "EnforcementStatus",
+                lambda m: m.operation_model("GetAccount").output_shape.members.keys(),
+                "AWS SES v2 GetAccount response no longer exposes `EnforcementStatus`. "
+                "Update get_account_enforcement_status in products/workflows/backend/providers/ses.py.",
+            ),
+            (
+                "recommendation_resource_arn",
+                "ResourceArn",
+                lambda m: m.shape_for("Recommendation").members.keys(),
+                "AWS SES v2 Recommendation no longer exposes `ResourceArn`. "
+                "Update get_account_reputation_findings in products/workflows/backend/providers/ses.py.",
+            ),
+        ]
+    )
+    def test_sdk_shape_exposes_field(self, _name, expected_key, get_members, message):
+        service_model = boto3.client("sesv2", region_name="us-east-1").meta.service_model
+        assert expected_key in get_members(service_model), message
+
+    def test_list_identity_tenants_parses_real_shape(self):
+        provider = SESProvider()
+        with (
+            patch.object(provider.sts_client, "get_caller_identity", return_value={"Account": "123456789012"}),
+            patch.object(provider.ses_v2_client, "list_resource_tenants") as mock_list,
+        ):
+            mock_list.return_value = {
+                "ResourceTenants": [
+                    {"TenantName": "team-1", "TenantId": "t1", "ResourceArn": "arn"},
+                    {"TenantName": "team-2", "TenantId": "t2", "ResourceArn": "arn"},
+                    {"TenantId": "t3", "ResourceArn": "arn"},  # TenantName is NotRequired in the SDK
+                ],
+                "ResponseMetadata": {},
+            }
+            tenants = provider._list_identity_tenants("test.posthog.com")
+        assert tenants == {"team-1", "team-2"}
+
+    def test_delete_identity_removes_tenant_associations_first(self):
+        # SES rejects DeleteIdentity while tenant associations exist, so the
+        # associations must be removed before the identity delete is attempted.
+        provider = SESProvider()
+        with (
+            override_settings(SES_REGION="us-east-1"),
+            patch.object(provider.sts_client, "get_caller_identity", return_value={"Account": "123456789012"}),
+            patch.object(
+                provider.ses_v2_client,
+                "list_resource_tenants",
+                return_value={"ResourceTenants": [{"TenantName": "team-1", "TenantId": "t1", "ResourceArn": "arn"}]},
+            ),
+            patch.object(provider.ses_v2_client, "delete_tenant_resource_association") as mock_delete_association,
+            patch.object(provider.ses_client, "delete_identity") as mock_delete_identity,
+        ):
+            manager = MagicMock()
+            manager.attach_mock(mock_delete_association, "delete_association")
+            manager.attach_mock(mock_delete_identity, "delete_identity")
+
+            provider.delete_identity(TEST_DOMAIN)
+
+        arn = f"arn:aws:ses:us-east-1:123456789012:identity/{TEST_DOMAIN}"
+        assert manager.mock_calls == [
+            call.delete_association(TenantName="team-1", ResourceArn=arn),
+            call.delete_identity(Identity=TEST_DOMAIN),
+        ]
+
+
+class TestGetTenantReputation(TestCase):
+    TENANT_ARN = "arn:aws:ses:us-east-1:123456789012:tenant/team-1/abc"
+
+    def setUp(self):
+        patcher = patch("products.workflows.backend.providers.ses.boto3.client")
+        mock_boto3_client = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mock_client = mock_boto3_client.return_value
+        self.provider = SESProvider()
+
+    @staticmethod
+    def _client_error(code: str) -> ClientError:
+        return ClientError({"Error": {"Code": code}}, "GetTenant")
+
+    def test_returns_none_when_the_tenant_does_not_exist(self):
+        self.mock_client.get_tenant.side_effect = self._client_error("NotFoundException")
+        assert self.provider.get_tenant_reputation(1) is None
+
+    def test_returns_tenant_status_with_no_findings_when_the_reputation_entity_is_missing(self):
+        self.mock_client.get_tenant.return_value = {
+            "Tenant": {"TenantName": "team-1", "TenantArn": self.TENANT_ARN, "SendingStatus": "ENABLED"}
+        }
+        self.mock_client.get_reputation_entity.side_effect = self._client_error("NotFoundException")
+        self.mock_client.list_recommendations.return_value = {"Recommendations": []}
+
+        assert self.provider.get_tenant_reputation(1) == {
+            "sending_status": "ENABLED",
+            "reputation_impact": None,
+            "findings": [],
+        }
+
+    def test_returns_aggregate_status_impact_and_paginated_findings(self):
+        self.mock_client.get_tenant.return_value = {
+            "Tenant": {"TenantName": "team-1", "TenantArn": self.TENANT_ARN, "SendingStatus": "ENABLED"}
+        }
+        self.mock_client.get_reputation_entity.return_value = {
+            "ReputationEntity": {
+                "ReputationImpact": "HIGH",
+                # The aggregate folds in customer-managed pauses, so it must win over GetTenant's status
+                "SendingStatusAggregate": "DISABLED",
+            }
+        }
+        self.mock_client.list_recommendations.side_effect = [
+            {
+                "Recommendations": [
+                    {"Type": "BOUNCE", "Impact": "HIGH", "Description": "Bounce rate too high", "Status": "OPEN"},
+                    # Resolved findings come back too (STATUS can't be combined with RESOURCE_ARN
+                    # in the AWS-side filter) and must be dropped locally
+                    {"Type": "SPF", "Impact": "LOW", "Description": "Fixed already", "Status": "FIXED"},
+                ],
+                "NextToken": "page-2",
+            },
+            {"Recommendations": [{"Type": "DKIM", "Impact": "LOW", "Description": "Set up DKIM", "Status": "OPEN"}]},
+        ]
+
+        result = self.provider.get_tenant_reputation(1)
+
+        assert result is not None
+        assert result["sending_status"] == "DISABLED"
+        assert result["reputation_impact"] == "HIGH"
+        assert [(f["finding_type"], f["impact"], f["description"]) for f in result["findings"]] == [
+            ("BOUNCE", "HIGH", "Bounce rate too high"),
+            ("DKIM", "LOW", "Set up DKIM"),
+        ]
+        # Both pages were requested, scoped to this tenant's ARN (OPEN is filtered locally)
+        first_call, second_call = self.mock_client.list_recommendations.call_args_list
+        assert first_call.kwargs["Filter"] == {"RESOURCE_ARN": self.TENANT_ARN}
+        assert second_call.kwargs["NextToken"] == "page-2"
+
+
+class TestGetAccountReputation(TestCase):
+    def setUp(self):
+        patcher = patch("products.workflows.backend.providers.ses.boto3.client")
+        mock_boto3_client = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mock_client = mock_boto3_client.return_value
+        self.provider = SESProvider()
+
+    def test_returns_open_findings_across_pages(self):
+        self.mock_client.list_recommendations.side_effect = [
+            {
+                "Recommendations": [
+                    {
+                        "Type": "BOUNCE",
+                        "Impact": "LOW",
+                        "Status": "OPEN",
+                        "ResourceArn": "arn:aws:ses:us-east-1:123:tenant/team-1/tn-abc",
+                        "Description": "Bounce rate exceeded 10%",
+                    },
+                ],
+                "NextToken": "page-2",
+            },
+            {
+                "Recommendations": [
+                    {
+                        "Type": "DMARC",
+                        "Impact": "HIGH",
+                        "Status": "OPEN",
+                        "ResourceArn": "arn:aws:ses:us-east-1:123:identity/customer.example.com",
+                        "Description": "DMARC5",
+                    },
+                    {
+                        "Type": "COMPLAINT",
+                        "Impact": "HIGH",
+                        "Status": "OPEN",
+                        "ResourceArn": "arn:aws:ses:us-east-1:123:configuration-set/posthog-messaging",
+                        "Description": "Complaint rate elevated",
+                    },
+                ]
+            },
+        ]
+
+        findings = self.provider.get_account_reputation_findings()
+
+        assert [(f["finding_type"], f["impact"], f["scope"]) for f in findings] == [
+            ("BOUNCE", "LOW", "tenant"),
+            ("DMARC", "HIGH", "identity"),
+            ("COMPLAINT", "HIGH", "account"),
+        ]
+        # The listing must be account-wide with OPEN filtered server-side, and walk every page
+        first_call, second_call = self.mock_client.list_recommendations.call_args_list
+        assert first_call.kwargs["Filter"] == {"STATUS": "OPEN"}
+        assert first_call.kwargs["PageSize"] == 100
+        assert second_call.kwargs["NextToken"] == "page-2"
+        self.mock_client.get_account.assert_not_called()
+
+    def test_missing_enforcement_status_fails_the_poll(self):
+        self.mock_client.get_account.return_value = {}
+
+        with pytest.raises(KeyError):
+            self.provider.get_account_enforcement_status()
+
+
+def _isp_of(query) -> str:
+    return query["Dimensions"].get("ISP", ISP_IDENTITY_TOTAL)
+
+
+class TestGetIdentityIspMetrics(TestCase):
+    def setUp(self):
+        patcher = patch("products.workflows.backend.providers.ses.boto3.client")
+        mock_boto3_client = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mock_client = mock_boto3_client.return_value
+        self.provider = SESProvider()
+
+    def _serve(self, values_by_subject: dict[tuple[str, str], int]) -> None:
+        """Answer each batch from a {(isp, metric): value} table, defaulting anything absent to 0."""
+
+        def respond(Queries):
+            return {
+                "Results": [
+                    {
+                        "Id": query["Id"],
+                        "Timestamps": [datetime(2026, 8, 1, tzinfo=UTC)],
+                        "Values": [values_by_subject.get((_isp_of(query), query["Metric"]), 0)],
+                    }
+                    for query in Queries
+                ]
+            }
+
+        self.mock_client.batch_get_metric_data.side_effect = lambda Queries: respond(Queries)
+
+    def _serve_series(self, values_by_subject: dict[tuple[str, str], dict[str, int]]) -> None:
+        """Answer from a {(isp, metric): {date: value}} table, so a query spans several buckets."""
+
+        def respond(Queries):
+            results = []
+            for query in Queries:
+                buckets = values_by_subject.get((_isp_of(query), query["Metric"]), {})
+                results.append(
+                    {
+                        "Id": query["Id"],
+                        "Timestamps": [datetime.fromisoformat(date) for date in sorted(buckets)],
+                        "Values": [buckets[date] for date in sorted(buckets)],
+                    }
+                )
+            return {"Results": results}
+
+        self.mock_client.batch_get_metric_data.side_effect = lambda Queries: respond(Queries)
+
+    def test_counts_are_summed_across_domains(self):
+        self._serve_series(
+            {
+                ("Gmail", "SEND"): {"2026-08-02": 50, "2026-08-01": 100},
+                ("Gmail", "DELIVERY"): {"2026-08-02": 10, "2026-08-01": 95},
+            }
+        )
+
+        rows = self.provider.get_identity_isp_metrics(
+            [TEST_DOMAIN, "other.posthog.com"], window_days=30, isps=["Gmail"]
+        )
+
+        assert rows[0].emails_sent == 300
+        assert rows[0].delivery_rate == 0.7
+
+    def test_a_partial_query_failure_leaves_the_other_metrics_intact(self):
+        # SES reports per-query failures in Errors while still returning Results. Logging one used
+        # to raise KeyError, because "message" is reserved on LogRecord, so a single failed query
+        # took down the whole breakdown instead of understating one metric.
+        def respond(Queries):
+            return {
+                "Results": [
+                    {"Id": q["Id"], "Timestamps": [datetime(2026, 8, 1, tzinfo=UTC)], "Values": [100]}
+                    for q in Queries
+                    if q["Metric"] == "SEND"
+                ],
+                "Errors": [
+                    {"Id": q["Id"], "Code": "ACCESS_DENIED", "Message": "denied"}
+                    for q in Queries
+                    if q["Metric"] != "SEND"
+                ],
+            }
+
+        self.mock_client.batch_get_metric_data.side_effect = lambda Queries: respond(Queries)
+
+        # assertLogs raises the level so the record is actually built. Without it the warning is
+        # gated out under pytest and never reaches makeRecord, which is how the reserved-key crash
+        # stayed invisible in tests while failing in production, where WARNING is enabled.
+        with self.assertLogs("products.workflows.backend.providers.ses", level="WARNING") as logs:
+            rows = self.provider.get_identity_isp_metrics([TEST_DOMAIN], window_days=30, isps=["Gmail"])
+
+        assert any("SES metric query failed" in line for line in logs.output)
+        assert [row.isp for row in rows] == ["Gmail"]
+        assert rows[0].emails_sent == 100
+        # The provider stays, because SEND answered and its volume is known. The rates behind the
+        # failed queries are reported as missing: zero would read as a real measurement, and a 0%
+        # complaint rate is the most reassuring number this table can show.
+        assert rows[0].delivery_rate is None
+        assert rows[0].bounce_rate is None
+        assert rows[0].complaint_rate is None
+        assert rows[0].transient_bounce_rate is None
+        assert set(rows[0].unavailable) == {"delivery", "bounce", "transient_bounce", "complaint"}
+
+    def test_a_provider_ses_rejects_does_not_take_its_batch_mates_with_it(self):
+        # SES validates dimension values per request, so a name it will not accept fails every
+        # query sent with it. A subject is keyed by provider and metric with no domain, so failing
+        # the batch dropped a good provider from every domain rather than from the one request.
+        # Six metrics do not divide the ten-query batch, so a rejected name also straddles two.
+        def respond(Queries):
+            if any(_isp_of(query) == "Mail.ru" for query in Queries):
+                raise ClientError({"Error": {"Code": "BadRequestException"}}, "BatchGetMetricData")
+            return {
+                "Results": [
+                    {"Id": query["Id"], "Timestamps": [datetime(2026, 8, 1, tzinfo=UTC)], "Values": [100]}
+                    for query in Queries
+                ]
+            }
+
+        self.mock_client.batch_get_metric_data.side_effect = lambda Queries: respond(Queries)
+
+        with self.assertLogs("products.workflows.backend.providers.ses", level="WARNING") as logs:
+            # Gmail shares the first batch with the name SES refuses; Yahoo sits in the second.
+            rows = self.provider.get_identity_isp_metrics(
+                [TEST_DOMAIN], window_days=30, isps=["Gmail", "Mail.ru", "Yahoo"]
+            )
+
+        assert any("SES rejected a metric query" in line for line in logs.output)
+        assert [row.isp for row in rows] == ["Gmail", "Yahoo"]
+
+    @parameterized.expand(
+        [
+            # A provider that reports complaints: the rate is complaints over the deliveries it
+            # reports them for, NOT over everything we sent it.
+            ("reporting_provider", 40, 4, 0.1),
+            # SES excludes recipients at providers it has no feedback-loop agreement with from
+            # DELIVERY_COMPLAINT. A zero base means unmeasurable, which must not read as 0%.
+            ("provider_without_a_feedback_loop", 0, 0, None),
+        ]
+    )
+    def test_complaint_rate_is_measured_against_delivery_complaint(
+        self, _name: str, delivery_complaint: int, complaints: int, expected: Optional[float]
+    ):
+        self._serve(
+            {
+                ("Gmail", "SEND"): 100,
+                ("Gmail", "DELIVERY"): 95,
+                ("Gmail", "DELIVERY_COMPLAINT"): delivery_complaint,
+                ("Gmail", "COMPLAINT"): complaints,
+            }
+        )
+
+        rows = self.provider.get_identity_isp_metrics([TEST_DOMAIN], window_days=30, isps=["Gmail"])
+
+        assert [row.complaint_rate for row in rows] == [expected]
+        # The base travels with the rate: a caller weighing whether the rate rests on enough
+        # volume has to use it, since emails_sent is far larger and would clear any floor.
+        assert [row.complaint_base for row in rows] == [delivery_complaint]
+
+    def test_soft_rejections_are_reported_apart_from_permanent_bounces(self):
+        self._serve(
+            {
+                ("Icloud", "SEND"): 100,
+                ("Icloud", "DELIVERY"): 92,
+                ("Icloud", "PERMANENT_BOUNCE"): 1,
+                ("Icloud", "TRANSIENT_BOUNCE"): 7,
+            }
+        )
+
+        rows = self.provider.get_identity_isp_metrics([TEST_DOMAIN], window_days=30, isps=["Icloud"])
+
+        assert rows[0].bounce_rate == 0.01
+        assert rows[0].transient_bounce_rate == 0.07
+
+    def test_counts_are_summed_across_the_projects_sending_domains(self):
+        # Each domain is queried separately because EMAIL_IDENTITY is per verified domain, but a
+        # project's rates are project-wide, so the two domains' counts have to add up.
+        self._serve({("Gmail", "SEND"): 50, ("Gmail", "DELIVERY"): 40, ("Gmail", "PERMANENT_BOUNCE"): 5})
+
+        rows = self.provider.get_identity_isp_metrics(
+            [TEST_DOMAIN, "other.posthog.com"], window_days=30, isps=["Gmail"]
+        )
+
+        assert len(rows) == 1
+        assert rows[0].emails_sent == 100
+        assert rows[0].delivery_rate == 0.8
+        assert rows[0].bounce_rate == 0.1
+
+    def test_queries_are_batched_within_the_ses_ten_query_limit(self):
+        self._serve({("Gmail", "SEND"): 1, ("Yahoo", "SEND"): 1, ("Outlook", "SEND"): 1})
+
+        self.provider.get_identity_isp_metrics([TEST_DOMAIN], window_days=30, isps=["Gmail", "Yahoo", "Outlook"])
+
+        batches = [kwargs["Queries"] for _, kwargs in self.mock_client.batch_get_metric_data.call_args_list]
+        # 3 providers plus the identity-wide totals, times 6 metrics, is 24 queries. SES rejects a
+        # batch of more than ten.
+        assert [len(batch) for batch in batches] == [10, 10, 4]
+        sent = {(_isp_of(query), query["Metric"]) for batch in batches for query in batch}
+        assert len(sent) == 24
+
+    def test_the_domain_cap_keeps_the_domains_that_actually_sent(self):
+        # The cap used to take the first few domains in id order, which is the order they were
+        # verified in — so a project that added its current sending domain last had the only domain
+        # with traffic dropped, while the breakdown still read as project-wide.
+        def respond(Queries):
+            results = []
+            for query in Queries:
+                dimensions = query["Dimensions"]
+                if "ISP" not in dimensions:
+                    volume = 500 if dimensions["EMAIL_IDENTITY"] == "busy.test" else 0
+                else:
+                    volume = 10
+                results.append(
+                    {"Id": query["Id"], "Timestamps": [datetime(2026, 8, 1, tzinfo=UTC)], "Values": [volume]}
+                )
+            return {"Results": results, "Errors": []}
+
+        self.mock_client.batch_get_metric_data.side_effect = lambda Queries: respond(Queries)
+
+        self.provider.get_identity_isp_metrics(
+            ["quiet-a.test", "quiet-b.test", "busy.test"], window_days=30, isps=["Gmail"], max_domains=1
+        )
+
+        per_provider = [
+            query["Dimensions"]["EMAIL_IDENTITY"]
+            for _, kwargs in self.mock_client.batch_get_metric_data.call_args_list
+            for query in kwargs["Queries"]
+            if "ISP" in query["Dimensions"]
+        ]
+        assert set(per_provider) == {"busy.test"}
+
+    def test_slow_ses_cannot_hold_the_request_past_the_budget(self):
+        # The budget used to start after domain ranking and to be checked only against the clock,
+        # so ranking ran outside it and the last call could still start with the budget nearly
+        # spent — holding a web worker well past the ceiling the constant advertises.
+        clock = iter(count(start=0.0, step=6.0))
+
+        def respond(Queries):
+            return {
+                "Results": [
+                    {"Id": query["Id"], "Timestamps": [datetime(2026, 8, 1, tzinfo=UTC)], "Values": [10]}
+                    for query in Queries
+                ],
+                "Errors": [],
+            }
+
+        self.mock_client.batch_get_metric_data.side_effect = lambda Queries: respond(Queries)
+        with patch("products.workflows.backend.providers.ses.monotonic", lambda: next(clock)):
+            with pytest.raises(TimeoutError):
+                self.provider.get_identity_isp_metrics(
+                    ["a.test", "b.test"], window_days=30, isps=["Gmail", "Yahoo", "Outlook"]
+                )
+
+        elapsed = 6.0 * self.mock_client.batch_get_metric_data.call_count
+        assert elapsed <= METRIC_QUERY_BUDGET_SECONDS
+
+    def test_ranking_that_runs_out_of_budget_keeps_the_first_domains(self):
+        # Ranking shares the budget, so it stops rather than spending all of it deciding which
+        # domains to spend it on. Losing the ranking is the old unconditional slice, not an error.
+        clock = iter(count(start=0.0, step=8.0))
+        self.mock_client.batch_get_metric_data.side_effect = lambda Queries: {
+            "Results": [
+                {"Id": query["Id"], "Timestamps": [datetime(2026, 8, 1, tzinfo=UTC)], "Values": [10]}
+                for query in Queries
+            ],
+            "Errors": [],
+        }
+        domains = [f"d{index}.test" for index in range(11)]
+
+        with patch("products.workflows.backend.providers.ses.monotonic", lambda: next(clock)):
+            with pytest.raises(TimeoutError):
+                self.provider.get_identity_isp_metrics(domains, window_days=30, isps=["Gmail"], max_domains=2)
+
+        ranking_calls = [
+            kwargs
+            for _, kwargs in self.mock_client.batch_get_metric_data.call_args_list
+            if all("ISP" not in query["Dimensions"] for query in kwargs["Queries"])
+        ]
+        # Eleven domains rank in two batches; the second would have started with less budget left
+        # than one call can take.
+        assert len(ranking_calls) == 1
+
+    def test_providers_that_received_nothing_are_omitted(self):
+        # Without this a silent provider divides by zero; a row of zeros would also read as a
+        # delivery problem rather than as "we never mailed anyone here".
+        self._serve({("Gmail", "SEND"): 10, ("Gmail", "DELIVERY"): 10})
+
+        rows = self.provider.get_identity_isp_metrics([TEST_DOMAIN], window_days=30, isps=["Gmail", "Yahoo"])
+
+        assert [row.isp for row in rows] == ["Gmail"]
+
+    def test_volume_no_named_provider_accounts_for_is_reported(self):
+        # SES rejects the name of its own catch-all bucket, so the unnamed remainder can only be
+        # derived. On posthog.com it was 91 of 108 sends, and the table dropped every one of them
+        # without saying so.
+        self._serve(
+            {
+                (ISP_IDENTITY_TOTAL, "SEND"): 108,
+                (ISP_IDENTITY_TOTAL, "DELIVERY"): 100,
+                ("Gmail", "SEND"): 16,
+                ("Gmail", "DELIVERY"): 16,
+            }
+        )
+
+        rows = self.provider.get_identity_isp_metrics([TEST_DOMAIN], window_days=30, isps=["Gmail"])
+
+        assert [(row.isp, row.emails_sent) for row in rows] == [(ISP_OTHER, 92), ("Gmail", 16)]
+        assert rows[0].delivery_rate == pytest.approx(84 / 92)
+
+    def test_no_remainder_row_when_a_named_provider_did_not_answer(self):
+        # A provider whose SEND query failed has no counts to subtract, so its volume would show up
+        # as unattributed. Reporting nothing beats moving one provider's mail into another row.
+        def respond(Queries):
+            return {
+                "Results": [
+                    {"Id": q["Id"], "Timestamps": [datetime(2026, 8, 1, tzinfo=UTC)], "Values": [108]}
+                    for q in Queries
+                    if _isp_of(q) == ISP_IDENTITY_TOTAL
+                ],
+                "Errors": [{"Id": q["Id"], "Code": "X", "Message": "y"} for q in Queries if _isp_of(q) == "Gmail"],
+            }
+
+        self.mock_client.batch_get_metric_data.side_effect = lambda Queries: respond(Queries)
+
+        with self.assertLogs("products.workflows.backend.providers.ses", level="WARNING"):
+            rows = self.provider.get_identity_isp_metrics([TEST_DOMAIN], window_days=30, isps=["Gmail"])
+
+        assert [row.isp for row in rows] == []
+
+    def test_busiest_provider_is_reported_first(self):
+        self._serve({("Gmail", "SEND"): 10, ("Yahoo", "SEND"): 90})
+
+        rows = self.provider.get_identity_isp_metrics([TEST_DOMAIN], window_days=30, isps=["Gmail", "Yahoo"])
+
+        assert [row.isp for row in rows] == ["Yahoo", "Gmail"]
+
+
+class TestVerifyEmailDomainApexSpf(TestCase):
+    @parameterized.expand(
+        [
+            (
+                "merged_into_one_record",
+                ("v=spf1 include:_spf.google.com include:amazonses.com ~all", "site-verification=abc"),
+                "success",
+            ),
+            (
+                "split_across_two_records",
+                ("v=spf1 include:_spf.google.com ~all", "v=spf1 include:amazonses.com ~all"),
+                "pending",
+            ),
+        ]
+    )
+    def test_apex_spf_status_follows_the_published_spf(
+        self, _name: str, spf_values: tuple[str, ...], expected_status: str
+    ) -> None:
+        domain = "mail.example.com"
+        world = EmailDomainWorld()
+        world.dns.add_zone("example.com", nameservers={"ns1.example-dns.net": "34.120.0.1"})
+        world.ses.add_identity(domain, verification_token="token")
+        world.dns.publish_txt(f"_amazonses.{domain}", "token")
+        world.dns.publish_txt(domain, *spf_values)
+
+        with world.installed():
+            result = SESProvider().verify_email_domain(domain, mail_from_subdomain="feedback", team_id=1)
+
+        [apex_spf] = [record for record in result["dnsRecords"] if record["recordHostname"] == "@"]
+        assert apex_spf["status"] == expected_status

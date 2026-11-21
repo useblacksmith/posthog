@@ -1,0 +1,612 @@
+"""Helpers for appending and querying `task_run` log artefacts on a report.
+
+A `task_run` artefact records that a `tasks.Task` ran for a report (research, implementation,
+repo-selection, …) so the run shows up in the report's work-log timeline. The append lives here
+as a single source of truth, shared by the live creation paths and the
+`backfill_task_run_artefacts` management command.
+
+Each artefact carries a `(product, type)` pair following the custom-agent identifier shape: the
+built-in signals pipeline uses `product="signals"` with one of the `TASK_RUN_TYPE_*` constants
+as `type`; custom agents supply their own `identifier()` pair. The pair is also how a task's
+purpose is *derived* — there is no relationship label on the task↔report association itself.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Sequence
+from enum import StrEnum
+
+from django.db import transaction
+
+from pydantic import ValidationError
+
+from posthog.dataclasses import frozen
+
+from products.signals.backend.artefact_schemas import (
+    SIGNALS_PRODUCT,
+    TASK_RUN_TYPE_DISCUSSION,
+    TASK_RUN_TYPE_IMPLEMENTATION,
+    TASK_RUN_TYPE_REPO_SELECTION,
+    TASK_RUN_TYPE_RESEARCH,
+    TASK_RUN_TYPE_SCOUT,
+    NoteArtefact,
+    TaskRunArtefact,
+)
+from products.signals.backend.billing import mark_report_billing_exempt, report_has_implementation_pr
+from products.signals.backend.models import ArtefactAttribution, SignalReport, SignalReportArtefact, SignalReportTask
+from products.signals.backend.report_assignments import ReportClaimConflict, claim_report_for_task, release_claim
+from products.signals.backend.report_claims import get_active_claim, is_claim_of_person, is_claim_of_task_creator
+
+# The task-run vocabulary lives in `artefact_schemas` (a leaf module the model layer can import
+# without a cycle); re-exported here so existing `from task_run_artefacts import …` callers keep
+# working.
+__all__ = [
+    "MAX_DISCUSSION_TASKS_PER_REPORT",
+    "SIGNALS_PRODUCT",
+    "TASK_RUN_TYPE_DISCUSSION",
+    "TASK_RUN_TYPE_IMPLEMENTATION",
+    "TASK_RUN_TYPE_REPO_SELECTION",
+    "TASK_RUN_TYPE_RESEARCH",
+    "ReportTaskCapExceeded",
+    "aappend_task_run_artefact",
+    "append_task_run_artefact",
+    "enforce_report_implementation_rerun_cap",
+    "enforce_report_task_cap",
+    "is_report_implementation_task",
+    "record_implementation_task",
+    "record_report_task",
+    "release_quota_cancelled_implementation",
+    "signals_task_ids",
+]
+
+# One report funds at most this many user-started discussion tasks, on top of one live
+# implementation. Inference on these tasks is unbilled (per-PR pricing), so without a cap a
+# single report is an unlimited font of free agent runs; the number only needs to cover honest
+# "ask a follow-up in a fresh task" use, since conversation *within* a task is unlimited.
+MAX_DISCUSSION_TASKS_PER_REPORT = 10
+
+# `scout` excluded too: it labels the scout run that authored the report, is server-written, and
+# is rejected as a client-asserted relationship by the tasks write serializer.
+_PIPELINE_TASK_RUN_TYPES = frozenset(
+    {TASK_RUN_TYPE_IMPLEMENTATION, TASK_RUN_TYPE_RESEARCH, TASK_RUN_TYPE_REPO_SELECTION, TASK_RUN_TYPE_SCOUT}
+)
+
+# Pipeline runs that never open a PR for the report. Research and repo-selection runs sit on the
+# base branch and read other people's PRs while checking for in-flight work, so a PR URL on one of
+# their runs is something the agent looked at, not something it shipped. Kept as a denylist so a
+# new run type that does ship code (a report is expected to grow several PRs) counts by default.
+NON_PR_BEARING_TASK_RUN_TYPES = frozenset({TASK_RUN_TYPE_RESEARCH, TASK_RUN_TYPE_REPO_SELECTION, TASK_RUN_TYPE_SCOUT})
+
+# Run statuses that mean the run is over. A run that ended is no longer spending inference, so it
+# holds the report's implementation slot only through the PR it shipped, if it shipped one.
+_TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+_GITHUB_PR_URL_PREFIX = "https://github.com/"
+
+
+class _ImplementationSlotClaim(StrEnum):
+    """Why a report's one implementation slot is still claimed."""
+
+    IN_FLIGHT = "in_flight"
+    SHIPPED_PR = "shipped_pr"
+
+    @property
+    def detail(self) -> str:
+        """The message the person reads when the claim refuses their action."""
+        if self is _ImplementationSlotClaim.SHIPPED_PR:
+            return "This report already has a pull request. Open the existing task to continue it."
+        return "A pull request run is already in progress for this report. Open the existing task to follow it."
+
+
+class ReportTaskCapExceeded(Exception):
+    """A signal report already has its allowance of user-started tasks."""
+
+    def __init__(self, kind: str, detail: str) -> None:
+        super().__init__(detail)
+        self.kind = kind
+        self.detail = detail
+
+
+def _task_run_content(product: str, type: str, task_id: str, run_id: str | None) -> TaskRunArtefact:
+    return TaskRunArtefact(
+        task_id=str(task_id),
+        run_id=str(run_id) if run_id is not None else None,
+        product=product,
+        type=type,
+    )
+
+
+def append_task_run_artefact(
+    *, team_id: int, report_id: str, product: str, type: str, task_id: str, run_id: str | None = None
+) -> SignalReportArtefact:
+    """Append a `task_run` log artefact recording that a task ran for the report (sync).
+
+    Always attributed to the task it records — that task *is* the producer of the entry.
+    """
+    return SignalReportArtefact.add_log(
+        team_id=team_id,
+        report_id=str(report_id),
+        content=_task_run_content(product, type, task_id, run_id),
+        attribution=ArtefactAttribution.from_task(task_id),
+    )
+
+
+async def aappend_task_run_artefact(
+    *, team_id: int, report_id: str, product: str, type: str, task_id: str, run_id: str | None = None
+) -> SignalReportArtefact:
+    """Append a `task_run` log artefact recording that a task ran for the report (async).
+
+    Uses the async ORM directly (not a `database_sync_to_async` hop, which would run on a
+    different connection and not see the caller's uncommitted rows); content validation and
+    task attribution match `append_task_run_artefact`.
+    """
+    attribution = ArtefactAttribution.from_task(task_id)
+    return await SignalReportArtefact.objects.acreate(
+        team_id=team_id,
+        report_id=str(report_id),
+        type=SignalReportArtefact.ArtefactType.TASK_RUN,
+        content=_task_run_content(product, type, task_id, run_id).model_dump_json(),
+        actor_kind=attribution.kind,
+        task_id=attribution.task_id,
+    )
+
+
+def signals_task_ids(*, report_id: str, type: str) -> list[str]:
+    """Task ids associated with the report by the built-in signals pipeline (product `signals`) for
+    the given `type`, oldest first.
+
+    Thin wrapper over `SignalReport.associated_task_runs`, which unifies the `task_run` artefact log
+    with the legacy `SignalReportTask` gate rows — so this is how a task's *purpose* is derived
+    across both sources during the migration.
+    """
+    return [
+        run.task_id
+        for run in SignalReport.associated_task_runs(report_id=report_id, product=SIGNALS_PRODUCT, type=type)
+    ]
+
+
+def _runs_claim_implementation_slot(
+    runs: Sequence[tuple[str | None, object]],
+) -> _ImplementationSlotClaim | None:
+    """Why one implementation task's runs still claim its slot, or `None` once it released the slot.
+
+    A task with no runs yet claims the slot, because its first run is about to start; an empty
+    status marks such a task row, where no run joined. A run that has not reached a terminal
+    status claims the slot while it works. A run that shipped a GitHub PR claims it for good,
+    because the report is implemented. Everything else is a run that ended with nothing to show,
+    so the report can be tried again.
+
+    A shipped PR outranks a live sibling run, because the PR is the more useful thing to send the
+    person to.
+    """
+    has_runs = any(run_status is not None for run_status, _run_pr_url in runs)
+    if not has_runs:
+        return _ImplementationSlotClaim.IN_FLIGHT
+    claim: _ImplementationSlotClaim | None = None
+    for run_status, run_pr_url in runs:
+        if run_status is None:
+            continue
+        if isinstance(run_pr_url, str) and run_pr_url.startswith(_GITHUB_PR_URL_PREFIX):
+            return _ImplementationSlotClaim.SHIPPED_PR
+        if run_status not in _TERMINAL_RUN_STATUSES:
+            claim = _ImplementationSlotClaim.IN_FLIGHT
+    return claim
+
+
+def _implementation_slot_claim(
+    *, team_id: int, report_id: str, exclude_task_id: str | None = None
+) -> _ImplementationSlotClaim | None:
+    """Why the report's one implementation slot is still claimed, or `None` when it is free.
+
+    Reads the `SignalReportTask` gate rows (not the API-mutable artefact log) and traverses
+    to runs via the FK, staying behind the tasks public interface like `billing`. Per task, the
+    rule is `_runs_claim_implementation_slot`; a deleted task claims nothing. Quota-cancelled
+    implementations delete their gate rows (`release_quota_cancelled_implementation`), so they
+    never count.
+    """
+    claimants = SignalReportTask.objects.filter(
+        team_id=team_id, report_id=report_id, relationship=TASK_RUN_TYPE_IMPLEMENTATION
+    ).exclude(task__deleted=True)
+    if exclude_task_id is not None:
+        claimants = claimants.exclude(task_id=exclude_task_id)
+    rows = claimants.values_list("task_id", "task__runs__status", "task__runs__output__pr_url")
+    runs_by_task: dict[str, list[tuple[str | None, object]]] = {}
+    for task_id, status, pr_url in rows:
+        runs_by_task.setdefault(str(task_id), []).append((status, pr_url))
+    claims = {_runs_claim_implementation_slot(runs) for runs in runs_by_task.values()}
+    # A shipped PR is the better answer when one task shipped and another is still working.
+    for claim in (_ImplementationSlotClaim.SHIPPED_PR, _ImplementationSlotClaim.IN_FLIGHT):
+        if claim in claims:
+            return claim
+    return None
+
+
+def implementation_in_flight_report_ids(*, team_id: int, report_ids: Sequence[str]) -> set[str]:
+    """The reports whose implementation run is still working, by the same rule as the slot.
+
+    One query for a page of reports, so every surface can block Create PR on a run in flight.
+    """
+    if not report_ids:
+        return set()
+    rows = (
+        SignalReportTask.objects.filter(
+            team_id=team_id, report_id__in=report_ids, relationship=TASK_RUN_TYPE_IMPLEMENTATION
+        )
+        .exclude(task__deleted=True)
+        .values_list("report_id", "task_id", "task__runs__status", "task__runs__output__pr_url")
+    )
+    runs_by_task: dict[tuple[str, str], list[tuple[str | None, object]]] = {}
+    for report_id, task_id, status, pr_url in rows:
+        runs_by_task.setdefault((str(report_id), str(task_id)), []).append((status, pr_url))
+    return {
+        report_id
+        for (report_id, _task_id), runs in runs_by_task.items()
+        if _runs_claim_implementation_slot(runs) is _ImplementationSlotClaim.IN_FLIGHT
+    }
+
+
+@frozen
+class InFlightImplementation:
+    task_id: str
+    # None while the task waits for its first run.
+    run_id: str | None
+
+
+def in_flight_implementation(*, team_id: int, report_id: str) -> InFlightImplementation | None:
+    """The report's implementation that is still working, by the same rule as the slot, or None."""
+    rows = (
+        SignalReportTask.objects.filter(team_id=team_id, report_id=report_id, relationship=TASK_RUN_TYPE_IMPLEMENTATION)
+        .exclude(task__deleted=True)
+        .values_list("task_id", "task__runs__id", "task__runs__status", "task__runs__output__pr_url")
+    )
+    runs_by_task: dict[str, list[tuple[str | None, str | None, object]]] = {}
+    for row_task_id, run_id, status, pr_url in rows:
+        runs_by_task.setdefault(str(row_task_id), []).append((str(run_id) if run_id else None, status, pr_url))
+    for task_id, runs in runs_by_task.items():
+        if _runs_claim_implementation_slot([(status, pr_url) for _, status, pr_url in runs]) is not (
+            _ImplementationSlotClaim.IN_FLIGHT
+        ):
+            continue
+        working = [run_id for run_id, status, _ in runs if status is not None and status not in _TERMINAL_RUN_STATUSES]
+        return InFlightImplementation(task_id=task_id, run_id=working[0] if working else None)
+    return None
+
+
+def _release_settled_task_claim(*, team_id: int, report_id: str, task_id: str) -> None:
+    """Release a task claim whose implementation run ended without a PR, so another task can run again.
+
+    A task claim names no person, so nobody owns the report once that run settles. A run still
+    working keeps its claim, and so does one that shipped a PR. Creating a task releases any task
+    claim in `enforce_report_task_cap`, so only a rerun of an existing task needs this. The caller
+    holds the report row lock.
+    """
+    claim = get_active_claim(team_id=team_id, report_id=report_id)
+    if (
+        claim is None
+        or claim.actor_kind != "task"
+        or claim.actor_task_id is None
+        or str(claim.actor_task_id) == task_id
+    ):
+        return
+    runs: list[tuple[str | None, object]] = list(
+        SignalReportTask.objects.filter(
+            team_id=team_id,
+            report_id=report_id,
+            task_id=claim.actor_task_id,
+            relationship=TASK_RUN_TYPE_IMPLEMENTATION,
+        ).values_list("task__runs__status", "task__runs__output__pr_url")
+    )
+    if not runs or _runs_claim_implementation_slot(runs) is not None:
+        return
+    release_claim(claim, ArtefactAttribution.from_task(task_id), takeover=True)
+
+
+def enforce_report_task_cap(
+    *,
+    team_id: int,
+    report_id: str,
+    relationship: str | None,
+    description: str | None = None,
+    created_by_id: int | None = None,
+) -> None:
+    """Cap the tasks a single report can spawn; raises `ReportTaskCapExceeded` at the limit.
+
+    Inference on report-started tasks is unbilled (the customer pays per PR), so the report is
+    the resource being spent and the cap belongs on it: one live implementation, and at most
+    `MAX_DISCUSSION_TASKS_PER_REPORT` tasks with any other relationship. This is defense in depth
+    over the gateway's `signals_interactive` per-user budget and per-task spend ceiling.
+
+    Must be called inside an open transaction: it locks the report row — the same lock
+    auto-start's `_create_implementation_task_if_absent` takes — so concurrent creates
+    serialize instead of both passing the count check.
+
+    A discussion whose `description` pushes to the report's pull request ("Get it merged", "Make it
+    green") is also refused while another such run works, so two agents never push to one branch.
+    """
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("enforce_report_task_cap must run inside a transaction; it locks the report row")
+    report = SignalReport.objects.select_for_update().filter(id=report_id, team_id=team_id).first()
+    if report is None:
+        # The serializer already team-scoped the report; behave as the create path would without a cap.
+        return
+    if relationship is None or relationship == TASK_RUN_TYPE_IMPLEMENTATION:
+        claim = _implementation_slot_claim(team_id=team_id, report_id=report_id)
+        if claim is not None:
+            raise ReportTaskCapExceeded(kind=TASK_RUN_TYPE_IMPLEMENTATION, detail=claim.detail)
+        assignment = get_active_claim(team_id=team_id, report_id=report_id)
+        if assignment and is_claim_of_person(assignment, created_by_id):
+            # The claim's owner starts the task, directly or through their agent, so it works under that claim.
+            return
+        if assignment and assignment.actor_kind:
+            if assignment.actor_kind != "task":
+                raise ReportTaskCapExceeded(
+                    kind=TASK_RUN_TYPE_IMPLEMENTATION,
+                    detail="This report already has an active claim. Release it before starting a task.",
+                )
+            release_claim(assignment, ArtefactAttribution.system())
+        return
+    if description is not None:
+        from products.signals.backend.report_task_actions import (  # noqa: PLC0415 — report_task_actions imports this module
+            PULL_REQUEST_RUN_ACTIVE_DETAIL,
+            active_pull_request_run,
+            is_pull_request_run_request,
+        )
+
+        if is_pull_request_run_request(description) and active_pull_request_run(team_id=team_id, report_id=report_id):
+            raise ReportTaskCapExceeded(kind=TASK_RUN_TYPE_DISCUSSION, detail=PULL_REQUEST_RUN_ACTIVE_DETAIL)
+    # Any non-implementation label is a discussion for cap purposes; server-only pipeline labels
+    # can't reach here (the write serializer rejects them) and are excluded from the count.
+    # Counting is status-independent: a discussion that ended still consumed inference.
+    discussions = [
+        run
+        for run in SignalReport.associated_task_runs(report_id=report_id, team_id=team_id, product=SIGNALS_PRODUCT)
+        if run.type not in _PIPELINE_TASK_RUN_TYPES
+    ]
+    if len(discussions) >= MAX_DISCUSSION_TASKS_PER_REPORT:
+        raise ReportTaskCapExceeded(
+            kind=TASK_RUN_TYPE_DISCUSSION,
+            detail="This report has reached its limit of AI discussions. Open an existing discussion task to continue.",
+        )
+
+
+def is_report_implementation_task(*, team_id: int, report_id: str, task_id: str) -> bool:
+    """Whether this task is the report's implementation, the relationship that opens a pull request.
+
+    Reads the `SignalReportTask` gate rows rather than the artefact log, because the log is
+    API-mutable and so cannot carry a spend-controlling decision.
+    """
+    return SignalReportTask.objects.filter(
+        team_id=team_id, report_id=report_id, task_id=task_id, relationship=TASK_RUN_TYPE_IMPLEMENTATION
+    ).exists()
+
+
+def enforce_report_implementation_rerun_cap(*, team_id: int, report_id: str, task_id: str) -> None:
+    """Re-check the one-live-implementation slot before starting another run of an existing task.
+
+    `enforce_report_task_cap` guards task *creation*, but a task outlives its runs. An
+    implementation whose every run ended without a PR releases its slot, which lets a second
+    implementation be created for the report — and then running the first one again would put two
+    live implementations on it, spending unbilled inference twice over.
+
+    Only another task holding the slot blocks: a task reclaiming the slot it released is the
+    ordinary "my run failed, try again" path and stays allowed. Non-implementation tasks are
+    unaffected, since the discussion cap counts tasks rather than runs and conversation inside
+    one is deliberately unlimited.
+
+    Must be called inside an open transaction: it locks the report row, the same lock creation
+    and auto-start take. That lock only serializes for as long as the caller's transaction stays
+    open, and a live run is what marks the slot taken, so a caller that goes on to start the run
+    has to insert the run row in this same transaction. Releasing the lock first would leave the
+    task looking released for the whole span before the insert, which is long enough for a
+    concurrent create to pass its own count check.
+    """
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError(
+            "enforce_report_implementation_rerun_cap must run inside a transaction; it locks the report row"
+        )
+    if not is_report_implementation_task(team_id=team_id, report_id=report_id, task_id=task_id):
+        return
+    report = SignalReport.objects.select_for_update().filter(id=report_id, team_id=team_id).first()
+    if report is None:
+        return
+    _release_settled_task_claim(team_id=team_id, report_id=report_id, task_id=task_id)
+    assignment = get_active_claim(team_id=team_id, report_id=report_id)
+    if (
+        assignment
+        and assignment.actor_kind
+        and str(assignment.actor_task_id) != task_id
+        and not is_claim_of_task_creator(assignment, task_id)
+    ):
+        raise ReportTaskCapExceeded(
+            kind=TASK_RUN_TYPE_IMPLEMENTATION, detail="This report is claimed by another actor."
+        )
+    claim = _implementation_slot_claim(team_id=team_id, report_id=report_id, exclude_task_id=task_id)
+    if claim is not None:
+        raise ReportTaskCapExceeded(kind=TASK_RUN_TYPE_IMPLEMENTATION, detail=claim.detail)
+    claim_report_for_task(
+        team_id=team_id,
+        report_id=report_id,
+        task_id=task_id,
+        for_task_creator=implementation_started_by_person(team_id=team_id, report_id=report_id, task_id=task_id),
+    )
+
+
+def implementation_started_by_person(*, team_id: int, report_id: str, task_id: str) -> bool:
+    """Whether a person started this implementation task by hand, rather than auto-start.
+
+    Auto-start stamps its generated branch on the run artefact of every run it starts, and the
+    manual start-task API leaves it unset. One stamped run makes the task automatic, because
+    auto-start runs a task as a suggested reviewer who never took the work on. A row that does not
+    parse also counts as automatic, so that no claim names a person without evidence.
+    """
+    rows = SignalReportArtefact.objects.filter(
+        team_id=team_id,
+        report_id=report_id,
+        type=SignalReportArtefact.ArtefactType.TASK_RUN,
+        task_id=task_id,
+    ).values_list("content", flat=True)
+    found = False
+    for content in rows:
+        try:
+            artefact = TaskRunArtefact.model_validate_json(content)
+        except ValidationError:
+            return False
+        if artefact.type != TASK_RUN_TYPE_IMPLEMENTATION:
+            continue
+        if artefact.automation_branch is not None:
+            return False
+        found = True
+    return found
+
+
+def record_implementation_task(
+    *,
+    team_id: int,
+    report_id: str,
+    task_id: str,
+    run_id: str | None = None,
+    billing_exempt_reason: str | None = None,
+    automation_branch: str | None = None,
+) -> SignalReportArtefact:
+    """Record a started implementation task as BOTH the legacy `SignalReportTask` gate row and the
+    `task_run` work-log artefact.
+
+    Both records remain necessary while historical task associations are being backfilled.
+    Call inside the transaction that created the task. Shared by auto-start and the manual
+    start-task API; only auto-start supplies `automation_branch`, binding replacement eligibility
+    to that exact automatically started run.
+
+    `billing_exempt_reason` lets a caller that knows its origin is PostHog-system declare the
+    report never-billable in the same transaction that records the task — before the run can ship
+    a billable PR. Enforced by the prospective-only freeze rule (`billing.mark_report_billing_exempt`
+    raises once a billable PR run exists). Auto-start stamps its exemption itself under its row
+    lock and does not pass this.
+    """
+    if billing_exempt_reason:
+        report = SignalReport.objects.select_for_update().get(id=report_id, team_id=team_id)
+        mark_report_billing_exempt(report, billing_exempt_reason)
+    SignalReportTask.objects.get_or_create(
+        team_id=team_id,
+        report_id=report_id,
+        task_id=task_id,
+        defaults={"relationship": TASK_RUN_TYPE_IMPLEMENTATION},
+    )
+    artefact = SignalReportArtefact.add_log(
+        team_id=team_id,
+        report_id=report_id,
+        content=TaskRunArtefact(
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_IMPLEMENTATION,
+            task_id=task_id,
+            run_id=run_id,
+            automation_branch=automation_branch,
+        ),
+        attribution=ArtefactAttribution.from_task(task_id),
+    )
+    try:
+        claim_report_for_task(
+            team_id=team_id,
+            report_id=report_id,
+            task_id=task_id,
+            for_task_creator=implementation_started_by_person(team_id=team_id, report_id=report_id, task_id=task_id),
+        )
+    except ReportClaimConflict as error:
+        raise ReportTaskCapExceeded(kind=TASK_RUN_TYPE_IMPLEMENTATION, detail=str(error)) from error
+    return artefact
+
+
+def record_report_task(
+    *, team_id: int, report_id: str, task_id: str, relationship: str | None = None, run_id: str | None = None
+) -> SignalReportArtefact:
+    """Record a task↔report association a client asserted when creating a task from the report.
+
+    `implementation` (also the default when no relationship is given) additionally writes the legacy
+    `SignalReportTask` gate row that guards auto-start spend, via `record_implementation_task`. Every
+    other relationship records only the `task_run` work-log artefact under `product="signals"`
+    (`research` never reaches here — it is created solely by the server-side research pipeline).
+    """
+    if relationship is None or relationship == TASK_RUN_TYPE_IMPLEMENTATION:
+        return record_implementation_task(team_id=team_id, report_id=report_id, task_id=task_id, run_id=run_id)
+    return append_task_run_artefact(
+        team_id=team_id,
+        report_id=report_id,
+        product=SIGNALS_PRODUCT,
+        type=relationship,
+        task_id=task_id,
+        run_id=run_id,
+    )
+
+
+def attribute_task_run_to_scout(
+    *, team_id: int, report_id: str, task_id: str, skill_name: str, scout_run_id: str
+) -> None:
+    """Name the scout run that started a report's task on the task's work-log entry.
+
+    The tasks facade writes the entry when it creates the task and knows nothing about scouts, so
+    the attribution is added after the start returns.
+    """
+    for artefact in SignalReportArtefact.objects.filter(
+        team_id=team_id, report_id=report_id, task_id=task_id, type=SignalReportArtefact.ArtefactType.TASK_RUN
+    ):
+        try:
+            content = TaskRunArtefact.model_validate_json(artefact.content)
+        except ValidationError:
+            continue
+        content = content.model_copy(update={"started_by_scout": skill_name, "started_by_scout_run_id": scout_run_id})
+        SignalReportArtefact.objects.filter(id=artefact.id).update(content=content.model_dump_json())
+
+
+def release_quota_cancelled_implementation(*, team_id: int, task_id: str) -> list[str]:
+    """Remove implementation gates so a quota-cancelled report can run again.
+
+    Preserve shipped PRs, including those from sibling runs. Lock reports to serialize
+    cleanup with auto-start, and return the affected report IDs.
+    """
+    report_ids = list(
+        SignalReportTask.objects.filter(
+            team_id=team_id, task_id=task_id, relationship=TASK_RUN_TYPE_IMPLEMENTATION
+        ).values_list("report_id", flat=True)
+    )
+    released: list[str] = []
+    for report_id in report_ids:
+        with transaction.atomic():
+            report = SignalReport.objects.select_for_update().filter(id=report_id, team_id=team_id).first()
+            if report is None:
+                continue
+            if report_has_implementation_pr(report_id, team_id=team_id):
+                continue
+            assignment = get_active_claim(team_id=team_id, report_id=report_id)
+            if assignment is not None and assignment.actor_kind == "task" and str(assignment.actor_task_id) == task_id:
+                release_claim(assignment, ArtefactAttribution.system())
+            SignalReportTask.objects.filter(
+                team_id=team_id,
+                report_id=report_id,
+                task_id=task_id,
+                relationship=TASK_RUN_TYPE_IMPLEMENTATION,
+            ).delete()
+            for artefact in SignalReportArtefact.objects.filter(
+                team_id=team_id,
+                report_id=report_id,
+                task_id=task_id,
+                type=SignalReportArtefact.ArtefactType.TASK_RUN,
+            ):
+                try:
+                    content = json.loads(artefact.content)
+                except (TypeError, ValueError):
+                    continue
+                if content.get("product") == SIGNALS_PRODUCT and content.get("type") == TASK_RUN_TYPE_IMPLEMENTATION:
+                    artefact.delete()
+            SignalReportArtefact.add_log(
+                team_id=team_id,
+                report_id=str(report_id),
+                content=NoteArtefact(
+                    note=(
+                        "Implementation run stopped: the organization reached its self-driving pull request "
+                        "limit. A new run can start after the limit is raised or the billing period resets."
+                    )
+                ),
+                attribution=ArtefactAttribution.system(),
+            )
+            released.append(str(report_id))
+    return released

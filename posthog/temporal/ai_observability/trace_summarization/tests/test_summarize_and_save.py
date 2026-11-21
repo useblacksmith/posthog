@@ -1,0 +1,298 @@
+"""Tests for unified summarize_and_save activity."""
+
+import uuid
+import threading
+import dataclasses
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+
+import pytest
+from unittest.mock import patch
+
+from temporalio.exceptions import ApplicationError
+from temporalio.testing import ActivityEnvironment
+
+from posthog.temporal.ai_observability.trace_summarization.models import SummarizeAndSaveInput, TextReprExpiredError
+from posthog.temporal.ai_observability.trace_summarization.summarize_and_save import summarize_and_save_activity
+
+
+@asynccontextmanager
+async def _noop_heartbeater(*args, **kwargs):
+    yield
+
+
+@pytest.fixture
+def mock_team(db):
+    from posthog.models.organization import Organization
+    from posthog.models.team import Team
+
+    from products.ai_observability.backend.models.clustering_config import ClusteringConfig
+    from products.ai_observability.backend.models.clustering_job import ClusteringJob
+
+    organization = Organization.objects.create(name="Test Org", is_ai_data_processing_approved=True)
+    team = Team.objects.create(organization=organization, name="Test Team")
+    ClusteringConfig.objects.create(team=team, enabled=True)
+    ClusteringJob.objects.create(
+        id="00000000-0000-0000-0000-000000000123", team=team, name="Traces", analysis_level="trace"
+    )
+    return team
+
+
+def _make_mock_summary():
+    from products.ai_observability.backend.summarization.llm.schema import SummarizationResponse
+
+    return SummarizationResponse(
+        title="Test Summary",
+        flow_diagram="A -> B",
+        summary_bullets=[],
+        interesting_notes=[],
+    )
+
+
+async def _run_activity(input_data, attempt=1):
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, attempt=attempt)
+    return await env.run(summarize_and_save_activity, input_data)
+
+
+def _make_input(mock_team, generation_id=None):
+    return SummarizeAndSaveInput(
+        redis_key="llma:summarization:trace:1:abc:text_repr",
+        trace_id=str(uuid.uuid4()),
+        team_id=mock_team.id,
+        trace_first_timestamp=datetime.now(UTC).isoformat(),
+        mode="minimal",
+        batch_run_id="test_batch",
+        model="gpt-4.1-nano",
+        generation_id=generation_id,
+        event_count=3,
+        text_repr_length=100,
+        job_id="00000000-0000-0000-0000-000000000123",
+        job_name="OpenAI only",
+    )
+
+
+@patch(
+    "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.Heartbeater",
+    _noop_heartbeater,
+)
+class TestSummarizeAndSaveActivity:
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "change", ["job_disabled", "job_deleted", "filters_changed", "project_disabled", "consent_revoked"]
+    )
+    async def test_obsolete_job_does_not_request_a_summary(self, mock_team, change):
+        from asgiref.sync import sync_to_async
+
+        from products.ai_observability.backend.facade.clustering_runtime import scope_key
+        from products.ai_observability.backend.models.clustering_config import ClusteringConfig
+        from products.ai_observability.backend.models.clustering_job import ClusteringJob
+
+        @sync_to_async
+        def change_job():
+            job = ClusteringJob.objects.get(team=mock_team)
+            if change == "job_disabled":
+                job.enabled = False
+                job.save()
+            elif change == "job_deleted":
+                job.delete()
+            elif change == "filters_changed":
+                job.event_filters = [{"key": "$ai_model", "type": "event", "value": "example-model"}]
+                job.save()
+            elif change == "project_disabled":
+                ClusteringConfig.objects.filter(team=mock_team).update(enabled=False)
+            else:
+                mock_team.organization.is_ai_data_processing_approved = False
+                mock_team.organization.save()
+
+        input_data = dataclasses.replace(_make_input(mock_team), job_scope=scope_key("trace", []))
+        await change_job()
+        with (
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.get_async_client"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.load_text_repr",
+                return_value="Example trace",
+            ),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.summarize",
+                side_effect=AssertionError("Obsolete jobs must not send data to the model"),
+            ) as summarize,
+        ):
+            with pytest.raises(ApplicationError, match="disabled or the job has changed"):
+                await _run_activity(input_data)
+            summarize.assert_not_called()
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.asyncio
+    async def test_redis_key_missing_raises_text_repr_expired(self, mock_team):
+        with (
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.get_async_client"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.load_text_repr"
+            ) as mock_load,
+        ):
+            mock_load.return_value = None
+
+            with pytest.raises(TextReprExpiredError):
+                await _run_activity(_make_input(mock_team))
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("attempt,final_attempt", [(1, False), (2, True)])
+    async def test_trace_summary_success(self, mock_team, attempt, final_attempt):
+        mock_summary = _make_mock_summary()
+        input_data = _make_input(mock_team)
+
+        with (
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.get_async_client"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.load_text_repr"
+            ) as mock_load,
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.delete_text_repr"
+            ) as mock_delete,
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.summarize"
+            ) as mock_summarize,
+            patch("posthog.temporal.ai_observability.generated_event_usage.create_event") as mock_create_event,
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.LLMTracesSummarizerEmbedder"
+            ) as mock_embedder_class,
+        ):
+            mock_load.return_value = "text_repr content"
+            mock_summarize.return_value = mock_summary
+
+            result = await _run_activity(input_data, attempt=attempt)
+
+            assert result.success is True
+            assert result.trace_id == input_data.trace_id
+            assert result.generation_id is None
+            assert result.embedding_requested is True
+            # Dropping flex here silently doubles the pipeline's LLM bill, so pin it.
+            assert mock_summarize.call_args.kwargs["flex"] is True
+            # A wrong final_attempt either alerts on failures the retry recovers or hides lost summaries.
+            assert mock_summarize.call_args.kwargs["final_attempt"] is final_attempt
+            mock_create_event.assert_called_once()
+            call_kwargs = mock_create_event.call_args.kwargs
+            assert call_kwargs["event"] == "$ai_trace_summary"
+            assert call_kwargs["properties"]["$ai_trace_id"] == input_data.trace_id
+            assert call_kwargs["properties"]["$ai_clustering_job_id"] == input_data.job_id
+            assert call_kwargs["properties"]["$ai_clustering_job_name"] == input_data.job_name
+            mock_delete.assert_called_once()
+
+            # rendering stays the low-cardinality mode enum; batch_run_id + job_id live in metadata,
+            # and document_id is scoped per (item, job) so overlapping jobs don't collapse on the RMT key
+            embed_kwargs = mock_embedder_class.return_value.embed_document.call_args.kwargs
+            assert embed_kwargs["rendering"] == input_data.mode
+            assert embed_kwargs["metadata"] == {
+                "batch_run_id": input_data.batch_run_id,
+                "job_id": input_data.job_id,
+            }
+            assert embed_kwargs["document_id"] == f"{input_data.trace_id}::{input_data.job_id}"
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.asyncio
+    async def test_generation_summary_success(self, mock_team):
+        mock_summary = _make_mock_summary()
+        generation_id = str(uuid.uuid4())
+        input_data = _make_input(mock_team, generation_id=generation_id)
+
+        with (
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.get_async_client"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.load_text_repr"
+            ) as mock_load,
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.delete_text_repr"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.summarize"
+            ) as mock_summarize,
+            patch("posthog.temporal.ai_observability.generated_event_usage.create_event") as mock_create_event,
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.LLMTracesSummarizerEmbedder"
+            ) as mock_embedder_class,
+        ):
+            mock_load.return_value = "generation text repr"
+            mock_summarize.return_value = mock_summary
+
+            result = await _run_activity(input_data)
+
+            assert result.success is True
+            assert result.generation_id == generation_id
+            assert result.embedding_requested is True
+            call_kwargs = mock_create_event.call_args.kwargs
+            assert call_kwargs["event"] == "$ai_generation_summary"
+            assert call_kwargs["properties"]["$ai_generation_id"] == generation_id
+            assert call_kwargs["properties"]["$ai_clustering_job_id"] == input_data.job_id
+            assert call_kwargs["properties"]["$ai_clustering_job_name"] == input_data.job_name
+
+            # rendering stays the low-cardinality mode enum; ids live in metadata; document_id is
+            # scoped per (generation, job) so overlapping jobs don't collapse on the RMT key
+            embed_kwargs = mock_embedder_class.return_value.embed_document.call_args.kwargs
+            assert embed_kwargs["rendering"] == input_data.mode
+            assert embed_kwargs["metadata"] == {
+                "batch_run_id": input_data.batch_run_id,
+                "job_id": input_data.job_id,
+            }
+            assert embed_kwargs["document_id"] == f"{generation_id}::{input_data.job_id}"
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.asyncio
+    async def test_llm_call_runs_on_the_slot_sized_pool(self, mock_team, asyncify_executor):
+        threads: list[str] = []
+
+        def record_thread(**kwargs):
+            threads.append(threading.current_thread().name)
+            return _make_mock_summary()
+
+        asyncify_executor(2)
+        with (
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.get_async_client"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.load_text_repr",
+                return_value="text_repr content",
+            ),
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.delete_text_repr"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.summarize",
+                side_effect=record_thread,
+            ),
+            patch("posthog.temporal.ai_observability.generated_event_usage.create_event"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.LLMTracesSummarizerEmbedder"
+            ),
+        ):
+            await _run_activity(_make_input(mock_team))
+
+        assert len(threads) == 1
+        assert threads[0].startswith("asyncify")
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.asyncio
+    async def test_embedding_failure_captured_not_fatal(self, mock_team):
+        mock_summary = _make_mock_summary()
+        input_data = _make_input(mock_team)
+
+        with (
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.get_async_client"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.load_text_repr"
+            ) as mock_load,
+            patch("posthog.temporal.ai_observability.trace_summarization.summarize_and_save.delete_text_repr"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.summarize"
+            ) as mock_summarize,
+            patch("posthog.temporal.ai_observability.generated_event_usage.create_event"),
+            patch(
+                "posthog.temporal.ai_observability.trace_summarization.summarize_and_save.LLMTracesSummarizerEmbedder"
+            ) as mock_embedder_class,
+        ):
+            mock_load.return_value = "text repr"
+            mock_summarize.return_value = mock_summary
+            mock_embedder_class.return_value.embed_document.side_effect = Exception("Kafka down")
+
+            result = await _run_activity(input_data)
+
+            assert result.success is True
+            assert result.embedding_requested is False
+            assert result.embedding_request_error == "Kafka down"

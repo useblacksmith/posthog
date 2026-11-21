@@ -1,0 +1,330 @@
+import posthog, { BeforeSendFn, PostHogConfig } from 'posthog-js'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { redactDestinationSecretsInReplay } from 'lib/utils/destinationSecretRedaction'
+import { inStorybook } from 'lib/utils/dom'
+import { isEmbeddedPageFrame } from 'lib/utils/embeddedPageFrame'
+import {
+    dropHandledAuthGateExceptions,
+    dropInjectedScriptReferenceErrors,
+    dropScopeNotFoundExceptions,
+    dropUnactionableNetworkExceptions,
+} from 'lib/utils/exceptionFilters'
+import { getAppContext, isHobbyDeployment } from 'lib/utils/getAppContext'
+import { redactMetricVariableUrls } from 'lib/utils/metricVariableUrlRedaction'
+import { networkMetricName } from 'lib/utils/networkMetricName'
+import { isOAuthMode } from 'lib/utils/oauthClient'
+import { identifyInstanceInPostHog, identifyUserInPostHog } from 'lib/utils/posthogIdentity'
+import { consumeMobileHandoff, installMobileHandoff } from 'lib/utils/webMobileHandoff'
+
+import { dropWebMCPToolErrors } from 'products/webmcp/frontend/webmcpToolError'
+
+import { startDetachedElementTracking } from './detachedElementTracker'
+
+export const SDK_DEFAULTS_DATE = '2026-05-30'
+
+const suppressPassiveTelemetryLastSeen: BeforeSendFn = (event) => {
+    if (
+        event &&
+        (event.event === '$exception' ||
+            event.event === '$web_vitals' ||
+            event.event === '$performance' ||
+            event.event === '$snapshot' ||
+            event.event.startsWith('$ai_'))
+    ) {
+        return { ...event, properties: { ...event.properties, $update_person_last_seen_at: false } }
+    }
+    return event
+}
+
+let removeMobileHandoff: (() => void) | undefined
+
+const LAST_SEEN_FEATURE_FLAGS_KEY = 'posthog-app-last-seen-feature-flags'
+
+export interface LastSeenFeatureFlags {
+    distinctId: string
+    featureFlags: Record<string, boolean | string>
+}
+
+type UserIdentityWithFlags = NonNullable<Window['POSTHOG_USER_IDENTITY_WITH_FLAGS']>
+
+/**
+ * The Django bootstrap leaves out every flag it cannot evaluate locally, for example a flag whose
+ * cohort reads a person property that Django does not send. posthog-js treats a flag that is not in
+ * the bootstrap as off until /flags responds, so the first render drops those flags and then shows
+ * them again. This fills only the missing keys from the last flags this same user saw, so server
+ * values still win and a different user on the same browser never gets them.
+ *
+ * `distinctId` is the user Django evaluated the bootstrap for. The bootstrap itself carries no
+ * distinct ID, so it cannot identify the user.
+ */
+export function withLastSeenFeatureFlags(
+    bootstrap: UserIdentityWithFlags,
+    lastSeen: LastSeenFeatureFlags | null,
+    distinctId: string | undefined
+): NonNullable<PostHogConfig['bootstrap']> {
+    if (!bootstrap.featureFlags) {
+        return { ...bootstrap, featureFlags: undefined }
+    }
+    // An empty bootstrap makes posthog-js use its own persisted flags, which are already complete.
+    if (!lastSeen || !distinctId || lastSeen.distinctId !== distinctId || !Object.keys(bootstrap.featureFlags).length) {
+        return bootstrap
+    }
+    return { ...bootstrap, featureFlags: { ...lastSeen.featureFlags, ...bootstrap.featureFlags } }
+}
+
+// pinned: analytics property name. Insights filter the framed pages by it.
+const stampEmbeddedPageFrame: BeforeSendFn = (event) =>
+    event && { ...event, properties: { ...event.properties, embedded_page_frame: true } }
+
+const dropExceptions: BeforeSendFn = (event) => (event?.event === '$exception' ? null : event)
+
+/**
+ * Local development without self-capture sends its events to PostHog Cloud. Its crashes come from
+ * dev-only state, for example a stale Vite prebundle, and file issues that no user can hit.
+ * This reads the raw context because getAppContext() hides it in OAuth mode, which also runs locally.
+ */
+function sendsLocalDevelopmentToCloud(): boolean {
+    return window.POSTHOG_APP_CONTEXT?.run_mode === 'LOCAL' && !window.JS_POSTHOG_SELF_CAPTURE
+}
+
+function readLastSeenFeatureFlags(): LastSeenFeatureFlags | null {
+    try {
+        const stored = window.localStorage.getItem(LAST_SEEN_FEATURE_FLAGS_KEY)
+        return stored ? JSON.parse(stored) : null
+    } catch {
+        return null
+    }
+}
+
+function writeLastSeenFeatureFlags(lastSeen: LastSeenFeatureFlags): void {
+    try {
+        window.localStorage.setItem(LAST_SEEN_FEATURE_FLAGS_KEY, JSON.stringify(lastSeen))
+    } catch {
+        // Storage can be full or blocked. The cache only smooths the first render, so skip it.
+    }
+}
+
+/**
+ * The server bootstrap evaluates flags locally with only a few properties, so it can be wrong for a flag
+ * that uses a cohort or a group. This sends every flag input the page knows, then loads flags once.
+ * userLogic and preflightLogic send the same identities again, and they reload flags only when one changed.
+ */
+function loadFeatureFlagsForPage(): void {
+    const appContext = getAppContext()
+    if (appContext?.current_user) {
+        identifyUserInPostHog(posthog, appContext.current_user)
+    }
+    if (appContext?.preflight?.site_url) {
+        identifyInstanceInPostHog(posthog, appContext.preflight.site_url)
+    }
+    posthog.reloadFeatureFlags()
+}
+
+export function loadPostHogJS(): void {
+    const incomingHandoff = consumeMobileHandoff()
+    removeMobileHandoff?.()
+    removeMobileHandoff = undefined
+    if (window.JS_POSTHOG_API_KEY) {
+        posthog.init(window.JS_POSTHOG_API_KEY, {
+            opt_out_useragent_filter: window.location.hostname === 'localhost', // we ARE a bot when running in localhost, so we need to enable this opt-out
+            api_host: window.JS_POSTHOG_HOST,
+            ui_host: window.JS_POSTHOG_UI_HOST,
+            defaults: 'latest',
+            disable_capture_url_hashes: false,
+            // Cookie reconciliation breaks the anonymous flag handoff and group persistence in this startup flow.
+            cookieWinsOnConflict: false,
+            // Hobby static files use /static/<asset>.js, without a version directory.
+            ...(isHobbyDeployment() && window.JS_POSTHOG_SELF_CAPTURE
+                ? { strict_script_versioning: false as const }
+                : {}),
+            persistence: 'localStorage+cookie',
+            cookie_persisted_properties: [
+                'prod_interest', // posthog.com sets these based on what docs were browsed
+            ],
+            bootstrap: window.POSTHOG_USER_IDENTITY_WITH_FLAGS
+                ? withLastSeenFeatureFlags(
+                      window.POSTHOG_USER_IDENTITY_WITH_FLAGS,
+                      readLastSeenFeatureFlags(),
+                      getAppContext()?.current_user?.distinct_id
+                  )
+                : {},
+            // The first flags request must wait until the user and groups from the page are set.
+            advanced_disable_feature_flags_on_first_load: true,
+            // Flags tagged only with other contexts stay out of the app. The server bootstrap
+            // applies the same rule in `flags_for_app_evaluation_context` (posthog/utils.py).
+            evaluation_contexts: ['posthog-web-app'],
+            opt_in_site_apps: true,
+            disable_surveys: window.IMPERSONATED_SESSION,
+            disable_product_tours: true,
+            capture_webmcp: true,
+            opt_out_capturing_by_default: window.IMPERSONATED_SESSION,
+            __preview_deferred_init_extensions: true,
+            error_tracking: {
+                __capturePostHogExceptions: true,
+            },
+            metrics: { network: { name: networkMetricName }, flags: true, serviceName: 'posthog-app' },
+            before_send: [
+                dropScopeNotFoundExceptions,
+                dropHandledAuthGateExceptions,
+                dropUnactionableNetworkExceptions,
+                dropInjectedScriptReferenceErrors,
+                dropWebMCPToolErrors,
+                redactMetricVariableUrls,
+                redactDestinationSecretsInReplay,
+                suppressPassiveTelemetryLastSeen,
+                // A page in a frame counts its own pageviews, so its events say so and analysis can filter them.
+                // `register` would persist the property in storage the main window shares, so it is stamped per event.
+                ...(isEmbeddedPageFrame() ? [stampEmbeddedPageFrame] : []),
+                ...(sendsLocalDevelopmentToCloud() ? [dropExceptions] : []),
+            ],
+            loaded: (loadedInstance) => {
+                if (loadedInstance.sessionRecording) {
+                    loadedInstance.sessionRecording._forceAllowLocalhostNetworkCapture = true
+                }
+
+                if (window.IMPERSONATED_SESSION) {
+                    loadedInstance.sessionManager?.resetSessionId()
+                    loadedInstance.opt_out_capturing()
+                } else {
+                    loadedInstance.opt_in_capturing()
+                    removeMobileHandoff = installMobileHandoff(loadedInstance, incomingHandoff)
+
+                    if (
+                        !!window.POSTHOG_APP_CONTEXT?.preflight?.is_debug ||
+                        !!loadedInstance.getFeatureFlag(FEATURE_FLAGS.TRACK_DETACHED_ELEMENTS)
+                    ) {
+                        startDetachedElementTracking(loadedInstance)
+                    }
+
+                    if (loadedInstance.getFeatureFlag(FEATURE_FLAGS.TRACK_MEMORY_USAGE)) {
+                        const hasMemory = 'memory' in window.performance
+                        if (!hasMemory) {
+                            return
+                        }
+
+                        const thirtyMinutesInMs = 60000 * 30
+                        let intervalId: number | null = null
+
+                        const captureMemory = (
+                            visibilityTrigger: 'is_visible' | 'went_invisible' | 'went_visible'
+                        ): void => {
+                            // this is deprecated and not available in all browsers,
+                            // but the supposed standard at https://developer.mozilla.org/en-US/docs/Web/API/Performance/measureUserAgentSpecificMemory
+                            // isn't available in Chrome even so 🤷
+                            const memory = (window.performance as any).memory
+                            if (memory && memory.usedJSHeapSize) {
+                                loadedInstance.capture('memory_usage', {
+                                    $update_person_last_seen_at: false,
+                                    totalJSHeapSize: memory.totalJSHeapSize,
+                                    usedJSHeapSize: memory.usedJSHeapSize,
+                                    visibility_trigger: visibilityTrigger,
+                                    pageIsVisible: document.visibilityState === 'visible',
+                                    pageIsFocused: document.hasFocus(),
+                                })
+                            }
+                        }
+
+                        const startInterval = (): void => {
+                            if (intervalId !== null) {
+                                return
+                            }
+                            intervalId = window.setInterval(() => captureMemory('is_visible'), thirtyMinutesInMs)
+                        }
+
+                        const stopInterval = (): void => {
+                            if (intervalId !== null) {
+                                clearInterval(intervalId)
+                                intervalId = null
+                            }
+                        }
+
+                        const onVisibilityChange = (): void => {
+                            if (document.hidden) {
+                                captureMemory('went_invisible')
+                                stopInterval()
+                            } else {
+                                captureMemory('went_visible')
+                                startInterval()
+                            }
+                        }
+
+                        document.addEventListener('visibilitychange', onVisibilityChange)
+
+                        if (!document.hidden) {
+                            startInterval()
+                        }
+
+                        window.addEventListener('beforeunload', () => {
+                            stopInterval()
+                            document.removeEventListener('visibilitychange', onVisibilityChange)
+                        })
+                    }
+                }
+
+                // This is a helpful flag to set to automatically reset the recording session on load for testing multiple recordings
+                const shouldResetSessionOnLoad = loadedInstance.getFeatureFlag(FEATURE_FLAGS.SESSION_RESET_ON_LOAD)
+                if (shouldResetSessionOnLoad) {
+                    loadedInstance.sessionManager?.resetSessionId()
+                }
+
+                // Make sure we have access to the object in window for debugging
+                window.posthog = loadedInstance
+            },
+            scroll_root_selector: ['main', 'html'],
+            autocapture: {
+                capture_copied_text: true,
+            },
+            session_recording: {
+                blockSelector: '.ph-replay-block',
+                streamNetworkBody: true,
+                captureJsonLd: false,
+            },
+            person_profiles: 'always',
+            // posthog-js patches fetch to add X-POSTHOG-* tracing headers to these hosts. In OAuth
+            // mode the app's own /api calls go cross-origin to one of them, where the cloud CORS
+            // allowlist rejects those headers — so disable the feature then.
+            tracing_headers: isOAuthMode() ? [] : ['eu.posthog.com', 'us.posthog.com'],
+            __preview_disable_xhr_credentials: true,
+            __preview_replay_sync_fetch: true,
+            capture_performance: {
+                //disabling to investigate if this is associated with memory leak in the posthog app
+                web_vitals_attribution: false,
+            },
+            identity_distinct_id: window.JS_POSTHOG_IDENTITY_DISTINCT_ID,
+            identity_hash: window.JS_POSTHOG_IDENTITY_HASH,
+        })
+
+        posthog.onFeatureFlags((_flags, variants, context) => {
+            if (!context?.errorsLoading) {
+                writeLastSeenFeatureFlags({ distinctId: posthog.get_distinct_id(), featureFlags: variants })
+            }
+
+            if (inStorybook() || !context?.errorsLoading) {
+                return
+            }
+
+            posthog.capture('onFeatureFlags error')
+
+            // Track that we failed to load feature flags
+            window.POSTHOG_GLOBAL_ERRORS ||= {}
+            window.POSTHOG_GLOBAL_ERRORS['onFeatureFlagsLoadError'] = true
+        })
+
+        loadFeatureFlagsForPage()
+    } else {
+        posthog.init('fake_token', {
+            autocapture: false,
+            // Pages without a project key only need `posthog` calls to be safe no-ops. Without this,
+            // init() fetches remote config and flags for the placeholder token from PostHog Cloud
+            // before `loaded` can opt out.
+            advanced_disable_flags: true,
+            // `loaded` runs at the end of init(). An event captured before then stays in the request
+            // queue, and the queue sends it to PostHog Cloud on page unload even after the opt-out.
+            opt_out_capturing_by_default: true,
+            loaded: function (ph) {
+                ph.opt_out_capturing()
+            },
+        })
+    }
+}

@@ -1,0 +1,879 @@
+from textwrap import dedent
+from typing import Any, Literal, Union, cast
+from uuid import UUID
+
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.utils import timezone
+
+from asgiref.sync import sync_to_async
+from pydantic import BaseModel, Field
+
+from posthog.schema import (
+    AlertCalculationInterval,
+    AlertConditionType,
+    InsightThresholdType,
+    InsightVizNode,
+    NodeKind,
+    QuerySchemaRoot,
+)
+
+from posthog.dataclasses import frozen
+from posthog.event_usage import EventSource
+from posthog.exceptions_capture import capture_exception
+from posthog.models.scoping import team_scope
+from posthog.models.team import Team
+from posthog.models.user import User
+from posthog.schema_migrations.upgrade_manager import upgrade_insight
+from posthog.scopes.catalog import APIScopeObject
+
+from products.access_control.backend.facade.user_access_control import AccessControlLevel
+from products.alerts.backend.evaluation.validation import THRESHOLD_BOUNDS_REQUIRED_MESSAGE, validate_alert_config
+from products.alerts.backend.facade.api import LLMAlertWrite, admit_llm_alert_write, is_llm_detector_config
+from products.alerts.backend.facade.contracts import PlatformCannotOwn
+from products.alerts.backend.insight_alert_state_machine import apply_disable, apply_enable, apply_threshold_change
+from products.alerts.backend.models.alert import AlertConfiguration, AlertSubscription, Threshold
+from products.alerts_platform.backend.facade.contracts import InvalidPlatformAlertEdit, PlatformAlertCreateRefused
+from products.product_analytics.backend.facade.api import lock_insight_for_evaluation
+from products.product_analytics.backend.facade.models import Insight, resolve_insight_by_id_or_short_id
+
+from ee.hogai.artifacts.types import ModelArtifactResult
+from ee.hogai.tool import MaxTool
+
+UPSERT_ALERT_CONTEXT_PROMPT_TEMPLATE = """
+The user is currently viewing an insight that supports alerts. Here are the insight's details for use with the `upsert_alert` tool:
+
+- Insight ID: {insight_id}
+- Insight short ID: {insight_short_id}
+- Insight name: {insight_name}
+
+<system_reminder>
+When the user asks to create an alert for this insight, use the insight ID above as the `insight_id` parameter. Do not ask the user for the insight ID. Use the insight name to generate a descriptive alert name if the user does not specify one.
+</system_reminder>
+""".strip()
+
+UPSERT_ALERT_TOOL_DESCRIPTION = dedent("""
+    Use this tool to create or edit alerts that monitor insight metrics and notify users when conditions are met.
+
+    # When to use
+    - User wants to be notified when a metric crosses a threshold
+    - User wants to monitor an insight for anomalies or changes
+    - User mentions alerts, notifications, or monitoring for insights
+    - User wants to change an existing alert's threshold, condition, name, or interval
+    - User wants to enable or disable an alert
+
+    # Actions
+    - **create**: Create a new alert (requires insight_id, name and condition_type)
+    - **update**: Edit an existing alert (requires alert_id, all other fields are optional)
+
+    # Requirements
+    - Only works for TrendsQuery insights (not funnels, retention, etc.)
+    - For create: insight_id is required
+    - For update: the alert_id must be provided (find it via list_data with kind="alerts")
+
+    # Identifying the insight (create only)
+    - **insight_id** (required): The ID of the insight to monitor. This can be a numeric database ID, a string short ID, or the ID of a visualization you just created with create_insight. If the visualization is not yet saved, it will be saved automatically as a new insight.
+
+    # Condition types
+    - **absolute_value**: Fires when the metric's absolute value crosses the threshold bounds
+    - **relative_increase**: Fires when the metric increases by more than the threshold (use upper_threshold)
+    - **relative_decrease**: Fires when the metric decreases by more than the threshold (use lower_threshold)
+
+    # Threshold configuration
+    - **lower_threshold**: Lower bound - alert fires when value drops below this
+    - **upper_threshold**: Upper bound - alert fires when value exceeds this
+    - You can set one or both bounds
+    - For percentage-based thresholds, set threshold_type to "percentage" and use decimal values (e.g., 0.5 for 50%)
+
+    # Calculation intervals
+    - **real_time**: Check in real time (Scale+ required)
+    - **every_15_minutes**: Check every 15 minutes (Boost+ required)
+    - **hourly**: Check every hour
+    - **daily**: Check once per day (default for create)
+    - **weekly**: Check once per week
+    - **monthly**: Check once per month
+
+    # Series index
+    - If the insight has multiple series (e.g., multiple event types), use series_index to specify which one to monitor
+    - Default is 0 (first series) for create
+
+    # Create examples
+    - "Alert me when daily signups drop below 100": action=create, condition_type=absolute_value, lower_threshold=100
+    - "Alert when pageviews increase by more than 50%": action=create, condition_type=relative_increase, upper_threshold=0.5, threshold_type=percentage
+    - "Notify me if revenue drops more than 20% week over week": action=create, condition_type=relative_decrease, lower_threshold=0.2, threshold_type=percentage, calculation_interval=weekly
+
+    # Update examples
+    - "Change my alert threshold to 200": action=update, alert_id=<id>, upper_threshold=200
+    - "Disable the signups alert": action=update, alert_id=<id>, enabled=false
+    - "Change the alert to check weekly": action=update, alert_id=<id>, calculation_interval=weekly
+    - "Rename my alert to 'Revenue drop'": action=update, alert_id=<id>, name="Revenue drop"
+
+    # Listing alerts
+    - To list existing alerts, use the list_data tool with kind="alerts"
+    - To view alerts in the UI, direct the user to /alerts
+    - To view alerts for a specific insight, direct the user to /insights/{insightShortId}/alerts
+    """).strip()
+
+
+class CreateAlertAction(BaseModel):
+    action: Literal["create"] = "create"
+    name: str = Field(description="Alert name (e.g., 'Daily signups below 100')")
+    condition_type: AlertConditionType = Field(
+        description="Type of condition: absolute_value, relative_increase, or relative_decrease"
+    )
+    insight_id: str | int = Field(
+        description="ID of the insight to monitor. Accepts a numeric database ID, a string short ID, or a visualization artifact ID from create_insight.",
+    )
+    calculation_interval: AlertCalculationInterval = Field(
+        default=AlertCalculationInterval.DAILY,
+        description="How often to check: real_time (Scale+), every_15_minutes (Boost+), hourly, daily, weekly, or monthly",
+    )
+    upper_threshold: float | None = Field(
+        default=None,
+        description="Upper bound - alert fires when value exceeds this",
+    )
+    lower_threshold: float | None = Field(
+        default=None,
+        description="Lower bound - alert fires when value drops below this",
+    )
+    threshold_type: InsightThresholdType = Field(
+        default=InsightThresholdType.ABSOLUTE,
+        description="Whether thresholds are absolute values or percentages (use decimal, e.g. 0.5 for 50%)",
+    )
+    series_index: int = Field(
+        default=0,
+        description="Which series to monitor (0-indexed). Use 0 for single-series insights.",
+    )
+    enabled: bool = Field(
+        default=True,
+        description="Whether the alert should be enabled immediately",
+    )
+    skip_weekend: bool = Field(
+        default=False,
+        description="Whether to skip weekend checks",
+    )
+
+
+class UpdateAlertAction(BaseModel):
+    action: Literal["update"] = "update"
+    alert_id: str = Field(description="The ID of the alert to update (find via list_data with kind='alerts')")
+    name: str | None = Field(default=None, description="New alert name")
+    condition_type: AlertConditionType | None = Field(default=None, description="New condition type")
+    calculation_interval: AlertCalculationInterval | None = Field(
+        default=None,
+        description="New calculation interval (real_time requires Scale+, every_15_minutes requires Boost+)",
+    )
+    upper_threshold: float | None = Field(default=None, description="New upper threshold bound")
+    lower_threshold: float | None = Field(default=None, description="New lower threshold bound")
+    threshold_type: InsightThresholdType | None = Field(default=None, description="New threshold type")
+    series_index: int | None = Field(default=None, description="New series index to monitor")
+    enabled: bool | None = Field(default=None, description="Enable or disable the alert")
+    skip_weekend: bool | None = Field(default=None, description="Whether to skip weekend checks")
+
+
+UpsertAlertAction = Union[CreateAlertAction, UpdateAlertAction]
+
+
+class AlertLimitReached(Exception):
+    """A create the plan limits refused once the team's alert lock was held."""
+
+
+@frozen
+class _SaveRefusal:
+    """A write the alert save refused, with the error code the tool reports."""
+
+    message: str
+    error_code: str
+
+
+class UpsertAlertToolArgs(BaseModel):
+    action: UpsertAlertAction = Field(
+        description="The action to perform. Either create a new alert or update an existing one.",
+        discriminator="action",
+    )
+
+
+def _follow_on_commit(alert: AlertConfiguration) -> None:
+    # Deferred to break a cycle: platform_alert_backfill reaches this module back through the alert
+    # workflows and the chat agent.
+    from products.alerts.backend.platform_alert_backfill import follow_insight_alert  # noqa: PLC0415
+
+    transaction.on_commit(lambda: follow_insight_alert(alert), robust=True)
+
+
+def _native_alert(*, team_id: int, alert_id: str) -> AlertConfiguration | None:
+    """The team's insight alert with no insight row under `alert_id`, as the insight API presents it, or None."""
+    # Deferred for the same cycle as `_follow_on_commit`.
+    from products.alerts.backend.platform_insight_alert import native_insight_alert_view  # noqa: PLC0415
+
+    try:
+        public_id = UUID(alert_id)
+    except ValueError:
+        return None
+    # The platform's tables refuse reads outside a team scope, which the insight API's request sets.
+    with team_scope(team_id):
+        view = native_insight_alert_view(team_id, public_id)
+        return AlertConfiguration.from_platform_view(view, team_id=team_id) if view is not None else None
+
+
+def _persist_native_alert(
+    *, team_id: int, insight: Insight, creator: User, fields: dict[str, Any]
+) -> AlertConfiguration:
+    """Creates an alert with no insight row, its creator subscribed, as the row path subscribes them."""
+    # Deferred for the same cycle as `_follow_on_commit`.
+    from products.alerts.backend.platform_ownership import create_native_alert  # noqa: PLC0415
+    from products.alerts.backend.platform_subscribers import set_native_subscribers  # noqa: PLC0415
+
+    try:
+        view = create_native_alert(team_id=team_id, insight_id=insight.id, created_by_id=creator.id, fields=fields)
+    except PlatformAlertCreateRefused as error:
+        raise AlertLimitReached(str(error)) from error
+    set_native_subscribers(
+        team_id=team_id, alert_id=view.id, user_ids=[creator.id], actor_id=creator.id, was_impersonated=False
+    )
+    created = AlertConfiguration.from_platform_view(view, team_id=team_id)
+    assert created is not None
+    return created
+
+
+class UpsertAlertTool(MaxTool):
+    name: str = "upsert_alert"
+    description: str = UPSERT_ALERT_TOOL_DESCRIPTION
+    args_schema: type[BaseModel] = UpsertAlertToolArgs
+    context_prompt_template: str = UPSERT_ALERT_CONTEXT_PROMPT_TEMPLATE
+
+    def get_required_resource_access(
+        self,
+    ) -> list[tuple[APIScopeObject, AccessControlLevel]]:
+        return [("alert", "editor")]
+
+    async def is_dangerous_operation(self, action: UpsertAlertAction, **kwargs) -> bool:
+        return isinstance(action, UpdateAlertAction)
+
+    async def format_dangerous_operation_preview(self, action: UpsertAlertAction, **kwargs) -> str:
+        if not isinstance(action, UpdateAlertAction):
+            return f"Execute {self.name} operation"
+
+        alert = await self._resolve_alert(action.alert_id)
+        # The preview reaches the user before the update runs its access checks, so it names only an
+        # alert whose insight the user may view.
+        visible = alert is not None and await self._can_view_insight_of(alert)
+        alert_label = f"'{alert.name}'" if alert and visible else f"(ID: {action.alert_id})"
+        return f"**Update** alert {alert_label}"
+
+    async def _can_view_insight_of(self, alert: AlertConfiguration) -> bool:
+        insight = await sync_to_async(lambda edited: edited.insight)(alert)
+        return bool(await sync_to_async(self.user_access_control.check_access_level_for_object)(insight, "viewer"))
+
+    async def _arun_impl(self, action: UpsertAlertAction) -> tuple[str, dict[str, Any]]:
+        if isinstance(action, CreateAlertAction):
+            return await self._handle_create(action)
+        else:
+            return await self._handle_update(action)
+
+    async def _validate_interval_entitlement(
+        self,
+        calculation_interval: str | AlertCalculationInterval | None,
+        *,
+        existing_interval: str | AlertCalculationInterval | None = None,
+    ) -> str | None:
+        team = self._team
+        org = await sync_to_async(lambda: team.organization)()
+        return await sync_to_async(AlertConfiguration.interval_entitlement_error)(
+            calculation_interval=calculation_interval or existing_interval,
+            organization=org,
+        )
+
+    async def _validate_real_time_alert(
+        self,
+        calculation_interval: str | AlertCalculationInterval | None,
+        *,
+        enabled: bool,
+        existing: AlertConfiguration | None = None,
+    ) -> str | None:
+        team = self._team
+        org = await sync_to_async(lambda: team.organization)()
+        return await sync_to_async(AlertConfiguration.real_time_alert_validation_error)(
+            team_id=team.id,
+            organization=org,
+            calculation_interval=calculation_interval,
+            enabled=enabled,
+            existing=existing,
+        )
+
+    async def _handle_create(self, action: CreateAlertAction) -> tuple[str, dict[str, Any]]:
+        try:
+            team = self._team
+            user = self._user
+
+            if action.upper_threshold is None and action.lower_threshold is None:
+                return THRESHOLD_BOUNDS_REQUIRED_MESSAGE, {
+                    "error": "validation_failed",
+                }
+
+            if limit_msg := await self._check_alert_limit():
+                return limit_msg, {"error": "plan_limit_reached"}
+
+            if interval_msg := await self._validate_interval_entitlement(action.calculation_interval):
+                return interval_msg, {"error": "validation_failed"}
+
+            if real_time_msg := await self._validate_real_time_alert(
+                action.calculation_interval, enabled=action.enabled
+            ):
+                return real_time_msg, {"error": "plan_limit_reached"}
+
+            try:
+                insight, was_auto_saved = await self._resolve_and_validate_insight(
+                    action.insight_id, action_description="create alert for"
+                )
+            except Insight.DoesNotExist:
+                return "Insight not found. Provide a valid insight ID or short ID.", {
+                    "error": "insight_not_found",
+                }
+            except ValueError as e:
+                return str(e), {"error": "unsupported_insight"}
+
+            truncated_name = action.name[:255]
+            unsaved_threshold = Threshold(
+                team=team,
+                insight=insight,
+                name=truncated_name,
+                created_by=user,
+                configuration={
+                    "type": action.threshold_type,
+                    "bounds": {"lower": action.lower_threshold, "upper": action.upper_threshold},
+                },
+            )
+
+            try:
+                unsaved_threshold.clean()
+            except ValidationError as e:
+                return str(e), {"error": "validation_failed"}
+
+            # Deferred for the same cycle as `_follow_on_commit`.
+            from products.alerts.backend.platform_ownership import creates_native_alert  # noqa: PLC0415
+
+            alert = await self._persist_alert(
+                native=await sync_to_async(creates_native_alert)(team.id),
+                team=team,
+                user=user,
+                insight=insight,
+                name=truncated_name,
+                threshold_to_persist=unsaved_threshold,
+                condition={"type": action.condition_type},
+                config={"type": "TrendsAlertConfig", "series_index": action.series_index},
+                calculation_interval=action.calculation_interval,
+                enabled=action.enabled,
+                skip_weekend=action.skip_weekend,
+            )
+            await sync_to_async(alert.report_created)(user, {"source": EventSource.POSTHOG_AI})
+
+            status = "enabled" if action.enabled else "disabled (draft)"
+            alert_url = f"/insights/{insight.short_id}/alerts?alert_id={alert.id}"
+            message = f"Alert '{action.name}' created successfully and is {status}. [View alert]({alert_url})."
+            if was_auto_saved:
+                message += (
+                    f" The visualization was automatically saved as insight"
+                    f" '{insight.name or insight.short_id}' so the alert can monitor it."
+                )
+
+            return (
+                message,
+                {
+                    "alert_id": str(alert.id),
+                    "alert_name": action.name,
+                    "alert_url": alert_url,
+                    "insight_id": insight.id,
+                    "insight_short_id": insight.short_id,
+                    "insight_auto_saved": was_auto_saved,
+                },
+            )
+
+        except AlertLimitReached as e:
+            return str(e), {"error": "plan_limit_reached"}
+        except Exception as e:
+            capture_exception(e, {"team_id": self._team.id, "user_id": self._user.id})
+            return f"Failed to create alert: {str(e)}", {
+                "error": "creation_failed",
+                "details": str(e),
+            }
+
+    def _save_alert(
+        self,
+        alert: AlertConfiguration,
+        action: UpdateAlertAction,
+    ) -> _SaveRefusal | None:
+        """Write the threshold and the alert together.
+
+        Both writes sit in one transaction so a rejected save leaves no half-applied
+        threshold behind. The AI detector's rules run through the same admission as the
+        API, under the row lock, so enabling an AI alert here holds the team's cap lock
+        across the count and the write. Returns a `_SaveRefusal` instead of saving when
+        the write is refused.
+        """
+        if alert.has_no_insight_row:
+            return self._save_native_alert(alert, action)
+        with transaction.atomic():
+            current_insight_id = AlertConfiguration.objects.get(id=alert.id, team_id=alert.team_id).insight_id
+            # Match evaluation's insight-before-alert lock order to keep validation stable.
+            if not lock_insight_for_evaluation(team_id=alert.team_id, insight_id=current_insight_id):
+                return _SaveRefusal(
+                    message="The insight no longer exists. Refresh the alert.", error_code="validation_failed"
+                )
+            alert.refresh_from_db(from_queryset=AlertConfiguration.objects.select_for_update(no_key=True))
+            if alert.insight_id != current_insight_id:
+                return _SaveRefusal(
+                    message="The alert's insight changed. Retry the update.", error_code="validation_failed"
+                )
+            new_interval = action.calculation_interval or alert.calculation_interval
+            new_enabled = action.enabled if action.enabled is not None else alert.enabled
+            if refusal := self._admission_refusal(alert, action, new_interval=new_interval, new_enabled=new_enabled):
+                return refusal
+            # The state before this update, which decides whether the update adds an active real-time alert.
+            previous = AlertConfiguration(
+                id=alert.id, calculation_interval=alert.calculation_interval, enabled=alert.enabled
+            )
+            update_fields: list[str] = []
+            conditions_or_threshold_changed = False
+            schedule_reset_required = False
+
+            if action.name is not None:
+                alert.name = action.name[:255]
+                update_fields.append("name")
+
+            if action.condition_type is not None:
+                alert.condition = {"type": action.condition_type}
+                update_fields.append("condition")
+                conditions_or_threshold_changed = True
+                schedule_reset_required = True
+
+            if action.calculation_interval is not None:
+                if action.calculation_interval != alert.calculation_interval:
+                    schedule_reset_required = True
+                    alert.calculation_interval = action.calculation_interval
+                    update_fields.append("calculation_interval")
+
+            if action.series_index is not None:
+                alert.config = {**(alert.config or {}), "series_index": action.series_index}
+                update_fields.append("config")
+                schedule_reset_required = True
+
+            enabled_changed = action.enabled is not None and action.enabled != alert.enabled
+            if action.enabled is not None:
+                if enabled_changed and action.enabled:
+                    update_fields.extend(apply_enable(alert))
+                    schedule_reset_required = True
+                elif enabled_changed:
+                    update_fields.extend(apply_disable(alert))
+                else:
+                    update_fields.append("enabled")
+
+            if action.skip_weekend is not None:
+                schedule_reset_required = schedule_reset_required or action.skip_weekend != alert.skip_weekend
+                alert.skip_weekend = action.skip_weekend
+                update_fields.append("skip_weekend")
+
+            has_threshold_changes = self._has_threshold_changes(action)
+            if has_threshold_changes:
+                conditions_or_threshold_changed = True
+                schedule_reset_required = True
+
+            if not update_fields and not has_threshold_changes:
+                return _SaveRefusal(
+                    message="No changes provided. Specify at least one field to update.", error_code="no_changes"
+                )
+
+            if self._has_threshold_changes(action):
+                try:
+                    update_fields.extend(self._update_threshold(alert, action))
+                except ValidationError as e:
+                    return _SaveRefusal(message=str(e), error_code="validation_failed")
+            if conditions_or_threshold_changed:
+                update_fields.extend(apply_threshold_change(alert))
+            if schedule_reset_required:
+                alert.next_check_at = timezone.now()
+                update_fields.append("next_check_at")
+            alert.save(update_fields=update_fields)
+            if alert.platform_owned:
+                # Deferred for the same cycle as `_follow_on_commit`.
+                from products.alerts.backend.platform_ownership import on_updated  # noqa: PLC0415
+
+                try:
+                    on_updated(alert, snooze_changed=False, rescheduled=schedule_reset_required)
+                except (PlatformCannotOwn, InvalidPlatformAlertEdit) as error:
+                    # Rolls back the insight row, so neither row takes an edit the platform rejects.
+                    transaction.set_rollback(True)
+                    return _SaveRefusal(message=str(error), error_code="validation_failed")
+            elif enabled_changed and action.enabled:
+                _follow_on_commit(alert)
+            # Again under the lock, because the check above counted without it and another update can race.
+            # After `on_updated`, for the lock order the API's `update` keeps.
+            if limit_error := AlertConfiguration.update_limit_error(
+                team_id=alert.team_id,
+                organization=self._team.organization,
+                calculation_interval=new_interval,
+                enabled=new_enabled,
+                existing=previous,
+            ):
+                transaction.set_rollback(True)
+                return _SaveRefusal(message=limit_error, error_code="plan_limit_reached")
+        return None
+
+    def _admission_refusal(
+        self,
+        alert: AlertConfiguration,
+        action: UpdateAlertAction,
+        *,
+        new_interval: str | None,
+        new_enabled: bool,
+    ) -> _SaveRefusal | None:
+        """The plan and AI detector checks an update runs under the alert's lock, with or without an insight row."""
+        if error := AlertConfiguration.real_time_alert_validation_error(
+            team_id=alert.team_id,
+            organization=self._team.organization,
+            calculation_interval=new_interval,
+            enabled=new_enabled,
+            existing=alert,
+        ):
+            return _SaveRefusal(message=error, error_code="plan_limit_reached")
+        if is_llm_detector_config(alert.detector_config) and new_enabled:
+            # The API validates the insight configuration on every write; this tool only
+            # touches it for an enabled AI alert, whose checks would otherwise auto-disable.
+            try:
+                with upgrade_insight(alert.insight):
+                    validate_alert_config(
+                        alert.insight.query or {},
+                        {"type": action.condition_type} if action.condition_type is not None else alert.condition,
+                        {**(alert.config or {}), "series_index": action.series_index}
+                        if action.series_index is not None
+                        else alert.config,
+                        self._proposed_threshold_configuration(alert, action),
+                        new_interval,
+                        detector_config=alert.detector_config,
+                    )
+            except ValueError as validation_error:
+                return _SaveRefusal(message=str(validation_error), error_code="validation_failed")
+        if refusal := admit_llm_alert_write(
+            LLMAlertWrite(
+                team_id=alert.team_id,
+                organization=self._team.organization,
+                principal=alert.created_by,
+                detector_config=alert.detector_config,
+                enabled=new_enabled,
+                calculation_interval=new_interval,
+                existing=alert,
+            )
+        ):
+            return _SaveRefusal(
+                message=refusal.message,
+                error_code="plan_limit_reached" if refusal.reason == "cap" else "validation_failed",
+            )
+        return None
+
+    def _save_native_alert(self, alert: AlertConfiguration, action: UpdateAlertAction) -> _SaveRefusal | None:
+        """`_save_alert` for an alert with no insight row: the same checks under the insight API's lock
+        order, then the edit written to the platform, which keeps the alert."""
+        # Deferred for the same cycle as `_follow_on_commit`.
+        from products.alerts.backend.platform_insight_alert import native_insight_alert_view  # noqa: PLC0415
+        from products.alerts.backend.platform_ownership import write_native_alert_edit  # noqa: PLC0415
+
+        with team_scope(alert.team_id), transaction.atomic():
+            if not lock_insight_for_evaluation(team_id=alert.team_id, insight_id=alert.insight_id):
+                return _SaveRefusal(
+                    message="The insight no longer exists. Refresh the alert.", error_code="validation_failed"
+                )
+            view = native_insight_alert_view(alert.team_id, alert.id, lock=True)
+            locked = AlertConfiguration.from_platform_view(view, team_id=alert.team_id) if view is not None else None
+            if locked is None:
+                return _SaveRefusal(message=f"Alert '{alert.id}' not found.", error_code="alert_not_found")
+            if locked.insight_id != alert.insight_id:
+                return _SaveRefusal(
+                    message="The alert's insight changed. Retry the update.", error_code="validation_failed"
+                )
+            new_interval = action.calculation_interval or locked.calculation_interval
+            new_enabled = action.enabled if action.enabled is not None else locked.enabled
+            if refusal := self._admission_refusal(locked, action, new_interval=new_interval, new_enabled=new_enabled):
+                return refusal
+            previous = AlertConfiguration(
+                id=locked.id, calculation_interval=locked.calculation_interval, enabled=locked.enabled
+            )
+            changes: dict[str, Any] = {}
+            if action.name is not None:
+                changes["name"] = action.name[:255]
+            if action.condition_type is not None:
+                changes["condition"] = {"type": action.condition_type}
+            if action.calculation_interval is not None and action.calculation_interval != locked.calculation_interval:
+                changes["calculation_interval"] = action.calculation_interval
+            if action.series_index is not None:
+                changes["config"] = {**(locked.config or {}), "series_index": action.series_index}
+            if action.enabled is not None:
+                changes["enabled"] = action.enabled
+            if action.skip_weekend is not None:
+                changes["skip_weekend"] = action.skip_weekend
+            if self._has_threshold_changes(action):
+                threshold = self._proposed_threshold_configuration(locked, action)
+                # The platform schema does not check that the lower bound is below the upper one.
+                try:
+                    Threshold(configuration=threshold).clean()
+                except ValidationError as e:
+                    return _SaveRefusal(message=str(e), error_code="validation_failed")
+                changes["threshold"] = threshold
+            if not changes:
+                return _SaveRefusal(
+                    message="No changes provided. Specify at least one field to update.", error_code="no_changes"
+                )
+            rescheduled = (
+                any(field in changes for field in ("condition", "calculation_interval", "config", "threshold"))
+                or ("enabled" in changes and changes["enabled"] and not locked.enabled)
+                or ("skip_weekend" in changes and changes["skip_weekend"] != locked.skip_weekend)
+            )
+            if rescheduled:
+                changes["next_check_at"] = timezone.now()
+            try:
+                write_native_alert_edit(
+                    team_id=locked.team_id,
+                    alert_id=locked.id,
+                    changes=changes,
+                    snooze_changed=False,
+                    rescheduled=rescheduled,
+                )
+            except (PlatformCannotOwn, InvalidPlatformAlertEdit) as error:
+                transaction.set_rollback(True)
+                return _SaveRefusal(message=str(error), error_code="validation_failed")
+            # Again under the lock, after the platform locked its copy, as the row path does.
+            if limit_error := AlertConfiguration.update_limit_error(
+                team_id=locked.team_id,
+                organization=self._team.organization,
+                calculation_interval=new_interval,
+                enabled=new_enabled,
+                existing=previous,
+            ):
+                transaction.set_rollback(True)
+                return _SaveRefusal(message=limit_error, error_code="plan_limit_reached")
+        return None
+
+    @staticmethod
+    def _has_threshold_changes(action: UpdateAlertAction) -> bool:
+        return (
+            action.upper_threshold is not None
+            or action.lower_threshold is not None
+            or action.threshold_type is not None
+        )
+
+    async def _handle_update(self, action: UpdateAlertAction) -> tuple[str, dict[str, Any]]:
+        try:
+            alert = await self._resolve_alert(action.alert_id)
+            if alert is None:
+                return f"Alert '{action.alert_id}' not found.", {"error": "alert_not_found"}
+
+            await self.check_object_access(alert, "editor", resource="alert", action="edit")
+            # Access control has no resource for an alert, so the check above passes everyone. The alert
+            # API gates every alert on viewer access to its insight, and so does this tool.
+            insight = await sync_to_async(lambda edited: edited.insight)(alert)
+            await self.check_object_access(insight, "viewer", resource="insight", action="edit an alert on")
+
+            if interval_msg := await self._validate_interval_entitlement(
+                action.calculation_interval,
+                existing_interval=alert.calculation_interval,
+            ):
+                return interval_msg, {"error": "validation_failed"}
+
+            if refusal := await sync_to_async(self._save_alert)(alert, action):
+                return refusal.message, {"error": refusal.error_code}
+            if alert.has_no_insight_row:
+                # The platform wrote the edit, so this object still holds the settings from before it.
+                alert = await sync_to_async(_native_alert)(team_id=self._team.id, alert_id=str(alert.id)) or alert
+            await sync_to_async(alert.report_updated)(self._user, {"source": EventSource.POSTHOG_AI})
+
+            alert_url = f"/insights/{insight.short_id}/alerts?alert_id={alert.id}"
+            return (
+                f"Alert '{alert.name}' updated successfully. [View alert]({alert_url}).",
+                {
+                    "alert_id": str(alert.id),
+                    "alert_name": alert.name,
+                    "alert_url": alert_url,
+                },
+            )
+
+        except Exception as e:
+            capture_exception(e, {"team_id": self._team.id, "user_id": self._user.id})
+            return f"Failed to update alert: {str(e)}", {
+                "error": "update_failed",
+                "details": str(e),
+            }
+
+    async def _resolve_alert(self, alert_id: str) -> AlertConfiguration | None:
+        alert_id = str(alert_id).strip()
+        if not alert_id:
+            return None
+        try:
+            return await AlertConfiguration.objects.select_related("threshold", "insight", "created_by").aget(
+                id=alert_id, team=self._team
+            )
+        except Exception:
+            return await sync_to_async(_native_alert)(team_id=self._team.id, alert_id=alert_id)
+
+    @classmethod
+    def _proposed_threshold_configuration(cls, alert: AlertConfiguration, action: UpdateAlertAction) -> dict | None:
+        """The threshold configuration the alert will have once ``action`` is applied.
+
+        Validation runs before the threshold is written, so it must see the same configuration
+        that ``_update_threshold`` persists, or a change to an incompatible threshold passes and
+        the next scheduled check auto-disables the alert.
+        """
+        if not cls._has_threshold_changes(action):
+            return alert.threshold.configuration if alert.threshold else None
+        base: dict = dict(alert.threshold.configuration) if alert.threshold else {}
+        config: dict = {**base, "type": action.threshold_type or base.get("type") or InsightThresholdType.ABSOLUTE}
+        bounds: dict = dict(base.get("bounds") or {})
+        if action.lower_threshold is not None:
+            bounds["lower"] = action.lower_threshold
+        if action.upper_threshold is not None:
+            bounds["upper"] = action.upper_threshold
+        config["bounds"] = bounds
+        return config
+
+    @classmethod
+    def _update_threshold(cls, alert: AlertConfiguration, action: UpdateAlertAction) -> list[str]:
+        """Returns list of alert field names that were modified (for use with update_fields)."""
+        config = cls._proposed_threshold_configuration(alert, action)
+        threshold = alert.threshold
+
+        if threshold is None:
+            threshold = Threshold(team=alert.team, insight=alert.insight, name=alert.name, configuration=config)
+            threshold.clean()
+            threshold.save()
+            alert.threshold = threshold
+            return ["threshold"]
+
+        threshold.configuration = config
+        threshold.clean()
+        threshold.save(update_fields=["configuration"])
+        return []
+
+    async def _check_alert_limit(self) -> str | None:
+        """Return an error message if the team has reached its alert limit, else None."""
+        team = self._team
+        org = await sync_to_async(lambda: team.organization)()
+        return await sync_to_async(AlertConfiguration.check_alert_limit)(team.id, org)
+
+    async def _resolve_and_validate_insight(
+        self, insight_id: str | int, *, action_description: str
+    ) -> tuple[Insight, bool]:
+        insight, was_auto_saved = await self._resolve_insight(insight_id)
+        await self.check_object_access(insight, "viewer", resource="insight", action=action_description)
+        # Max's alert tooling only builds trends configs, so it accepts only trends — narrower
+        # than the model's alertable_query_kind (which also allows SQL).
+        if await sync_to_async(lambda: insight.alertable_query_kind)() != NodeKind.TRENDS_QUERY:
+            raise ValueError("Alerts are only supported for TrendsQuery insights. This insight type is not supported.")
+        return insight, was_auto_saved
+
+    async def _resolve_insight(self, insight_id: str | int) -> tuple[Insight, bool]:
+        """Resolve an insight by numeric ID, short_id, or conversation artifact.
+
+        Tries in order:
+        1. Numeric database ID
+        2. Short ID (saved insight)
+        3. Conversation artifact (transient visualization — auto-saved as a new insight)
+
+        Returns (insight, was_auto_saved).
+        """
+        effective_id = str(insight_id).strip()
+        if not effective_id:
+            raise Insight.DoesNotExist("No insight provided. Provide an insight_id.")
+
+        qs = Insight.objects.filter(team=self._team, deleted=False)
+
+        # 1. Try numeric DB ID, then short_id (including legacy numeric-only short IDs).
+        insight = await sync_to_async(resolve_insight_by_id_or_short_id)(qs, effective_id)
+        if insight is not None:
+            return insight, False
+
+        # 2. Try conversation artifact — auto-save as a new insight
+        result = await self._context_manager.artifacts.aget_visualization(self._state.messages, effective_id)
+        if result is None:
+            raise Insight.DoesNotExist(f"Insight or visualization '{effective_id}' not found.")
+
+        if isinstance(result, ModelArtifactResult):
+            return cast(Insight, result.model), False
+
+        content = result.content
+        coerced_query = QuerySchemaRoot.model_validate(content.query.model_dump(mode="json")).root
+        converted = InsightVizNode(source=coerced_query).model_dump(exclude_none=True)
+
+        insight = await sync_to_async(Insight.objects.create)(
+            team=self._team,
+            created_by=self._user,
+            name=(content.name or "Untitled")[:400],
+            description=(content.description or "")[:400],
+            query=converted,
+            saved=True,
+        )
+        return insight, True
+
+    @staticmethod
+    @sync_to_async
+    @transaction.atomic
+    def _persist_alert(
+        *,
+        native: bool,
+        team: Team,
+        user: User,
+        insight: Insight,
+        name: str,
+        threshold_to_persist: Threshold,
+        condition: dict,
+        config: dict,
+        calculation_interval: AlertCalculationInterval,
+        enabled: bool,
+        skip_weekend: bool,
+    ) -> AlertConfiguration:
+        # Again under the lock, because the checks before this transaction can race another create.
+        if limit_error := AlertConfiguration.create_limit_error(
+            team_id=team.id, organization=team.organization, calculation_interval=calculation_interval, enabled=enabled
+        ):
+            raise AlertLimitReached(limit_error.message)
+        if native:
+            return _persist_native_alert(
+                team_id=team.id,
+                insight=insight,
+                creator=user,
+                fields={
+                    "name": name,
+                    "threshold": threshold_to_persist.configuration,
+                    "condition": condition,
+                    "config": config,
+                    "calculation_interval": calculation_interval,
+                    "enabled": enabled,
+                    "skip_weekend": skip_weekend,
+                },
+            )
+        threshold_to_persist.save()
+
+        alert = AlertConfiguration.objects.create(
+            team=team,
+            insight=insight,
+            name=name,
+            threshold=threshold_to_persist,
+            condition=condition,
+            config=config,
+            calculation_interval=calculation_interval,
+            enabled=enabled,
+            skip_weekend=skip_weekend,
+            created_by=user,
+        )
+
+        AlertSubscription.objects.create(
+            user=user,
+            alert_configuration=alert,
+            created_by=user,
+        )
+        # Deferred for the same cycle as `_follow_on_commit`.
+        from products.alerts.backend.platform_ownership import on_created  # noqa: PLC0415
+
+        # A draft is handed over too, so turning it on later needs no second cutover run.
+        handed_over = on_created(alert, timezone.now())
+        if alert.enabled and not handed_over:
+            _follow_on_commit(alert)
+
+        return alert

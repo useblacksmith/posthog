@@ -1,0 +1,113 @@
+from typing import Any, NotRequired, TypedDict
+
+from products.ai_observability.backend.llm.client import Client
+from products.ai_observability.backend.llm.errors import LLMError, ProviderMismatchError, UnsupportedProviderError
+from products.ai_observability.backend.llm.providers.anthropic import AnthropicConfig
+from products.ai_observability.backend.llm.providers.gemini import GeminiConfig
+from products.ai_observability.backend.llm.providers.openai import OpenAIConfig
+from products.ai_observability.backend.llm.types import (
+    CompletionRequest,
+    CompletionResponse,
+    OutputSchema,
+    StreamChunk,
+    Usage,
+)
+
+SUPPORTED_MODELS_WITH_THINKING = (
+    AnthropicConfig.SUPPORTED_MODELS_WITH_THINKING + OpenAIConfig.SUPPORTED_MODELS_WITH_THINKING
+)
+
+
+class ModelInfo(TypedDict):
+    id: str
+    name: str
+    provider: str
+    description: str
+    is_recommended: bool
+    supports_decisions: NotRequired[bool]
+    supports_chat: NotRequired[bool]
+    supports_reasoning: NotRequired[bool]
+
+
+# Single registry of providers. Add new providers here and everything else
+# (model lists, playground models, ID sets) derives from it automatically.
+PROVIDERS: list[tuple[str, Any]] = [
+    ("OpenAI", OpenAIConfig),
+    ("Anthropic", AnthropicConfig),
+    ("Gemini", GeminiConfig),
+]
+
+
+# Providers whose `complete()` honors CompletionRequest.reasoning_level.
+REASONING_LEVEL_CONFIGS: dict[str, type[AnthropicConfig] | type[OpenAIConfig]] = {
+    "anthropic": AnthropicConfig,
+    "openai": OpenAIConfig,
+}
+
+
+def supports_reasoning_level(provider: str | None, model: str | None) -> bool:
+    config = REASONING_LEVEL_CONFIGS.get(provider or "")
+    return bool(config and model and config.supports_reasoning_level(model))
+
+
+def _build_model_infos(provider: str, models: list[str]) -> list[ModelInfo]:
+    return [{"id": m, "name": m, "provider": provider, "description": "", "is_recommended": True} for m in models]
+
+
+def get_default_models() -> list[ModelInfo]:
+    """Returns the full list of supported models across all providers."""
+    result: list[ModelInfo] = []
+    for display_name, config in PROVIDERS:
+        result.extend(_build_model_infos(display_name, config.SUPPORTED_MODELS))
+    return result
+
+
+def get_playground_models() -> list[ModelInfo]:
+    """Returns the models available in the PostHog-funded playground.
+
+    This is a curated subset excluding expensive models like pro/opus tiers
+    while including one flagship per provider for quality evaluation.
+    """
+    result: list[ModelInfo] = []
+    for display_name, config in PROVIDERS:
+        result.extend(_build_model_infos(display_name, config.PLAYGROUND_MODELS))
+    return result
+
+
+PLAYGROUND_MODEL_IDS: frozenset[str] = frozenset(model for _, config in PROVIDERS for model in config.PLAYGROUND_MODELS)
+
+# Provider-keyed lookup (lowercase keys matching DB provider values)
+PLAYGROUND_MODELS_BY_PROVIDER: dict[str, list[str]] = {
+    display_name.lower(): config.PLAYGROUND_MODELS for display_name, config in PROVIDERS
+}
+
+# Model picked when an eval/tagger has no explicit model_configuration and the provider is
+# dictated by the team's active key (e.g. an Anthropic BYOK key implies an Anthropic model).
+DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
+    display_name.lower(): config.DEFAULT_MODEL for display_name, config in PROVIDERS
+}
+
+
+__all__ = [
+    "Client",
+    "CompletionRequest",
+    "OutputSchema",
+    "CompletionResponse",
+    "StreamChunk",
+    "Usage",
+    "LLMError",
+    "ModelInfo",
+    "ProviderMismatchError",
+    "UnsupportedProviderError",
+    "PROVIDERS",
+    "SUPPORTED_MODELS_WITH_THINKING",
+    "PLAYGROUND_MODEL_IDS",
+    "PLAYGROUND_MODELS_BY_PROVIDER",
+    "DEFAULT_MODEL_BY_PROVIDER",
+    "get_default_models",
+    "get_playground_models",
+    "supports_reasoning_level",
+    "OpenAIConfig",
+    "AnthropicConfig",
+    "GeminiConfig",
+]

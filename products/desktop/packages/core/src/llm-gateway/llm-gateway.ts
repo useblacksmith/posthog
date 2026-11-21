@@ -1,0 +1,422 @@
+import { ROOT_LOGGER, type RootLogger } from "@posthog/di/logger";
+import {
+  aiGatewayDenialCode,
+  aiGatewayRemintReason,
+  GATEWAY_BLOCKED_ERROR_TYPES,
+  isAnthropicModelId,
+} from "@posthog/shared";
+import {
+  buildAiGatewayReservedHeaders,
+  buildPosthogProjectHeaderRecord,
+  buildPosthogPropertiesHeaderRecord,
+  type PosthogProperties,
+} from "@posthog/shared/posthog-property-headers";
+import { inject, injectable } from "inversify";
+import type { AuthService } from "../auth/auth";
+import { AUTH_SERVICE } from "../auth/auth.module";
+import { blockedRoute, type GatewayTokenService } from "./gateway-token";
+import {
+  GATEWAY_TOKEN_SERVICE,
+  LLM_GATEWAY_HOST,
+  type LlmGatewayAuth,
+  type LlmGatewayEndpoints,
+  type LlmGatewayHost,
+  type LlmGatewayLogger,
+} from "./identifiers";
+import {
+  type AnthropicErrorResponse,
+  type AnthropicMessagesRequest,
+  type AnthropicMessagesResponse,
+  type ChatCompletionsRequest,
+  type ChatCompletionsResponse,
+  type GatewayRoute,
+  type LlmMessage,
+  type PromptOutput,
+  type UsageOutput,
+  usageOutput,
+} from "./schemas";
+
+// Bounded helper workloads (titles, summaries, commit messages, PR copy) run on
+// the cheapest model rather than the gateway default.
+export const HELPER_GATEWAY_MODEL = "claude-haiku-4-5";
+
+// Go does not resolve the `@cf/` spelling of this model.
+const GO_FREE_TIER_GATEWAY_MODEL = "zai-org/glm-5.2";
+
+// The Messages API requires max_tokens; the Go gateway forwards the body as sent.
+const HELPER_DEFAULT_MAX_TOKENS = 4096;
+// Open-weight reasoning spends max_tokens, so a Claude-sized budget can end before any content.
+const CHAT_MIN_MAX_TOKENS = 1024;
+
+type GoRoute = Extract<GatewayRoute, { mode: "go" }>;
+
+type PromptShape = "anthropic-messages" | "openai-chat";
+
+// Go serves only Claude models on the Messages API.
+function goPromptShape(model: string): PromptShape {
+  return isAnthropicModelId(model) ? "anthropic-messages" : "openai-chat";
+}
+
+export function desktopUsageUrl(apiHost: string, projectId: number): string {
+  return `${apiHost}/api/projects/${projectId}/desktop/usage/`;
+}
+
+type SendOptions = {
+  system?: string;
+  maxTokens?: number;
+  model: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  posthogProperties?: PosthogProperties;
+};
+
+// The Go gateway's model for a helper prompt, picked from the token's pin
+// so a free-tier token never spends a round trip on a refused model.
+// A paid pin is the whole product list; Go enforces it in canonical spelling,
+// which a bare requested id never string-matches.
+function pickGoModel(route: GoRoute, requested: string): string {
+  const allowed = route.allowedModels;
+  if (
+    allowed === null ||
+    route.plan === "paid" ||
+    allowed.includes(requested)
+  ) {
+    return requested;
+  }
+  if (route.plan === "free" && allowed.includes(GO_FREE_TIER_GATEWAY_MODEL)) {
+    return GO_FREE_TIER_GATEWAY_MODEL;
+  }
+  return allowed[0] ?? requested;
+}
+
+export class LlmGatewayError extends Error {
+  constructor(
+    message: string,
+    public readonly type: string,
+    public readonly code?: string,
+    public readonly statusCode?: number,
+  ) {
+    super(message);
+    this.name = "LlmGatewayError";
+  }
+}
+
+@injectable()
+export class LlmGatewayService {
+  constructor(
+    @inject(LLM_GATEWAY_HOST)
+    host: LlmGatewayHost,
+    @inject(ROOT_LOGGER)
+    logger: RootLogger,
+    @inject(AUTH_SERVICE)
+    authService: AuthService,
+    @inject(GATEWAY_TOKEN_SERVICE)
+    private readonly gatewayTokens: GatewayTokenService,
+  ) {
+    this.auth = host;
+    this.endpoints = host;
+    this.log = logger.scope("llm-gateway");
+    this.authService = authService;
+  }
+
+  private readonly auth: LlmGatewayAuth;
+  private readonly endpoints: LlmGatewayEndpoints;
+  private readonly log: LlmGatewayLogger;
+  private readonly authService: AuthService;
+
+  async prompt(
+    messages: LlmMessage[],
+    options: {
+      system?: string;
+      maxTokens?: number;
+      model?: string;
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      /**
+       * Free-form metadata forwarded as `x-posthog-property-<key>` headers.
+       * The gateway lifts each one onto the `$ai_generation` event it
+       * captures, so helper callers (commit messages, PR descriptions, etc.)
+       * can be told apart from the agent's main generations.
+       */
+      posthogProperties?: PosthogProperties;
+    } = {},
+  ): Promise<PromptOutput> {
+    const requested = options.model ?? this.endpoints.defaultModel;
+    const route = await this.gatewayTokens
+      .getRoute()
+      .catch((): GatewayRoute => blockedRoute("route_failed").route);
+    if (route.mode === "blocked") {
+      throw new LlmGatewayError(
+        route.detail,
+        GATEWAY_BLOCKED_ERROR_TYPES[route.status],
+        route.reason,
+        route.status,
+      );
+    }
+    return this.sendGoPrompt(
+      messages,
+      {
+        ...options,
+        model: pickGoModel(route, requested),
+      },
+      route,
+    );
+  }
+
+  private async sendGoPrompt(
+    messages: LlmMessage[],
+    options: SendOptions,
+    route: GoRoute,
+  ): Promise<PromptOutput> {
+    const shape = goPromptShape(options.model);
+    const path =
+      shape === "anthropic-messages" ? "/v1/messages" : "/v1/chat/completions";
+    const send = (current: GoRoute) =>
+      this.executePrompt(
+        messages,
+        options,
+        `${current.gatewayUrl}${path}`,
+        (url, init) =>
+          (this.auth.fetch ?? fetch)(url, {
+            ...init,
+            redirect: "error",
+            headers: {
+              ...(init.headers as Record<string, string>),
+              Authorization: `Bearer ${current.token}`,
+            },
+          }),
+        {
+          ...buildPosthogPropertiesHeaderRecord({
+            ...options.posthogProperties,
+            ai_product: "posthog_code",
+            team_id: current.teamId,
+          }),
+          ...buildAiGatewayReservedHeaders(options.posthogProperties ?? {}),
+        },
+        shape,
+      );
+    try {
+      return await send(route);
+    } catch (error) {
+      const reason = remintReason(error);
+      if (!reason) throw error;
+      const fresh = await this.gatewayTokens
+        .remint(reason, route.token, route.projectId)
+        .catch(() => null);
+      if (!fresh || fresh.mode !== "go") throw error;
+      try {
+        return await send(fresh);
+      } catch (retryError) {
+        if (
+          reason === "unauthorized" &&
+          remintReason(retryError) === "unauthorized"
+        ) {
+          this.gatewayTokens.fallBack(fresh.token, fresh.projectId);
+        }
+        throw retryError;
+      }
+    }
+  }
+
+  private async executePrompt(
+    messages: LlmMessage[],
+    options: SendOptions,
+    messagesUrl: string,
+    fetchImpl: (url: string, init: RequestInit) => Promise<Response>,
+    extraHeaders: Record<string, string>,
+    shape: PromptShape = "anthropic-messages",
+  ): Promise<PromptOutput> {
+    const { system, maxTokens, model, signal, timeoutMs = 60_000 } = options;
+
+    const turns = messages.map((m) => ({ role: m.role, content: m.content }));
+    const maxTokensOrDefault = maxTokens ?? HELPER_DEFAULT_MAX_TOKENS;
+    let requestBody: AnthropicMessagesRequest | ChatCompletionsRequest;
+    if (shape === "openai-chat") {
+      requestBody = {
+        model,
+        messages: system
+          ? [{ role: "system", content: system }, ...turns]
+          : turns,
+        stream: false,
+        max_tokens: Math.max(maxTokensOrDefault, CHAT_MIN_MAX_TOKENS),
+      };
+    } else {
+      const anthropicBody: AnthropicMessagesRequest = {
+        model,
+        messages: turns,
+        stream: false,
+        max_tokens: maxTokensOrDefault,
+      };
+      if (system) {
+        anthropicBody.system = system;
+      }
+      requestBody = anthropicBody;
+    }
+
+    this.log.debug("Sending request to LLM gateway", {
+      url: messagesUrl,
+      model,
+      messageCount: messages.length,
+    });
+
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => {
+      timeoutController.abort();
+    }, timeoutMs);
+    const onCallerAbort = () => timeoutController.abort();
+    if (signal) {
+      if (signal.aborted) timeoutController.abort();
+      else signal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...extraHeaders,
+    };
+
+    let response: Response;
+    try {
+      response = await fetchImpl(messagesUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+        signal: timeoutController.signal,
+      });
+    } catch (err) {
+      if (timeoutController.signal.aborted && !signal?.aborted) {
+        throw new LlmGatewayError(
+          `LLM gateway request timed out after ${timeoutMs}ms`,
+          "timeout",
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener("abort", onCallerAbort);
+    }
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      let errorData: AnthropicErrorResponse | null = null;
+
+      try {
+        errorData = JSON.parse(errorBody) as AnthropicErrorResponse;
+      } catch {
+        this.log.error("Failed to parse error response", {
+          errorBody,
+          status: response.status,
+        });
+      }
+
+      const detail =
+        typeof errorData?.detail === "string" ? errorData.detail : undefined;
+      const errorMessage =
+        errorData?.error?.message ||
+        (typeof errorData?.message === "string" ? errorData.message : "") ||
+        detail ||
+        `HTTP ${response.status}: ${response.statusText}`;
+      const errorType = errorData?.error?.type || "unknown_error";
+      const errorCode = aiGatewayDenialCode(
+        response.headers.get("x-posthog-denial"),
+        errorData,
+      );
+
+      this.log.error("LLM gateway request failed", {
+        status: response.status,
+        errorType,
+        errorMessage,
+      });
+
+      throw new LlmGatewayError(
+        errorMessage,
+        errorType,
+        errorCode,
+        response.status,
+      );
+    }
+
+    if (shape === "openai-chat") {
+      const chat = (await response.json()) as ChatCompletionsResponse;
+      const choice = chat.choices[0];
+      this.log.debug("LLM gateway response received", {
+        model: chat.model,
+        stopReason: choice?.finish_reason ?? null,
+        inputTokens: chat.usage?.prompt_tokens ?? 0,
+        outputTokens: chat.usage?.completion_tokens ?? 0,
+      });
+      return {
+        content: choice?.message.content ?? "",
+        model: chat.model,
+        stopReason: choice?.finish_reason ?? null,
+        usage: {
+          inputTokens: chat.usage?.prompt_tokens ?? 0,
+          outputTokens: chat.usage?.completion_tokens ?? 0,
+        },
+      };
+    }
+
+    const data = (await response.json()) as AnthropicMessagesResponse;
+
+    const textContent = data.content.find((c) => c.type === "text");
+    const content = textContent?.text || "";
+
+    this.log.debug("LLM gateway response received", {
+      model: data.model,
+      stopReason: data.stop_reason,
+      inputTokens: data.usage.input_tokens,
+      outputTokens: data.usage.output_tokens,
+    });
+
+    return {
+      content,
+      model: data.model,
+      stopReason: data.stop_reason,
+      usage: {
+        inputTokens: data.usage.input_tokens,
+        outputTokens: data.usage.output_tokens,
+      },
+    };
+  }
+
+  async fetchUsage(): Promise<UsageOutput | null> {
+    const auth = await this.auth.getValidAccessToken();
+    const { currentProjectId } = this.authService.getState();
+    if (currentProjectId === null) return null;
+    const usageUrl = this.endpoints.usageUrl(auth.apiHost, currentProjectId);
+
+    this.log.debug("Fetching usage", { url: usageUrl });
+
+    let response: Response;
+    try {
+      response = await this.auth.authenticatedFetch(usageUrl, {
+        headers: buildPosthogProjectHeaderRecord(currentProjectId),
+      });
+    } catch (err) {
+      this.log.warn("Usage fetch network error", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+
+    if (!response.ok) {
+      this.log.warn("Usage fetch failed", { status: response.status });
+      throw new LlmGatewayError(
+        `Failed to fetch usage: HTTP ${response.status}`,
+        "usage_error",
+        undefined,
+        response.status,
+      );
+    }
+
+    const usage = usageOutput.parse(await response.json());
+    if (usage.ai_credits && !usage.ai_credits.exhausted) {
+      this.gatewayTokens.clearBlocked();
+    }
+    return usage;
+  }
+}
+
+function remintReason(error: unknown) {
+  if (!(error instanceof LlmGatewayError)) return null;
+  return aiGatewayRemintReason(error.statusCode, error.code);
+}

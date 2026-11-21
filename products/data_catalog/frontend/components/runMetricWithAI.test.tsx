@@ -1,0 +1,74 @@
+import '@testing-library/jest-dom'
+
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+
+import { aiConsentLogic } from '~/layout/ai/aiConsentLogic'
+import { initKeaTests } from '~/test/init'
+
+import { buildMetricRunPrompt, RunMetricWithAIButton } from './RunMetricWithAIButton'
+
+jest.mock('~/layout/ai/aiConsentLogic', () => {
+    const { kea, selectors } = jest.requireActual('kea')
+    return {
+        aiConsentLogic: kea([
+            selectors({
+                dataProcessingAccepted: [() => [], () => (global as any).__consentAccepted ?? false],
+                dataProcessingDismissed: [() => [], () => false],
+                dataProcessingApprovalDisabledReason: [() => [], () => null],
+            }),
+        ]),
+    }
+})
+
+// Admins see the approve button, members see the access request button.
+function consentPopoverOpen(): boolean {
+    return document.querySelector('[data-attr="ai-consent-approve"], [data-attr="ai-access-request"]') !== null
+}
+
+describe('RunMetricWithAIButton', () => {
+    beforeEach(() => {
+        initKeaTests()
+    })
+
+    afterEach(() => {
+        cleanup()
+    })
+
+    it.each([
+        [false, "system.information_schema.metrics where name = 'weekly_paying_customers'"],
+        [true, 'data-catalog-metric-run'],
+    ])('keeps metric runs read-only when the metric is attached: %s', (metricAttached, expectedInstruction) => {
+        const prompt = buildMetricRunPrompt('weekly_paying_customers', { metricAttached })
+
+        // Attached context only reaches the sandbox send path, so the prompt has to stand alone.
+        expect(prompt).toContain(expectedInstruction)
+        // The definition is project-authored, so a stored-injection attempt must not read as intent.
+        expect(prompt).toContain('untrusted data')
+        expect(prompt).toContain('do not create, modify, or delete anything')
+    })
+
+    it.each([
+        ['consent already given', true, 1, false],
+        ['consent not yet given', false, 0, true],
+    ])(
+        'when %s, runs %s time(s) per click and opens consent only on click',
+        async (_label, accepted, expectedRuns, popoverAfterClick) => {
+            ;(global as any).__consentAccepted = accepted
+            aiConsentLogic.mount()
+            const onRun = jest.fn()
+
+            render(<RunMetricWithAIButton onRun={onRun} />)
+            // The popover mounts its overlay after a frame, so let pending effects settle before each check.
+            await act(async () => {})
+            // With `ignoreDismissal`, an ungated popover opens on render and Cancel cannot close it.
+            expect(consentPopoverOpen()).toBe(false)
+            fireEvent.click(screen.getByText('Run with AI'))
+            await act(async () => {})
+
+            // Without the guard an unapproved click fires here and again from the consent popover's
+            // onApprove, recording the run twice.
+            expect(onRun).toHaveBeenCalledTimes(expectedRuns)
+            expect(consentPopoverOpen()).toBe(popoverAfterClick)
+        }
+    )
+})

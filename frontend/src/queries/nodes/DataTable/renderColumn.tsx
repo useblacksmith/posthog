@@ -1,0 +1,537 @@
+import type { ReactJsonViewProps } from '@microlink/react-json-view'
+import { combineUrl, router } from 'kea-router'
+
+import { CopyToClipboardInline } from 'lib/components/CopyToClipboard'
+import { JSONViewer } from 'lib/components/JSONViewer'
+import { Property } from 'lib/components/Property'
+import { PropertyKeyInfo } from 'lib/components/PropertyKeyInfo'
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { TZLabel } from 'lib/components/TZLabel'
+import { dayjs } from 'lib/dayjs'
+import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
+import { LemonTag } from 'lib/lemon-ui/LemonTag/LemonTag'
+import { Link } from 'lib/lemon-ui/Link'
+import { Spinner } from 'lib/lemon-ui/Spinner/Spinner'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { COUNTRY_CODE_TO_LONG_NAME, countryCodeToFlag } from 'lib/utils/country'
+import { formatCurrency } from 'lib/utils/currency'
+import { autoCaptureEventToDescription } from 'lib/utils/events'
+import { isURL } from 'lib/utils/url'
+import { sessionColumnRenderers } from 'scenes/sessions/sessionColumnRenderers'
+import { urls } from 'scenes/urls'
+
+import { errorColumn, loadingColumn } from '~/queries/nodes/DataTable/dataTableLogic'
+import { renderHogQLX } from '~/queries/nodes/HogQLX/render'
+import { DeletePersonButton } from '~/queries/nodes/PersonsNode/DeletePersonButton'
+import { isActorsQuery, isHogQLQuery, isPersonsNode } from '~/queries/schema/node-guards'
+import {
+    CurrencyCode,
+    DataTableNode,
+    EventsQueryPersonColumn,
+    HasPropertiesNode,
+    LLMTracePerson,
+} from '~/queries/schema/schema-general'
+import { QueryContext, QueryContextColumn } from '~/queries/types'
+import { isEventsQuery, isGroupsQuery, isTracesQuery, trimQuotes } from '~/queries/utils'
+import { AnyPropertyFilter, EventType, PersonType, PropertyFilterType, PropertyOperator } from '~/types'
+
+import { aiObservabilityGlobalColumnRenderers } from 'products/ai_observability/frontend/aiObservabilityGlobalColumns'
+import { HarnessLabel } from 'products/mcp_analytics/frontend/dashboard/HarnessLabel'
+import { GroupActorDisplay } from 'products/persons/frontend/components/GroupActorDisplay'
+import { PersonDisplay, PersonDisplayProps } from 'products/persons/frontend/components/PersonDisplay'
+import { pickBestPersonDistinctId } from 'products/persons/frontend/person-utils'
+
+import { extractExpressionComment, removeExpressionComment } from './utils'
+
+export const DATETIME_KEYS = ['timestamp', 'created_at', 'last_seen', 'last_seen_at', 'session_start', 'session_end']
+
+// Wraps the JSON viewer in a horizontally scrollable container so wide or deeply
+// nested objects stay readable inside fixed-width table cells, where the surrounding
+// table clips overflow and offers no horizontal scroll of its own (e.g. dashboard tiles).
+function JSONCell(props: ReactJsonViewProps): JSX.Element {
+    return (
+        <div className="overflow-x-auto max-w-full">
+            <JSONViewer {...props} />
+        </div>
+    )
+}
+
+// Registry for product-specific column renderers
+// Products can add their custom column renderers here to have them automatically applied across all DataTable instances.
+// An entry wins over the core renderer for that column name in every DataTable, so a product registers only namespaced
+// keys here and passes the rest through its own scene's QueryContext.
+const productColumnRenderers: Record<string, QueryContextColumn> = {
+    ...aiObservabilityGlobalColumnRenderers,
+    ...sessionColumnRenderers,
+}
+
+export function getContextColumn(
+    key: string,
+    columns?: QueryContext<DataTableNode>['columns']
+): {
+    queryContextColumnName: string | undefined
+    queryContextColumn: QueryContextColumn | undefined
+} {
+    const queryContextColumnName = key.startsWith('context.columns.') ? trimQuotes(key.substring(16)) : undefined
+    const queryContextColumn = queryContextColumnName ? columns?.[queryContextColumnName] : undefined
+
+    return {
+        queryContextColumnName,
+        queryContextColumn,
+    }
+}
+
+export function getPersonForDeleteColumn(
+    record: any[],
+    query: DataTableNode
+): (PersonType & { display_name?: string }) | null {
+    const select = isActorsQuery(query.source) ? query.source.select : undefined
+    if (!select?.length) {
+        return record[0] as PersonType
+    }
+    const columns = select.map((column) => removeExpressionComment(column))
+    const personIndex = columns.findIndex((column) => column === 'person' || column === 'person_display_name')
+    if (personIndex !== -1 && record[personIndex]?.id) {
+        return record[personIndex] as PersonType
+    }
+    const idIndex = columns.indexOf('id')
+    if (idIndex !== -1 && record[idIndex]) {
+        return { id: String(record[idIndex]), distinct_ids: [], properties: {} }
+    }
+    return null
+}
+
+export function renderColumn(
+    key: string,
+    value: any,
+    record: Record<string, any> | any[],
+    recordIndex: number,
+    rowCount: number,
+    query: DataTableNode,
+    setQuery?: (query: DataTableNode) => void,
+    context?: QueryContext<DataTableNode>,
+    columnFormat?: string | null
+): JSX.Element | string {
+    const { queryContextColumnName, queryContextColumn } = getContextColumn(key, context?.columns)
+    const originalKey = key
+    key = isGroupsQuery(query.source) ? extractExpressionComment(key) : removeExpressionComment(key)
+
+    // Look up context/product renderers using both the stripped key and the original key,
+    // since renderers may be registered with the full expression (e.g. "'' -- Sentiment")
+    const contextColumn = context?.columns?.[key] ?? (key !== originalKey ? context?.columns?.[originalKey] : undefined)
+    const productColumn =
+        productColumnRenderers[key] ?? (key !== originalKey ? productColumnRenderers[originalKey] : undefined)
+
+    if (value === loadingColumn) {
+        return <Spinner />
+    } else if (value === errorColumn) {
+        return <LemonTag className="text-danger">Error</LemonTag>
+    } else if (context?.dataTableRenderPlainText) {
+        return value == null ? '—' : typeof value === 'object' ? JSON.stringify(value) : String(value)
+    } else if (columnFormat === 'mcp_harness' && typeof value === 'string') {
+        return <HarnessLabel category={value} />
+    } else if (queryContextColumnName && queryContextColumn?.render) {
+        const Component = queryContextColumn?.render
+        return (
+            <Component
+                record={record}
+                columnName={queryContextColumnName}
+                value={value}
+                query={query}
+                recordIndex={recordIndex}
+                rowCount={rowCount}
+                context={context}
+            />
+        )
+    } else if (contextColumn?.render) {
+        const Component = contextColumn.render
+        return (
+            <Component
+                record={record}
+                columnName={key}
+                value={value}
+                query={query}
+                recordIndex={recordIndex}
+                rowCount={rowCount}
+                context={context}
+            />
+        )
+    } else if (productColumn?.render) {
+        const Component = productColumn.render
+        return (
+            <Component
+                record={record}
+                columnName={key}
+                value={value}
+                query={query}
+                recordIndex={recordIndex}
+                rowCount={rowCount}
+            />
+        )
+    } else if (typeof value === 'object' && Array.isArray(value) && value[0] === '__hx_tag') {
+        return renderHogQLX(value)
+    } else if (value === null) {
+        return (
+            <Tooltip title="NULL" placement="right" delayMs={0}>
+                <span className="cursor-default" aria-hidden>
+                    —
+                </span>
+            </Tooltip>
+        )
+    } else if (isHogQLQuery(query.source)) {
+        if (typeof value === 'string') {
+            try {
+                if (value.startsWith('{') && value.endsWith('}')) {
+                    return (
+                        <JSONCell
+                            src={JSON.parse(value)}
+                            name={key}
+                            collapsed={Object.keys(JSON.stringify(value)).length > 10 ? 0 : 1}
+                        />
+                    )
+                }
+                if (value.startsWith('[') && value.endsWith(']')) {
+                    return (
+                        <JSONCell
+                            src={JSON.parse(value)}
+                            name={key}
+                            collapsed={JSON.stringify(value).length > 10 ? 0 : 1}
+                        />
+                    )
+                }
+            } catch {
+                // do nothing
+            }
+            if (value.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3,6})?(?:Z|[+-]\d{2}:\d{2})?$/)) {
+                // ClickHouse returns the epoch for min() or max() over no rows, because DateTime is not Nullable
+                if (new Date(value).getTime() === 0 && !/\.\d*[1-9]/.test(value)) {
+                    return (
+                        <Tooltip title="Unix epoch. An aggregate like min() or max() returns this when no rows match.">
+                            <span className="cursor-default">{value}</span>
+                        </Tooltip>
+                    )
+                }
+                return (
+                    <TZLabel
+                        time={value}
+                        showSeconds
+                        timestampStyle={query.showAbsoluteTime ? 'absolute' : 'relative'}
+                    />
+                )
+            }
+        }
+        if (typeof value === 'object') {
+            if (Array.isArray(value)) {
+                return <JSONCell src={value} name={key} collapsed={value.length > 10 ? 0 : 1} />
+            }
+            return <JSONCell src={value} name={key} collapsed={Object.keys(value).length > 10 ? 0 : 1} />
+        }
+        return <Property value={value} />
+    } else if (key === 'event' && isEventsQuery(query.source)) {
+        const resultRow = record as any[]
+        const eventRecord = query.source.select.includes('*') ? resultRow[query.source.select.indexOf('*')] : null
+
+        if (value === '$autocapture' && eventRecord) {
+            return (
+                <PropertyKeyInfo
+                    value={value}
+                    displayText={autoCaptureEventToDescription(eventRecord)}
+                    type={TaxonomicFilterGroupType.Events}
+                />
+            )
+        }
+        const content = <PropertyKeyInfo value={value} type={TaxonomicFilterGroupType.Events} />
+        const $sentry_url = eventRecord?.properties?.$sentry_url
+        return $sentry_url ? (
+            <Link to={$sentry_url} target="_blank">
+                {content}
+            </Link>
+        ) : (
+            content
+        )
+    } else if ((isActorsQuery(query.source) || isActorsQuery(query)) && key === 'last_seen_at') {
+        const isWithinLastHour = dayjs().diff(dayjs(value), 'hour', true) < 1
+        // Hide the "last hour" pill when the absolute-time mode is on — TZLabel's children
+        // override the formatted text, so the pill would otherwise mask the absolute timestamp.
+        const showLastHourPill = isWithinLastHour && !query.showAbsoluteTime
+        return (
+            <TZLabel time={value} showSeconds timestampStyle={query.showAbsoluteTime ? 'absolute' : 'relative'}>
+                {showLastHourPill ? (
+                    <span className="whitespace-nowrap align-middle border-dotted border-b">last hour</span>
+                ) : undefined}
+            </TZLabel>
+        )
+    } else if (DATETIME_KEYS.includes(key)) {
+        return <TZLabel time={value} showSeconds timestampStyle={query.showAbsoluteTime ? 'absolute' : 'relative'} />
+    } else if (!Array.isArray(record) && key.startsWith('properties.')) {
+        // TODO: remove after removing the old events table
+        const propertyKey = trimQuotes(key.substring('properties.'.length))
+        if (setQuery && (isEventsQuery(query.source) || isPersonsNode(query.source)) && query.showPropertyFilter) {
+            const newProperty: AnyPropertyFilter = {
+                key: propertyKey,
+                value: record.properties[propertyKey],
+                operator: PropertyOperator.Exact,
+                type: isPersonsNode(query.source) ? PropertyFilterType.Person : PropertyFilterType.Event,
+            }
+            const matchingProperty = (query.source.properties || []).find(
+                (p) => p.key === newProperty.key && p.type === newProperty.type
+            )
+            const newProperties = matchingProperty
+                ? (query.source.properties || []).filter((p) => p !== matchingProperty)
+                : [...(query.source.properties || []), newProperty]
+            const newUrl = query.propertiesViaUrl
+                ? combineUrl(
+                      router.values.location.pathname,
+                      {
+                          ...router.values.searchParams,
+                          properties: newProperties,
+                      },
+                      router.values.hashParams
+                  ).url
+                : '#'
+            return (
+                <Link
+                    to={newUrl}
+                    onClick={(e) => {
+                        e.preventDefault()
+                        setQuery({
+                            ...query,
+                            source: {
+                                ...query.source,
+                                properties: newProperties,
+                            } as HasPropertiesNode,
+                        })
+                    }}
+                >
+                    <Property value={record.properties[propertyKey]} propertyKey={propertyKey} />
+                </Link>
+            )
+        }
+        return <Property value={record.properties[propertyKey]} propertyKey={propertyKey} />
+    } else if (!Array.isArray(record) && key.startsWith('person.properties.')) {
+        // TODO: remove after removing the old events table
+        const eventRecord = record as EventType
+        const propertyKey = trimQuotes(key.substring(18))
+        if (setQuery && isEventsQuery(query.source)) {
+            const newProperty: AnyPropertyFilter = {
+                key: propertyKey,
+                value: eventRecord.person?.properties[propertyKey],
+                operator: PropertyOperator.Exact,
+                type: PropertyFilterType.Person,
+            }
+            const matchingProperty = (query.source.properties || []).find(
+                (p) => p.key === newProperty.key && p.type === newProperty.type
+            )
+            const newProperties = matchingProperty
+                ? (query.source.properties || []).filter((p) => p !== matchingProperty)
+                : [...(query.source.properties || []), newProperty]
+            const newUrl = query.propertiesViaUrl
+                ? combineUrl(
+                      router.values.location.pathname,
+                      {
+                          ...router.values.searchParams,
+                          properties: newProperties,
+                      },
+                      router.values.hashParams
+                  ).url
+                : '#'
+            return (
+                <Link
+                    to={newUrl}
+                    onClick={(e) => {
+                        e.preventDefault()
+                        setQuery({
+                            ...query,
+                            source: {
+                                ...query.source,
+                                properties: newProperties,
+                            } as HasPropertiesNode,
+                        })
+                    }}
+                >
+                    <Property value={eventRecord.person?.properties?.[propertyKey]} propertyKey={propertyKey} />
+                </Link>
+            )
+        }
+        return <Property value={eventRecord.person?.properties?.[propertyKey]} propertyKey={propertyKey} />
+    } else if (key === 'person') {
+        const personRecord = record as PersonType
+        const displayProps: PersonDisplayProps = {
+            withIcon: true,
+            person: record as PersonType,
+            noPopover: true,
+        }
+
+        if (isEventsQuery(query.source)) {
+            displayProps.person = value.distinct_id ? (value as EventsQueryPersonColumn) : value
+            // The query runner resolves this column against Postgres by distinct ID, so a row without
+            // `properties` has no profile behind it. The popover would repeat that same lookup to show
+            // an empty card, so the cell says it in place instead.
+            if (!value?.properties) {
+                return (
+                    <Tooltip
+                        title="This distinct ID has no person profile."
+                        docLink="https://posthog.com/docs/data/persons#capturing-person-profiles"
+                        openOnClick
+                    >
+                        <span>
+                            <PersonDisplay {...displayProps} />
+                        </span>
+                    </Tooltip>
+                )
+            }
+            displayProps.noPopover = false // If we are in an events list, the popover experience is better
+        }
+
+        if (isPersonsNode(query.source) && personRecord.distinct_ids) {
+            displayProps.href = urls.personByDistinctId(
+                pickBestPersonDistinctId(personRecord.distinct_ids) ?? personRecord.distinct_ids[0]
+            )
+        }
+
+        if (isActorsQuery(query.source) && value) {
+            displayProps.person = value
+            const bestDistinctId = pickBestPersonDistinctId(value.distinct_ids)
+            displayProps.href = bestDistinctId ? urls.personByDistinctId(bestDistinctId) : urls.personByUUID(value.id)
+        }
+
+        if (isTracesQuery(query.source) && value) {
+            displayProps.person = value.distinct_id ? (value as LLMTracePerson) : value
+            displayProps.noPopover = false // If we are in a traces list, the popover experience is better
+        }
+
+        return <PersonDisplay {...displayProps} />
+    } else if (key === 'person_display_name') {
+        // The column coalesces the display-name properties down to the distinct ID, so a name of its own
+        // is the only evidence the row reached a person profile. An event captured without person
+        // processing carries a placeholder person ID that links to "Person not found", and a `properties`
+        // key is what makes PersonDisplay render that link. The popover stays on either way, because it
+        // looks the person up by distinct ID and so still finds a profile created after the event.
+        const nameCameFromProfile = value.display_name !== value.distinct_id
+        const displayProps: PersonDisplayProps = {
+            withIcon: true,
+            person: nameCameFromProfile
+                ? { id: value.id, distinct_id: value.distinct_id, properties: {} }
+                : { id: value.id, distinct_id: value.distinct_id },
+            displayName: value.display_name,
+            // Hide the popover on people list only
+            noPopover: isActorsQuery(query.source),
+        }
+        return <PersonDisplay {...displayProps} />
+    } else if (key === 'group' && typeof value === 'object') {
+        return <GroupActorDisplay actor={value} />
+    } else if (key === 'person.$delete' && (isPersonsNode(query.source) || isActorsQuery(query.source))) {
+        if (!Array.isArray(record)) {
+            console.error('Expected record to be an array for person.$delete column')
+            return ''
+        }
+        return <DeletePersonButton person={getPersonForDeleteColumn(record, query)} />
+    } else if (key === 'properties.$geoip_country_code') {
+        if (typeof value === 'string') {
+            return `${countryCodeToFlag(value)} ${COUNTRY_CODE_TO_LONG_NAME[value] || value}`
+        }
+
+        return String(value)
+    } else if (key.startsWith('context.columns.')) {
+        const columnName = trimQuotes(key.substring(16)) // 16 = "context.columns.".length
+        const Component = context?.columns?.[columnName]?.render
+        return Component ? (
+            <Component
+                record={record}
+                columnName={columnName}
+                value={value}
+                query={query}
+                recordIndex={recordIndex}
+                rowCount={rowCount}
+            />
+        ) : (
+            String(value)
+        )
+    } else if (
+        isGroupsQuery(query.source) &&
+        key.startsWith('properties.') &&
+        context?.columns?.[trimQuotes(key.substring('properties.'.length))]?.render
+    ) {
+        const propertyName = trimQuotes(key.substring('properties.'.length))
+        const Component = context?.columns?.[propertyName].render
+        return Component ? (
+            <Component
+                record={record}
+                columnName={propertyName}
+                value={value}
+                query={query}
+                recordIndex={recordIndex}
+                rowCount={rowCount}
+            />
+        ) : (
+            String(value)
+        )
+    } else if (key === 'id' && (isPersonsNode(query.source) || isActorsQuery(query.source))) {
+        return (
+            <CopyToClipboardInline
+                explicitValue={String(value)}
+                iconStyle={{ color: 'var(--color-accent)' }}
+                description="person id"
+            >
+                {String(value)}
+            </CopyToClipboardInline>
+        )
+    } else if (key === 'key' && isGroupsQuery(query.source)) {
+        return (
+            <CopyToClipboardInline
+                explicitValue={String(value)}
+                iconStyle={{ color: 'var(--color-accent)' }}
+                description="group id"
+            >
+                {String(value)}
+            </CopyToClipboardInline>
+        )
+    } else if (key === 'group_name' && isGroupsQuery(query.source)) {
+        if (typeof value === 'object' && 'display_name' in value && 'key' in value) {
+            return (
+                <div className="flex flex-col min-w-40">
+                    <LemonTableLink
+                        to={urls.group(query.source.group_type_index, value.key)}
+                        title={value.display_name as string}
+                    />
+                    <CopyToClipboardInline
+                        explicitValue={value.key}
+                        iconStyle={{ color: 'var(--color-accent)' }}
+                        description="group id"
+                    >
+                        {value.key}
+                    </CopyToClipboardInline>
+                </div>
+            )
+        }
+        return String(value)
+    } else if (trimQuotes(key).endsWith('$virt_mrr') || trimQuotes(key).endsWith('$virt_revenue')) {
+        if (value === null || value === undefined) {
+            return '—'
+        }
+        const baseCurrency = context?.baseCurrency || CurrencyCode.USD
+        return formatCurrency(Number(value), baseCurrency)
+    }
+    if (typeof value === 'object') {
+        return <JSONCell src={value} name={null} collapsed={Object.keys(value).length > 10 ? 0 : 1} />
+    } else if (
+        typeof value === 'string' &&
+        ((value.startsWith('{') && value.endsWith('}')) || (value.startsWith('[') && value.endsWith(']')))
+    ) {
+        try {
+            return <JSONCell src={JSON.parse(value)} name={null} collapsed={Object.keys(value).length > 10 ? 0 : 1} />
+        } catch {
+            // do nothing
+        }
+    }
+
+    if (typeof value === 'string' && isURL(value)) {
+        return (
+            <Link to={value} target="_blank" targetBlankIcon>
+                {value}
+            </Link>
+        )
+    }
+
+    return String(value)
+}

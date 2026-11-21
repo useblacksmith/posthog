@@ -1,0 +1,118 @@
+# MarkdownNotebook
+
+A notebook editor that uses markdown as its storage format. The document model is parsed from and serialized back to markdown on every edit, so the markdown string is always the source of truth.
+
+See [COMPONENTS.md](./COMPONENTS.md) for how to register embeddable components (`<Query ... />`-style tags).
+
+## Module layout
+
+| Module                                                                                              | Responsibility                                                                                                                                            |
+| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MarkdownNotebook.tsx`                                                                              | The editor component: document state, commit/undo, selection restoration, keyboard/input dispatch, drag/copy/paste, insert menu and toolbar orchestration |
+| `markdown.ts`                                                                                       | Markdown ↔ `NotebookDocument` parser and serializer, stable node ID assignment                                                                            |
+| `reconcile.ts`                                                                                      | Preserves node identity across re-parses so the caret and DOM survive autosave echoes                                                                     |
+| `collaboration.ts`                                                                                  | Three-way merge of base/local/remote markdown for autosave conflicts and realtime updates                                                                 |
+| `remoteCarets.tsx`                                                                                  | Remote caret presence: cross-client caret coordinates (node index + text offset) and the positioned caret overlay                                         |
+| `documentModel.ts`                                                                                  | Pure document/block-level helpers: visual grouping, node predicates, input shortcuts, clipboard serialization                                             |
+| `listModel.ts` / `tableModel.ts`                                                                    | Pure list and table structure operations (depth shifting, row/column normalization)                                                                       |
+| `inlineContent.ts`                                                                                  | Pure inline-node operations: marks, links, splitting at offsets                                                                                           |
+| `domSelection.ts`                                                                                   | DOM selection reading/writing: mapping `window.getSelection()` to nodes and back                                                                          |
+| `registry.tsx`                                                                                      | Built-in component definitions (`Query`, `Image`, `Embed`, …) and the registry helpers                                                                    |
+| `editorTypes.ts` / `componentPanels.ts`                                                             | Internal shared types, constants, and component panel visibility state                                                                                    |
+| `Editable*.tsx`, `DividerBlock.tsx`, `renderNode.tsx`                                               | Per-block render components (text, list, table, code, divider, AI prompt)                                                                                 |
+| `NotebookComponentShell.tsx`, `InsertMenu.tsx`, `FormattingToolbar.tsx`, `InsertBoundaryButton.tsx` | Editor chrome                                                                                                                                             |
+
+## Supported markdown
+
+Inline: bold (`**`/`__`), italic (`*`/`_`, underscores only at word boundaries), underline (`<u>`), strikethrough (`~~`), inline code, links (http/https only; balanced parentheses in hrefs supported, as is the pointy-bracket href form `[label](<href>)` that Slack copies produce), hard breaks, ref anchors (`<ref id="x">highlighted text</ref>`, lowercase inline tags so they can never collide with uppercase component tags), and mentions (`<mention id="5">@Name</mention>`; the text is the display label, the id is the member). Blocks: paragraphs, headings (`#`–`######` parse and round-trip; the UI offers H1–H3), blockquotes (including quoted headings — `> ## Heading` — and quoted lists), ordered/unordered lists with nesting, GFM task lists (`- [ ]`/`- [x]` on bullet items; the checkbox replaces the bullet and `1. [x]` stays literal), GFM tables with column alignment (header and body rows must start with `|`), fenced code blocks (language tag preserved; the serializer picks a fence longer than any backtick run in the content), dividers (`---`/`***`/`___`, stored as a reserved `Divider` component tag), images (`![alt](src)`, stored as the `Image` component), and JSX-like component tags. Blocks are separated by a blank line; a second blank line additionally starts a new card (see [Visual grouping](#visual-grouping)).
+
+### Round-trip guarantee
+
+`parse(serialize(doc))` must preserve the document: the serializer backslash-escapes every character the inline parser would interpret (`escapeInlineMarkdownText`, kept in sync with `INLINE_ESCAPABLE_CHARS`), and `escapeMarkdownLineStart` protects text lines that would otherwise re-parse as a different block type (headings, lists, blockquotes, dividers, component tags). Source text is never dropped: an unterminated component tag stops at the first blank line and degrades to a paragraph, and a component tag with malformed props serializes back from its `raw` source until it is edited. `markdownRoundTrip.test.ts` enforces this with a generated-document fixpoint test — extend it when adding syntax.
+
+## Visual grouping
+
+Consecutive text-like blocks (paragraphs, headings, lists, blockquotes, code blocks) render inside one shared card surface — a _text group_ (`getMarkdownNotebookVisualGroups` in `documentModel.ts`). Within a group, blockquote runs and code blocks form their own tinted sub-surfaces (`MarkdownNotebookTextSurface`: `text` | `quote` | `code`); a surface that starts or ends its group stretches flush to the card edge. Components and dividers render as standalone rows between groups.
+
+A table joins a card an earlier block already opened, but never opens one itself (`tableJoinsTextGroup`). A table written between two paragraphs therefore reads as part of that passage: it joins the `text` surface and drops its card chrome, keeping only the grid outline. A table carrying a card boundary, or following a standalone block, keeps its own row and its own chrome.
+
+A block carrying `startsGroup` breaks out of the run above it and starts its own card. It is set when the block was added as a node in its own right rather than typed as a continuation: the insert boundary's "+", an MCP `notebooks-add-cell` insert, `appendMarkdownNotebookBlock`. Enter inside a card keeps making blocks in that same card, so the two stay distinguishable. The flag lives in the markdown as a **second blank line** before the block (`NOTEBOOK_BLOCK_SEPARATOR`) — nothing else would survive a save, since markdown is the only storage. It never applies to the first block, which has no separator to widen.
+
+Because it belongs to the slot rather than the content, `withPreservedGroupStart` carries it across a replacement (an insert-menu command swapping a real node in for the placeholder) and keeps it on the first half only when Enter splits a block.
+It also stays out of `getNodeFingerprint`, since folding it in would churn the content-derived node id every time a card splits, so both layers that compare nodes by fingerprint handle it explicitly: `diffNotebookDocuments` emits a `set_group_start` operation (what makes a card boundary undoable, and what rebases it past concurrent edits), and `mergeNotebookMarkdownChanges` merges it on its own three-way rule.
+
+Code blocks render a non-editable line-number gutter next to the editable `<pre>`. Gutter numbers are absolutely positioned at line tops measured from the DOM (wrapped lines hang without numbers), so the gutter never participates in selection, copy, or text offsets. A trailing `<br>` sentinel keeps trailing blank lines visible; it contributes nothing to `textContent`, which keeps offsets stable.
+
+## Event architecture: one editing host
+
+The canvas (`.MarkdownNotebook__canvas`) is a single `contenteditable` editing host. Block elements inside it (list items, table cells, code blocks) also carry `contenteditable`, but **nested contenteditable elements inside an editable region are not separate editing hosts** — in real browsers, keyboard and `beforeinput` events target the canvas, not the inner block.
+
+Because of this, all editing behavior must be dispatched from root-level handlers based on the current selection:
+
+- `handleRootEditableKeyDown` (canvas `onKeyDown`) — Tab indentation, Enter splits, Backspace/Delete semantics, ArrowDown below a trailing code block
+- the native `beforeinput` capture listener — `insertParagraph`/`insertLineBreak` (inside code blocks these insert a literal `\n` through the model, since the browser default inserts `<br>` elements that are invisible to `textContent`), `deleteContent*`, `historyUndo/Redo`, and a last-resort guard that cancels any unclaimed native range edit crossing inline-editable boundaries — the browser would otherwise restructure React-managed elements in place (e.g. merge two `<li>`s) and the next React commit would crash with `removeChild` DOM exceptions
+- `handleRootEditableInput` (canvas `onInput`) — syncing typed text back into the document model
+- `handleNotebookKeyDown` (notebook root `onKeyDownCapture`) — Cmd/Ctrl shortcuts: bold/italic/underline (`B`/`I`/`U`), strikethrough (`Shift+X`), scoped select-all (`A`), copy of a focused component (`C`), save (`S`), and `Alt+Up`/`Alt+Down` to move the active block past its neighbour
+
+These resolve the affected block with `getInlineEditableElementForSelection` and the `data-markdown-notebook-*` attributes. Do **not** add keyboard handlers to inner block components: they only fire in JSDOM tests (where events are dispatched directly on inner elements), so they create behavior that passes tests but never runs in the app.
+
+Two of the root shortcuts sit either side of the guard that skips native editable elements (`input`, `textarea`, `select`, `.monaco-editor`), and the order is the behavior. `Cmd/Ctrl+S` is claimed **before** it, so saving works inside a code editor too — left to the browser there, it opens the "save page" dialog over the notebook. `Alt+Up`/`Alt+Down` sits **after** it, so a code editor keeps the same keys for moving a line.
+
+`Cmd/Ctrl+S` calls the host's `onSaveRequested`; without that prop the key stays with the browser. The notebooks scene points it at `notebookLogic`'s `saveNotebookNow`, which skips the autosave debounce and applies the gates the autosave path already applies.
+
+## Cell keys
+
+A component block that publishes a run handler (`usePublishNotebookComponentRunHandler`, from `componentRunHandlers.ts`) is a **cell**, and `NotebookComponentShell` gives it notebook keys on top of the document keys every block has. The SQL, Python, and generated-widget blocks publish one; the legacy code blocks do not, so they keep the document keys alone. The generic editor never learns what SQL or Python is: the block's toolbar control publishes `run()` and the `disabledReason` guarding it, so a shortcut can never start a run the Run button would refuse — an in-flight run included, since a second one races the poller and strands the spinner.
+
+| Key              | Where it works       | What it does                                    |
+| ---------------- | -------------------- | ----------------------------------------------- |
+| `Cmd/Ctrl+Enter` | anywhere in the cell | Runs the cell                                   |
+| `Shift+Enter`    | anywhere in the cell | Runs the cell and moves focus to the next block |
+| `Escape`         | inside the editor    | Moves focus out to the cell                     |
+| `Enter`          | on the cell          | Moves focus back into the editor                |
+
+The run keys reach the whole cell so a run still starts with focus on the results or on a collapsed cell, where there is no editor on screen. Monaco binds its own `Cmd+Enter` and stops the event there, so a run from inside the editor never reaches the shell twice; `Shift+Enter` it treats as a plain newline, which `Enter` already gives you. `Escape` arrives only once Monaco has nothing left to dismiss (its suggestion list, its find box), which is what makes it safe to take.
+
+The shell only handles keys that happened inside its own DOM. A block that renders a modal or a menu portals that DOM out of the shell, and React still bubbles its events here through the component tree, so without the check a source editor in a modal would run the cell on `Shift+Enter` instead of taking the newline.
+
+`Escape`/`Enter` apply to cells alone. On every other block `Enter` keeps adding a paragraph below it, which is the document behavior. A cell therefore gives that up: add a block after one from the insert boundary instead.
+
+`Enter` focuses the element Monaco actually reads keystrokes from, and which one that is depends on the build. An EditContext-based Monaco uses `.native-edit-context` and renders a second textarea only for IME, so focusing that textarea puts the caret nowhere. The selector tries the EditContext element first and keeps the bare `textarea` last for older builds. `NotebookComponentShell.test.tsx` covers both shapes, because JSDOM alone cannot tell them apart.
+
+## Jupyter mode
+
+The `jupyterMode` prop lays the notebook out and drives it the way JupyterLab does. The notebooks scene enables it by default, and each user can turn it off from the notebook's View menu.
+
+`Shift+Enter` inside markdown text inserts a line break within the text cell. `Escape` selects the markdown cell in command mode, where `Shift+Enter` advances to the next cell and inserts a code cell if there is none. Python and SQL editors keep `Shift+Enter` as run and advance.
+
+- The notebook is a list of cells (`getNotebookJupyterCells` in `jupyterCells.ts`). Each component tag in `cellTagNames` is a code cell with an `In [n]:` prompt. A run of text blocks that share a card is one markdown cell, the way a Jupyter markdown cell holds several paragraphs. Every other block (an insight, a divider) is a cell of its own and reads as rich output. A cell is named by its first node's id.
+- A selected cell is in command mode, and a cell whose source holds the caret is in edit mode. A code cell's shell takes focus in command mode. Text never takes focus itself, because the canvas is the editing host, so a markdown cell in command mode puts focus on an invisible sink (`MarkdownNotebook__jupyter-command-sink`). Without it, letter keys would type into the text.
+- `resolveNotebookJupyterKey` in `jupyterMode.ts` maps key presses to commands, including the two-key sequences (`D D`, `I I`, `0 0`). In edit mode it only claims the run keys, Escape, and the split chord, so typing never adds, deletes, or converts a cell. `executeCommand` in the editor implements every command against the document, so each edit is undoable and merges like any other.
+- `NotebookJupyterStore` holds the state the cells and the notebook toolbar share: the active cell, the Shift+Up/Down selection and its anchor, each cell's published run handler, the cell clipboard, and the deleted-cell history for `Z`. It lives outside React state, so a selection change re-renders only the cells it affects.
+- Keys inside a code editor live on the editor itself (`jupyterEditorKeys.ts`): Tab completes after code and indents elsewhere, Shift+Tab shows the docs for the name at the cursor, Up and Down at the first and last line leave the cell, Backspace in an empty editor removes it, and Ctrl+Shift+Minus splits it. The shell finds the Monaco instance inside it through `lib/monaco/mountedCodeEditors.ts`, so the Python and SQL cells get the same keys without importing Monaco.
+- The generic editor still knows nothing about Python or SQL. The run handler a cell publishes carries its running state and execution count. The host supplies the cell source (`getCellSource`, `withCellSource`), fresh identities for a pasted copy (`prepareCellCopy`), kernel completion and inspection (`completeCode`, `inspectCode`), and a callback for each command it runs (`onCommand`), which the notebooks scene uses for usage events.
+
+## Sync model
+
+The component receives two props: `value` (the local content owned by the caller, e.g. `notebookLogic.localContent`) and `remoteValue` (the latest known server content). Internally it tracks:
+
+- `lastSerializedValueRef` — the last markdown emitted through `onChange`
+- `lastBaseValueRef` — the last server state local edits were derived from; this is always a server-side value, never a local or merged one, since it is the common ancestor for the next three-way merge
+
+When `remoteValue` changes it is merged with `mergeNotebookMarkdownChanges({ base, local, remote })`, and the merged document is committed without touching the merge base (the merge result still contains unsaved local changes). When `remoteValue` catches up with the local serialization (autosave echo), the component is fully synced; undo history is intentionally preserved in that case.
+
+Save conflicts (HTTP 409) are resolved through the same path: `notebookLogic` reloads the fresh server content, which flows in as `remoteValue`, the editor merges and re-emits, and the save is retried against the new version.
+
+## Debug session recorder
+
+The debug drawer (`showDebug`) has a Log button that records an editing session as JSONL: every keystroke, mouse, input, and clipboard event on the notebook (capture phase), deduplicated selection snapshots, and every document commit with the resulting markdown — plus remote merges with their base/local/remote inputs and conflicts. Stop downloads the session as a `.log` file, built to be handed to an agent (or a human) to reconstruct exactly what the editor did and why.
+
+If the editor crashes while a recording is in flight, the log downloads itself instead of being lost: a `crash` entry (error, stack, current markdown) is appended and the file is saved immediately — whether the crash is an uncaught error in an event handler (window `error` listener) or a React render/commit error (`MarkdownNotebookCrashReporter`, which flushes the log and rethrows so the app's error boundary still takes over). Unhandled promise rejections are logged as entries but don't end the session.
+
+## Inline discussion comments
+
+A Google Docs-style comment thread is two paired pieces of markdown: an inline `<ref id="banana">highlighted text</ref>` anchor (a multi-block selection wraps each block's range in the same id) and a `<Comment ref="banana" replies={[…]} />` block placed right above the first block holding the highlight. When threads are present and the container is wide enough, the canvas reserves a right gutter (`--markdown-notebook-comment-gutter`) and pushes the text column left; each thread row keeps zero height so the card hangs in the gutter level with its content. Below `COMMENT_GUTTER_MIN_CONTAINER_WIDTH_PX` the threads flow inline as right-aligned cards. Replies live in the markdown itself as an id-keyed array, so two people replying at the same time merge by union (`mergeIdKeyedArrayPropValues` in `collaboration.ts`) instead of clobbering each other.
+
+Deletion is intentionally asymmetric (`removeNotebookNodesWithRefCleanup` in `documentModel.ts`): deleting the comment thread also unwraps its `<ref>` highlight, but removing the highlight (or the text holding it) leaves the thread in place — it contains people's replies and must be deleted on its own.
+
+The `Comment` tag also has an authorial-note flavor (`text` prop) that serializes as a plain `<!-- … -->` markdown comment; `isDiscussionCommentProps` in `markdown.ts` is the discriminator.

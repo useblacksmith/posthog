@@ -1,0 +1,152 @@
+import { Edge, Node } from '@xyflow/react'
+import z from 'zod'
+
+import { CyclotronJobInputsValidationResult } from 'lib/components/CyclotronJob/CyclotronJobInputsValidation'
+import { EmailFieldErrors } from 'scenes/hog-functions/email-templater/types'
+
+import { AccessControlLevel, UserBasicType } from '~/types'
+
+import { HogFlowOriginProductEnumApi } from '../../generated/api.schemas'
+import { CyclotronJobInputSchemaTypeSchema, HogFlowActionSchema, HogFlowTriggerSchema } from './steps/types'
+
+const HogFlowEdgeSchema = z.object({
+    from: z.string(),
+    to: z.string(),
+    type: z.enum(['continue', 'branch']),
+    index: z.number().optional(),
+})
+
+export const HogFlowSchema = z.object({
+    id: z.string(),
+    team_id: z.number(),
+    version: z.number(),
+    name: z.string(),
+    description: z.string().optional(),
+    status: z.enum(['active', 'draft', 'archived']),
+    trigger: HogFlowTriggerSchema.optional(),
+    // Optional masking config for the trigger, allows HogFlows to be rate limited per distinct ID or other property
+    trigger_masking: z
+        .object({
+            ttl: z.number().nullable(),
+            hash: z.string(),
+            bytecode: z.array(z.union([z.string(), z.number()])),
+            threshold: z.number().nullable(),
+        })
+        .optional()
+        .nullable(),
+    conversion: z
+        .object({
+            window: z.string().optional(),
+            filters: z.any(),
+            events: z
+                .array(
+                    z.object({
+                        filters: z.any().optional().nullable(),
+                        name: z.string().optional(),
+                    })
+                )
+                .optional(),
+            bytecode: z.array(z.union([z.string(), z.number()])).optional(), // Bytecode only present after save
+        })
+        .optional(),
+    exit_condition: z.enum([
+        'exit_on_conversion',
+        'exit_on_trigger_not_matched',
+        'exit_on_trigger_not_matched_or_conversion',
+        'exit_only_at_end',
+    ]),
+    // Optional email pacing: the email worker delays sends over the limit instead of dropping them
+    email_sending_rate_limit: z
+        .object({
+            count: z.number(),
+            period: z.enum(['minute', 'hour']),
+        })
+        .optional()
+        .nullable(),
+    actions: z.array(HogFlowActionSchema),
+    abort_action: z.string().optional(),
+    edges: z.array(HogFlowEdgeSchema),
+    variables: z.array(CyclotronJobInputSchemaTypeSchema).optional().nullable(),
+    updated_at: z.string(),
+    created_at: z.string(),
+})
+
+export const HogFlowTemplateSchema = HogFlowSchema.omit({ status: true }).extend({
+    image_url: z.string().optional().nullable(),
+    tags: z.array(z.string()).default([]),
+    scope: z.enum(['team', 'global', 'organization']).optional().nullable(),
+})
+
+export const HogFlowBatchJobSchema = z.object({
+    id: z.string(),
+    hog_flow: z.string(),
+    variables: z.record(z.string(), z.any()),
+    status: z.enum(['waiting', 'queued', 'active', 'completed', 'partially_failed', 'cancelled', 'failed']),
+    filters: z.any(),
+    created_at: z.string(),
+    updated_at: z.string(),
+})
+
+// NOTE: these are purposefully exported as interfaces to support kea typegen
+export interface HogFlow extends z.infer<typeof HogFlowSchema> {
+    created_by?: UserBasicType | null
+    // UX discriminator set by purpose-built surfaces; 'broadcast' rows are managed via the
+    // broadcasts UI and hidden from the ordinary workflows list.
+    // Product surface that owns this workflow (e.g. `loops` for Desktop loops). Null when built directly in the workflows UI.
+    origin_product?: HogFlowOriginProductEnumApi | null
+    // Effective access level of the current user for this workflow (resource access control).
+    user_access_level?: AccessControlLevel
+    // Staged content changes awaiting publish (active workflows only). A full snapshot of the
+    // content fields; null when nothing is staged. Read-only server state.
+    draft?: Partial<HogFlow> | null
+    draft_updated_at?: string | null
+    // Set when PostHog paused this workflow's email because its spam complaint or hard bounce rate
+    // crossed a threshold. Read-only server state: only the resume endpoint clears it.
+    email_sending_paused_at?: string | null
+    email_sending_paused_reason?: string
+    // "auto" (detector) or "staff"; a staff pause has no customer resume. Empty when not paused.
+    email_sending_paused_by?: string
+    // True when only PostHog can lift the pause: staff placed it, or it re-tripped soon after a resume.
+    email_sending_pause_requires_support?: boolean
+    email_sending_resumed_at?: string | null
+    // Suggested changes waiting for a person. Only the list endpoint counts it.
+    pending_suggestions?: number | null
+    suggestions_enabled?: boolean | null
+    tags?: string[]
+}
+
+export interface HogFlowEdge extends z.infer<typeof HogFlowEdgeSchema> {}
+export interface HogFlowActionEdge extends Edge<{ edge: HogFlowEdge }> {}
+
+export type HogFlowAction = z.infer<typeof HogFlowActionSchema> & Record<string, unknown>
+export interface HogFlowActionNode extends Node<HogFlowAction> {}
+
+// Dropzone nodes are ephemeral and on the client only, used in the editor to highlight where nodes can be added to a workflow
+export type DropzoneNode = Node<{ edge: HogFlowActionEdge; isBranchJoinDropzone?: boolean }>
+
+export type HogFlowActionValidationResult = CyclotronJobInputsValidationResult & {
+    schema: z.ZodError | null
+    // Per-field messages for a `function_email` step, placed next to their inputs. Only populated
+    // once a save/enable has been attempted, so a freshly opened step stays clean.
+    emailErrors?: EmailFieldErrors
+}
+
+export interface HogFlowTemplate extends z.infer<typeof HogFlowTemplateSchema> {
+    created_by?: UserBasicType | null
+}
+
+export interface HogFlowBatchJob extends z.infer<typeof HogFlowBatchJobSchema> {
+    created_by?: UserBasicType | null
+}
+
+export interface HogFlowSchedule {
+    id: string
+    rrule: string
+    starts_at: string
+    timezone?: string
+    variables?: Record<string, unknown>
+    status?: string
+    next_run_at?: string | null
+    created_at?: string
+    updated_at?: string
+}

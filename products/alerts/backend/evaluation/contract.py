@@ -1,0 +1,198 @@
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Protocol
+from zoneinfo import ZoneInfo
+
+from posthog.schema import AlertCondition, AlertConditionType, IntervalType
+
+from posthog.api.services.query import ExecutionMode
+from posthog.dataclasses import frozen
+from posthog.interval_specs import interval_spec
+from posthog.models.team import Team
+from posthog.models.user import User
+
+from products.alerts.backend.models.alert import AlertConfiguration
+from products.product_analytics.backend.facade.models import Insight
+
+
+@dataclass
+class SeriesPoint:
+    date: str | None  # None for non-time-series (single aggregated value)
+    value: float | None  # None = missing data point this interval
+
+
+@frozen
+class ComparableSeries:
+    label: str  # series / breakdown label, used in breach messages
+    points: list[SeriesPoint]  # chronologically ascending; extractor guarantees order
+    current_index: int  # comparison anchor; previous = current_index - 1
+    is_current_interval: bool = False  # anchor is the ongoing (incomplete) interval — affects breach wording
+    # The raw identity a caller keys per-series state on. Labels are formatted for display and two
+    # series can render the same one, such as multi-breakdown values ["a::b", "c"] and ["a", "b::c"].
+    # None when the label is the only identity the extractor has.
+    identity: str | None = None
+
+
+@frozen
+class EvaluatedInterval:
+    start: str
+    end: str
+    timezone: str
+    delay: int
+
+
+@dataclass(frozen=False)
+class ExtractionResult:
+    """Everything the comparator needs from an extractor, so the dispatcher stays kind-agnostic.
+
+    ``subject`` and ``framed`` shape the breach message: framed trends messages read
+    "The insight value (label) for previous day (...)"; unframed messages (e.g. SQL insights,
+    which have no series label or interval) read "The SQL insight value (...)".
+    """
+
+    series: list[ComparableSeries]
+    is_breakdown: bool = False  # breakdown queries report no single no-breach value
+    interval_type: IntervalType | None = None  # breach-message interval framing (time-series trends only)
+    subject: str = "The insight value"  # breach-message subject
+    framed: bool = True  # include the "(label) for current/previous interval" framing
+    unit: str = ""  # appended to breach-message values (e.g. "%" for funnel conversion rates)
+    # Detector-path-only: True means the query returned zero rows, so the metric is genuinely 0. An
+    # empty ``series`` with this False instead means rows existed but none were long enough to score —
+    # the detector reports that as an uncomputed value (None). Threshold extractors never set this
+    # (they emit a zero sentinel series) and the comparator ignores it.
+    empty_query_result: bool = False
+    # When True, every breaching series is reported (capped) instead of stopping at the first —
+    # any-row SQL alerts use this so the notification names all violating rows. Trends breakdowns
+    # keep first-breach-only for parity with their historical messages.
+    aggregate_breaches: bool = False
+    # Name the (single) series in the breach message even when it isn't a breakdown — single-row SQL
+    # alerts set this so a resolved label column surfaces, e.g. "(Burn rate 24h)". Breakdowns already
+    # name every row via ``is_breakdown``; this covers the one-series case where the name is meaningful.
+    include_series_label: bool = False
+    # Optional per-value display formatter mirroring the insight's axis format (currency, prefix/postfix,
+    # decimals, duration, %). None → the comparator falls back to raw ``f"{value}{unit}"``. Only the
+    # trends extractor sets it today; the PERCENTAGE-threshold path ignores it (relative % ratios).
+    value_formatter: Callable[[float], str] | None = None
+    evaluated_interval: EvaluatedInterval | None = None
+    # The query folded breakdown values past its limit into one "Other" series, so a value missing
+    # from ``series`` may still exist and breach.
+    truncated: bool = False
+
+
+def zero_sentinel_series() -> ComparableSeries:
+    """The shared empty-result sentinel: two zero points so relative conditions compute
+    0 - 0 = 0 rather than skipping for lack of a previous point; absolute reads 0 at the anchor."""
+    return ComparableSeries(
+        label="empty result",
+        points=[SeriesPoint(date=None, value=0.0), SeriesPoint(date=None, value=0.0)],
+        current_index=1,
+    )
+
+
+class AlertExtractionError(Exception):
+    """The alert cannot be evaluated as configured (wrong query shape, bad config).
+
+    Routed to the errored-alert notification path — distinct from "evaluated fine,
+    no data this interval", which is represented as SeriesPoint(value=None).
+
+    Its subclass `AlertDataUnavailableError` keeps the alert enabled, so a caller that disables on
+    this error catches the subclass first.
+    """
+
+
+class AlertDataUnavailableError(AlertExtractionError):
+    """This check lacks usable data; keep the alert enabled for future checks."""
+
+
+class AlertOwnerAccessError(AlertExtractionError):
+    """The query runs with the owner's access, and the owner can no longer run it.
+
+    Both evaluation stacks disable the alert for an `AlertExtractionError`, so this subclass only
+    lets a test or a log tell the owner case apart.
+    """
+
+
+CREATOR_LEFT_DISABLE_REASON = "The alert owner is no longer in the organization."
+CREATOR_LOST_ACCESS_DISABLE_REASON = "The alert owner no longer has access to some of the data it reads."
+
+
+def lookback_intervals_for(condition: AlertCondition) -> int:
+    """How many trailing intervals an extractor must fetch for this condition.
+
+    Absolute needs the current + previous interval (2); relative needs three intervals
+    because, when the current interval is still accumulating, it compares the previous
+    interval against the one before it.
+    """
+    match condition.type:
+        case AlertConditionType.ABSOLUTE_VALUE:
+            return 2
+        case AlertConditionType.RELATIVE_INCREASE | AlertConditionType.RELATIVE_DECREASE:
+            return 3
+        case _:
+            raise AlertExtractionError(f"Unsupported alert condition type: {condition.type}")
+
+
+def execution_mode_for_alert(interval: IntervalType | None, *, high_frequency: bool) -> ExecutionMode:
+    """Pick the query execution mode for an alert check, shared by every extractor."""
+    if interval == IntervalType.HOUR or high_frequency:
+        return ExecutionMode.CALCULATE_BLOCKING_ALWAYS
+    return ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE
+
+
+def cache_age_seconds_for_alert(interval: IntervalType | None, *, now: datetime, team: Team) -> int | None:
+    """Max cache age for this check, counted from the start of the bucket ``now`` falls in.
+    None leaves the shared staleness rule in place.
+
+    The cache key holds the relative date range (``-1h``), so consecutive checks share a key while
+    scoring different buckets. Ageing from the bucket start rejects a result from the previous bucket.
+    """
+    if interval is None:
+        return None
+    spec = interval_spec(interval)
+    local_now = now.astimezone(ZoneInfo(team.timezone))
+    # A DST transition can put the aligned bucket start after local_now.
+    elapsed = max(int((local_now - spec.align(local_now, team.week_start_day)).total_seconds()), 0)
+    if spec.staleness_default is None:
+        return None
+    # The override replaces the shared threshold, so cap it there to only ever tighten it.
+    return min(elapsed, int(spec.staleness_default.total_seconds()))
+
+
+@dataclass(frozen=False)
+class SimulationContext:
+    """Alert-less inputs for a read-only detector simulation. Each extractor reads only the fields its
+    kind needs: trends uses ``series_index``/``date_from``, SQL uses ``config``; both use ``team``,
+    ``user``, and ``detector_config`` (the latter sizes the lookback window)."""
+
+    team: Team
+    detector_config: dict[str, Any]
+    user: User | None = None
+    series_index: int = 0
+    date_from: str | None = None
+    config: dict[str, Any] | None = None
+    evaluation_delay_intervals: int = 0
+
+
+class Extractor(Protocol):
+    # The dispatcher resolves execution_mode and cache_age_seconds once and passes them in, so the
+    # cache/recompute decision lives at one site instead of being re-derived in each extractor.
+    def extract(
+        self,
+        alert: AlertConfiguration,
+        insight: Insight,
+        query: object,
+        execution_mode: ExecutionMode,
+        cache_age_seconds: int | None = None,
+    ) -> ExtractionResult: ...
+
+
+class DetectorExtractor(Extractor, Protocol):
+    """An ``Extractor`` that can also build its series for a read-only simulation (no
+    ``AlertConfiguration``). One implementation per detector-supported kind, registered in
+    ``dispatcher.DETECTOR_EXTRACTORS`` — the single source of truth for both the alert-check path
+    (``extract``) and the simulation path (``simulate``)."""
+
+    def simulate(self, insight: Insight, query: object, ctx: SimulationContext) -> tuple[ExtractionResult, str | None]:
+        """Return the extracted series plus the chart interval (None for kinds with no time interval)."""
+        ...

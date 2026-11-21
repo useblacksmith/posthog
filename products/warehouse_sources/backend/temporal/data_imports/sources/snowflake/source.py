@@ -1,0 +1,581 @@
+from typing import TYPE_CHECKING, Optional, cast
+
+from snowflake.connector.errors import DatabaseError, ForbiddenError, HttpError, ProgrammingError
+
+from products.warehouse_sources.backend.facade.codebase_detection import detect
+
+if TYPE_CHECKING:
+    from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+
+from posthog.exceptions_capture import capture_exception
+
+from products.data_warehouse.backend.facade.api import reconcile_snowflake_schemas
+from products.warehouse_sources.backend.facade.source_config import (
+    DataWarehouseSourceCategory,
+    SourceConfig,
+    SourceFieldInputConfig,
+    SourceFieldInputConfigType,
+    SourceFieldSelectConfig,
+    SourceFieldSelectConfigOption,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.base import SQLSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.snowflake import (
+    SnowflakeSourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.snowflake.snowflake import (
+    SnowflakeImplementation,
+    SnowflakeResumeState,
+    get_connection_metadata as get_connection_metadata_snowflake,
+)
+from products.warehouse_sources.backend.types import ExternalDataSourceType
+
+_SNOWFLAKE_IMPLEMENTATION = SnowflakeImplementation()
+
+# cryptography raises ValueError("Unable to load PEM file ...") when the key-pair private key can't
+# be parsed — typically the user pasted the bare base64 DER body without the
+# `-----BEGIN/END PRIVATE KEY-----` framing, or a truncated key. The `{action}` placeholder lets each
+# call site supply its own context-appropriate verb ("resync." on the sync path, "try again." during
+# credential validation) while keeping the guidance text defined once.
+_MALFORMED_PEM_MESSAGE = (
+    "Your Snowflake key-pair private key could not be read. Paste the full PEM private key including "
+    "the -----BEGIN PRIVATE KEY----- and -----END PRIVATE KEY----- lines (not just the base64 body), "
+    "then {action}"
+)
+
+# `load_pem_private_key` rejects an encrypted key-pair private key with a wrong passphrase
+# (ValueError "Incorrect password, could not decrypt key") or no passphrase at all
+# (TypeError "Password was not given but private key is encrypted"). Same `{action}` placeholder
+# convention as `_MALFORMED_PEM_MESSAGE`.
+_WRONG_KEY_PASSPHRASE_MESSAGE = (
+    "Your Snowflake key-pair private key is encrypted, but the passphrase is missing or incorrect. "
+    "Enter the passphrase that decrypts your private key (or paste an unencrypted key), then {action}"
+)
+
+# The inverse of `_WRONG_KEY_PASSPHRASE_MESSAGE`: `load_pem_private_key` raises
+# TypeError "Password was given but private key is not encrypted." when a passphrase is supplied
+# for an unencrypted key-pair private key. Same `{action}` placeholder convention.
+_UNENCRYPTED_KEY_WITH_PASSPHRASE_MESSAGE = (
+    "You entered a passphrase, but the Snowflake key-pair private key you pasted is not encrypted. "
+    "Remove the passphrase, or paste your encrypted private key, then {action}"
+)
+
+_RESOURCE_MONITOR_QUOTA_ERROR = "cannot be resumed because resource monitor"
+
+# Snowflake error 251001: the connector's own `_validate_account` rejects an account identifier
+# containing a character other than letters, digits, '_', '-', or '.' before any request reaches
+# Snowflake — typically the customer pasted a full URL or hostname (e.g.
+# "https://xy12345.snowflakecomputing.com") into the account id field instead of the bare
+# identifier. Nothing we send differs between attempts, so retrying can never succeed until the
+# customer corrects the field. The message is fully static (no account value embedded), so it's
+# safe to match as-is. Same `{action}` placeholder convention as `_MALFORMED_PEM_MESSAGE`.
+_INVALID_ACCOUNT_IDENTIFIER_MESSAGE = (
+    "Snowflake rejected the account identifier because it contains a character other than letters, "
+    "digits, '_', '-', or '.' (for example a slash from a pasted URL or hostname). Enter just the "
+    "account identifier (for example xy12345 or xy12345.us-east-1), then {action}"
+)
+
+# Shown when `validate_credentials` hits a transient connect blip (see `get_retryable_errors`). The
+# sync path retries such a blip quietly, but interactive validation has nothing to retry
+# automatically, so it tells the user it was a brief blip and to try again rather than capturing it
+# as an unexpected bug or claiming their (correct) connection details are wrong.
+_TRANSIENT_CONNECTION_MESSAGE = (
+    "Could not reach Snowflake while checking your credentials. This is usually a brief network or "
+    "service blip rather than a configuration problem. Please try again."
+)
+
+# Snowflake rejects the login (250001 / 08001) when the account enforces multi-factor auth for the
+# connecting user. The server phrases this several ways, and the bare "MFA authentication is
+# required" variant carries the account host and vendor codes, so it must not reach the customer
+# raw. Same `{action}` placeholder convention as `_MALFORMED_PEM_MESSAGE`.
+_MFA_ENFORCED_MESSAGE = (
+    "Snowflake rejected the login because multi-factor authentication is enforced for this user. "
+    "Automated syncs can't answer an MFA prompt, so connect with a service user that uses key-pair "
+    "authentication or is exempt from MFA, then {action}"
+)
+
+SnowflakeErrors = {
+    _RESOURCE_MONITOR_QUOTA_ERROR: "The Snowflake warehouse can't resume because its resource monitor has used its credit quota. Raise the quota or wait for it to reset, then try again.",
+    "No active warehouse selected in the current session": "No active warehouse is available for this connection. Check that the configured warehouse exists, is running, and that the connecting role has USAGE on it, then try again.",
+    "or attempt to login with another role": "Role specified doesn't exist or is not authorized",
+    "Incorrect username or password was specified": "Incorrect username or password was specified",
+    "This session does not have a current database": "No database is available for this connection. Check that the configured database exists and that the connecting role has USAGE on it, then try again.",
+    "Verify the account name is correct": "Can't find an account with the specified account ID",
+    "Invalid account identifier": _INVALID_ACCOUNT_IDENTIFIER_MESSAGE.format(action="try again."),
+    "Multi-factor authentication is required for this account": "This Snowflake account requires multi-factor authentication enrollment. Connect with a service user that uses key-pair authentication or is exempt from MFA.",
+    # Snowflake error 290404: the login-request endpoint 404s because the account identifier doesn't
+    # resolve to a real deployment (wrong/incomplete account id, missing region/cloud segment). The
+    # connector raises HttpError rather than the "Verify the account name is correct" OperationalError,
+    # so it needs its own entry. The host and port in the message are volatile, so we match "404 Not Found".
+    "404 Not Found": "Can't find a Snowflake account with the specified account ID. Please check your account identifier and try again.",
+    # Snowflake error 250001 (08001): the account enforces MFA for this user, either as a denied Duo
+    # push or as a bare requirement. Without these entries the wizard falls back to the generic
+    # "check all connection details" message, so people re-enter correct credentials repeatedly.
+    "Duo Security authentication is denied": _MFA_ENFORCED_MESSAGE.format(action="try again."),
+    "MFA authentication is required": _MFA_ENFORCED_MESSAGE.format(action="try again."),
+    # Snowflake error 250001 (08001): the account enforces TOTP-based MFA instead of Duo, so the
+    # connector's password-only login is rejected asking for a live TOTP passcode. A distinct phrase
+    # from the "MFA authentication is required" case above.
+    "MFA with TOTP is required": _MFA_ENFORCED_MESSAGE.format(action="try again."),
+}
+
+
+@SourceRegistry.register
+class SnowflakeSource(SQLSource[SnowflakeSourceConfig], ResumableSource[SnowflakeSourceConfig, SnowflakeResumeState]):
+    codebase_detection = detect(
+        env=("^SNOWFLAKE_", "^SNOWSQL_", "^AIRFLOW_CONN_SNOWFLAKE_DEFAULT$"),
+        npm=("snowflake-sdk",),
+        pypi=(
+            "snowflake-connector-python",
+            "snowflake-sqlalchemy",
+            "snowflake-snowpark-python",
+            "snowflake",
+            "snowflake-core",
+            "snowflake-ml-python",
+            "snowflake-cli",
+            "snowflake-cli-labs",
+            "snowflake-ingest",
+            "snowpipe-streaming",
+            "snowflake-telemetry-python",
+            "snowpark-connect",
+            "snowpark-submit",
+            "snowpark-checkpoints",
+            "snowpark-checkpoints-collectors",
+            "snowpark-checkpoints-validators",
+            "snowpark-checkpoints-configuration",
+            "snowpark-checkpoints-hypothesis",
+            "dbt-snowflake",
+            "apache-airflow-providers-snowflake",
+        ),
+        cargo=("snowflake-connector-rs",),
+        go=("github.com/snowflakedb/gosnowflake",),
+        maven=(
+            "net.snowflake:snowflake-jdbc",
+            "net.snowflake:snowflake-jdbc-fips",
+            "net.snowflake:snowflake-jdbc-thin",
+            "net.snowflake:snowflake-jdbc-native",
+            "net.snowflake:snowflake-jdbc-native-all",
+            "net.snowflake:snowflake-ingest-sdk",
+            "net.snowflake:spark-snowflake_2.10",
+            "net.snowflake:spark-snowflake_2.11",
+            "net.snowflake:spark-snowflake_2.12",
+            "net.snowflake:spark-snowflake_2.13",
+            "com.snowflake:snowpark",
+            "com.snowflake:snowpark_2.12",
+            "com.snowflake:snowpark_2.13",
+            "com.snowflake:snowpark-fips",
+            "com.snowflake:snowpark-fips_2.12",
+            "com.snowflake:snowpark-fips_2.13",
+            "com.snowflake:snowpipe-streaming",
+            "com.snowflake:telemetry",
+            "com.snowflake:connectors-native-sdk",
+            "com.snowflake:snowflake-kafka-connector",
+            "com.snowflake:snowflake-maven-plugin",
+            "com.snowflake:snowpark-connect-java-client_2.12",
+            "com.snowflake:snowpark-connect-java-client_2.13",
+        ),
+        rubygems=("rb_snowflake_client", "sequel-snowflake"),
+    )
+
+    @property
+    def get_implementation(self) -> SnowflakeImplementation:
+        return _SNOWFLAKE_IMPLEMENTATION
+
+    def get_resumable_source_manager(self, inputs: SourceInputs) -> ResumableSourceManager[SnowflakeResumeState]:
+        return ResumableSourceManager[SnowflakeResumeState](inputs, SnowflakeResumeState)
+
+    # The activity dispatch checks ResumableSource before SimpleSource, so the three-argument
+    # resumable signature is the one that runs; the SQLSource two-argument form is unreachable here.
+    def source_for_pipeline(  # type: ignore[override]
+        self,
+        config: SnowflakeSourceConfig,
+        resumable_source_manager: ResumableSourceManager[SnowflakeResumeState],
+        inputs: SourceInputs,
+    ) -> SourceResponse:
+        return self.get_implementation.build_pipeline(config, inputs, resumable_source_manager=resumable_source_manager)
+
+    @property
+    def source_type(self) -> ExternalDataSourceType:
+        return ExternalDataSourceType.SNOWFLAKE
+
+    @property
+    def get_source_config(self) -> SourceConfig:
+        return SourceConfig(
+            name=ExternalDataSourceType.SNOWFLAKE,
+            category=DataWarehouseSourceCategory.DATABASES,
+            keywords=["sql"],
+            caption="Enter your Snowflake credentials to automatically pull your Snowflake data into the PostHog Data warehouse.",
+            iconPath="/static/services/snowflake.png",
+            docsUrl="https://posthog.com/docs/cdp/sources/snowflake",
+            fields=cast(
+                list[FieldType],
+                [
+                    SourceFieldInputConfig(
+                        name="connection_string",
+                        label="Connection string (optional)",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=False,
+                        placeholder="snowflake://user:password@account_id/database/schema?warehouse=COMPUTE_WAREHOUSE&role=ACCOUNTADMIN",
+                        secret=True,
+                    ),
+                    SourceFieldInputConfig(
+                        name="account_id",
+                        label="Account id",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=True,
+                        placeholder="",
+                        secret=False,
+                    ),
+                    SourceFieldInputConfig(
+                        name="database",
+                        label="Database",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=True,
+                        placeholder="snowflake_sample_data",
+                        secret=False,
+                    ),
+                    SourceFieldInputConfig(
+                        name="warehouse",
+                        label="Warehouse",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=True,
+                        placeholder="COMPUTE_WAREHOUSE",
+                        secret=False,
+                    ),
+                    # the validation for these options happens in validate_credentials
+                    SourceFieldSelectConfig(
+                        name="auth_type",
+                        label="Authentication type",
+                        required=True,
+                        defaultValue="password",
+                        options=[
+                            SourceFieldSelectConfigOption(
+                                label="Password",
+                                value="password",
+                                fields=cast(
+                                    list[FieldType],
+                                    [
+                                        SourceFieldInputConfig(
+                                            name="user",
+                                            label="Username",
+                                            type=SourceFieldInputConfigType.TEXT,
+                                            required=True,
+                                            placeholder="User1",
+                                            secret=False,
+                                        ),
+                                        SourceFieldInputConfig(
+                                            name="password",
+                                            label="Password",
+                                            type=SourceFieldInputConfigType.PASSWORD,
+                                            required=False,
+                                            placeholder="",
+                                            secret=True,
+                                        ),
+                                    ],
+                                ),
+                            ),
+                            SourceFieldSelectConfigOption(
+                                label="Key pair",
+                                value="keypair",
+                                fields=cast(
+                                    list[FieldType],
+                                    [
+                                        SourceFieldInputConfig(
+                                            name="user",
+                                            label="Username",
+                                            type=SourceFieldInputConfigType.TEXT,
+                                            required=True,
+                                            placeholder="User1",
+                                            secret=False,
+                                        ),
+                                        SourceFieldInputConfig(
+                                            name="private_key",
+                                            label="Private key",
+                                            type=SourceFieldInputConfigType.TEXTAREA,
+                                            required=False,
+                                            placeholder="",
+                                            secret=True,
+                                        ),
+                                        SourceFieldInputConfig(
+                                            name="passphrase",
+                                            label="Passphrase",
+                                            type=SourceFieldInputConfigType.PASSWORD,
+                                            required=False,
+                                            placeholder="",
+                                            secret=True,
+                                        ),
+                                    ],
+                                ),
+                            ),
+                        ],
+                    ),
+                    SourceFieldInputConfig(
+                        name="role",
+                        label="Role (optional)",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=False,
+                        placeholder="ACCOUNTADMIN",
+                        secret=False,
+                    ),
+                    SourceFieldInputConfig(
+                        name="schema",
+                        sync_setting=True,
+                        label="Schema (optional)",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=False,
+                        placeholder="Leave blank to import all schemas",
+                        secret=False,
+                    ),
+                ],
+            ),
+        )
+
+    def get_non_retryable_errors(self) -> dict[str, str | None]:
+        return {
+            "This account has been marked for decommission": "Your Snowflake account has been suspended or trial has ended. Please check your account status.",
+            # Snowflake error 000606 (57P03): the session has no active warehouse, so the first query
+            # needing compute fails. The connector doesn't fail at connect time even when the configured
+            # warehouse is missing/suspended or the role lacks USAGE on it — it just leaves the session
+            # warehouse unset. Retrying can never succeed until the customer fixes the grant or warehouse.
+            "No active warehouse selected in the current session": "No active warehouse is available for this connection. Check that the configured warehouse exists, is running, and that the connecting role has USAGE on it, then resync.",
+            # Snowflake error 090105 (22000): the session has no current database, so the first query
+            # that references an unqualified object (our `information_schema` listing query) fails. The
+            # connector doesn't fail at connect time when the configured database is missing or the role
+            # lacks USAGE on it — it just leaves the session database unset. Retrying can never succeed
+            # until the customer fixes the database name or the grant. The query id is volatile, so we
+            # match the stable phrase.
+            "This session does not have a current database": "No database is available for this connection. Check that the configured database exists and that the connecting role has USAGE on it, then resync.",
+            "404 Not Found": None,
+            "Invalid account identifier": _INVALID_ACCOUNT_IDENTIFIER_MESSAGE.format(action="resync."),
+            "Your free trial has ended": "Your Snowflake account has been suspended or trial has ended. Please check your account status.",
+            "Your account is suspended due to lack of payment method": "Your Snowflake account has been suspended or trial has ended. Please check your account status.",
+            # Snowflake error 250001: the user account was disabled by the customer's Snowflake admin
+            # (e.g. `ALTER USER ... SET DISABLED = TRUE`). Retrying can never succeed until they re-enable it.
+            "User access disabled. Contact your local system administrator": "Your Snowflake user account has been disabled. Please contact your Snowflake administrator to re-enable it, then resync.",
+            # Snowflake error 250001 (08001): the user's password has expired. Snowflake requires it
+            # to be changed via the web console before any login can succeed, so retrying never works.
+            "Specified password has expired": "Your Snowflake password has expired. Please change it in the Snowflake web console (or switch to key-pair authentication), then resync.",
+            "MFA authentication is required": _MFA_ENFORCED_MESSAGE.format(action="resync."),
+            # The account enforces Duo Security multi-factor auth for this user, so the
+            # connector's login is rejected (250001 / 08001). An unattended sync can't answer a
+            # Duo push, so retrying never succeeds — surface an actionable message instead.
+            "Duo Security authentication is denied": "Snowflake rejected the login because multi-factor authentication (Duo Security) is enforced for this user. Automated syncs can't answer an MFA prompt — connect with a service user that uses key-pair authentication or is exempt from MFA.",
+            # Snowflake error 250001 (08001): the account requires MFA enrollment, so the login is
+            # rejected until the user enrolls via Snowsight. An unattended sync can't complete MFA, so
+            # retrying never succeeds. The codes and host in the message are volatile, so we match the
+            # stable phrase.
+            "Multi-factor authentication is required for this account": "Snowflake rejected the login because this account requires multi-factor authentication enrollment. Automated syncs can't complete MFA — connect with a service user that uses key-pair authentication or is exempt from MFA, then resync.",
+            # Snowflake error 250001 (08001): the account enforces TOTP-based MFA, so a password-only
+            # login is rejected asking for a live TOTP passcode. An unattended sync can't answer that
+            # prompt, so retrying never succeeds. Distinct phrase from "MFA authentication is
+            # required" above, so it needs its own entry.
+            "MFA with TOTP is required": _MFA_ENFORCED_MESSAGE.format(action="resync."),
+            "invalid credentials": "Snowflake authentication failed. Please check your username, password, and account details.",
+            "authentication failed": "Snowflake authentication failed. Please check your username, password, and account details.",
+            # Snowflake error 250001 (08001): the supplied username or password is wrong, so the
+            # connector's login is rejected at connect time. Retrying can never succeed until the
+            # customer corrects the credentials. The codes, account id, and host in the message are
+            # volatile, so we match on the stable trailing phrase.
+            "Incorrect username or password was specified": "Snowflake rejected the login because the username or password is incorrect. Please check your Snowflake username and password (or switch to key-pair authentication), then resync.",
+            # Snowflake error 000904 (42000): the table or view we select from references a column
+            # that no longer exists — typically a stale view definition or a column dropped/renamed
+            # in the source schema. We only run `SELECT ... FROM IDENTIFIER(%s)`, so the bad identifier
+            # lives in the customer's object, not in our SQL. Retrying can't fix it until they repair
+            # the object or reconfigure the synced columns.
+            "invalid identifier": "A Snowflake table or view you're syncing references a column that no longer exists (for example a stale view definition, or a column that was dropped or renamed). Please fix the table or view in Snowflake, or reconfigure the columns selected for this table, then resync.",
+            # Snowflake error 250001 (08001): a network policy (IP allowlist) on the customer's account
+            # rejects the connection because PostHog's egress IP isn't permitted. Retrying can never
+            # succeed until their admin allowlists our IPs, so stop retrying and surface what to do.
+            "is not allowed to access Snowflake": "Snowflake rejected the connection because a network policy (IP allowlist) on your account does not permit PostHog's IP address. Ask your Snowflake administrator to add PostHog's egress IP addresses to the network policy allowlist, then resync.",
+            # Snowflake error 250001 (08001): key-pair login was rejected because the JWT we signed with
+            # the configured private key doesn't match the public key registered on the Snowflake user
+            # (rotated/removed key, key assigned to a different user, or the wrong key pasted). Retrying
+            # can never succeed until the customer re-registers the matching public key. The host and
+            # request id in the message are volatile, so we match the stable phrase.
+            "JWT token is invalid": "Snowflake rejected key-pair authentication because the signed token is invalid — the private key you configured doesn't match the public key registered on the Snowflake user (often after a key rotation, or if the public key was never set). Re-register the matching public key on your Snowflake user (ALTER USER ... SET RSA_PUBLIC_KEY), or paste the correct private key here, then resync.",
+            # See `_MALFORMED_PEM_MESSAGE`: the key-pair private key can't be parsed, so retrying can
+            # never succeed until the user pastes a valid PEM key.
+            "Unable to load PEM file": _MALFORMED_PEM_MESSAGE.format(action="resync."),
+            # See `_WRONG_KEY_PASSPHRASE_MESSAGE`: the encrypted key-pair private key can't be decrypted
+            # because the passphrase is wrong (ValueError) or was never provided (TypeError), so retrying
+            # can never succeed until the user fixes it.
+            "Incorrect password, could not decrypt key": _WRONG_KEY_PASSPHRASE_MESSAGE.format(action="resync."),
+            "Password was not given but private key is encrypted": _WRONG_KEY_PASSPHRASE_MESSAGE.format(
+                action="resync."
+            ),
+            # See `_UNENCRYPTED_KEY_WITH_PASSPHRASE_MESSAGE`: a passphrase was supplied for an
+            # unencrypted key-pair private key, which fails to parse before we reach Snowflake, so
+            # retrying can never succeed until the user removes the passphrase or pastes an encrypted key.
+            "Password was given but private key is not encrypted": _UNENCRYPTED_KEY_WITH_PASSPHRASE_MESSAGE.format(
+                action="resync."
+            ),
+            # Snowflake error 002003 (SQLSTATE 42S02 for tables / 02000 for schemas): a table or
+            # schema the source syncs was dropped or renamed in Snowflake, or the role's grant on it
+            # was revoked, after the schema was discovered. The driver raises "<object> does not exist
+            # or not authorized" on `SHOW PRIMARY KEYS` / the data query. Retrying can never succeed
+            # until the user restores the object or re-grants access. The object name and query id in
+            # the message are volatile, so we match on the stable trailing phrase.
+            "does not exist or not authorized": "A table or schema this source syncs no longer exists in Snowflake, or your role is no longer authorized to access it. Check that the object still exists and that your Snowflake role has access, then resync.",
+            # Raised from the shared `evolve_pyarrow_schema` in `pipelines/core/arrow_utils.py`
+            # when an integer column's source type was widened (e.g. a narrower NUMBER widened
+            # to a larger NUMBER/BIGINT) after the destination table was created with the
+            # narrower type. Delta Lake can't widen an existing column in place, so retrying
+            # won't help — the table must be reset and fully re-synced to adopt the new type.
+            "Source column type changed": "A column's type changed in your source database (for example an integer column was widened to bigint) and no longer fits the type we stored. We can't widen an existing column in place — please reset and fully re-sync this table to adopt the new type.",
+            # Snowflake SQL compilation error 002057: a view's declared column list no longer
+            # matches the columns its query produces, so the view itself fails to compile. This is
+            # a broken object on the source side that retrying can't repair.
+            "but view query produces": "A Snowflake view in your source is invalid — the columns it declares no longer match the columns its query returns. Please recreate the view in Snowflake so the two agree, then resync.",
+            # Snowflake connector error 290403 (ER_HTTP_GENERAL_ERROR + 403): a request to Snowflake
+            # returned HTTP 403 Forbidden and kept doing so through the connector's own retry budget.
+            # Two different conditions produce it. At connect, or early in a sync, it is access
+            # denied: a network policy, firewall, or proxy blocks PostHog, or the role's grant on
+            # the data was revoked. Hours into a sync it is instead an expired result-chunk URL,
+            # because the pre-signed URLs that `result_batch.py::_download` fetches have a limited
+            # lifetime and a slow sync outlives them.
+            #
+            # Only the first condition is truly non-retryable. A fresh attempt re-executes the
+            # query and gets a new set of chunk URLs, so the expiry case would clear on retry the
+            # same way "HTTP 400: Bad Request" does below. Both stay here until the two can be told
+            # apart, because retrying a real access-denied 403 burns the whole attempt budget
+            # against a condition that only the customer can fix. The errno prefix and host are
+            # volatile, so we match the stable status text.
+            "HTTP 403: Forbidden": "Snowflake refused a request with an HTTP 403 (forbidden). If the sync ran for several hours before failing, the temporary link Snowflake gave us to download the query results expired. Resync to get a fresh one. If it failed soon after starting, check your Snowflake role grants and network access rules, then resync.",
+        }
+
+    def get_retryable_errors(self) -> set[str]:
+        return {
+            # Snowflake connector error 290400 (ER_HTTP_GENERAL_ERROR + 400): downloading a query
+            # result chunk got HTTP 400, which the connector's own `is_retryable_http_code` already
+            # retries with backoff before re-raising the plain `BadRequest` once its download retry
+            # budget is exhausted (`result_batch.py::_download`). Unlike the access-denied 403 case
+            # above, every Temporal-level retry of `get_rows` opens a fresh connection and re-executes
+            # the query from scratch, getting a brand new set of chunk URLs — a stale one from the
+            # previous attempt doesn't carry over. Self-recovering, so keep retrying instead of
+            # stopping the sync. The errno prefix is volatile, so we match the stable status text.
+            "HTTP 400: Bad Request",
+            # Snowflake error 250001 (08001): the login-request endpoint itself responded with a
+            # generic "Internal error" (`auth/_auth.py` formats this as "Failed to connect to DB:
+            # {host}:{port}. {message}", where `message` is Snowflake's own internal-error text) —
+            # a transient blip on Snowflake's authentication service, not a credential or config
+            # problem. It isn't retried inside the connector's own auth flow, so without this marker
+            # every Temporal-level retry logs it as unclassified error-tracking noise instead of the
+            # self-recovering failure it is. The request id in brackets is volatile, so we match the
+            # stable phrase.
+            "Internal error:",
+            # Snowflake error 250001 (08001): the connector exhausted its internal login retry budget
+            # (default 11 attempts) because an HTTP proxy returned 502 Bad Gateway when tunneling to
+            # the Snowflake login endpoint. A recovered proxy or transient network blip resolves it,
+            # so Temporal-level retries will eventually succeed. The attempt count is volatile, so we
+            # match the stable prefix.
+            "Could not connect to Snowflake backend after",
+            # requests (vendored by the connector) raises ChunkedEncodingError when the peer resets
+            # the TCP connection (ECONNRESET) while streaming a query result's chunked HTTP response
+            # body. This happens after the connector's own request-retry wrapper has already handed
+            # back the response object, so it isn't covered by that retry budget. A fresh Temporal-level
+            # retry opens a new connection and re-executes the query from scratch, which recovers
+            # cleanly, so this is a self-recovering network blip rather than a bug. The errno and OS-
+            # specific wrapping vary, so we match the stable requests-library wrapper phrase.
+            "Connection broken: ConnectionResetError",
+            # Snowflake connector error 290503 (ER_HTTP_GENERAL_ERROR + 503): Snowflake's own backend
+            # briefly returned HTTP 503 while the connector was already retrying internally (it
+            # re-raises only after exhausting its own `RetryRequest` budget). A fresh Temporal-level
+            # retry opens a new connection and re-executes the query from scratch, which recovers
+            # cleanly once the backend blip clears, so this is self-recovering rather than a bug.
+            # The errno prefix is volatile, so we match the stable status text.
+            "HTTP 503: Service Unavailable",
+            # Snowflake error 000604 (57014): the connector arms a client-side "timebomb" on
+            # `cursor.execute()` using `network_timeout` (see `_SNOWFLAKE_QUERY_TIMEOUT_SECONDS`) and
+            # cancels the query once it elapses. The metadata/listing queries (column discovery,
+            # primary-key and clustering-key lookups) don't pass the long explicit per-query timeout,
+            # so they inherit the shorter connection-level one — usually plenty, but a cold warehouse
+            # resume or a transient backend slowdown can push a catalog scan past it. A fresh attempt
+            # opens a new connection and re-executes from scratch, so this is self-recovering rather
+            # than a bug. The query id in the message is volatile, so we match the stable phrase.
+            "SQL execution was cancelled by the client due to a timeout",
+            # Snowflake error 090073 (22000): the warehouse can't resume because the customer's resource
+            # monitor used its credit quota. Monitors reset on the schedule the customer set (daily,
+            # weekly or monthly), and the customer can raise the quota at any time. Disabling the
+            # schema would leave the sync off after the quota returns, so keep it enabled and retry.
+            # The query id and names are volatile, so we match the stable phrase.
+            _RESOURCE_MONITOR_QUOTA_ERROR,
+        }
+
+    def get_retry_exhausted_errors(self) -> dict[str, str]:
+        return {
+            _RESOURCE_MONITOR_QUOTA_ERROR: "Your Snowflake warehouse can't resume because its resource monitor has used its credit quota. This sync tries again on its own and works again once you raise the quota or it resets.",
+        }
+
+    def reconcile_schema_metadata(
+        self,
+        source: "ExternalDataSource",
+        source_schemas: list[SourceSchema],
+        team_id: int,
+    ) -> list[str]:
+        """Delegates to `reconcile_snowflake_schemas` so direct-query mode also rebuilds DWH tables."""
+        return reconcile_snowflake_schemas(source=source, source_schemas=source_schemas, team_id=team_id)
+
+    def get_connection_metadata(
+        self, config: SnowflakeSourceConfig, team_id: int, require_ssl: bool = False
+    ) -> dict[str, str | None]:
+        # `require_ssl` keeps signature parity with Postgres/MySQL; Snowflake transport is always TLS.
+        return get_connection_metadata_snowflake(config)
+
+    def validate_credentials(
+        self,
+        config: SnowflakeSourceConfig,
+        team_id: int,
+        schema_name: Optional[str] = None,
+        api_version: str | None = None,
+    ) -> tuple[bool, str | None]:
+        if config.auth_type.selection == "password" and (not config.auth_type.user or not config.auth_type.password):
+            return False, "Missing required parameters: username, password"
+
+        # passphrase is optional if the key they use to auth is not encrypted
+        if config.auth_type.selection == "keypair" and (not config.auth_type.user or not config.auth_type.private_key):
+            return False, "Missing required parameters: username, private key"
+
+        try:
+            self.get_schemas(config, team_id, api_version=api_version)
+        except (ProgrammingError, DatabaseError, ForbiddenError, HttpError) as e:
+            error_msg = e.msg or e.raw_msg or ""
+            for key, value in SnowflakeErrors.items():
+                if key in error_msg:
+                    return False, value
+
+            # A transient connect blip is not a credential or config problem, so classify it the way
+            # the sync path does (`get_retryable_errors`) and surface a "try again" message instead of
+            # capturing it as an unexpected bug. Mirrors `planetscale_mysql`'s validate_credentials.
+            for pattern in self.get_retryable_errors():
+                if pattern in error_msg:
+                    return False, _TRANSIENT_CONNECTION_MESSAGE
+
+            capture_exception(e)
+            return False, "Could not connect to Snowflake. Please check all connection details are valid."
+        except (ValueError, TypeError) as e:
+            error_str = str(e)
+            # A malformed key-pair private key fails to parse in `load_pem_private_key` before we ever
+            # reach Snowflake — a user config error, not an unexpected failure worth capturing.
+            if "Unable to load PEM file" in error_str:
+                return False, _MALFORMED_PEM_MESSAGE.format(action="try again.")
+            # An encrypted private key whose passphrase is wrong (ValueError) or was never provided
+            # (TypeError) — also a user config error.
+            if (
+                "Incorrect password, could not decrypt key" in error_str
+                or "Password was not given but private key is encrypted" in error_str
+            ):
+                return False, _WRONG_KEY_PASSPHRASE_MESSAGE.format(action="try again.")
+            # The inverse: a passphrase was supplied for an unencrypted private key (TypeError).
+            if "Password was given but private key is not encrypted" in error_str:
+                return False, _UNENCRYPTED_KEY_WITH_PASSPHRASE_MESSAGE.format(action="try again.")
+            capture_exception(e)
+            return False, "Could not connect to Snowflake. Please check all connection details are valid."
+        except Exception as e:
+            capture_exception(e)
+            return False, "Could not connect to Snowflake. Please check all connection details are valid."
+
+        return True, None

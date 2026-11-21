@@ -1,0 +1,386 @@
+from datetime import time
+
+from django.db import models
+from django.db.models import Q
+
+from posthog.models.scoping.root_mixin import TeamScopedRootMixin
+from posthog.models.utils import UUIDModel
+
+
+class SlackThreadTaskMapping(UUIDModel):
+    """Maps Slack threads to task runs so follow-up messages can be forwarded to the running agent."""
+
+    class ConversationType(models.TextChoices):
+        """Shape of the Slack conversation a thread lives in, in Slack's own
+        ``conversations.list`` vocabulary so there is no translation layer."""
+
+        IM = "im", "Direct message"
+        MPIM = "mpim", "Group direct message"
+        PUBLIC_CHANNEL = "public_channel", "Public channel"
+        PRIVATE_CHANNEL = "private_channel", "Private channel"
+        UNKNOWN = "unknown", "Unknown"
+
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="slack_thread_task_mappings")
+    integration = models.ForeignKey(
+        "posthog.Integration",
+        on_delete=models.CASCADE,
+        related_name="slack_thread_task_mappings",
+    )
+    slack_workspace_id = models.CharField(max_length=64)
+    channel = models.CharField(max_length=64)
+    thread_ts = models.CharField(max_length=64)
+    task = models.ForeignKey(
+        "tasks.Task",
+        on_delete=models.CASCADE,
+        related_name="slack_thread_mappings",
+    )
+    task_run = models.ForeignKey(
+        "tasks.TaskRun",
+        on_delete=models.CASCADE,
+        related_name="slack_thread_mappings",
+    )
+    mentioning_slack_user_id = models.CharField(max_length=64)
+    # Reply-tag fallback for runs started before per-turn actor capture
+    # (tasks slack_relay); drop the column and its stamp in task_creation
+    # once those runs drain.
+    latest_actor_slack_user_id = models.CharField(max_length=64, null=True, blank=True)
+    # Slack `ts` of the most recent message we've already shown to the agent (either
+    # in the original `<slack_thread_context>` block at task creation, or in a follow-up
+    # `<slack_thread_context_update>` diff). On each follow-up, anything in the thread
+    # with a strictly larger `ts` (and smaller than the just-arrived message's `ts`) is
+    # rendered as a diff so the agent catches up on messages it never saw.
+    last_forwarded_ts = models.CharField(max_length=64, null=True, blank=True)
+    # Resolved once, when the thread's task is created. NULL on rows written before this was
+    # tracked; UNKNOWN when Slack could not tell us. Only PUBLIC_CHANNEL makes the task readable
+    # team-wide (see `facade.constants`); every other value, NULL included, keeps it with its creator.
+    conversation_type = models.CharField(max_length=16, choices=ConversationType, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["integration", "channel", "thread_ts"],
+                name="uniq_slack_thread_task_mapping",
+            )
+        ]
+        indexes = [
+            # Serves the workspace-wide activity aggregates on the App Home tab, which scan a
+            # whole workspace over a date window rather than a single thread. `team_id` rides
+            # along as an INCLUDE column so the accessible-projects filter is evaluated off the
+            # index instead of a heap fetch per candidate row.
+            models.Index(
+                fields=["slack_workspace_id", "created_at"],
+                include=["team_id"],
+                name="slack_thr_map_ws_created_idx",
+            ),
+        ]
+
+
+class SlackThreadJoin(TeamScopedRootMixin, UUIDModel):
+    """A person the thread creator let join their thread under an ask join mode.
+
+    Only the thread creator can approve, so the approver is the mapping's
+    ``mentioning_slack_user_id``. Joining lets the person send messages to the thread's task, so
+    the row keeps when the approval happened.
+    """
+
+    # db_constraint=False: a foreign key constraint to posthog_team locks that hot table when the
+    # table is created. The mapping cascade removes these rows when a team goes.
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+", db_constraint=False)
+    thread_mapping = models.ForeignKey(SlackThreadTaskMapping, on_delete=models.CASCADE, related_name="joins")
+    slack_user_id = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["thread_mapping", "slack_user_id"], name="uniq_slack_thread_join"),
+        ]
+
+
+class SlackUserProfileCache(UUIDModel):
+    integration = models.ForeignKey(
+        "posthog.Integration",
+        on_delete=models.CASCADE,
+        related_name="slack_user_profile_cache",
+    )
+    slack_user_id = models.CharField(max_length=64)
+    email = models.EmailField(blank=True, null=True)
+    display_name = models.CharField(max_length=255, blank=True, default="")
+    real_name = models.CharField(max_length=255, blank=True, default="")
+    is_admin = models.BooleanField(default=False, db_default=False)
+    is_owner = models.BooleanField(default=False, db_default=False)
+    is_bot = models.BooleanField(default=False, db_default=False)
+    # The IANA name from Slack, such as "Europe/Prague". Empty when Slack sent none.
+    tz = models.CharField(max_length=64, blank=True, default="", db_default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    # Null is treated as stale (rows predating this field).
+    refreshed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["integration", "slack_user_id"],
+                name="uniq_slack_user_profile_cache_integration_user",
+            )
+        ]
+
+
+class UntaggedFollowupMode(models.TextChoices):
+    """What PostHog does with a message that does not tag it.
+
+    Read from the settings row of the person who started the thread, so it governs
+    every untagged reply in a thread PostHog owns, and the author's own top-level
+    channel question. An unset row resolves to ``ASK``, so the person who wrote the
+    message chooses whether to send it.
+    """
+
+    AUTO = "auto", "Always pick it up"
+    ASK = "ask", "Ask before picking it up"
+    NEVER = "never", "Never pick it up"
+
+
+class ThreadJoinMode(models.TextChoices):
+    """What PostHog does when someone else tags it in a thread a user started.
+
+    Read from the thread creator's settings row. An unset row resolves to ``ALLOW``.
+    Under ``ASK_PER_THREAD`` the creator's first approval in a thread lets anyone join it.
+    """
+
+    NEVER = "never", "Ignore them"
+    ASK_PER_PERSON = "ask_per_person", "Ask me for each person"
+    ASK_PER_THREAD = "ask_per_thread", "Ask me once per thread"
+    ALLOW = "allow", "Let anyone join"
+
+
+class ChannelWelcomeMode(models.TextChoices):
+    """Where the greeting goes when someone adds the app to a channel.
+
+    Read from the workspace-wide settings row. An unset row resolves to
+    ``CHANNEL``.
+    """
+
+    CHANNEL = "channel", "Post it in the channel"
+    INVITER = "inviter", "Show it only to the person who added the app"
+    OFF = "off", "Don't send it"
+
+
+class SlackSettings(UUIDModel):
+    """Per-(Slack workspace, Slack user) settings for inbound Slack events.
+    Currently stores the routing default — which PostHog integration a mention
+    from this Slack user should route to.
+
+    Two row shapes share this table:
+    - ``slack_user_id`` set → that Slack user's personal settings for this workspace.
+      Written by the Slack `/posthog project <id>` command or the user-level
+      settings UI.
+    - ``slack_user_id IS NULL`` → workspace-wide fallback, applied when an
+      inbound event's Slack user has no personal row yet. Written via the
+      PostHog project-level settings UI by a team admin, or via the Slack
+      `/posthog project workspace <id>` command by a Slack workspace
+      admin/owner.
+
+    A user-specific row, if present, always wins over the workspace-wide row at
+    resolution time.
+    """
+
+    # Nullable so a personal row can carry other settings (e.g. the follow-up
+    # mode) while inheriting the workspace routing default.
+    default_integration = models.ForeignKey(
+        "posthog.Integration",
+        on_delete=models.CASCADE,
+        related_name="slack_settings_as_default",
+        null=True,
+        blank=True,
+    )
+    slack_workspace_id = models.CharField(max_length=64)
+    slack_user_id = models.CharField(max_length=64, null=True, blank=True)
+    # Unused: holds historical per-integration agent permission modes from the retired
+    # approval-card flow. Retained so the column needs no migration.
+    permission_modes = models.JSONField(
+        blank=True,
+        null=True,
+        help_text="Per-integration permission mode for Slack-started agent runs, keyed by integration id.",
+    )
+    # NULL means the user has never picked, which resolves to ``ASK``.
+    untagged_followup_mode = models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        choices=UntaggedFollowupMode.choices,
+        help_text="What PostHog does with untagged replies in threads this user started.",
+    )
+    # NULL means the user has never picked, which resolves to ``ASK``.
+    untagged_question_mode = models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        choices=UntaggedFollowupMode.choices,
+        help_text="What PostHog does with this user's top-level channel questions that do not tag the app.",
+    )
+    # NULL means the user has never picked, which resolves to ``ALLOW``.
+    thread_join_mode = models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        choices=ThreadJoinMode.choices,
+        help_text="What PostHog does when someone else tags it in threads this user started.",
+    )
+    # Only read on the workspace-wide row. NULL resolves to ``CHANNEL``.
+    channel_welcome_mode = models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        choices=ChannelWelcomeMode.choices,
+        help_text="Where the greeting goes when someone adds the app to a channel in this workspace.",
+    )
+    # Only read on a personal row. NULL means the user never turned it on, which resolves to off.
+    auto_model_choice = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text="Let PostHog pick the model for each new task this user starts from Slack.",
+    )
+    # Only read on a personal row. NULL means feature tips never evaluated this user.
+    # The shape is ``FeatureTipsState`` in ``logic/feature_tips/state.py``.
+    feature_tips = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Which Slack app features this user used, saw as a tip, or dismissed.",
+    )
+    # Only read on a personal row. The shape is ``OnboardingState`` in ``services/slack_settings.py``.
+    onboarding = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="This user's onboarding thread in the PostHog DM, and whether they finished it.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["slack_workspace_id", "slack_user_id"],
+                name="uniq_slack_settings_per_user",
+                condition=Q(slack_user_id__isnull=False),
+            ),
+            # Partial: NULL slack_user_id is the workspace-wide row, which
+            # Postgres's default NULL-distinct rule wouldn't otherwise dedupe.
+            models.UniqueConstraint(
+                fields=["slack_workspace_id"],
+                name="uniq_slack_settings_per_workspace",
+                condition=Q(slack_user_id__isnull=True),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        who = self.slack_user_id or "(workspace default)"
+        target = self.default_integration_id if self.default_integration_id else "(inherit)"
+        return f"{self.slack_workspace_id} / {who} → integration {target}"
+
+
+class SlackDailyFocus(TeamScopedRootMixin, UUIDModel):
+    """One row per Slack user who set up the daily work focus. Turning it off keeps the row, so a later onboarding
+    does not turn it back on and the picked time stays.
+
+    The row is keyed by the Slack user, so a person gets one daily DM also when their workspace connects several
+    teams. ``team`` is the team of the installation the runs use."""
+
+    # db_constraint=False: a foreign key constraint to posthog_team locks that hot table when the table is created.
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+", db_constraint=False)
+    slack_workspace_id = models.CharField(max_length=64)
+    slack_user_id = models.CharField(max_length=64)
+    # An id, not a relation, because integration rows are read through the integrations SDK. A run whose
+    # installation is gone ends without a DM.
+    integration_id = models.IntegerField(
+        help_text="The installation the daily work focus runs on, because one Slack workspace can connect several."
+    )
+    at = models.TimeField(
+        default=time(9, 0),
+        help_text="The local time of day the daily work focus runs, in the user's Slack timezone.",
+    )
+    # NULL while the daily work focus is off. The sweep runs every row whose time has come.
+    next_run_at = models.DateTimeField(null=True, blank=True)
+    # The next run reads the messages sent after it, and a changed time never adds a second run on its day.
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    # Set before a run's DM goes out. A retry of that run sends nothing when it is at or after last_run_at.
+    sent_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["slack_workspace_id", "slack_user_id"],
+                name="uniq_slack_daily_focus_per_user",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["next_run_at"],
+                name="slack_daily_focus_due_idx",
+                condition=Q(next_run_at__isnull=False),
+            )
+        ]
+
+
+class SlackChannel(UUIDModel):
+    """Per-(Slack workspace, Slack channel) state.
+
+    Today the only meaning of a row with ``approved_at`` set is that a user
+    in the channel has acknowledged that PostHog data answered there may be
+    visible to external (cross-workspace) members. Absence of a row — or a
+    row with ``approved_at`` null — for an externally-shared channel means
+    the bot must refuse to answer and post the approval prompt instead.
+    Non-externally-shared channels skip the lookup entirely.
+
+    The approval is workspace-scoped, not integration-scoped: a single
+    workspace can be connected to multiple PostHog projects, and once any
+    member of any of those orgs has consented to the bot answering in this
+    channel the consent applies to all of them. Per-mention data access
+    remains gated by the existing email → ``OrganizationMembership`` check,
+    so workspace-scope here only governs the channel-level question
+    ("can the bot speak here at all?"), not which project's data is read.
+
+    Reserved for future per-channel configuration (denials, routing
+    overrides, etc.) without needing another model.
+    """
+
+    slack_workspace_id = models.CharField(max_length=64)
+    slack_channel_id = models.CharField(max_length=64)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        "posthog.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_slack_channels",
+        help_text="The PostHog user who clicked Approve. Carries the email and audit trail.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["slack_workspace_id", "slack_channel_id"],
+                name="uniq_slack_channel",
+            )
+        ]
+
+    @property
+    def is_approved(self) -> bool:
+        return self.approved_at is not None
+
+    @classmethod
+    def approval_granted(cls, slack_workspace_id: str, slack_channel_id: str) -> bool:
+        """Whether someone in this channel has already granted approval.
+
+        Only answers the persistence question. Whether approval is required at all is the
+        caller's to decide from the ``is_ext_shared_channel`` flag on the Slack event.
+        """
+        return cls.objects.filter(
+            slack_workspace_id=slack_workspace_id,
+            slack_channel_id=slack_channel_id,
+            approved_at__isnull=False,
+        ).exists()

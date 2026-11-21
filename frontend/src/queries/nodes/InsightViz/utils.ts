@@ -1,0 +1,161 @@
+import { deepEqual as equal } from 'fast-equals'
+
+import { ApiError } from 'lib/api'
+import { getEventNamesForAction } from 'lib/utils/events'
+
+import { examples } from '~/queries/examples'
+import { isInsightQueryWithSeries } from '~/queries/schema/node-guards'
+import { setLatestVersionsOnQuery } from '~/queries/schema/query-versions'
+import {
+    DataTableNode,
+    DataVisualizationNode,
+    HogQuery,
+    InsightQueryNode,
+    InsightVizNode,
+    MetricsQuery,
+    Node,
+    NodeKind,
+} from '~/queries/schema/schema-general'
+import { ActionType, InsightModel, InsightType } from '~/types'
+
+import { ProductAnalyticsInsightNodeKind, getNodeKindToDefaultQuery } from '../InsightQuery/defaults'
+
+export const getAllEventNames = (query: InsightQueryNode, allActions: ActionType[]): string[] => {
+    if (!isInsightQueryWithSeries(query)) {
+        return []
+    }
+
+    const allEvents = query.series.flatMap((e) => {
+        if (e.kind == NodeKind.EventsNode) {
+            return e.event
+        } else if (e.kind == NodeKind.ActionsNode) {
+            return getEventNamesForAction(e.id, allActions)
+        }
+    })
+
+    // has one "all events" event
+    if (allEvents.some((e) => e === null)) {
+        return []
+    }
+
+    // remove duplicates and empty events
+    return Array.from(new Set(allEvents.filter((e): e is string => !!e)))
+}
+
+export const getCachedResults = (
+    cachedInsight: Partial<InsightModel> | undefined | null,
+    query: InsightQueryNode
+): Partial<InsightModel> | undefined => {
+    if (!cachedInsight) {
+        return undefined
+    }
+
+    let cachedQueryNode: Node | undefined
+
+    if (cachedInsight.query) {
+        cachedQueryNode = cachedInsight.query
+        if ('source' in cachedInsight.query) {
+            cachedQueryNode = cachedInsight.query.source as Node
+        }
+    } else {
+        return undefined
+    }
+
+    // only set the cached result when the filters match the currently set ones
+    if (!equal(cachedQueryNode, query)) {
+        return undefined
+    }
+
+    return cachedInsight
+}
+
+export const queryFromKind = (
+    kind: ProductAnalyticsInsightNodeKind,
+    filterTestAccountsDefault: boolean
+): InsightVizNode =>
+    setLatestVersionsOnQuery({
+        kind: NodeKind.InsightVizNode,
+        source: {
+            ...getNodeKindToDefaultQuery()[kind],
+            ...(filterTestAccountsDefault ? { filterTestAccounts: true } : {}),
+        },
+    })
+
+export const getDefaultQuery = (
+    insightType: InsightType,
+    filterTestAccountsDefault: boolean
+): DataTableNode | DataVisualizationNode | HogQuery | InsightVizNode | MetricsQuery => {
+    // Web Analytics insights should always come from Web Analytics tiles with a pre-configured query
+    // This is a fallback that should rarely be used
+    if (insightType === InsightType.WEB_ANALYTICS) {
+        throw new Error('Web Analytics insights must be created from Web Analytics tiles')
+    }
+
+    if (insightType === InsightType.METRICS) {
+        return { kind: NodeKind.MetricsQuery, clauses: [], dateRange: { date_from: '-1h' } }
+    }
+
+    if ([InsightType.SQL, InsightType.JSON, InsightType.HOG].includes(insightType)) {
+        if (insightType === InsightType.JSON) {
+            return examples.TotalEventsTable as DataTableNode
+        } else if (insightType === InsightType.SQL) {
+            return examples.DataVisualization as DataVisualizationNode
+        } else if (insightType === InsightType.HOG) {
+            return examples.Hoggonacci as HogQuery
+        }
+    }
+
+    if (insightType === InsightType.TRENDS) {
+        return queryFromKind(NodeKind.TrendsQuery, filterTestAccountsDefault)
+    } else if (insightType === InsightType.FUNNELS) {
+        return queryFromKind(NodeKind.FunnelsQuery, filterTestAccountsDefault)
+    } else if (insightType === InsightType.RETENTION) {
+        return queryFromKind(NodeKind.RetentionQuery, filterTestAccountsDefault)
+    } else if (insightType === InsightType.PATHS) {
+        return queryFromKind(NodeKind.PathsQuery, filterTestAccountsDefault)
+    } else if (insightType === InsightType.JOURNEYS) {
+        return queryFromKind(NodeKind.PathsV2Query, filterTestAccountsDefault)
+    } else if (insightType === InsightType.STICKINESS) {
+        return queryFromKind(NodeKind.StickinessQuery, filterTestAccountsDefault)
+    } else if (insightType === InsightType.LIFECYCLE) {
+        return queryFromKind(NodeKind.LifecycleQuery, filterTestAccountsDefault)
+    }
+
+    throw new Error('encountered unexpected type for view')
+}
+
+// Statuses whose responses carry an actionable validation message: 400 (bad query), 512 (query
+// estimated too expensive to run), 513 (out of memory)
+export const VALIDATION_ERROR_STATUSES = new Set([400, 512, 513])
+
+const hasValidationErrorStatus = (error: Error | Record<string, any> | null | undefined): boolean =>
+    VALIDATION_ERROR_STATUSES.has((error as Record<string, any> | null | undefined)?.status)
+
+export const extractValidationError = (error: Error | Record<string, any> | null | undefined): string | null => {
+    if (hasValidationErrorStatus(error)) {
+        // Async queries put the error message on data.error_message, while synchronous ones use detail
+        const anyError = error as Record<string, any>
+        // Add unbreakable space for better line breaking
+        return (anyError.detail || anyError.data?.error_message)?.replace('Try ', 'Try\u00A0') ?? null
+    }
+
+    return null
+}
+
+export const extractValidationErrorCode = (error: Error | Record<string, any> | null | undefined): string | null => {
+    if (hasValidationErrorStatus(error)) {
+        const anyError = error as Record<string, any>
+        return anyError.code ?? anyError.data?.code ?? null
+    }
+
+    return null
+}
+
+// 512 only (query estimated too expensive) — OOM is 513, so this can't misfire on a memory error.
+export const isTimeoutError = (error: Error | Record<string, any> | null | undefined): boolean => {
+    if (error instanceof ApiError || (error && typeof error === 'object' && 'status' in error)) {
+        return error?.status === 512
+    }
+
+    return false
+}

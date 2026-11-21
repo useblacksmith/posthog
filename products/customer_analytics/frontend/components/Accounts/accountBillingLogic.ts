@@ -1,0 +1,458 @@
+import {
+    MakeLogicType,
+    actions,
+    afterMount,
+    isBreakpoint,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    reducers,
+    selectors,
+} from 'kea'
+import { loaders } from 'kea-loaders'
+import posthog from 'posthog-js'
+
+import { dayjs } from 'lib/dayjs'
+import { dateStringToDayJs } from 'lib/utils/dateFilters'
+import { insightsApi } from 'scenes/insights/utils/api'
+
+import { dataVisualizationLogic } from '~/queries/nodes/DataVisualization/dataVisualizationLogic'
+import {
+    DataVisualizationNode,
+    HogQLVariable,
+    NodeKind,
+    ProductKey,
+    QueryLogTags,
+} from '~/queries/schema/schema-general'
+import { InsightShortId, InsightModel } from '~/types'
+
+import type { Node } from '../../../../../frontend/src/queries/schema/schema-general'
+import {
+    getTileRecord,
+    getTileString,
+    type AccountViewTileConfig,
+    type AccountViewTileLogicProps,
+} from './accountViewTileConfig'
+import { BillingUsageInterval, billingUsageQuery, supportsUsageAggregation } from './billingUsageQuery'
+import { AccountsEvents } from './constants'
+
+export type AccountBillingKind = 'usage' | 'spend'
+
+// Short IDs of the saved billing insights per tab. Absent in environments without them — the tab then shows a not-found state.
+export const BILLING_INSIGHT_SHORT_IDS: Record<AccountBillingKind, InsightShortId[]> = {
+    usage: ['fiJDsKLp' as InsightShortId],
+    spend: ['o4I9sdFE' as InsightShortId, 'Tjo4bsux' as InsightShortId],
+}
+
+// code_names of the SQL variables defined on the saved billing insights.
+const ORG_VARIABLE = 'billing_org_id'
+const START_VARIABLE = 'billing_start_date'
+const END_VARIABLE = 'billing_end_date'
+
+// Attributes the saved insights' ad-hoc SQL to this product — an untagged ClickHouse query is
+// rejected in local dev (UntaggedQueryError), and the insight's SQL may reference no table the
+// backend could attribute it by.
+const BILLING_QUERY_TAGS: QueryLogTags = { productKey: ProductKey.CUSTOMER_ANALYTICS, scene: 'CustomerAnalytics' }
+
+function withBillingQueryTags(insight: InsightModel): InsightModel {
+    const query = insight.query
+    if (!query || query.kind !== NodeKind.DataVisualizationNode) {
+        return insight
+    }
+    const dataViz = query as DataVisualizationNode
+    const taggedQuery: DataVisualizationNode = {
+        ...dataViz,
+        source: { ...dataViz.source, tags: { ...BILLING_QUERY_TAGS, ...dataViz.source.tags } },
+    }
+    return { ...insight, query: taggedQuery as InsightModel['query'] }
+}
+
+export interface BillingDateRange {
+    date_from: string | null
+    date_to: string | null
+}
+
+// Usage insights are daily, spend insights are monthly — so they want different default windows.
+const DEFAULT_DATE_RANGE: Record<AccountBillingKind, BillingDateRange> = {
+    usage: { date_from: '-30d', date_to: null },
+    spend: { date_from: '-1y', date_to: null },
+}
+
+export interface AccountBillingLogicProps extends AccountViewTileLogicProps {
+    accountId: string
+    externalId: string
+    kind: AccountBillingKind
+}
+
+function getInitialDateRange(config: AccountViewTileConfig | undefined, kind: AccountBillingKind): BillingDateRange {
+    const dateRange = getTileRecord(config, 'dateRange')
+    const dateFrom = dateRange?.date_from
+    const dateTo = dateRange?.date_to
+    return {
+        date_from: typeof dateFrom === 'string' || dateFrom === null ? dateFrom : DEFAULT_DATE_RANGE[kind].date_from,
+        date_to: typeof dateTo === 'string' || dateTo === null ? dateTo : DEFAULT_DATE_RANGE[kind].date_to,
+    }
+}
+
+function getInitialUsageInterval(config: AccountViewTileConfig | undefined): BillingUsageInterval {
+    const interval = getTileString(config, 'usageInterval')
+    return interval === 'week' || interval === 'month' ? interval : 'day'
+}
+
+function getInitialHiddenSeries(config: AccountViewTileConfig | undefined): Record<string, string[]> {
+    const hiddenSeries = getTileRecord(config, 'hiddenSeriesKeysByShortId')
+    if (!hiddenSeries) {
+        return {}
+    }
+    return Object.fromEntries(
+        Object.entries(hiddenSeries).filter(
+            (entry): entry is [string, string[]] =>
+                Array.isArray(entry[1]) && entry[1].every((value) => typeof value === 'string')
+        )
+    )
+}
+
+export function getBillingDataVisualizationKey(queryKey: string): string {
+    return `InsightViz.${queryKey}`
+}
+
+// Inject the account's org and the chosen date range into the saved insight's SQL variables, keyed by their
+// variableId as read from the fetched insight (so this works regardless of the variable UUIDs in each env).
+function buildVariableOverrides(
+    insight: InsightModel,
+    resolvedDateRange: BillingDateRange,
+    externalId: string
+): Record<string, HogQLVariable> | undefined {
+    const query = insight.query
+    if (!query || query.kind !== NodeKind.DataVisualizationNode) {
+        return undefined
+    }
+    const variables = (query as DataVisualizationNode).source.variables
+    if (!variables) {
+        return undefined
+    }
+    const valueByCodeName: Record<string, string | null> = {
+        [ORG_VARIABLE]: externalId,
+        [START_VARIABLE]: resolvedDateRange.date_from,
+        [END_VARIABLE]: resolvedDateRange.date_to,
+    }
+    const overrides: Record<string, HogQLVariable> = {}
+    for (const variable of Object.values(variables)) {
+        if (variable.code_name in valueByCodeName) {
+            overrides[variable.variableId] = {
+                ...variable,
+                value: valueByCodeName[variable.code_name],
+            }
+        }
+    }
+    return overrides
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface accountBillingLogicValues {
+    canAggregateUsage: boolean
+    dateRange: BillingDateRange
+    displayInsights: InsightModel[] | null
+    ephemeralHiddenSeriesKeysByShortId: Record<string, string[]>
+    queryKeyFor: (shortId: string) => string
+    resolvedDateRange: BillingDateRange
+    savedInsights: InsightModel[] | null
+    savedInsightsLoading: boolean
+    usageInterval: BillingUsageInterval
+    variableOverridesByShortId: Record<string, Record<string, HogQLVariable>>
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface accountBillingLogicActions {
+    loadSavedInsights: (_?: any) => any
+    loadSavedInsightsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadSavedInsightsSuccess: (
+        savedInsights: InsightModel<Node<Record<string, any>>>[],
+        payload?: any
+    ) => {
+        savedInsights: InsightModel<Node<Record<string, any>>>[]
+        payload?: any
+    }
+    setAllSeriesHidden: (
+        shortId: string,
+        seriesKeys: string[],
+        hidden: boolean
+    ) => {
+        hidden: boolean
+        seriesKeys: string[]
+        shortId: string
+    }
+    setDateRange: (
+        dateFrom: string | null,
+        dateTo: string | null
+    ) => {
+        dateFrom: string | null
+        dateTo: string | null
+    }
+    setUsageInterval: (interval: BillingUsageInterval) => {
+        interval: BillingUsageInterval
+    }
+    toggleHiddenSeriesKey: (
+        shortId: string,
+        seriesKey: string,
+        seriesCount: number
+    ) => {
+        seriesCount: number
+        seriesKey: string
+        shortId: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface accountBillingLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        canAggregateUsage: (savedInsights: InsightModel<Node<Record<string, any>>>[] | null, arg: any) => boolean
+        displayInsights: (
+            savedInsights: InsightModel<Node<Record<string, any>>>[] | null,
+            usageInterval: BillingUsageInterval,
+            canAggregateUsage: boolean
+        ) => InsightModel[] | null
+        resolvedDateRange: (dateRange: BillingDateRange) => BillingDateRange
+        variableOverridesByShortId: (
+            savedInsights: InsightModel<Node<Record<string, any>>>[] | null,
+            resolvedDateRange: BillingDateRange,
+            arg: any
+        ) => Record<string, Record<string, HogQLVariable>>
+        queryKeyFor: (
+            resolvedDateRange: BillingDateRange,
+            arg: any,
+            arg2: any,
+            arg3: any,
+            usageInterval: BillingUsageInterval
+        ) => (shortId: string) => string
+    }
+}
+
+export type accountBillingLogicType = MakeLogicType<
+    accountBillingLogicValues,
+    accountBillingLogicActions,
+    AccountBillingLogicProps,
+    accountBillingLogicMeta
+>
+
+export const accountBillingLogic = kea<accountBillingLogicType>([
+    path((key) => ['scenes', 'customerAnalytics', 'accounts', 'accountBillingLogic', key]),
+    props({} as AccountBillingLogicProps),
+    key((props) => `${props.accountId}:${props.kind}:${props.instanceId ?? 'default'}`),
+    actions({
+        setUsageInterval: (interval: BillingUsageInterval) => ({ interval }),
+        setDateRange: (dateFrom: string | null, dateTo: string | null) => ({ dateFrom, dateTo }),
+        toggleHiddenSeriesKey: (shortId: string, seriesKey: string, seriesCount: number) => ({
+            shortId,
+            seriesKey,
+            seriesCount,
+        }),
+        setAllSeriesHidden: (shortId: string, seriesKeys: string[], hidden: boolean) => ({
+            shortId,
+            seriesKeys,
+            hidden,
+        }),
+    }),
+    reducers(({ props }) => ({
+        usageInterval: [
+            getInitialUsageInterval(props.initialConfig),
+            { setUsageInterval: (_, { interval }) => interval },
+        ],
+        dateRange: [
+            getInitialDateRange(props.initialConfig, props.kind),
+            {
+                setDateRange: (_, { dateFrom, dateTo }) => ({ date_from: dateFrom, date_to: dateTo }),
+            },
+        ],
+        ephemeralHiddenSeriesKeysByShortId: [
+            getInitialHiddenSeries(props.initialConfig),
+            {
+                toggleHiddenSeriesKey: (state, { shortId, seriesKey }) => {
+                    const current = state[shortId] ?? []
+                    return {
+                        ...state,
+                        [shortId]: current.includes(seriesKey)
+                            ? current.filter((key) => key !== seriesKey)
+                            : [...current, seriesKey],
+                    }
+                },
+                setAllSeriesHidden: (state, { shortId, seriesKeys, hidden }) => ({
+                    ...state,
+                    [shortId]: hidden ? seriesKeys : [],
+                }),
+                setDateRange: () => ({}),
+            },
+        ],
+    })),
+    listeners(({ props, values, cache }) => {
+        const saveConfig = (): void => {
+            props.onConfigChange?.({
+                dateRange: values.dateRange,
+                usageInterval: values.usageInterval,
+                hiddenSeriesKeysByShortId: values.ephemeralHiddenSeriesKeysByShortId,
+            })
+        }
+        const preloadSavedInsights = (savedInsights: InsightModel[]): void => {
+            for (const insight of savedInsights) {
+                if (!insight.query || insight.query.kind !== NodeKind.DataVisualizationNode) {
+                    continue
+                }
+                const queryKey = values.queryKeyFor(insight.short_id)
+                const dataVisualizationKey = getBillingDataVisualizationKey(queryKey)
+                cache.disposables.add(
+                    () =>
+                        dataVisualizationLogic({
+                            key: dataVisualizationKey,
+                            query: insight.query as DataVisualizationNode,
+                            dataNodeCollectionId: queryKey,
+                            variablesOverride: values.variableOverridesByShortId[insight.short_id] ?? null,
+                        }).mount(),
+                    `preload-${insight.short_id}`,
+                    { pauseOnPageHidden: false }
+                )
+            }
+        }
+
+        return {
+            loadSavedInsightsSuccess: () => {
+                preloadSavedInsights(values.displayInsights ?? [])
+            },
+            setDateRange: () => {
+                saveConfig()
+                preloadSavedInsights(values.displayInsights ?? [])
+            },
+            setUsageInterval: ({ interval }) => {
+                saveConfig()
+                preloadSavedInsights(values.displayInsights ?? [])
+                posthog.capture(AccountsEvents.UsageIntervalChanged, { interval })
+            },
+            toggleHiddenSeriesKey: ({ shortId, seriesKey, seriesCount }) => {
+                saveConfig()
+                posthog.capture(AccountsEvents.UsageSeriesToggled, {
+                    kind: props.kind,
+                    is_hidden: (values.ephemeralHiddenSeriesKeysByShortId[shortId] ?? []).includes(seriesKey),
+                    series_count: seriesCount,
+                })
+            },
+            setAllSeriesHidden: ({ seriesKeys, hidden }) => {
+                saveConfig()
+                posthog.capture(AccountsEvents.UsageSeriesBulkToggled, {
+                    kind: props.kind,
+                    is_hidden: hidden,
+                    series_count: seriesKeys.length,
+                })
+            },
+        }
+    }),
+    loaders(({ props }) => ({
+        savedInsights: [
+            null as InsightModel[] | null,
+            {
+                loadSavedInsights: async (_ = null, breakpoint) => {
+                    const insights = await Promise.all(
+                        BILLING_INSIGHT_SHORT_IDS[props.kind].map(async (shortId) => {
+                            try {
+                                return await insightsApi.getByShortId(shortId)
+                            } catch (error) {
+                                if (isBreakpoint(error as Error)) {
+                                    throw error
+                                }
+                                posthog.captureException(error as Error, {
+                                    scope: 'accountBillingLogic.loadSavedInsights',
+                                    shortId,
+                                })
+                                return null
+                            }
+                        })
+                    )
+                    breakpoint()
+                    return insights
+                        .filter((insight): insight is InsightModel => insight !== null)
+                        .map(withBillingQueryTags)
+                },
+            },
+        ],
+    })),
+    selectors({
+        canAggregateUsage: [
+            (s) => [s.savedInsights, (_, p) => p.kind],
+            (savedInsights: InsightModel[] | null, kind: AccountBillingKind): boolean =>
+                kind === 'usage' &&
+                !!savedInsights?.length &&
+                savedInsights.every(({ query }) => supportsUsageAggregation(query)),
+        ],
+        displayInsights: [
+            (s) => [s.savedInsights, s.usageInterval, s.canAggregateUsage],
+            (
+                savedInsights: InsightModel[] | null,
+                interval: BillingUsageInterval,
+                canAggregate: boolean
+            ): InsightModel[] | null =>
+                canAggregate
+                    ? savedInsights!.map((insight) => ({
+                          ...insight,
+                          query: billingUsageQuery(insight.query as DataVisualizationNode, interval),
+                      }))
+                    : savedInsights,
+        ],
+        // The saved insights filter on a calendar date column, so the range must be resolved to absolute dates.
+        resolvedDateRange: [
+            (s) => [s.dateRange],
+            (dateRange: BillingDateRange): BillingDateRange => {
+                const from = dateStringToDayJs(dateRange.date_from)
+                const to = dateRange.date_to ? dateStringToDayJs(dateRange.date_to) : dayjs()
+                return {
+                    date_from: from ? from.format('YYYY-MM-DD') : null,
+                    date_to: to ? to.format('YYYY-MM-DD') : null,
+                }
+            },
+        ],
+        variableOverridesByShortId: [
+            (s) => [s.savedInsights, s.resolvedDateRange, (_, p) => p.externalId],
+            (
+                savedInsights: InsightModel[] | null,
+                resolvedDateRange: BillingDateRange,
+                externalId
+            ): Record<string, Record<string, HogQLVariable>> => {
+                const overridesByShortId: Record<string, Record<string, HogQLVariable>> = {}
+                for (const insight of savedInsights ?? []) {
+                    const overrides = buildVariableOverrides(insight, resolvedDateRange, externalId)
+                    if (overrides) {
+                        overridesByShortId[insight.short_id] = overrides
+                    }
+                }
+                return overridesByShortId
+            },
+        ],
+        // The embedded <Query> only refetches when its query changes, not when variablesOverride changes — so a date
+        // change must remount it. Keying on the resolved range gives each insight a key that changes with the range.
+        // The fallback <Query> passes this key as `dashboardItemId`. The `new-` prefix stops insightLogic from
+        // fetching it as a saved insight short ID, which fails as "not found".
+        queryKeyFor: [
+            (s) => [
+                s.resolvedDateRange,
+                (_, p) => p.accountId,
+                (_, p) => p.kind,
+                (_, p) => p.instanceId,
+                s.usageInterval,
+            ],
+            (resolvedDateRange: BillingDateRange, accountId, kind, instanceId, interval: BillingUsageInterval) =>
+                (shortId: string): string =>
+                    `new-account-billing-${accountId}-${kind}-${instanceId ?? 'default'}-${shortId}-${resolvedDateRange.date_from}-${resolvedDateRange.date_to}-${interval}`,
+        ],
+    }),
+    afterMount(({ actions, props }) => {
+        if (props.externalId) {
+            actions.loadSavedInsights()
+        }
+    }),
+])

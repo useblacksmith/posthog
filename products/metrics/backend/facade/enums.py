@@ -1,0 +1,245 @@
+"""
+Exported enums and constants for metrics.
+
+These appear in the contract dataclasses (contracts.py) and are the
+vocabulary other products / the presentation layer use to build metric
+queries. Framework-free: no Django, no DRF.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+from posthog.enums import LabeledStrEnum
+
+
+class AttributeScope(StrEnum):
+    """Where a label lives on a `metrics1` row.
+
+    - RESOURCE: `resource_attributes` (set once per scrape target, e.g.
+      `service.name`, `k8s.pod.name`).
+    - ATTRIBUTE: per-data-point `attributes` (the alias that strips the
+      5-char `_str` type tag, e.g. `http.method`).
+    - AUTO: resource first, fall back to attribute. ClickHouse map lookups
+      return '' for missing keys, so the fallback compares against '' — you
+      cannot meaningfully match "equals empty string" in AUTO scope; use an
+      explicit scope for that edge case.
+    """
+
+    RESOURCE = "resource"
+    ATTRIBUTE = "attribute"
+    AUTO = "auto"
+
+
+class FilterOp(StrEnum):
+    """Comparison operators for a label filter."""
+
+    EQ = "eq"
+    NEQ = "neq"
+    REGEX = "regex"
+    NOT_REGEX = "not_regex"
+
+
+class MetricType(StrEnum):
+    """The OTel metric type a clause targets. Series identity includes the
+    type — one name can exist as both a counter and a gauge — so queries
+    constrain it to avoid blending distinct series. Values match what the
+    ingest writes to `metric_type` (rust/capture-logs `flatten_metric`)."""
+
+    GAUGE = "gauge"
+    SUM = "sum"
+    HISTOGRAM = "histogram"
+    EXPONENTIAL_HISTOGRAM = "exponential_histogram"
+    SUMMARY = "summary"
+
+
+class MetricAggregation(StrEnum):
+    """How a clause collapses the values in each time bucket into one number.
+
+    Every aggregation resolves per series first, then combines across series,
+    so a result never depends on how often a series was scraped.
+
+    Instant aggregations take each series' last sample in the bucket and
+    combine those: SUM is the total across series, AVG and QUANTILE are
+    computed over series, COUNT is how many series reported, and MIN and MAX
+    are the smallest and largest last sample across series. The per-series step
+    matters most for MIN and MAX: taken over raw samples they would report a
+    stale within-bucket extreme rather than the current cross-series one.
+
+    Counter functions operate on the change across the bucket (cumulative
+    counters get reset-corrected; deltas are summed): RATE, INCREASE.
+
+    HISTOGRAM_QUANTILE reads the `histogram_bounds`/`histogram_counts`
+    arrays rather than the scalar `value`.
+
+    QUANTILE and HISTOGRAM_QUANTILE require the clause's `quantile` field.
+
+    COUNT_RATE and COUNT_INCREASE are RATE and INCREASE over the `count`
+    column instead of `value`, summed across series. On a histogram or
+    summary row, `value` holds the running sum of the observations and
+    `count` the number of observations, so these give requests per second
+    (or per bucket) from a latency histogram, like PromQL `rate(x_count)`.
+    They accept only histogram and summary series and take no range function.
+
+    NONE combines nothing: the clause returns one series per physical series,
+    capped at 100 series.
+    """
+
+    NONE = "none"
+    SUM = "sum"
+    AVG = "avg"
+    COUNT = "count"
+    MIN = "min"
+    MAX = "max"
+    QUANTILE = "quantile"
+    RATE = "rate"
+    INCREASE = "increase"
+    HISTOGRAM_QUANTILE = "histogram_quantile"
+    COUNT_RATE = "count_rate"
+    COUNT_INCREASE = "count_increase"
+
+    @property
+    def is_raw(self) -> bool:
+        return self is MetricAggregation.NONE
+
+    @property
+    def needs_quantile(self) -> bool:
+        return self in (MetricAggregation.QUANTILE, MetricAggregation.HISTOGRAM_QUANTILE)
+
+    @property
+    def is_counter_function(self) -> bool:
+        return self in (
+            MetricAggregation.RATE,
+            MetricAggregation.INCREASE,
+            MetricAggregation.COUNT_RATE,
+            MetricAggregation.COUNT_INCREASE,
+        )
+
+
+class MetricRangeFunction(LabeledStrEnum):
+    """A per-series transform that runs before the cross-series aggregation.
+
+    Both read the change in a counter across each bucket (cumulative counters
+    get reset-corrected; deltas are summed). RATE divides by the bucket length
+    in seconds.
+    """
+
+    RATE = "rate", "rate"
+    INCREASE = "increase", "increase"
+
+
+class MetricNameMatchMode(LabeledStrEnum):
+    """How a metric-names search matches a name: case-insensitive substring or prefix, or an RE2 regex."""
+
+    SUBSTRING = "substring", "substring"
+    PREFIX = "prefix", "prefix"
+    REGEX = "regex", "regex"
+
+
+class DashboardImportSource(LabeledStrEnum):
+    """What a dashboard import reads: a Grafana dashboard JSON model, or a screenshot of a dashboard."""
+
+    GRAFANA = "grafana"
+    SCREENSHOT = "screenshot"
+
+
+class DashboardImportState(LabeledStrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class PanelImportOutcome(LabeledStrEnum):
+    """What happened to one panel. APPROXIMATED means the panel imported, but what it shows changed."""
+
+    IMPORTED = "imported"
+    APPROXIMATED = "approximated"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class DashboardImportPhase(LabeledStrEnum):
+    """The step of an import that runs: the agent starts, the agent matches panels, PostHog builds the dashboard,
+    and for a screenshot the agent compares pictures of the dashboard with the screenshot."""
+
+    STARTING = "starting"
+    MATCHING = "matching"
+    BUILDING = "building"
+    CHECKING_LAYOUT = "checking_layout"
+
+
+class PanelProgressState(LabeledStrEnum):
+    """Where one panel is while an import runs. WORKING means that a check of the panel's query failed so far."""
+
+    WAITING = "waiting"
+    WORKING = "working"
+    DONE = "done"
+    SKIPPED = "skipped"
+
+
+class PanelBuilderAggregation(LabeledStrEnum):
+    """The aggregations of a builder clause that the dashboard import checks. They match the metrics query API."""
+
+    SUM = "sum"
+    AVG = "avg"
+    COUNT = "count"
+    MIN = "min"
+    MAX = "max"
+    P95 = "p95"
+    RATE = "rate"
+    INCREASE = "increase"
+    HISTOGRAM_QUANTILE = "histogram_quantile"
+
+
+class PanelQueryLanguage(LabeledStrEnum):
+    PROMQL = "promql"
+    BUILDER = "builder"
+    HISTOGRAM = "histogram"
+    HOGQL = "hogql"
+
+
+class DashboardTemplateSource(LabeledStrEnum):
+    """Where a template of the metrics dashboard bank comes from: a file in the code, or an AI generation."""
+
+    CURATED = "curated"
+    GENERATED = "generated"
+
+
+class DashboardTemplateStatus(LabeledStrEnum):
+    """Teams see only an approved template. A generated one waits for a staff review first."""
+
+    GENERATING = "generating"
+    PENDING_REVIEW = "pending_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    FAILED = "failed"
+
+
+class PrecomputedMetricKind(LabeledStrEnum):
+    """What a precomputed metric stores for each hour and kept label set.
+
+    INCREASE and COUNT_INCREASE store the summed increase of the `value` or `count` column, which answers
+    increase and rate clauses. HISTOGRAM stores the summed bucket counts, which answers histogram quantiles.
+
+    SUM_OVER_TIME and BUCKET_INCREASE answer PromQL tiles and are filled through Snuffle, so they match what a
+    PromQL query reads: `sum_over_time` of any metric type, and `increase` of a histogram's `_bucket` series,
+    which always keeps `le`.
+    """
+
+    INCREASE = "increase", "increase"
+    COUNT_INCREASE = "count_increase", "count_increase"
+    HISTOGRAM = "histogram", "histogram"
+    SUM_OVER_TIME = "sum_over_time", "sum_over_time"
+    BUCKET_INCREASE = "bucket_increase", "bucket_increase"
+
+
+class MetricQueryProvenanceMode(StrEnum):
+    """Where a query's buckets came from.
+
+    PRECOMPUTED: every bucket from precomputed metrics. MIXED: stored buckets for the history and raw samples
+    for the rest, such as the newest buckets or a clause that can't be precomputed. RAW: every bucket from raw samples.
+    """
+
+    PRECOMPUTED = "precomputed"
+    MIXED = "mixed"
+    RAW = "raw"

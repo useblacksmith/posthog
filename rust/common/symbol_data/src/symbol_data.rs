@@ -1,0 +1,248 @@
+use std::io::{Cursor, Read as _, Write as _};
+
+use crate::{error::Error, utils::assert_at_least_as_long_as};
+
+const MAGIC: &[u8] = b"posthog_error_tracking";
+const VERSION: u32 = 2;
+const V1_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolDataType {
+    SourceAndMap = 2,
+    HermesMap = 3,
+    ProguardMapping = 4,
+    AppleDsym = 5,
+    ElfDebugInfo = 6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Compression {
+    None = 0,
+    Zstd = 1,
+}
+
+impl TryFrom<u8> for Compression {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Compression::None),
+            1 => Ok(Compression::Zstd),
+            other => Err(Error::UnknownCompression(other)),
+        }
+    }
+}
+
+pub trait SymbolData: Sized {
+    fn from_bytes(data: Vec<u8>) -> Result<Self, Error>;
+    fn into_bytes(self) -> Vec<u8>;
+    fn data_type() -> SymbolDataType;
+}
+
+pub fn write<T>(data: T) -> Result<Vec<u8>, Error>
+where
+    T: SymbolData,
+{
+    write_inner(data, Compression::Zstd)
+}
+
+pub fn write_uncompressed<T>(data: T) -> Result<Vec<u8>, Error>
+where
+    T: SymbolData,
+{
+    write_inner(data, Compression::None)
+}
+
+fn write_inner<T>(data: T, compression: Compression) -> Result<Vec<u8>, Error>
+where
+    T: SymbolData,
+{
+    let d_type = T::data_type();
+    let raw_bytes = data.into_bytes();
+
+    let payload = match compression {
+        Compression::None => raw_bytes,
+        Compression::Zstd => {
+            let mut encoder = zstd::Encoder::new(Vec::new(), 3)
+                .map_err(|e| Error::CompressionError(e.to_string()))?;
+            encoder
+                .set_pledged_src_size(Some(raw_bytes.len() as u64))
+                .map_err(|e| Error::CompressionError(e.to_string()))?;
+            encoder
+                .write_all(&raw_bytes)
+                .map_err(|e| Error::CompressionError(e.to_string()))?;
+            encoder
+                .finish()
+                .map_err(|e| Error::CompressionError(e.to_string()))?
+        }
+    };
+
+    let mut buffer = Vec::with_capacity(v2_header_len() + payload.len());
+    buffer.extend_from_slice(MAGIC);
+    buffer.extend_from_slice(&VERSION.to_le_bytes());
+    buffer.extend_from_slice(&(d_type as u32).to_le_bytes());
+    buffer.push(compression as u8);
+    buffer.extend_from_slice(&payload);
+    Ok(buffer)
+}
+
+pub fn read_as<T>(data: &[u8]) -> Result<T, Error>
+where
+    T: SymbolData,
+{
+    read_as_with_byte_count(data).map(|(v, _)| v)
+}
+
+pub fn known_decompressed_size(data: &[u8]) -> Result<Option<usize>, Error> {
+    let version = read_version(data)?;
+
+    match version {
+        V1_VERSION => {
+            assert_at_least_as_long_as(v1_header_len(), data.len())?;
+            Ok(Some(data.len() - v1_header_len()))
+        }
+        VERSION => {
+            assert_at_least_as_long_as(v2_header_len(), data.len())?;
+            let payload = &data[v2_header_len()..];
+            match Compression::try_from(data[v2_header_len() - 1])? {
+                Compression::None => Ok(Some(payload.len())),
+                Compression::Zstd => known_zstd_decompressed_size(payload),
+            }
+        }
+        other => Err(Error::WrongVersion(other, VERSION)),
+    }
+}
+
+fn known_zstd_decompressed_size(mut data: &[u8]) -> Result<Option<usize>, Error> {
+    let mut total = 0usize;
+    while !data.is_empty() {
+        let frame_len = zstd::zstd_safe::find_frame_compressed_size(data).map_err(|code| {
+            Error::CompressionError(zstd::zstd_safe::get_error_name(code).to_string())
+        })?;
+        let Some(frame_size) = zstd::zstd_safe::get_frame_content_size(data)
+            .map_err(|e| Error::CompressionError(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let Ok(frame_size) = usize::try_from(frame_size) else {
+            return Ok(None);
+        };
+        let Some(next_total) = total.checked_add(frame_size) else {
+            return Ok(None);
+        };
+        total = next_total;
+        data = &data[frame_len..];
+    }
+    Ok(Some(total))
+}
+
+/// Like `read_as`, but also returns the decompressed payload byte count.
+/// This is useful for cache memory accounting when the container uses compression,
+/// since the compressed size can be much smaller than the actual data in memory.
+pub fn read_as_with_byte_count<T>(data: &[u8]) -> Result<(T, usize), Error>
+where
+    T: SymbolData,
+{
+    read_as_with_byte_count_limited(data, usize::MAX)
+}
+
+/// Like `read_as_with_byte_count`, but fails with `Error::DecompressedTooLarge` rather than
+/// produce a payload larger than `max_bytes`. Use it for data from an untrusted source.
+pub fn read_as_with_byte_count_limited<T>(
+    data: &[u8],
+    max_bytes: usize,
+) -> Result<(T, usize), Error>
+where
+    T: SymbolData,
+{
+    let version = read_version(data)?;
+
+    match version {
+        V1_VERSION => {
+            assert_at_least_as_long_as(v1_header_len(), data.len())?;
+            assert_data_type_impl(data, T::data_type())?;
+            let payload = &data[v1_header_len()..];
+            assert_within_limit(payload.len(), max_bytes)?;
+            T::from_bytes(payload.to_vec()).map(|v| (v, payload.len()))
+        }
+        VERSION => {
+            assert_at_least_as_long_as(v2_header_len(), data.len())?;
+            assert_data_type_impl(data, T::data_type())?;
+            let compression = Compression::try_from(data[v2_header_len() - 1])?;
+            let payload = &data[v2_header_len()..];
+            let decompressed = match compression {
+                Compression::None => {
+                    assert_within_limit(payload.len(), max_bytes)?;
+                    payload.to_vec()
+                }
+                Compression::Zstd => {
+                    // zstd fails a frame whose content differs from its declared size, so that
+                    // size is safe to reject on. A frame can omit it, so the read keeps a cap.
+                    if let Ok(Some(declared)) = known_zstd_decompressed_size(payload) {
+                        assert_within_limit(declared, max_bytes)?;
+                    }
+                    let decoder = zstd::Decoder::new(Cursor::new(payload))
+                        .map_err(|e| Error::CompressionError(e.to_string()))?;
+                    let mut out = Vec::new();
+                    // Read one byte past the limit to tell an oversized payload from an exact fit.
+                    decoder
+                        .take((max_bytes as u64).saturating_add(1))
+                        .read_to_end(&mut out)
+                        .map_err(|e| Error::CompressionError(e.to_string()))?;
+                    assert_within_limit(out.len(), max_bytes)?;
+                    out
+                }
+            };
+            let byte_count = decompressed.len();
+            T::from_bytes(decompressed).map(|v| (v, byte_count))
+        }
+        other => Err(Error::WrongVersion(other, VERSION)),
+    }
+}
+
+fn assert_within_limit(len: usize, max_bytes: usize) -> Result<(), Error> {
+    if len > max_bytes {
+        return Err(Error::DecompressedTooLarge(max_bytes as u64));
+    }
+    Ok(())
+}
+
+fn read_version(buffer: &[u8]) -> Result<u32, Error> {
+    assert_at_least_as_long_as(MAGIC.len() + 4, buffer.len())?;
+    assert_has_magic(buffer)?;
+    Ok(u32::from_le_bytes(
+        buffer[MAGIC.len()..MAGIC.len() + 4].try_into().unwrap(),
+    ))
+}
+
+fn assert_has_magic(buffer: &[u8]) -> Result<(), Error> {
+    if &buffer[..MAGIC.len()] != MAGIC {
+        return Err(Error::InvalidMagic);
+    }
+    Ok(())
+}
+
+fn assert_data_type_impl(buffer: &[u8], expected_type: SymbolDataType) -> Result<(), Error> {
+    // Type field sits at the same offset in both v1 and v2 (after MAGIC + VERSION)
+    let type_offset = MAGIC.len() + 4;
+    let data_type = u32::from_le_bytes(buffer[type_offset..type_offset + 4].try_into().unwrap());
+    if data_type != expected_type as u32 {
+        Err(Error::InvalidDataType(
+            data_type,
+            format!("{expected_type:?}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+const fn v1_header_len() -> usize {
+    // Magic + Version + Type
+    MAGIC.len() + 4 + 4
+}
+
+const fn v2_header_len() -> usize {
+    // Magic + Version + Type + Compression
+    MAGIC.len() + 4 + 4 + 1
+}

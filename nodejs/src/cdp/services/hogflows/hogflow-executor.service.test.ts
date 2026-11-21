@@ -1,0 +1,4379 @@
+// sort-imports-ignore
+import { SESv2Client, TooManyRequestsException } from '@aws-sdk/client-sesv2'
+import { PosthogJwtAudience } from '~/cdp/utils/jwt-utils'
+import { ScopedServiceJwt } from '~/cdp/utils/scoped-service-jwt'
+import { DateTime, Duration } from 'luxon'
+import { createHash, randomUUID } from 'node:crypto'
+import { IncomingMessage, ServerResponse, createServer } from 'node:http'
+import { AddressInfo } from 'node:net'
+import { register } from 'prom-client'
+
+import { FixtureHogFlowBuilder, SimpleHogFlowRepresentation } from '~/cdp/_tests/builders/hogflow.builder'
+import { createHogExecutionGlobals, insertHogFunctionTemplate, insertIntegration } from '~/cdp/_tests/fixtures'
+import { postgresThatDropsConnections } from '~/cdp/_tests/postgres-that-drops-connections'
+import { EmailAttachmentMetadata } from '~/cdp/schema/cyclotron'
+import { HogFlow } from '~/cdp/schema/hogflow'
+import { template as posthogCaptureTemplate } from '~/cdp/templates/_destinations/posthog_capture/posthog-capture.template'
+import { template as customerTaskTemplate } from '~/cdp/templates/_destinations/posthog_customer_analytics/posthog-create-customer-task.template'
+import { template as setVariableTemplate } from '~/cdp/templates/_destinations/posthog_workflows/posthog-set-variable.template'
+import { compileHog } from '~/cdp/templates/compiler'
+import { convertToHogFunctionFilterGlobal } from '~/cdp/utils/hog-function-filtering'
+import { createRedisV2PoolFromConfig } from '~/common/redis/redis-v2'
+import { FakeUsageIngestion } from '~/common/usage-ingestion/_tests/fake-usage-ingestion'
+import { createHub } from '~/common/utils/db/hub'
+import { PostgresRouter, PostgresUse } from '~/common/utils/db/postgres'
+import { parseJSON } from '~/common/utils/json-parse'
+import { logger } from '~/common/utils/logger'
+import { FetchResponse, fetch, internalFetch } from '~/common/utils/request'
+import { createTestTeamFixture, uniqueTestId } from '~/tests/helpers/sql'
+
+import { Hub, Team } from '../../../types'
+import { CyclotronJobInvocationHogFlow, CyclotronJobInvocationResult } from '../../types'
+import { HOG_FILTERS_EXAMPLES } from '../../_tests/examples'
+import { createExampleHogFlowInvocation } from '../../_tests/fixtures-hogflows'
+import { CohortMembershipRepository } from '../cohorts/cohort-membership-repository'
+import { HogExecutorAsyncService } from '../hog-executor-async.service'
+import { HogExecutorService } from '../hog-executor.service'
+import { HogInputsService } from '../hog-inputs.service'
+import { HogFunctionTemplateManagerService } from '../managers/hog-function-template-manager.service'
+import { RecipientsManagerService } from '../managers/recipients-manager.service'
+import { TeamWorkflowsConfigService } from '../managers/team-workflows-config.service'
+import {
+    AttachmentMissingError,
+    AttachmentStore,
+    AttachmentStoreUnavailableError,
+    LoadedAttachment,
+} from '../messaging/attachment-store'
+import { EmailSuppressionService, emailSuppressionConfigFromEnv } from '../messaging/email-suppression.service'
+import { EmailValidationService } from '../messaging/email-validation.service'
+import { EmailService } from '../messaging/email.service'
+import { EmailTrackingCodeSigner } from '../messaging/helpers/tracking-code'
+import { PushNotificationFetchUtils, PushNotificationService } from '../messaging/push-notification.service'
+import { RecipientPreferencesService } from '../messaging/recipient-preferences.service'
+import { RecipientTokensService } from '../messaging/recipient-tokens.service'
+import { SandboxEmailService } from '../messaging/sandbox/sandbox-email.service'
+import { SandboxEmailSendStep } from '../messaging/sandbox/sandbox-email-step'
+import { SandboxMessage } from '../messaging/sandbox/sandbox-message'
+import { RateLimiterService } from '../rate-limiter/rate-limiter.service'
+import { CdpUsageReporterService } from '../usage/cdp-usage-reporter.service'
+import { HogFlowExecutorService, createHogFlowInvocation } from './hogflow-executor.service'
+import { HogFlowFunctionsService } from './hogflow-functions.service'
+import { TRANSACTIONAL_EMAIL_EVENT } from './hogflow-sensitivity'
+import { QueuedSend } from './transactional-email'
+
+// Mock before importing fetch
+jest.mock('~/common/utils/request', () => {
+    const original = jest.requireActual('~/common/utils/request')
+    return {
+        ...original,
+        internalFetch: jest.fn(),
+        fetch: jest.fn().mockImplementation((url, options) => {
+            return original.fetch(url, options)
+        }),
+    }
+})
+
+type TrackedPushFetch = PushNotificationFetchUtils['trackedFetch']
+
+const cleanLogs = (logs: string[]): string[] => {
+    // Replaces the function time with a fixed value to simplify testing
+    return logs.map((log) => log.replace(/Function completed in \d+(\.\d+)?ms/, 'Function completed in REPLACEDms'))
+}
+
+type DeliveredEmail = { to: string[]; subject: string; attachments: { filename: string; bytes: Buffer }[] }
+
+class SesV2Fake {
+    readonly delivered: DeliveredEmail[] = []
+    endpoint = ''
+    private readonly server = createServer((request, response) => void this.handle(request, response))
+
+    static async start(): Promise<SesV2Fake> {
+        const fake = new SesV2Fake()
+        await new Promise<void>((resolve) => fake.server.listen(0, '127.0.0.1', resolve))
+        fake.endpoint = `http://127.0.0.1:${(fake.server.address() as AddressInfo).port}`
+        return fake
+    }
+
+    client(): SESv2Client {
+        return new SESv2Client({
+            region: 'us-east-1',
+            endpoint: this.endpoint,
+            credentials: { accessKeyId: 'AKIDEXAMPLE', secretAccessKey: 'example-secret' },
+        })
+    }
+
+    async close(): Promise<void> {
+        this.server.closeAllConnections()
+        await new Promise((resolve) => this.server.close(resolve))
+    }
+
+    private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+        const chunks: Buffer[] = []
+        for await (const chunk of request) {
+            chunks.push(chunk as Buffer)
+        }
+        if (request.method !== 'POST' || request.url !== '/v2/email/outbound-emails') {
+            response
+                .writeHead(404, { 'content-type': 'application/json', 'x-amzn-errortype': 'NotFoundException' })
+                .end(JSON.stringify({ message: `No route for ${request.method} ${request.url}` }))
+            return
+        }
+        const { Destination, Content } = parseJSON(Buffer.concat(chunks).toString())
+        this.delivered.push({
+            to: Destination.ToAddresses,
+            subject: Content.Simple.Subject.Data,
+            attachments: (Content.Simple.Attachments ?? []).map(
+                (attachment: { FileName: string; RawContent: string }) => ({
+                    filename: attachment.FileName,
+                    bytes: Buffer.from(attachment.RawContent, 'base64'),
+                })
+            ),
+        })
+        response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ MessageId: randomUUID() }))
+    }
+}
+
+class AttachmentStoreFake implements AttachmentStore {
+    loadsBeforeOutage = Infinity
+    private readonly files = new Map<string, Buffer>()
+
+    store(teamId: number, filename: string, bytes: Buffer): EmailAttachmentMetadata {
+        const sha256 = createHash('sha256').update(bytes).digest('hex')
+        this.files.set(`${teamId}/${sha256}`, bytes)
+        return { filename, contentType: 'application/pdf', sizeBytes: bytes.length, sha256 }
+    }
+
+    prepareUploads(): Promise<never> {
+        return Promise.reject(new Error('Sends in these tests reference files that are already stored'))
+    }
+
+    acceptForSend(): Promise<never> {
+        return Promise.reject(new Error('Sends in these tests reference files that are already stored'))
+    }
+
+    load(teamId: number, files: EmailAttachmentMetadata[]): Promise<LoadedAttachment[]> {
+        if (this.loadsBeforeOutage-- <= 0) {
+            return Promise.reject(new AttachmentStoreUnavailableError(new Error('The bucket did not answer')))
+        }
+        try {
+            return Promise.resolve(
+                files.map((file) => {
+                    const bytes = this.files.get(`${teamId}/${file.sha256}`)
+                    if (!bytes) {
+                        throw new AttachmentMissingError(file.sha256)
+                    }
+                    return { file, bytes }
+                })
+            )
+        } catch (error) {
+            return Promise.reject(error)
+        }
+    }
+}
+
+async function metricValue(name: string, labels: Record<string, string>, metricName = name): Promise<number> {
+    const metric = await register.getSingleMetric(name)!.get()
+    const values: { labels: Partial<Record<string, string | number>>; value: number; metricName?: string }[] =
+        metric.values
+    return values
+        .filter(
+            (value) =>
+                (value.metricName ?? name) === metricName &&
+                Object.entries(labels).every(([key, labelValue]) => value.labels[key] === labelValue)
+        )
+        .reduce((sum, value) => sum + value.value, 0)
+}
+
+describe('Hogflow Executor', () => {
+    let executor: HogFlowExecutorService
+    let cohortMembershipRepository: CohortMembershipRepository
+    let hogFlowFunctionsService: HogFlowFunctionsService
+    let recipientPreferencesService: RecipientPreferencesService
+    let emailValidationService: EmailValidationService
+    let hub: Hub
+    let team: Team
+    let integrationId: number
+    const mockFetch = jest.mocked(fetch)
+    const mockPushProviderFetch = jest.fn<ReturnType<TrackedPushFetch>, Parameters<TrackedPushFetch>>()
+
+    const createEmailService = ({
+        ses,
+        teamDailyCap,
+        suppressionDb,
+        store = null,
+    }: {
+        ses?: SesV2Fake
+        teamDailyCap?: number
+        suppressionDb?: PostgresRouter
+        store?: AttachmentStore | null
+    } = {}): EmailService => {
+        const teamEmailRateLimiter = teamDailyCap
+            ? new RateLimiterService(
+                  createRedisV2PoolFromConfig({
+                      connection: hub.CDP_REDIS_HOST
+                          ? {
+                                url: hub.CDP_REDIS_HOST,
+                                options: { port: hub.CDP_REDIS_PORT, password: hub.CDP_REDIS_PASSWORD },
+                            }
+                          : { url: hub.REDIS_URL },
+                      poolMinSize: hub.REDIS_POOL_MIN_SIZE,
+                      poolMaxSize: hub.REDIS_POOL_MAX_SIZE,
+                  }),
+                  { name: 'team-email-test' }
+              )
+            : null
+        const emailService = new EmailService(
+            {
+                sesAccessKeyId: hub.SES_ACCESS_KEY_ID,
+                sesSecretAccessKey: hub.SES_SECRET_ACCESS_KEY,
+                sesRegion: hub.SES_REGION,
+                sesEndpoint: ses?.endpoint ?? hub.SES_ENDPOINT,
+                sesTrackedConfigurationSet: hub.SES_TRACKED_CONFIGURATION_SET,
+                sesUntrackedConfigurationSet: hub.SES_UNTRACKED_CONFIGURATION_SET,
+                ...(teamDailyCap ? { teamEmailCapMode: 'enforce', teamEmailTierDailyCaps: [teamDailyCap] } : {}),
+            },
+            hub.integrationManager,
+            new TeamWorkflowsConfigService(hub.postgres, hub.pubSub),
+            hub.ENCRYPTION_SALT_KEYS,
+            hub.SITE_URL,
+            new EmailTrackingCodeSigner(hub.ENCRYPTION_SALT_KEYS, hub.CDP_EMAIL_TRACKING_URL),
+            new EmailSuppressionService(suppressionDb ?? hub.postgres, emailSuppressionConfigFromEnv()),
+            new RecipientsManagerService(hub.postgres),
+            null,
+            { report: jest.fn(), reportEmailSent: jest.fn() },
+            undefined,
+            null,
+            teamEmailRateLimiter,
+            store
+        )
+        if (ses) {
+            emailService.sesV2Client = ses.client()
+        }
+        return emailService
+    }
+
+    const createExecutor = (
+        emailService: EmailService
+    ): { executor: HogFlowExecutorService; hogFlowFunctionsService: HogFlowFunctionsService } => {
+        const hogInputsService = new HogInputsService(
+            hub.integrationManager,
+            new RecipientTokensService(hub.ENCRYPTION_SALT_KEYS, hub.SITE_URL),
+            hub.encryptedFields
+        )
+        const recipientTokensService = new RecipientTokensService(hub.ENCRYPTION_SALT_KEYS, hub.SITE_URL)
+        const hogExecutor = new HogExecutorAsyncService(
+            new HogExecutorService({ executionTimeoutMs: hub.CDP_WATCHER_HOG_COST_TIMING_UPPER_MS }, hogInputsService),
+            {
+                googleAdwordsDeveloperToken: hub.CDP_GOOGLE_ADWORDS_DEVELOPER_TOKEN,
+                fetchRetries: hub.CDP_FETCH_RETRIES,
+                fetchBackoffBaseMs: hub.CDP_FETCH_BACKOFF_BASE_MS,
+                fetchBackoffMaxMs: hub.CDP_FETCH_BACKOFF_MAX_MS,
+                siteUrl: hub.SITE_URL,
+                internalApiBaseUrl: hub.INTERNAL_API_BASE_URL,
+            },
+            {
+                teamManager: hub.teamManager,
+                conversationsTicketsJwt: new ScopedServiceJwt(
+                    PosthogJwtAudience.CONVERSATIONS_TICKETS,
+                    hub.CONVERSATIONS_TICKETS_JWT_SECRET
+                ),
+                customerAnalyticsAccountsJwt: new ScopedServiceJwt(
+                    PosthogJwtAudience.CUSTOMER_ANALYTICS_ACCOUNTS,
+                    hub.CUSTOMER_ANALYTICS_ACCOUNTS_JWT_SECRET
+                ),
+                hogInputsService,
+                emailService,
+                recipientTokensService,
+                pushNotificationService: new PushNotificationService(
+                    hub.integrationManager,
+                    hub.encryptedFields,
+                    {
+                        trackedFetch: mockPushProviderFetch,
+                        maxFetchTimeoutMs: 10000,
+                        maxRetries: 3,
+                        backoffBaseMs: 1000,
+                        backoffMaxMs: 30000,
+                    },
+                    undefined as any,
+                    undefined as any,
+                    { reportPushSent: () => Promise.resolve() }
+                ),
+            }
+        )
+        const hogFunctionTemplateManager = new HogFunctionTemplateManagerService(hub.postgres)
+        const hogFlowFunctionsService = new HogFlowFunctionsService(
+            hub.SITE_URL,
+            hogFunctionTemplateManager,
+            hogExecutor
+        )
+        const recipientsManager = new RecipientsManagerService(hub.postgres)
+        recipientPreferencesService = new RecipientPreferencesService(
+            recipientsManager,
+            new EmailSuppressionService(hub.postgres, emailSuppressionConfigFromEnv())
+        )
+        // Stubbed to always allow: this suite covers executor routing and flow control,
+        // not MX validation (email-validation.service.test.ts does), and the real
+        // service would fire live DNS lookups for the fixture recipients here.
+        emailValidationService = {
+            getSkipReason: () => Promise.resolve(null),
+        } as unknown as EmailValidationService
+        return {
+            executor: new HogFlowExecutorService(
+                hogFlowFunctionsService,
+                recipientPreferencesService,
+                emailValidationService,
+                cohortMembershipRepository,
+                hub.integrationManager,
+                null
+            ),
+            hogFlowFunctionsService,
+        }
+    }
+
+    beforeEach(async () => {
+        mockPushProviderFetch.mockReset()
+        const fixedTime = DateTime.fromObject({ year: 2025, month: 1, day: 1 }, { zone: 'UTC' })
+        jest.spyOn(Date, 'now').mockReturnValue(fixedTime.toMillis())
+
+        mockFetch.mockImplementation((): any => {
+            return {
+                status: 200,
+                text: () => Promise.resolve(JSON.stringify({ status: 200 })),
+            }
+        })
+
+        hub = await createHub({
+            SITE_URL: 'http://localhost:8000',
+        })
+        team = (await createTestTeamFixture(hub.postgres)).team
+        integrationId = uniqueTestId()
+        cohortMembershipRepository = {
+            getMemberCohortIds: () => Promise.resolve([]),
+            getCohortMembership: () => Promise.resolve(null),
+        }
+        ;({ executor, hogFlowFunctionsService } = createExecutor(createEmailService()))
+
+        await insertHogFunctionTemplate(hub.postgres, {
+            id: 'template-test-hogflow-executor',
+            name: 'Test Template',
+            code: `
+            print(f'Hello, {inputs.name}!')
+            print('Fetch 1', fetch('https://posthog.com').status)`,
+            inputs_schema: [
+                {
+                    key: 'name',
+                    type: 'string',
+                    required: true,
+                },
+            ],
+        })
+
+        await insertHogFunctionTemplate(hub.postgres, {
+            id: 'template-test-hogflow-executor-async',
+            name: 'Test template multi fetch',
+            code: `
+            print(f'Hello, {inputs.name}!')
+            print('Fetch 1', fetch('https://posthog.com').status)
+            print('Fetch 2', fetch('https://posthog.com').status)
+            print('Fetch 3', fetch('https://posthog.com').status)
+            print('All fetches done!')`,
+            inputs_schema: [
+                {
+                    key: 'name',
+                    type: 'string',
+                    required: true,
+                },
+            ],
+        })
+
+        await insertHogFunctionTemplate(hub.postgres, posthogCaptureTemplate)
+    })
+
+    describe('general event processing', () => {
+        let hogFlow: HogFlow
+
+        beforeEach(async () => {
+            hogFlow = new FixtureHogFlowBuilder()
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                            },
+                        },
+
+                        function_id_1: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-test-hogflow-executor',
+                                inputs: {
+                                    name: {
+                                        value: `Mr {event?.properties?.name}`,
+                                        bytecode: await compileHog(`return f'Mr {event?.properties?.name}'`),
+                                    },
+                                },
+                            },
+                        },
+
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [
+                        {
+                            from: 'trigger',
+                            to: 'function_id_1',
+                            type: 'continue',
+                        },
+                        {
+                            from: 'function_id_1',
+                            to: 'exit',
+                            type: 'continue',
+                        },
+                    ],
+                })
+                .build()
+        })
+
+        it('resuming past a completed action does not re-execute it (no double-send on recovery)', async () => {
+            // A recovered poison-pill run resumes from where it stalled. currentAction
+            // sits AFTER function_id_1 (which does a fetch), so replay must resume at
+            // exit and must NOT re-run that fetch — otherwise a recovered flow re-sends
+            // an email/webhook that already went out.
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    properties: {
+                        name: 'John Doe',
+                    },
+                    timestamp: '2026-01-30T20:20:20.200Z',
+                },
+            })
+            invocation.state.currentAction = {
+                id: 'exit',
+                startedAtTimestamp: DateTime.now().toMillis(),
+            }
+
+            const result = await executor.execute(invocation)
+
+            expect(result.finished).toBe(true)
+            expect(result.invocation.state.currentAction?.id).toBe('exit')
+            // The fetch-doing action before the resume point must not run again.
+            expect(mockFetch).toHaveBeenCalledTimes(0)
+            expect(result.logs.map((log) => log.message)).not.toContain('Executing action [Action:function_id_1]')
+        })
+
+        it('resuming a rerun onto an action removed by a later flow edit fails safe without re-running anything', async () => {
+            // #70792 restores currentAction on rerun. If the flow was edited after the run
+            // recorded its globals and the resume-point action was deleted, ensureCurrentAction
+            // can't find the id. The safe outcome is a finished, errored result — never a
+            // restart from the trigger (which would re-send) and never a hang.
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    properties: {
+                        name: 'John Doe',
+                    },
+                },
+            })
+            invocation.state.currentAction = {
+                id: 'action_removed_by_edit',
+                startedAtTimestamp: DateTime.now().toMillis(),
+            }
+
+            const result = await executor.execute(invocation)
+
+            expect(result.finished).toBe(true)
+            expect(result.error).toContain('action_removed_by_edit')
+            // Nothing already done gets re-run: the fetch-doing action never executes.
+            expect(mockFetch).toHaveBeenCalledTimes(0)
+            expect(result.logs.map((log) => log.message)).not.toContain('Executing action [Action:function_id_1]')
+        })
+
+        it('can execute a simple hogflow', async () => {
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    properties: {
+                        name: 'John Doe',
+                    },
+                    timestamp: '2026-01-30T20:20:20.200Z',
+                },
+            })
+
+            const result = await executor.execute(invocation)
+
+            expect(result).toEqual({
+                capturedPostHogEvents: [],
+                warehouseWebhookPayloads: [],
+                messageAssets: [],
+                conversionWatchers: [],
+                invocation: {
+                    state: {
+                        actionStepCount: 1,
+                        currentAction: {
+                            id: 'exit',
+                            startedAtTimestamp: expect.any(Number),
+                        },
+                        event: {
+                            distinct_id: 'distinct_id',
+                            elements_chain: '',
+                            event: 'test',
+                            properties: {
+                                name: 'John Doe',
+                            },
+                            timestamp: expect.any(String),
+                            url: 'http://localhost:8000/events/1',
+                            uuid: 'uuid',
+                        },
+                    },
+                    id: expect.any(String),
+                    teamId: 1,
+                    hogFlow: invocation.hogFlow,
+                    person: {
+                        id: 'person_id',
+                        name: 'John Doe',
+                        properties: {
+                            name: 'John Doe',
+                        },
+                        url: '',
+                    },
+                    filterGlobals: expect.any(Object),
+                    functionId: invocation.hogFlow.id,
+                    queue: 'hogflow',
+                    queueMetadata: undefined,
+                    queueScheduledAt: undefined,
+                    queueSource: undefined,
+                    queueParameters: undefined,
+                    queuePriority: 0,
+                },
+                finished: true,
+                logs: [
+                    {
+                        level: 'info',
+                        message:
+                            'Starting workflow execution at trigger for [Person:person_id|John Doe] on [Event:uuid|test|2026-01-30T20:20:20.200Z]',
+                        timestamp: expect.any(DateTime),
+                    },
+                    {
+                        level: 'debug',
+                        message: 'Executing action [Action:function_id_1]',
+                        timestamp: expect.any(DateTime),
+                    },
+                    {
+                        level: 'info',
+                        timestamp: expect.any(DateTime),
+                        message: '[Action:function_id_1] Hello, Mr John Doe!',
+                    },
+                    {
+                        level: 'info',
+                        timestamp: expect.any(DateTime),
+                        message: '[Action:function_id_1] Fetch 1, 200',
+                    },
+                    {
+                        level: 'debug',
+                        timestamp: expect.any(DateTime),
+                        message: expect.stringContaining('[Action:function_id_1] Function completed in'),
+                    },
+                    {
+                        level: 'info',
+                        timestamp: expect.any(DateTime),
+                        message: 'Workflow moved to action [Action:exit]',
+                    },
+                    {
+                        level: 'debug',
+                        timestamp: expect.any(DateTime),
+                        message: 'Executing action [Action:exit]',
+                    },
+                    {
+                        level: 'info',
+                        timestamp: expect.any(DateTime),
+                        message: 'Workflow completed',
+                    },
+                ],
+                metrics: [
+                    {
+                        team_id: hogFlow.team_id,
+                        app_source_id: hogFlow.id,
+                        metric_kind: 'other',
+                        metric_name: 'fetch',
+                        count: 1,
+                    },
+                    {
+                        team_id: hogFlow.team_id,
+                        app_source_id: hogFlow.id,
+                        instance_id: 'function_id_1',
+                        metric_kind: 'fetch',
+                        metric_name: 'billable_invocation',
+                        count: 1,
+                    },
+                    {
+                        team_id: hogFlow.team_id,
+                        app_source_id: hogFlow.id,
+                        instance_id: 'function_id_1',
+                        metric_kind: 'success',
+                        metric_name: 'succeeded',
+                        count: 1,
+                    },
+                    {
+                        team_id: hogFlow.team_id,
+                        app_source_id: hogFlow.id,
+                        instance_id: 'exit',
+                        metric_kind: 'success',
+                        metric_name: 'succeeded',
+                        count: 1,
+                    },
+                ],
+            })
+        })
+
+        it.each([
+            ['keeps the version a step rendered under', true, 2],
+            ['uses the live version for a step saved before the rendered version was stored', false, 3],
+        ])('%s when the workflow is republished before it sends', async (_name, storesRenderedVersion, expected) => {
+            await insertHogFunctionTemplate(hub.postgres, customerTaskTemplate)
+            const config = { template_id: customerTaskTemplate.id, inputs: { name: { value: 'Follow up' } } }
+            const renderedFlow = { ...hogFlow, version: 2 }
+            const invocation = createExampleHogFlowInvocation(renderedFlow, {
+                currentAction: { id: 'function_id_1', startedAtTimestamp: Date.now() },
+            })
+            const hogFunction = await hogFlowFunctionsService.buildHogFunction(renderedFlow, config)
+            const rendered = await hogFlowFunctionsService.buildHogFunctionInvocation(invocation, hogFunction, {
+                event: invocation.state.event,
+                person: invocation.person,
+            })
+            const { renderedWorkflowVersion, ...legacyState } = rendered.state
+            invocation.state.currentAction!.hogFunctionState = parseJSON(
+                JSON.stringify(storesRenderedVersion ? { ...legacyState, renderedWorkflowVersion } : legacyState)
+            )
+
+            invocation.hogFlow = { ...renderedFlow, version: 3 }
+            const resumed = await hogFlowFunctionsService.buildHogFunctionInvocation(invocation, hogFunction, {
+                event: invocation.state.event,
+                person: invocation.person,
+            })
+
+            expect(resumed.state.renderedWorkflowVersion).toBe(expected)
+        })
+
+        it.each([false, true])('keeps legacy task keys with saved function state: %s', async (hasSavedState) => {
+            await insertHogFunctionTemplate(hub.postgres, customerTaskTemplate)
+            const config = {
+                template_id: customerTaskTemplate.id,
+                inputs: { name: { value: 'Follow up' } },
+            }
+            hogFlow.actions = hogFlow.actions.map((action) =>
+                action.id === 'function_id_1' ? { ...action, type: 'function', config } : action
+            )
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                actionStepCount: 7,
+                rerunAttempts: 2,
+                currentAction: { id: 'function_id_1', startedAtTimestamp: Date.now() },
+            })
+            if (hasSavedState) {
+                const hogFunction = await hogFlowFunctionsService.buildHogFunction(hogFlow, config)
+                const functionInvocation = await hogFlowFunctionsService.buildHogFunctionInvocation(
+                    invocation,
+                    hogFunction,
+                    { event: invocation.state.event, person: invocation.person }
+                )
+                invocation.state.currentAction!.hogFunctionState = parseJSON(JSON.stringify(functionInvocation.state))
+            }
+            const internalFetchSpy = jest.mocked(internalFetch).mockResolvedValue({
+                status: 201,
+                text: () => Promise.resolve(JSON.stringify({ id: '00000000-0000-4000-8000-000000000000' })),
+            } as FetchResponse)
+            try {
+                const result = await executor.execute(invocation)
+                expect(result.error).toBeUndefined()
+                expect(result.finished).toBe(true)
+                expect(result.invocation.state.customerTaskIdempotencyVersion).toBeUndefined()
+                expect(internalFetchSpy).toHaveBeenCalledTimes(1)
+                expect(parseJSON(internalFetchSpy.mock.calls[0][1]!.body!.toString()).idempotency_key).toBe(
+                    `${invocation.id}:function_id_1`
+                )
+            } finally {
+                internalFetchSpy.mockReset()
+            }
+        })
+
+        it('creates distinct customer task keys when a conditional loop revisits the same action', async () => {
+            await insertHogFunctionTemplate(hub.postgres, customerTaskTemplate)
+            await insertHogFunctionTemplate(hub.postgres, setVariableTemplate)
+            const cyclicFlow = new FixtureHogFlowBuilder()
+                .withTeamId(team.id)
+                .withWorkflow({
+                    actions: {
+                        trigger: { type: 'trigger', config: { type: 'event', filters: {} } },
+                        customer_task: {
+                            type: 'function',
+                            on_error: 'abort',
+                            config: {
+                                template_id: customerTaskTemplate.id,
+                                inputs: { name: { value: 'Follow up' } },
+                            },
+                        },
+                        increment_visits: {
+                            type: 'function',
+                            on_error: 'abort',
+                            config: {
+                                template_id: setVariableTemplate.id,
+                                inputs: {
+                                    variable_value: {
+                                        value: '{variables.task_visits + 1}',
+                                        bytecode: await compileHog('return variables.task_visits + 1'),
+                                    },
+                                },
+                            },
+                            output_variable: { key: 'task_visits', result_path: null },
+                        },
+                        repeat: {
+                            type: 'conditional_branch',
+                            config: {
+                                conditions: [
+                                    {
+                                        filters: {
+                                            properties: [{ type: 'hogql', key: 'variables.task_visits < 2' }],
+                                            bytecode: await compileHog('return variables.task_visits < 2'),
+                                        },
+                                    },
+                                ],
+                            },
+                        },
+                        exit: { type: 'exit', config: {} },
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'customer_task', type: 'continue' },
+                        { from: 'customer_task', to: 'increment_visits', type: 'continue' },
+                        { from: 'increment_visits', to: 'repeat', type: 'continue' },
+                        { from: 'repeat', to: 'customer_task', type: 'branch', index: 0 },
+                        { from: 'repeat', to: 'exit', type: 'continue' },
+                    ],
+                })
+                .build()
+            const globals = createHogExecutionGlobals({ variables: { task_visits: 0 } })
+            const invocation = createHogFlowInvocation(globals, cyclicFlow, convertToHogFunctionFilterGlobal(globals))
+            const taskResponse = {
+                status: 201,
+                text: () => Promise.resolve(JSON.stringify({ id: '00000000-0000-4000-8000-000000000000' })),
+            } as FetchResponse
+            const internalFetchSpy = jest
+                .mocked(internalFetch)
+                .mockResolvedValueOnce(taskResponse)
+                .mockResolvedValueOnce(taskResponse)
+                .mockRejectedValue(new Error('Unexpected task visit'))
+            try {
+                const result = await executor.execute(invocation)
+
+                expect(result.error).toBeUndefined()
+                expect(result.finished).toBe(true)
+                expect(result.invocation.state).toMatchObject({
+                    customerTaskIdempotencyVersion: 1,
+                    actionStepCount: 6,
+                    currentAction: { id: 'exit' },
+                    variables: { task_visits: 2 },
+                })
+                expect(
+                    internalFetchSpy.mock.calls.map(([, params]) => parseJSON(params!.body!.toString()).idempotency_key)
+                ).toEqual([`${invocation.id}:customer_task:0`, `${invocation.id}:customer_task:3`])
+            } finally {
+                internalFetchSpy.mockReset()
+            }
+        })
+
+        it('can execute a hogflow with async function delays', async () => {
+            const action = hogFlow.actions.find((action) => action.id === 'function_id_1')!
+            ;(action.config as any).template_id = 'template-test-hogflow-executor-async'
+
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                customerTaskIdempotencyVersion: 1,
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    properties: {
+                        name: 'John Doe',
+                    },
+                    timestamp: '2026-01-30T20:20:20.200Z',
+                },
+            })
+
+            const result = await executor.execute(invocation)
+
+            expect(result.finished).toEqual(false)
+            expect(result.invocation.state).toMatchObject({
+                customerTaskIdempotencyVersion: 1,
+                actionStepCount: 0,
+                currentAction: {
+                    hogFunctionState: { customerTaskIdempotencyVersion: 1, actionStepCount: 0 },
+                },
+            })
+            expect(result.invocation.queueScheduledAt).toEqual(expect.any(DateTime))
+            expect(result.logs.map((log) => log.message)).toMatchInlineSnapshot(`
+                [
+                  "Starting workflow execution at trigger for [Person:person_id|John Doe] on [Event:uuid|test|2026-01-30T20:20:20.200Z]",
+                  "Executing action [Action:function_id_1]",
+                  "[Action:function_id_1] Hello, Mr John Doe!",
+                  "[Action:function_id_1] Fetch 1, 200",
+                  "Workflow will pause until 2025-01-01T00:00:00.000Z",
+                ]
+            `)
+
+            const result2 = await executor.execute(result.invocation)
+
+            expect(result2.finished).toEqual(false)
+            expect(result2.invocation.state).toMatchObject({
+                customerTaskIdempotencyVersion: 1,
+                actionStepCount: 0,
+                currentAction: {
+                    hogFunctionState: { customerTaskIdempotencyVersion: 1, actionStepCount: 0 },
+                },
+            })
+            expect(result2.logs.map((log) => log.message)).toMatchInlineSnapshot(`
+                [
+                  "Resuming workflow execution at [Action:function_id_1] on [Event:uuid|test|2026-01-30T20:20:20.200Z]",
+                  "Executing action [Action:function_id_1]",
+                  "[Action:function_id_1] Fetch 2, 200",
+                  "Workflow will pause until 2025-01-01T00:00:00.000Z",
+                ]
+            `)
+
+            const result3 = await executor.execute(result2.invocation)
+
+            expect(result3.finished).toEqual(true)
+            expect(result3.invocation.state.customerTaskIdempotencyVersion).toBe(1)
+            expect(cleanLogs(result3.logs.map((log) => log.message))).toMatchInlineSnapshot(`
+                [
+                  "Resuming workflow execution at [Action:function_id_1] on [Event:uuid|test|2026-01-30T20:20:20.200Z]",
+                  "Executing action [Action:function_id_1]",
+                  "[Action:function_id_1] Fetch 3, 200",
+                  "[Action:function_id_1] All fetches done!",
+                  "[Action:function_id_1] Function completed in REPLACEDms. Sync: 0ms. Mem: 0.099kb. Ops: 32. Event: 'http://localhost:8000/events/1'",
+                  "Workflow moved to action [Action:exit]",
+                  "Executing action [Action:exit]",
+                  "Workflow completed",
+                ]
+            `)
+        })
+
+        describe('action filtering', () => {
+            beforeEach(() => {
+                const action = hogFlow.actions.find((action) => action.id === 'function_id_1')!
+                action.filters = HOG_FILTERS_EXAMPLES.pageview_or_autocapture_filter.filters
+            })
+
+            it('should only run the action if the provided filters match', async () => {
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        event: '$pageview',
+                        properties: {
+                            $current_url: 'https://posthog.com',
+                        },
+                    },
+                })
+
+                const result = await executor.execute(invocation)
+
+                expect(result.finished).toEqual(true)
+                expect(mockFetch).toHaveBeenCalledTimes(1)
+                expect(
+                    result.metrics.find((x) => x.instance_id === 'function_id_1' && x.metric_name === 'succeeded')
+                ).toMatchObject({
+                    count: 1,
+                    instance_id: 'function_id_1',
+                    metric_kind: 'success',
+                    metric_name: 'succeeded',
+                })
+            })
+
+            it('should skip the action if the filters do not match', async () => {
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        event: 'not-a-pageview',
+                        properties: {
+                            $current_url: 'https://posthog.com',
+                        },
+                    },
+                })
+
+                const result = await executor.execute(invocation)
+
+                expect(result.finished).toEqual(true)
+                expect(mockFetch).toHaveBeenCalledTimes(0)
+                expect(result.metrics.find((x) => x.instance_id === 'function_id_1')).toMatchObject({
+                    count: 1,
+                    instance_id: 'function_id_1',
+                    metric_kind: 'other',
+                    metric_name: 'filtered',
+                })
+            })
+        })
+
+        describe('executeTest', () => {
+            it('executes only a single step at a time', async () => {
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        properties: {
+                            name: 'Debug User',
+                        },
+                        timestamp: '2026-01-30T20:20:20.200Z',
+                    },
+                })
+
+                // NOTE: Slightly contrived as we dont set the current action to trigger when creating the invocation
+                // but we do support it technically from the frontend
+                invocation.state.currentAction = {
+                    id: 'trigger',
+                    startedAtTimestamp: DateTime.now().toMillis(),
+                }
+
+                // First step: should process trigger and move to function_id_1, but not complete
+                const result1 = await executor.executeCurrentAction(invocation)
+                expect(result1.finished).toBe(false)
+                expect(result1.invocation.state.currentAction?.id).toBe('function_id_1')
+                expect(result1.logs.map((log) => log.message)).toEqual([
+                    'Executing action [Action:trigger]',
+                    'Workflow moved to action [Action:function_id_1]',
+                ])
+
+                // Second step: should process function_id_1 and move to exit, but not complete
+                const result2 = await executor.execute(result1.invocation)
+                expect(result2.finished).toBe(true)
+                expect(result2.invocation.state.currentAction?.id).toBe('exit')
+                expect(result2.logs.map((log) => log.message)).toEqual([
+                    'Resuming workflow execution at [Action:function_id_1] on [Event:uuid|test|2026-01-30T20:20:20.200Z]',
+                    'Executing action [Action:function_id_1]',
+                    '[Action:function_id_1] Hello, Mr Debug User!',
+                    '[Action:function_id_1] Fetch 1, 200',
+                    expect.stringContaining('[Action:function_id_1] Function completed in'),
+                    'Workflow moved to action [Action:exit]',
+                    'Executing action [Action:exit]',
+                    'Workflow completed',
+                ])
+            })
+
+            it('surfaces the matcher wake event in the resume log', async () => {
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        properties: { name: 'Debug User' },
+                        timestamp: '2026-01-30T20:20:20.200Z',
+                    },
+                })
+                // Woken by the matcher: the resume log should emit a linkable
+                // [Event:uuid|name|timestamp] token, not just echo the trigger event.
+                invocation.state.currentAction = {
+                    id: 'function_id_1',
+                    startedAtTimestamp: DateTime.now().toMillis(),
+                    eventMatched: true,
+                    eventMatchedEvent: 'subscription created',
+                    eventMatchedEventUuid: 'wake-uuid-123',
+                    eventMatchedEventTimestamp: '2026-01-30T21:00:00.000Z',
+                }
+
+                const result = await executor.execute(invocation)
+
+                expect(result.logs[0].message).toBe(
+                    'Resuming workflow execution at [Action:function_id_1] on [Event:uuid|test|2026-01-30T20:20:20.200Z] (woken by [Event:wake-uuid-123|subscription created|2026-01-30T21:00:00.000Z])'
+                )
+            })
+        })
+    })
+
+    describe('actions', () => {
+        const createHogFlow = (flow: SimpleHogFlowRepresentation): HogFlow => {
+            return new FixtureHogFlowBuilder()
+                .withExitCondition('exit_on_conversion')
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                            },
+                        },
+                        delay: {
+                            type: 'delay',
+                            config: {
+                                delay_duration: '2h',
+                            },
+                        },
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                        ...flow.actions,
+                    },
+                    edges: flow.edges,
+                })
+                .build()
+        }
+
+        describe('workflow definition changed mid-run', () => {
+            const buildFlow = (): HogFlow =>
+                createHogFlow({
+                    actions: {},
+                    edges: [
+                        { from: 'trigger', to: 'delay', type: 'continue' },
+                        { from: 'delay', to: 'exit', type: 'continue' },
+                    ],
+                })
+
+            it.each([
+                [
+                    'the current action was deleted',
+                    (hogFlow: HogFlow) => {
+                        hogFlow.actions = hogFlow.actions.filter((action) => action.id !== 'delay')
+                    },
+                ],
+                [
+                    'the current action no longer has a continue edge',
+                    (hogFlow: HogFlow) => {
+                        hogFlow.edges = hogFlow.edges.filter((edge) => edge.from !== 'delay')
+                    },
+                ],
+            ])('exits gracefully when %s', async (_desc, mutateFlow) => {
+                const hogFlow = buildFlow()
+                const invocation = createExampleHogFlowInvocation(hogFlow)
+                // Parked on the delay long enough that it has elapsed, so the handler advances
+                invocation.state.currentAction = {
+                    id: 'delay',
+                    startedAtTimestamp: DateTime.now().minus({ hours: 3 }).toMillis(),
+                }
+                mutateFlow(hogFlow)
+                // The flow was edited after the run arrived at the step - the live-edit case
+                hogFlow.updated_at = DateTime.now().toMillis()
+
+                const result = await executor.execute(invocation)
+
+                expect(result.finished).toBe(true)
+                expect(result.error).toBeUndefined()
+                const exitMetric = result.metrics.find((m) => m.metric_name === 'exited_workflow_changed')
+                expect(exitMetric).toMatchObject({ metric_kind: 'other', instance_id: 'delay' })
+                expect(result.metrics.map((m) => m.metric_name)).not.toContain('failed')
+                expect(result.logs.filter((l) => l.level === 'error')).toEqual([])
+                expect(result.logs.map((l) => l.message).join('\n')).toContain('Workflow exited')
+            })
+
+            it('still fails the run when the graph was malformed all along (no edit since the step started)', async () => {
+                const hogFlow = buildFlow()
+                const invocation = createExampleHogFlowInvocation(hogFlow)
+                invocation.state.currentAction = {
+                    id: 'delay',
+                    startedAtTimestamp: DateTime.now().minus({ hours: 3 }).toMillis(),
+                }
+                hogFlow.edges = hogFlow.edges.filter((edge) => edge.from !== 'delay')
+                // No edit since the run arrived: the missing edge is a bad definition, not a live edit
+                hogFlow.updated_at = DateTime.now().minus({ hours: 4 }).toMillis()
+
+                const result = await executor.execute(invocation)
+
+                expect(result.finished).toBe(true)
+                expect(result.error).toBe('No next action found for action delay')
+                expect(result.metrics.map((m) => m.metric_name)).toContain('failed')
+                expect(result.metrics.map((m) => m.metric_name)).not.toContain('exited_workflow_changed')
+            })
+
+            describe('skip-forward for deleted steps (action_redirects)', () => {
+                const parkOnDeleted = (
+                    hogFlow: HogFlow,
+                    actionId = 'delay'
+                ): ReturnType<typeof createExampleHogFlowInvocation> => {
+                    const invocation = createExampleHogFlowInvocation(hogFlow)
+                    invocation.state.currentAction = {
+                        id: actionId,
+                        startedAtTimestamp: DateTime.now().minus({ hours: 3 }).toMillis(),
+                    }
+                    hogFlow.actions = hogFlow.actions.filter((action) => action.id !== actionId)
+                    hogFlow.updated_at = DateTime.now().toMillis()
+                    return invocation
+                }
+
+                // A run can be parked on any async step type. The redirect never inspects the
+                // deleted step - it was removed before the run executed it - so every park type
+                // must take the identical path: same metric, same log, same landing spot.
+                it.each([
+                    ['delay', { type: 'delay', config: { delay_duration: '2h' } }],
+                    [
+                        'wait_until_condition',
+                        {
+                            type: 'wait_until_condition',
+                            config: {
+                                condition: { filters: HOG_FILTERS_EXAMPLES.elements_text_filter.filters },
+                                max_wait_duration: '10m',
+                            },
+                        },
+                    ],
+                    [
+                        'wait_until_time_window',
+                        {
+                            type: 'wait_until_time_window',
+                            config: { time: ['10:00', '11:00'], day: 'any', timezone: 'UTC' },
+                        },
+                    ],
+                ] as const)(
+                    'continues at the surviving successor instead of exiting (parked on %s)',
+                    async (_parkType, parkedAction) => {
+                        const hogFlow = createHogFlow({
+                            actions: { parked: parkedAction as any },
+                            edges: [
+                                { from: 'trigger', to: 'parked', type: 'continue' },
+                                { from: 'parked', to: 'exit', type: 'continue' },
+                            ],
+                        })
+                        const invocation = parkOnDeleted(hogFlow, 'parked')
+                        hogFlow.action_redirects = { parked: 'exit' }
+
+                        const result = await executor.execute(invocation)
+
+                        expect(result.finished).toBe(true)
+                        expect(result.error).toBeUndefined()
+                        const redirectMetric = result.metrics.find(
+                            (m) => m.metric_name === 'redirected_workflow_changed'
+                        )
+                        expect(redirectMetric).toMatchObject({ metric_kind: 'other', instance_id: 'parked' })
+                        expect(result.metrics.map((m) => m.metric_name)).not.toContain('exited_workflow_changed')
+                        expect(result.metrics.map((m) => m.metric_name)).not.toContain('failed')
+                        expect(result.logs.map((l) => l.message).join('\n')).toContain('continuing at [Action:exit]')
+                    }
+                )
+
+                it('enters the redirect target fresh, so a delay there parks from redirect time', async () => {
+                    // The run spent 3h on the deleted step; the 2h delay it redirects into must still
+                    // park for its full 2h rather than treating the old step entry time as its own
+                    const hogFlow = createHogFlow({
+                        actions: { delay_2: { type: 'delay', config: { delay_duration: '2h' } } },
+                        edges: [
+                            { from: 'trigger', to: 'delay', type: 'continue' },
+                            { from: 'delay', to: 'delay_2', type: 'continue' },
+                            { from: 'delay_2', to: 'exit', type: 'continue' },
+                        ],
+                    })
+                    const invocation = parkOnDeleted(hogFlow)
+                    hogFlow.action_redirects = { delay: 'delay_2' }
+
+                    const result = await executor.execute(invocation)
+
+                    expect(result.finished).toBe(false)
+                    expect(result.invocation.queueScheduledAt?.toMillis()).toEqual(
+                        DateTime.now().plus({ hours: 2 }).toMillis()
+                    )
+                })
+
+                it.each([
+                    [
+                        'the dead position has no map entry',
+                        (hogFlow: HogFlow) => {
+                            hogFlow.actions = hogFlow.actions.filter((action) => action.id !== 'delay')
+                        },
+                    ],
+                    [
+                        'the surviving position lost its edge (map keys are deleted steps only)',
+                        (hogFlow: HogFlow) => {
+                            hogFlow.edges = hogFlow.edges.filter((edge) => edge.from !== 'delay')
+                        },
+                    ],
+                ])('still exits gracefully when %s', async (_desc, mutateFlow) => {
+                    const hogFlow = buildFlow()
+                    const invocation = createExampleHogFlowInvocation(hogFlow)
+                    invocation.state.currentAction = {
+                        id: 'delay',
+                        startedAtTimestamp: DateTime.now().minus({ hours: 3 }).toMillis(),
+                    }
+                    mutateFlow(hogFlow)
+                    hogFlow.updated_at = DateTime.now().toMillis()
+                    // An entry for an unrelated deleted step must not capture this run
+                    hogFlow.action_redirects = { some_other_step: 'exit' }
+
+                    const result = await executor.execute(invocation)
+
+                    expect(result.finished).toBe(true)
+                    expect(result.error).toBeUndefined()
+                    expect(result.metrics.map((m) => m.metric_name)).toContain('exited_workflow_changed')
+                    expect(result.metrics.map((m) => m.metric_name)).not.toContain('redirected_workflow_changed')
+                })
+
+                it('never redirects a graph that was malformed all along, even with a map entry', async () => {
+                    const hogFlow = buildFlow()
+                    const invocation = createExampleHogFlowInvocation(hogFlow)
+                    invocation.state.currentAction = {
+                        id: 'delay',
+                        startedAtTimestamp: DateTime.now().minus({ hours: 3 }).toMillis(),
+                    }
+                    hogFlow.actions = hogFlow.actions.filter((action) => action.id !== 'delay')
+                    hogFlow.action_redirects = { delay: 'exit' }
+                    // No edit since the run arrived: the timestamp guard must run before any redirect
+                    hogFlow.updated_at = DateTime.now().minus({ hours: 4 }).toMillis()
+
+                    const result = await executor.execute(invocation)
+
+                    expect(result.finished).toBe(true)
+                    expect(result.error).toBe('Action delay not found')
+                    // Deleting the current action itself throws in ensureCurrentAction, before the
+                    // per-action failure metric is emitted - so the loud failure surfaces via
+                    // result.error rather than a 'failed' metric (unlike a deleted *edge*, which
+                    // throws inside the action handler where the metric is tracked).
+                    expect(result.metrics.map((m) => m.metric_name)).not.toContain('redirected_workflow_changed')
+                })
+
+                it('fails the run (no loop) when the redirect target itself dead-ends', async () => {
+                    // The target enters with a fresh step timestamp, so its own structural miss no
+                    // longer classifies as a live edit - it must surface as a plain failure. Uses a
+                    // trigger target so the dead end throws synchronously on entry (a delay would
+                    // park first and only fail on the next wake, which one execute() can't observe).
+                    const hogFlow = createHogFlow({
+                        actions: { hop: { type: 'trigger', config: { type: 'schedule' } } },
+                        edges: [
+                            { from: 'trigger', to: 'delay', type: 'continue' },
+                            { from: 'delay', to: 'hop', type: 'continue' },
+                            { from: 'hop', to: 'exit', type: 'continue' },
+                        ],
+                    })
+                    const invocation = parkOnDeleted(hogFlow)
+                    hogFlow.edges = hogFlow.edges.filter((edge) => edge.from !== 'hop')
+                    hogFlow.action_redirects = { delay: 'hop' }
+
+                    const result = await executor.execute(invocation)
+
+                    expect(result.finished).toBe(true)
+                    expect(result.error).toBe('No next action found for action hop')
+                    expect(result.metrics.map((m) => m.metric_name)).toContain('redirected_workflow_changed')
+                    expect(result.metrics.map((m) => m.metric_name)).toContain('failed')
+                })
+            })
+        })
+
+        // The follow-live contract: the worker re-reads live config on every wake, so edits made
+        // while a run is parked take effect the next time that run executes. These tests pin the
+        // per-edit-type semantics down as a contract rather than emergent behavior. Note the wake
+        // itself still happens at the originally scheduled time - only what happens ON wake is
+        // recomputed from the edited config.
+        describe('follow-live contract: edits picked up on wake', () => {
+            const parkAt = (
+                hogFlow: HogFlow,
+                actionId: string,
+                agoMs: number
+            ): ReturnType<typeof createExampleHogFlowInvocation> => {
+                const invocation = createExampleHogFlowInvocation(hogFlow)
+                invocation.state.currentAction = {
+                    id: actionId,
+
+                    startedAtTimestamp: DateTime.now().minus({ milliseconds: agoMs }).toMillis(),
+                }
+                return invocation
+            }
+
+            const editFlow = (hogFlow: HogFlow, mutate: (hogFlow: HogFlow) => void): void => {
+                mutate(hogFlow)
+                hogFlow.updated_at = DateTime.now().toMillis()
+            }
+
+            describe('delay duration edits', () => {
+                const buildDelayFlow = (duration: string): HogFlow =>
+                    createHogFlow({
+                        actions: { delay: { type: 'delay', config: { delay_duration: duration } } },
+                        edges: [
+                            { from: 'trigger', to: 'delay', type: 'continue' },
+                            { from: 'delay', to: 'exit', type: 'continue' },
+                        ],
+                    })
+
+                it.each([
+                    // parkedAgo is relative to the fixed test clock; expectedParkOffsetMs is relative
+                    // to the step's startedAtTimestamp (null = the run advances instead of re-parking)
+                    {
+                        name: 'a shortened delay that has already elapsed advances on wake with no extra wait',
+                        initial: '7d',
+                        edited: '1d',
+                        parkedAgo: { days: 3 },
+                        expectedParkOffsetMs: null,
+                    },
+                    {
+                        name: 'a shortened delay still pending re-parks at startedAt + new duration',
+                        initial: '7d',
+                        edited: '5d',
+                        parkedAgo: { days: 3 },
+                        expectedParkOffsetMs: 5 * 24 * 60 * 60 * 1000,
+                    },
+                    {
+                        name: 'a lengthened delay woken at its old expiry re-parks for the remainder',
+                        initial: '1d',
+                        edited: '7d',
+                        parkedAgo: { days: 1, minutes: 1 },
+                        expectedParkOffsetMs: 7 * 24 * 60 * 60 * 1000,
+                    },
+                ])('$name', async ({ initial, edited, parkedAgo, expectedParkOffsetMs }) => {
+                    const hogFlow = buildDelayFlow(initial)
+                    const invocation = parkAt(hogFlow, 'delay', Duration.fromObject(parkedAgo).toMillis())
+                    editFlow(hogFlow, (flow) => {
+                        const delayAction = flow.actions.find((a) => a.id === 'delay')!
+                        ;(delayAction.config as any).delay_duration = edited
+                    })
+
+                    const result = await executor.execute(invocation)
+
+                    if (expectedParkOffsetMs === null) {
+                        expect(result.finished).toBe(true)
+                        expect(result.error).toBeUndefined()
+                        expect(result.invocation.queueScheduledAt).toBeUndefined()
+                        expect(result.invocation.state.currentAction?.id).toBe('exit')
+                    } else {
+                        expect(result.finished).toBe(false)
+                        expect(result.invocation.queueScheduledAt?.toMillis()).toBe(
+                            invocation.state.currentAction!.startedAtTimestamp + expectedParkOffsetMs
+                        )
+                        // Parked without advancing: the run is still standing on the delay step
+                        expect(result.invocation.state.currentAction?.id).toBe('delay')
+                    }
+                })
+            })
+
+            it('a run parked before its message step was protected is protected from its next wake', async () => {
+                const hogFlow = createHogFlow({
+                    actions: {
+                        delay: { type: 'delay', config: { delay_duration: '7d' } },
+                        message: {
+                            type: 'function_push',
+                            config: { template_id: 'template-native-push', inputs: {} },
+                        } as any,
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'delay', type: 'continue' },
+                        { from: 'delay', to: 'message', type: 'continue' },
+                        { from: 'message', to: 'exit', type: 'continue' },
+                    ],
+                })
+                const invocation = parkAt(hogFlow, 'delay', Duration.fromObject({ days: 1 }).toMillis())
+                expect(invocation.state.sensitive).toBeUndefined()
+                editFlow(hogFlow, (flow) => {
+                    ;(flow.actions.find((a) => a.id === 'message')!.config as any).sensitive = true
+                })
+
+                const result = await executor.execute(invocation)
+
+                expect(result.invocation.state.currentAction?.id).toBe('delay')
+                expect(result.invocation.state.sensitive).toBe(true)
+            })
+
+            describe('wait_until_time_window edits', () => {
+                // The fixed test clock is 2025-01-01T00:00:00Z (a Wednesday)
+                const buildWindowFlow = (config: Record<string, any>): HogFlow =>
+                    createHogFlow({
+                        actions: { window: { type: 'wait_until_time_window', config } },
+                        edges: [
+                            { from: 'trigger', to: 'window', type: 'continue' },
+                            { from: 'window', to: 'exit', type: 'continue' },
+                        ],
+                    })
+
+                it.each([
+                    {
+                        name: 'a window edited to be open now advances on wake',
+                        edited: { time: 'any', day: 'any', timezone: 'UTC' },
+                        expectedParkIso: null,
+                    },
+                    {
+                        name: 'an edited window re-parks at the new window start',
+                        edited: { time: ['05:00', '06:00'], day: 'any', timezone: 'UTC' },
+                        expectedParkIso: '2025-01-01T05:00:00.000Z',
+                    },
+                ])('$name', async ({ edited, expectedParkIso }) => {
+                    // Parked on a window that is closed at the fixed test time
+                    const hogFlow = buildWindowFlow({ time: ['10:00', '11:00'], day: 'any', timezone: 'UTC' })
+                    const invocation = parkAt(hogFlow, 'window', 60 * 60 * 1000)
+                    editFlow(hogFlow, (flow) => {
+                        const windowAction = flow.actions.find((a) => a.id === 'window')!
+                        windowAction.config = edited as any
+                    })
+
+                    const result = await executor.execute(invocation)
+
+                    if (expectedParkIso === null) {
+                        expect(result.finished).toBe(true)
+                        expect(result.error).toBeUndefined()
+                        expect(result.invocation.state.currentAction?.id).toBe('exit')
+                    } else {
+                        expect(result.finished).toBe(false)
+                        expect(result.invocation.queueScheduledAt?.toUTC().toISO()).toBe(expectedParkIso)
+                        expect(result.invocation.state.currentAction?.id).toBe('window')
+                    }
+                })
+            })
+
+            describe('graph edits around the run position', () => {
+                const buildFlow = (): HogFlow =>
+                    createHogFlow({
+                        actions: {},
+                        edges: [
+                            { from: 'trigger', to: 'delay', type: 'continue' },
+                            { from: 'delay', to: 'exit', type: 'continue' },
+                        ],
+                    })
+
+                const addDelayAction = (hogFlow: HogFlow, id: string): void => {
+                    hogFlow.actions.push({
+                        id,
+                        name: id,
+                        description: id,
+                        type: 'delay',
+                        config: { delay_duration: '2h' },
+                        created_at: Date.now(),
+                        updated_at: Date.now(),
+                        on_error: 'continue',
+                    } as any)
+                }
+
+                it('a step inserted after the run position executes when reached (live edges are followed)', async () => {
+                    const hogFlow = buildFlow()
+                    // Parked on the (2h) delay long enough that it advances on wake
+                    const invocation = parkAt(hogFlow, 'delay', 3 * 60 * 60 * 1000)
+                    editFlow(hogFlow, (flow) => {
+                        addDelayAction(flow, 'delay_b')
+                        flow.edges = [
+                            { from: 'trigger', to: 'delay', type: 'continue' },
+                            { from: 'delay', to: 'delay_b', type: 'continue' },
+                            { from: 'delay_b', to: 'exit', type: 'continue' },
+                        ]
+                    })
+
+                    const result = await executor.execute(invocation)
+
+                    // The run advanced onto the inserted step and parked there for its full duration
+                    expect(result.finished).toBe(false)
+                    expect(result.invocation.state.currentAction?.id).toBe('delay_b')
+                    expect(result.invocation.queueScheduledAt?.toMillis()).toBe(
+                        DateTime.now().plus({ hours: 2 }).toMillis()
+                    )
+                })
+
+                it('a step inserted behind the run position never executes for it (the past does not re-run)', async () => {
+                    const hogFlow = buildFlow()
+                    const invocation = parkAt(hogFlow, 'delay', 3 * 60 * 60 * 1000)
+                    editFlow(hogFlow, (flow) => {
+                        addDelayAction(flow, 'delay_early')
+                        flow.edges = [
+                            { from: 'trigger', to: 'delay_early', type: 'continue' },
+                            { from: 'delay_early', to: 'delay', type: 'continue' },
+                            { from: 'delay', to: 'exit', type: 'continue' },
+                        ]
+                    })
+
+                    const result = await executor.execute(invocation)
+
+                    expect(result.finished).toBe(true)
+                    expect(result.error).toBeUndefined()
+                    expect(result.invocation.queueScheduledAt).toBeUndefined()
+                    expect(result.logs.map((l) => l.message).join('\n')).not.toContain('delay_early')
+                })
+            })
+
+            it('an in-progress function step completes with the inputs rendered before the edit', async () => {
+                // Two fetches so the function pauses mid-execution: the run parks between them
+                // with its rendered inputs stored in hogFunctionState
+                await insertHogFunctionTemplate(hub.postgres, {
+                    id: 'template-test-follow-live-paused',
+                    name: 'Prints an input before and after an async pause',
+                    code: `
+                    print('Rendered as', inputs.name);
+                    fetch('https://posthog.com');
+                    fetch('https://posthog.com');
+                    print('Still', inputs.name);`,
+                    inputs_schema: [{ key: 'name', type: 'string', required: true }],
+                })
+
+                const hogFlow = createHogFlow({
+                    actions: {
+                        function_1: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-test-follow-live-paused',
+                                inputs: {
+                                    name: { value: 'Original', bytecode: await compileHog(`return 'Original'`) },
+                                },
+                            },
+                        },
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'function_1', type: 'continue' },
+                        { from: 'function_1', to: 'exit', type: 'continue' },
+                    ],
+                })
+
+                const invocation = createExampleHogFlowInvocation(hogFlow)
+
+                // First execution renders the inputs and pauses inside the function at the fetch
+                const pausedResult = await executor.execute(invocation)
+                expect(pausedResult.finished).toBe(false)
+                expect(pausedResult.invocation.state.currentAction?.hogFunctionState).toEqual(expect.any(Object))
+                expect(pausedResult.logs.map((l) => l.message).join('\n')).toContain('Rendered as, Original')
+
+                // Edit the input while the run is paused inside the step
+                editFlow(hogFlow, (flow) => {
+                    const action = flow.actions.find((a) => a.id === 'function_1')!
+                    ;(action.config as any).inputs.name.value = 'Edited'
+                })
+                ;(hogFlow.actions.find((a) => a.id === 'function_1')!.config as any).inputs.name.bytecode =
+                    await compileHog(`return 'Edited'`)
+
+                // The continuation completes as prepared: inputs were rendered at step entry
+                const result = await executor.execute(pausedResult.invocation)
+                expect(result.finished).toBe(true)
+                expect(result.error).toBeUndefined()
+                const messages = result.logs.map((l) => l.message).join('\n')
+                expect(messages).toContain('Still, Original')
+                expect(messages).not.toContain('Edited')
+            })
+
+            // The cases above wake at the natural time; these wake EARLY — as the timing-edit
+            // reschedule sweep (#66380) and the subscription matcher do. Early wake must be
+            // behaviourally idempotent: the run re-parks at its unchanged target (never advancing
+            // currentAction, so the job row's action_id keeps naming the wait step), or runs the
+            // step's new handler when the type changed under it. Bulk-rescheduling parked jobs is
+            // only safe while these hold.
+            describe('early wakes (reschedule sweep contract)', () => {
+                it('a delay woken early with unchanged config re-parks at its original target', async () => {
+                    const hogFlow = createHogFlow({
+                        actions: { delay: { type: 'delay', config: { delay_duration: '7d' } } },
+                        edges: [
+                            { from: 'trigger', to: 'delay', type: 'continue' },
+                            { from: 'delay', to: 'exit', type: 'continue' },
+                        ],
+                    })
+                    const invocation = parkAt(hogFlow, 'delay', Duration.fromObject({ days: 2 }).toMillis())
+
+                    const result = await executor.execute(invocation)
+
+                    expect(result.finished).toBe(false)
+                    expect(result.invocation.queueScheduledAt?.toMillis()).toBe(
+                        invocation.state.currentAction!.startedAtTimestamp + Duration.fromObject({ days: 7 }).toMillis()
+                    )
+                    expect(result.invocation.state.currentAction?.id).toBe('delay')
+                })
+
+                it('a time window woken early with unchanged config re-parks at the original window start', async () => {
+                    // The window is closed at the fixed test time (2025-01-01T00:00:00Z)
+                    const hogFlow = createHogFlow({
+                        actions: {
+                            window: {
+                                type: 'wait_until_time_window',
+                                config: { time: ['10:00', '11:00'], day: 'any', timezone: 'UTC' },
+                            },
+                        },
+                        edges: [
+                            { from: 'trigger', to: 'window', type: 'continue' },
+                            { from: 'window', to: 'exit', type: 'continue' },
+                        ],
+                    })
+                    const invocation = parkAt(hogFlow, 'window', 60 * 60 * 1000)
+
+                    const result = await executor.execute(invocation)
+
+                    expect(result.finished).toBe(false)
+                    expect(result.invocation.queueScheduledAt?.toUTC().toISO()).toBe('2025-01-01T10:00:00.000Z')
+                    expect(result.invocation.state.currentAction?.id).toBe('window')
+                })
+
+                it("a step whose type changed while a run was parked on it runs the new type's handler on wake", async () => {
+                    const hogFlow = createHogFlow({
+                        actions: { delay: { type: 'delay', config: { delay_duration: '7d' } } },
+                        edges: [
+                            { from: 'trigger', to: 'delay', type: 'continue' },
+                            { from: 'delay', to: 'exit', type: 'continue' },
+                        ],
+                    })
+                    const invocation = parkAt(hogFlow, 'delay', Duration.fromObject({ days: 2 }).toMillis())
+                    editFlow(hogFlow, (flow) => {
+                        const action = flow.actions.find((a) => a.id === 'delay')!
+                        action.type = 'wait_until_time_window'
+                        action.config = { time: 'any', day: 'any', timezone: 'UTC' } as any
+                    })
+
+                    const result = await executor.execute(invocation)
+
+                    // The always-open window handler runs and the run advances
+                    expect(result.finished).toBe(true)
+                    expect(result.error).toBeUndefined()
+                    expect(result.invocation.state.currentAction?.id).toBe('exit')
+                })
+            })
+        })
+
+        describe('early exit conditions', () => {
+            let hogFlow: HogFlow
+
+            beforeEach(async () => {
+                // Setup: exit if person no longer matches trigger filters
+                hogFlow = new FixtureHogFlowBuilder()
+                    .withExitCondition('exit_only_at_end')
+                    .withWorkflow({
+                        actions: {
+                            trigger: {
+                                type: 'trigger',
+                                config: {
+                                    type: 'event',
+                                    filters: HOG_FILTERS_EXAMPLES.pageview_or_autocapture_filter.filters ?? {},
+                                },
+                            },
+                            function_id_1: {
+                                type: 'function',
+                                config: {
+                                    template_id: 'template-test-hogflow-executor',
+                                    inputs: {
+                                        name: {
+                                            value: `Mr {event?.properties?.name}`,
+                                            bytecode: await compileHog(`return f'Mr {event?.properties?.name}'`),
+                                        },
+                                    },
+                                },
+                            },
+                            exit: {
+                                type: 'exit',
+                                config: {},
+                            },
+                        },
+                        edges: [
+                            { from: 'trigger', to: 'function_id_1', type: 'continue' },
+                            { from: 'function_id_1', to: 'exit', type: 'continue' },
+                        ],
+                    })
+                    .build()
+            })
+
+            it('should not exit early if exit condition is exit_only_at_end', async () => {
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        event: '$pageview',
+                        properties: { name: 'John Doe', $current_url: 'https://posthog.com' },
+                    },
+                })
+
+                // Step 1: run first action (function_id_1)
+                const result1 = await executor.execute(invocation)
+                expect(result1.finished).toBe(true)
+                // Metrics: 'fetch' from function_id_1, 'billable_invocation' from function_id_1, 'succeeded' from function_id_1, 'succeeded' from exit action
+                expect(result1.metrics.map((m) => m.metric_name)).toEqual([
+                    'fetch',
+                    'billable_invocation',
+                    'succeeded',
+                    'succeeded',
+                ])
+
+                const invocation2 = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        event: 'not-a-pageview',
+                        properties: { name: 'John Doe', $current_url: 'https://posthog.com' },
+                    },
+                })
+
+                // Step 2: run again, should NOT exit early due to exit_only_at_end
+                const result2 = await executor.execute(invocation2)
+                expect(result2.finished).toBe(true)
+                // Metrics: 'fetch' from function_id_1, 'billable_invocation' from function_id_1, 'succeeded' from function_id_1, 'succeeded' from exit action
+                expect(result2.metrics.map((m) => m.metric_name)).toEqual([
+                    'fetch',
+                    'billable_invocation',
+                    'succeeded',
+                    'succeeded',
+                ])
+            })
+
+            it('should exit early if exit condition is exit_on_conversion', async () => {
+                hogFlow.exit_condition = 'exit_on_conversion'
+                hogFlow.conversion = {
+                    filters: [
+                        {
+                            key: '$browser',
+                            type: 'person',
+                            value: ['Chrome'],
+                            operator: 'exact',
+                        },
+                    ],
+                    bytecode: ['_H', 1, 32, 'Chrome', 32, '$browser', 32, 'properties', 32, 'person', 1, 3, 11],
+                }
+
+                // Person does not match conversion filters yet
+                const invocation = createExampleHogFlowInvocation(
+                    hogFlow,
+                    {
+                        event: {
+                            ...createHogExecutionGlobals().event,
+                            event: '$pageview',
+                            properties: { name: 'John Doe', $current_url: 'https://posthog.com' },
+                        },
+                    },
+                    {
+                        properties: {
+                            $browser: 'Firefox',
+                        },
+                    }
+                )
+
+                const result1 = await executor.execute(invocation)
+                expect(result1.finished).toBe(true)
+                // Metrics: 'fetch' from function_id_1, 'billable_invocation' from function_id_1, 'succeeded' from function_id_1, 'succeeded' from exit action
+                expect(result1.metrics.map((m) => m.metric_name)).toEqual([
+                    'fetch',
+                    'billable_invocation',
+                    'succeeded',
+                    'succeeded',
+                ])
+
+                const invocation2 = createExampleHogFlowInvocation(
+                    hogFlow,
+                    {
+                        event: {
+                            ...createHogExecutionGlobals().event,
+                            event: '$pageview',
+                            properties: { name: 'John Doe', $current_url: 'https://posthog.com' },
+                        },
+                    },
+                    {
+                        properties: {
+                            $browser: 'Chrome',
+                        },
+                    }
+                )
+                invocation2.queueCreatedAt = DateTime.fromISO('2026-11-01T09:59:58Z')
+                const result2 = await executor.execute(invocation2)
+                expect(result2.finished).toBe(true)
+                // The property-based conversion is also counted on the exit path
+                expect(result2.metrics.map((m) => m.metric_name)).toEqual([
+                    'early_exit',
+                    'conversion',
+                    'conversion_by_start',
+                ])
+                expect(
+                    result2.metrics
+                        .find((m) => m.metric_name === 'conversion_by_start')
+                        ?.timestamp?.toUTC()
+                        .toISO()
+                ).toEqual('2026-11-01T09:59:58.000Z')
+                expect(result2.logs.map((log) => log.message)).toMatchInlineSnapshot(`
+                    [
+                      "Workflow exited early due to exit condition: exit_on_conversion ([Person:person_id|John Doe] matches conversion filters)",
+                    ]
+                `)
+            })
+
+            it('should exit early if exit condition is exit_on_trigger_not_matched', async () => {
+                hogFlow.exit_condition = 'exit_on_trigger_not_matched'
+                hogFlow.trigger = {
+                    type: 'event',
+                    filters: HOG_FILTERS_EXAMPLES.pageview_or_autocapture_filter.filters ?? {},
+                }
+
+                const invocation1 = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        event: '$pageview',
+                        properties: { name: 'John Doe', $current_url: 'https://posthog.com' },
+                    },
+                })
+
+                const result1 = await executor.execute(invocation1)
+                expect(result1.finished).toBe(true)
+                expect(result1.metrics.map((m) => m.metric_name)).toEqual([
+                    'fetch',
+                    'billable_invocation',
+                    'succeeded',
+                    'succeeded',
+                ])
+
+                const invocation2 = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        event: '$not-a-pageview',
+                        properties: { name: 'John Doe', $current_url: 'https://posthog.com' },
+                    },
+                })
+
+                const result2 = await executor.execute(invocation2)
+                expect(result2.finished).toBe(true)
+                expect(result2.metrics.map((m) => m.metric_name)).toEqual(['early_exit'])
+                expect(result2.logs.map((log) => log.message)).toMatchInlineSnapshot(`
+                    [
+                      "Workflow exited early due to exit condition: exit_on_trigger_not_matched ([Person:person_id|John Doe] no longer matches trigger filters)",
+                    ]
+                `)
+            })
+
+            const caughtUp = { inCohort: false, caughtUp: true }
+            it.each([
+                [
+                    'an entered trigger while the person is in the cohort',
+                    'entered',
+                    { inCohort: true, caughtUp: null },
+                    false,
+                    false,
+                    null,
+                    true,
+                ],
+                [
+                    'an entered trigger after the person left the cohort',
+                    'entered',
+                    { inCohort: false, caughtUp: null },
+                    true,
+                    false,
+                    'left cohort 42',
+                    true,
+                ],
+                [
+                    'a left trigger after the person rejoined the cohort',
+                    'left',
+                    { inCohort: true, caughtUp: null },
+                    true,
+                    false,
+                    'rejoined cohort 42',
+                    true,
+                ],
+                // The person can leave before any read sees them in, so the version stamp is what shows freshness.
+                [
+                    'an entered trigger whose row is past the trigger version',
+                    'entered',
+                    caughtUp,
+                    false,
+                    false,
+                    'left cohort 42',
+                    true,
+                ],
+                // The trigger moved to this cohort while the run was parked, so no enrolling write is pending.
+                [
+                    'an entered trigger that changed cohort since the run enrolled',
+                    'entered',
+                    { inCohort: false, caughtUp: false },
+                    false,
+                    false,
+                    'left cohort 42',
+                    true,
+                    7,
+                ],
+                // The membership writer lags the trigger consumer, so these reads can still show the old state.
+                [
+                    'an entered trigger the table has not caught up with',
+                    'entered',
+                    { inCohort: false, caughtUp: null },
+                    false,
+                    false,
+                    null,
+                    undefined,
+                ],
+                [
+                    'a left trigger whose row is older than the trigger version',
+                    'left',
+                    { inCohort: false, caughtUp: false },
+                    false,
+                    false,
+                    null,
+                    undefined,
+                ],
+                ['a left trigger the table has no row for yet', 'left', null, false, false, null, undefined],
+                ['a membership lookup that fails', 'entered', null, true, true, null, true],
+            ])(
+                'cohort trigger exit check: %s',
+                async (
+                    _name,
+                    transition,
+                    membership,
+                    confirmedBefore,
+                    lookupFails,
+                    expectedReason,
+                    confirmedAfter,
+                    enrolledCohortId = 42
+                ) => {
+                    hogFlow.exit_condition = 'exit_on_trigger_not_matched'
+                    hogFlow.trigger = { type: 'cohort', cohort_id: 42, transition: transition as 'entered' | 'left' }
+                    const lookup = jest.spyOn(cohortMembershipRepository, 'getCohortMembership')
+                    if (lookupFails) {
+                        lookup.mockRejectedValue(new Error('behavioral cohorts db unreachable'))
+                    } else {
+                        lookup.mockResolvedValue(membership)
+                    }
+                    const invocation = createExampleHogFlowInvocation(hogFlow, {
+                        event: {
+                            ...createHogExecutionGlobals().event,
+                            event: '$cohort_membership_changed',
+                            properties: {
+                                name: 'John Doe',
+                                cohort_id: enrolledCohortId,
+                                status: transition,
+                                $membership_version: '2026-10-20 10:00:00.000000',
+                            },
+                        },
+                    })
+                    if (confirmedBefore) {
+                        invocation.state.cohortTriggerConfirmed = true
+                    }
+
+                    const result = await executor.execute(invocation)
+
+                    if (expectedReason) {
+                        expect(result.metrics.map((m) => m.metric_name)).toEqual(['early_exit'])
+                        expect(result.logs.map((log) => log.message)).toEqual([
+                            `Workflow exited early due to exit condition: exit_on_trigger_not_matched ([Person:person_id|John Doe] ${expectedReason})`,
+                        ])
+                    } else {
+                        expect(result.metrics.map((m) => m.metric_name)).not.toContain('early_exit')
+                    }
+                    expect(lookup).toHaveBeenCalledWith(
+                        hogFlow.team_id,
+                        'person_id',
+                        42,
+                        enrolledCohortId === 42 ? '2026-10-20 10:00:00.000000' : undefined
+                    )
+                    expect(result.invocation.state.cohortTriggerConfirmed).toBe(confirmedAfter)
+                }
+            )
+
+            it('does not look up cohort membership when the exit condition ignores the trigger', async () => {
+                hogFlow.exit_condition = 'exit_only_at_end'
+                hogFlow.trigger = { type: 'cohort', cohort_id: 42, transition: 'entered' }
+                const lookup = jest.spyOn(cohortMembershipRepository, 'getCohortMembership').mockResolvedValue(null)
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: { ...createHogExecutionGlobals().event, properties: { name: 'John Doe' } },
+                })
+                invocation.state.currentAction = { id: 'function_id_1', startedAtTimestamp: Date.now() }
+
+                const result = await executor.execute(invocation)
+
+                expect(result.metrics.map((m) => m.metric_name)).not.toContain('early_exit')
+                expect(lookup).not.toHaveBeenCalled()
+            })
+
+            it('should exit early if exit condition is exit_on_trigger_not_matched_or_conversion', async () => {
+                // Setup: exit if person no longer matches trigger filters or person matches conversion filters
+                hogFlow.exit_condition = 'exit_on_trigger_not_matched_or_conversion'
+                hogFlow.trigger = {
+                    type: 'event',
+                    filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                }
+                hogFlow.conversion = {
+                    filters: [
+                        {
+                            key: '$browser',
+                            type: 'person',
+                            value: ['Chrome'],
+                            operator: 'exact',
+                        },
+                    ],
+                    bytecode: ['_H', 1, 32, 'Chrome', 32, '$browser', 32, 'properties', 32, 'person', 1, 3, 11],
+                }
+
+                // Person does not match conversion filters yet
+                const invocation = createExampleHogFlowInvocation(
+                    hogFlow,
+                    {
+                        event: {
+                            ...createHogExecutionGlobals().event,
+                            event: '$not-a-pageview',
+                            properties: { $current_url: 'https://posthog.com' },
+                        },
+                    },
+                    {
+                        properties: {
+                            $browser: 'Firefox',
+                        },
+                    }
+                )
+
+                const result1 = await executor.execute(invocation)
+                expect(result1.finished).toBe(true)
+                // Metrics: 'fetch' from function_id_1, 'billable_invocation' from function_id_1, 'succeeded' from function_id_1, 'succeeded' from exit action
+                expect(result1.metrics.map((m) => m.metric_name)).toEqual([
+                    'fetch',
+                    'billable_invocation',
+                    'succeeded',
+                    'succeeded',
+                ])
+
+                const invocation2 = createExampleHogFlowInvocation(
+                    hogFlow,
+                    {
+                        event: {
+                            ...createHogExecutionGlobals().event,
+                            event: '$not-a-pageview',
+                            properties: { name: 'John Doe', $current_url: 'https://posthog.com' },
+                        },
+                    },
+                    {
+                        properties: {
+                            $browser: 'Chrome',
+                        },
+                    }
+                )
+
+                const result2 = await executor.execute(invocation2)
+                expect(result2.finished).toBe(true)
+                // The property-based conversion is also counted on the exit path
+                expect(result2.metrics.map((m) => m.metric_name)).toEqual([
+                    'early_exit',
+                    'conversion',
+                    'conversion_by_start',
+                ])
+                expect(result2.logs.map((log) => log.message)).toMatchInlineSnapshot(`
+                    [
+                      "Workflow exited early due to exit condition: exit_on_trigger_not_matched_or_conversion ([Person:person_id|John Doe] matches conversion filters)",
+                    ]
+                `)
+            })
+
+            // Counting at enrollment and counting from the watcher must stay disjoint. A goal already
+            // satisfied when the run enrolls can never be claimed from a watcher — the matcher reads the
+            // enrollment event before the row exists — so it is counted here and writes no row. A goal
+            // not yet satisfied writes the row and is counted by the matcher later. Either path counting
+            // twice, or neither counting, is the bug this guards.
+            test.each([
+                { name: 'goal not yet satisfied', browser: 'Firefox', watchers: 1, conversions: 0 },
+                { name: 'goal already satisfied at enrollment', browser: 'Chrome', watchers: 0, conversions: 1 },
+            ])('$name: writes $watchers watcher and counts $conversions conversion', async (params) => {
+                hogFlow.exit_condition = 'exit_only_at_end'
+                hogFlow.conversion = {
+                    filters: [{ key: '$browser', type: 'person', value: ['Chrome'], operator: 'exact' }],
+                    bytecode: ['_H', 1, 32, 'Chrome', 32, '$browser', 32, 'properties', 32, 'person', 1, 3, 11],
+                } as any
+
+                const invocation = createExampleHogFlowInvocation(
+                    hogFlow,
+                    {},
+                    { properties: { $browser: params.browser } }
+                )
+                const result = await executor.execute(invocation)
+
+                expect(result.conversionWatchers).toHaveLength(params.watchers)
+                expect(result.metrics.filter((m) => m.metric_name === 'conversion')).toHaveLength(params.conversions)
+                if (params.watchers) {
+                    expect(result.conversionWatchers[0].run_id).toEqual(invocation.id)
+                }
+            })
+
+            it('does not count event-based conversions in the executor (counted by the matcher)', async () => {
+                hogFlow.exit_condition = 'exit_only_at_end'
+                // Event-based conversion goal: no property filters/bytecode, so the executor's
+                // property path never matches. The matcher flags the run via conversionMatched.
+                hogFlow.conversion = {
+                    filters: [],
+                    bytecode: [],
+                    events: [{ filters: { bytecode: ['_H', 1, 29] } }],
+                }
+
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        event: '$pageview',
+                        properties: { name: 'John Doe', $current_url: 'https://posthog.com' },
+                    },
+                })
+                invocation.state.conversionMatched = true
+
+                const result = await executor.execute(invocation)
+                expect(result.finished).toBe(true)
+                // No conversion metric from the executor; the flag is consumed, not double-counted
+                expect(result.metrics.map((m) => m.metric_name)).not.toContain('conversion')
+                expect(invocation.state.conversionMatched).toBe(false)
+                expect(invocation.state.conversionCounted).toBeUndefined()
+            })
+
+            describe('on_error handling', () => {
+                let hogFlow: HogFlow
+                beforeEach(async () => {
+                    hogFlow = new FixtureHogFlowBuilder()
+                        .withWorkflow({
+                            actions: {
+                                trigger: {
+                                    type: 'trigger',
+                                    config: {
+                                        type: 'event',
+                                        filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                                    },
+                                },
+                                function_id_1: {
+                                    type: 'function',
+                                    config: {
+                                        template_id: 'template-test-hogflow-executor',
+                                        inputs: {
+                                            name: {
+                                                value: `Mr {event?.properties?.name}`,
+                                                bytecode: await compileHog(`raise Exception('fail!')`),
+                                            },
+                                        },
+                                    },
+                                    // filters: none
+                                },
+                                middle_action: {
+                                    id: 'middle_action',
+                                    name: 'Middle Action',
+                                    description: '',
+                                    type: 'delay',
+                                    config: { delay_duration: '5m' },
+                                    created_at: new Date().getUTCSeconds(),
+                                    updated_at: new Date().getUTCSeconds(),
+                                },
+                                exit: {
+                                    type: 'exit',
+                                    config: {},
+                                },
+                            },
+                            edges: [
+                                { from: 'trigger', to: 'function_id_1', type: 'continue' },
+                                { from: 'function_id_1', to: 'middle_action', type: 'continue' },
+                                { from: 'middle_action', to: 'exit', type: 'continue' },
+                            ],
+                        })
+                        .build()
+                })
+
+                describe('execute error handling when error is returned, not thrown', () => {
+                    it('continues to next action when on_error is continue', async () => {
+                        const action = hogFlow.actions.find((a) => a.id === 'function_id_1')!
+                        action.on_error = 'continue'
+
+                        // Mock the handler to return an error in the result
+                        const functionHandler = executor['actionHandlers']['function']
+                        jest.spyOn(functionHandler, 'execute').mockResolvedValueOnce({
+                            error: new Error('Mocked handler error'),
+                        })
+
+                        const invocation = createExampleHogFlowInvocation(hogFlow, {
+                            event: {
+                                ...createHogExecutionGlobals().event,
+                                properties: { name: 'Test User' },
+                            },
+                        })
+                        invocation.state.currentAction = {
+                            id: 'function_id_1',
+                            startedAtTimestamp: DateTime.now().toMillis(),
+                        }
+
+                        const result = await executor.executeCurrentAction(invocation)
+
+                        expect(result.error).toBe('Mocked handler error')
+
+                        expect(result.finished).toBe(false)
+
+                        expect(result.invocation.state.currentAction?.id).toBe('middle_action')
+                        expect(result.logs.map((l) => l.message)).toEqual(
+                            expect.arrayContaining([
+                                expect.stringContaining('Continuing to next action'),
+                                expect.stringContaining('Workflow moved to action [Action:middle_action]'),
+                            ])
+                        )
+                    })
+
+                    // Steps saved before error handling was configurable, and steps the author never
+                    // touched, carry no on_error. They get the documented default: continue.
+                    it('continues to next action when on_error is not set', async () => {
+                        const action = hogFlow.actions.find((a) => a.id === 'function_id_1')!
+                        delete action.on_error
+
+                        const functionHandler = executor['actionHandlers']['function']
+                        jest.spyOn(functionHandler, 'execute').mockResolvedValueOnce({
+                            error: new Error('Mocked handler error'),
+                        })
+
+                        const invocation = createExampleHogFlowInvocation(hogFlow, {
+                            event: {
+                                ...createHogExecutionGlobals().event,
+                                properties: { name: 'Test User' },
+                            },
+                        })
+                        invocation.state.currentAction = {
+                            id: 'function_id_1',
+                            startedAtTimestamp: DateTime.now().toMillis(),
+                        }
+
+                        const result = await executor.executeCurrentAction(invocation)
+
+                        expect(result.error).toBe('Mocked handler error')
+                        expect(result.finished).toBe(false)
+                        expect(result.invocation.state.currentAction?.id).toBe('middle_action')
+                    })
+
+                    it('stores the output variable of a failed step so the next action can branch on it', async () => {
+                        const action = hogFlow.actions.find((a) => a.id === 'function_id_1')!
+                        action.on_error = 'continue'
+                        action.output_variable = { key: 'task' }
+
+                        const functionHandler = executor['actionHandlers']['function']
+                        jest.spyOn(functionHandler, 'execute').mockResolvedValueOnce({
+                            error: new Error('The task failed'),
+                            result: { run_id: 'r1', status: 'failed' },
+                        })
+
+                        const invocation = createExampleHogFlowInvocation(hogFlow, {
+                            event: {
+                                ...createHogExecutionGlobals().event,
+                                properties: { name: 'Test User' },
+                            },
+                        })
+                        invocation.state.currentAction = {
+                            id: 'function_id_1',
+                            startedAtTimestamp: DateTime.now().toMillis(),
+                        }
+
+                        const result = await executor.executeCurrentAction(invocation)
+
+                        expect(result.error).toBe('The task failed')
+                        expect(result.invocation.state.variables).toEqual({ task: { run_id: 'r1', status: 'failed' } })
+                        expect(result.invocation.state.currentAction?.id).toBe('middle_action')
+                    })
+
+                    it('does NOT continue to next action when on_error is abort', async () => {
+                        const action = hogFlow.actions.find((a) => a.id === 'function_id_1')!
+                        action.on_error = 'abort'
+
+                        // Mock the handler to return an error in the result
+                        const functionHandler = executor['actionHandlers']['function']
+                        jest.spyOn(functionHandler, 'execute').mockResolvedValueOnce({
+                            error: new Error('Mocked handler error'),
+                        })
+
+                        const invocation = createExampleHogFlowInvocation(hogFlow, {
+                            event: {
+                                ...createHogExecutionGlobals().event,
+                                properties: { name: 'Test User' },
+                            },
+                        })
+                        invocation.state.currentAction = {
+                            id: 'function_id_1',
+                            startedAtTimestamp: DateTime.now().toMillis(),
+                        }
+
+                        const loggerErrorSpy = jest.spyOn(logger, 'error')
+
+                        const result = await executor.execute(invocation)
+
+                        expect(result.error).toBe('Mocked handler error')
+                        expect(result.finished).toBe(true)
+                        // Should stay on function_id_1 - goToNextAction was NOT called
+                        expect(result.invocation.state.currentAction?.id).toBe('function_id_1')
+                        expect(result.logs.map((l) => l.message)).not.toEqual(
+                            expect.arrayContaining([expect.stringContaining('Workflow moved to action')])
+                        )
+                        expect(result.logs.map((l) => l.message)).toEqual(
+                            expect.arrayContaining([
+                                expect.stringContaining(
+                                    `Workflow is aborting due to [Action:function_id_1] error handling setting being set to abort on error`
+                                ),
+                            ])
+                        )
+
+                        // Check that logger.error was called with the expected log
+                        expect(loggerErrorSpy).toHaveBeenCalledWith(
+                            '🦔',
+                            expect.stringContaining(
+                                `[HogFlowExecutor] Error executing hog flow ${hogFlow.id} - ${hogFlow.name}. Event: '`
+                            ),
+                            expect.any(Error)
+                        )
+                        loggerErrorSpy.mockRestore()
+                    })
+
+                    // A wait that cannot work out when to continue is the one error on_error must not be
+                    // allowed to carry past: continuing runs the next step immediately, which for a "N days
+                    // before X" reminder sends it with nothing to be before. The handler marks the wait
+                    // unresolved and the executor has to honour that over on_error: 'continue'.
+                    it.each([
+                        {
+                            label: 'a delay whose date cannot be worked out',
+                            // Compiled by the HogQL compiler from `person.properties.expires_at`,
+                            // which evaluates to null for a person without that property.
+                            wait: {
+                                type: 'delay',
+                                config: {
+                                    delay_until: {
+                                        expression: 'person.properties.expires_at',
+                                        bytecode: ['_H', 1, 32, 'expires_at', 32, 'properties', 32, 'person', 1, 3],
+                                    },
+                                },
+                            },
+                            error: 'The date to wait for did not evaluate to a date',
+                        },
+                        {
+                            label: 'a time window with no days to open on',
+                            wait: {
+                                type: 'wait_until_time_window',
+                                config: { timezone: 'UTC', day: [], time: ['09:00', '17:00'] },
+                            },
+                            error: 'No day in the next 7 days matches the time window',
+                        },
+                    ])('does NOT continue past $label, despite on_error continue', async ({ wait, error }) => {
+                        const flow = new FixtureHogFlowBuilder()
+                            .withWorkflow({
+                                actions: {
+                                    trigger: {
+                                        type: 'trigger',
+                                        config: {
+                                            type: 'event',
+                                            filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                                        },
+                                    },
+                                    wait_1: wait as any,
+                                    exit: { type: 'exit', config: {} },
+                                },
+                                edges: [
+                                    { from: 'trigger', to: 'wait_1', type: 'continue' },
+                                    { from: 'wait_1', to: 'exit', type: 'continue' },
+                                ],
+                            })
+                            .build()
+                        expect(flow.actions.find((a) => a.id === 'wait_1')!.on_error).toBe('continue')
+
+                        const invocation = createExampleHogFlowInvocation(flow)
+                        invocation.state.currentAction = {
+                            id: 'wait_1',
+                            startedAtTimestamp: DateTime.now().toMillis(),
+                        }
+
+                        const result = await executor.execute(invocation)
+
+                        expect(result.error).toContain(error)
+                        expect(result.finished).toBe(true)
+                        expect(result.invocation.state.currentAction?.id).toBe('wait_1')
+                        expect(result.logs.map((l) => l.message)).not.toEqual(
+                            expect.arrayContaining([expect.stringContaining('Workflow moved to action')])
+                        )
+                        expect(result.logs.map((l) => l.message)).toEqual(
+                            expect.arrayContaining([
+                                expect.stringContaining(
+                                    'Workflow is aborting because [Action:wait_1] could not work out the date to wait for'
+                                ),
+                            ])
+                        )
+                    })
+
+                    it('does NOT continue past a branch whose cohort lookup failed on every attempt, despite on_error continue', async () => {
+                        jest.spyOn(cohortMembershipRepository, 'getMemberCohortIds').mockRejectedValue(
+                            new Error('lookup timed out')
+                        )
+                        const flow = new FixtureHogFlowBuilder()
+                            .withWorkflow({
+                                actions: {
+                                    trigger: {
+                                        type: 'trigger',
+                                        config: {
+                                            type: 'event',
+                                            filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                                        },
+                                    },
+                                    branch: {
+                                        type: 'conditional_branch',
+                                        config: {
+                                            conditions: [
+                                                {
+                                                    filters: {
+                                                        bytecode: [
+                                                            '_H',
+                                                            1,
+                                                            33,
+                                                            42,
+                                                            32,
+                                                            'cohort_ids',
+                                                            1,
+                                                            1,
+                                                            2,
+                                                            'inCohort',
+                                                            2,
+                                                        ],
+                                                        properties: [{ key: 'id', type: 'cohort', value: 42 }],
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                    },
+                                    in_cohort: { type: 'exit', config: {} },
+                                    not_in_cohort: { type: 'exit', config: {} },
+                                },
+                                edges: [
+                                    { from: 'trigger', to: 'branch', type: 'continue' },
+                                    { from: 'branch', to: 'in_cohort', type: 'branch', index: 0 },
+                                    { from: 'branch', to: 'not_in_cohort', type: 'continue' },
+                                ],
+                            })
+                            .build()
+                        expect(flow.actions.find((a) => a.id === 'branch')!.on_error).toBe('continue')
+
+                        const invocation = createExampleHogFlowInvocation(flow)
+                        invocation.state.currentAction = {
+                            id: 'branch',
+                            startedAtTimestamp: DateTime.now().toMillis(),
+                            cohortLookupAttempts: 2,
+                        }
+
+                        const result = await executor.execute(invocation)
+
+                        expect(result.error).toContain('lookup timed out')
+                        expect(result.finished).toBe(true)
+                        expect(result.invocation.state.currentAction?.id).toBe('branch')
+                        expect(result.logs.map((l) => l.message)).not.toEqual(
+                            expect.arrayContaining([expect.stringContaining('Workflow moved to action')])
+                        )
+                        expect(result.logs.map((l) => l.message)).toEqual(
+                            expect.arrayContaining([
+                                expect.stringContaining(
+                                    'Workflow is aborting because [Action:branch] could not look up cohort membership'
+                                ),
+                                expect.stringContaining(
+                                    'Workflow encountered an error: Cohort membership lookup failed: Error: lookup timed out'
+                                ),
+                            ])
+                        )
+                    })
+                })
+            })
+        })
+
+        describe('per action runner tests', () => {
+            // NOTE: We test one case of each action to ensure it works as expected, the rest is handles as per-action unit test
+            const cases: [
+                string,
+                SimpleHogFlowRepresentation,
+                {
+                    finished: boolean
+                    scheduledAt?: DateTime
+                    nextActionId: string
+                },
+            ][] = [
+                [
+                    'wait_until_condition',
+                    {
+                        actions: {
+                            wait_until_condition: {
+                                type: 'wait_until_condition',
+                                config: {
+                                    condition: {
+                                        filters: HOG_FILTERS_EXAMPLES.elements_text_filter.filters, // no match
+                                    },
+                                    max_wait_duration: '10m',
+                                },
+                            },
+                        },
+                        edges: [
+                            {
+                                from: 'trigger',
+                                to: 'wait_until_condition',
+                                type: 'continue',
+                            },
+                        ],
+                    },
+                    {
+                        finished: false,
+                        scheduledAt: DateTime.fromISO('2025-01-01T00:10:00.000Z').toUTC(),
+                        nextActionId: 'wait_until_condition',
+                    },
+                ],
+
+                [
+                    'conditional_branch',
+                    {
+                        actions: {
+                            conditional_branch: {
+                                type: 'conditional_branch',
+                                config: {
+                                    conditions: [
+                                        {
+                                            filters: HOG_FILTERS_EXAMPLES.elements_text_filter.filters,
+                                        },
+                                        {
+                                            filters: HOG_FILTERS_EXAMPLES.pageview_or_autocapture_filter.filters,
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                        edges: [
+                            {
+                                from: 'conditional_branch',
+                                to: 'exit',
+                                type: 'branch',
+                                index: 0,
+                            },
+                            {
+                                from: 'conditional_branch',
+                                to: 'delay',
+                                type: 'branch',
+                                index: 1,
+                            },
+                        ],
+                    },
+                    {
+                        finished: false,
+                        nextActionId: 'delay',
+                    },
+                ],
+                [
+                    'delay',
+                    {
+                        actions: {
+                            delay: {
+                                type: 'delay',
+                                config: {
+                                    delay_duration: '2h',
+                                },
+                            },
+                        },
+                        edges: [
+                            {
+                                from: 'delay',
+                                to: 'exit',
+                                type: 'continue',
+                            },
+                        ],
+                    },
+                    {
+                        finished: false,
+                        scheduledAt: DateTime.fromISO('2025-01-01T02:00:00.000Z').toUTC(),
+                        // Still pending, so the delay parks without advancing currentAction
+                        nextActionId: 'delay',
+                    },
+                ],
+                [
+                    'random_cohort_branch',
+                    {
+                        actions: {
+                            random_cohort_branch: {
+                                type: 'random_cohort_branch',
+                                config: {
+                                    cohorts: [
+                                        {
+                                            percentage: 50,
+                                        },
+                                        {
+                                            percentage: 50,
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                        edges: [
+                            {
+                                from: 'random_cohort_branch',
+                                to: 'exit',
+                                type: 'branch',
+                                index: 0,
+                            },
+                            {
+                                from: 'random_cohort_branch',
+                                to: 'delay',
+                                type: 'branch',
+                                index: 1,
+                            },
+                        ],
+                    },
+                    {
+                        finished: false,
+                        nextActionId: 'delay',
+                    },
+                ],
+                [
+                    'exit',
+                    {
+                        actions: {
+                            exit: {
+                                type: 'exit',
+                                config: {},
+                            },
+                        },
+                        edges: [
+                            {
+                                from: 'exit',
+                                to: 'exit',
+                                type: 'continue',
+                            },
+                        ],
+                    },
+                    { finished: true, nextActionId: 'exit' },
+                ],
+            ]
+
+            it.each(cases)(
+                'should run %s action',
+                async (actionId, simpleFlow, { nextActionId, finished, scheduledAt }) => {
+                    const hogFlow = createHogFlow(simpleFlow)
+                    const invocation = createExampleHogFlowInvocation(hogFlow, {
+                        event: {
+                            ...createHogExecutionGlobals().event,
+                            event: '$pageview',
+                            properties: {
+                                $current_url: 'https://posthog.com',
+                            },
+                        },
+                    })
+
+                    // For the random_cohort_branch action
+                    jest.spyOn(Math, 'random').mockReturnValue(0.8)
+
+                    invocation.state.currentAction = {
+                        id: actionId,
+                        startedAtTimestamp: DateTime.utc().toMillis(),
+                    }
+
+                    const result = await executor['executeCurrentAction'](invocation)
+
+                    expect(result.finished).toEqual(finished)
+                    expect(result.invocation.queueScheduledAt).toEqual(scheduledAt)
+                    expect(result.invocation.state.currentAction!.id).toEqual(nextActionId)
+                }
+            )
+        })
+
+        describe('capturedPostHogEvents', () => {
+            it('should collect capturedPostHogEvents from hog function actions', async () => {
+                const hogFlow = createHogFlow({
+                    actions: {
+                        capture_function: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-posthog-capture',
+                                inputs: {
+                                    event: { value: 'custom_event' },
+                                    distinct_id: { value: '{event.distinct_id}' },
+                                    properties: {
+                                        value: {
+                                            user: '{event.properties.user_name}',
+                                            value: '{event.properties.value}',
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [
+                        {
+                            from: 'trigger',
+                            to: 'capture_function',
+                            type: 'continue',
+                        },
+                        {
+                            from: 'capture_function',
+                            to: 'exit',
+                            type: 'continue',
+                        },
+                    ],
+                })
+
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        properties: { user_name: 'Test User', value: 'test-value-123' },
+                    },
+                })
+
+                const result = await executor.execute(invocation)
+
+                expect(result.finished).toBe(true)
+                expect(result.error).toBeUndefined()
+
+                expect(result.capturedPostHogEvents).toBeDefined()
+                expect(result.capturedPostHogEvents).toHaveLength(1)
+                expect(result.capturedPostHogEvents[0]).toMatchObject({
+                    team_id: 1,
+                    event: 'custom_event',
+                    distinct_id: '{event.distinct_id}',
+                    properties: {
+                        user: '{event.properties.user_name}',
+                        value: '{event.properties.value}',
+                    },
+                })
+            })
+
+            it('should collect capturedPostHogEvents from multiple hog function actions', async () => {
+                const hogFlow = createHogFlow({
+                    actions: {
+                        capture_function_1: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-posthog-capture',
+                                inputs: {
+                                    event: { value: 'custom_event' },
+                                    distinct_id: { value: 'user1' },
+                                    properties: { value: { user: 'User1', value: 'value1' } },
+                                },
+                            },
+                        },
+                        capture_function_2: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-posthog-capture',
+                                inputs: {
+                                    event: { value: 'custom_event' },
+                                    distinct_id: { value: 'user2' },
+                                    properties: { value: { user: 'User2', value: 'value2' } },
+                                },
+                            },
+                        },
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [
+                        {
+                            from: 'trigger',
+                            to: 'capture_function_1',
+                            type: 'continue',
+                        },
+                        {
+                            from: 'capture_function_1',
+                            to: 'capture_function_2',
+                            type: 'continue',
+                        },
+                        {
+                            from: 'capture_function_2',
+                            to: 'exit',
+                            type: 'continue',
+                        },
+                    ],
+                })
+
+                const invocation = createExampleHogFlowInvocation(hogFlow)
+
+                const result = await executor.execute(invocation)
+
+                expect(result.finished).toBe(true)
+                expect(result.error).toBeUndefined()
+
+                expect(result.capturedPostHogEvents).toHaveLength(2)
+                expect(result.capturedPostHogEvents[0]).toMatchObject({
+                    event: 'custom_event',
+                    distinct_id: 'user1',
+                    properties: { user: 'User1', value: 'value1' },
+                })
+                expect(result.capturedPostHogEvents[1]).toMatchObject({
+                    event: 'custom_event',
+                    distinct_id: 'user2',
+                    properties: { user: 'User2', value: 'value2' },
+                })
+            })
+        })
+    })
+
+    describe('filter_test_accounts', () => {
+        let hogFlow: HogFlow
+
+        beforeEach(async () => {
+            hogFlow = new FixtureHogFlowBuilder()
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                // Use the test account filter which filters out @posthog.com emails
+                                filters: HOG_FILTERS_EXAMPLES.test_account_filter.filters ?? {},
+                            },
+                        },
+
+                        function_id_1: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-test-hogflow-executor',
+                                inputs: {
+                                    name: {
+                                        value: `Mr {event?.properties?.name}`,
+                                        bytecode: await compileHog(`return f'Mr {event?.properties?.name}'`),
+                                    },
+                                },
+                            },
+                        },
+
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [
+                        {
+                            from: 'trigger',
+                            to: 'function_id_1',
+                            type: 'continue',
+                        },
+                        {
+                            from: 'function_id_1',
+                            to: 'exit',
+                            type: 'continue',
+                        },
+                    ],
+                })
+                .build()
+        })
+
+        it('should filter out internal users with @posthog.com email', async () => {
+            // Create globals with internal user email
+            const globals = createHogExecutionGlobals({
+                event: {
+                    uuid: 'uuid',
+                    event: '$pageview',
+                    distinct_id: 'distinct_id',
+                    elements_chain: '',
+                    timestamp: new Date().toISOString(),
+                    url: 'http://localhost:8000/events/1',
+                    properties: {
+                        name: 'Internal User',
+                    },
+                },
+                person: {
+                    id: 'person_internal',
+                    name: 'Internal User',
+                    url: '',
+                    properties: {
+                        email: 'internal@posthog.com',
+                    },
+                },
+            })
+
+            const result = await executor.buildHogFlowInvocations([hogFlow], globals)
+
+            // Should not match because email contains @posthog.com
+            expect(result.invocations).toHaveLength(0)
+            // These metrics are queued straight by the pipeline, not via an invocation result, so they
+            // need the version stamped here or a trigger change that filters everyone out is invisible
+            // in the per-version series.
+            expect(result.metrics).toEqual([
+                expect.objectContaining({
+                    metric_name: 'filtered',
+                    app_source_version: { id: hogFlow.id, version: hogFlow.version },
+                }),
+            ])
+        })
+
+        it('should allow external users without @posthog.com email', async () => {
+            // Create globals with external user email
+            const globals = createHogExecutionGlobals({
+                event: {
+                    uuid: 'uuid',
+                    event: '$pageview',
+                    distinct_id: 'distinct_id',
+                    elements_chain: '',
+                    timestamp: new Date().toISOString(),
+                    url: 'http://localhost:8000/events/1',
+                    properties: {
+                        name: 'External User',
+                    },
+                },
+                person: {
+                    id: 'person_external',
+                    name: 'External User',
+                    url: '',
+                    properties: {
+                        email: 'external@customer.com',
+                    },
+                },
+            })
+
+            const result = await executor.buildHogFlowInvocations([hogFlow], globals)
+
+            // Should match because email doesn't contain @posthog.com
+            expect(result.invocations).toHaveLength(1)
+            expect(result.invocations[0].hogFlow.id).toBe(hogFlow.id)
+        })
+    })
+
+    describe('data-warehouse-table trigger', () => {
+        // Trigger-source compatibility is decided by the pipeline's eligibilityFn (per consumer),
+        // not the executor — coverage for source matching lives in the consumer tests. Here we just
+        // assert that when a warehouse-trigger flow with always-true filters is handed to the
+        // executor with warehouse-row globals, an invocation is produced.
+        it('builds an invocation when filter bytecode evaluates true for warehouse-row globals', async () => {
+            const hogFlow = new FixtureHogFlowBuilder()
+                .withSimpleWorkflow({
+                    trigger: {
+                        type: 'data-warehouse-table',
+                        table_name: 'postgres.table_1',
+                        // Always-true bytecode (return true) like the no-filter data warehouse example
+                        filters: { properties: [], bytecode: ['_h', 29] } as any,
+                    },
+                })
+                .build()
+            const globals = createHogExecutionGlobals({
+                event: {
+                    uuid: 'row-uuid-0001',
+                    event: '$warehouse_source_row',
+                    distinct_id: '',
+                    elements_chain: '',
+                    timestamp: new Date().toISOString(),
+                    url: '',
+                    properties: { column1: 'value1', column2: 123, $source_table: 'postgres.table_1' },
+                },
+            })
+
+            const result = await executor.buildHogFlowInvocations([hogFlow], globals)
+
+            expect(result.invocations).toHaveLength(1)
+            expect(result.invocations[0].hogFlow.id).toBe(hogFlow.id)
+        })
+    })
+
+    describe('variable merging', () => {
+        it('merges default and provided variables correctly', () => {
+            const hogFlow: HogFlow = new FixtureHogFlowBuilder()
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: {},
+                            },
+                        },
+
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [{ from: 'trigger', to: 'exit', type: 'continue' }],
+                })
+                .build()
+
+            // Set variables directly with required fields
+            hogFlow.variables = [
+                { key: 'foo', default: 'bar', type: 'string', label: 'foo' },
+                { key: 'baz', default: 123, type: 'number', label: 'baz' },
+                { key: 'overrideMe', default: 'defaultValue', type: 'string', label: 'overrideMe' },
+            ]
+
+            const globals = {
+                event: {
+                    event: 'test',
+                    properties: {},
+                    url: '',
+                    distinct_id: '',
+                    timestamp: '',
+                    uuid: '',
+                    elements_chain: '',
+                },
+                project: { id: 1, name: 'Test Project', url: '' },
+                person: { id: 'person_id', name: 'John Doe', properties: {}, url: '' },
+                variables: {
+                    overrideMe: 'customValue',
+                    extra: 'shouldBeIncluded',
+                },
+            }
+            const invocation = createHogFlowInvocation(globals, hogFlow, {} as any)
+            expect(invocation.state.customerTaskIdempotencyVersion).toBe(1)
+            expect(invocation.state.variables).toEqual({
+                foo: 'bar',
+                baz: 123,
+                overrideMe: 'customValue',
+                extra: 'shouldBeIncluded',
+            })
+        })
+    })
+
+    describe('group propagation', () => {
+        it('carries groups from globals onto the invocation', () => {
+            const hogFlow: HogFlow = new FixtureHogFlowBuilder()
+                .withWorkflow({
+                    actions: {
+                        trigger: { type: 'trigger', config: { type: 'event', filters: {} } },
+                        exit: { type: 'exit', config: {} },
+                    },
+                    edges: [{ from: 'trigger', to: 'exit', type: 'continue' }],
+                })
+                .build()
+
+            const groups = {
+                organization: {
+                    id: 'acme-123',
+                    type: 'organization',
+                    index: 0,
+                    url: '',
+                    properties: {},
+                },
+            }
+            const globals = {
+                event: {
+                    event: 'test',
+                    properties: {},
+                    url: '',
+                    distinct_id: '',
+                    timestamp: '',
+                    uuid: '',
+                    elements_chain: '',
+                },
+                project: { id: 1, name: 'Test Project', url: '' },
+                person: { id: 'person_id', name: 'John Doe', properties: {}, url: '' },
+                groups,
+            }
+
+            const invocation = createHogFlowInvocation(globals, hogFlow, {} as any)
+
+            expect(invocation.groups).toEqual(groups)
+        })
+    })
+
+    describe('output variable mapping', () => {
+        let hogFlowBuilder: (outputVariable: any) => Promise<HogFlow>
+
+        beforeEach(async () => {
+            const nameBytecode = await compileHog(`return 'Test'`)
+            hogFlowBuilder = (outputVariable: any) => {
+                return Promise.resolve(
+                    new FixtureHogFlowBuilder()
+                        .withWorkflow({
+                            actions: {
+                                trigger: {
+                                    type: 'trigger',
+                                    config: {
+                                        type: 'event',
+                                        filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                                    },
+                                },
+                                action_1: {
+                                    type: 'function',
+                                    config: {
+                                        template_id: 'template-test-hogflow-executor',
+                                        inputs: {
+                                            name: {
+                                                value: 'Test',
+                                                bytecode: nameBytecode,
+                                            },
+                                        },
+                                    },
+                                    output_variable: outputVariable,
+                                } as any,
+                                exit: {
+                                    type: 'exit',
+                                    config: {},
+                                },
+                            },
+                            edges: [
+                                { from: 'trigger', to: 'action_1', type: 'continue' },
+                                { from: 'action_1', to: 'exit', type: 'continue' },
+                            ],
+                        })
+                        .build()
+                )
+            }
+        })
+
+        const executeToCompletion = async (hogFlow: HogFlow) => {
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    properties: { name: 'Test' },
+                },
+            })
+            let result = await executor.execute(invocation)
+            while (!result.finished) {
+                result = await executor.execute(result.invocation)
+            }
+            return result
+        }
+
+        it('stores full result in variable with single object output_variable', async () => {
+            const hogFlow = await hogFlowBuilder({ key: 'response', result_path: null })
+            const result = await executeToCompletion(hogFlow)
+
+            expect(result.invocation.state.variables?.response).toBeDefined()
+            expect(result.invocation.state.variables?.response).toHaveProperty('status', 200)
+        })
+
+        it.each([false, true])(
+            'logs stored variable values only for an unprotected run, protected: %s',
+            async (sensitive) => {
+                const hogFlow = await hogFlowBuilder({ key: 'http_status', result_path: 'status' })
+                const invocation = createExampleHogFlowInvocation(hogFlow, {
+                    event: { ...createHogExecutionGlobals().event, properties: { name: 'Test' } },
+                })
+                invocation.state.sensitive = sensitive || undefined
+                const logs: string[] = []
+                let result = await executor.execute(invocation)
+                logs.push(...result.logs.map((log) => log.message))
+                while (!result.finished) {
+                    result = await executor.execute(result.invocation)
+                    logs.push(...result.logs.map((log) => log.message))
+                }
+
+                expect(result.invocation.state.variables).toEqual({ http_status: 200 })
+                const stored = logs.find((message) => message.startsWith('Stored action result'))
+                expect(stored).toBe(
+                    sensitive
+                        ? 'Stored action result in variable(s): http_status'
+                        : 'Stored action result in variable(s): http_status = 200'
+                )
+            }
+        )
+
+        it('stores extracted value via result_path', async () => {
+            const hogFlow = await hogFlowBuilder({ key: 'http_status', result_path: 'status' })
+            const result = await executeToCompletion(hogFlow)
+
+            expect(result.invocation.state.variables).toEqual({ http_status: 200 })
+        })
+
+        it('stores multiple variables from array output_variable', async () => {
+            const hogFlow = await hogFlowBuilder([
+                { key: 'http_status', result_path: 'status' },
+                { key: 'response_body', result_path: 'body' },
+            ])
+            const result = await executeToCompletion(hogFlow)
+
+            expect(result.invocation.state.variables?.http_status).toBe(200)
+            expect(result.invocation.state.variables?.response_body).toBeDefined()
+        })
+
+        it('spreads object result into prefixed variables', async () => {
+            const hogFlow = await hogFlowBuilder({ key: 'resp', result_path: 'body', spread: true })
+            const result = await executeToCompletion(hogFlow)
+
+            // body is { status: 200 } so spread should create resp_status
+            expect(result.invocation.state.variables?.resp_status).toBe(200)
+        })
+
+        it('skips entries with empty key in array form', async () => {
+            const hogFlow = await hogFlowBuilder([
+                { key: '', result_path: 'status' },
+                { key: 'http_status', result_path: 'status' },
+            ])
+            const result = await executeToCompletion(hogFlow)
+
+            expect(result.invocation.state.variables).toEqual({ http_status: 200 })
+        })
+
+        it('does nothing when output_variable is undefined', async () => {
+            const hogFlow = await hogFlowBuilder(undefined)
+            const result = await executeToCompletion(hogFlow)
+
+            expect(result.invocation.state.variables).toBeUndefined()
+        })
+
+        it('errors and exits when total variable size exceeds 5KB with on_error=abort', async () => {
+            const hogFlow = await hogFlowBuilder({ key: 'response', result_path: null })
+            // Set action to abort on error
+            const action = hogFlow.actions.find((a) => a.id === 'action_1')!
+            action.on_error = 'abort'
+
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    properties: { name: 'Test' },
+                },
+            })
+            invocation.state.variables = { existing: 'x'.repeat(5100) }
+
+            let result = await executor.execute(invocation)
+            while (!result.finished) {
+                result = await executor.execute(result.invocation)
+            }
+
+            expect(result.error).toContain('exceeds 5KB limit')
+            expect(result.invocation.state.variables?.response).toBeUndefined()
+            expect(result.invocation.state.variables?.existing).toBe('x'.repeat(5100))
+        })
+
+        it('errors but continues when total variable size exceeds 5KB with on_error=continue', async () => {
+            const hogFlow = await hogFlowBuilder({ key: 'response', result_path: null })
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    properties: { name: 'Test' },
+                },
+            })
+            invocation.state.variables = { existing: 'x'.repeat(5100) }
+
+            let result = await executor.execute(invocation)
+            while (!result.finished) {
+                result = await executor.execute(result.invocation)
+            }
+
+            // on_error=continue (default), so workflow finishes but variables are cleaned up
+            expect(result.finished).toBe(true)
+            expect(result.invocation.state.variables?.response).toBeUndefined()
+            expect(result.invocation.state.variables?.existing).toBe('x'.repeat(5100))
+            expect(result.logs.some((l) => l.message.includes('exceeds 5KB limit'))).toBe(true)
+        })
+
+        it('warns when output variable specified but no result returned', async () => {
+            // Use a template that doesn't do a fetch (no result)
+            await insertHogFunctionTemplate(hub.postgres, {
+                id: 'template-no-result',
+                name: 'No result template',
+                code: `print('no result')`,
+                inputs_schema: [],
+            })
+
+            const hogFlow = new FixtureHogFlowBuilder()
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                            },
+                        },
+                        action_1: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-no-result',
+                                inputs: {},
+                            },
+                            output_variable: { key: 'my_var', result_path: null },
+                        } as any,
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'action_1', type: 'continue' },
+                        { from: 'action_1', to: 'exit', type: 'continue' },
+                    ],
+                })
+                .build()
+
+            const result = await executeToCompletion(hogFlow)
+
+            // No variables should be set since no result was produced
+            expect(result.invocation.state.variables).toBeUndefined()
+        })
+
+        it('links a create-ai-task result to the task in the stored action result log', async () => {
+            // Mirrors the shape template-posthog-create-task returns on success: { id, run_id }.
+            // A non-empty inputs_schema sidesteps an insertRow quirk where an empty array param
+            // reaches the jsonb column as an empty object, not an empty array.
+            await insertHogFunctionTemplate(hub.postgres, {
+                id: 'template-posthog-create-task',
+                name: 'Create AI task',
+                code: `return { 'id': 'task-1234', 'run_id': 'run-5678' }`,
+                inputs_schema: [{ key: 'prompt', type: 'string', required: false }],
+            })
+
+            const hogFlow = new FixtureHogFlowBuilder()
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                            },
+                        },
+                        action_1: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-posthog-create-task',
+                                inputs: {},
+                            },
+                            output_variable: { key: 'task', result_path: null },
+                        } as any,
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'action_1', type: 'continue' },
+                        { from: 'action_1', to: 'exit', type: 'continue' },
+                    ],
+                })
+                .build()
+
+            const result = await executeToCompletion(hogFlow)
+
+            expect(result.invocation.state.variables?.task).toEqual({ id: 'task-1234', run_id: 'run-5678' })
+            expect(result.logs.some((l) => l.message.includes('task = [Task:task-1234|run-5678]'))).toBe(true)
+        })
+    })
+
+    describe('billing metrics', () => {
+        const createHogFlow = (flow: SimpleHogFlowRepresentation): HogFlow => {
+            return new FixtureHogFlowBuilder()
+                .withTeamId(team.id)
+                .withExitCondition('exit_on_conversion')
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                            },
+                        },
+                        ...flow.actions,
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [...flow.edges],
+                })
+                .build()
+        }
+
+        it('bills hog functions and own-domain email, and never a sandbox email in the same run', async () => {
+            const usageIngestion = new FakeUsageIngestion()
+            const usageReporter = new CdpUsageReporterService(await usageIngestion.start(), () => true)
+            const sandboxMailbox: SandboxMessage[] = []
+            const sandboxSes = {
+                send: (message: SandboxMessage) => {
+                    sandboxMailbox.push(message)
+                    return Promise.resolve({ status: 'accepted' as const, messageId: 'ses-1' })
+                },
+            }
+            executor = new HogFlowExecutorService(
+                hogFlowFunctionsService,
+                recipientPreferencesService,
+                emailValidationService,
+                cohortMembershipRepository,
+                hub.integrationManager,
+                null,
+                undefined,
+                usageReporter,
+                {
+                    sandboxEmail: {
+                        enabled: true,
+                        send: new SandboxEmailSendStep({
+                            service: new SandboxEmailService({
+                                enabled: true,
+                                fromAddress: 'sandbox@send.example.com',
+                                tenantName: 'sandbox-tenant',
+                                isProvisioned: () => Promise.resolve(true),
+                                checkRecipient: () => Promise.resolve({ ok: true }),
+                                authorize: () =>
+                                    Promise.resolve({
+                                        ok: true,
+                                        organizationId: 'org-1',
+                                        organizationName: 'Acme',
+                                        storedAddress: 'member@example.com',
+                                        tenant: { sendingStatus: 'ENABLED', syncedAt: new Date(Date.now()) },
+                                    }),
+                                claimCaps: () =>
+                                    Promise.resolve({
+                                        ok: true,
+                                        markSending: () => Promise.resolve(true),
+                                        releaseUnsent: () => Promise.resolve(true),
+                                        refundUnsent: () => Promise.resolve(true),
+                                    }),
+                                teamWorkflowsConfig: new TeamWorkflowsConfigService(hub.postgres, hub.pubSub),
+                                ses: sandboxSes,
+                                now: () => new Date(Date.now()),
+                            }),
+                            hogInputsService: new HogInputsService(
+                                hub.integrationManager,
+                                new RecipientTokensService(hub.ENCRYPTION_SALT_KEYS, hub.SITE_URL),
+                                hub.encryptedFields
+                            ),
+                            deliveredAddress: () => Promise.resolve('member@example.com'),
+                            siteUrl: hub.SITE_URL,
+                            recipientPreferences: recipientPreferencesService,
+                            events: { capture: () => Promise.resolve() },
+                            teamWorkflowsConfig: new TeamWorkflowsConfigService(hub.postgres, hub.pubSub),
+                            sesBucket: {
+                                limiter: { claimUpTo: () => Promise.resolve(1) } as unknown as RateLimiterService,
+                                key: '@posthog/ses/billing-test',
+                                capacity: 1,
+                                refillPerSecond: 1,
+                            },
+                        }),
+                    },
+                }
+            )
+
+            await insertIntegration(hub.postgres, team.id, {
+                id: integrationId,
+                kind: 'email',
+                config: {
+                    email: 'test@posthog.com',
+                    name: 'Test User',
+                    domain: 'posthog.com',
+                    verified: true,
+                    provider: 'maildev',
+                },
+            })
+
+            const regularTemplate = await insertHogFunctionTemplate(hub.postgres, {
+                id: 'template-email',
+                name: 'Test Regular Template',
+                code: `sendEmail(inputs.email)`,
+                inputs_schema: [
+                    {
+                        type: 'native_email',
+                        key: 'email',
+                        label: 'Email message',
+                        integration: 'email',
+                        required: true,
+                        default: {
+                            to: {
+                                email: '',
+                                name: '',
+                            },
+                            from: {},
+                            replyTo: '',
+                            subject: '',
+                            preheader: '',
+                            text: 'Hello from PostHog!',
+                            html: '<div>Hi {{ person.properties.name }}, this email was sent from PostHog!</div>',
+                        },
+                        secret: false,
+                        description: '',
+                        templating: 'liquid',
+                    },
+                ],
+            })
+
+            // Create a workflow with 2 regular hog function actions and 2 email actions
+            const hogFlow = createHogFlow({
+                actions: {
+                    function_1: {
+                        type: 'function',
+                        config: {
+                            template_id: regularTemplate.template_id,
+                            inputs: {
+                                name: { value: 'Function 1' },
+                            },
+                        },
+                    },
+                    function_2: {
+                        type: 'function',
+                        config: {
+                            template_id: regularTemplate.template_id,
+                            inputs: {
+                                name: { value: 'Function 2' },
+                            },
+                        },
+                    },
+                    email_1: {
+                        type: 'function_email',
+                        config: {
+                            template_id: 'template-email',
+                            inputs: {
+                                email: {
+                                    value: {
+                                        to: {
+                                            email: 'recipient@example.com',
+                                            name: 'Recipient',
+                                        },
+                                        from: {
+                                            integrationId,
+                                        },
+                                        subject: 'Test Email 1',
+                                        text: 'Test Text 1',
+                                        html: 'Test HTML 1',
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    email_2: {
+                        type: 'function_email',
+                        config: {
+                            template_id: 'template-email',
+                            inputs: {
+                                email: {
+                                    value: {
+                                        to: {
+                                            email: 'recipient2@example.com',
+                                            name: 'Recipient 2',
+                                        },
+                                        from: {
+                                            integrationId,
+                                        },
+                                        subject: 'Test Email 2',
+                                        text: 'Test Text 2',
+                                        html: 'Test HTML 2',
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    sandbox_email: {
+                        type: 'email_sandbox',
+                        config: {
+                            inputs: {
+                                email: {
+                                    value: { to: { email: 'member@example.com' }, subject: 'Sandbox', text: 'Hi' },
+                                },
+                            },
+                        },
+                    },
+                },
+                edges: [
+                    { from: 'trigger', to: 'function_1', type: 'continue' },
+                    { from: 'function_1', to: 'function_2', type: 'continue' },
+                    { from: 'function_2', to: 'email_1', type: 'continue' },
+                    { from: 'email_1', to: 'email_2', type: 'continue' },
+                    { from: 'email_2', to: 'sandbox_email', type: 'continue' },
+                    { from: 'sandbox_email', to: 'exit', type: 'continue' },
+                ],
+            })
+
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    event: '$pageview',
+                    properties: {
+                        $current_url: 'https://posthog.com',
+                    },
+                },
+            })
+
+            // Each execute call returns the metrics for one queue segment, and email
+            // actions route through the dedicated email queue — so we accumulate metrics
+            // across every segment to assert the total billing over the whole run.
+            let result = await executor.execute(invocation)
+            const metrics = [...result.metrics]
+            while (!result.finished) {
+                result = await executor.execute(result.invocation)
+                metrics.push(...result.metrics)
+            }
+
+            expect(result.finished).toBe(true)
+            expect(result.error).toBeUndefined()
+
+            // Verify we have billing metrics for both hog functions and email actions
+            const fetchBilling = metrics.filter(
+                (m) => m.metric_kind === 'fetch' && m.metric_name === 'billable_invocation'
+            )
+            expect(fetchBilling).toHaveLength(2)
+            const emailBilling = metrics.filter(
+                (m) => m.metric_kind === 'email' && m.metric_name === 'billable_invocation'
+            )
+            expect(emailBilling).toHaveLength(2)
+
+            expect(sandboxMailbox.map((message) => message.to.address)).toEqual(['member@example.com'])
+            await usageReporter.shutdown()
+            await usageIngestion.stop()
+            expect(
+                usageIngestion.accepted.map(({ teamId, usageKey, quantity }) => [teamId, usageKey, quantity]).sort()
+            ).toEqual([
+                [invocation.teamId, 'workflow_billable_invocations', 1],
+                [invocation.teamId, 'workflow_billable_invocations', 1],
+                [invocation.teamId, 'workflow_emails_sent', 1],
+                [invocation.teamId, 'workflow_emails_sent', 1],
+            ])
+            expect(
+                metrics.filter((m) => m.instance_id === 'sandbox_email').map((m) => [m.metric_kind, m.metric_name])
+            ).toEqual([
+                ['email', 'email_sandbox_sent'],
+                ['success', 'succeeded'],
+            ])
+        })
+
+        const suspendEmailSending = async (): Promise<void> => {
+            await hub.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `INSERT INTO workflows_teamworkflowsconfig
+                    (team_id, capture_workflows_engagement_events, email_tracking_consent_mode,
+                     email_sending_suspended_at, email_sending_suspension_reason)
+                 VALUES ($1, false, 'off', now(), 'testing suspension')`,
+                [team.id],
+                'test-suspend-email-sending'
+            )
+        }
+
+        it.each<{
+            label: string
+            senderId?: unknown
+            toEmail?: string
+            verified?: boolean
+            suspended?: boolean
+            outcome: string
+            alsoFailsStep?: boolean
+        }>([
+            {
+                label: 'the sender id is not a number',
+                senderId: 'not-a-number',
+                outcome: 'failed',
+                alsoFailsStep: true,
+            },
+            {
+                label: 'the sender no longer exists',
+                senderId: 999_999_999,
+                outcome: 'email_failed',
+                alsoFailsStep: true,
+            },
+            {
+                label: 'the sender domain is not verified',
+                verified: false,
+                outcome: 'email_failed',
+                alsoFailsStep: true,
+            },
+            { label: 'email sending is suspended for the team', suspended: true, outcome: 'email_suspended' },
+            {
+                label: 'the recipient has no email address',
+                toEmail: '',
+                outcome: 'email_missing_recipient',
+                alsoFailsStep: false,
+            },
+        ])(
+            'does not bill an email step when $label',
+            async ({
+                senderId,
+                toEmail = 'recipient@example.com',
+                verified = true,
+                suspended = false,
+                outcome,
+                alsoFailsStep,
+            }) => {
+                await insertIntegration(hub.postgres, team.id, {
+                    id: integrationId,
+                    kind: 'email',
+                    config: {
+                        email: 'test@posthog.com',
+                        name: 'Test User',
+                        domain: 'posthog.com',
+                        verified,
+                        provider: 'maildev',
+                    },
+                })
+                if (suspended) {
+                    await suspendEmailSending()
+                }
+                await insertHogFunctionTemplate(hub.postgres, {
+                    id: 'template-email',
+                    name: 'Test Email Template',
+                    code: `let res := sendEmail(inputs.email)
+                    if (not res.success) { throw Error(res.error) }`,
+                    inputs_schema: [
+                        {
+                            type: 'native_email',
+                            key: 'email',
+                            integration: 'email',
+                            required: true,
+                            templating: 'liquid',
+                        },
+                    ],
+                })
+                const hogFlow = createHogFlow({
+                    actions: {
+                        email: {
+                            type: 'function_email',
+                            config: {
+                                template_id: 'template-email',
+                                inputs: {
+                                    email: {
+                                        value: {
+                                            to: { email: toEmail, name: 'Recipient' },
+                                            from: { integrationId: senderId ?? integrationId },
+                                            subject: 'Subject',
+                                            text: 'Text',
+                                            html: 'HTML',
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'email', type: 'continue' },
+                        { from: 'email', to: 'exit', type: 'continue' },
+                    ],
+                })
+
+                let result = await executor.execute(createExampleHogFlowInvocation(hogFlow))
+                const metrics = [...result.metrics]
+                while (!result.finished) {
+                    result = await executor.execute(result.invocation)
+                    metrics.push(...result.metrics)
+                }
+
+                const emailStepMetrics = metrics.filter((m) => m.instance_id === 'email').map((m) => m.metric_name)
+                expect(emailStepMetrics).toContain(outcome)
+                expect(emailStepMetrics).not.toContain('billable_invocation')
+                if (alsoFailsStep !== undefined) {
+                    // The broadcast audience breakdown counts unsent people by step failures alone.
+                    expect(emailStepMetrics.includes('failed')).toBe(alsoFailsStep)
+                }
+            }
+        )
+    })
+
+    describe('email queue routing', () => {
+        afterEach(() => {
+            jest.restoreAllMocks()
+        })
+
+        const insertEmailSetup = async (provider: 'maildev' | 'ses'): Promise<void> => {
+            await insertIntegration(hub.postgres, team.id, {
+                id: integrationId,
+                kind: 'email',
+                config: {
+                    email: 'test@posthog.com',
+                    name: 'Test User',
+                    domain: 'posthog.com',
+                    verified: true,
+                    provider,
+                },
+            })
+            await insertHogFunctionTemplate(hub.postgres, {
+                id: 'template-email-routing-test',
+                name: 'Email Routing Test',
+                code: `sendEmail(inputs.email)`,
+                inputs_schema: [
+                    {
+                        type: 'native_email',
+                        key: 'email',
+                        label: 'Email message',
+                        integration: 'email',
+                        required: true,
+                        default: {
+                            to: { email: '', name: '' },
+                            from: { email: '', name: '' },
+                            subject: '',
+                            text: 'Hello!',
+                            html: '<div>Hello!</div>',
+                        },
+                        secret: false,
+                        description: '',
+                        templating: 'liquid',
+                    },
+                ],
+            })
+        }
+
+        const emailAction = (subject: string, to = 'recipient@example.com') =>
+            ({
+                type: 'function_email',
+                config: {
+                    template_id: 'template-email-routing-test',
+                    inputs: {
+                        email: {
+                            value: {
+                                to: { email: to, name: 'Recipient' },
+                                from: { integrationId, email: 'test@posthog.com' },
+                                subject,
+                                text: `${subject} text`,
+                                html: `<p>${subject}</p>`,
+                            },
+                        },
+                    },
+                },
+            }) as const
+
+        const emailFlow = (email: Record<string, any>, stepConfig: Record<string, any> = {}): HogFlow =>
+            new FixtureHogFlowBuilder()
+                .withTeamId(team.id)
+                .withExitCondition('exit_only_at_end')
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                            },
+                        },
+                        email_1: {
+                            type: 'function_email',
+                            config: {
+                                template_id: 'template-email-routing-test',
+                                inputs: { email: { value: email } },
+                                ...stepConfig,
+                            },
+                        },
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'email_1', type: 'continue' },
+                        { from: 'email_1', to: 'exit', type: 'continue' },
+                    ],
+                })
+                .build()
+
+        const flowInvocation = (hogFlow: HogFlow): CyclotronJobInvocationHogFlow =>
+            createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    event: '$pageview',
+                },
+            })
+
+        const storedStep = () => ({
+            to: { email: 'recipient@example.com', name: 'Recipient' },
+            from: { integrationId, email: 'test@posthog.com' },
+            subject: 'Test Email',
+            text: 'Test text',
+            html: '<p>Test html</p>',
+        })
+
+        const codeKeyStep = () => ({
+            to: { email: 'recipient@example.com', name: 'Recipient' },
+            from: { integrationId: null },
+            cc: 'cc@example.com',
+            subject: '',
+            text: '',
+            html: '',
+        })
+
+        const codeSend = (): QueuedSend => ({
+            content: { subject: 'Reset your password', html: '<p>Hi {{ variables.name }}</p>', text: 'Hi' },
+            from: { integrationId, email: 'security@posthog.com', name: 'Security' },
+            replyTo: ['help@example.com', 'support@example.com'],
+            cc: ['manager@example.com', 'team@example.com'],
+            bcc: ['audit@example.com'],
+            tracking: { captureEngagement: true },
+        })
+
+        const attachmentFile = {
+            filename: 'report.pdf',
+            contentType: 'application/pdf',
+            sizeBytes: 11,
+            sha256: 'a1b2c3',
+        }
+
+        it('should route email actions to the email queue', async () => {
+            await insertEmailSetup('maildev')
+
+            const hogFlow = new FixtureHogFlowBuilder()
+                .withTeamId(team.id)
+                .withExitCondition('exit_only_at_end')
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                            },
+                        },
+                        email_1: emailAction('Test Email'),
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'email_1', type: 'continue' },
+                        { from: 'email_1', to: 'exit', type: 'continue' },
+                    ],
+                })
+                .build()
+
+            const invocation = createExampleHogFlowInvocation(hogFlow, {
+                event: {
+                    ...createHogExecutionGlobals().event,
+                    event: '$pageview',
+                },
+            })
+
+            const result = await executor.execute(invocation)
+
+            // Should be routed to email queue, not finished
+            expect(result.finished).toBe(false)
+            expect(result.invocation.queue).toBe('email')
+            expect(result.invocation.queueMetadata?.originQueue).toBeDefined()
+            expect(result.invocation.queueParameters).toBeDefined()
+            expect(result.invocation.queueParameters?.type).toBe('email')
+        })
+
+        it('returns consecutive emails and push retries to their origin queue and priority: hogflow → email queue → messages sent → workflow continues', async () => {
+            await insertEmailSetup('ses')
+            const pushIntegrationId = uniqueTestId()
+            await insertIntegration(hub.postgres, team.id, {
+                id: pushIntegrationId,
+                kind: 'firebase',
+                config: { project_id: 'test-project' },
+                sensitive_config: { access_token: 'test-access-token' },
+            })
+            const fcmResponse = (status: number): Awaited<ReturnType<TrackedPushFetch>> => ({
+                fetchError: null,
+                fetchResponse: {
+                    status,
+                    headers: {},
+                    json: () => Promise.resolve({}),
+                    text: () => Promise.resolve('{}'),
+                    dump: () => Promise.resolve(),
+                },
+                fetchDuration: 10,
+            })
+            mockPushProviderFetch
+                .mockResolvedValueOnce(fcmResponse(503))
+                .mockResolvedValueOnce(fcmResponse(200))
+                .mockResolvedValueOnce(fcmResponse(503))
+                .mockResolvedValueOnce(fcmResponse(200))
+            const sesSend = jest.spyOn(SESv2Client.prototype, 'send') as jest.SpyInstance
+            sesSend
+                .mockResolvedValueOnce({ MessageId: 'first-email' })
+                .mockRejectedValueOnce(new TooManyRequestsException({ $metadata: {}, message: 'Too many requests' }))
+                .mockResolvedValue({ MessageId: 'follow-up-email' })
+
+            await insertHogFunctionTemplate(hub.postgres, {
+                id: 'template-push-queue-routing-test',
+                name: 'Push Routing Test',
+                code: `let res := sendPushNotification({'integrationIds': [inputs.integrationId], 'distinctId': 'distinct-id', 'payload': {'title': 'Hi', 'body': 'Hello'}})
+if (not res.success) { throw Error(res.error) }`,
+                inputs_schema: [
+                    { type: 'string', key: 'integrationId', label: 'Channel', secret: false, required: true },
+                ],
+            })
+            const transactionalPush = {
+                type: 'function_push',
+                config: {
+                    template_id: 'template-push-queue-routing-test',
+                    message_category_type: 'transactional',
+                    inputs: { integrationId: { value: pushIntegrationId } },
+                },
+            } as const
+
+            const hogFlow = new FixtureHogFlowBuilder()
+                .withTeamId(team.id)
+                .withExitCondition('exit_only_at_end')
+                .withWorkflow({
+                    actions: {
+                        trigger: {
+                            type: 'trigger',
+                            config: {
+                                type: 'event',
+                                filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {},
+                            },
+                        },
+                        email_1: emailAction('Test Email'),
+                        push_1: transactionalPush,
+                        push_2: transactionalPush,
+                        email_2: emailAction('Follow-up Email'),
+                        webhook: {
+                            type: 'function',
+                            config: {
+                                template_id: 'template-test-hogflow-executor',
+                                inputs: { name: { value: 'Mr Debug' } },
+                            },
+                        },
+                        exit: {
+                            type: 'exit',
+                            config: {},
+                        },
+                    },
+                    edges: [
+                        { from: 'trigger', to: 'email_1', type: 'continue' },
+                        { from: 'email_1', to: 'push_1', type: 'continue' },
+                        { from: 'push_1', to: 'push_2', type: 'continue' },
+                        { from: 'push_2', to: 'email_2', type: 'continue' },
+                        { from: 'email_2', to: 'webhook', type: 'continue' },
+                        { from: 'webhook', to: 'exit', type: 'continue' },
+                    ],
+                })
+                .build()
+
+            const invocation = createExampleHogFlowInvocation(
+                hogFlow,
+                {
+                    event: {
+                        ...createHogExecutionGlobals().event,
+                        event: '$pageview',
+                    },
+                },
+                {
+                    properties: {
+                        '$device_push_subscription_test-project': hub.encryptedFields.encrypt('device-token'),
+                    },
+                }
+            )
+
+            // A watcher-degraded flow enters at priority 2; the routing must stash that
+            // exact value, not the 0 that per-action result clones reset queuePriority to
+            // before the email action runs (the trigger action executes first here).
+            invocation.queuePriority = 2
+
+            // Step 1: Hogflow worker executes (queue !== 'email') — should route to email queue
+            const hogflowResult = await executor.execute(invocation)
+            expect(hogflowResult.finished).toBe(false)
+            expect(hogflowResult.invocation.queue).toBe('email')
+            expect(hogflowResult.invocation.queueParameters?.type).toBe('email')
+            // Uncategorized sends classify as bulk (priority 1).
+            expect(hogflowResult.invocation.queuePriority).toBe(1)
+            expect(hogflowResult.invocation.queueMetadata?.originPriority).toBe(2)
+
+            const results = []
+            let emailResult = await executor.execute(hogflowResult.invocation)
+            results.push(emailResult)
+            while (!emailResult.finished && emailResult.invocation.queue === 'email') {
+                emailResult = await executor.execute(emailResult.invocation)
+                results.push(emailResult)
+            }
+            expect(emailResult.invocation).toMatchObject({ queue: 'hogflow', queuePriority: 2 })
+            const rescheduledOnEmailQueue = results
+                .filter((result) => result.invocation.queue === 'email')
+                .map(({ invocation }) => ({ priority: invocation.queuePriority, metadata: invocation.queueMetadata }))
+            expect(rescheduledOnEmailQueue).toEqual([
+                { priority: 0, metadata: { originQueue: 'hogflow', originPriority: 2, tries: 1 } },
+                { priority: 0, metadata: { originQueue: 'hogflow', originPriority: 2, tries: 1 } },
+                { priority: 1, metadata: expect.objectContaining({ originQueue: 'hogflow', originPriority: 2 }) },
+            ])
+
+            let workflowResult = emailResult
+            while (!workflowResult.finished) {
+                workflowResult = await executor.execute(workflowResult.invocation)
+                results.push(workflowResult)
+            }
+            expect(workflowResult.error).toBeUndefined()
+
+            const sentMetrics = results
+                .flatMap((r) => r.metrics)
+                .map((m) => m.metric_name)
+                .filter((name) => name === 'email_sent' || name === 'push_sent')
+            expect(sentMetrics).toEqual(['email_sent', 'push_sent', 'push_sent', 'email_sent'])
+            expect(sesSend).toHaveBeenCalledTimes(3)
+            expect(mockPushProviderFetch).toHaveBeenCalledTimes(4)
+        })
+
+        describe('a scheduled transactional send', () => {
+            let ses: SesV2Fake
+
+            beforeEach(async () => {
+                ses = await SesV2Fake.start()
+                await insertEmailSetup('ses')
+            })
+
+            afterEach(async () => {
+                await ses.close()
+            })
+
+            it('measures its queue wait from its scheduled time, not from when it was created', async () => {
+                const { executor: runner } = createExecutor(createEmailService({ ses }))
+                const invocation = createExampleHogFlowInvocation(emailFlow(storedStep()), {
+                    event: { ...createHogExecutionGlobals().event, event: TRANSACTIONAL_EMAIL_EVENT },
+                })
+                invocation.queueCreatedAt = DateTime.utc().minus({ hours: 1 })
+                invocation.state.scheduledAt = DateTime.utc().minus({ seconds: 30 }).toISO()!
+                const waits = (metricName: string): Promise<number> =>
+                    metricValue('cdp_email_queue_to_send_ms', { source: 'transactional_api' }, metricName)
+                const [countBefore, sumBefore] = [
+                    await waits('cdp_email_queue_to_send_ms_count'),
+                    await waits('cdp_email_queue_to_send_ms_sum'),
+                ]
+
+                let result = await runner.execute(invocation)
+                while (!result.finished) {
+                    result = await runner.execute(result.invocation)
+                }
+
+                expect(ses.delivered.map((email) => email.subject)).toEqual(['Test Email'])
+                expect((await waits('cdp_email_queue_to_send_ms_count')) - countBefore).toEqual(1)
+                const waitMs = (await waits('cdp_email_queue_to_send_ms_sum')) - sumBefore
+                expect(waitMs).toBeGreaterThanOrEqual(30_000)
+                expect(waitMs).toBeLessThan(30 * 60_000)
+            })
+        })
+
+        describe('the email after one the email queue delayed', () => {
+            let ses: SesV2Fake
+
+            beforeEach(async () => {
+                ses = await SesV2Fake.start()
+                await insertEmailSetup('ses')
+            })
+
+            afterEach(async () => {
+                await ses.close()
+            })
+
+            const twoEmailFlow = (nextRecipient: string): HogFlow =>
+                new FixtureHogFlowBuilder()
+                    .withTeamId(team.id)
+                    .withExitCondition('exit_only_at_end')
+                    .withWorkflow({
+                        actions: {
+                            trigger: {
+                                type: 'trigger',
+                                config: { type: 'event', filters: HOG_FILTERS_EXAMPLES.no_filters.filters ?? {} },
+                            },
+                            email_1: emailAction('Delayed Email'),
+                            email_2: emailAction('Next Email', nextRecipient),
+                        },
+                        edges: [
+                            { from: 'trigger', to: 'email_1', type: 'continue' },
+                            { from: 'email_1', to: 'email_2', type: 'continue' },
+                            { from: 'email_2', to: 'exit', type: 'continue' },
+                        ],
+                    })
+                    .build()
+
+            const runUntilHeld = async (
+                runner: HogFlowExecutorService,
+                invocation: CyclotronJobInvocationHogFlow
+            ): Promise<CyclotronJobInvocationResult<CyclotronJobInvocationHogFlow>> => {
+                let result = await runner.execute(invocation)
+                for (let step = 0; step < 10 && !result.finished; step++) {
+                    if ((result.invocation.queueScheduledAt?.toMillis() ?? 0) > Date.now()) {
+                        return result
+                    }
+                    result = await runner.execute(result.invocation)
+                }
+                return result
+            }
+
+            const runAfterDelay = async (
+                runner: HogFlowExecutorService,
+                delayedWith: CyclotronJobInvocationHogFlow['queueMetadata'],
+                { nextRecipient = 'recipient@example.com', send }: { nextRecipient?: string; send?: QueuedSend } = {}
+            ): Promise<CyclotronJobInvocationResult<CyclotronJobInvocationHogFlow>> => {
+                const invocation = flowInvocation(twoEmailFlow(nextRecipient))
+                invocation.state.send = send
+                const routed = await runner.execute(invocation)
+                expect(routed.invocation.queue).toBe('email')
+                const firstEmailHeldOnceAndNowFiveSecondsLate: CyclotronJobInvocationHogFlow = {
+                    ...routed.invocation,
+                    queueMetadata: { ...routed.invocation.queueMetadata, ...delayedWith },
+                    queueDueAt: DateTime.utc().minus({ seconds: 5 }),
+                }
+                return await runUntilHeld(runner, firstEmailHeldOnceAndNowFiveSecondsLate)
+            }
+
+            const sendsLeftInTheTeamBudget = async (runner: HogFlowExecutorService): Promise<number> => {
+                for (let sent = 0; sent < 5; sent++) {
+                    const result = await runUntilHeld(runner, flowInvocation(emailFlow(storedStep())))
+                    if (!result.finished) {
+                        return sent
+                    }
+                }
+                throw new Error('the team budget did not run out')
+            }
+
+            it('charges the team budget for the next email, though the delayed one had paid already', async () => {
+                await hub.postgres.query(
+                    PostgresUse.COMMON_WRITE,
+                    `INSERT INTO workflows_teamworkflowsconfig
+                        (team_id, capture_workflows_engagement_events, email_tracking_consent_mode,
+                         email_sending_suspension_reason, ses_tenant_sending_status, email_sending_tier)
+                     VALUES ($1, false, 'off', '', '', 0)`,
+                    [team.id],
+                    'test-team-email-tier'
+                )
+                const { executor: runner } = createExecutor(createEmailService({ ses, teamDailyCap: 4 }))
+
+                const result = await runAfterDelay(runner, { teamBudgetClaimed: true })
+
+                expect(result.finished).toBe(true)
+                expect(ses.delivered.map((email) => email.subject)).toEqual(['Delayed Email', 'Next Email'])
+                expect(await sendsLeftInTheTeamBudget(runner)).toBe(3)
+            })
+
+            it('measures the wait of a transactional send from when the API accepted it', async () => {
+                const { executor: runner } = createExecutor(createEmailService({ ses }))
+                const invocation = flowInvocation(emailFlow(storedStep()))
+                invocation.state.event = { ...invocation.state.event, event: '$transactional_email' }
+                invocation.state.acceptedAt = DateTime.utc().minus({ seconds: 120 }).toISO()
+                const name = 'cdp_email_queue_to_send_ms'
+                const labels = { source: 'transactional_api' }
+                const sumBefore = await metricValue(name, labels, `${name}_sum`)
+
+                const result = await runUntilHeld(runner, invocation)
+
+                expect(result.finished).toBe(true)
+                expect((await metricValue(name, labels, `${name}_sum`)) - sumBefore).toBeGreaterThanOrEqual(120_000)
+            })
+
+            it('records the wait of the next email as not held by the team cap', async () => {
+                const { executor: runner } = createExecutor(createEmailService({ ses }))
+                const waits = (teamCapped: string): Promise<number> =>
+                    metricValue(
+                        'cdp_email_queue_to_send_ms',
+                        { source: 'workflow', team_capped: teamCapped },
+                        'cdp_email_queue_to_send_ms_count'
+                    )
+                const [cappedBefore, uncappedBefore] = [await waits('true'), await waits('false')]
+
+                const result = await runAfterDelay(runner, { teamCapped: true })
+
+                expect(result.finished).toBe(true)
+                expect(ses.delivered.map((email) => email.subject)).toEqual(['Delayed Email', 'Next Email'])
+                expect({
+                    capped: (await waits('true')) - cappedBefore,
+                    uncapped: (await waits('false')) - uncappedBefore,
+                }).toEqual({ capped: 1, uncapped: 1 })
+            })
+
+            it("holds the next email for its first suppression retry, not the delayed one's eighth, when the list cannot be read", async () => {
+                let listUnreadable = true
+                const suppressionDb = await postgresThatDropsConnections(
+                    hub.DATABASE_URL,
+                    (message) => listUnreadable && message.includes('next@example.com')
+                )
+                const { executor: runner } = createExecutor(
+                    createEmailService({ ses, suppressionDb: suppressionDb.postgres })
+                )
+
+                const held = await runAfterDelay(
+                    runner,
+                    { suppressionLookupAttempts: 7 },
+                    { nextRecipient: 'next@example.com' }
+                )
+                expect(held.finished).toBe(false)
+                expect(ses.delivered.map((email) => email.subject)).toEqual(['Delayed Email'])
+                expect(held.invocation.queueScheduledAt!.diff(DateTime.utc()).as('seconds')).toBeLessThanOrEqual(60)
+
+                listUnreadable = false
+                const result = await runUntilHeld(runner, held.invocation)
+                await suppressionDb.close()
+
+                expect(result.finished).toBe(true)
+                expect(ses.delivered.map((email) => email.subject)).toEqual(['Delayed Email', 'Next Email'])
+            })
+
+            it('retries the files of the next email when the bucket goes down, though the delayed one used up its retries', async () => {
+                const store = new AttachmentStoreFake()
+                const file = store.store(team.id, 'report.pdf', Buffer.from('%PDF-1.4 report'))
+                const { executor: runner } = createExecutor(createEmailService({ ses, store }))
+                store.loadsBeforeOutage = 1
+
+                const held = await runAfterDelay(
+                    runner,
+                    { attachmentLoadRetries: 10 },
+                    { send: { tracking: { captureEngagement: false }, attachments: [file] } }
+                )
+                expect(held.finished).toBe(false)
+                expect(ses.delivered.map((email) => email.subject)).toEqual(['Delayed Email'])
+
+                store.loadsBeforeOutage = Infinity
+                const result = await runUntilHeld(runner, held.invocation)
+
+                expect(result.finished).toBe(true)
+                expect(ses.delivered).toEqual([
+                    expect.objectContaining({ subject: 'Delayed Email' }),
+                    {
+                        to: [expect.stringContaining('recipient@example.com')],
+                        subject: 'Next Email',
+                        attachments: [{ filename: 'report.pdf', bytes: Buffer.from('%PDF-1.4 report') }],
+                    },
+                ])
+            })
+        })
+
+        it.each([
+            {
+                name: 'a template send as the step renders it',
+                step: storedStep,
+                stepConfig: { template_uuid: 'template-1' },
+                send: (): QueuedSend | undefined => undefined,
+                expected: () => ({ type: 'email', ...storedStep(), template: { template_uuid: 'template-1' } }),
+            },
+            {
+                name: 'a step whose email input names a template, with the template the step was saved from',
+                step: () => ({ ...storedStep(), template: { template_uuid: 'another-template' } }),
+                stepConfig: { template_uuid: 'template-1' },
+                send: (): QueuedSend | undefined => undefined,
+                expected: () => ({ type: 'email', ...storedStep(), template: { template_uuid: 'template-1' } }),
+            },
+            {
+                name: 'a code send for a local template as the step renders it',
+                step: storedStep,
+                stepConfig: {},
+                send: (): QueuedSend => ({ tracking: { captureEngagement: false } }),
+                expected: () => ({ type: 'email', ...storedStep(), template: {} }),
+            },
+            {
+                name: "a code send with the caller's content, sender, reply-to and copies over the step",
+                step: codeKeyStep,
+                stepConfig: { template_key: 'reset_password' },
+                send: codeSend,
+                expected: () => ({
+                    type: 'email',
+                    template: { template_key: 'reset_password' },
+                    to: { email: 'recipient@example.com', name: 'Recipient' },
+                    from: { integrationId, email: 'security@posthog.com', name: 'Security' },
+                    cc: 'manager@example.com, team@example.com',
+                    bcc: 'audit@example.com',
+                    replyTo: 'help@example.com, support@example.com',
+                    subject: 'Reset your password',
+                    preheader: '',
+                    text: 'Hi',
+                    html: '<p>Hi {{ variables.name }}</p>',
+                }),
+            },
+            {
+                name: 'a code send with the metadata of its files, which the email worker loads by job id',
+                step: storedStep,
+                stepConfig: {},
+                send: (): QueuedSend => ({ tracking: { captureEngagement: false }, attachments: [attachmentFile] }),
+                expected: () => ({ type: 'email', ...storedStep(), attachments: [attachmentFile], template: {} }),
+            },
+            {
+                name: 'a step whose own email input lists files without them, because only an accepted send has files',
+                step: () => ({ ...storedStep(), attachments: [attachmentFile] }),
+                stepConfig: {},
+                send: (): QueuedSend | undefined => undefined,
+                expected: () => ({ type: 'email', ...storedStep(), template: {} }),
+            },
+        ])('hands the email queue $name', async ({ step, stepConfig, send, expected }) => {
+            await insertEmailSetup('ses')
+            const invocation = flowInvocation(emailFlow(step(), stepConfig))
+            invocation.state.variables = { name: 'Ada' }
+            invocation.state.send = send()
+
+            const result = await executor.execute(invocation)
+
+            expect(result.invocation.queueParameters).toEqual(expected())
+        })
+
+        it.each([
+            {
+                name: 'fails a code-key step without an accepted send',
+                send: (): QueuedSend | undefined => undefined,
+                sent: 0,
+            },
+            { name: 'delivers a code-key step with an accepted send', send: codeSend, sent: 1 },
+        ])('$name', async ({ send, sent }) => {
+            await insertEmailSetup('ses')
+            const sesSend = jest.spyOn(SESv2Client.prototype, 'send') as jest.SpyInstance
+            sesSend.mockResolvedValue({ MessageId: 'code-key-email' })
+            const invocation = flowInvocation(emailFlow(codeKeyStep()))
+            invocation.state.send = send()
+
+            let result = await executor.execute(invocation)
+            const metrics = [...result.metrics]
+            while (!result.finished) {
+                result = await executor.execute(result.invocation)
+                metrics.push(...result.metrics)
+            }
+
+            expect(metrics.filter((m) => m.metric_name === 'email_sent')).toHaveLength(sent)
+            expect(sesSend).toHaveBeenCalledTimes(sent)
+        })
+
+        it.each([
+            {
+                captureEngagement: true,
+                teamCaptures: true,
+                savedWithoutSend: false,
+                captured: ['$workflows_email_sent'],
+            },
+            { captureEngagement: false, teamCaptures: true, savedWithoutSend: false, captured: [] },
+            { captureEngagement: true, teamCaptures: false, savedWithoutSend: false, captured: [] },
+            { captureEngagement: false, teamCaptures: true, savedWithoutSend: true, captured: [] },
+        ])(
+            "captures the email's events by the code send's choice $captureEngagement and the team switch $teamCaptures, step state saved without the send: $savedWithoutSend",
+            async ({ captureEngagement, teamCaptures, savedWithoutSend, captured }) => {
+                await insertEmailSetup('ses')
+                const sesSend = jest.spyOn(SESv2Client.prototype, 'send') as jest.SpyInstance
+                sesSend.mockResolvedValue({ MessageId: 'captured-email' })
+                await hub.postgres.query(
+                    PostgresUse.COMMON_WRITE,
+                    `INSERT INTO workflows_teamworkflowsconfig
+                        (team_id, capture_workflows_engagement_events, email_tracking_consent_mode,
+                         email_sending_suspension_reason, ses_tenant_sending_status, email_sending_tier)
+                     VALUES ($1, $2, 'off', '', '', 0)`,
+                    [team.id, teamCaptures],
+                    'test-team-engagement-capture'
+                )
+                const invocation = flowInvocation(emailFlow(storedStep()))
+                invocation.state.send = { tracking: { captureEngagement } }
+
+                let result = await executor.execute(invocation)
+                const events = [...result.capturedPostHogEvents]
+                if (savedWithoutSend) {
+                    delete result.invocation.state.currentAction!.hogFunctionState!.send
+                }
+                while (!result.finished) {
+                    result = await executor.execute(result.invocation)
+                    events.push(...result.capturedPostHogEvents)
+                }
+
+                expect(
+                    events.map((event) => event.event).filter((event) => event.startsWith('$workflows_email_'))
+                ).toEqual(captured)
+                expect(sesSend).toHaveBeenCalledTimes(1)
+            }
+        )
+    })
+})

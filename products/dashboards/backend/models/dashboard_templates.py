@@ -1,0 +1,867 @@
+from django.contrib.postgres.fields import ArrayField
+from django.db import models
+from django.db.models import Q, UniqueConstraint
+
+from posthog.models.utils import RootTeamManager, RootTeamMixin, UUIDTModel
+
+
+class DashboardTemplateManager(RootTeamManager):
+    def get_queryset(self):
+        return super().get_queryset().exclude(deleted=True)
+
+
+class DashboardTemplate(UUIDTModel, RootTeamMixin):
+    objects = DashboardTemplateManager()  # type: ignore
+    objects_including_soft_deleted = RootTeamManager()
+
+    class Scope(models.TextChoices):
+        """Visibility of the dashboard template"""
+
+        ONLY_TEAM = "team", "Only team"
+        ORGANIZATION = "organization", "Organization"
+        GLOBAL = "global", "Global"
+        FEATURE_FLAG = "feature_flag", "Feature Flag"
+
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, null=True, related_name="+")
+    template_name = models.CharField(max_length=400, null=True, blank=True)
+    dashboard_description = models.CharField(max_length=400, null=True, blank=True)
+    dashboard_filters = models.JSONField(null=True, blank=True)
+    tiles = models.JSONField(blank=True, null=True)
+    variables = models.JSONField(null=True, blank=True)
+    customization = models.JSONField(null=True, blank=True)
+    tags: ArrayField = ArrayField(models.CharField(max_length=255), blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True, blank=True, null=True)
+    created_by = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    deleted = models.BooleanField(blank=True, null=True)
+    image_url = models.CharField(max_length=8201, null=True, blank=True)
+    scope = models.CharField(max_length=24, choices=Scope, null=True, blank=True)
+    # where this template is available, e.g. "general" and/or "onboarding"
+    availability_contexts = ArrayField(models.CharField(max_length=255), blank=True, null=True)
+    is_featured = models.BooleanField(
+        default=False,
+        help_text="Manually curated; used to highlight templates in the UI.",
+    )
+
+    class Meta:
+        constraints = [
+            UniqueConstraint(
+                fields=[
+                    "template_name",
+                    "team",
+                ],
+                condition=Q(deleted__isnull=True) | Q(deleted=False),
+                name="unique_template_name_per_team",
+            ),
+        ]
+        db_table = "posthog_dashboardtemplate"
+
+    def __str__(self):
+        return self.template_name
+
+    @staticmethod
+    def original_template() -> "DashboardTemplate":
+        """
+        The authoritative hardcoded "Product analytics" template the rest of the codebase relies on
+        (the DEFAULT_APP seed, the DB-absent fallback in create_dashboard_from_template, and the global
+        template seed used in tests). It is intentionally the legacy shape; new projects get the
+        refreshed layout via default_signup_template().
+
+        This OG template is not stored in https://github.com/PostHog/templates-repository
+        The system assumes this template is always present and doesn't wait to import it from the template repository
+        """
+        return DashboardTemplate.legacy_signup_template()
+
+    @staticmethod
+    def default_signup_template() -> "DashboardTemplate":
+        """
+        Refreshed signup dashboard given to every new non-demo project's primary dashboard.
+        This OG template is not stored in https://github.com/PostHog/templates-repository
+        The system assumes this template is always present and doesn't wait to import it from the template repository
+        """
+        return DashboardTemplate(
+            template_name="Product analytics",
+            dashboard_description="An overview of how people use your app.",
+            dashboard_filters={},
+            customization={
+                "groups": {
+                    "retention": {"title": "Are people coming back?"},
+                    "acquisition": {"title": "Where your visitors come from"},
+                    "conversion": {"title": "Turning visits into actions"},
+                    "next-steps": {"title": "What to do next"},
+                }
+            },
+            tiles=[
+                {
+                    "type": "TEXT",
+                    "color": None,
+                    "transparent_background": True,
+                    "body": (
+                        "# 👋 Start here\n\n"
+                        "The charts below use pageviews, clicks, sessions, and location, which PostHog captures "
+                        "automatically. Set the retention and funnel tiles to use your own events. You can edit "
+                        "any tile or duplicate the dashboard."
+                    ),
+                    "layouts": {
+                        "sm": {"h": 2, "w": 12, "x": 0, "y": 0, "minH": 1, "minW": 3},
+                        "xs": {"h": 3, "w": 1, "x": 0, "y": 0, "minH": 1, "minW": 1},
+                    },
+                },
+                {
+                    "name": "Active users (last 30 days)",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {
+                                    "kind": "GroupNode",
+                                    "operator": "OR",
+                                    "nodes": [
+                                        {"kind": "EventsNode", "event": "$pageview", "name": "$pageview"},
+                                        {"kind": "EventsNode", "event": "$screen", "name": "$screen"},
+                                    ],
+                                    "math": "dau",
+                                    "name": "Pageview or screen",
+                                }
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-30d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "Metric",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 3, "w": 4, "x": 0, "y": 2, "minH": 2, "minW": 3},
+                        "xs": {"h": 3, "w": 1, "x": 0, "y": 3, "minH": 2, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "name": "Sessions (last 7 days)",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {
+                                    "kind": "EventsNode",
+                                    "math": "unique_session",
+                                    "name": "$pageview",
+                                    "event": "$pageview",
+                                }
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-7d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "Metric",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "compareFilter": {"compare": True},
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 3, "w": 4, "x": 4, "y": 2, "minH": 2, "minW": 3},
+                        "xs": {"h": 3, "w": 1, "x": 0, "y": 6, "minH": 2, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "name": "Pageviews (last 7 days)",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {"kind": "EventsNode", "math": "total", "name": "$pageview", "event": "$pageview"}
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-7d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "Metric",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "compareFilter": {"compare": True},
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 3, "w": 4, "x": 8, "y": 2, "minH": 2, "minW": 3},
+                        "xs": {"h": 3, "w": 1, "x": 0, "y": 9, "minH": 2, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "type": "TEXT",
+                    "color": None,
+                    "group_key": "retention",
+                    "transparent_background": True,
+                    "body": "Active users show your trend. Retention shows how many return after their first visit.",
+                    "layouts": {
+                        "sm": {"h": 1, "w": 12, "x": 0, "y": 5, "minH": 1, "minW": 3},
+                        "xs": {"h": 2, "w": 1, "x": 0, "y": 12, "minH": 1, "minW": 1},
+                    },
+                },
+                {
+                    "name": "Daily active users (DAUs)",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "group_key": "retention",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {
+                                    "kind": "GroupNode",
+                                    "operator": "OR",
+                                    "nodes": [
+                                        {"kind": "EventsNode", "event": "$pageview", "name": "$pageview"},
+                                        {"kind": "EventsNode", "event": "$screen", "name": "$screen"},
+                                    ],
+                                    "math": "dau",
+                                    "name": "Pageview or screen",
+                                }
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-30d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "ActionsLineGraph",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 4, "w": 6, "x": 0, "y": 6, "minH": 3, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 14, "minH": 3, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "name": "Weekly active users (WAUs)",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "group_key": "retention",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {
+                                    "kind": "GroupNode",
+                                    "operator": "OR",
+                                    "nodes": [
+                                        {"kind": "EventsNode", "event": "$pageview", "name": "$pageview"},
+                                        {"kind": "EventsNode", "event": "$screen", "name": "$screen"},
+                                    ],
+                                    "math": "dau",
+                                    "name": "Pageview or screen",
+                                }
+                            ],
+                            "interval": "week",
+                            "dateRange": {"date_from": "-90d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "ActionsBar",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 4, "w": 6, "x": 6, "y": 6, "minH": 3, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 19, "minH": 3, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "name": "Retention",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "group_key": "retention",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "RetentionQuery",
+                            "dateRange": {"date_from": "-7w", "explicitDate": False},
+                            "properties": [],
+                            "retentionFilter": {
+                                "period": "Week",
+                                "targetEntity": {"id": "$pageview", "type": "events"},
+                                "retentionType": "retention_first_time",
+                                "totalIntervals": 8,
+                                "returningEntity": {"id": "$pageview", "type": "events"},
+                            },
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 12, "x": 0, "y": 10, "minH": 4, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 24, "minH": 4, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "type": "TEXT",
+                    "color": None,
+                    "group_key": "acquisition",
+                    "transparent_background": True,
+                    "body": "The sites sending people to your app and the countries they visit from.",
+                    "layouts": {
+                        "sm": {"h": 1, "w": 12, "x": 0, "y": 15, "minH": 1, "minW": 3},
+                        "xs": {"h": 2, "w": 1, "x": 0, "y": 29, "minH": 1, "minW": 1},
+                    },
+                },
+                {
+                    "name": "Top referrers",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "group_key": "acquisition",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {"kind": "EventsNode", "math": "dau", "name": "$pageview", "event": "$pageview"}
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-7d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "ActionsBarValue",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {
+                                "breakdown": "$referring_domain",
+                                "breakdown_type": "event",
+                                "breakdown_limit": 8,
+                                "breakdown_hide_other_aggregation": True,
+                            },
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 4, "w": 6, "x": 0, "y": 16, "minH": 3, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 31, "minH": 3, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "name": "Users by country",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "group_key": "acquisition",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {"kind": "EventsNode", "math": "dau", "name": "$pageview", "event": "$pageview"}
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-7d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "WorldMap",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown": "$geoip_country_code", "breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 4, "w": 6, "x": 6, "y": 16, "minH": 3, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 36, "minH": 3, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "type": "TEXT",
+                    "color": None,
+                    "group_key": "conversion",
+                    "transparent_background": True,
+                    "body": "A funnel from page view to click. Swap in your own events to measure real conversion.",
+                    "layouts": {
+                        "sm": {"h": 1, "w": 12, "x": 0, "y": 20, "minH": 1, "minW": 3},
+                        "xs": {"h": 2, "w": 1, "x": 0, "y": 41, "minH": 1, "minW": 1},
+                    },
+                },
+                {
+                    "name": "Visit to interaction funnel",
+                    "type": "INSIGHT",
+                    "color": None,
+                    "group_key": "conversion",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "FunnelsQuery",
+                            "series": [
+                                {
+                                    "kind": "EventsNode",
+                                    "name": "$pageview",
+                                    "event": "$pageview",
+                                    "custom_name": "Viewed a page",
+                                },
+                                {
+                                    "kind": "EventsNode",
+                                    "name": "$autocapture",
+                                    "event": "$autocapture",
+                                    "custom_name": "Clicked something",
+                                },
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-7d", "explicitDate": False},
+                            "properties": [],
+                            "funnelsFilter": {
+                                "layout": "horizontal",
+                                "exclusions": [],
+                                "funnelVizType": "steps",
+                                "funnelOrderType": "ordered",
+                                "funnelStepReference": "total",
+                                "funnelWindowInterval": 14,
+                                "breakdownAttributionType": "first_touch",
+                                "funnelWindowIntervalUnit": "day",
+                            },
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 3, "w": 12, "x": 0, "y": 21, "minH": 3, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 43, "minH": 3, "minW": 1},
+                    },
+                    "description": "",
+                },
+                {
+                    "type": "TEXT",
+                    "color": None,
+                    "group_key": "next-steps",
+                    "transparent_background": True,
+                    "body": "Watch how people behave, explore raw events, or dig into traffic and acquisition.",
+                    "layouts": {
+                        "sm": {"h": 1, "w": 12, "x": 0, "y": 24, "minH": 1, "minW": 3},
+                        "xs": {"h": 2, "w": 1, "x": 0, "y": 48, "minH": 1, "minW": 1},
+                    },
+                },
+                {
+                    "type": "BUTTON",
+                    "color": None,
+                    "group_key": "next-steps",
+                    "transparent_background": True,
+                    "url": "/replay/home",
+                    "text": "Watch session replays",
+                    "placement": "left",
+                    "style": "primary",
+                    "layouts": {
+                        "sm": {"h": 1, "w": 4, "x": 0, "y": 25, "minH": 1, "minW": 2},
+                        "xs": {"h": 1, "w": 1, "x": 0, "y": 50, "minH": 1, "minW": 1},
+                    },
+                },
+                {
+                    "type": "BUTTON",
+                    "color": None,
+                    "group_key": "next-steps",
+                    "transparent_background": True,
+                    "url": "/web",
+                    "text": "Open web analytics",
+                    "placement": "left",
+                    "style": "secondary",
+                    "layouts": {
+                        "sm": {"h": 1, "w": 4, "x": 4, "y": 25, "minH": 1, "minW": 2},
+                        "xs": {"h": 1, "w": 1, "x": 0, "y": 51, "minH": 1, "minW": 1},
+                    },
+                },
+                {
+                    "type": "BUTTON",
+                    "color": None,
+                    "group_key": "next-steps",
+                    "transparent_background": True,
+                    "url": "/activity/events",
+                    "text": "Browse activity",
+                    "placement": "left",
+                    "style": "secondary",
+                    "layouts": {
+                        "sm": {"h": 1, "w": 4, "x": 8, "y": 25, "minH": 1, "minW": 2},
+                        "xs": {"h": 1, "w": 1, "x": 0, "y": 52, "minH": 1, "minW": 1},
+                    },
+                },
+            ],
+            tags=[],
+        )
+
+    @staticmethod
+    def legacy_signup_template() -> "DashboardTemplate":
+        """
+        The legacy "Product analytics" dashboard, still used by the DEFAULT_APP template seed.
+        This OG template is not stored in https://github.com/PostHog/templates-repository
+        The system assumes this template is always present and doesn't wait to import it from the template repository
+        """
+        return DashboardTemplate(
+            template_name="Product analytics",
+            dashboard_description=(
+                "A starter view of how people use your app: how many visit, whether they come back, "
+                "where traffic comes from, and how they move through your pages."
+            ),
+            dashboard_filters={},
+            tiles=[
+                {
+                    "name": "Daily active users (DAUs)",
+                    "type": "INSIGHT",
+                    "color": "blue",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {
+                                    "kind": "GroupNode",
+                                    "operator": "OR",
+                                    "nodes": [
+                                        {"kind": "EventsNode", "event": "$pageview", "name": "$pageview"},
+                                        {"kind": "EventsNode", "event": "$screen", "name": "$screen"},
+                                    ],
+                                    "math": "dau",
+                                    "name": "Pageview or screen",
+                                }
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-30d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "ActionsLineGraph",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 6, "x": 0, "y": 0, "minH": 5, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 0, "minH": 5, "minW": 3},
+                    },
+                    "description": "Shows the number of unique users that view a page or screen in your app every day.",
+                },
+                {
+                    "name": "Weekly active users (WAUs)",
+                    "type": "INSIGHT",
+                    "color": "green",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {
+                                    "kind": "GroupNode",
+                                    "operator": "OR",
+                                    "nodes": [
+                                        {"kind": "EventsNode", "event": "$pageview", "name": "$pageview"},
+                                        {"kind": "EventsNode", "event": "$screen", "name": "$screen"},
+                                    ],
+                                    "math": "dau",
+                                    "name": "Pageview or screen",
+                                }
+                            ],
+                            "interval": "week",
+                            "dateRange": {"date_from": "-90d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "ActionsLineGraph",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 6, "x": 6, "y": 0, "minH": 5, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 5, "minH": 5, "minW": 3},
+                    },
+                    "description": "Shows the number of unique users that view a page or screen in your app every week.",
+                },
+                {
+                    "name": "Retention",
+                    "type": "INSIGHT",
+                    "color": "blue",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "RetentionQuery",
+                            "dateRange": {"date_from": "-7d", "explicitDate": False},
+                            "properties": [],
+                            "retentionFilter": {
+                                "period": "Week",
+                                "targetEntity": {"id": "$pageview", "type": "events"},
+                                "retentionType": "retention_first_time",
+                                "totalIntervals": 11,
+                                "returningEntity": {"id": "$pageview", "type": "events"},
+                            },
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 6, "x": 6, "y": 5, "minH": 5, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 10, "minH": 5, "minW": 3},
+                    },
+                    "description": "Weekly retention of your users based on pageviews.",
+                },
+                {
+                    "name": "Growth accounting",
+                    "type": "INSIGHT",
+                    "color": "purple",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "LifecycleQuery",
+                            "series": [{"kind": "EventsNode", "name": "$pageview", "event": "$pageview"}],
+                            "interval": "week",
+                            "dateRange": {"date_from": "-30d", "explicitDate": False},
+                            "properties": [],
+                            "lifecycleFilter": {"showLegend": False},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 6, "x": 0, "y": 5, "minH": 5, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 15, "minH": 5, "minW": 3},
+                    },
+                    "description": "How many of your users are new, returning, resurrecting, or dormant each week based on pageviews.",
+                },
+                {
+                    "name": "Referring domain (last 14 days)",
+                    "type": "INSIGHT",
+                    "color": "black",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {"kind": "EventsNode", "math": "dau", "name": "$pageview", "event": "$pageview"}
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-14d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "ActionsBarValue",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown": "$referring_domain", "breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 6, "x": 0, "y": 10, "minH": 5, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 20, "minH": 5, "minW": 3},
+                    },
+                    "description": "Shows the most common referring domains for your users over the past 14 days. Pageviews only.",
+                },
+                {
+                    "name": "Pageview funnel, by browser",
+                    "type": "INSIGHT",
+                    "color": "green",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "FunnelsQuery",
+                            "series": [
+                                {
+                                    "kind": "EventsNode",
+                                    "name": "$pageview",
+                                    "event": "$pageview",
+                                    "custom_name": "First page view",
+                                },
+                                {
+                                    "kind": "EventsNode",
+                                    "name": "$pageview",
+                                    "event": "$pageview",
+                                    "custom_name": "Second page view",
+                                },
+                                {
+                                    "kind": "EventsNode",
+                                    "name": "$pageview",
+                                    "event": "$pageview",
+                                    "custom_name": "Third page view",
+                                },
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-7d", "explicitDate": False},
+                            "properties": [],
+                            "funnelsFilter": {
+                                "layout": "horizontal",
+                                "exclusions": [],
+                                "funnelVizType": "steps",
+                                "funnelOrderType": "ordered",
+                                "funnelStepReference": "total",
+                                "funnelWindowInterval": 14,
+                                "breakdownAttributionType": "first_touch",
+                                "funnelWindowIntervalUnit": "day",
+                            },
+                            "breakdownFilter": {"breakdown": "$browser", "breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 6, "x": 6, "y": 10, "minH": 5, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 25, "minH": 5, "minW": 3},
+                    },
+                    "description": "This example funnel shows how many of your users have completed 3 page views, broken down by browser. Pageviews only.",
+                },
+            ],
+            tags=[],
+        )
+
+    @staticmethod
+    def feature_flag_template(feature_flag_key: str) -> "DashboardTemplate":
+        return DashboardTemplate(
+            template_name=feature_flag_key + "Usage Information",
+            dashboard_description="",
+            dashboard_filters={},
+            tiles=[
+                {
+                    "name": "Daily active users (DAUs)",
+                    "type": "INSIGHT",
+                    "color": "blue",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {"kind": "EventsNode", "math": "dau", "name": "$pageview", "event": "$pageview"}
+                            ],
+                            "interval": "day",
+                            "dateRange": {"date_from": "-30d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "ActionsLineGraph",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 6, "x": 0, "y": 0, "minH": 5, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 0, "minH": 5, "minW": 3},
+                    },
+                    "description": "Shows the number of unique users that use your app every day.",
+                },
+                {
+                    "name": "Weekly active users (WAUs)",
+                    "type": "INSIGHT",
+                    "color": "green",
+                    "query": {
+                        "kind": "InsightVizNode",
+                        "source": {
+                            "kind": "TrendsQuery",
+                            "series": [
+                                {"kind": "EventsNode", "math": "dau", "name": "$pageview", "event": "$pageview"}
+                            ],
+                            "interval": "week",
+                            "dateRange": {"date_from": "-90d", "explicitDate": False},
+                            "properties": [],
+                            "trendsFilter": {
+                                "display": "ActionsLineGraph",
+                                "showLegend": False,
+                                "yAxisScaleType": "linear",
+                                "showValuesOnSeries": False,
+                                "smoothingIntervals": 1,
+                                "showPercentStackView": False,
+                                "aggregationAxisFormat": "numeric",
+                                "showAlertThresholdLines": False,
+                            },
+                            "breakdownFilter": {"breakdown_type": "event"},
+                            "filterTestAccounts": False,
+                        },
+                    },
+                    "layouts": {
+                        "sm": {"h": 5, "w": 6, "x": 6, "y": 0, "minH": 5, "minW": 3},
+                        "xs": {"h": 5, "w": 1, "x": 0, "y": 5, "minH": 5, "minW": 3},
+                    },
+                    "description": "Shows the number of unique users that use your app every week.",
+                },
+            ],
+        )

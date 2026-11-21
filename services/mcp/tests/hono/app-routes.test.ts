@@ -1,0 +1,563 @@
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Mock } from 'vitest'
+import { z } from 'zod'
+
+import { createApp } from '@/hono/app'
+import type { RedisLike } from '@/hono/cache/RedisCache'
+import {
+    type ConfirmedActionRuntime,
+    getConfirmedActionRuntime,
+    setConfirmedActionRuntime,
+} from '@/tools/confirmed-action-registry'
+import { executeConfirmedAction, prepareConfirmedAction } from '@/tools/confirmed-action-runtime'
+import type { Context } from '@/tools/types'
+
+import { makeRedisRateLimitStubs } from './helpers/redis-rate-limit-stubs'
+
+// Tests that go through createApp need a signing key — the typed-confirm
+// runtime install throws without one. We stub a fixed value rather than
+// depend on the surrounding environment.
+const TEST_SIGNING_KEY = 'a'.repeat(32)
+beforeAll(() => {
+    process.env.MCP_SIGNED_STATE_KEY = TEST_SIGNING_KEY
+})
+
+interface MockRedis extends RedisLike {
+    incrby(key: string, increment: number): Promise<number>
+    ping: Mock<() => Promise<string>>
+    _store: Map<string, string>
+}
+
+function createMockRedis(): MockRedis {
+    const store = new Map<string, string>()
+    return {
+        get: vi.fn(async (key: string) => store.get(key) ?? null),
+        set: vi.fn(async (key: string, value: string) => {
+            store.set(key, value)
+            return 'OK'
+        }),
+        del: vi.fn(async (...keys: string[]) => keys.length),
+        scan: vi.fn(async () => ['0', []] as [string, string[]]),
+        ...makeRedisRateLimitStubs(),
+        ping: vi.fn(async () => 'PONG'),
+        _store: store,
+    }
+}
+
+describe('Hono App Routes', () => {
+    let mockRedis: MockRedis
+
+    beforeEach(() => {
+        mockRedis = createMockRedis()
+    })
+
+    describe('GET /', () => {
+        it('should redirect to the docs', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/')
+            expect(res.status).toBe(302)
+            expect(res.headers.get('location')).toBe('https://posthog.com/docs/model-context-protocol')
+        })
+    })
+
+    describe('health checks', () => {
+        it('should return 200 with JSON on /healthz', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/healthz')
+            expect(res.status).toBe(200)
+            const body = (await res.json()) as Record<string, unknown>
+            expect(body).toEqual({ status: 'ok' })
+        })
+
+        it('should return 200 with JSON on /health', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/health')
+            expect(res.status).toBe(200)
+            const body = (await res.json()) as Record<string, unknown>
+            expect(body).toEqual({ status: 'ok' })
+        })
+
+        it('should return Cache-Control: no-store on /health', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/health')
+            expect(res.headers.get('Cache-Control')).toBe('no-store')
+        })
+
+        it('should return 200 on /readyz when Redis is healthy', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/readyz')
+            expect(res.status).toBe(200)
+            const body = (await res.json()) as Record<string, unknown>
+            expect(body).toEqual({ status: 'ok', redis: 'healthy' })
+        })
+
+        it('should return 503 on /readyz when Redis ping fails', async () => {
+            mockRedis.ping.mockRejectedValue(new Error('Connection refused'))
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/readyz')
+            expect(res.status).toBe(503)
+            const body = (await res.json()) as Record<string, unknown>
+            expect(body.status).toBe('error')
+        })
+
+        it('should return 503 on /readyz when Redis returns unexpected value', async () => {
+            mockRedis.ping.mockResolvedValue('NOT_PONG')
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/readyz')
+            expect(res.status).toBe(503)
+        })
+    })
+
+    describe('domain verification challenges', () => {
+        it.each([
+            ['/.well-known/openai-apps-challenge', 'pRLV9JYbPOF5Dy039v3Rn3-qrMuKqZ2_4SsX9GoL9aU'],
+            [
+                '/.well-known/muse-challenge/5e793573d164f4dde673230b30b881493267f7e5036340c31bdef7d50ee73afc',
+                'muse-challenge=5e793573d164f4dde673230b30b881493267f7e5036340c31bdef7d50ee73afc',
+            ],
+        ])('GET %s returns the challenge token', async (path, expected) => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request(path)
+            expect(res.status).toBe(200)
+            const body = await res.text()
+            expect(body).toBe(expected)
+        })
+    })
+
+    describe('security headers', () => {
+        it('should include X-Content-Type-Options: nosniff', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/healthz')
+            expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff')
+        })
+
+        it('should include X-Frame-Options: DENY', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/healthz')
+            expect(res.headers.get('X-Frame-Options')).toBe('DENY')
+        })
+    })
+
+    describe('OAuth Protected Resource Metadata', () => {
+        it('should return metadata for bare /.well-known/oauth-protected-resource', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/.well-known/oauth-protected-resource')
+            expect(res.status).toBe(200)
+            const body = (await res.json()) as Record<string, any>
+            expect(body.authorization_servers).toBeTruthy()
+            expect(body.bearer_methods_supported).toEqual(['header'])
+            expect(body.scopes_supported).toBeTruthy()
+        })
+
+        it('should return metadata for /mcp path', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/.well-known/oauth-protected-resource/mcp')
+            expect(res.status).toBe(200)
+            const body = (await res.json()) as Record<string, any>
+            expect(body.resource).toContain('/mcp')
+        })
+
+        it('should use oauth.posthog.com as authorization server', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/.well-known/oauth-protected-resource/mcp')
+            const body = (await res.json()) as Record<string, any>
+            expect(body.authorization_servers[0]).toBe('https://oauth.posthog.com')
+        })
+
+        it('should set Cache-Control header', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/.well-known/oauth-protected-resource/mcp')
+            expect(res.headers.get('Cache-Control')).toBe('public, max-age=3600')
+        })
+
+        it('should allow CORS from PostHog app origins for consent-page metadata fetch', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/.well-known/oauth-protected-resource/mcp', {
+                headers: { Origin: 'https://us.posthog.com' },
+            })
+            expect(res.status).toBe(200)
+            expect(res.headers.get('Access-Control-Allow-Origin')).toBe('https://us.posthog.com')
+            expect(res.headers.get('Vary')).toBe('Origin')
+        })
+
+        it('should answer OPTIONS preflight for PostHog app origins', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/.well-known/oauth-protected-resource/mcp', {
+                method: 'OPTIONS',
+                headers: {
+                    Origin: 'https://us.posthog.com',
+                    'Access-Control-Request-Method': 'GET',
+                },
+            })
+            expect(res.status).toBe(204)
+            expect(res.headers.get('Access-Control-Allow-Origin')).toBe('https://us.posthog.com')
+        })
+    })
+
+    describe('hostname-based region detection', () => {
+        it('should detect EU from mcp.eu.posthog.com', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request(new Request('http://mcp.eu.posthog.com/mcp', { method: 'POST' }))
+            expect(res.status).toBe(401)
+            const wwwAuth = res.headers.get('WWW-Authenticate') || ''
+            expect(wwwAuth).toContain('mcp.eu.posthog.com')
+        })
+
+        it('should detect US from mcp.us.posthog.com', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request(
+                new Request('http://mcp.us.posthog.com/.well-known/oauth-protected-resource/mcp')
+            )
+            expect(res.status).toBe(200)
+        })
+
+        it('should detect EU from legacy mcp-eu.posthog.com', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request(new Request('http://mcp-eu.posthog.com/mcp', { method: 'POST' }))
+            expect(res.status).toBe(401)
+            const wwwAuth = res.headers.get('WWW-Authenticate') || ''
+            expect(wwwAuth).toContain('region=eu')
+        })
+    })
+
+    describe('client-sent X-Forwarded-Host', () => {
+        const headers = { 'X-Forwarded-Host': 'mcp-eu.posthog.com', 'X-Forwarded-Proto': 'https' }
+
+        it('does not change the resource in protected resource metadata', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request(
+                new Request('http://mcp.us.posthog.com/.well-known/oauth-protected-resource/mcp', { headers })
+            )
+            expect(res.status).toBe(200)
+            const body = (await res.json()) as Record<string, any>
+            expect(body.resource).toBe('https://mcp.us.posthog.com/mcp')
+        })
+
+        it('does not change the host or region in the 401 challenge', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request(new Request('http://mcp.us.posthog.com/mcp', { method: 'POST', headers }))
+            expect(res.status).toBe(401)
+            expect(res.headers.get('WWW-Authenticate')).toBe(
+                'Bearer resource_metadata="https://mcp.us.posthog.com/.well-known/oauth-protected-resource/mcp?region=us"'
+            )
+        })
+
+        it('does not change the host in the SSE redirect, and keeps the forwarded protocol', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request(new Request('http://mcp.us.posthog.com/sse', { headers }))
+            expect(res.status).toBe(308)
+            expect(res.headers.get('location')).toBe('https://mcp.us.posthog.com/mcp?_deprecated=sse')
+        })
+    })
+
+    describe('MCP auth on /mcp', () => {
+        it('should return 401 with WWW-Authenticate when no token', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp', { method: 'POST' })
+            expect(res.status).toBe(401)
+            const text = await res.text()
+            expect(text).toContain('No token provided')
+            expect(res.headers.get('WWW-Authenticate')).toContain('Bearer')
+            expect(res.headers.get('WWW-Authenticate')).toContain('oauth-protected-resource/mcp')
+        })
+
+        it('should return 401 for invalid token prefix', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp', {
+                method: 'POST',
+                headers: { Authorization: 'Bearer bad_token' },
+            })
+            expect(res.status).toBe(401)
+            expect(await res.text()).toContain('Invalid token')
+        })
+
+        it('should pass auth check for phx_ tokens (may fail later at init)', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp', {
+                method: 'POST',
+                headers: {
+                    Authorization: 'Bearer phx_test_token',
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    method: 'initialize',
+                    params: {
+                        protocolVersion: '2024-11-05',
+                        capabilities: {},
+                        clientInfo: { name: 'test', version: '1.0' },
+                    },
+                    id: 1,
+                }),
+            })
+            // Token format check passes — response is NOT "Invalid token"
+            const body = await res.text()
+            expect(body).not.toContain('Invalid token')
+        })
+
+        it('should pass auth check for pha_ tokens (may fail later at init)', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp', {
+                method: 'POST',
+                headers: {
+                    Authorization: 'Bearer pha_test_token',
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    method: 'initialize',
+                    params: {
+                        protocolVersion: '2024-11-05',
+                        capabilities: {},
+                        clientInfo: { name: 'test', version: '1.0' },
+                    },
+                    id: 1,
+                }),
+            })
+            // Token format check passes — response is NOT "Invalid token"
+            const body = await res.text()
+            expect(body).not.toContain('Invalid token')
+        })
+
+        it('should pass auth check for ID-JAG access tokens (typ: at+jwt)', async () => {
+            // Synthesize a JWT-shaped token: header `{"typ":"at+jwt","alg":"RS256"}`,
+            // a stub payload, and a placeholder signature. The MCP gate only inspects
+            // the header — the PostHog API verifies the signature downstream.
+            const headerB64 = btoa('{"typ":"at+jwt","alg":"RS256"}')
+                .replace(/=+$/, '')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+            const payloadB64 = btoa('{"sub":"example.com:user@example.com","aud":"https://posthog.test"}')
+                .replace(/=+$/, '')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+            const idJagToken = `${headerB64}.${payloadB64}.signature`
+
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp', {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${idJagToken}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    method: 'initialize',
+                    params: {
+                        protocolVersion: '2024-11-05',
+                        capabilities: {},
+                        clientInfo: { name: 'test', version: '1.0' },
+                    },
+                    id: 1,
+                }),
+            })
+            const body = await res.text()
+            expect(body).not.toContain('Invalid token')
+        })
+
+        it('should reject non-id-jag JWTs (e.g. typ: JWT)', async () => {
+            // A JWT without `typ: at+jwt` is not an ID-JAG access token — e.g.
+            // a sharing JWT — and must be rejected here so the right backend
+            // takes over (or fails with the documented invalid-token response).
+            const headerB64 = btoa('{"typ":"JWT","alg":"HS256"}')
+                .replace(/=+$/, '')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+            const wrongJwt = `${headerB64}.eyJzdWIiOiJ4In0.sig`
+
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${wrongJwt}` },
+            })
+            expect(res.status).toBe(401)
+            expect(await res.text()).toContain('Invalid token')
+        })
+
+        it('sends a project secret API key to the business knowledge URL', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp?project_id=1', {
+                method: 'POST',
+                headers: { Authorization: 'Bearer phs_test_key' },
+            })
+            expect(res.status).toBe(400)
+            expect(await res.text()).toContain('/mcp/business-knowledge')
+        })
+
+        it.each([
+            ['no credential', undefined],
+            ['a personal API key', 'Bearer phx_test_key'],
+        ])('asks for a project secret API key on the business knowledge URL with %s', async (_, authorization) => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp/business-knowledge', {
+                method: 'POST',
+                headers: authorization ? { Authorization: authorization } : {},
+            })
+            expect(res.status).toBe(401)
+            expect(await res.text()).toContain('project secret API key')
+            expect(res.headers.get('WWW-Authenticate')).toBeNull()
+        })
+    })
+
+    describe('OAuth redirect routes', () => {
+        it('should redirect /.well-known/oauth-authorization-server', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/.well-known/oauth-authorization-server', { redirect: 'manual' })
+            expect([301, 302]).toContain(res.status)
+            expect(res.headers.get('Location')).toContain('oauth.posthog.com')
+        })
+
+        it('should redirect /.well-known/jwks.json with 301', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/.well-known/jwks.json', { redirect: 'manual' })
+            expect(res.status).toBe(301)
+        })
+
+        it('should redirect /oauth/* routes with 301', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/oauth/authorize', { redirect: 'manual' })
+            expect(res.status).toBe(301)
+        })
+
+        it('should redirect /register with 307 (preserves POST)', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/register', { method: 'POST', redirect: 'manual' })
+            expect(res.status).toBe(307)
+            expect(res.headers.get('Location')).toContain('/oauth/register')
+        })
+
+        it('should redirect /authorize with 302', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/authorize', { redirect: 'manual' })
+            expect(res.status).toBe(302)
+            expect(res.headers.get('Location')).toContain('/oauth/authorize')
+        })
+
+        it('should redirect /token with 307 (preserves POST)', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/token', { method: 'POST', redirect: 'manual' })
+            expect(res.status).toBe(307)
+            expect(res.headers.get('Location')).toContain('/oauth/token')
+        })
+    })
+
+    describe('Streamable HTTP endpoint', () => {
+        it('should return 405 for unsupported method (PUT)', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp', {
+                method: 'PUT',
+                headers: { Authorization: 'Bearer phx_test' },
+            })
+            expect(res.status).toBe(405)
+        })
+
+        it('should return 405 for DELETE (stateless, no session management)', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/mcp', {
+                method: 'DELETE',
+                headers: {
+                    Authorization: 'Bearer phx_test',
+                    'mcp-session-id': 'non-existent',
+                },
+            })
+            expect(res.status).toBe(405)
+        })
+    })
+
+    describe('404 handling', () => {
+        it('should return 404 for unknown routes', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/unknown-path')
+            expect(res.status).toBe(404)
+        })
+
+        it('should return 404 for /api paths', async () => {
+            const { app } = createApp(mockRedis)
+            const res = await app.request('/api/anything')
+            expect(res.status).toBe(404)
+        })
+    })
+
+    describe('session isolation', () => {
+        it('should create independent app instances with separate session maps', async () => {
+            const redis1 = createMockRedis()
+            const redis2 = createMockRedis()
+            const { app: app1 } = createApp(redis1)
+            const { app: app2 } = createApp(redis2)
+
+            const res1 = await app1.request('/healthz')
+            const res2 = await app2.request('/healthz')
+            expect(res1.status).toBe(200)
+            expect(res2.status).toBe(200)
+        })
+    })
+
+    describe('confirmed-action runtime', () => {
+        afterEach(() => {
+            // Restore the signing key after the "missing key" test below
+            // unsets it, so following tests don't bleed into each other.
+            process.env.MCP_SIGNED_STATE_KEY = TEST_SIGNING_KEY
+            setConfirmedActionRuntime(undefined)
+        })
+
+        async function confirmsAcross(
+            prepareWith: ConfirmedActionRuntime,
+            executeWith: ConfirmedActionRuntime
+        ): Promise<boolean> {
+            const context = { getDistinctId: async () => 'did-1' } as unknown as Context
+            const inputSchema = z.object({ orgId: z.string() })
+            const prepared = await prepareConfirmedAction(context, {
+                args: { orgId: 'acme' },
+                purpose: 'enforce-2fa',
+                inputSchema,
+                actionLabel: 'enforce 2FA',
+                messageTemplate: 'Enforce 2FA?',
+                ...prepareWith,
+            })
+            const outcome = await executeConfirmedAction(context, {
+                incomingArgs: { confirmation_hash: prepared.confirmation_hash, confirmation: 'confirm' },
+                purpose: 'enforce-2fa',
+                inputSchema,
+                ...executeWith,
+            })
+            return outcome.ok
+        }
+
+        it('installs a runtime that confirms an action it prepared', async () => {
+            createApp(mockRedis)
+            const runtime = getConfirmedActionRuntime()
+
+            expect(await confirmsAcross(runtime, runtime)).toBe(true)
+        })
+
+        it('binds each createApp call to its own Redis (latest wins)', async () => {
+            createApp(createMockRedis())
+            const first = getConfirmedActionRuntime()
+            createApp(createMockRedis())
+            const second = getConfirmedActionRuntime()
+
+            expect(await confirmsAcross(second, second)).toBe(true)
+            expect(await confirmsAcross(first, second)).toBe(false)
+        })
+
+        it('boots without a signing key — confirmed_action paradigm is disabled but the app still serves', async () => {
+            // Option B: missing key disables the paradigm but does NOT
+            // crash the app. Other tools keep working; only confirmed_action
+            // tools fail at request time. Assert: app responds normally
+            // AND getConfirmedActionRuntime() throws with a message that
+            // points at the env var.
+            delete process.env.MCP_SIGNED_STATE_KEY
+            const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+            try {
+                const { app } = createApp(mockRedis)
+                const res = await app.request('/healthz')
+                expect(res.status).toBe(200)
+                expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('confirmed-action paradigm disabled'))
+
+                expect(() => getConfirmedActionRuntime()).toThrow(/MCP_SIGNED_STATE_KEY/)
+            } finally {
+                errorSpy.mockRestore()
+            }
+        })
+    })
+})

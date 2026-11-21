@@ -1,0 +1,1014 @@
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+export interface StaffCohortApi {
+    /** Cohort id. */
+    id: number
+    /**
+     * Cohort name.
+     * @nullable
+     */
+    name: string | null
+    /** Id of the team the cohort belongs to. */
+    team_id: number
+    /** Name of the team the cohort belongs to. */
+    team_name: string
+    /** Project id the cohort's team belongs to, for building /project/<id>/cohorts/<id> links. */
+    project_id: number
+    /** Whether the cohort is soft-deleted. */
+    deleted: boolean
+    /** Whether the cohort is static (populated once from a source rather than recalculated). */
+    is_static: boolean
+    /** Whether a calculation is currently marked as in flight. */
+    is_calculating: boolean
+    /**
+     * When the last calculation completed, or null if never calculated.
+     * @nullable
+     */
+    last_calculation: string | null
+    /**
+     * Duration of the last completed calculation in milliseconds.
+     * @nullable
+     */
+    last_calculation_duration_ms: number | null
+    /** Consecutive calculation failures; above 20 the cohort is excluded from periodic recalculation. */
+    errors_calculating: number
+    /**
+     * When the last calculation error was recorded.
+     * @nullable
+     */
+    last_error_at: string | null
+    /**
+     * Version of the last completed calculation.
+     * @nullable
+     */
+    version: number | null
+    /**
+     * Version most recently requested; greater than `version` while a calculation is pending or stuck.
+     * @nullable
+     */
+    pending_version: number | null
+    /**
+     * Number of persons in the cohort as of the last completed calculation.
+     * @nullable
+     */
+    count: number | null
+    /**
+     * When the cohort was created.
+     * @nullable
+     */
+    created_at: string | null
+}
+
+export interface StaffCohortLookupResponseApi {
+    /** Requested cohorts, in request order. */
+    results: StaffCohortApi[]
+    /** Requested cohort ids that do not exist. */
+    not_found_cohort_ids: number[]
+}
+
+export interface StaffCohortRecalculateApi {
+    /**
+     * Cohort ids to force-recalculate (max 10 per request).
+     * @minItems 1
+     * @maxItems 10
+     */
+    cohort_ids: number[]
+}
+
+export interface StaffCohortFailedApi {
+    /** Cohort id that raised while being enqueued. */
+    cohort_id: number
+    /** Error message from the failed enqueue attempt. */
+    error: string
+}
+
+export interface StaffCohortSkippedApi {
+    /** Cohort id that was skipped. */
+    cohort_id: number
+    /** Why the cohort was not enqueued for recalculation. */
+    reason: string
+}
+
+export interface StaffCohortRecalculateResponseApi {
+    /** Cohort ids for which a recalculation was enqueued (including their dependency chains). */
+    queued_cohort_ids: number[]
+    /** Subset of queued_cohort_ids whose dependency chain failed to resolve, so only the cohort itself (not its dependents/dependencies) was enqueued. Those related cohorts are still stale; re-request recalculation for them explicitly once the dependency issue is fixed. */
+    partial_cohort_ids: number[]
+    /** Cohort ids that raised while being enqueued and were not queued at all. Cohorts listed elsewhere in this response already had their enqueue attempted; retry only these ids rather than the whole batch. */
+    failed_cohort_ids: StaffCohortFailedApi[]
+    /** Cohorts that exist but were not enqueued, with the reason. */
+    skipped: StaffCohortSkippedApi[]
+    /** Requested cohort ids that do not exist. */
+    not_found_cohort_ids: number[]
+}
+
+export interface StaffStuckCohortsResponseApi {
+    /** Stuck cohorts, oldest last_calculation first (max 100). */
+    results: StaffCohortApi[]
+    /** Total number of stuck cohorts instance-wide. */
+    total_count: number
+}
+
+export type PropertyGroupOperatorEnumApi =
+    (typeof PropertyGroupOperatorEnumApi)[keyof typeof PropertyGroupOperatorEnumApi]
+
+export const PropertyGroupOperatorEnumApi = {
+    And: 'AND',
+    Or: 'OR',
+} as const
+
+export type EventPropFilterTypeEnumApi = (typeof EventPropFilterTypeEnumApi)[keyof typeof EventPropFilterTypeEnumApi]
+
+export const EventPropFilterTypeEnumApi = {
+    Event: 'event',
+    Element: 'element',
+} as const
+
+export interface EventPropFilterApi {
+    type: EventPropFilterTypeEnumApi
+    key: string
+    value: unknown
+    operator?: string | null
+}
+
+export interface HogQLFilterApi {
+    type: 'hogql'
+    key: string
+    value?: unknown
+}
+
+export interface BehavioralFilterApi {
+    bytecode?: unknown[] | null
+    bytecode_error?: string | null
+    conditionHash?: string | null
+    type: 'behavioral'
+    key: string | number
+    value: string
+    event_type: string
+    time_value?: number | null
+    time_interval?: string | null
+    negation?: boolean
+    operator?: string | null
+    operator_value?: number | null
+    seq_time_interval?: string | null
+    seq_time_value?: number | null
+    seq_event?: string | number | null
+    seq_event_type?: string | null
+    total_periods?: number | null
+    min_periods?: number | null
+    event_filters?: (EventPropFilterApi | HogQLFilterApi)[] | null
+    explicit_datetime?: string | null
+    explicit_datetime_to?: string | null
+}
+
+export interface CohortFilterApi {
+    bytecode?: unknown[] | null
+    bytecode_error?: string | null
+    conditionHash?: string | null
+    type: 'cohort'
+    key: 'id'
+    value: number
+    negation?: boolean
+}
+
+export interface PersonFilterApi {
+    operator?: string | null
+    value?: unknown
+    bytecode?: unknown[] | null
+    bytecode_error?: string | null
+    conditionHash?: string | null
+    type: 'person'
+    key: string
+    negation?: boolean
+}
+
+/**
+ * Filter on a top-level persons-table column (e.g. created_at) rather than the
+ * properties JSON. The matching key must be one of PERSON_METADATA_FIELDS.
+ */
+export interface PersonMetadataFilterApi {
+    operator?: string | null
+    value?: unknown
+    bytecode?: unknown[] | null
+    bytecode_error?: string | null
+    conditionHash?: string | null
+    type: 'person_metadata'
+    key: string
+    negation?: boolean
+}
+
+/**
+ * AND/OR group containing cohort filters. Named to avoid collision with analytics Group model.
+ */
+export interface CohortFilterGroupApi {
+    type: PropertyGroupOperatorEnumApi
+    values: (BehavioralFilterApi | CohortFilterApi | PersonFilterApi | PersonMetadataFilterApi | CohortFilterGroupApi)[]
+}
+
+export interface CohortFiltersApi {
+    properties: CohortFilterGroupApi
+    filterTestAccounts?: boolean | null
+}
+
+/**
+ * * `engineering` - Engineering
+ * * `data` - Data
+ * * `product` - Product Management
+ * * `founder` - Founder
+ * * `leadership` - Leadership
+ * * `marketing` - Marketing
+ * * `sales` - Sales / Success
+ * * `student` - Student
+ * * `other` - Other
+ */
+export type RoleAtOrganizationEnumApi = (typeof RoleAtOrganizationEnumApi)[keyof typeof RoleAtOrganizationEnumApi]
+
+export const RoleAtOrganizationEnumApi = {
+    Engineering: 'engineering',
+    Data: 'data',
+    Product: 'product',
+    Founder: 'founder',
+    Leadership: 'leadership',
+    Marketing: 'marketing',
+    Sales: 'sales',
+    Student: 'student',
+    Other: 'other',
+} as const
+
+export type BlankEnumApi = (typeof BlankEnumApi)[keyof typeof BlankEnumApi]
+
+export const BlankEnumApi = {
+    '': '',
+} as const
+
+/**
+ * @nullable
+ */
+export type UserBasicApiHedgehogConfig = { [key: string]: unknown } | null
+
+export interface UserBasicApi {
+    readonly id: number
+    readonly uuid: string
+    /**
+     * @maxLength 200
+     * @nullable
+     */
+    distinct_id?: string | null
+    /** @maxLength 150 */
+    first_name?: string
+    /** @maxLength 150 */
+    last_name?: string
+    /** @maxLength 254 */
+    email: string
+    /** @nullable */
+    is_email_verified?: boolean | null
+    /** @nullable */
+    readonly hedgehog_config: UserBasicApiHedgehogConfig
+    role_at_organization?: RoleAtOrganizationEnumApi | BlankEnumApi | null
+}
+
+/**
+ * * `static` - static
+ * * `person_property` - person_property
+ * * `behavioral` - behavioral
+ * * `realtime` - realtime
+ * * `analytical` - analytical
+ */
+export type CohortTypeEnumApi = (typeof CohortTypeEnumApi)[keyof typeof CohortTypeEnumApi]
+
+export const CohortTypeEnumApi = {
+    Static: 'static',
+    PersonProperty: 'person_property',
+    Behavioral: 'behavioral',
+    Realtime: 'realtime',
+    Analytical: 'analytical',
+} as const
+
+export interface CohortConditionTypeFlagsApi {
+    /** The filters include a person property or person_metadata condition. */
+    person_properties: boolean
+    /** The filters include a behavioral condition that is not lifecycle-style (e.g. performed_event, performed_event_multiple, performed_event_sequence, or their negations). */
+    behavioral: boolean
+    /** The filters include a lifecycle-style behavioral condition (first-seen/regularly/stopped/restarted performing an event). */
+    lifecycle: boolean
+    /** The filters include a nested reference to another cohort. */
+    cohorts: boolean
+}
+
+/**
+ * * `static` - Static
+ * * `person_properties` - Person properties
+ * * `daily` - Daily
+ * * `off` - Off
+ * * `building` - Building
+ * * `rebuilding` - Rebuilding
+ * * `ready` - Ready
+ * * `needs_attention` - Needs attention
+ */
+export type CohortRealtimeStateEnumApi = (typeof CohortRealtimeStateEnumApi)[keyof typeof CohortRealtimeStateEnumApi]
+
+export const CohortRealtimeStateEnumApi = {
+    Static: 'static',
+    PersonProperties: 'person_properties',
+    Daily: 'daily',
+    Off: 'off',
+    Building: 'building',
+    Rebuilding: 'rebuilding',
+    Ready: 'ready',
+    NeedsAttention: 'needs_attention',
+} as const
+
+/**
+ * * `waiting` - Waiting
+ * * `scanning` - Scanning
+ * * `checking` - Checking
+ */
+export type CohortHistoryBuildPhaseEnumApi =
+    (typeof CohortHistoryBuildPhaseEnumApi)[keyof typeof CohortHistoryBuildPhaseEnumApi]
+
+export const CohortHistoryBuildPhaseEnumApi = {
+    Waiting: 'waiting',
+    Scanning: 'scanning',
+    Checking: 'checking',
+} as const
+
+export interface CohortHistoryBuildApi {
+    /** What the build is doing now: `waiting` to start, `scanning` past events, or `checking` the membership it produced. A build that is queued but has not started reports `waiting` too.
+     *
+     * * `waiting` - Waiting
+     * * `scanning` - Scanning
+     * * `checking` - Checking */
+    phase: CohortHistoryBuildPhaseEnumApi
+    /**
+     * How much of the event history has been scanned, 0 to 100. Null outside the `scanning` phase, and while the scan is still being planned.
+     * @nullable
+     */
+    percent_complete: number | null
+    /**
+     * When this build last made progress. Null while it is still queued.
+     * @nullable
+     */
+    updated_at: string | null
+}
+
+/**
+ * * `history_over_limit` - History over limit
+ * * `too_large_to_build` - Too large to build
+ */
+export type CohortRealtimeUnavailableReasonEnumApi =
+    (typeof CohortRealtimeUnavailableReasonEnumApi)[keyof typeof CohortRealtimeUnavailableReasonEnumApi]
+
+export const CohortRealtimeUnavailableReasonEnumApi = {
+    HistoryOverLimit: 'history_over_limit',
+    TooLargeToBuild: 'too_large_to_build',
+} as const
+
+export interface CohortRealtimeReadinessApi {
+    /** Whether feature flags can target this cohort now. `ready`: they can, and they see membership changes within about a minute. `building` / `rebuilding`: PostHog is preparing the cohort from past events, and flags cannot target it yet. `needs_attention`: the cohort qualifies but nothing is preparing it. `off`: the cohort qualifies and realtime is off for it, so feature flags cannot target it until it is turned on. `daily`: its criteria are not supported in realtime, so its membership only comes from the once-a-day calculation. `person_properties`: it matches on person properties, which flags read directly, so they can always target it. `static`: it is a fixed list of people.
+     *
+     * * `static` - Static
+     * * `person_properties` - Person properties
+     * * `daily` - Daily
+     * * `off` - Off
+     * * `building` - Building
+     * * `rebuilding` - Rebuilding
+     * * `ready` - Ready
+     * * `needs_attention` - Needs attention */
+    state: CohortRealtimeStateEnumApi
+    /**
+     * When the cohort became targetable by feature flags. Null unless the state is `ready`.
+     * @nullable
+     */
+    ready_at: string | null
+    /** The build preparing the cohort. Null unless the state is `building` or `rebuilding`. */
+    build: CohortHistoryBuildApi | null
+    /** Why feature flags can't target the cohort. `history_over_limit`, on a `daily` cohort: its criteria look back further than realtime cohorts can. On an `off` cohort: its criteria look back further than the project's plan allows, so it can't be turned on. `too_large_to_build`, on a `needs_attention` cohort: the events in its criteria happen too often for PostHog to prepare it automatically. Null in every other case, including a `daily` cohort that other criteria keep off realtime.
+     *
+     * * `history_over_limit` - History over limit
+     * * `too_large_to_build` - Too large to build */
+    reason: CohortRealtimeUnavailableReasonEnumApi | null
+    /**
+     * The most days realtime cohort criteria can look back on the project's plan. Null unless the reason is `history_over_limit`.
+     * @nullable
+     */
+    history_limit_days: number | null
+}
+
+export type SearchMatchTypeEnumApi = (typeof SearchMatchTypeEnumApi)[keyof typeof SearchMatchTypeEnumApi]
+
+export const SearchMatchTypeEnumApi = {
+    Exact: 'exact',
+    Similar: 'similar',
+} as const
+
+export interface CohortApi {
+    readonly id: number
+    /**
+     * @maxLength 400
+     * @nullable
+     */
+    name?: string | null
+    /** @maxLength 1000 */
+    description?: string
+    groups?: unknown
+    deleted?: boolean
+    filters?: CohortFiltersApi | null
+    query?: unknown
+    /** @nullable */
+    readonly version: number | null
+    /** @nullable */
+    readonly pending_version: number | null
+    readonly is_calculating: boolean
+    readonly created_by: UserBasicApi
+    /** @nullable */
+    readonly created_at: string | null
+    /** @nullable */
+    readonly last_calculation: string | null
+    /** @nullable */
+    readonly last_backfill_person_properties_at: string | null
+    readonly errors_calculating: number
+    /** @nullable */
+    readonly last_error_message: string | null
+    /** @nullable */
+    readonly count: number | null
+    /**
+     * Number of IDs supplied by the most recent static cohort import. Null if the cohort was never populated from a list of IDs.
+     * @nullable
+     */
+    readonly last_import_total_count: number | null
+    /**
+     * How many of the IDs in the most recent static cohort import matched no person, and so were not added to the cohort.
+     * @nullable
+     */
+    readonly last_import_unmatched_count: number | null
+    is_static?: boolean
+    /** Type of cohort based on filter complexity
+     *
+     * * `static` - static
+     * * `person_property` - person_property
+     * * `behavioral` - behavioral
+     * * `realtime` - realtime
+     * * `analytical` - analytical */
+    cohort_type?: CohortTypeEnumApi | BlankEnumApi | null
+    /** Flags describing which kinds of conditions the cohort's filters contain. Null when the cohort has no filters to classify. */
+    readonly condition_type: CohortConditionTypeFlagsApi | null
+    /** Whether feature flags can target this cohort, and the progress of the build that gets it there. Null outside the realtime cohort flag targeting rollout, on projects the realtime pipeline does not cover, and for cohorts that match on neither events nor person properties, which nothing in the flag API decides on. */
+    readonly realtime: CohortRealtimeReadinessApi | null
+    /** Whether realtime is on for this cohort, so PostHog keeps its membership current for feature flags and workflows. Send true when you create a cohort to turn realtime on for it. It stays false when the project has no realtime cohorts or the cohort's criteria can't be realtime. For an existing cohort, use the `realtime` endpoint to turn it on or off. */
+    realtime_enabled?: boolean
+    readonly experiment_set: readonly number[]
+    /** How this row matched the `search` query parameter: `exact` (the term is a case-insensitive substring of a searched field) or `similar` (a fuzzy trigram match, returned only when no exact match exists). Null when the list is not filtered by `search`. */
+    readonly search_match_type: SearchMatchTypeEnumApi | null
+    _create_in_folder?: string
+    /**
+     * Person UUIDs to add to a new static cohort.
+     * @maxItems 1000
+     */
+    _create_static_person_ids?: string[]
+}
+
+export interface PaginatedCohortListApi {
+    count: number
+    /** @nullable */
+    next?: string | null
+    /** @nullable */
+    previous?: string | null
+    results: CohortApi[]
+}
+
+export interface PatchedCohortApi {
+    readonly id?: number
+    /**
+     * @maxLength 400
+     * @nullable
+     */
+    name?: string | null
+    /** @maxLength 1000 */
+    description?: string
+    groups?: unknown
+    deleted?: boolean
+    filters?: CohortFiltersApi | null
+    query?: unknown
+    /** @nullable */
+    readonly version?: number | null
+    /** @nullable */
+    readonly pending_version?: number | null
+    readonly is_calculating?: boolean
+    readonly created_by?: UserBasicApi
+    /** @nullable */
+    readonly created_at?: string | null
+    /** @nullable */
+    readonly last_calculation?: string | null
+    /** @nullable */
+    readonly last_backfill_person_properties_at?: string | null
+    readonly errors_calculating?: number
+    /** @nullable */
+    readonly last_error_message?: string | null
+    /** @nullable */
+    readonly count?: number | null
+    /**
+     * Number of IDs supplied by the most recent static cohort import. Null if the cohort was never populated from a list of IDs.
+     * @nullable
+     */
+    readonly last_import_total_count?: number | null
+    /**
+     * How many of the IDs in the most recent static cohort import matched no person, and so were not added to the cohort.
+     * @nullable
+     */
+    readonly last_import_unmatched_count?: number | null
+    is_static?: boolean
+    /** Type of cohort based on filter complexity
+     *
+     * * `static` - static
+     * * `person_property` - person_property
+     * * `behavioral` - behavioral
+     * * `realtime` - realtime
+     * * `analytical` - analytical */
+    cohort_type?: CohortTypeEnumApi | BlankEnumApi | null
+    /** Flags describing which kinds of conditions the cohort's filters contain. Null when the cohort has no filters to classify. */
+    readonly condition_type?: CohortConditionTypeFlagsApi | null
+    /** Whether feature flags can target this cohort, and the progress of the build that gets it there. Null outside the realtime cohort flag targeting rollout, on projects the realtime pipeline does not cover, and for cohorts that match on neither events nor person properties, which nothing in the flag API decides on. */
+    readonly realtime?: CohortRealtimeReadinessApi | null
+    /** Whether realtime is on for this cohort, so PostHog keeps its membership current for feature flags and workflows. Send true when you create a cohort to turn realtime on for it. It stays false when the project has no realtime cohorts or the cohort's criteria can't be realtime. For an existing cohort, use the `realtime` endpoint to turn it on or off. */
+    realtime_enabled?: boolean
+    readonly experiment_set?: readonly number[]
+    /** How this row matched the `search` query parameter: `exact` (the term is a case-insensitive substring of a searched field) or `similar` (a fuzzy trigram match, returned only when no exact match exists). Null when the list is not filtered by `search`. */
+    readonly search_match_type?: SearchMatchTypeEnumApi | null
+    _create_in_folder?: string
+    /**
+     * Person UUIDs to add to a new static cohort.
+     * @maxItems 1000
+     */
+    _create_static_person_ids?: string[]
+}
+
+export interface ChangeApi {
+    readonly type: string
+    readonly action: string
+    readonly field: string
+    readonly before: unknown
+    readonly after: unknown
+}
+
+export interface MergeApi {
+    readonly type: string
+    readonly source: unknown
+    readonly target: unknown
+}
+
+export interface TriggerApi {
+    readonly job_type: string
+    readonly job_id: string
+    readonly payload: unknown
+}
+
+export interface DetailApi {
+    readonly id: string
+    changes?: ChangeApi[]
+    merge?: MergeApi
+    trigger?: TriggerApi
+    readonly name: string
+    readonly short_id: string
+    readonly type: string
+}
+
+/**
+ * @nullable
+ */
+export type ActivityLogEntryApiUser = { [key: string]: unknown } | null
+
+export interface ActivityLogEntryApi {
+    readonly id: string
+    /** @nullable */
+    readonly user: ActivityLogEntryApiUser
+    readonly activity: string
+    readonly scope: string
+    readonly item_id: string
+    detail?: DetailApi
+    readonly created_at: string
+    /** Whether the activity was performed by the system rather than a user. */
+    readonly is_system: boolean
+    /** Whether the acting user was being impersonated by PostHog staff. */
+    readonly was_impersonated: boolean
+    /**
+     * API client that triggered the activity. Self-reported through the x-posthog-client request header (e.g. 'mcp'), or 'scout:<skill_name>' when a scout run made the change, which the server derives from the run's own token. Null for requests that did neither.
+     * @nullable
+     */
+    readonly client: string | null
+}
+
+/**
+ * Response shape for paginated activity log endpoints.
+ */
+export interface ActivityLogPaginatedResponseApi {
+    results: ActivityLogEntryApi[]
+    /** @nullable */
+    next: string | null
+    /** @nullable */
+    previous: string | null
+    total_count: number
+}
+
+export interface PatchedAddPersonsToStaticCohortRequestApi {
+    /**
+     * Person UUIDs to add to the cohort (the `id` column of the persons table, not distinct IDs). At most 1000 per request.
+     * @maxItems 1000
+     */
+    person_ids?: string[]
+}
+
+export interface CohortUsedInWorkflowApi {
+    /** Workflow ID (UUID) */
+    id: string
+    /** Workflow display name */
+    name: string
+    /** Workflow status. Always 'active', because only active workflows rely on the cohort */
+    status: string
+}
+
+export interface CohortUsedInWorkflowsBlockApi {
+    /** Active workflows relying on this cohort that the caller can view, capped at 100 results */
+    results: CohortUsedInWorkflowApi[]
+    /** Total number of active workflows relying on this cohort, including ones the caller cannot view */
+    total: number
+    /** Number of relying workflows the caller cannot view. They count toward total but are never listed */
+    hidden: number
+    /** True when some relying workflows are not listed in results */
+    has_more: boolean
+}
+
+export interface CohortCalculationHistoryApi {
+    readonly id: string
+    /** Cohort filters/properties at time of calculation */
+    filters: unknown
+    /**
+     * Number of people in cohort
+     * @minimum 0
+     * @maximum 2147483647
+     * @nullable
+     */
+    count?: number | null
+    /** When calculation started */
+    started_at?: string
+    /**
+     * When calculation finished
+     * @nullable
+     */
+    finished_at?: string | null
+    /** Array of query information (query, query_id, query_ms, memory_mb, read_rows, written_rows) */
+    queries?: unknown
+    /**
+     * Error message if calculation failed
+     * @nullable
+     */
+    error?: string | null
+    /**
+     * Calculate duration in seconds if both start and end times are available
+     * @nullable
+     */
+    readonly duration_seconds: number | null
+    /** Check if calculation is completed (successfully or with error) */
+    readonly is_completed: boolean
+    /** Check if calculation completed successfully */
+    readonly is_successful: boolean
+    /**
+     * Get total query duration across all queries
+     * @nullable
+     */
+    readonly total_query_ms: number | null
+    /**
+     * Get total memory usage across all queries
+     * @nullable
+     */
+    readonly total_memory_mb: number | null
+    /**
+     * Get total rows read across all queries
+     * @nullable
+     */
+    readonly total_read_rows: number | null
+    /**
+     * Get total rows written across all queries
+     * @nullable
+     */
+    readonly total_written_rows: number | null
+    /**
+     * Get the main query (first query in the array)
+     * @nullable
+     */
+    readonly main_query: string | null
+}
+
+export interface CohortCalculationHistoryResponseApi {
+    /** Calculation runs on this page, newest first. */
+    results: CohortCalculationHistoryApi[]
+    /** Number of calculation runs recorded for the cohort. */
+    count: number
+    /**
+     * Query string for the next page, such as `?limit=100&offset=100`, or null.
+     * @nullable
+     */
+    next: string | null
+    /**
+     * Query string for the previous page, or null on the first page.
+     * @nullable
+     */
+    previous: string | null
+}
+
+export interface SerializedMatchedRecordingEventApi {
+    /** UUID of the matched event. */
+    uuid: string
+    /** When the matched event happened. */
+    timestamp: string
+    /** ID of the browser window the event was captured in. */
+    window_id: string
+}
+
+export interface SerializedMatchedRecordingApi {
+    /** ID of the session recording. */
+    session_id: string
+    /** Events of the recording that matched the query. */
+    events: SerializedMatchedRecordingEventApi[]
+}
+
+/**
+ * The actor's properties.
+ */
+export type SerializedPersonActorApiProperties = { [key: string]: unknown }
+
+export interface SerializedPersonActorApi {
+    /** The person's UUID, or the group's key. */
+    id: string
+    /** The actor's properties. */
+    properties: SerializedPersonActorApiProperties
+    /**
+     * When the actor was first seen.
+     * @nullable
+     */
+    created_at: string | null
+    /** Recordings that matched the query. Empty unless the endpoint asks for them. */
+    matched_recordings: SerializedMatchedRecordingApi[]
+    /**
+     * The actor's value at the data point it was queried for. Null unless the query computes one.
+     * @nullable
+     */
+    value_at_data_point: number | null
+    /** Marks this actor as a person. */
+    type: 'person'
+    /** The person's UUID. Same value as `id`. */
+    uuid: string
+    /** Display name, resolved from the person's properties or distinct IDs. */
+    name: string
+    /** The person's distinct IDs, newest first. */
+    distinct_ids: string[]
+    /**
+     * When the person was last seen.
+     * @nullable
+     */
+    last_seen_at: string | null
+    /** Whether the person has been identified. */
+    is_identified: boolean
+}
+
+export interface CohortPersonsResponseApi {
+    results: SerializedPersonActorApi[]
+    /** @nullable */
+    next: string | null
+    /** @nullable */
+    previous: string | null
+}
+
+export interface CohortRealtimeRequestApi {
+    /** True turns realtime on for the cohort and for every realtime cohort it includes as criteria, and starts preparing them from past events. PostHog refuses that when the project's plan allows no more cohorts with realtime on, or when the criteria look back further than the plan allows. False turns realtime off. PostHog refuses that while a feature flag, an active workflow, or another cohort with realtime on reads the cohort. */
+    enabled: boolean
+}
+
+export interface PatchedRemovePersonRequestApi {
+    /** Person UUID to remove from the cohort */
+    person_id?: string
+}
+
+export interface CohortUsedInFlagApi {
+    /** Feature flag database ID */
+    id: number
+    /** Feature flag key (URL slug) */
+    key: string
+    /**
+     * Feature flag display name
+     * @nullable
+     */
+    name: string | null
+    /** True when the flag is archived. Every flag that is not archived prevents the cohort from being deleted, enabled or not */
+    archived: boolean
+}
+
+export interface CohortUsedInFlagsBlockApi {
+    /** Feature flags referencing this cohort, capped at 100 results */
+    results: CohortUsedInFlagApi[]
+    /** Total number of feature flags referencing this cohort that the caller can view, before truncation */
+    total: number
+    /** Number of flags that are not archived and that the caller cannot view. They prevent the cohort from being deleted but never appear in results or total */
+    hidden: number
+    /** True when more feature flags exist beyond the truncation cap */
+    has_more: boolean
+}
+
+export interface CohortUsedInInsightApi {
+    /** Insight database ID */
+    id: number
+    /** Insight short ID used for routing in the frontend */
+    short_id: string
+    /** Insight display name; falls back to derived name, then to 'Unnamed' when both are empty */
+    name: string
+}
+
+export interface CohortUsedInInsightsBlockApi {
+    /** Insights referencing this cohort, capped at 100 results */
+    results: CohortUsedInInsightApi[]
+    /** Total number of insights referencing this cohort that the caller can view, before truncation */
+    total: number
+    /** Number of insights referencing this cohort that the caller cannot view. They prevent the cohort from being deleted but never appear in results or total */
+    hidden: number
+    /** True when more insights exist beyond the truncation cap */
+    has_more: boolean
+}
+
+export interface CohortUsedInCohortApi {
+    /** Cohort database ID */
+    id: number
+    /** Cohort display name; falls back to 'Unnamed' when empty */
+    name: string
+}
+
+export interface CohortUsedInCohortsBlockApi {
+    /** Cohorts that include this cohort as a criterion, capped at 100 results */
+    results: CohortUsedInCohortApi[]
+    /** Total number of cohorts referencing this cohort that the caller can view, before truncation */
+    total: number
+    /** Number of cohorts referencing this cohort that the caller cannot view. They prevent the cohort from being deleted but never appear in results or total */
+    hidden: number
+    /** True when more cohorts exist beyond the truncation cap */
+    has_more: boolean
+}
+
+export interface CohortUsedInEnvironmentApi {
+    /** Environment (team) database ID */
+    id: number
+    /** Environment display name */
+    name: string
+}
+
+export interface CohortUsedInEnvironmentsBlockApi {
+    /** Environments that use this cohort in 'Filter out internal and test users', capped at 100 results */
+    results: CohortUsedInEnvironmentApi[]
+    /** Total number of environments using this cohort in their test account filters, before truncation */
+    total: number
+    /** True when more environments exist beyond the truncation cap */
+    has_more: boolean
+}
+
+export interface CohortUsedInResponseApi {
+    /** Feature flags (active and inactive, excluding soft-deleted) that reference this cohort in their targeting conditions, with truncation metadata */
+    feature_flags: CohortUsedInFlagsBlockApi
+    /** Insights referencing this cohort with truncation metadata */
+    insights: CohortUsedInInsightsBlockApi
+    /** Other cohorts that include this cohort as a criterion, with truncation metadata */
+    cohorts: CohortUsedInCohortsBlockApi
+    /** Environments across the project that use this cohort in 'Filter out internal and test users', with truncation metadata */
+    test_account_filters: CohortUsedInEnvironmentsBlockApi
+    /** Active workflows that trigger on this cohort or branch on its membership. While any exist, the cohort cannot be deleted or edited in a way that stops it updating in real time. */
+    workflows: CohortUsedInWorkflowsBlockApi
+}
+
+/**
+ * * `serving` - Serving
+ * * `setting_up` - Setting up
+ * * `available` - Available
+ * * `not_open` - Not open
+ * * `refused` - Refused
+ * * `failed` - Failed
+ */
+export type RealtimeCohortsJoinStateEnumApi =
+    (typeof RealtimeCohortsJoinStateEnumApi)[keyof typeof RealtimeCohortsJoinStateEnumApi]
+
+export const RealtimeCohortsJoinStateEnumApi = {
+    Serving: 'serving',
+    SettingUp: 'setting_up',
+    Available: 'available',
+    NotOpen: 'not_open',
+    Refused: 'refused',
+    Failed: 'failed',
+} as const
+
+export interface RealtimeCohortsJoinStateApi {
+    /** Where this project stands in joining the realtime cohorts beta. `serving`: the project has realtime cohorts. `setting_up`: a join is in progress. `available`: a POST to `join` starts one. `not_open`: this region takes no new projects. `refused`: the project cannot join by itself, and support can turn realtime cohorts on for it. `failed`: the last join did not finish, and a join an hour later tries again.
+     *
+     * * `serving` - Serving
+     * * `setting_up` - Setting up
+     * * `available` - Available
+     * * `not_open` - Not open
+     * * `refused` - Refused
+     * * `failed` - Failed */
+    state: RealtimeCohortsJoinStateEnumApi
+}
+
+export type CohortsStaffListParams = {
+    /**
+     * Cohort ids to look up (max 50 per request). Repeat the param (?cohort_ids=1&cohort_ids=2) or pass one comma-separated value (?cohort_ids=1,2).
+     * @minItems 1
+     * @maxItems 50
+     */
+    cohort_ids: number[]
+}
+
+export type CohortsListParams = {
+    /**
+     * Return a basic payload that omits the `query`, `groups`, `last_error_message`, and `experiment_set` fields (`filters` is kept). Useful for pickers that only need id/name/count.
+     */
+    basic?: boolean
+    /**
+     * Optional. Return only cohorts created by the user with this id.
+     */
+    created_by_id?: number
+    /**
+     * Set true to exclude behavioral (event-based) cohorts, which can't be used in feature flags or batch workflow audiences.
+     */
+    hide_behavioral_cohorts?: boolean
+    /**
+     * Number of results to return per page.
+     */
+    limit?: number
+    /**
+     * The initial index from which to return the results.
+     */
+    offset?: number
+    /**
+     * Optional. Match against cohort `name`. Returns exact (case-insensitive substring) matches only; if no exact match exists, returns similar (fuzzy trigram — typos, transpositions, prefix-as-you-type) matches instead. Each result's `search_match_type` is `exact` or `similar`. Results are ordered by relevance. When omitted, cohorts are ordered newest-first. Capped at 200 characters; longer queries return a 400 error.
+     */
+    search?: string
+    /**
+     * Optional. `static` returns only static cohorts, `dynamic` only dynamic ones.
+     */
+    type?: CohortsListType
+}
+
+export type CohortsListType = (typeof CohortsListType)[keyof typeof CohortsListType]
+
+export const CohortsListType = {
+    Dynamic: 'dynamic',
+    Static: 'static',
+} as const
+
+export type CohortsActivityRetrieveParams = {
+    /**
+     * Number of items per page
+     * @minimum 1
+     */
+    limit?: number
+    /**
+     * Page number
+     * @minimum 1
+     */
+    page?: number
+}
+
+export type CohortsCalculationHistoryRetrieveParams = {
+    /**
+     * Number of calculation runs to return. Defaults to 100, at most 500.
+     * @minimum 1
+     * @maximum 500
+     */
+    limit?: number
+    /**
+     * Number of calculation runs to skip. Defaults to 0.
+     * @minimum 0
+     */
+    offset?: number
+}
+
+export type CohortsPersonsRetrieveParams = {
+    format?: CohortsPersonsRetrieveFormat
+    /**
+     * Maximum number of persons to return per page (defaults to 100).
+     */
+    limit?: number
+    /**
+     * Number of persons to skip before starting to return results.
+     */
+    offset?: number
+}
+
+export type CohortsPersonsRetrieveFormat =
+    (typeof CohortsPersonsRetrieveFormat)[keyof typeof CohortsPersonsRetrieveFormat]
+
+export const CohortsPersonsRetrieveFormat = {
+    Csv: 'csv',
+    Json: 'json',
+} as const

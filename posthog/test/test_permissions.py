@@ -1,0 +1,1934 @@
+import json
+from datetime import timedelta
+from types import SimpleNamespace
+from typing import cast
+from uuid import uuid4
+
+import pytest
+from posthog.test.base import BaseTest
+from unittest.mock import Mock, PropertyMock, patch
+
+from django.apps import apps
+from django.test import SimpleTestCase
+from django.utils import timezone
+
+from parameterized import parameterized
+from rest_framework import status
+from rest_framework.exceptions import ErrorDetail, PermissionDenied
+from rest_framework.test import APIRequestFactory
+
+from posthog.auth import (
+    DelegatedPersonalAPIKeyAuthentication,
+    ExportRendererAuthentication,
+    IDJagAccessTokenAuthentication,
+    JwtAuthentication,
+    OAuthAccessTokenAuthentication,
+    PersonalAPIKeyAuthentication,
+    ProjectSecretAPIKeyAuthentication,
+    SessionAuthentication,
+    SharingAccessTokenAuthentication,
+    TeamSecretTokenAuthentication,
+)
+from posthog.constants import AvailableFeature
+from posthog.exceptions import InsufficientScope
+from posthog.jwt import PosthogJwtAudience, encode_jwt
+from posthog.models import Organization, Team, User
+from posthog.models.oauth import OAuthAccessToken, OAuthApplication
+from posthog.models.organization import OrganizationMembership
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.project_secret_api_key import ProjectSecretAPIKey
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+from posthog.permissions import (
+    FEATURE_FLAG_REQUIRED_ERROR_CODE,
+    AccessControlPermission,
+    ActiveOrganizationPermission,
+    APIScopePermission,
+    PostHogFeatureFlagPermission,
+    SharingTokenPermission,
+    extract_organization,
+    get_authenticator_client,
+    resource_for_ref,
+)
+from posthog.scopes.catalog import APIScopeObject
+from posthog.scopes.checks import scopes_not_covered
+from posthog.test.authentication_checks import covers_authentication
+
+from products.access_control.backend.facade.contracts import FallbackParent, ObjectAccessRef
+from products.access_control.backend.facade.user_access_control import UserAccessControl
+from products.access_control.backend.models.access_control import AccessControl
+from products.access_control.backend.models.role import Role, RoleMembership
+from products.authorization.backend.facade.contracts import Parent
+from products.authorization.backend.facade.enums import ResourceType
+
+ErrorTrackingIssue = apps.get_model("error_tracking", "ErrorTrackingIssue")
+
+
+class TestAccessControlPermission(BaseTest):
+    """
+    Test the AccessControlPermission class to ensure it properly handles
+    specific object access when users have "none" resource access.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.organization.available_product_features = [
+            {
+                "key": AvailableFeature.ACCESS_CONTROL,
+                "name": AvailableFeature.ACCESS_CONTROL,
+            },
+            {
+                "key": AvailableFeature.ROLE_BASED_ACCESS,
+                "name": AvailableFeature.ROLE_BASED_ACCESS,
+            },
+        ]
+        self.organization.save()
+
+        self.role = Role.objects.create(name="Test Role", organization=self.organization)
+        RoleMembership.objects.create(user=self.user, role=self.role)
+
+        self.factory = APIRequestFactory()
+        self.permission = AccessControlPermission()
+
+        self.other_user = self._create_user("other_user")
+
+        # Create test notebooks
+        from products.notebooks.backend.models import Notebook
+
+        self.notebook_1 = Notebook.objects.create(team=self.team, created_by=self.other_user, title="Notebook 1")
+        self.notebook_2 = Notebook.objects.create(team=self.team, created_by=self.other_user, title="Notebook 2")
+
+    def _create_access_control(
+        self, resource="notebook", resource_id=None, access_level="editor", organization_member=None, role=None
+    ):
+        """Helper to create access control entries"""
+        ac, _ = AccessControl.objects.get_or_create(
+            team=self.team,
+            resource=resource,
+            resource_id=resource_id,
+            organization_member=organization_member,
+            role=role,
+        )
+        ac.access_level = access_level
+        ac.save()
+        return ac
+
+    def _create_real_view(self, action="list", pk=None):
+        """Helper to create a real NotebookViewSet instance"""
+        from products.notebooks.backend.presentation.views.notebook import NotebookViewSet
+
+        view = NotebookViewSet()
+        view.action = action
+        view.kwargs = {"pk": pk} if pk else {}
+        view.team = self.team
+        view.user_access_control = UserAccessControl(self.user, self.team)
+        view.request = Mock()
+        view.request.user = self.user
+        return view
+
+    def _create_mock_request(self, method="GET", user=None):
+        """Helper to create a mock request"""
+        if user is None:
+            user = self.user
+
+        request = self.factory.get("/") if method == "GET" else self.factory.post("/")
+        request.user = user
+        request.successful_authenticator = Mock()  # type: ignore
+        request.successful_authenticator.__class__.__name__ = "SessionAuthentication"
+        return request
+
+    def test_has_permission_with_resource_access(self):
+        """Test API permission when user has resource-level access"""
+        # Give user resource-level access to notebooks
+        self._create_access_control(
+            resource="notebook",
+            access_level="editor",
+            organization_member=OrganizationMembership.objects.get(user=self.user, organization=self.organization),
+        )
+
+        request = self._create_mock_request()
+        view = self._create_real_view(action="list")
+
+        # Should have permission
+        assert self.permission.has_permission(request, view) is True
+
+    def test_has_permission_with_none_resource_but_specific_access(self):
+        """Test API permission when user has 'none' resource access but specific object access"""
+        # Set resource-level access to "none"
+        self._create_access_control(resource="notebook", access_level="none")
+
+        # Give specific access to notebook_1
+        self._create_access_control(
+            resource="notebook",
+            resource_id=str(self.notebook_1.id),
+            access_level="editor",
+            organization_member=OrganizationMembership.objects.get(user=self.user, organization=self.organization),
+        )
+
+        request = self._create_mock_request()
+        view = self._create_real_view(action="list")
+
+        # Should have permission due to specific access fallback
+        assert self.permission.has_permission(request, view) is True
+
+    def test_has_permission_with_none_resource_and_no_specific_access(self):
+        """Test API permission when user has 'none' resource access and no specific access"""
+        # Set resource-level access to "none"
+        self._create_access_control(resource="notebook", access_level="none")
+
+        request = self._create_mock_request()
+        view = self._create_real_view(action="list")
+
+        # Should NOT have permission
+        assert self.permission.has_permission(request, view) is False
+
+    def _as_target(self, notebook, target: str, view):
+        if target == "model":
+            return notebook
+        if target == "ref":
+            return ObjectAccessRef(
+                resource="notebook", id=str(notebook.id), team_id=self.team.id, created_by_id=notebook.created_by_id
+            )
+        view.object_access_ref = lambda record: ObjectAccessRef(
+            resource="notebook", id=record.id, team_id=record.team_id, created_by_id=record.created_by_id
+        )
+        return SimpleNamespace(id=str(notebook.id), team_id=self.team.id, created_by_id=notebook.created_by_id)
+
+    @parameterized.expand([("model",), ("ref",), ("record",)])
+    def test_has_object_permission_with_specific_access(self, target):
+        """Test object-level permission when user has specific access to the object"""
+        # Set resource-level access to "none"
+        self._create_access_control(resource="notebook", access_level="none")
+
+        # Give specific access to notebook_1
+        self._create_access_control(
+            resource="notebook",
+            resource_id=str(self.notebook_1.id),
+            access_level="editor",
+            organization_member=OrganizationMembership.objects.get(user=self.user, organization=self.organization),
+        )
+
+        request = self._create_mock_request()
+        view = self._create_real_view(action="retrieve", pk=str(self.notebook_1.id))
+
+        # Should have object permission for notebook_1
+        assert (
+            self.permission.has_object_permission(request, view, self._as_target(self.notebook_1, target, view)) is True
+        )
+
+    @parameterized.expand([("model",), ("ref",), ("record",)])
+    def test_has_object_permission_without_specific_access(self, target):
+        """Test object-level permission when user lacks specific access to the object"""
+        # Set resource-level access to "none"
+        self._create_access_control(resource="notebook", access_level="none")
+
+        request = self._create_mock_request()
+        view = self._create_real_view(action="retrieve", pk=str(self.notebook_2.id))
+
+        # Should NOT have object permission for notebook_2
+        assert (
+            self.permission.has_object_permission(request, view, self._as_target(self.notebook_2, target, view))
+            is False
+        )
+
+    def test_has_object_permission_on_a_record_without_a_ref(self):
+        self._create_access_control(resource="notebook", access_level="none")
+        request = self._create_mock_request()
+        view = self._create_real_view(action="retrieve", pk=str(self.notebook_2.id))
+        record = SimpleNamespace(id=str(self.notebook_2.id), team_id=self.team.id, created_by_id=None)
+
+        with pytest.raises(NotImplementedError, match="object_access_ref"):
+            self.permission.has_object_permission(request, view, record)
+
+        view.records_have_object_access_rules = False
+        assert self.permission.has_object_permission(request, view, record) is True
+
+    def test_has_permission_for_create_action_with_none_resource_access(self):
+        """Test that create actions are blocked when user has 'none' resource access"""
+        # Set resource-level access to "none"
+        self._create_access_control(resource="notebook", access_level="none")
+
+        # Give specific access to notebook_1 (shouldn't matter for creation)
+        self._create_access_control(
+            resource="notebook",
+            resource_id=str(self.notebook_1.id),
+            access_level="editor",
+            organization_member=OrganizationMembership.objects.get(user=self.user, organization=self.organization),
+        )
+
+        request = self._create_mock_request(method="POST")
+        view = self._create_real_view(action="create")
+
+        # Should NOT have permission to create (resource-level check should fail)
+        assert self.permission.has_permission(request, view) is False
+
+    def test_has_permission_for_create_action_with_resource_access(self):
+        """Test that create actions work when user has resource-level access"""
+        # Give user resource-level access to notebooks
+        self._create_access_control(
+            resource="notebook",
+            access_level="editor",
+            organization_member=OrganizationMembership.objects.get(user=self.user, organization=self.organization),
+        )
+
+        request = self._create_mock_request(method="POST")
+        view = self._create_real_view(action="create")
+
+        # Should have permission to create
+        assert self.permission.has_permission(request, view) is True
+
+    def test_has_permission_with_team_secret_token_authentication(self):
+        """Test that has_permission returns True when authenticated via team secret token"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        request = self._create_mock_request()
+        request.successful_authenticator = TeamSecretTokenAuthentication()
+        view = self._create_real_view(action="list")
+
+        # Should have permission when authenticated via team secret token
+        assert self.permission.has_permission(request, view) is True
+
+
+class TestExtractOrganizationForRef(BaseTest):
+    @parameterized.expand([("view_serves_the_ref_team", True), ("view_serves_another_team", False)])
+    def test_ref_resolves_its_own_organization(self, _name, same_team):
+        other_organization = Organization.objects.create(name="Other org")
+        other_team = Team.objects.create(organization=other_organization, name="Other team")
+        ref_team = self.team if same_team else other_team
+        ref = ObjectAccessRef(resource="notebook", id="1", team_id=ref_team.id, created_by_id=None)
+        view = Mock(team_id=self.team.id, organization=self.organization)
+
+        assert extract_organization(ref, view) == ref_team.organization
+
+
+class TestTeamSecretTokenPermission(BaseTest):
+    """Direct unit tests for TeamSecretTokenPermission.has_permission method"""
+
+    def setUp(self):
+        super().setUp()
+        from posthog.permissions import TeamSecretTokenPermission
+
+        self.permission = TeamSecretTokenPermission()
+
+    def _create_mock_request(self, authenticator_class=None, view_name="featureflag-local-evaluation", user=None):
+        """Helper to create a mock request with specified authenticator and view name"""
+        request = Mock()
+
+        # Mock the authenticator
+        mock_authenticator = Mock()
+        if authenticator_class:
+            mock_authenticator.__class__ = authenticator_class
+        request.successful_authenticator = mock_authenticator
+
+        # Mock resolver_match with view_name
+        request.resolver_match = Mock()
+        request.resolver_match.view_name = view_name
+
+        # Set user if provided
+        if user:
+            request.user = user
+
+        return request
+
+    def _create_mock_view(self, team=None, raise_exception=None):
+        """Helper to create a mock view with specified team or exception"""
+        view = Mock()
+
+        if raise_exception:
+            # Configure the mock to raise the exception when team is accessed
+            view.team = Mock(side_effect=raise_exception)
+        else:
+            view.team = team
+
+        return view
+
+    def _create_mock_team(self, team_id=1):
+        """Helper to create a mock team with specified ID"""
+        team = Mock()
+        team.id = team_id
+        return team
+
+    def _create_mock_user(self, team):
+        """Helper to create a mock user with specified team"""
+        user = Mock()
+        user.team = team
+        return user
+
+    def test_has_permission_with_non_team_secret_token_authenticator(self):
+        """Should return True when not using TeamSecretTokenAuthentication"""
+        from posthog.auth import PersonalAPIKeyAuthentication
+
+        request = self._create_mock_request(authenticator_class=PersonalAPIKeyAuthentication)
+        view = self._create_mock_view()
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+
+    def test_has_permission_with_team_secret_token_authenticator_disallowed_endpoint(self):
+        """Should return False for disallowed endpoints"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        request = self._create_mock_request(
+            authenticator_class=TeamSecretTokenAuthentication, view_name="some-other-endpoint"
+        )
+        view = self._create_mock_view()
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertFalse(result)
+
+    @parameterized.expand(
+        [
+            ("featureflag-local-evaluation",),
+            ("project_feature_flags-remote-config",),
+            ("project_feature_flags-local-evaluation",),
+        ]
+    )
+    def test_has_permission_to_team_secret_token_secured_endpoints(self, endpoint_name):
+        """Should allow project_feature_flags endpoints with matching teams"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        team = self._create_mock_team(team_id=1)
+        user = self._create_mock_user(team)
+
+        request = self._create_mock_request(
+            authenticator_class=TeamSecretTokenAuthentication,
+            view_name=endpoint_name,
+            user=user,
+        )
+        view = self._create_mock_view(team=team)
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+
+    def test_has_permission_unknown_endpoint(self):
+        """Should reject unknown endpoints"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        request = self._create_mock_request(
+            authenticator_class=TeamSecretTokenAuthentication, view_name="unknown-endpoint"
+        )
+        view = self._create_mock_view()
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertFalse(result)
+
+    def test_has_permission_matching_teams(self):
+        """Should return True when authenticated team matches resolved team"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        team = self._create_mock_team(team_id=1)
+        user = self._create_mock_user(team)
+
+        request = self._create_mock_request(authenticator_class=TeamSecretTokenAuthentication, user=user)
+        view = self._create_mock_view(team=team)
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+
+    def test_has_permission_mismatched_teams(self):
+        """Should return False when authenticated team doesn't match resolved team"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        team1 = self._create_mock_team(team_id=1)
+        team2 = self._create_mock_team(team_id=2)
+        user = self._create_mock_user(team1)
+
+        request = self._create_mock_request(authenticator_class=TeamSecretTokenAuthentication, user=user)
+        view = self._create_mock_view(team=team2)
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertFalse(result)
+
+    def test_has_permission_view_team_resolution_fails_with_team_does_not_exist(self):
+        """Should return True when view.team raises Team.DoesNotExist"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        team = self._create_mock_team(team_id=1)
+        user = self._create_mock_user(team)
+
+        request = self._create_mock_request(authenticator_class=TeamSecretTokenAuthentication, user=user)
+
+        # Create a view class that raises Team.DoesNotExist when team is accessed
+        class MockView:
+            @property
+            def team(self):
+                raise Team.DoesNotExist("Team not found")
+
+        view = MockView()
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+
+    def test_has_permission_view_missing_team_attribute(self):
+        """Should return True when view.team raises AttributeError"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        team = self._create_mock_team(team_id=1)
+        user = self._create_mock_user(team)
+
+        request = self._create_mock_request(authenticator_class=TeamSecretTokenAuthentication, user=user)
+
+        # Create a view class that raises AttributeError when team is accessed
+        class MockView:
+            @property
+            def team(self):
+                raise AttributeError("'view' object has no attribute 'team'")
+
+        view = MockView()
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+
+    def test_has_permission_no_view_name(self):
+        """Should handle missing view_name gracefully"""
+        from posthog.auth import TeamSecretTokenAuthentication
+
+        request = self._create_mock_request(authenticator_class=TeamSecretTokenAuthentication, view_name=None)
+        view = self._create_mock_view()
+
+        result = self.permission.has_permission(request, view)
+
+        # None is not in the allowed endpoints tuple, so this should return False
+        self.assertFalse(result)
+
+
+class TestProjectSecretAPIKeyAPIScopePermission(SimpleTestCase):
+    def setUp(self):
+        from posthog.permissions import APIScopePermission
+
+        self.permission = APIScopePermission()
+
+    def _make_psak_request(self, scopes=("endpoint:read",), team_id=1):
+        from posthog.auth import ProjectSecretAPIKeyAuthentication
+
+        request = Mock()
+        request.method = "POST"
+
+        authenticator = Mock(spec=ProjectSecretAPIKeyAuthentication)
+        psak = Mock()
+        psak.team_id = team_id
+        psak.scopes = list(scopes)
+        authenticator.project_secret_api_key = psak
+        request.successful_authenticator = authenticator
+        return request, psak
+
+    def test_default_deny_when_view_omits_psak_allowed_actions(self):
+        request, _ = self._make_psak_request()
+
+        view = Mock(spec=[])
+        view.action = "run"
+        view.scope_object = "endpoint"
+
+        self.assertFalse(self.permission.has_permission(request, view))
+        self.assertIn("does not support project secret API key", self.permission.message)
+
+    def test_team_check_attribute_error_denies(self):
+        from rest_framework.exceptions import PermissionDenied
+
+        request, _ = self._make_psak_request()
+
+        class NoTeamView:
+            @property
+            def team(self):
+                raise AttributeError("view has no team attribute")
+
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.permission._check_project_secret_api_key_team(request, NoTeamView())
+
+        self.assertIn("only supported on project-based endpoints", str(ctx.exception.detail))
+
+    def test_team_check_key_error_denies(self):
+        from rest_framework.exceptions import PermissionDenied
+
+        request, _ = self._make_psak_request()
+
+        class NoTeamKwargView:
+            @property
+            def team(self):
+                raise KeyError("team_id")
+
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.permission._check_project_secret_api_key_team(request, NoTeamKwargView())
+
+        self.assertIn("only supported on project-based endpoints", str(ctx.exception.detail))
+
+    def test_team_check_does_not_exist_denies(self):
+        from rest_framework.exceptions import PermissionDenied
+
+        from posthog.models.team import Team
+
+        request, _ = self._make_psak_request()
+
+        class StaleTeamView:
+            @property
+            def team(self):
+                raise Team.DoesNotExist
+
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.permission._check_project_secret_api_key_team(request, StaleTeamView())
+
+        self.assertIn("only supported on project-based endpoints", str(ctx.exception.detail))
+
+    def test_allows_read_action_with_matching_scope_and_team(self):
+        request, _ = self._make_psak_request(scopes=("endpoint:read",), team_id=1)
+
+        view = Mock(spec=[])
+        view.action = "run"
+        view.scope_object = "endpoint"
+        view.scope_object_read_actions = ["run"]
+        view.psak_allowed_actions = ["run"]
+        view.team = Mock(id=1)
+
+        self.assertTrue(self.permission.has_permission(request, view))
+
+    def test_denies_write_action_with_only_read_scope(self):
+        request, _ = self._make_psak_request(scopes=("endpoint:read",), team_id=1)
+
+        view = Mock(spec=[])
+        view.action = "create"
+        view.scope_object = "endpoint"
+        view.psak_allowed_actions = ["create"]
+        view.team = Mock(id=1)
+
+        with self.assertRaises(InsufficientScope) as ctx:
+            self.permission.has_permission(request, view)
+        self.assertIn("missing required scope 'endpoint:write'", str(ctx.exception.detail))
+
+    def test_team_check_denies_when_psak_team_differs(self):
+        from rest_framework.exceptions import PermissionDenied
+
+        request, _ = self._make_psak_request(team_id=1)
+
+        view = Mock(spec=[])
+        view.team = Mock(id=999)
+
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.permission._check_project_secret_api_key_team(request, view)
+
+        self.assertIn("does not have access to the requested project", str(ctx.exception.detail))
+
+
+class _ScopedView:
+    def __init__(self, scope_object: str, action: str) -> None:
+        self.scope_object = scope_object
+        self.action = action
+
+
+class TestUserScopeTenantPermissions(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("user_only", {}, None, [2], ["other"], False, True),
+            ("project_denied", {"team_id": 1}, None, [2], [], True, False),
+            ("organization_denied", {"team_id": 1}, None, [], ["other"], True, False),
+            ("policy_denied", {"team_id": 1}, None, [], [], False, False),
+            ("effective_admin", {"team_id": 1}, None, [], [], False, True, OrganizationMembership.Level.ADMIN),
+            ("allowed", {"team_id": 1}, None, [1], None, True, True),
+            ("current_team_denied", {}, "team_id", [2], [], True, False),
+        ]
+    )
+    def test_user_scopes_respect_the_route_tenant(
+        self,
+        _name: str,
+        parent_kwargs: dict[str, int],
+        current_team_parameter: str | None,
+        scoped_teams: list[int],
+        scoped_organizations: list[str] | None,
+        keys_allowed: bool,
+        expected: bool,
+        effective_level: OrganizationMembership.Level = OrganizationMembership.Level.MEMBER,
+    ) -> None:
+        organization = Organization(
+            id=uuid4(),
+            members_can_use_personal_api_keys=keys_allowed,
+            available_product_features=[{"key": AvailableFeature.ORGANIZATION_SECURITY_SETTINGS}],
+        )
+        authenticator = PersonalAPIKeyAuthentication()
+        authenticator.personal_api_key = PersonalAPIKey(
+            scopes=["user:read"],
+            scoped_teams=scoped_teams,
+            scoped_organizations=scoped_organizations if scoped_organizations is not None else [str(organization.id)],
+        )
+        request = SimpleNamespace(successful_authenticator=authenticator, method="GET", user=User(id=1))
+        view = SimpleNamespace(
+            scope_object="user",
+            action="list",
+            parent_query_kwargs=parent_kwargs,
+            param_derived_from_user_current_team=current_team_parameter,
+            team=SimpleNamespace(id=1, organization=organization),
+            organization=organization,
+        )
+        with (
+            patch(
+                "posthog.permissions.get_cached_organization_membership",
+                return_value=OrganizationMembership(level=OrganizationMembership.Level.MEMBER),
+            ),
+            patch.object(
+                OrganizationMembership, "effective_level", new_callable=PropertyMock, return_value=effective_level
+            ),
+        ):
+            if expected:
+                assert APIScopePermission().has_permission(request, view)
+            else:
+                with self.assertRaises(PermissionDenied):
+                    APIScopePermission().has_permission(request, view)
+
+
+class TestAPIScopePermissionLegacyFallback(SimpleTestCase):
+    def setUp(self) -> None:
+        self.permission = APIScopePermission()
+        capture_patcher = patch("posthog.permissions.posthoganalytics.capture")
+        self.capture = capture_patcher.start()
+        self.addCleanup(capture_patcher.stop)
+
+    def _make_personal_api_key_request(self, scopes: list[str]) -> Mock:
+        authenticator = Mock(spec=PersonalAPIKeyAuthentication)
+        authenticator.personal_api_key = Mock(scopes=scopes, scoped_teams=[], scoped_organizations=[])
+        request = Mock()
+        request.method = "GET"
+        request.successful_authenticator = authenticator
+        # A fresh caller per request, so the per-caller throttle cannot carry over between cases.
+        request.user = Mock(distinct_id=str(uuid4()))
+        return request
+
+    def _view_requiring(self, required_scope: str) -> _ScopedView:
+        scope_object, action = required_scope.split(":")
+        return _ScopedView(scope_object, "create" if action == "write" else "list")
+
+    @parameterized.expand(
+        [
+            ("task_read_satisfies_inbox_read", ["task:read"], "inbox:read", True, "task:read"),
+            ("task_write_satisfies_inbox_read", ["task:write"], "inbox:read", True, "task:read"),
+            ("task_write_satisfies_inbox_write", ["task:write"], "inbox:write", True, "task:write"),
+            ("task_read_does_not_satisfy_inbox_write", ["task:read"], "inbox:write", False, None),
+            ("inbox_read_needs_no_fallback", ["inbox:read"], "inbox:read", True, None),
+            ("fallback_only_covers_mapped_objects", ["task:write"], "insight:read", False, None),
+        ]
+    )
+    def test_task_scopes_satisfy_inbox_scopes(
+        self, _name: str, scopes: list[str], required_scope: str, allowed: bool, legacy_scope: str | None
+    ) -> None:
+        request = self._make_personal_api_key_request(scopes)
+
+        if allowed:
+            assert self.permission.has_permission(request, self._view_requiring(required_scope))
+        else:
+            with self.assertRaises(InsufficientScope) as ctx:
+                self.permission.has_permission(request, self._view_requiring(required_scope))
+            assert ctx.exception.detail == f"API key missing required scope '{required_scope}'"
+        if legacy_scope is None:
+            self.capture.assert_not_called()
+        else:
+            self.capture.assert_called_once()
+            assert self.capture.call_args.kwargs["properties"] == {
+                "required_scope": required_scope,
+                "legacy_scope": legacy_scope,
+                "credential_type": "personal_api_key",
+                "client_id": "personal_api_key",
+                "view": "_ScopedView",
+            }
+
+    def test_fallback_event_is_throttled_per_caller(self) -> None:
+        request = self._make_personal_api_key_request(["task:read"])
+
+        assert self.permission.has_permission(request, self._view_requiring("inbox:read"))
+        assert self.permission.has_permission(request, self._view_requiring("inbox:read"))
+
+        self.capture.assert_called_once()
+
+    def test_project_secret_api_key_issuance_rule_ignores_the_fallback(self) -> None:
+        assert scopes_not_covered(["task:write"], ["inbox:read", "inbox:write"]) == ["inbox:read", "inbox:write"]
+
+
+class TestTeamMemberAccessPermission(BaseTest):
+    """Direct unit tests for TeamMemberAccessPermission.has_permission method"""
+
+    def setUp(self):
+        super().setUp()
+        from posthog.permissions import TeamMemberAccessPermission
+
+        self.permission = TeamMemberAccessPermission()
+
+    def _create_mock_request(self, authenticator_class=None, user=None, psak_team_id=None):
+        """Helper to create a mock request with specified authenticator"""
+        request = Mock()
+
+        # Mock the authenticator
+        mock_authenticator = Mock()
+        if authenticator_class:
+            mock_authenticator.__class__ = authenticator_class
+        if psak_team_id is not None:
+            mock_authenticator.project_secret_api_key = Mock(team_id=psak_team_id)
+        request.successful_authenticator = mock_authenticator
+
+        # Set user if provided
+        if user:
+            request.user = user
+
+        return request
+
+    def _create_mock_view(self, team=None, raise_exception=None):
+        """Helper to create a mock view with specified team or exception"""
+        view = Mock()
+
+        if raise_exception:
+            type(view).team = PropertyMock(side_effect=raise_exception)
+        else:
+            view.team = team
+
+        return view
+
+    def _create_mock_team(self, team_id=1):
+        """Helper to create a mock team with specified ID"""
+        team = Mock()
+        team.id = team_id
+        return team
+
+    def test_has_permission_with_team_secret_token_authenticator(self):
+        """Should return True when using TeamSecretTokenAuthentication"""
+        request = self._create_mock_request(authenticator_class=TeamSecretTokenAuthentication)
+        view = self._create_mock_view()
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+
+    def test_has_permission_with_project_secret_api_key_matching_team(self):
+        request = self._create_mock_request(
+            authenticator_class=ProjectSecretAPIKeyAuthentication,
+            psak_team_id=1,
+        )
+        view = self._create_mock_view(team=self._create_mock_team(team_id=1))
+
+        self.assertTrue(self.permission.has_permission(request, view))
+
+    def test_has_permission_with_project_secret_api_key_different_team(self):
+        request = self._create_mock_request(
+            authenticator_class=ProjectSecretAPIKeyAuthentication,
+            psak_team_id=1,
+        )
+        view = self._create_mock_view(team=self._create_mock_team(team_id=2))
+
+        self.assertFalse(self.permission.has_permission(request, view))
+
+    def test_has_permission_with_project_secret_api_key_missing_team(self):
+        request = self._create_mock_request(
+            authenticator_class=ProjectSecretAPIKeyAuthentication,
+            psak_team_id=1,
+        )
+        view = self._create_mock_view(raise_exception=Team.DoesNotExist("Team not found"))
+
+        self.assertFalse(self.permission.has_permission(request, view))
+
+    @parameterized.expand(
+        [
+            ("member", OrganizationMembership.Level.MEMBER, True),
+            ("admin", OrganizationMembership.Level.ADMIN, True),
+            ("no_membership", None, False),
+        ]
+    )
+    def test_has_permission_follows_project_membership(self, _name, level, expected):
+        if level is None:
+            user = User.objects.create(email="outsider@example.com")
+        else:
+            user = self.user
+            membership = OrganizationMembership.objects.get(user=user, organization=self.organization)
+            membership.level = level
+            membership.save()
+
+        request = self._create_mock_request(authenticator_class=PersonalAPIKeyAuthentication, user=user)
+        view = self._create_mock_view(team=self.team)
+
+        self.assertEqual(self.permission.has_permission(request, view), expected)
+
+    def test_has_permission_with_team_does_not_exist_exception(self):
+        """Should return True when view.team raises Team.DoesNotExist"""
+        request = self._create_mock_request(authenticator_class=PersonalAPIKeyAuthentication)
+        view = self._create_mock_view(raise_exception=Team.DoesNotExist("Team not found"))
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+
+
+class TestDelegatedJwtPermissions(BaseTest):
+    def _create_delegated_token(
+        self,
+        source_authentication: str,
+        scopes: list[str],
+        scoped_teams: list[int] | None = None,
+        scoped_organizations: list[str] | None = None,
+    ) -> tuple[str, PersonalAPIKey | OAuthAccessToken]:
+        token_payload: dict[str, str | int] = {"id": self.user.id}
+        if source_authentication == "personal_api_key":
+            credential: PersonalAPIKey | OAuthAccessToken = PersonalAPIKey.objects.create(
+                user=self.user,
+                label="delegated credential",
+                secure_value=hash_key_value(generate_random_token_personal()),
+                scopes=scopes,
+                scoped_teams=scoped_teams,
+                scoped_organizations=scoped_organizations,
+            )
+            token_payload["personal_api_key_id"] = credential.id
+        else:
+            application = OAuthApplication.objects.create(
+                name="Delegated credential test",
+                client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+                authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+                redirect_uris="https://example.com/callback",
+                algorithm="RS256",
+                organization=self.organization,
+                user=self.user,
+            )
+            credential = OAuthAccessToken.objects.create(
+                user=self.user,
+                application=application,
+                token="pha_delegated_credential_test",
+                expires=timezone.now() + timedelta(hours=1),
+                scope=" ".join(scopes),
+                scoped_teams=scoped_teams,
+                scoped_organizations=scoped_organizations,
+            )
+            token_payload["oauth_access_token_id"] = str(credential.id)
+
+        worker_token = encode_jwt(
+            token_payload,
+            timedelta(minutes=15),
+            PosthogJwtAudience.DELEGATED_USER,
+        )
+        return worker_token, credential
+
+    @parameterized.expand([("personal_api_key",), ("oauth_access_token",)])
+    def test_delegated_jwt_cannot_exceed_source_scope(self, source_authentication: str) -> None:
+        worker_token, _credential = self._create_delegated_token(
+            source_authentication,
+            scopes=["export:write"],
+            scoped_teams=[self.team.id],
+        )
+
+        response = self.client.post(
+            f"/api/organizations/{self.organization.id}/invites/",
+            {"target_email": "security-test@example.com", "level": 8, "send_email": False},
+            headers={"authorization": f"Bearer {worker_token}"},
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_delegated_jwt_fails_after_source_personal_api_key_is_revoked(self) -> None:
+        worker_token, credential = self._create_delegated_token(
+            "personal_api_key",
+            scopes=["feature_flag:read"],
+        )
+        credential.delete()
+
+        response = self.client.get(
+            f"/api/projects/{self.team.id}/feature_flags/",
+            headers={"authorization": f"Bearer {worker_token}"},
+        )
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_delegated_jwt_cannot_exceed_source_project_restriction(self) -> None:
+        other_team = Team.objects.create(organization=self.organization, name="Other project")
+        worker_token, _credential = self._create_delegated_token(
+            "personal_api_key",
+            scopes=["*"],
+            scoped_teams=[self.team.id],
+        )
+
+        response = self.client.get(
+            f"/api/projects/{other_team.id}/feature_flags/",
+            headers={"authorization": f"Bearer {worker_token}"},
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @covers_authentication(DelegatedPersonalAPIKeyAuthentication)
+    def test_delegated_personal_api_key_filters_organization_list(self) -> None:
+        other_organization, _, _ = Organization.objects.bootstrap(self.user)
+        worker_token, _credential = self._create_delegated_token(
+            "personal_api_key",
+            scopes=["*"],
+            scoped_organizations=[str(other_organization.id)],
+        )
+
+        response = self.client.get(
+            "/api/organizations/",
+            headers={"authorization": f"Bearer {worker_token}"},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert {organization["id"] for organization in response.json()["results"]} == {str(other_organization.id)}
+
+
+class TestOAuthAccessTokenAPIScopePermission(BaseTest):
+    """Test that OAuth access tokens properly enforce API scopes via APIScopePermission"""
+
+    def setUp(self):
+        super().setUp()
+
+        # Create OAuth application
+        self.oauth_application = OAuthApplication.objects.create(
+            name="Test OAuth App",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            skip_authorization=False,
+            organization=self.organization,
+            user=self.user,
+        )
+
+        # Create access token with limited scopes
+        self.access_token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=self.oauth_application,
+            token="pha_test_oauth_scoped_token",
+            expires=timezone.now() + timedelta(hours=1),
+            scope="feature_flag:read",
+        )
+
+    def _do_request(self, url, method="GET", data=None):
+        """Helper to make requests with OAuth token"""
+        if method == "GET":
+            return self.client.get(url, headers={"authorization": f"Bearer {self.access_token.token}"})
+        elif method == "POST":
+            return self.client.post(
+                url, data or {}, format="json", headers={"authorization": f"Bearer {self.access_token.token}"}
+            )
+        elif method == "PATCH":
+            return self.client.patch(
+                url, data or {}, format="json", headers={"authorization": f"Bearer {self.access_token.token}"}
+            )
+
+    def test_denies_token_with_no_scopes(self):
+        """OAuth tokens with empty scopes should not have access"""
+        self.access_token.scope = ""
+        self.access_token.save()
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], "OAuth token has no scopes and cannot access this resource")
+
+    def test_forbids_scoped_access_for_unsupported_endpoint(self):
+        """Even * scope isn't allowed for unsupported endpoints"""
+        self.access_token.scope = "*"
+        self.access_token.save()
+        response = self._do_request(f"/api/projects/{self.team.id}/search")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], "This action does not support personal API key access")
+
+    def test_forbids_wildcard_scope_for_internal_viewset(self):
+        """`*` does not satisfy INTERNAL viewsets — explicit scope required."""
+        self.access_token.scope = "*"
+        self.access_token.save()
+        response = self._do_request("/api/query_performance_proxy/execute-test/", method="POST")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("clickhouse_test_cluster_perf:read", response.json()["detail"])
+
+    def test_allows_explicit_scope_for_internal_viewset(self):
+        self.access_token.scope = "clickhouse_test_cluster_perf:read"
+        self.access_token.save()
+        response = self._do_request(
+            "/api/query_performance_proxy/execute-test/", method="POST", data={"sql": "SELECT 1"}
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_forbids_wildcard_scope_for_internal_required_scope_on_public_viewset(self):
+        """Regression: when a viewset's `scope_object` is public (e.g. `signal_scout`) but a
+        specific action's `required_scopes` targets an INTERNAL_API_SCOPE_OBJECTS object
+        (e.g. `signal_scratchpad_internal:write`), `*` must NOT satisfy that action. Otherwise
+        a user-consented `*` token could write durable scout memory or emit findings —
+        bypassing the threat model that those scopes are sandbox-only.
+        """
+        self.access_token.scope = "*"
+        self.access_token.save()
+        response = self._do_request(
+            f"/api/projects/{self.team.id}/signals/scout/scratchpad/forget/",
+            method="POST",
+            data={"key": "noop"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("signal_scratchpad_internal:write", response.json()["detail"])
+
+    def test_allows_explicit_internal_write_scope_on_public_viewset(self):
+        """Sibling to the above: a token with explicit `signal_scratchpad_internal:write` reaches
+        the same endpoint (validated_data parses, the forget tool reports deleted=false)."""
+        self.access_token.scope = "signal_scratchpad_internal:write"
+        self.access_token.save()
+        response = self._do_request(
+            f"/api/projects/{self.team.id}/signals/scout/scratchpad/forget/",
+            method="POST",
+            data={"key": "noop"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"deleted": False})
+
+    def test_session_auth_cannot_satisfy_internal_write_scope(self):
+        """Session auth must NOT bypass an internal-scope requirement. A logged-in team member
+        POSTing to a scratchpad internal-write action (`signal_scratchpad_internal:write`) via browser
+        session is denied — otherwise any member could write durable scout scratchpad, which is
+        read verbatim into the scout's prompt. No bearer token here, so SessionAuthentication is
+        the successful authenticator and must hit the internal-scope guard."""
+        self.client.force_login(self.user)
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/signals/scout/scratchpad/forget/",
+            data={"key": "noop"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("internal scope", response.json()["detail"])
+
+    def test_allows_derived_scope_for_read(self):
+        """OAuth token with feature_flag:read can read feature flags"""
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_denies_derived_scope_for_write(self):
+        """OAuth token with feature_flag:read cannot write feature flags"""
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/", method="POST")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], "API key missing required scope 'feature_flag:write'")
+
+    @parameterized.expand(
+        [
+            (
+                "step_up",
+                True,
+                "GET",
+                "persons/cohorts/?person_id=1",
+                "API key missing required scope 'person:read'",
+                'Bearer error="insufficient_scope", scope="person:read cohort:read"',
+            ),
+            (
+                "no_step_up",
+                False,
+                "GET",
+                "persons/cohorts/?person_id=1",
+                "API key missing required scope 'person:read'",
+                None,
+            ),
+            (
+                "step_up_internal_scope",
+                True,
+                "POST",
+                "signals/scout/scratchpad/forget/",
+                "API key missing required scope 'signal_scratchpad_internal:write'",
+                None,
+            ),
+            (
+                "step_up_legacy_covered_scope_outside_app_ceiling",
+                True,
+                "GET",
+                f"signals/scout/runs/{uuid4()}/emissions/reports/",
+                "API key missing required scope 'signal_scout:read'",
+                'Bearer error="insufficient_scope", scope="signal_scout:read inbox:read"',
+                "task:read",
+                ["task:read", "signal_scout:read"],
+            ),
+        ]
+    )
+    def test_missing_scope_challenge_names_every_required_scope(
+        self,
+        _name,
+        supports_step_up,
+        method,
+        path,
+        expected_detail,
+        expected_challenge,
+        token_scope="feature_flag:read",
+        app_scopes=(),
+    ):
+        self.oauth_application.scopes = list(app_scopes)
+        self.oauth_application.save()
+        self.access_token.scope = token_scope
+        self.access_token.supports_step_up = supports_step_up
+        self.access_token.save()
+
+        response = self._do_request(f"/api/projects/{self.team.id}/{path}", method=method)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], expected_detail)
+        self.assertEqual(response.headers.get("WWW-Authenticate"), expected_challenge)
+
+    @parameterized.expand(
+        [
+            ("step_up", True, [], 'Bearer error="insufficient_scope", scope="task:write"'),
+            ("no_step_up", False, [], None),
+            ("step_up_scope_outside_app_ceiling", True, ["inbox:write"], None),
+        ]
+    )
+    def test_scope_check_inside_a_view_gets_the_same_challenge(
+        self, _name, supports_step_up, app_scopes, expected_challenge
+    ):
+        self.oauth_application.scopes = app_scopes
+        self.oauth_application.save()
+        self.access_token.scope = "inbox:write"
+        self.access_token.supports_step_up = supports_step_up
+        self.access_token.save()
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/signals/onboarding/complete/",
+            json.dumps(
+                {
+                    "step": "github",
+                    "sources": [],
+                    "scanner_ids": [],
+                    "suggestions": [],
+                    "automatic_implementation": True,
+                    "implementation_priority": "P1",
+                }
+            ),
+            content_type="application/json",
+            headers={"authorization": f"Bearer {self.access_token.token}"},
+        )
+
+        self.assertEqual(response.status_code, 403, response.content)
+        self.assertEqual(
+            response.json()["detail"], "Turning on automatic implementation requires the task:write scope."
+        )
+        self.assertEqual(response.headers.get("WWW-Authenticate"), expected_challenge)
+
+    def test_allows_action_with_required_scopes(self):
+        """OAuth token can access endpoints that match its scopes"""
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/my_flags")
+        self.assertEqual(response.status_code, 200)
+
+    def test_allows_custom_error_tracking_write_action(self):
+        """OAuth token can access custom error tracking write actions via scope_object_write_actions"""
+        self.access_token.scope = "error_tracking:write"
+        self.access_token.save()
+        issue = ErrorTrackingIssue.objects.create(team=self.team)
+
+        response = self.client.generic(
+            "PATCH",
+            f"/api/environments/{self.team.id}/error_tracking/issues/{issue.id}/assign",
+            json.dumps({"assignee": None}),
+            content_type="application/json",
+            headers={"authorization": f"Bearer {self.access_token.token}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"success": True})
+
+    def test_forbids_action_with_other_scope(self):
+        """OAuth token cannot access endpoints requiring different scopes"""
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/activity")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], "API key missing required scope 'activity_log:read'")
+
+    def test_allows_action_with_multiple_scopes(self):
+        """OAuth token with multiple scopes can access all matching endpoints"""
+        self.access_token.scope = "feature_flag:write activity_log:read"
+        self.access_token.save()
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/activity")
+        self.assertEqual(response.status_code, 200)
+
+    def test_write_scope_allows_read_operations(self):
+        """OAuth token with write scope should also allow read operations"""
+        self.access_token.scope = "feature_flag:write"
+        self.access_token.save()
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_wildcard_scope_allows_all_supported_endpoints(self):
+        """OAuth token with * scope can access all supported endpoints"""
+        self.access_token.scope = "*"
+        self.access_token.save()
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 200)
+
+
+class TestOAuthAccessTokenWithOrganizationScoping(BaseTest):
+    """Test that OAuth access tokens properly enforce organization scoping"""
+
+    def setUp(self):
+        super().setUp()
+
+        # Create OAuth application
+        self.oauth_application = OAuthApplication.objects.create(
+            name="Test OAuth App",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            skip_authorization=False,
+            organization=self.organization,
+            user=self.user,
+        )
+
+        # Create org-scoped access token
+        self.access_token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=self.oauth_application,
+            token="pha_test_org_scoped_token",
+            expires=timezone.now() + timedelta(hours=1),
+            scope="*",
+            scoped_organizations=[str(self.organization.id)],
+            scoped_teams=[],
+        )
+
+    def _do_request(self, url):
+        return self.client.get(url, headers={"authorization": f"Bearer {self.access_token.token}"})
+
+    def test_allows_access_to_scoped_org(self):
+        """OAuth token scoped to an org can access that org"""
+        response = self._do_request(f"/api/organizations/{self.organization.id}/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_allows_access_to_scoped_org_teams(self):
+        """OAuth token scoped to an org can access teams in that org"""
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_denies_access_to_non_scoped_org_and_team(self):
+        """OAuth token scoped to one org cannot access other orgs"""
+
+        other_user = User.objects.create(email="other@example.com")
+        other_org, _, _ = Organization.objects.bootstrap(user=other_user)
+
+        response = self._do_request(f"/api/organizations/{other_org.id}/")
+
+        self.assertEqual(response.status_code, 404)
+
+
+class TestOAuthAccessTokenWithTeamScoping(BaseTest):
+    """Test that OAuth access tokens properly enforce team scoping"""
+
+    def setUp(self):
+        super().setUp()
+
+        # Create OAuth application
+        self.oauth_application = OAuthApplication.objects.create(
+            name="Test OAuth App",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            skip_authorization=False,
+            organization=self.organization,
+            user=self.user,
+        )
+
+        # Create team-scoped access token
+        self.access_token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=self.oauth_application,
+            token="pha_test_team_scoped_token",
+            expires=timezone.now() + timedelta(hours=1),
+            scope="*",
+            scoped_organizations=[],
+            scoped_teams=[self.team.id],
+        )
+
+    def _do_request(self, url):
+        return self.client.get(url, headers={"authorization": f"Bearer {self.access_token.token}"})
+
+    def test_allows_access_to_scoped_team(self):
+        """OAuth token scoped to a team can access that team"""
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_denies_access_to_non_scoped_team(self):
+        """OAuth token scoped to one team cannot access other teams"""
+
+        other_user = User.objects.create(email="other@example.com")
+        _, _, other_team = Organization.objects.bootstrap(user=other_user)
+
+        response = self._do_request(f"/api/projects/{other_team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("does not have access to the requested project", response.json()["detail"])
+
+
+class TestOAuthAccessTokenWithBothTeamAndOrgScoping(BaseTest):
+    """Test that OAuth access tokens properly enforce scoping when both teams and orgs are defined"""
+
+    def setUp(self):
+        super().setUp()
+
+        # Create a second team in the same org
+        self.team2 = Team.objects.create(organization=self.organization, name="Test Team 2", project=self.project)
+
+        # Create a second org with a team
+        _, self.project2, self.other_org_team = Organization.objects.bootstrap(
+            user=self.user, name="Other Organization"
+        )
+
+        # Create OAuth application
+        self.oauth_application = OAuthApplication.objects.create(
+            name="Test OAuth App",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            skip_authorization=False,
+            organization=self.organization,
+            user=self.user,
+        )
+
+        # Create access token scoped to specific org and specific team within that org
+        self.access_token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=self.oauth_application,
+            token="pha_test_mixed_scoped_token",
+            expires=timezone.now() + timedelta(hours=1),
+            scope="*",
+            scoped_organizations=[str(self.organization.id)],
+            scoped_teams=[self.team.id],
+        )
+
+    def _do_request(self, url):
+        return self.client.get(url, headers={"authorization": f"Bearer {self.access_token.token}"})
+
+    def test_allows_access_to_scoped_team(self):
+        """OAuth token with both org and team scopes allows access to the scoped team"""
+        response = self._do_request(f"/api/projects/{self.team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_denies_access_to_other_team_in_scoped_org(self):
+        """OAuth token with both org and team scopes denies access to other teams in the same org"""
+        response = self._do_request(f"/api/projects/{self.team2.id}/feature_flags/")
+        # Returns 403 because the token is scoped to a different team
+        self.assertEqual(response.status_code, 403)
+
+    def test_denies_access_to_team_in_non_scoped_org(self):
+        """OAuth token with both org and team scopes denies access to teams in other orgs"""
+        response = self._do_request(f"/api/projects/{self.other_org_team.id}/feature_flags/")
+        self.assertEqual(response.status_code, 403)
+
+    def test_denies_access_to_org_endpoint_when_teams_scoped(self):
+        """OAuth token with scoped_teams cannot access org endpoints (current limitation)"""
+        response = self._do_request(f"/api/organizations/{self.organization.id}/")
+        # When scoped_teams is set, org endpoints are denied because the logic requires team-based endpoints
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("only supported on project-based endpoints", response.json()["detail"])
+
+
+class TestOAuthAccessTokenExpiration(BaseTest):
+    """Test that expired OAuth access tokens are properly rejected"""
+
+    def setUp(self):
+        super().setUp()
+
+        # Create OAuth application
+        self.oauth_application = OAuthApplication.objects.create(
+            name="Test OAuth App",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            skip_authorization=False,
+            organization=self.organization,
+            user=self.user,
+        )
+
+        # Create a valid access token
+        self.access_token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=self.oauth_application,
+            token="pha_test_expiring_token",
+            expires=timezone.now() + timedelta(hours=1),
+            scope="feature_flag:read",
+        )
+
+    def _do_request(self, token=None):
+        token = token or self.access_token.token
+        return self.client.get(
+            f"/api/projects/{self.team.id}/feature_flags/", headers={"authorization": f"Bearer {token}"}
+        )
+
+    def test_valid_token_allows_access(self):
+        """A valid non-expired OAuth token allows access"""
+        response = self._do_request()
+        self.assertEqual(response.status_code, 200)
+
+    def test_expired_token_denies_access(self):
+        """An expired OAuth token denies access"""
+        # Expire the token
+        self.access_token.expires = timezone.now() - timedelta(hours=1)
+        self.access_token.save()
+
+        response = self._do_request()
+        self.assertEqual(response.status_code, 401)
+
+    def test_token_works_then_expires_then_fails(self):
+        """OAuth token works when valid, then fails after expiration"""
+        # First verify it works
+        response = self._do_request()
+        self.assertEqual(response.status_code, 200)
+
+        # Expire the token
+        self.access_token.expires = timezone.now() - timedelta(hours=1)
+        self.access_token.save()
+
+        # Verify it no longer works
+        response = self._do_request()
+        self.assertEqual(response.status_code, 401)
+
+
+class TestOAuthAccessTokenUserMembership(BaseTest):
+    """Test that OAuth tokens respect current user membership (not historical)"""
+
+    def setUp(self):
+        super().setUp()
+
+        # Create OAuth application
+        self.oauth_application = OAuthApplication.objects.create(
+            name="Test OAuth App",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            skip_authorization=False,
+            organization=self.organization,
+            user=self.user,
+        )
+
+        # Create a valid access token
+        self.access_token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=self.oauth_application,
+            token="pha_test_membership_token",
+            expires=timezone.now() + timedelta(hours=1),
+            scope="feature_flag:read",
+        )
+
+    def _do_request(self, token=None):
+        token = token or self.access_token.token
+        return self.client.get(
+            f"/api/projects/{self.team.id}/feature_flags/", headers={"authorization": f"Bearer {token}"}
+        )
+
+    def test_token_works_with_membership(self):
+        """OAuth token works when user has org membership"""
+        response = self._do_request()
+        self.assertEqual(response.status_code, 200)
+
+    def test_token_fails_after_user_leaves_organization(self):
+        """OAuth token stops working when user leaves the organization"""
+        from posthog.models import OrganizationMembership
+
+        # First verify token works
+        response = self._do_request()
+        self.assertEqual(response.status_code, 200)
+
+        # Remove user from organization
+        OrganizationMembership.objects.filter(user=self.user, organization=self.organization).delete()
+
+        # Verify token no longer works (membership check fails)
+        response = self._do_request()
+        self.assertEqual(response.status_code, 403)  # Forbidden - user no longer has org membership
+
+    def test_team_scoped_token_fails_when_user_not_in_team_org(self):
+        """OAuth token scoped to a team requires user to be in that team's organization"""
+        from posthog.models import Organization, User
+
+        # Create a different organization with a team (self.user is NOT a member)
+        other_user = User.objects.create(email="other@example.com")
+        other_org, _, other_team = Organization.objects.bootstrap(user=other_user)
+
+        # Create a token scoped to the other team
+        other_team_token = OAuthAccessToken.objects.create(
+            user=self.user,
+            application=self.oauth_application,
+            token="pha_test_other_team_token",
+            expires=timezone.now() + timedelta(hours=1),
+            scope="feature_flag:read",
+            scoped_teams=[other_team.id],
+        )
+
+        # Verify token does NOT work because user is not in that org
+        response = self.client.get(
+            f"/api/projects/{other_team.id}/feature_flags/",
+            headers={"authorization": f"Bearer {other_team_token.token}"},
+        )
+        self.assertEqual(response.status_code, 403)  # Forbidden - user not in org
+
+
+SESSION_CALLER = {"credential_type": "session", "client_id": "posthog"}
+
+
+class TestAuthenticatorClient(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("session", None, SESSION_CALLER),
+            (
+                "personal key",
+                PersonalAPIKeyAuthentication(),
+                {"credential_type": "personal_api_key", "client_id": "personal_api_key"},
+            ),
+            (
+                "project secret key",
+                ProjectSecretAPIKeyAuthentication(),
+                {"credential_type": "project_secret_key", "client_id": "project_secret_key"},
+            ),
+        ]
+    )
+    def test_names_the_caller(self, _name, authenticator, expected):
+        self.assertEqual(get_authenticator_client(authenticator), expected)
+
+    def test_an_oauth_caller_is_its_registered_application(self):
+        authenticator = OAuthAccessTokenAuthentication()
+        authenticator.access_token = OAuthAccessToken(application=OAuthApplication(client_id="app_client_id"))
+
+        self.assertEqual(
+            get_authenticator_client(authenticator), {"credential_type": "oauth", "client_id": "app_client_id"}
+        )
+
+
+class TestPostHogFeatureFlagPermission(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.permission = PostHogFeatureFlagPermission()
+        self.factory = APIRequestFactory()
+
+    def _create_mock_request(self):
+        request = self.factory.get("/")
+        request.user = self.user
+        return request
+
+    def _create_mock_view(self, flag="test-flag", action="list"):
+        view = Mock()
+        view.posthog_feature_flag = flag
+        view.action = action
+        view.organization = self.organization
+        view.team = self.team
+        # get_organization_from_view looks for these attributes
+        view.organization_id = str(self.organization.id)
+        return view
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_delegates_to_posthoganalytics_by_default(self, mock_ff):
+        request = self._create_mock_request()
+        view = self._create_mock_view(flag="my-flag")
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+        mock_ff.assert_called_once()
+        self.assertEqual(mock_ff.call_args[0][0], "my-flag")
+        kwargs = mock_ff.call_args[1]
+        self.assertEqual(
+            kwargs["groups"],
+            {"organization": str(self.organization.id), "project": str(self.team.id)},
+        )
+        self.assertEqual(
+            kwargs["group_properties"],
+            {
+                "organization": {**SESSION_CALLER, "id": str(self.organization.id)},
+                "project": {**SESSION_CALLER, "id": str(self.team.id)},
+            },
+        )
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_feature_flag_evaluation_passes_organization_only_when_view_has_no_team(self, mock_ff):
+        class OrgOnlyView:
+            posthog_feature_flag = "my-flag"
+            action = "list"
+            organization = self.organization
+            organization_id = str(self.organization.id)
+
+        request = self._create_mock_request()
+        view = OrgOnlyView()
+
+        self.assertTrue(self.permission.has_permission(request, view))
+        kwargs = mock_ff.call_args[1]
+        self.assertEqual(kwargs["groups"], {"organization": str(self.organization.id)})
+        self.assertEqual(
+            kwargs["group_properties"], {"organization": {**SESSION_CALLER, "id": str(self.organization.id)}}
+        )
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_a_credential_caller_is_named_apart_from_the_app(self, mock_ff):
+        request = self._create_mock_request()
+        request.successful_authenticator = PersonalAPIKeyAuthentication()
+        view = self._create_mock_view(flag="my-flag")
+
+        self.assertTrue(self.permission.has_permission(request, view))
+
+        caller = {"credential_type": "personal_api_key", "client_id": "personal_api_key"}
+        kwargs = mock_ff.call_args[1]
+        # Both channels: a flag aggregated by a group reads group properties and never a person's.
+        self.assertEqual(kwargs["person_properties"], caller)
+        self.assertEqual(kwargs["group_properties"]["organization"], {**caller, "id": str(self.organization.id)})
+
+    @parameterized.expand(
+        [
+            ("the flag is off", False),
+            # A flag key nothing has created, and a flag service that cannot answer, both come
+            # back as None. Neither is a yes, so neither opens the view.
+            ("the flag does not exist", None),
+        ]
+    )
+    def test_denies_unless_the_flag_says_yes(self, _, flag_value):
+        request = self._create_mock_request()
+        view = self._create_mock_view(flag="my-flag")
+
+        with patch("posthoganalytics.feature_enabled", return_value=flag_value):
+            result = self.permission.has_permission(request, view)
+
+        self.assertFalse(result)
+        # DRF passes both onto the 403 body. The code lets a client tell a not-yet-ingested
+        # alpha enrollment (which clears on its own seconds later) apart from a plain
+        # access-control denial.
+        self.assertEqual(self.permission.code, FEATURE_FLAG_REQUIRED_ERROR_CODE)
+        self.assertEqual(
+            self.permission.message,
+            "This action requires feature flag 'my-flag' to be enabled for your organization.",
+        )
+
+    @patch("posthog.permissions._FORCE_ENABLED_FLAGS", frozenset({"my-flag"}))
+    @patch("posthoganalytics.feature_enabled")
+    def test_force_enabled_bypasses_posthoganalytics(self, mock_ff):
+        request = self._create_mock_request()
+        view = self._create_mock_view(flag="my-flag")
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+        mock_ff.assert_not_called()
+
+    @patch("posthog.permissions._FORCE_ENABLED_FLAGS", frozenset({"flag-a", "flag-b", "flag-c"}))
+    @patch("posthoganalytics.feature_enabled")
+    def test_force_enabled_supports_multiple_flags(self, mock_ff):
+        request = self._create_mock_request()
+        view = self._create_mock_view(flag="flag-b")
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertTrue(result)
+        mock_ff.assert_not_called()
+
+    @patch("posthog.permissions._FORCE_ENABLED_FLAGS", frozenset({"other-flag"}))
+    @patch("posthoganalytics.feature_enabled", return_value=False)
+    def test_force_enabled_does_not_affect_unlisted_flags(self, mock_ff):
+        request = self._create_mock_request()
+        view = self._create_mock_view(flag="my-flag")
+
+        result = self.permission.has_permission(request, view)
+
+        self.assertFalse(result)
+        mock_ff.assert_called_once()
+
+
+class TestSharingTokenPermission(SimpleTestCase):
+    def test_denies_an_object_access_ref(self):
+        request = Mock()
+        request.successful_authenticator = Mock(spec=SharingAccessTokenAuthentication)
+        ref = ObjectAccessRef(resource="notebook", id="1", team_id=1, created_by_id=None)
+
+        assert SharingTokenPermission().has_object_permission(request, Mock(), ref) is False
+
+
+class TestResourceForRef(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("table_without_parent", "warehouse_table", None),
+            ("table_with_another_parent_type", "warehouse_table", FallbackParent(resource="notebook", id="1")),
+            ("notebook_with_parent", "notebook", FallbackParent(resource="external_data_source", id="1")),
+        ]
+    )
+    def test_rejects_a_parent_that_does_not_match_the_resource(
+        self, _name: str, resource: APIScopeObject, fallback_parent: FallbackParent | None
+    ) -> None:
+        ref = ObjectAccessRef(resource=resource, id="1", team_id=1, created_by_id=None, fallback_parent=fallback_parent)
+
+        with pytest.raises(ValueError, match="fallback_parent"):
+            resource_for_ref(ref)
+
+    def test_keeps_the_parent_of_a_table(self) -> None:
+        parent = FallbackParent(resource="external_data_source", id="7")
+        ref = ObjectAccessRef(resource="warehouse_table", id="1", team_id=1, created_by_id=None, fallback_parent=parent)
+
+        assert resource_for_ref(ref).parent == Parent(type=ResourceType.EXTERNAL_DATA_SOURCE, id="7")
+
+
+class TestActiveOrganizationPermission(SimpleTestCase):
+    # The permission reads three fields off the organization, so unsaved instances are enough.
+    def setUp(self):
+        self.permission = ActiveOrganizationPermission()
+        self.organization = Organization(name="Test org")
+        self.team = Team(organization=self.organization)
+
+    def _view(self, scope_object="insight", team=None, basename="project_insights", action="list"):
+        view = Mock()
+        view.parent_query_kwargs = ["team_id"]
+        view.param_derived_from_user_current_team = None
+        view.team = team if team is not None else self.team
+        view.scope_object = scope_object
+        view.basename = basename
+        view.action = action
+        # A bare Mock would hand back a truthy attribute and skip the check everywhere.
+        view.detail = False
+        return view
+
+    def _root_view(self, basename="projects", action="create"):
+        view = self._view(basename=basename, action=action)
+        view.parent_query_kwargs = []
+        view.organization = self.organization
+        return view
+
+    def _request(self, authenticator, method="GET"):
+        request = Mock()
+        request.successful_authenticator = authenticator
+        request.method = method
+        return request
+
+    def _personal_api_key_auth(self):
+        auth = PersonalAPIKeyAuthentication()
+        auth.personal_api_key = PersonalAPIKey(scopes=["*"])
+        return auth
+
+    def _oauth_auth(self):
+        auth = OAuthAccessTokenAuthentication()
+        auth.access_token = OAuthAccessToken(scope="insight:read")
+        return auth
+
+    def _project_secret_key_auth(self):
+        auth = ProjectSecretAPIKeyAuthentication()
+        auth.project_secret_api_key = ProjectSecretAPIKey(scopes=["feature_flag:read"])
+        return auth
+
+    def _id_jag_auth(self):
+        auth = IDJagAccessTokenAuthentication()
+        auth.scopes = ["insight:read"]
+        return auth
+
+    def _export_renderer_auth(self):
+        auth = ExportRendererAuthentication()
+        auth.scopes = ["insight:read"]
+        return auth
+
+    def _deactivate(self, reason=None):
+        self.organization.is_active = False
+        self.organization.is_not_active_reason = reason
+
+    def _denial_code(self, exception: PermissionDenied) -> str | None:
+        return cast(ErrorDetail, exception.detail).code
+
+    @parameterized.expand(
+        [
+            ("personal_api_key", "_personal_api_key_auth"),
+            ("oauth", "_oauth_auth"),
+            ("project_secret_api_key", "_project_secret_key_auth"),
+            ("id_jag", "_id_jag_auth"),
+            ("export_renderer", "_export_renderer_auth"),
+        ]
+    )
+    def test_every_token_credential_is_blocked_for_a_deactivated_organization(self, _name, auth_factory):
+        self._deactivate()
+        request = self._request(getattr(self, auth_factory)())
+
+        with self.assertRaises(PermissionDenied) as denial:
+            self.permission.has_permission(request, self._view())
+
+        self.assertEqual(self._denial_code(denial.exception), "organization_deactivated")
+
+    @parameterized.expand(
+        [
+            ("session", SessionAuthentication),
+            ("jwt", JwtAuthentication),
+            ("team_secret_token", TeamSecretTokenAuthentication),
+            ("none", None),
+        ]
+    )
+    def test_non_token_credentials_still_reach_a_deactivated_organization(self, _name, authenticator_class):
+        self._deactivate()
+        authenticator = authenticator_class() if authenticator_class else None
+
+        self.assertTrue(self.permission.has_permission(self._request(authenticator), self._view()))
+
+    def test_null_is_active_is_treated_as_deactivated(self):
+        self.organization.is_active = None
+
+        with self.assertRaises(PermissionDenied) as denial:
+            self.permission.has_permission(self._request(self._personal_api_key_auth()), self._view())
+
+        self.assertEqual(self._denial_code(denial.exception), "organization_deactivated")
+
+    def test_active_organization_admits_a_token(self):
+        self.assertTrue(self.permission.has_permission(self._request(self._personal_api_key_auth()), self._view()))
+
+    def test_pending_deletion_is_blocked_even_while_active(self):
+        self.organization.is_pending_deletion = True
+
+        with self.assertRaises(PermissionDenied) as denial:
+            self.permission.has_permission(self._request(self._personal_api_key_auth()), self._view())
+
+        self.assertEqual(self._denial_code(denial.exception), "organization_pending_deletion")
+
+    def test_billing_stays_reachable_so_a_customer_can_pay(self):
+        self._deactivate(reason="Access revoked due to unpaid balance.")
+        view = self._view(scope_object="billing")
+
+        self.assertTrue(self.permission.has_permission(self._request(self._personal_api_key_auth()), view))
+
+    def test_deactivation_reason_is_surfaced_to_the_caller(self):
+        self._deactivate(reason="Access revoked due to unpaid balance.")
+
+        with self.assertRaises(PermissionDenied) as denial:
+            self.permission.has_permission(self._request(self._personal_api_key_auth()), self._view())
+
+        self.assertIn("Access revoked due to unpaid balance.", str(denial.exception.detail))
+
+    def test_a_second_organization_is_judged_on_its_own_state(self):
+        self._deactivate()
+        other_team = Team(organization=Organization(name="Still active"))
+
+        view = self._view(team=other_team)
+
+        self.assertTrue(self.permission.has_permission(self._request(self._personal_api_key_auth()), view))
+
+    def test_object_level_check_covers_root_viewsets(self):
+        self._deactivate()
+        view = self._view()
+        view.parent_query_kwargs = []
+        request = self._request(self._personal_api_key_auth())
+
+        self.assertTrue(self.permission.has_permission(request, view))
+        with self.assertRaises(PermissionDenied):
+            self.permission.has_object_permission(request, view, self.organization)
+        with self.assertRaises(PermissionDenied):
+            self.permission.has_object_permission(request, view, self.team)
+
+    @parameterized.expand([("post", "POST"), ("patch", "PATCH"), ("delete", "DELETE")])
+    def test_root_writes_are_blocked_for_the_current_organization(self, _name, method):
+        # DRF runs no object check for a root create, so has_permission is the only gate.
+        self._deactivate()
+        request = self._request(self._personal_api_key_auth(), method=method)
+
+        with self.assertRaises(PermissionDenied) as denial:
+            self.permission.has_permission(request, self._root_view())
+
+        self.assertEqual(self._denial_code(denial.exception), "organization_deactivated")
+
+    def test_root_reads_stay_open_so_a_member_can_switch_organization(self):
+        # Listing organizations is how a member leaves a deactivated one.
+        self._deactivate()
+        request = self._request(self._personal_api_key_auth(), method="GET")
+
+        view = self._root_view(basename="organizations", action="list")
+        self.assertTrue(self.permission.has_permission(request, view))
+
+    def test_creating_an_organization_is_not_judged_on_the_current_one(self):
+        self._deactivate()
+        request = self._request(self._personal_api_key_auth(), method="POST")
+
+        view = self._root_view(basename="organizations", action="create")
+        self.assertTrue(self.permission.has_permission(request, view))
+
+    @parameterized.expand([("patch", "PATCH", "partial_update"), ("delete", "DELETE", "destroy")])
+    def test_a_root_detail_route_is_left_to_the_object_check(self, _name, method, action):
+        # The URL names the target, but the mixin resolves no organization from it and falls back
+        # to the current one. Gating here would refuse an active organization whenever a
+        # deactivated one happened to be current.
+        self._deactivate()
+        request = self._request(self._personal_api_key_auth(), method=method)
+
+        view = self._root_view(basename="projects", action=action)
+        view.detail = True
+
+        self.assertTrue(self.permission.has_permission(request, view))

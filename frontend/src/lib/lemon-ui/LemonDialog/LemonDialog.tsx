@@ -1,0 +1,341 @@
+import { BindLogic, useActions, useValues } from 'kea'
+import { Form } from 'kea-forms'
+import { router } from 'kea-router'
+import posthog from 'posthog-js'
+import { ReactNode, forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
+import { Root, createRoot } from 'react-dom/client'
+
+import { ApiError } from 'lib/api-error'
+import { LemonButton, LemonButtonProps } from 'lib/lemon-ui/LemonButton'
+import { LemonModal, LemonModalProps } from 'lib/lemon-ui/LemonModal'
+import { uuid } from 'lib/utils/dom'
+
+import { LemonDialogFormPropsType, lemonDialogLogic } from './lemonDialogLogic'
+
+// A rejected await-submit keeps the dialog open so the user can retry. Capture only genuinely
+// unexpected failures — not 4xx validation errors the user is expected to cause (e.g. a reserved
+// name), which would otherwise flood the exception tracker on every validation failure.
+function captureUnexpectedSubmitError(error: unknown): void {
+    if (!(error instanceof ApiError) || (error.status ?? 500) >= 500) {
+        posthog.captureException(error)
+    }
+}
+
+export type LemonFormDialogProps = LemonDialogFormPropsType &
+    Omit<LemonDialogProps, 'primaryButton' | 'secondaryButton' | 'content'> & {
+        initialValues: Record<string, any>
+        onSubmit: (values: Record<string, any>) => void | Promise<void>
+        shouldAwaitSubmit?: boolean
+        content?: ((isLoading: boolean) => ReactNode) | ReactNode
+        /** Override props on the auto-generated submit button (e.g. status, children) */
+        primaryButtonProps?: Partial<Pick<LemonButtonProps, 'children' | 'status' | 'type' | 'icon'>>
+        /** Like primaryButtonProps, but computed from the current form values */
+        getPrimaryButtonProps?: (
+            values: Record<string, any>
+        ) => Partial<Pick<LemonButtonProps, 'children' | 'status' | 'type' | 'icon'>>
+    }
+
+export type LemonDialogProps = Pick<
+    LemonModalProps,
+    'title' | 'description' | 'width' | 'maxWidth' | 'inline' | 'footer' | 'zIndex' | 'className' | 'overlayClassName'
+> & {
+    primaryButton?: LemonButtonProps | null
+    secondaryButton?: LemonButtonProps | null
+    tertiaryButton?: LemonButtonProps | null
+    initialFormValues?: Record<string, any>
+    content?: ((closeDialog: () => void) => ReactNode) | ReactNode
+    onClose?: () => void
+    onAfterClose?: () => void
+    closeOnNavigate?: boolean
+    shouldAwaitSubmit?: boolean
+    isLoadingCallback?: (isLoading: boolean) => void
+}
+
+type LemonDialogRef = {
+    closeDialog: () => void
+}
+
+type LemonDialogMethods = {
+    open: (props: LemonDialogProps) => void
+    openForm: (props: LemonFormDialogProps) => void
+}
+
+const LemonDialogComponent = forwardRef<LemonDialogRef, LemonDialogProps>(function LemonDialog(
+    {
+        onAfterClose,
+        onClose,
+        primaryButton,
+        tertiaryButton,
+        secondaryButton,
+        content,
+        initialFormValues,
+        closeOnNavigate = true,
+        shouldAwaitSubmit = false,
+        footer,
+        isLoadingCallback,
+        ...props
+    }: LemonDialogProps,
+    ref
+): JSX.Element {
+    const { currentLocation } = useValues(router)
+    const lastLocation = useRef(currentLocation.pathname)
+    const [isOpen, setIsOpen] = useState(true)
+    const [isLoading, setIsLoading] = useState(false)
+
+    useImperativeHandle(
+        ref,
+        () => ({
+            closeDialog: () => {
+                setIsOpen(false)
+            },
+        }),
+        []
+    )
+
+    primaryButton =
+        primaryButton ||
+        (primaryButton === null
+            ? null
+            : {
+                  children: 'Okay',
+                  disabledReason: shouldAwaitSubmit && isLoading ? 'Please wait...' : undefined,
+              })
+    if (primaryButton) {
+        primaryButton.type = primaryButton.type || 'primary'
+    }
+
+    const renderButton = (button: LemonButtonProps | null | undefined): JSX.Element | null => {
+        if (!button) {
+            return null
+        }
+
+        const { preventClosing, ...buttonProps } = button
+
+        return (
+            <LemonButton
+                type="secondary"
+                {...buttonProps}
+                loading={button === primaryButton && shouldAwaitSubmit ? isLoading : undefined}
+                // eslint-disable-next-line @typescript-eslint/no-misused-promises
+                onClick={async (e) => {
+                    if (button === primaryButton && shouldAwaitSubmit) {
+                        setIsLoading(true)
+                        isLoadingCallback?.(true)
+                        try {
+                            // eslint-disable-next-line @typescript-eslint/await-thenable
+                            await button.onClick?.(e)
+                        } catch (error) {
+                            // The submit handler is responsible for surfacing the error to the user
+                            // (e.g. via a toast). Keep the dialog open so they can correct and retry,
+                            // and capture genuine bugs so they aren't silently swallowed.
+                            captureUnexpectedSubmitError(error)
+                            return
+                        } finally {
+                            setIsLoading(false)
+                            isLoadingCallback?.(false)
+                        }
+                    } else {
+                        button.onClick?.(e)
+                    }
+
+                    if (!preventClosing) {
+                        setIsOpen(false)
+                    }
+                }}
+            />
+        )
+    }
+
+    useEffect(() => {
+        if (lastLocation.current !== currentLocation.pathname && closeOnNavigate) {
+            setIsOpen(false)
+        }
+        lastLocation.current = currentLocation.pathname
+    }, [currentLocation]) // oxlint-disable-line react-hooks/exhaustive-deps
+
+    const handleClose = (): void => {
+        setIsOpen(false)
+    }
+
+    // Resolve content, supporting both function and static content
+    const resolvedContent = typeof content === 'function' ? content(handleClose) : content
+
+    return (
+        <LemonModal
+            {...props}
+            isOpen={isOpen}
+            onClose={() => setIsOpen(false)}
+            onAfterClose={() => onAfterClose?.()}
+            footer={
+                footer ? (
+                    footer
+                ) : primaryButton || secondaryButton || tertiaryButton ? (
+                    <>
+                        <div className="flex-1">{renderButton(tertiaryButton)}</div>
+                        {renderButton(secondaryButton)}
+                        {renderButton(primaryButton)}
+                    </>
+                ) : null
+            }
+        >
+            {resolvedContent}
+        </LemonModal>
+    )
+})
+
+// The browser turns Enter on a focused button into a click on that button. Submitting the form as well would run
+// Submit twice, or run it for Cancel.
+function isEnterOnField(e: React.KeyboardEvent<HTMLFormElement>): boolean {
+    return e.key === 'Enter' && !(e.target as HTMLElement).closest('button')
+}
+
+function isImeComposing(e: React.KeyboardEvent<HTMLFormElement>): boolean {
+    return e.nativeEvent.isComposing || e.keyCode === 229
+}
+
+function isEnterHandledByField(e: React.KeyboardEvent<HTMLFormElement>): boolean {
+    return e.defaultPrevented || isImeComposing(e)
+}
+
+export const LemonFormDialog = ({
+    initialValues = {},
+    onSubmit,
+    errors,
+    content,
+    primaryButtonProps,
+    getPrimaryButtonProps,
+    dialogKey,
+    showErrorsOnTouch,
+    ...props
+}: LemonFormDialogProps): JSX.Element => {
+    const logicProps = { errors, dialogKey, showErrorsOnTouch }
+    const logic = lemonDialogLogic(logicProps)
+    const { form, isFormValid, formValidationErrors } = useValues(logic)
+    const { setFormValues } = useActions(logic)
+    const [isLoading, setIsLoading] = useState(false)
+
+    const firstError = useMemo(
+        () => Object.values(formValidationErrors).find((error) => Boolean(error)) as string,
+        [formValidationErrors]
+    )
+
+    const primaryButton: LemonDialogProps['primaryButton'] = {
+        type: 'primary',
+        children: 'Submit',
+        ...primaryButtonProps,
+        ...getPrimaryButtonProps?.(form),
+        htmlType: 'submit',
+        // eslint-disable-next-line @typescript-eslint/no-misused-promises
+        onClick: props.shouldAwaitSubmit ? async () => await onSubmit(form) : () => void onSubmit(form),
+        disabledReason: !isFormValid ? firstError : undefined,
+    }
+
+    const secondaryButton: LemonDialogProps['secondaryButton'] = {
+        type: 'secondary',
+        children: 'Cancel',
+    }
+
+    // Resolve content, supporting both function and static content
+    const resolvedContent = typeof content === 'function' ? content(isLoading) : content
+
+    useEffect(() => {
+        setFormValues(initialValues)
+    }, [setFormValues, initialValues])
+
+    const ref = useRef<LemonDialogRef>(null)
+
+    const isSubmitKey = (e: React.KeyboardEvent<HTMLFormElement>): boolean =>
+        isEnterOnField(e) && !isEnterHandledByField(e) && primaryButton?.htmlType === 'submit' && isFormValid
+
+    return (
+        <Form
+            logic={lemonDialogLogic}
+            props={logicProps}
+            formKey="form"
+            onKeyDown={
+                props.shouldAwaitSubmit
+                    ? async (e: React.KeyboardEvent<HTMLFormElement>): Promise<void> => {
+                          if (isSubmitKey(e)) {
+                              try {
+                                  await onSubmit(form)
+                              } catch (error) {
+                                  // Mirror the button path: keep the dialog open on failure so the
+                                  // user can correct and retry, and capture instead of leaking an
+                                  // unhandled rejection.
+                                  captureUnexpectedSubmitError(error)
+                                  return
+                              }
+                              ref?.current?.closeDialog()
+                          }
+                      }
+                    : (e: React.KeyboardEvent<HTMLFormElement>): void => {
+                          if (isSubmitKey(e)) {
+                              void onSubmit(form)
+                              ref?.current?.closeDialog()
+                          }
+                      }
+            }
+        >
+            <BindLogic logic={lemonDialogLogic} props={logicProps}>
+                <LemonDialog
+                    ref={ref}
+                    {...props}
+                    content={resolvedContent}
+                    primaryButton={primaryButton}
+                    secondaryButton={secondaryButton}
+                    isLoadingCallback={setIsLoading}
+                />
+            </BindLogic>
+        </Form>
+    )
+}
+
+function createAndInsertRoot(): { root: Root; onDestroy: () => void } {
+    const div = document.createElement('div')
+    const root = createRoot(div)
+    function destroy(): void {
+        // defer the unmounting to avoid collisions with the rendering cycle
+        setTimeout(() => {
+            root.unmount()
+            if (div.parentNode) {
+                div.parentNode.removeChild(div)
+            }
+        }, 0)
+    }
+
+    document.body.appendChild(div)
+    return { root, onDestroy: destroy }
+}
+
+export const LemonDialog = LemonDialogComponent as typeof LemonDialogComponent & LemonDialogMethods
+
+LemonDialog.open = (props: LemonDialogProps) => {
+    const { root, onDestroy } = createAndInsertRoot()
+    root.render(
+        <LemonDialog
+            {...props}
+            onAfterClose={() => {
+                props.onAfterClose?.()
+                onDestroy()
+            }}
+        />
+    )
+}
+
+LemonDialog.openForm = (props: LemonFormDialogProps) => {
+    const { root, onDestroy } = createAndInsertRoot()
+    // Each dialog gets a unique key so nested dialogs don't share the same
+    // lemonDialogLogic instance and corrupt each other's form state. A caller that passes its own
+    // key must keep it unique, and uses it to reach the form, for example to show a server error
+    // under a field.
+    root.render(
+        <LemonFormDialog
+            {...props}
+            dialogKey={props.dialogKey ?? uuid()}
+            onAfterClose={() => {
+                props.onAfterClose?.()
+                onDestroy()
+            }}
+        />
+    )
+}

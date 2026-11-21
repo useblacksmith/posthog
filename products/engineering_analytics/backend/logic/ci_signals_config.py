@@ -1,0 +1,166 @@
+from dataclasses import dataclass
+from uuid import UUID
+
+from posthog.models.team import Team
+from posthog.models.user import User
+
+from products.access_control.backend.facade.user_access_control import UserAccessControl
+from products.engineering_analytics.backend.facade.contracts import CISignalsConfig, CISignalsSyncStatus
+from products.engineering_analytics.backend.logic.signals.contracts import (
+    SOURCE_PRODUCT,
+    SOURCE_TYPE_BROKEN_DEFAULT_BRANCH,
+    SOURCE_TYPE_DURATION_REGRESSION,
+    SOURCE_TYPE_FLAKY_CHECK,
+)
+from products.engineering_analytics.backend.logic.sources import (
+    PULL_REQUESTS_SCHEMA,
+    WORKFLOW_JOBS_SCHEMA,
+    WORKFLOW_RUNS_SCHEMA,
+    list_github_sources,
+)
+from products.signals.backend.facade.api import set_signal_source_types_enabled, signal_source_types_state
+from products.signals.backend.facade.source_configs import get_source_config, latest_enabled_source_config
+from products.warehouse_sources.backend.facade.models import ExternalDataSchema
+from products.warehouse_sources.backend.facade.sources import github_schema_repo_endpoint
+from products.warehouse_sources.backend.facade.types import ExternalDataSchemaStatus
+
+CI_SIGNAL_SOURCE_TYPES = (
+    SOURCE_TYPE_FLAKY_CHECK,
+    SOURCE_TYPE_BROKEN_DEFAULT_BRANCH,
+    SOURCE_TYPE_DURATION_REGRESSION,
+)
+CI_SIGNAL_REQUIRED_SCHEMAS = (PULL_REQUESTS_SCHEMA, WORKFLOW_RUNS_SCHEMA, WORKFLOW_JOBS_SCHEMA)
+# Keys of SignalSourceConfig.config. A dry run detects and logs, and emits nothing.
+AUTHORIZED_SOURCES_CONFIG_KEY = "github_source_ids"
+DRY_RUN_CONFIG_KEY = "dry_run"
+
+
+def is_dry_run(*, team: Team) -> bool:
+    row = get_source_config(team_id=team.id, source_product=SOURCE_PRODUCT, source_type=SOURCE_TYPE_FLAKY_CHECK)
+    if row is None:
+        return False
+    return bool(row.config.get(DRY_RUN_CONFIG_KEY, False))
+
+
+def get_ci_signals_config(*, team: Team, user_access_control: UserAccessControl | None = None) -> CISignalsConfig:
+    state = signal_source_types_state(
+        team_id=team.id,
+        source_product=SOURCE_PRODUCT,
+        source_types=CI_SIGNAL_SOURCE_TYPES,
+    )
+    return CISignalsConfig(
+        configured=state.configured,
+        enabled=state.all_enabled,
+        sync_status=_sync_status(team, user_access_control),
+    )
+
+
+def update_ci_signals_config(
+    *,
+    team: Team,
+    enabled: bool,
+    created_by_id: int,
+    user_access_control: UserAccessControl | None = None,
+) -> CISignalsConfig:
+    """Enabling snapshots the requesting user's accessible GitHub sources as the authorization of
+    the userless sweep. A source connected later is not scanned until a re-enable authorizes it."""
+    config = None
+    if enabled:
+        # list_github_sources yields one entry per (source, repo). A duplicate id would become a
+        # duplicate sweep target that rescans every repo and races the emission ledger.
+        authorized = list(
+            dict.fromkeys(
+                source.id for source in list_github_sources(team=team, user_access_control=user_access_control)
+            )
+        )
+        config = {AUTHORIZED_SOURCES_CONFIG_KEY: authorized}
+    set_signal_source_types_enabled(
+        team_id=team.id,
+        source_product=SOURCE_PRODUCT,
+        source_types=CI_SIGNAL_SOURCE_TYPES,
+        enabled=enabled,
+        created_by_id=created_by_id,
+        config=config,
+    )
+    return get_ci_signals_config(team=team, user_access_control=user_access_control)
+
+
+def resolve_authorizer(*, team: Team, user_id: int) -> User | None:
+    """Return None when the user is deactivated or no longer in the team's organization."""
+    user = User.objects.filter(id=user_id, is_active=True).first()
+    if user is None or not user.organization_memberships.filter(organization_id=team.organization_id).exists():
+        return None
+    return user
+
+
+@dataclass(frozen=True)
+class AuthorizedCISignalSource:
+    source_id: str
+    authorized_by_user_id: int
+
+
+def list_authorized_ci_signal_sources(*, team: Team) -> list[AuthorizedCISignalSource]:
+    """The enabled snapshot filtered through the enabling user's current access. Every failure
+    returns fewer sources and never widens to all of the team's sources."""
+    row = latest_enabled_source_config(
+        team_id=team.id, source_product=SOURCE_PRODUCT, source_types=CI_SIGNAL_SOURCE_TYPES
+    )
+    if row is None or row.created_by_id is None:
+        return []
+    snapshot = row.config.get(AUTHORIZED_SOURCES_CONFIG_KEY)
+    if not isinstance(snapshot, list) or not snapshot:
+        return []
+    user = resolve_authorizer(team=team, user_id=row.created_by_id)
+    if user is None:
+        return []
+    access_control = UserAccessControl(user=user, team=team)
+    accessible = {source.id for source in list_github_sources(team=team, user_access_control=access_control)}
+    return [
+        AuthorizedCISignalSource(source_id=source_id, authorized_by_user_id=user.id)
+        # A stored snapshot can hold duplicate ids.
+        for source_id in dict.fromkeys(snapshot)
+        if source_id in accessible
+    ]
+
+
+def _sync_status(team: Team, user_access_control: UserAccessControl | None) -> CISignalsSyncStatus | None:
+    source_ids: set[UUID] = {
+        UUID(source.id) for source in list_github_sources(team=team, user_access_control=user_access_control)
+    }
+    if not source_ids:
+        return None
+    # Schema names can be repo-qualified (`owner/repo.endpoint`), so status aggregates per (source, repo).
+    schemas = (
+        ExternalDataSchema.objects.filter(
+            team_id=team.id,
+            source_id__in=source_ids,
+            should_sync=True,
+        )
+        .exclude(source__deleted=True)
+        .exclude(deleted=True)
+        .values_list("source_id", "name", "status", "sync_type_config")
+    )
+    required = set(CI_SIGNAL_REQUIRED_SCHEMAS)
+    failure_statuses = {
+        ExternalDataSchemaStatus.FAILED,
+        ExternalDataSchemaStatus.BILLING_LIMIT_REACHED,
+        ExternalDataSchemaStatus.BILLING_LIMIT_TOO_LOW,
+    }
+    syncing_by_group: dict[tuple[UUID, str], set[str]] = {}
+    completed_by_group: dict[tuple[UUID, str], set[str]] = {}
+    for source_id, name, status, sync_type_config in schemas:
+        metadata = sync_type_config.get("schema_metadata") if isinstance(sync_type_config, dict) else None
+        repository, endpoint = github_schema_repo_endpoint(metadata, name, None)
+        if endpoint not in required:
+            continue
+        if status in failure_statuses:
+            return CISignalsSyncStatus.FAILED
+        group = (source_id, (repository or "").lower())
+        syncing_by_group.setdefault(group, set()).add(endpoint)
+        if status == ExternalDataSchemaStatus.COMPLETED:
+            completed_by_group.setdefault(group, set()).add(endpoint)
+    if not syncing_by_group:
+        return CISignalsSyncStatus.RUNNING
+    if all(completed_by_group.get(group, set()) >= required for group in syncing_by_group):
+        return CISignalsSyncStatus.COMPLETED
+    return CISignalsSyncStatus.RUNNING

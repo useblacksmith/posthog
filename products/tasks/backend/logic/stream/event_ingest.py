@@ -1,0 +1,819 @@
+from __future__ import annotations
+
+import re
+import json
+import math
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from dataclasses import dataclass
+from datetime import datetime
+from http import HTTPStatus
+from typing import BinaryIO, Literal, cast
+from uuid import NAMESPACE_URL, uuid5
+
+from django.conf import settings
+from django.db import InterfaceError, OperationalError, close_old_connections
+
+import structlog
+from asgiref.sync import async_to_sync, sync_to_async
+from jwt import PyJWTError
+
+from posthog.ph_client import ph_scoped_capture
+
+from products.tasks.backend.awaiting_input import dispatch_awaiting_input
+from products.tasks.backend.facade.api import signal_workflow_completion
+from products.tasks.backend.logic.services.connection_token import (
+    SandboxEventIngestTokenPayload,
+    validate_sandbox_event_ingest_token,
+)
+from products.tasks.backend.logic.services.permission_broker import parse_permission_request
+from products.tasks.backend.logic.services.process_killed import (
+    PROCESS_KILLED_EVENT,
+    ProcessKilledNotice,
+    parse_process_killed,
+    process_killed_event_uuid,
+)
+from products.tasks.backend.logic.stream.agent_events import is_agent_command_dispatched, is_agent_generation_event
+from products.tasks.backend.logic.stream.budget_steer import BudgetSteerCapture
+from products.tasks.backend.logic.stream.redis_stream import (
+    TASK_RUN_STREAM_INITIAL_GENERATION,
+    TaskRunRedisStream,
+    TaskRunStreamAlreadyCompleted,
+    TaskRunStreamCompletionSequenceMismatch,
+    TaskRunStreamGenerationMismatch,
+    TaskRunStreamSequenceGap,
+    get_task_run_stream_key,
+)
+from products.tasks.backend.metrics import observe_sandbox_process_killed, observe_stream_write_skipped
+from products.tasks.backend.models import TaskRun
+from products.tasks.backend.redis import run_uses_dedicated_stream
+from products.tasks.backend.turn_completed import dispatch_turn_completed
+
+from ee.hogai.sandbox import (
+    PI_RUNTIME_ERROR_MESSAGE,
+    is_idle_resume_turn_complete,
+    is_turn_complete,
+    pi_turn_error,
+    turn_completed_successfully,
+)
+
+logger = structlog.get_logger(__name__)
+
+TASK_RUN_EVENT_INGEST_ROUTE = re.compile(
+    r"^/api/projects/(?P<project_id>[^/]+)/tasks/(?P<task_id>[^/]+)/runs/(?P<run_id>[^/]+)/event_stream/?$"
+)
+HEARTBEAT_THROTTLE_SECONDS = 30
+MAX_EVENT_LINE_BYTES = 1_000_000
+MAX_REQUEST_BYTES = 5_000_000
+MAX_EVENTS_PER_REQUEST = 1_000
+STREAM_COMPLETE_CONTROL_TYPE = "_posthog/stream_complete"
+RTK_SAVINGS_SIDE_EFFECT = "rtk-savings"
+RTK_SAVINGS_CAPTURE_LOCK_SECONDS = 60
+BUDGET_STEER_SIDE_EFFECT = "budget-steer"
+PROCESS_KILLED_SIDE_EFFECT = "process-killed"
+BUDGET_STEER_STAGES = frozenset({"warn", "critical"})
+BUDGET_STEER_MODES = frozenset({"publish", "wrap_up"})
+
+ASGIMessage = dict[str, object]
+ASGIReceive = Callable[[], Awaitable[ASGIMessage]]
+ASGISend = Callable[[ASGIMessage], Awaitable[None]]
+WSGIStartResponse = Callable[[str, list[tuple[str, str]]], object]
+
+WSGI_READ_CHUNK_BYTES = 64 * 1024
+
+
+class ClientDisconnected(Exception):
+    pass
+
+
+class EventIngestBadRequest(Exception):
+    pass
+
+
+class EventIngestPayloadTooLarge(Exception):
+    def __init__(self, message: str, last_accepted_seq: int = 0):
+        super().__init__(message)
+        self.last_accepted_seq = last_accepted_seq
+
+
+class EventIngestCaptureError(Exception):
+    pass
+
+
+class EventIngestHTTPError(Exception):
+    def __init__(self, status_code: int, payload: dict):
+        super().__init__(payload.get("error", "Event ingest request failed"))
+        self.status_code = status_code
+        self.payload = payload
+
+
+@dataclass(frozen=True)
+class EventIngestRoute:
+    project_id: str
+    task_id: str
+    run_id: str
+
+
+@dataclass
+class EventIngestResult:
+    accepted: int = 0
+    duplicate: int = 0
+    last_accepted_seq: int = 0
+
+
+@dataclass
+class EventIngestEventLine:
+    sequence: int
+    event: dict
+
+
+@dataclass
+class EventIngestCompleteLine:
+    final_sequence: int
+
+
+async def handle_task_run_event_ingest(scope: ASGIMessage, receive: ASGIReceive, send: ASGISend) -> bool:
+    """Handle sandbox-to-Django streaming event ingest before Django buffers the request body."""
+    if scope.get("type") != "http":
+        return False
+
+    path = scope.get("path")
+    if not isinstance(path, str):
+        return False
+
+    route = _match_event_ingest_route(path)
+    if route is None:
+        return False
+
+    if scope.get("method") != "POST":
+        await _send_json(send, 405, {"error": "Method not allowed"})
+        return True
+
+    try:
+        claims, use_dedicated = await _authorize_event_ingest_request(scope, route)
+    except EventIngestHTTPError as error:
+        await _send_json(send, error.status_code, error.payload)
+        return True
+
+    redis_stream = TaskRunRedisStream(
+        get_task_run_stream_key(claims.run_id),
+        use_dedicated=use_dedicated,
+        presence_gated=claims.presence_gated,
+        thin_tail=claims.thin_tail,
+        origin_product=claims.origin_product,
+        expected_generation=claims.stream_generation or TASK_RUN_STREAM_INITIAL_GENERATION,
+    )
+
+    try:
+        result = await _ingest_event_lines(
+            redis_stream,
+            claims,
+            receive,
+        )
+    except ClientDisconnected:
+        logger.info("task_run_event_ingest_client_disconnected", run_id=claims.run_id)
+        return True
+    except EventIngestBadRequest as error:
+        await _send_json(send, 400, {"error": str(error)})
+        return True
+    except EventIngestPayloadTooLarge as error:
+        await _send_json(send, 413, {"error": str(error), "last_accepted_seq": error.last_accepted_seq})
+        return True
+    except EventIngestCaptureError:
+        await _send_json(send, 503, {"error": "Failed to capture RTK savings; retry the request"})
+        return True
+    except TaskRunStreamGenerationMismatch as error:
+        await _send_json(send, 403, {"error": str(error), "code": "stream_generation_mismatch"})
+        return True
+    except TaskRunStreamSequenceGap as error:
+        await _send_json(send, 409, {"error": str(error), "last_accepted_seq": error.last_accepted_seq})
+        return True
+    except TaskRunStreamAlreadyCompleted as error:
+        await _send_json(send, 409, {"error": str(error), "last_accepted_seq": error.last_accepted_seq})
+        return True
+    except TaskRunStreamCompletionSequenceMismatch as error:
+        await _send_json(send, 409, {"error": str(error), "last_accepted_seq": error.last_accepted_seq})
+        return True
+
+    await _send_json(
+        send,
+        200,
+        {
+            "accepted": result.accepted,
+            "duplicate": result.duplicate,
+            "last_accepted_seq": result.last_accepted_seq,
+        },
+    )
+    return True
+
+
+def handle_task_run_event_ingest_wsgi(
+    environ: dict[str, object], start_response: WSGIStartResponse
+) -> Iterable[bytes] | None:
+    path = environ.get("PATH_INFO")
+    if not isinstance(path, str) or _match_event_ingest_route(path) is None:
+        return None
+
+    body_stream = cast(BinaryIO, environ["wsgi.input"])
+    sent: list[ASGIMessage] = []
+
+    async def receive() -> ASGIMessage:
+        chunk = body_stream.read(WSGI_READ_CHUNK_BYTES)
+        return {"type": "http.request", "body": chunk, "more_body": bool(chunk)}
+
+    async def send(message: ASGIMessage) -> None:
+        sent.append(message)
+
+    scope: ASGIMessage = {
+        "type": "http",
+        "method": environ.get("REQUEST_METHOD"),
+        "path": path,
+        "headers": [
+            (_wsgi_header_name(key).encode("latin-1"), value.encode("latin-1"))
+            for key, value in environ.items()
+            if isinstance(value, str) and (key.startswith("HTTP_") or key in ("CONTENT_TYPE", "CONTENT_LENGTH"))
+        ],
+    }
+    async_to_sync(handle_task_run_event_ingest)(scope, receive, send)
+    if not sent:
+        return []
+
+    status = cast(int, sent[0]["status"])
+    headers = [
+        (name.decode("latin-1"), value.decode("latin-1"))
+        for name, value in cast(list[tuple[bytes, bytes]], sent[0].get("headers", []))
+    ]
+    start_response(f"{status} {HTTPStatus(status).phrase}", headers)
+    return [cast(bytes, message.get("body", b"")) for message in sent[1:]]
+
+
+def _wsgi_header_name(environ_key: str) -> str:
+    return environ_key.removeprefix("HTTP_").replace("_", "-").lower()
+
+
+async def _ingest_event_lines(
+    redis_stream: TaskRunRedisStream,
+    claims: SandboxEventIngestTokenPayload,
+    receive: ASGIReceive,
+) -> EventIngestResult:
+    result = EventIngestResult(last_accepted_seq=await redis_stream.get_last_sequence())
+
+    event_count = 0
+    completion_line_final_sequence: int | None = None
+    try:
+        async for line in _iter_request_lines(receive):
+            parsed_line = _parse_ingest_line(line)
+            if isinstance(parsed_line, EventIngestCompleteLine):
+                if completion_line_final_sequence is not None:
+                    raise EventIngestBadRequest("Completion line must be the final event stream line")
+                completion_line_final_sequence = parsed_line.final_sequence
+                continue
+
+            if completion_line_final_sequence is not None:
+                raise EventIngestBadRequest("Completion line must be the final event stream line")
+
+            event_count += 1
+            if event_count > MAX_EVENTS_PER_REQUEST:
+                raise EventIngestPayloadTooLarge("Too many events in request", result.last_accepted_seq)
+
+            sequence = parsed_line.sequence
+            event = parsed_line.event
+            rtk_savings_properties = _parse_rtk_savings_properties(claims, event)
+            budget_steer_properties = _parse_budget_steer_properties(claims, event)
+            process_killed = parse_process_killed(event)
+            pending_side_effect = None
+            if rtk_savings_properties is not None:
+                pending_side_effect = RTK_SAVINGS_SIDE_EFFECT
+            elif budget_steer_properties is not None:
+                pending_side_effect = BUDGET_STEER_SIDE_EFFECT
+            elif process_killed is not None:
+                pending_side_effect = PROCESS_KILLED_SIDE_EFFECT
+            write = await redis_stream.write_event_with_sequence(
+                event, sequence, pending_side_effect=pending_side_effect
+            )
+            await _capture_rtk_savings_if_needed(redis_stream, claims, sequence, rtk_savings_properties)
+            await _capture_budget_steer_if_needed(
+                redis_stream, claims, sequence, budget_steer_properties, event.get("timestamp")
+            )
+            await _capture_process_killed_if_needed(redis_stream, claims, sequence, process_killed)
+            if not write.accepted:
+                result.duplicate += 1
+                result.last_accepted_seq = max(result.last_accepted_seq, await redis_stream.get_last_sequence())
+                continue
+            if write.skipped:
+                observe_stream_write_skipped("ingest", claims.origin_product)
+
+            result.accepted += 1
+            result.last_accepted_seq = sequence
+            await _heartbeat_workflow_if_needed(redis_stream, claims.run_id, event)
+    except EventIngestPayloadTooLarge as error:
+        if result.last_accepted_seq and error.last_accepted_seq == 0:
+            error.last_accepted_seq = result.last_accepted_seq
+        raise
+
+    if completion_line_final_sequence is not None:
+        await redis_stream.mark_complete_after_sequence(completion_line_final_sequence)
+
+    return result
+
+
+async def _capture_rtk_savings_if_needed(
+    redis_stream: TaskRunRedisStream,
+    claims: SandboxEventIngestTokenPayload,
+    sequence: int,
+    properties: dict[str, str | int] | None,
+) -> None:
+    if properties is None:
+        return
+    capture_claim = await redis_stream.claim_pending_side_effect(
+        RTK_SAVINGS_SIDE_EFFECT, sequence, RTK_SAVINGS_CAPTURE_LOCK_SECONDS
+    )
+    if capture_claim is None:
+        return
+    if not capture_claim:
+        return
+
+    try:
+        event_uuid = str(uuid5(NAMESPACE_URL, f"posthog-task-rtk-savings:{claims.run_id}:{sequence}"))
+        await sync_to_async(_capture_rtk_savings, thread_sensitive=False)(claims.team_id, event_uuid, properties)
+    except Exception as error:
+        await redis_stream.release_pending_side_effect(RTK_SAVINGS_SIDE_EFFECT, sequence)
+        logger.warning("task_run_rtk_savings_capture_failed", run_id=claims.run_id, exc_info=True)
+        raise EventIngestCaptureError from error
+    await redis_stream.complete_pending_side_effect(RTK_SAVINGS_SIDE_EFFECT, sequence)
+
+
+def _capture_rtk_savings(team_id: int, event_uuid: str, properties: dict[str, str | int]) -> None:
+    with ph_scoped_capture() as capture:
+        capture(
+            distinct_id=f"team_{team_id}",
+            event="rtk savings",
+            properties=properties,
+            uuid=event_uuid,
+        )
+
+
+async def _capture_budget_steer_if_needed(
+    redis_stream: TaskRunRedisStream,
+    claims: SandboxEventIngestTokenPayload,
+    sequence: int,
+    properties: dict[str, str | int | float | bool] | None,
+    event_timestamp: object = None,
+) -> None:
+    if properties is None:
+        return
+    capture_claim = await redis_stream.claim_pending_side_effect(
+        BUDGET_STEER_SIDE_EFFECT, sequence, RTK_SAVINGS_CAPTURE_LOCK_SECONDS
+    )
+    if not capture_claim:
+        return
+    try:
+        await sync_to_async(BudgetSteerCapture.enqueue, thread_sensitive=False)(
+            claims.team_id, claims.run_id, sequence, properties, event_timestamp
+        )
+    except Exception:
+        await redis_stream.release_pending_side_effect(BUDGET_STEER_SIDE_EFFECT, sequence)
+        logger.warning("task_run_budget_steer_capture_failed", run_id=claims.run_id, exc_info=True)
+        return
+    await redis_stream.complete_pending_side_effect(BUDGET_STEER_SIDE_EFFECT, sequence)
+
+
+async def _capture_process_killed_if_needed(
+    redis_stream: TaskRunRedisStream,
+    claims: SandboxEventIngestTokenPayload,
+    sequence: int,
+    notice: ProcessKilledNotice | None,
+) -> None:
+    if notice is None:
+        return
+    capture_claim = await redis_stream.claim_pending_side_effect(
+        PROCESS_KILLED_SIDE_EFFECT, sequence, RTK_SAVINGS_CAPTURE_LOCK_SECONDS
+    )
+    if not capture_claim:
+        return
+    event_uuid = process_killed_event_uuid(claims.run_id, sequence)
+    try:
+        captured = await sync_to_async(_capture_process_killed, thread_sensitive=True)(
+            claims.run_id, event_uuid, notice
+        )
+    except Exception:
+        captured = False
+    if not captured:
+        await redis_stream.release_pending_side_effect(PROCESS_KILLED_SIDE_EFFECT, sequence)
+        logger.warning("task_run_process_killed_capture_failed", run_id=claims.run_id)
+        return
+    await redis_stream.complete_pending_side_effect(PROCESS_KILLED_SIDE_EFFECT, sequence)
+    observe_sandbox_process_killed()
+
+
+def _capture_process_killed(run_id: str, event_uuid: str, notice: ProcessKilledNotice) -> bool:
+    if not settings.TEST:
+        close_old_connections()
+
+    try:
+        task_run = TaskRun.objects.select_related("task__created_by", "team").get(id=run_id)
+    except TaskRun.DoesNotExist:
+        logger.warning("task_run_event_ingest_process_killed_run_missing", run_id=run_id)
+        return True
+
+    return task_run.capture_event(PROCESS_KILLED_EVENT, notice.analytics_properties(), event_uuid=event_uuid)
+
+
+def _parse_budget_steer_properties(
+    claims: SandboxEventIngestTokenPayload, event: dict
+) -> dict[str, str | int | float | bool] | None:
+    notification = event.get("notification")
+    if not isinstance(notification, dict) or notification.get("method") != "_posthog/budget_steer":
+        return None
+    params = notification.get("params")
+    if not isinstance(params, dict):
+        return None
+    stage = params.get("stage")
+    mode = params.get("mode")
+    delivered = params.get("delivered")
+    if not isinstance(stage, str) or stage not in BUDGET_STEER_STAGES:
+        return None
+    if not isinstance(mode, str) or mode not in BUDGET_STEER_MODES or not isinstance(delivered, bool):
+        return None
+    amounts: dict[str, float] = {}
+    for key in ("spent_usd", "cap_usd"):
+        amount = _parse_usd_amount(params.get(key))
+        if amount is None:
+            return None
+        amounts[key] = amount
+    threshold = _parse_usd_amount(params.get("threshold_spent_usd"))
+    if threshold is not None:
+        amounts["threshold_spent_usd"] = threshold
+    timestamps: dict[str, str] = {}
+    for key in ("threshold_at", "delivered_at"):
+        value = params.get(key)
+        if isinstance(value, str) and len(value) <= 40:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                continue
+            if parsed.tzinfo is not None:
+                timestamps[key] = value
+    return {
+        "team_id": claims.team_id,
+        "task_id": claims.task_id,
+        "run_id": claims.run_id,
+        "stage": stage,
+        "mode": mode,
+        "delivered": delivered,
+        **amounts,
+        **timestamps,
+    }
+
+
+def _parse_usd_amount(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        amount = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(amount) or amount < 0:
+        return None
+    return amount
+
+
+def _parse_rtk_savings_properties(claims: SandboxEventIngestTokenPayload, event: dict) -> dict[str, str | int] | None:
+    notification = event.get("notification")
+    if not isinstance(notification, dict) or notification.get("method") != "_posthog/rtk_savings":
+        return None
+
+    params = notification.get("params")
+    if not isinstance(params, dict):
+        return None
+
+    counters: dict[str, int] = {}
+    for key in (
+        "cumulative_commands",
+        "cumulative_input_tokens",
+        "cumulative_output_tokens",
+        "cumulative_tokens_saved",
+    ):
+        value = params.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or (isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()))
+            or value < 0
+        ):
+            return None
+        counters[key] = int(value)
+
+    properties: dict[str, str | int] = {
+        "team_id": claims.team_id,
+        "task_id": claims.task_id,
+        "run_id": claims.run_id,
+        "counter_id": claims.run_id,
+        **counters,
+    }
+    for key in ("runtime_adapter", "model"):
+        value = params.get(key)
+        if isinstance(value, str) and value:
+            properties[key] = value
+
+    return properties
+
+
+async def _iter_request_lines(receive: ASGIReceive) -> AsyncGenerator[str]:
+    """Yield NDJSON request lines with bounded event-loop work per request."""
+    buffer = b""
+    request_size = 0
+
+    while True:
+        message = await receive()
+        message_type = message.get("type")
+        if message_type == "http.disconnect":
+            raise ClientDisconnected
+        if message_type != "http.request":
+            continue
+
+        body = message.get("body", b"")
+        if isinstance(body, bytes) and body:
+            request_size += len(body)
+            if request_size > MAX_REQUEST_BYTES:
+                raise EventIngestPayloadTooLarge("Event ingest request is too large")
+
+            buffer += body
+            if len(buffer) > MAX_EVENT_LINE_BYTES and b"\n" not in buffer:
+                raise EventIngestPayloadTooLarge("Event line is too large")
+
+            lines = buffer.split(b"\n")
+            buffer = lines.pop() or b""
+            for line in lines:
+                if len(line) > MAX_EVENT_LINE_BYTES:
+                    raise EventIngestPayloadTooLarge("Event line is too large")
+                stripped = line.strip()
+                if stripped:
+                    yield _decode_line(stripped)
+
+        if not message.get("more_body", False):
+            stripped = buffer.strip()
+            if stripped:
+                if len(stripped) > MAX_EVENT_LINE_BYTES:
+                    raise EventIngestPayloadTooLarge("Event line is too large")
+                yield _decode_line(stripped)
+            return
+
+
+def _decode_line(line: bytes) -> str:
+    try:
+        return line.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EventIngestBadRequest("Invalid UTF-8 in event stream") from error
+
+
+def _parse_ingest_line(line: str) -> EventIngestEventLine | EventIngestCompleteLine:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise EventIngestBadRequest("Invalid JSON line") from error
+
+    if not isinstance(payload, dict):
+        raise EventIngestBadRequest("Each event line must be a JSON object")
+
+    if payload.get("type") == STREAM_COMPLETE_CONTROL_TYPE:
+        final_sequence = payload.get("final_seq")
+        if type(final_sequence) is not int or final_sequence < 0:
+            raise EventIngestBadRequest("Completion final sequence must be a non-negative integer")
+        return EventIngestCompleteLine(final_sequence=final_sequence)
+
+    sequence = payload.get("seq")
+    event = payload.get("event")
+    if type(sequence) is not int or sequence < 1:
+        raise EventIngestBadRequest("Event sequence must be a positive integer")
+    if not isinstance(event, dict):
+        raise EventIngestBadRequest("Event payload must be an object")
+
+    return EventIngestEventLine(sequence=sequence, event=event)
+
+
+async def _heartbeat_workflow_if_needed(redis_stream: TaskRunRedisStream, run_id: str, event: dict) -> None:
+    if is_agent_command_dispatched(event) and await redis_stream.claim_first_agent_command():
+        dispatched = await sync_to_async(_signal_agent_boot_milestone, thread_sensitive=True)(
+            run_id, "agent_command_dispatched"
+        )
+        if not dispatched:
+            await redis_stream.release_first_agent_command()
+    elif is_agent_generation_event(event) and await redis_stream.claim_first_agent_activity():
+        dispatched = await sync_to_async(_signal_agent_boot_milestone, thread_sensitive=True)(
+            run_id, "agent_activity_observed"
+        )
+        if not dispatched:
+            await redis_stream.release_first_agent_activity()
+
+    if permission_request := parse_permission_request(event):
+        # A pending permission request or question holds the turn open, so no turn-complete push
+        # reaches the user until they answer it.
+        await sync_to_async(_notify_awaiting_input, thread_sensitive=True)(run_id, permission_request["request_id"])
+
+    if is_turn_complete(event):
+        await redis_stream.set_agent_active(False)
+        if pi_turn_error(event):
+            await _dispatch_turn_failed(run_id)
+        else:
+            await _dispatch_turn_completed(
+                run_id,
+                succeeded=turn_completed_successfully(event),
+                turn_completed=not is_idle_resume_turn_complete(event),
+            )
+        return
+
+    activity_started = False
+    if is_agent_generation_event(event):
+        activity_started = not await redis_stream.set_agent_active(True)
+        agent_active = True
+    else:
+        agent_active = await redis_stream.get_agent_active()
+
+    if not agent_active:
+        return
+
+    if not await redis_stream.claim_agent_active_heartbeat(HEARTBEAT_THROTTLE_SECONDS) and not activity_started:
+        return
+
+    await sync_to_async(_heartbeat_workflow, thread_sensitive=True)(run_id, agent_active, force=activity_started)
+
+
+def _heartbeat_workflow(run_id: str, agent_active: bool, *, force: bool = False) -> None:
+    # This runs on a sync_to_async thread that Django never health-checks (the ASGI wrapper
+    # intercepts the request before Django's connection lifecycle runs), so a pooled connection
+    # Postgres has since closed can be reused. Mirror push_dispatcher/custom_prompt_internals and
+    # clear stale connections first. Gated on `not settings.TEST` since it trips pytest-django's
+    # DB-access guard when the ORM read is patched.
+    if not settings.TEST:
+        close_old_connections()
+
+    try:
+        task_run = TaskRun.objects.get(id=run_id)
+    except TaskRun.DoesNotExist:
+        logger.warning("task_run_event_ingest_heartbeat_run_missing", run_id=run_id)
+        return
+
+    task_run.heartbeat_workflow(agent_active=agent_active, force=force)
+
+
+def _signal_agent_boot_milestone(
+    run_id: str, milestone: Literal["agent_command_dispatched", "agent_activity_observed"]
+) -> bool:
+    if not settings.TEST:
+        close_old_connections()
+
+    try:
+        task_run = TaskRun.objects.get(id=run_id)
+    except TaskRun.DoesNotExist:
+        logger.warning("task_run_event_ingest_milestone_run_missing", run_id=run_id, milestone=milestone)
+        return False
+
+    return task_run.signal_agent_boot_milestone(milestone)
+
+
+async def _dispatch_turn_completed(run_id: str, *, succeeded: bool = False, turn_completed: bool = True) -> None:
+    await sync_to_async(_dispatch_turn_completed_sync, thread_sensitive=True)(
+        run_id, succeeded=succeeded, turn_completed=turn_completed
+    )
+
+
+def _dispatch_turn_completed_sync(run_id: str, *, succeeded: bool = False, turn_completed: bool = True) -> None:
+    if not settings.TEST:
+        close_old_connections()
+
+    try:
+        task_run = TaskRun.objects.select_related("task__created_by", "team").get(id=run_id)
+    except TaskRun.DoesNotExist:
+        logger.warning("task_run_event_ingest_turn_completed_run_missing", run_id=run_id)
+        return
+
+    task_run.signal_agent_turn_completed(succeeded=succeeded)
+    dispatch_turn_completed(task_run, turn_completed=turn_completed)
+
+
+def _notify_awaiting_input(run_id: str, request_id: str) -> None:
+    if not settings.TEST:
+        close_old_connections()
+
+    try:
+        task_run = TaskRun.objects.select_related("task__created_by").get(id=run_id)
+    except TaskRun.DoesNotExist:
+        logger.warning("task_run_event_ingest_awaiting_input_run_missing", run_id=run_id)
+        return
+    except (OperationalError, InterfaceError):
+        # The event is already accepted, so a failed lookup loses only the push and must not fail the request.
+        logger.warning("task_run_event_ingest_awaiting_input_lookup_failed", run_id=run_id, exc_info=True)
+        return
+
+    dispatch_awaiting_input(task_run, request_id=request_id)
+
+
+async def _dispatch_turn_failed(run_id: str) -> None:
+    await sync_to_async(_dispatch_turn_failed_sync, thread_sensitive=True)(run_id)
+
+
+def _dispatch_turn_failed_sync(run_id: str) -> None:
+    if not settings.TEST:
+        close_old_connections()
+
+    signal_workflow_completion(run_id, "failed", PI_RUNTIME_ERROR_MESSAGE, "pi_runtime_error")
+
+
+def _is_session_update(event: dict) -> bool:
+    if event.get("type") != "notification":
+        return False
+    notification = event.get("notification", {})
+    return isinstance(notification, dict) and notification.get("method") == "session/update"
+
+
+def _task_run_state_sync(run_id: str, task_id: str, team_id: int) -> dict | None:
+    if not settings.TEST:
+        close_old_connections()
+    return TaskRun.objects.filter(id=run_id, task_id=task_id, team_id=team_id).values_list("state", flat=True).first()
+
+
+async def _task_run_state(run_id: str, task_id: str, team_id: int) -> dict | None:
+    """Existence check on a sync_to_async thread whose pooled connection Django never
+    health-checks. `close_old_connections()` clears a stale connection before the read; a
+    single retry recovers a transparent reconnect since this is a side-effect-free read.
+    An uncaught OperationalError here would otherwise crash the whole ingest request."""
+    run_check = sync_to_async(_task_run_state_sync, thread_sensitive=True)
+    try:
+        return await run_check(run_id, task_id, team_id)
+    except (OperationalError, InterfaceError):
+        logger.warning("task_run_event_ingest_exists_db_reconnect", run_id=run_id, exc_info=True)
+        return await run_check(run_id, task_id, team_id)
+
+
+def _get_bearer_token(scope: ASGIMessage) -> str | None:
+    authorization = _get_header(scope, b"authorization")
+    if authorization is None:
+        return None
+
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return None
+    token = authorization[len(prefix) :].strip()
+    return token or None
+
+
+def _match_event_ingest_route(path: str) -> EventIngestRoute | None:
+    route_match = TASK_RUN_EVENT_INGEST_ROUTE.match(path)
+    if route_match is None:
+        return None
+    return EventIngestRoute(
+        project_id=route_match.group("project_id"),
+        task_id=route_match.group("task_id"),
+        run_id=route_match.group("run_id"),
+    )
+
+
+async def _authorize_event_ingest_request(
+    scope: ASGIMessage, route: EventIngestRoute
+) -> tuple[SandboxEventIngestTokenPayload, bool]:
+    token = _get_bearer_token(scope)
+    if token is None:
+        raise EventIngestHTTPError(401, {"error": "Missing authorization bearer token"})
+
+    try:
+        claims = await sync_to_async(validate_sandbox_event_ingest_token, thread_sensitive=False)(token)
+    except PyJWTError as error:
+        raise EventIngestHTTPError(
+            401,
+            {"error": "Invalid event ingest token", "code": error.__class__.__name__},
+        ) from error
+
+    if claims.task_id != route.task_id or claims.run_id != route.run_id:
+        raise EventIngestHTTPError(403, {"error": "Token does not match task run"})
+    if route.project_id != "@current" and (not route.project_id.isdigit() or int(route.project_id) != claims.team_id):
+        raise EventIngestHTTPError(403, {"error": "Token does not match project"})
+
+    state = await _task_run_state(claims.run_id, claims.task_id, claims.team_id)
+    if state is None:
+        raise EventIngestHTTPError(404, {"error": "Task run not found"})
+
+    return claims, run_uses_dedicated_stream(state)
+
+
+def _get_header(scope: ASGIMessage, header_name: bytes) -> str | None:
+    raw_headers = scope.get("headers", [])
+    headers = cast(list[tuple[bytes, bytes]], raw_headers)
+    for name, value in headers:
+        if name.lower() == header_name:
+            return value.decode("utf-8")
+    return None
+
+
+async def _send_json(send: ASGISend, status_code: int, payload: dict) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})

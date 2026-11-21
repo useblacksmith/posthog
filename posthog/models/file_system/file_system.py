@@ -1,0 +1,169 @@
+from collections.abc import Sequence
+from datetime import datetime
+from typing import Optional
+
+from django.contrib.postgres.indexes import GinIndex, OpClass
+from django.db import models
+from django.db.models import Func, Q, TextField, Value
+from django.db.models.expressions import F
+from django.db.models.functions import Concat, Lower
+from django.utils import timezone
+
+from posthog.models.file_system.constants import DEFAULT_SURFACE, surface_q
+from posthog.models.file_system.file_system_shortcut import FileSystemShortcut
+from posthog.models.file_system.refs import file_refs_q
+from posthog.models.team import Team
+from posthog.models.user import User
+from posthog.models.utils import uuid7
+
+SEARCH_TEXT = Lower(Concat(F("path"), Value(" "), F("type"), output_field=TextField()))
+SEARCH_NAME = Lower(
+    Func(F("path"), Value(r"^((?:[^\\/]|\\.)*/)*"), Value(""), function="regexp_replace", output_field=TextField())
+)
+
+
+class FileSystem(models.Model):
+    """
+    A model representing a "file" (or folder) in our hierarchical system.
+    """
+
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+    id = models.UUIDField(primary_key=True, default=uuid7)
+    path = models.TextField()
+    depth = models.IntegerField(null=True, blank=True)
+    type = models.CharField(max_length=100, blank=True)
+    ref = models.CharField(max_length=100, null=True, blank=True)
+    href = models.TextField(null=True, blank=True)
+    shortcut = models.BooleanField(null=True, blank=True)
+    meta = models.JSONField(default=dict, null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    # Product surface this row belongs to (e.g. "web", "desktop"). NULL == DEFAULT_SURFACE.
+    surface = models.CharField(max_length=100, null=True, blank=True)
+
+    # DEPRECATED/UNUSED. It's all based on just the team_id.
+    project = models.ForeignKey("Project", on_delete=models.CASCADE, null=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["team"]),
+            models.Index(F("team_id"), F("surface"), F("path"), name="posthog_fs_team_s_path"),
+            models.Index(F("team_id"), F("surface"), F("depth"), name="posthog_fs_team_s_depth"),
+            models.Index(F("team_id"), F("surface"), F("type"), F("ref"), name="posthog_fs_team_s_typeref"),
+            GinIndex(F("team_id"), OpClass(SEARCH_TEXT, name="gin_trgm_ops"), name="posthog_fs_team_text_trgm"),
+            GinIndex(F("team_id"), OpClass(SEARCH_NAME, name="gin_trgm_ops"), name="posthog_fs_team_name_trgm"),
+        ]
+
+    def __str__(self):
+        return self.path
+
+
+def create_or_update_file(
+    *,
+    team: Team,
+    base_folder: str,
+    name: str,
+    file_type: str,
+    ref: str,
+    href: str,
+    meta: dict,
+    created_at: Optional[datetime] = None,
+    created_by_id: Optional[int] = None,
+    surface: str = DEFAULT_SURFACE,
+):
+    has_existing = False
+    all_existing = (
+        FileSystem.objects.filter(surface_q(surface), file_refs_q(file_type, [ref]), team=team, type=file_type)
+        .filter(~Q(shortcut=True))
+        .order_by("id")
+    )
+    for existing in all_existing:
+        has_existing = True
+        segments = split_path(existing.path)
+        segments[-1] = name
+        new_path = join_path(segments)
+        existing.path = new_path
+        existing.depth = len(segments)
+        existing.href = href
+        existing.meta = meta
+        if created_at:
+            existing.created_at = created_at
+        if created_by_id and existing.created_by_id != created_by_id:
+            existing.created_by_id = created_by_id
+        existing.save()
+
+    if has_existing:
+        path = escape_path(name)
+        shortcuts = (
+            FileSystemShortcut.objects.filter(
+                surface_q(surface), file_refs_q(file_type, [ref]), team=team, type=file_type
+            )
+            .filter(~(Q(path=path) & Q(href=href)))
+            .all()
+        )
+        for shortcut in shortcuts:
+            shortcut.path = path
+            shortcut.href = href
+            shortcut.save()
+    else:
+        full_path = f"{base_folder}/{escape_path(name)}"
+        FileSystem.objects.create(
+            team=team,
+            path=full_path,
+            depth=len(split_path(full_path)),
+            type=file_type,
+            ref=ref,
+            href=href,
+            meta=meta,
+            shortcut=False,
+            surface=surface,
+            created_by_id=created_by_id,
+            created_at=created_at or timezone.now(),
+        )
+
+
+def delete_file(*, team: Team, file_type: str, ref: str, surface: str = DEFAULT_SURFACE):
+    delete_files(team=team, file_type=file_type, refs=[ref], surface=surface)
+
+
+def delete_files(*, team: Team, file_type: str, refs: Sequence[str], surface: str = DEFAULT_SURFACE) -> None:
+    same_objects = file_refs_q(file_type, refs)
+    count, _ = FileSystem.objects.filter(surface_q(surface), same_objects, team=team, type=file_type).delete()
+    if count > 0:
+        FileSystemShortcut.objects.filter(surface_q(surface), same_objects, team=team, type=file_type).delete()
+
+
+def split_path(path: str) -> list[str]:
+    segments = []
+    current = ""
+    i = 0
+    while i < len(path):
+        # If we encounter a backslash, and the next char is either / or \
+        if path[i] == "\\" and i < len(path) - 1 and path[i + 1] in ["/", "\\"]:
+            current += path[i + 1]
+            i += 2
+            continue
+        elif path[i] == "/":
+            segments.append(current)
+            current = ""
+        else:
+            current += path[i]
+        i += 1
+
+    # Push any remaining part of the path into segments
+    segments.append(current)
+
+    # Filter out empty segments
+    return [s for s in segments if s != ""]
+
+
+def escape_path(path: str) -> str:
+    # Replace backslash with double-backslash, and forward slash with backslash-slash
+    path = path.replace("\\", "\\\\")
+    path = path.replace("/", "\\/")
+    return path
+
+
+def join_path(paths: list[str]) -> str:
+    # Join all segments using '/', while escaping each segment
+    return "/".join(escape_path(segment) for segment in paths)

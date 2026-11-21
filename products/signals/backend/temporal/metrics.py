@@ -1,0 +1,262 @@
+"""Business-level counters for signals pipeline incident alerts.
+
+Pipeline counters go to the Temporal metric meter, so they only record inside a workflow or an
+activity. The scout coordinator counters keep a Prometheus instrument for Grafana and push the
+same name through the PostHog SDK metrics client, which puts fleet dispatch health in the
+PostHog Metrics product, where it can be alerted on directly rather than inferred from
+downstream tool-call volume.
+"""
+
+import posthoganalytics
+from prometheus_client import Counter
+from temporalio import activity, workflow
+
+from posthog.temporal.common.metrics import get_metric_meter
+
+COORDINATOR_DISPATCH_STARTED = "started"
+COORDINATOR_DISPATCH_DEDUPED = "deduped"
+
+SCOUT_COORDINATOR_TICKS_METRIC = "signals_scout_coordinator_ticks_total"
+SCOUT_COORDINATOR_PLANNED_METRIC = "signals_scout_coordinator_planned_total"
+SCOUT_COORDINATOR_DISPATCHED_METRIC = "signals_scout_coordinator_dispatched_total"
+
+SCOUT_COORDINATOR_TICKS = Counter(
+    SCOUT_COORDINATOR_TICKS_METRIC,
+    "Signals scout coordinator ticks that finished planning",
+)
+
+SCOUT_COORDINATOR_PLANNED = Counter(
+    SCOUT_COORDINATOR_PLANNED_METRIC,
+    "Scout runs the coordinator planned to dispatch",
+)
+
+SCOUT_COORDINATOR_DISPATCHED = Counter(
+    SCOUT_COORDINATOR_DISPATCHED_METRIC,
+    "Scout child workflows the coordinator dispatched, by outcome",
+    ["outcome"],
+)
+
+SCOUT_REPORT_SAFETY_REFUSALS_METRIC = "signals_scout_report_safety_refusals_total"
+
+SCOUT_REPORT_SAFETY_REFUSALS = Counter(
+    SCOUT_REPORT_SAFETY_REFUSALS_METRIC,
+    "Scout report safety judge calls the model refused, by report path",
+    ["path"],
+)
+
+FUNNEL_STAGE_EMITTED = "emitted"
+FUNNEL_STAGE_GROUPED = "grouped"
+FUNNEL_STAGE_PROMOTED = "promoted"
+
+LLM_STATUS_OK = "ok"
+LLM_STATUS_ERROR = "error"
+
+
+def _in_temporal_context() -> bool:
+    return activity.in_activity() or workflow.in_workflow()
+
+
+def increment_funnel(stage: str, source_product: str = "unknown", count: int = 1) -> None:
+    """Count signals reaching a pipeline funnel stage. No-ops outside a Temporal context."""
+    if not _in_temporal_context() or count <= 0:
+        return
+    get_metric_meter({"stage": stage, "source_product": source_product}).create_counter(
+        "signals_funnel_total",
+        "Signals reaching each pipeline funnel stage",
+    ).add(count)
+
+
+def increment_safety_blocked(source_product: str = "unknown") -> None:
+    """Count a signal rejected by the safety filter — a legitimate terminal exit, not a drop."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"source_product": source_product}).create_counter(
+        "signals_safety_blocked_total",
+        "Signals rejected by the safety filter",
+    ).add(1)
+
+
+def increment_safety_cache_lookup(result: str) -> None:
+    """Count safety verdict cache lookups by hit, miss, or error."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"result": result}).create_counter(
+        "signals_safety_cache_lookups_total",
+        "Safety verdict cache lookups by result",
+    ).add(1)
+
+
+def increment_safety_cache_write_error() -> None:
+    """Count failed safety verdict cache writes."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter().create_counter(
+        "signals_safety_cache_write_errors_total",
+        "Failed safety verdict cache writes",
+    ).add(1)
+
+
+def increment_dropped(stage: str, reason: str, count: int = 1) -> None:
+    """Count signals lost to an error, attributed to a stage and reason."""
+    if not _in_temporal_context() or count <= 0:
+        return
+    get_metric_meter({"stage": stage, "reason": reason}).create_counter(
+        "signals_dropped_total",
+        "Signals dropped from the pipeline by stage and reason",
+    ).add(count)
+
+
+def increment_report_completed(result: str, failure_reason: str | None = None, error_type: str | None = None) -> None:
+    """Count report completions by result (ready/failed/not_actionable/pending_input)."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter(
+        {"result": result, "failure_reason": failure_reason or "", "error_type": error_type or ""}
+    ).create_counter(
+        "signals_reports_total",
+        "Signal reports completed by result",
+    ).add(1)
+
+
+def increment_llm_call(stage: str, status: str) -> None:
+    """Count an LLM call on the grouping/summary hot path by stage and outcome."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"stage": stage, "status": status}).create_counter(
+        "signals_llm_calls_total",
+        "LLM calls by stage and outcome",
+    ).add(1)
+
+
+def increment_ch_wait_timeout() -> None:
+    """Count a give-up of the wait-for-signal-in-ClickHouse consistency wait."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter().create_counter(
+        "signals_ch_wait_timeouts_total",
+        "Times the wait-for-signal-in-ClickHouse activity gave up after its max wait",
+    ).add(1)
+
+
+def increment_recently_seen_lookup(result: str) -> None:
+    """Count recently-seen cache lookups by result."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"result": result}).create_counter(
+        "signals_recently_seen_lookups_total",
+        "Recently-seen cache lookups by result",
+    ).add(1)
+
+
+def increment_ch_wait_query(mode: str, reason: str) -> None:
+    """Count ClickHouse confirmation queries by wait mode and reason."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"mode": mode, "reason": reason}).create_counter(
+        "signals_ch_wait_queries_total",
+        "ClickHouse confirmation queries issued by signals waits",
+    ).add(1)
+
+
+def increment_ch_wait_completion(mode: str, result: str) -> None:
+    """Count wait completions by mode and completion path."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"mode": mode, "result": result}).create_counter(
+        "signals_ch_wait_completions_total",
+        "Signals consistency waits by completion result",
+    ).add(1)
+
+
+def increment_research_run_collapsed() -> None:
+    """Count a promotion that folded into an already-running research workflow instead of its own run.
+
+    This is the research-debounce savings metric: with the debounce off it counts the rare race where
+    a signal lands mid-run, and with it on it counts every signal that a waiting run absorbed.
+    """
+    if not _in_temporal_context():
+        return
+    get_metric_meter().create_counter(
+        "signals_research_runs_collapsed_total",
+        "Report promotions absorbed by an already-running research workflow",
+    ).add(1)
+
+
+def increment_report_fetch_recovered(attempt: int) -> None:
+    """Count a research run whose signals only became readable in ClickHouse on a retried fetch."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"attempt": str(attempt)}).create_counter(
+        "signals_report_fetch_recovered_total",
+        "Report signal fetches that succeeded only after retrying an empty read",
+    ).add(1)
+
+
+def increment_report_run_deferred(reason: str) -> None:
+    """Count a research run that exited without researching or failing, leaving the report to re-promote."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"reason": reason}).create_counter(
+        "signals_report_runs_deferred_total",
+        "Report research runs deferred to a later promotion by reason",
+    ).add(1)
+
+
+def increment_scout_run(status: str) -> None:
+    """Count a scout run by terminal status."""
+    if not _in_temporal_context():
+        return
+    get_metric_meter({"status": status}).create_counter(
+        "signals_scout_runs_total",
+        "Signals scout runs by terminal status",
+    ).add(1)
+
+
+def _push_posthog_metric(name: str, value: float, attributes: dict[str, str]) -> None:
+    """Push one counter into the PostHog Metrics product.
+
+    The SDK client is the only sink that carries a counter out of a Temporal worker into the
+    Metrics product: the worker exports no `prometheus_client` series there, and it has no OTLP
+    push configured. Failures are swallowed, because callers run on paths that a telemetry error
+    must not fail, such as the coordinator planning activity and the scout report safety judge.
+    """
+    try:
+        posthoganalytics.setup().metrics.count(name, value, attributes=attributes)
+    except Exception:
+        pass
+
+
+def increment_coordinator_tick(planned_count: int) -> None:
+    """Count a coordinator tick that finished planning, and the scout runs it planned.
+
+    The tick counter carries the stall signal on its own: a schedule that stopped firing and a
+    fleet with no work due both leave the planned and dispatched counters flat, and only this one
+    tells them apart.
+    """
+    SCOUT_COORDINATOR_TICKS.inc()
+    _push_posthog_metric(SCOUT_COORDINATOR_TICKS_METRIC, 1, {})
+    # Zero is the reading that matters, so the series is kept alive rather than guarded away.
+    SCOUT_COORDINATOR_PLANNED.inc(planned_count)
+    _push_posthog_metric(SCOUT_COORDINATOR_PLANNED_METRIC, planned_count, {})
+    # A labeled counter has no child series until code calls .labels(), and the dispatch counter is
+    # only touched after a dispatch. So warm both outcomes to zero every tick. A stall is a run of
+    # zero-plan ticks that never dispatch, which is exactly when the dispatch series would otherwise
+    # be absent, so a zero-rate alert on it would read "no data" instead of zero and stay silent.
+    for outcome in (COORDINATOR_DISPATCH_STARTED, COORDINATOR_DISPATCH_DEDUPED):
+        increment_coordinator_dispatch(outcome, 0)
+
+
+def increment_coordinator_dispatch(outcome: str, count: int) -> None:
+    """Count scout child workflows the coordinator dispatched, by outcome."""
+    SCOUT_COORDINATOR_DISPATCHED.labels(outcome=outcome).inc(count)
+    _push_posthog_metric(SCOUT_COORDINATOR_DISPATCHED_METRIC, count, {"outcome": outcome})
+
+
+def increment_scout_report_safety_refusal(path: str) -> None:
+    """Count a scout report safety judge call that the model refused, by report path (emit or edit).
+
+    The judge fails closed on a refusal, so no exception records it. This counter is the only signal.
+    It works outside Temporal because the scout report API calls the judge from a web request.
+    """
+    SCOUT_REPORT_SAFETY_REFUSALS.labels(path=path).inc()
+    _push_posthog_metric(SCOUT_REPORT_SAFETY_REFUSALS_METRIC, 1, {"path": path})

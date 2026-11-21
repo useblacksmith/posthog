@@ -1,0 +1,194 @@
+import { Runtime } from '@temporalio/worker'
+import { NativeConnection, Worker } from '@temporalio/worker'
+import * as fs from 'fs/promises'
+import * as http from 'http'
+import * as prometheus from 'prom-client'
+import express from 'ultimate-express'
+
+import { EncryptionCodec } from '~/common/temporal/codec'
+import { BrowserPool } from '~/session-replay/recording-rasterizer/capture/browser-pool'
+import { playerHtmlCache } from '~/session-replay/recording-rasterizer/capture/capture-page'
+import { config } from '~/session-replay/recording-rasterizer/config'
+import { createLogger } from '~/session-replay/recording-rasterizer/logger'
+import { RasterizationMetrics } from '~/session-replay/recording-rasterizer/metrics'
+import { initMetrics, shutdownMetrics } from '~/session-replay/recording-rasterizer/otel-metrics'
+
+import { createActivities } from './activities'
+import { installUnhandledRejectionGuard } from './install-unhandled-rejection-guard'
+
+prometheus.collectDefaultMetrics()
+RasterizationMetrics.initialize()
+// OTLP push into the PostHog Metrics product; no-op unless OTEL_METRICS_EXPORT_URL/TOKEN are set.
+initMetrics()
+
+const log = createLogger()
+
+installUnhandledRejectionGuard(log, () => RasterizationMetrics.incrementUnhandledRejection())
+
+// Route Temporal SDK logs through our JSON logger so all output is structured.
+Runtime.install({
+    logger: {
+        log: (level, message, meta) => {
+            const { sdkComponent, taskQueue, ...rest } = meta ?? {}
+            const fields = { ...rest, sdk_component: sdkComponent, task_queue: taskQueue }
+            switch (level) {
+                case 'TRACE':
+                case 'DEBUG':
+                    log.debug(fields, message)
+                    break
+                case 'INFO':
+                    log.info(fields, message)
+                    break
+                case 'WARN':
+                    log.warn(fields, message)
+                    break
+                case 'ERROR':
+                    log.error(fields, message)
+                    break
+            }
+        },
+        trace: (message, meta) => log.debug(meta ?? {}, message),
+        debug: (message, meta) => log.debug(meta ?? {}, message),
+        info: (message, meta) => log.info(meta ?? {}, message),
+        warn: (message, meta) => log.warn(meta ?? {}, message),
+        error: (message, meta) => log.error(meta ?? {}, message),
+    },
+})
+
+async function buildTLSConfig() {
+    const { temporalClientRootCA, temporalClientCert, temporalClientKey } = config
+
+    if (!temporalClientRootCA && !temporalClientCert && !temporalClientKey) {
+        return undefined
+    }
+    if (!temporalClientRootCA || !temporalClientCert || !temporalClientKey) {
+        throw new Error(
+            'Partial TLS configuration: all three of TEMPORAL_CLIENT_ROOT_CA, TEMPORAL_CLIENT_CERT, and TEMPORAL_CLIENT_KEY must be set'
+        )
+    }
+
+    let systemCAs: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+    try {
+        systemCAs = await fs.readFile('/etc/ssl/certs/ca-certificates.crt')
+    } catch {
+        // System CA bundle not found, using only provided root CA
+    }
+
+    const combinedCA = Buffer.concat([systemCAs, Buffer.from(temporalClientRootCA)])
+
+    return {
+        serverRootCACertificate: combinedCA,
+        clientCertPair: {
+            crt: Buffer.from(temporalClientCert),
+            key: Buffer.from(temporalClientKey),
+        },
+    }
+}
+
+function buildPayloadCodec(): EncryptionCodec {
+    if (!config.secretKey) {
+        throw new Error(
+            'TEMPORAL_SECRET_KEY must be set: every activity input is encrypted, so a worker without the key fails every render'
+        )
+    }
+    return new EncryptionCodec(config.secretKey, config.fallbackKeys)
+}
+
+function startMetricsServer(): http.Server {
+    let ready = false
+
+    const app = express()
+    app.get(['/_health'], (_, res) => res.status(200).send('ok'))
+    app.get(['/_ready'], (_, res) => res.status(ready ? 200 : 503).send(ready ? 'ok' : 'not ready'))
+    app.get('/_metrics', async (_, res) => {
+        try {
+            res.set('Content-Type', prometheus.register.contentType)
+            res.end(await prometheus.register.metrics())
+        } catch {
+            res.status(500).end()
+        }
+    })
+
+    const server = app.listen(config.metricsPort, () => {
+        log.info({ port: config.metricsPort }, 'metrics server started')
+    })
+
+    return Object.assign(server, {
+        setReady: (value: boolean) => {
+            ready = value
+        },
+    })
+}
+
+async function main(): Promise<void> {
+    const payloadCodec = buildPayloadCodec()
+    const metricsServer = startMetricsServer() as http.Server & { setReady: (value: boolean) => void }
+
+    const address = `${config.temporalHost}:${config.temporalPort}`
+    const tls = await buildTLSConfig()
+
+    const connection = await NativeConnection.connect({ address, tls })
+    log.info({ address }, 'connected to temporal')
+
+    const pool = new BrowserPool()
+    await pool.launch()
+
+    log.info('browser pool launched')
+
+    const playerHtml = await playerHtmlCache.load()
+    log.info({ path: config.playerHtmlPath }, 'player html loaded')
+
+    const worker = await Worker.create({
+        connection,
+        namespace: config.temporalNamespace,
+        taskQueue: config.taskQueue,
+        activities: createActivities(pool, playerHtml),
+        // A render's memory grows for minutes after pickup, so a fixed slot count keeps taking work on a
+        // pod that is already near its limit. The tuner stops taking work above these targets, and the
+        // ramp throttle gives each new render time to show its memory before the next slot opens.
+        tuner: {
+            tunerOptions: {
+                targetMemoryUsage: config.tunerTargetMemoryUsage,
+                targetCpuUsage: config.tunerTargetCpuUsage,
+            },
+            activityTaskSlotOptions: {
+                minimumSlots: 1,
+                maximumSlots: config.maxConcurrentActivities,
+                rampThrottle: config.tunerRampThrottleMs,
+            },
+        },
+        dataConverter: { payloadCodecs: [payloadCodec] },
+        // Throttle heartbeat *server flushes* (not heartbeat() calls) to 10s. Each flush is a billed
+        // Temporal action, and frame progress is only a UI hint. Without this override the SDK throttles
+        // to 80% of the 30s heartbeat_timeout (24s), so short recordings would show no frame progress.
+        defaultHeartbeatThrottleInterval: '10s',
+        maxHeartbeatThrottleInterval: '10s',
+        // Let in-flight renders finish after shutdown() instead of cancelling them right away (SDK default 0).
+        shutdownGraceTime: config.shutdownGraceTimeMs,
+    })
+
+    metricsServer.setReady(true)
+
+    const shutdown = () => {
+        log.info('shutting down')
+        // Flip readiness first so the pod drops out of rotation while activities drain.
+        metricsServer.setReady(false)
+        worker.shutdown()
+    }
+
+    process.on('SIGTERM', shutdown)
+    process.on('SIGINT', shutdown)
+
+    log.info({ task_queue: config.taskQueue }, 'worker started')
+    await worker.run()
+
+    // run() resolves after shutdown drains all in-flight activities
+    await pool.shutdown()
+    await shutdownMetrics()
+    metricsServer.close()
+}
+
+main().catch((err) => {
+    log.error({ error: err instanceof Error ? err.message : String(err) }, 'worker failed to start')
+    process.exit(1)
+})

@@ -1,0 +1,598 @@
+import re
+from pathlib import Path
+
+from django.test import SimpleTestCase
+
+from parameterized import parameterized
+
+from posthog.scopes.catalog import API_SCOPE_ACTIONS, API_SCOPE_OBJECTS, translate_renamed_scopes
+from posthog.scopes.ceilings import (
+    MIN_SCOPES_BEFORE_TRUNCATION,
+    clamp_scopes_to_ceiling,
+    effective_ceiling,
+    filter_self_registered_ceiling,
+    filter_to_unprivileged_scopes,
+    grantable_ceiling,
+    is_truncated_scope_request,
+    narrow_scopes_to_ceiling,
+    resolve_ceiling,
+    scopes_outside_ceiling,
+    scopes_within_ceiling,
+)
+from posthog.scopes.checks import downgrade_scopes_to_read_only
+from posthog.scopes.exposure import (
+    ALL_SCOPES,
+    INTERNAL_API_SCOPE_OBJECTS,
+    OAUTH_HIDDEN_SCOPE_OBJECTS,
+    OAUTH_SCOPES_HIDDEN,
+    PRIVILEGED_SCOPES,
+    RISKY_SCOPE_WARNINGS,
+    UNPRIVILEGED_SCOPES,
+    get_scope_descriptions,
+)
+from posthog.scopes.oauth import ALWAYS_ALLOWED_SCOPES, OAUTH_SCOPES_SUPPORTED
+from posthog.scopes.project_secret_api_key import PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION
+from posthog.scopes_projection import load_scopes_without_django
+
+
+class TestDowngradeScopesToReadOnly(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("empty_string", "", ""),
+            ("single_read_passthrough", "feature_flag:read", "feature_flag:read"),
+            ("single_write_downgraded", "feature_flag:write", "feature_flag:read"),
+            ("oidc_passthrough", "openid profile email", "openid profile email"),
+            (
+                "mixed_read_write_dedupe",
+                "feature_flag:read feature_flag:write organization:write",
+                "feature_flag:read organization:read",
+            ),
+            (
+                "order_preserved_first_seen",
+                "organization:write feature_flag:write",
+                "organization:read feature_flag:read",
+            ),
+        ]
+    )
+    def test_basic_cases(self, _name: str, given: str, expected: str) -> None:
+        self.assertEqual(downgrade_scopes_to_read_only(given), expected)
+
+    def test_wildcard_expands_to_all_public_read_scopes(self) -> None:
+        result = downgrade_scopes_to_read_only("*").split()
+        expected = [
+            f"{obj}:read"
+            for obj in API_SCOPE_OBJECTS
+            if obj not in INTERNAL_API_SCOPE_OBJECTS and obj not in OAUTH_HIDDEN_SCOPE_OBJECTS
+        ]
+        self.assertEqual(result, expected)
+        # Sanity: no write scope, no internal scope, no hidden scope leaked through.
+        for scope in result:
+            self.assertFalse(scope.endswith(":write"), f"{scope} should have been read-only")
+        for internal in INTERNAL_API_SCOPE_OBJECTS:
+            self.assertNotIn(f"{internal}:read", result)
+        for hidden in OAUTH_HIDDEN_SCOPE_OBJECTS:
+            self.assertNotIn(f"{hidden}:read", result)
+
+    def test_wildcard_combined_with_other_scopes_dedupes(self) -> None:
+        # `*` already covers feature_flag:read — passing both must not duplicate the entry.
+        result = downgrade_scopes_to_read_only("feature_flag:write * openid").split()
+        self.assertEqual(result.count("feature_flag:read"), 1)
+        self.assertIn("openid", result)
+
+
+# sorted: parameterized bakes the iteration order into the test ids, and a frozenset
+# iterates in hash order, which differs per process.
+INTERNAL_SCOPE_CASES = [
+    (f"{obj}:{action}",) for obj in sorted(INTERNAL_API_SCOPE_OBJECTS) for action in API_SCOPE_ACTIONS
+]
+
+
+class TestScopeSets(SimpleTestCase):
+    def test_all_scopes_matches_scope_descriptions_keys(self) -> None:
+        self.assertEqual(ALL_SCOPES, frozenset(get_scope_descriptions().keys()))
+
+    @parameterized.expand(INTERNAL_SCOPE_CASES)
+    def test_all_scopes_excludes_internal_scope(self, scope: str) -> None:
+        self.assertNotIn(scope, ALL_SCOPES)
+
+    def test_privileged_scopes_subset_of_all_scopes(self) -> None:
+        self.assertTrue(PRIVILEGED_SCOPES.issubset(ALL_SCOPES))
+        self.assertIn("llm_gateway:read", PRIVILEGED_SCOPES)
+
+    def test_unprivileged_scopes_excludes_privileged_and_hidden(self) -> None:
+        self.assertTrue(UNPRIVILEGED_SCOPES.isdisjoint(PRIVILEGED_SCOPES))
+        self.assertTrue(UNPRIVILEGED_SCOPES.isdisjoint(OAUTH_SCOPES_HIDDEN))
+
+    @parameterized.expand([("openid",), ("profile",), ("email",)])
+    def test_unprivileged_scopes_excludes_oidc(self, oidc: str) -> None:
+        # OIDC scopes are accepted at /authorize independently of application.scopes;
+        # they are not part of the UNPRIVILEGED broad-default set.
+        self.assertNotIn(oidc, UNPRIVILEGED_SCOPES)
+
+    @parameterized.expand(INTERNAL_SCOPE_CASES)
+    def test_unprivileged_scopes_excludes_internal_scope(self, scope: str) -> None:
+        self.assertNotIn(scope, UNPRIVILEGED_SCOPES)
+
+    @parameterized.expand(
+        [("insight:read",), ("dashboard:write",), ("query:read",), ("customer_task:read",), ("customer_task:write",)]
+    )
+    def test_unprivileged_scopes_covers_known_public_scope(self, scope: str) -> None:
+        # Spot-check: a generic OAuth client should be able to request these.
+        self.assertIn(scope, UNPRIVILEGED_SCOPES)
+
+    def test_scopes_package_loads_by_path_like_the_projection(self) -> None:
+        # posthog/scopes_projection.py loads the package by file path to skip posthog/__init__.py,
+        # so an absolute import inside posthog/scopes/ breaks the build even though tests pass.
+        modules = load_scopes_without_django()
+
+        self.assertTrue(modules["exposure"].UNPRIVILEGED_SCOPES)
+        self.assertIn("llm_gateway:read", modules["exposure"].PRIVILEGED_SCOPES)
+
+    def test_oauth_scopes_supported_excludes_privileged_and_hidden(self) -> None:
+        # Discovery metadata (/.well-known/oauth-authorization-server) must not
+        # advertise privileged scopes (llm_gateway:*, admin-granted only) or
+        # OAUTH_HIDDEN scopes — an OAuth client can't obtain them self-serve.
+        supported = set(OAUTH_SCOPES_SUPPORTED)
+        self.assertTrue(supported.isdisjoint(PRIVILEGED_SCOPES))
+        self.assertTrue(supported.isdisjoint(OAUTH_SCOPES_HIDDEN))
+        self.assertNotIn("llm_gateway:read", supported)
+        self.assertNotIn("llm_gateway:write", supported)
+
+    def test_oauth_scopes_supported_includes_always_allowed_and_unprivileged(self) -> None:
+        supported = set(OAUTH_SCOPES_SUPPORTED)
+        self.assertEqual(supported - ALWAYS_ALLOWED_SCOPES, UNPRIVILEGED_SCOPES)
+
+    def test_project_secret_api_keys_exclude_user_bound_customer_task_scopes(self) -> None:
+        # Customer task endpoints need a user for RBAC and activity attribution.
+        self.assertNotIn(("customer_task", "read"), PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION)
+        self.assertNotIn(("customer_task", "write"), PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION)
+
+    def test_all_scope_objects_fit_in_oauthapplication_scopes_charfield(self) -> None:
+        # OAuthApplication.scopes is ArrayField(CharField(max_length=100)), matching
+        # PersonalAPIKey.scopes. Verify every `obj:action` string fits so admin-set
+        # ceilings don't truncate.
+        for scope in ALL_SCOPES:
+            self.assertLessEqual(len(scope), 100, f"{scope} exceeds OAuthApplication.scopes CharField max_length=100")
+
+
+class TestOAuthScopesSupported(SimpleTestCase):
+    def test_signal_scout_internal_write_is_not_advertised(self) -> None:
+        # Security invariant — the scout sandbox token carries `signal_scout_internal:write`
+        # but is minted by direct DB insert (posthog/temporal/oauth.py), never via /authorize.
+        # Advertising it in OAuth metadata would let any OAuth client request it via user
+        # consent, a durable prompt-injection vector (scratchpad rows are read verbatim into
+        # every subsequent run's prompt). It must NOT appear in the advertised scope set.
+        assert "signal_scout_internal:write" not in OAUTH_SCOPES_SUPPORTED
+        assert "signal_scout_internal:read" not in OAUTH_SCOPES_SUPPORTED
+
+    def test_internal_scopes_are_not_advertised(self) -> None:
+        advertised = set(OAUTH_SCOPES_SUPPORTED)
+        for obj in INTERNAL_API_SCOPE_OBJECTS:
+            for action in ("read", "write"):
+                assert f"{obj}:{action}" not in advertised, (
+                    f"{obj}:{action} is in INTERNAL_API_SCOPE_OBJECTS but is being advertised in "
+                    "OAuth metadata — internal scopes must never be advertised or user-grantable."
+                )
+
+    def test_always_allowed_scopes_are_advertised(self) -> None:
+        # Every ALWAYS_ALLOWED_SCOPES member is granted on every token, so discovery
+        # metadata that omits one under-reports what the token carries. Clients such as
+        # ChatGPT compare the scopes they asked for against `scopes_supported` and warn
+        # the user that consent was only partly granted.
+        advertised = set(OAUTH_SCOPES_SUPPORTED)
+        for scope in ALWAYS_ALLOWED_SCOPES:
+            assert scope in advertised, (
+                f"{scope} is granted on every token via ALWAYS_ALLOWED_SCOPES but is missing from "
+                "`scopes_supported` in OAuth discovery metadata."
+            )
+
+
+class TestGetScopeDescriptions(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("signal_scout_internal:read",),
+            ("signal_scout_internal:write",),
+        ]
+    )
+    def test_signal_scout_internal_scopes_are_not_pak_descriptions(self, scope: str) -> None:
+        # Critical security invariant — PAK validation reads from `get_scope_descriptions()`
+        # and must reject `signal_scout_internal` (it's a prompt-injection vector if
+        # user-grantable: scratchpad rows are read verbatim into every subsequent scout
+        # run's prompt).
+        assert scope not in get_scope_descriptions()
+
+    def test_all_non_internal_objects_get_pak_descriptions(self) -> None:
+        descriptions = get_scope_descriptions()
+        for obj in API_SCOPE_OBJECTS:
+            if obj in INTERNAL_API_SCOPE_OBJECTS:
+                continue
+            for action in ("read", "write"):
+                assert f"{obj}:{action}" in descriptions
+
+
+class TestScopesWithinCeiling(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("subset_of_explicit_ceiling", ["query:read"], ["query:read", "insight:read"], True),
+            ("outside_explicit_ceiling", ["insight:write"], ["query:read"], False),
+            ("empty_request_always_allowed", [], ["query:read"], True),
+            ("privileged_rejected_without_ceiling", ["llm_gateway:read"], [], False),
+            ("privileged_allowed_when_in_ceiling", ["llm_gateway:read"], ["llm_gateway:read"], True),
+            ("wildcard_rejected_under_explicit_ceiling", ["*"], ["query:read"], False),
+            # Provisioning never grandfathered `*`; an unseeded ceiling must not grant it.
+            ("wildcard_rejected_under_empty_ceiling", ["*"], [], False),
+            ("unprivileged_allowed_under_empty_ceiling", ["query:read", "insight:write"], [], True),
+            # `@default` sentinel: the unprivileged default plus the other listed scopes.
+            ("default_sentinel_grants_unprivileged", ["query:read", "insight:write"], ["@default"], True),
+            (
+                "default_sentinel_grants_listed_privileged_extra",
+                ["llm_gateway:read", "query:read"],
+                ["@default", "llm_gateway:read"],
+                True,
+            ),
+            (
+                "default_sentinel_rejects_unlisted_privileged",
+                ["llm_gateway:write"],
+                ["@default", "llm_gateway:read"],
+                False,
+            ),
+            ("wildcard_rejected_under_default_sentinel", ["*"], ["@default"], False),
+            ("sentinel_itself_not_grantable", ["@default"], ["@default"], False),
+            ("default_sentinel_tolerates_whitespace", ["query:read", "insight:write"], [" @default "], True),
+        ]
+    )
+    def test_resolution(self, _name: str, requested: list[str], app_scopes: list[str], expected: bool) -> None:
+        assert scopes_within_ceiling(requested, app_scopes) is expected
+
+    @parameterized.expand(
+        [
+            ("openid_and_introspection", ["openid", "introspection"], ["query:read"]),
+            ("email_under_empty_ceiling", ["email"], []),
+        ]
+    )
+    def test_oidc_and_introspection_always_allowed(
+        self, _name: str, requested: list[str], app_scopes: list[str]
+    ) -> None:
+        assert scopes_within_ceiling(requested, app_scopes) is True
+
+    @parameterized.expand(
+        [
+            ("write_entry_admits_its_read_half", ["insight:write"], ["insight:read"], ["insight:read"]),
+            ("read_entry_does_not_admit_write", ["insight:read"], ["insight:write"], []),
+            (
+                "read_only_downgrade_of_a_whole_write_ceiling",
+                ["insight:write", "experiment:write"],
+                ["insight:read", "experiment:read"],
+                ["experiment:read", "insight:read"],
+            ),
+        ]
+    )
+    def test_write_ceiling_entry_admits_read(
+        self, _name: str, app_scopes: list[str], requested: list[str], expected: list[str]
+    ) -> None:
+        assert clamp_scopes_to_ceiling(requested, app_scopes) == expected
+
+    def test_read_halves_do_not_reach_the_literal_ceiling(self) -> None:
+        # `create_wizard_oauth_access_token_for_user` and the provisioning account-request
+        # path mint `resolve_ceiling`/`effective_ceiling` verbatim as a token. Adding read
+        # halves there would hand out scope strings nobody asked for, so the expansion
+        # lives in `grantable_ceiling`, which only decides what a request may name.
+        assert resolve_ceiling(["insight:write"]) == frozenset({"insight:write"})
+        assert effective_ceiling(["insight:write"]) == frozenset({"insight:write"})
+        assert grantable_ceiling(["insight:write"]) == frozenset({"insight:write", "insight:read"})
+
+    @parameterized.expand(
+        [
+            # A token that HELD scopes now outside the ceiling: rejecting is right,
+            # because re-authorizing can still grant whatever is inside it.
+            ("held_scopes_now_outside_ceiling_rejects", ["experiment:write"], None),
+            # A token that never held any: rejecting would loop, since /authorize
+            # clamps and hands the same empty grant back on re-authorization.
+            ("never_held_any_scope_narrows_to_empty", [], []),
+        ]
+    )
+    def test_nothing_surviving_narrowing_depends_on_whether_there_was_anything(
+        self, _name: str, original: list[str], expected: list[str] | None
+    ) -> None:
+        assert narrow_scopes_to_ceiling(original, ["dashboard:read"]) == expected
+
+    def test_wildcard_under_empty_ceiling_gated_by_flag(self) -> None:
+        # The one resolution difference between callers: /authorize grandfathers `*`
+        # under an empty ceiling, provisioning (default) does not.
+        assert scopes_within_ceiling(["*"], [], allow_wildcard_under_empty_ceiling=True) is True
+        assert scopes_within_ceiling(["*"], [], allow_wildcard_under_empty_ceiling=False) is False
+
+    @parameterized.expand(
+        [
+            ("empty_falls_back_to_unprivileged", [], UNPRIVILEGED_SCOPES),
+            ("explicit_list_is_exhaustive", ["query:read", "insight:read"], frozenset({"query:read", "insight:read"})),
+            (
+                "default_sentinel_expands_to_unprivileged_plus_extras",
+                ["@default", "llm_gateway:read"],
+                UNPRIVILEGED_SCOPES | {"llm_gateway:read"},
+            ),
+            (
+                "sentinel_and_extras_tolerate_whitespace",
+                [" @default ", "llm_gateway:read "],
+                UNPRIVILEGED_SCOPES | {"llm_gateway:read"},
+            ),
+        ]
+    )
+    def test_effective_ceiling(self, _name: str, app_scopes: list[str], expected: frozenset[str]) -> None:
+        assert effective_ceiling(app_scopes) == expected
+
+
+class TestScopesOutsideCeiling(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("subset_within_ceiling_none_rejected", ["query:read"], ["query:read", "insight:read"], []),
+            ("isolates_offender_from_grantable", ["query:read", "insight:write"], ["query:read"], ["insight:write"]),
+            ("privileged_rejected_without_ceiling", ["llm_gateway:read"], [], ["llm_gateway:read"]),
+            ("wildcard_rejected_under_explicit_ceiling", ["query:read", "*"], ["query:read"], ["*"]),
+            ("oidc_never_rejected", ["openid", "insight:write"], ["query:read"], ["insight:write"]),
+            (
+                "default_sentinel_isolates_unlisted_privileged",
+                ["llm_gateway:write", "query:read"],
+                ["@default", "llm_gateway:read"],
+                ["llm_gateway:write"],
+            ),
+        ]
+    )
+    def test_resolution(self, _name: str, requested: list[str], app_scopes: list[str], expected: list[str]) -> None:
+        assert scopes_outside_ceiling(requested, app_scopes) == expected
+
+    def test_inverse_of_within_ceiling(self) -> None:
+        # The two helpers must never disagree: empty offender list iff within ceiling.
+        cases = [
+            (["query:read", "insight:write"], ["query:read"]),
+            (["query:read"], []),
+            (["*"], []),
+            (["llm_gateway:write", "query:read"], ["@default", "llm_gateway:read"]),
+        ]
+        for requested, app_scopes in cases:
+            within = scopes_within_ceiling(requested, app_scopes, allow_wildcard_under_empty_ceiling=True)
+            outside = scopes_outside_ceiling(requested, app_scopes, allow_wildcard_under_empty_ceiling=True)
+            assert within is (outside == [])
+
+
+class TestNarrowScopesToCeiling(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("empty_ceiling_is_noop", ["query:read", "insight:write"], [], ["query:read", "insight:write"]),
+            ("narrows_to_tightened_ceiling", ["query:read", "insight:write"], ["query:read"], ["query:read"]),
+            ("no_overlap_returns_none", ["insight:write"], ["query:read"], None),
+            ("read_half_of_a_write_ceiling_survives", ["insight:read"], ["insight:write"], ["insight:read"]),
+            ("wildcard_left_untouched", ["*"], ["query:read"], ["*"]),
+            (
+                "always_allowed_survive_narrowing",
+                ["openid", "query:read", "insight:write"],
+                ["query:read"],
+                ["openid", "query:read"],
+            ),
+            # OIDC alone keeps the token alive even when every resource scope falls
+            # outside the ceiling — mirrors OAuthValidator.get_original_scopes.
+            (
+                "only_always_allowed_survive_when_resource_scopes_drop",
+                ["openid", "insight:write"],
+                ["query:read"],
+                ["openid"],
+            ),
+            # `@default` ceiling narrows to the unprivileged default plus listed extras,
+            # dropping a hidden scope (`wizard_session:read`) the default doesn't cover.
+            (
+                "default_sentinel_keeps_unprivileged_and_extras",
+                ["query:read", "llm_gateway:read", "wizard_session:read"],
+                ["@default", "llm_gateway:read"],
+                ["llm_gateway:read", "query:read"],
+            ),
+            # A token stored before the code review rename refreshes under the new names.
+            (
+                "renamed_token_scope_meets_new_ceiling",
+                ["stamphog:read"],
+                ["code_review_approval:read"],
+                ["code_review_approval:read"],
+            ),
+            (
+                "token_holding_both_names_keeps_one",
+                ["stamphog:read", "code_review_approval:read"],
+                ["stamphog:read", "code_review_approval:read"],
+                ["code_review_approval:read"],
+            ),
+        ]
+    )
+    def test_resolution(self, _name: str, requested: list[str], app_scopes: list[str], expected: list[str]) -> None:
+        assert narrow_scopes_to_ceiling(requested, app_scopes) == expected
+
+
+class TestClampScopesToCeiling(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("subset_of_ceiling_passes_through", ["query:read"], ["query:read", "insight:read"], ["query:read"]),
+            # The regression this exists for: one ungrantable scope used to fail the whole
+            # authorization, so a client asking for a retired or hidden scope alongside valid
+            # ones could not connect at all.
+            (
+                "ungrantable_scope_dropped_not_rejected",
+                ["query:read", "insight:write"],
+                ["query:read"],
+                ["query:read"],
+            ),
+            ("retired_scope_dropped_under_empty_ceiling", ["query:read", "agents:read"], [], ["query:read"]),
+            ("hidden_scope_dropped_under_empty_ceiling", ["query:read", "wizard_session:read"], [], ["query:read"]),
+            ("privileged_scope_dropped_under_empty_ceiling", ["query:read", "llm_gateway:read"], [], ["query:read"]),
+            # An identity-only grant is a real outcome, not a rejection: /authorize never
+            # fails on scope grounds, so the client signs in and 403s on resource calls.
+            ("all_resource_scopes_ungrantable_grants_nothing", ["insight:write"], ["query:read"], []),
+            ("unknown_scope_alone_grants_nothing", ["agents:read"], [], []),
+            ("identity_only_request_is_not_a_rejection", ["openid", "email"], ["query:read"], ["email", "openid"]),
+            (
+                "always_allowed_survive_alongside_dropped_scopes",
+                ["openid", "query:read", "insight:write"],
+                ["query:read"],
+                ["openid", "query:read"],
+            ),
+            (
+                "wildcard_resolves_to_explicit_ceiling",
+                ["*"],
+                ["query:read", "insight:read"],
+                ["insight:read", "query:read"],
+            ),
+            (
+                "default_sentinel_keeps_unprivileged_and_listed_extra",
+                ["query:read", "llm_gateway:read", "llm_gateway:write"],
+                ["@default", "llm_gateway:read"],
+                ["llm_gateway:read", "query:read"],
+            ),
+        ]
+    )
+    def test_resolution(self, _name: str, requested: list[str], app_scopes: list[str], expected: list[str]) -> None:
+        assert clamp_scopes_to_ceiling(requested, app_scopes) == expected
+
+    def test_wildcard_under_empty_ceiling_gated_by_flag(self) -> None:
+        # Narrowing `*` under an empty ceiling would strip the legacy client's full access,
+        # so it is kept verbatim where the caller grandfathers it and dropped where it doesn't.
+        assert clamp_scopes_to_ceiling(["*"], [], allow_wildcard_under_empty_ceiling=True) == ["*"]
+        assert clamp_scopes_to_ceiling(["*"], [], allow_wildcard_under_empty_ceiling=False) == []
+
+    def test_never_grants_outside_the_ceiling(self) -> None:
+        # The ceiling stays the sole authority on what a token may hold: clamping may only
+        # ever shrink a request, so any result is a subset of what the old all-or-nothing
+        # check would have allowed through.
+        cases = [
+            (["query:read", "insight:write", "llm_gateway:read"], ["query:read", "insight:read"]),
+            (["*"], ["query:read"]),
+            (["query:read", "agents:read"], []),
+            (["query:read", "llm_gateway:write"], ["@default", "llm_gateway:read"]),
+        ]
+        for requested, app_scopes in cases:
+            clamped = clamp_scopes_to_ceiling(requested, app_scopes, allow_wildcard_under_empty_ceiling=True)
+            assert scopes_within_ceiling(clamped, app_scopes, allow_wildcard_under_empty_ceiling=True)
+
+
+class TestTranslateRenamedScopes(SimpleTestCase):
+    @parameterized.expand(
+        [
+            # Shipped desktop builds still request the old object names.
+            (
+                "renamed_objects_translate_to_new_names",
+                ["query:read", "review_hog:write", "stamphog:read"],
+                ["query:read", "code_review:write", "code_review_approval:read"],
+            ),
+            (
+                "both_names_collapse_to_one",
+                ["stamphog:read", "code_review_approval:read"],
+                ["code_review_approval:read"],
+            ),
+            ("bare_old_object_name_is_not_a_scope", ["stamphog", "*"], ["stamphog", "*"]),
+        ]
+    )
+    def test_translation(self, _name: str, given: list[str], expected: list[str]) -> None:
+        assert translate_renamed_scopes(given) == expected
+
+
+def _real_scopes(count: int) -> list[str]:
+    return sorted(ALL_SCOPES)[:count]
+
+
+LONG_HEAD = _real_scopes(MIN_SCOPES_BEFORE_TRUNCATION)
+
+
+class TestIsTruncatedScopeRequest(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("cut_mid_token", [*LONG_HEAD, "can"], True),
+            ("cut_after_the_colon", [*LONG_HEAD, "feature_flag:"], True),
+            ("complete_request", [*LONG_HEAD, "canvas:read"], False),
+            ("stale_scope", [*LONG_HEAD, "legacy_object:read"], False),
+            ("junk_tail_that_prefixes_nothing", [*LONG_HEAD, "zzz"], False),
+            ("fragment_in_the_middle", [*LONG_HEAD, "can", "canvas:read"], False),
+            ("stale_scope_before_the_fragment", ["legacy_object:read", *LONG_HEAD, "can"], False),
+            ("short_request_with_a_prefix_tail", ["openid", "insight"], False),
+            ("short_request_with_a_single_letter_tail", ["openid", "a"], False),
+            ("one_scope_short_of_the_bar", [*_real_scopes(MIN_SCOPES_BEFORE_TRUNCATION - 1), "can"], False),
+            ("fragment_alone", ["can"], False),
+            ("empty", [], False),
+        ]
+    )
+    def test_resolution(self, _name: str, requested: list[str], expected: bool) -> None:
+        assert is_truncated_scope_request(requested) is expected
+
+
+class TestFilterToUnprivilegedScopes(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("keeps_unprivileged", ["insight:read", "dashboard:write"], ["insight:read", "dashboard:write"]),
+            ("drops_privileged", ["llm_gateway:read", "insight:read"], ["insight:read"]),
+            ("drops_unknown_string", ["not_a_real_scope:write", "query:read"], ["query:read"]),
+            (
+                "dedupes_preserving_order",
+                ["insight:read", "query:read", "insight:read"],
+                ["insight:read", "query:read"],
+            ),
+            ("empty_in_empty_out", [], []),
+            ("all_dropped_yields_empty", ["llm_gateway:read", "garbage"], []),
+            # A self-registering app can't inject the ceiling sentinel to widen itself.
+            ("drops_default_sentinel", ["@default", "insight:read"], ["insight:read"]),
+        ]
+    )
+    def test_resolution(self, _name: str, given: list[str], expected: list[str]) -> None:
+        assert filter_to_unprivileged_scopes(given) == expected
+
+    def test_non_string_entries_dropped(self) -> None:
+        # Callers pass raw partner JSON (CIMD `com.posthog.scopes`), which may hold non-strings.
+        assert filter_to_unprivileged_scopes(["insight:read", 123, None, {"x": 1}, "query:read"]) == [
+            "insight:read",
+            "query:read",
+        ]
+
+
+class TestFilterSelfRegisteredCeiling(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("oidc_only_kept", ["openid", "profile", "email"], ["openid", "profile", "email"]),
+            ("oidc_only_deduped", ["email", "openid", "email"], ["email", "openid"]),
+            ("oidc_dropped_next_to_resource", ["openid", "insight:read"], ["insight:read"]),
+            ("oidc_kept_when_resources_all_dropped", ["openid", "llm_gateway:read"], ["openid"]),
+            ("introspection_is_not_an_identity_scope", ["introspection"], []),
+            ("nothing_grantable", ["llm_gateway:read", "garbage"], []),
+            ("empty_in_empty_out", [], []),
+            # CIMD and DCR metadata written before the code review rename keeps code review access.
+            (
+                "renamed_scopes_translated",
+                ["stamphog:read", "insight:read"],
+                ["code_review_approval:read", "insight:read"],
+            ),
+            ("only_renamed_scopes", ["review_hog:read", "review_hog:write"], ["code_review:read", "code_review:write"]),
+        ]
+    )
+    def test_resolution(self, _name: str, given: list[str], expected: list[str]) -> None:
+        assert filter_self_registered_ceiling(given) == expected
+
+    def test_oidc_only_ceiling_grants_no_resource_scope(self) -> None:
+        ceiling = filter_self_registered_ceiling(["openid", "profile", "email"])
+        assert effective_ceiling(ceiling) == frozenset({"openid", "profile", "email"})
+        assert clamp_scopes_to_ceiling({"openid", "email", "insight:read"}, ceiling) == ["email", "openid"]
+
+
+class TestProjectSecretAPIKeyScopeParity(SimpleTestCase):
+    # The settings scope picker builds its checkboxes from the frontend copy of this list,
+    # so a scope added on the backend alone is allowed by the API but has no UI to grant it.
+    def test_frontend_list_matches_backend(self) -> None:
+        tsx = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "lib" / "scopes.tsx").read_text()
+        match = re.search(
+            r"export const PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION = \[(.*?)\] as const",
+            tsx,
+            re.DOTALL,
+        )
+        assert match, "Could not find PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION in scopes.tsx"
+
+        frontend_scopes = set(re.findall(r"'([a-z_]+:[a-z]+)'", match.group(1)))
+        backend_scopes = {f"{obj}:{action}" for obj, action in PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION}
+        assert frontend_scopes == backend_scopes
+
+
+class TestRiskyScopeWarnings(SimpleTestCase):
+    def test_every_risky_scope_warning_names_a_grantable_scope(self) -> None:
+        stale = sorted(set(RISKY_SCOPE_WARNINGS) - UNPRIVILEGED_SCOPES)
+
+        assert not stale, f"{stale} have a risky-scope warning but are no longer grantable. Remove them."

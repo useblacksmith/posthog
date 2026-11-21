@@ -1,0 +1,906 @@
+import { DateTime } from 'luxon'
+import { Client, Pool, PoolClient, QueryResult, QueryResultRow } from 'pg'
+import { Counter } from 'prom-client'
+import { v7 as uuidv7 } from 'uuid'
+
+import { logger } from '~/common/utils/logger'
+
+import {
+    COUNT_WORK_SQL,
+    DEQUEUE_JOBS_SQL,
+    FAIR_DEQUEUE_JOBS_SQL,
+    LEGACY_COUNT_WORK_SQL,
+    LEGACY_DEQUEUE_JOBS_SQL,
+    LEGACY_FAIR_DEQUEUE_JOBS_SQL,
+} from './due-rows-sql'
+import { SqlRunner, allocateEmailDequeueSeqs, batchEmailDequeueSeqs, timeEnqueuePhase } from './manager'
+import { createCyclotronPool } from './pg-pool'
+import {
+    CYCLOTRON_COUNTER_MAX,
+    CYCLOTRON_TRANSITION_CHURN_RATE_PER_HOUR,
+    CYCLOTRON_TRANSITION_CHURN_THRESHOLD,
+    CyclotronV2BulkCreateAndCheckInInput,
+    CyclotronV2DequeuedJob,
+    CyclotronV2JobInit,
+    CyclotronV2JobInitSchema,
+    CyclotronV2RescheduleOptions,
+    CyclotronV2RescheduleOptionsSchema,
+    CyclotronV2WorkerConfig,
+} from './types'
+
+export interface RawJobRow {
+    id: string
+    team_id: number
+    function_id: string | null
+    queue_name: string
+    priority: number
+    scheduled: string
+    created: string
+    parent_run_id: string | null
+    transition_count: number
+    state: Buffer | null
+    distinct_id: string | null
+    person_id: string | null
+    action_id: string | null
+    cancel_requested_at: string | null
+    lock_id: string
+}
+
+const highTransitionDequeuesCounter = new Counter({
+    name: 'cdp_cyclotron_v2_high_transition_dequeues',
+    help: `Jobs dequeued with transition_count at or above ${CYCLOTRON_TRANSITION_CHURN_THRESHOLD} and at least ${CYCLOTRON_TRANSITION_CHURN_RATE_PER_HOUR} transitions per hour of age, meaning they are cycling without completing.`,
+    labelNames: ['queue'] as const,
+})
+
+function isChurning(row: RawJobRow): boolean {
+    if (row.transition_count < CYCLOTRON_TRANSITION_CHURN_THRESHOLD) {
+        return false
+    }
+    const ageHours = (Date.now() - new Date(row.created).getTime()) / 3_600_000
+    return row.transition_count >= CYCLOTRON_TRANSITION_CHURN_RATE_PER_HOUR * ageHours
+}
+
+// The loop swallows the error and retries, so without this counter a queue whose every
+// dequeue throws looks exactly like an idle queue. Exported for the rate-limited
+// subclass, which has its own loop and catch.
+export const consumerLoopErrorsCounter = new Counter({
+    name: 'cdp_cyclotron_v2_consumer_loop_errors_total',
+    help: 'Consumer loop iterations that threw, per queue. A sustained positive rate can indicate the queue is not being consumed.',
+    labelNames: ['queue'] as const,
+})
+
+const staleCommitsCounter = new Counter({
+    name: 'cdp_cyclotron_v2_stale_commits_total',
+    help: 'Writes to a job that matched no row because the worker no longer held its lock, usually after the janitor reset a stalled job. Another worker may run that job too.',
+    labelNames: ['queue', 'operation'] as const,
+})
+
+const releaseWriteRetriesCounter = new Counter({
+    name: 'cdp_cyclotron_v2_release_write_retries_total',
+    help: 'Release writes retried once on a fresh connection after the first attempt lost its connection, per queue, operation and outcome. no_row means the first attempt most likely committed before the connection dropped.',
+    labelNames: ['queue', 'operation', 'outcome'] as const,
+})
+
+const CONNECTION_LOST_SQLSTATES = new Set(['57P01', '57P02', '57P03'])
+const CONNECTION_LOST_ERRNOS = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE'])
+const NODE_PG_CONNECTION_LOST_MESSAGE = /^Connection terminated|is not queryable$/
+
+type ReleaseDb = SqlRunner
+type ReleaseAttempt = (db: ReleaseDb) => Promise<{ rowCount: number | null }>
+
+class ReleaseRetrySlots {
+    private free: number
+    private readonly waiters: (() => void)[] = []
+
+    constructor(size: number) {
+        this.free = size
+    }
+
+    acquire(waitMs: number): Promise<(() => void) | null> {
+        if (this.free > 0) {
+            this.free--
+            return Promise.resolve(this.releaser())
+        }
+        return new Promise((resolve) => {
+            const grant = (): void => {
+                clearTimeout(timer)
+                resolve(this.releaser())
+            }
+            const timer = setTimeout(() => {
+                this.waiters.splice(this.waiters.indexOf(grant), 1)
+                resolve(null)
+            }, waitMs)
+            this.waiters.push(grant)
+        })
+    }
+
+    private releaser(): () => void {
+        let released = false
+        return () => {
+            if (released) {
+                return
+            }
+            released = true
+            const next = this.waiters.shift()
+            if (next) {
+                next()
+            } else {
+                this.free++
+            }
+        }
+    }
+}
+
+function isConnectionLost(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+        return false
+    }
+    const code = (error as { code?: unknown }).code
+    if (typeof code === 'string') {
+        if (code.startsWith('08') || CONNECTION_LOST_SQLSTATES.has(code) || CONNECTION_LOST_ERRNOS.has(code)) {
+            return true
+        }
+    }
+    return NODE_PG_CONNECTION_LOST_MESSAGE.test(error.message)
+}
+
+export function countStaleCommit(queue: string, operation: string): void {
+    staleCommitsCounter.labels({ queue, operation }).inc()
+}
+
+export const pollsCounter = new Counter({
+    name: 'cdp_cyclotron_v2_polls_total',
+    help: 'Consumer loop polls of the queue database, per queue and outcome.',
+    labelNames: ['queue', 'outcome'] as const,
+})
+
+/**
+ * Insert N new jobs within an open transaction. Mirrors the bulk-insert shape
+ * from `CyclotronV2Manager.bulkCreateJobs` but runs on a caller-provided
+ * client so the inserts can be wrapped in the same transaction as a sibling
+ * UPDATE (used by `bulkCreateAndCheckIn`).
+ *
+ * Intentionally narrower than manager.bulkCreateJobs: no `overwriteExisting`
+ * path, no email-queue `dequeue_seq` computation (the resolver enqueues
+ * children onto 'hogflow', not 'email'). Email re-routing happens later via
+ * the worker's reschedule path which already handles dequeue_seq assignment.
+ */
+async function insertNewJobsInTx(client: PoolClient, newJobs: CyclotronV2JobInit[]): Promise<string[]> {
+    if (newJobs.length === 0) {
+        return []
+    }
+
+    const now = new Date()
+    const ids: string[] = []
+    const teamIds: number[] = []
+    const functionIds: (string | null)[] = []
+    const queueNames: string[] = []
+    const priorities: number[] = []
+    const scheduleds: Date[] = []
+    const parentRunIds: (string | null)[] = []
+    const states: (Buffer | null)[] = []
+    const distinctIds: (string | null)[] = []
+    const personIds: (string | null)[] = []
+    const actionIds: (string | null)[] = []
+
+    for (const job of newJobs) {
+        ids.push(job.id ?? uuidv7())
+        teamIds.push(job.teamId)
+        functionIds.push(job.functionId ?? null)
+        queueNames.push(job.queueName)
+        priorities.push(job.priority ?? 0)
+        scheduleds.push(job.scheduled ?? now)
+        parentRunIds.push(job.parentRunId ?? null)
+        states.push(job.state ?? null)
+        distinctIds.push(job.distinctId ?? null)
+        personIds.push(job.personId ?? null)
+        actionIds.push(job.actionId ?? null)
+    }
+
+    await timeEnqueuePhase('insert', 'worker', () =>
+        client.query(
+            `INSERT INTO cyclotron_jobs
+         (id, team_id, function_id, queue_name, status, priority, scheduled, created,
+          lock_id, last_heartbeat, janitor_touch_count, transition_count, last_transition,
+          parent_run_id, state, distinct_id, person_id, action_id)
+         SELECT
+            unnest($1::uuid[]),
+            unnest($2::int[]),
+            unnest($3::uuid[]),
+            unnest($4::text[]),
+            'available'::CyclotronJobStatus,
+            unnest($5::smallint[]),
+            unnest($6::timestamptz[]),
+            $12::timestamptz,
+            NULL::uuid,
+            NULL::timestamptz,
+            0::smallint,
+            0::smallint,
+            $12::timestamptz,
+            unnest($7::text[]),
+            unnest($8::bytea[]),
+            unnest($9::text[]),
+            unnest($10::text[]),
+            unnest($11::text[])`,
+            [
+                ids,
+                teamIds,
+                functionIds,
+                queueNames,
+                priorities,
+                scheduleds,
+                parentRunIds,
+                states,
+                distinctIds,
+                personIds,
+                actionIds,
+                now,
+            ]
+        )
+    )
+
+    return ids
+}
+
+/**
+ * Update the current worker's job row to reflect the chosen disposition
+ * (reschedule for next page / ack / fail). Mirrors the SQL shapes used by
+ * the wrapper's `ack`, `fail`, and `reschedule` methods, but runs in a
+ * caller-provided transaction so it can be atomic with sibling inserts.
+ *
+ * Throws if the UPDATE doesn't match exactly one row. The `WHERE lock_id`
+ * filter can match zero rows if the janitor reassigns the lock between
+ * dequeue and commit (stall-recovery race) — without this guard the child
+ * inserts would commit while the self UPDATE silently no-ops, leaving the
+ * cursor un-advanced for the new lock-holder to replay.
+ */
+async function updateSelfInTx(
+    client: PoolClient,
+    jobId: string,
+    lockId: string,
+    disposition: CyclotronV2BulkCreateAndCheckInInput['selfDisposition']
+): Promise<void> {
+    // Deliberate self-checkins zero janitor_touch_count for the same reason the
+    // wrapJob dispositions do — the poison budget counts CONSECUTIVE stalls, so a
+    // healthy batch-resolve release must not leave a stale touch count behind.
+    if (disposition.kind === 'ack') {
+        const result = await client.query(
+            `UPDATE cyclotron_jobs
+             SET status = 'completed', lock_id = NULL, last_heartbeat = NULL,
+                 last_transition = NOW(), transition_count = LEAST(transition_count + 1, ${CYCLOTRON_COUNTER_MAX}),
+                 janitor_touch_count = 0
+             WHERE id = $1 AND lock_id = $2`,
+            [jobId, lockId]
+        )
+        assertSelfRowAffected(result.rowCount, jobId, 'ack')
+        return
+    }
+    if (disposition.kind === 'fail') {
+        const result = await client.query(
+            `UPDATE cyclotron_jobs
+             SET status = 'failed', lock_id = NULL, last_heartbeat = NULL,
+                 last_transition = NOW(), transition_count = LEAST(transition_count + 1, ${CYCLOTRON_COUNTER_MAX}),
+                 janitor_touch_count = 0
+             WHERE id = $1 AND lock_id = $2`,
+            [jobId, lockId]
+        )
+        assertSelfRowAffected(result.rowCount, jobId, 'fail')
+        return
+    }
+    // reschedule
+    const scheduled = disposition.scheduledAt ?? new Date()
+    const setClauses = [
+        `status = 'available'`,
+        `lock_id = NULL`,
+        `last_heartbeat = NULL`,
+        `last_transition = NOW()`,
+        `transition_count = LEAST(transition_count + 1, ${CYCLOTRON_COUNTER_MAX})`,
+        `janitor_touch_count = 0`,
+        // A cancel requested while this worker held the job must not sleep the full
+        // next delay before it's observed, so it wakes immediately instead.
+        `scheduled = CASE WHEN cancel_requested_at IS NOT NULL THEN LEAST($3::timestamptz, NOW()) ELSE $3::timestamptz END`,
+    ]
+    const params: any[] = [jobId, lockId, scheduled]
+    if (disposition.state !== undefined) {
+        params.push(disposition.state ?? null)
+        setClauses.push(`state = $${params.length}`)
+    }
+    const result = await client.query(
+        `UPDATE cyclotron_jobs SET ${setClauses.join(', ')}
+         WHERE id = $1 AND lock_id = $2`,
+        params
+    )
+    assertSelfRowAffected(result.rowCount, jobId, 'reschedule')
+}
+
+function assertSelfRowAffected(rowCount: number | null, jobId: string, kind: string): void {
+    if (rowCount !== 1) {
+        throw new Error(
+            `bulkCreateAndCheckIn(${kind}) self row matched ${rowCount} rows for job ${jobId} — lock_id may have been reassigned`
+        )
+    }
+}
+
+export class CyclotronV2Worker {
+    private pool: Pool
+    protected isConsuming = false
+    protected lastPollTime = new Date()
+    private consumerLoopPromise: Promise<void> | null = null
+
+    protected readonly queueName: string
+    protected readonly batchMaxSize: number
+    protected readonly pollDelayMs: number
+    private readonly pollDelayMaxMs: number
+    private nextPollDelayMs: number
+    private wakeFromPollSleep: (() => void) | null = null
+    private readonly heartbeatTimeoutMs: number
+    private readonly releaseWriteHeartbeatLimitMs: number
+    private readonly releaseWriteRetry: boolean
+    protected readonly includeEmptyBatches: boolean
+    protected readonly fairDequeue: boolean
+    private readonly boundedPolls: boolean
+    private readonly ownershipReadTimeoutMs: number
+    private readonly boundedFairDequeue: boolean
+    private readonly assignEmailDequeueSeq: (teamId: number) => Promise<string>
+    private readonly releaseRetrySlots: ReleaseRetrySlots
+
+    constructor(private config: CyclotronV2WorkerConfig) {
+        this.pool = createCyclotronPool('worker', {
+            connectionString: config.pool.dbUrl,
+            max: config.pool.maxConnections ?? 10,
+            idleTimeoutMillis: config.pool.idleTimeoutMs ?? 30000,
+        })
+        this.assignEmailDequeueSeq = batchEmailDequeueSeqs(this.pool)
+        // One dropped query can fail a whole batch at once, such as every
+        // email slot reservation a team coalesced into it.
+        this.releaseRetrySlots = new ReleaseRetrySlots(config.pool.maxConnections ?? 10)
+        this.queueName = config.queueName
+        this.batchMaxSize = config.batchMaxSize ?? 100
+        this.pollDelayMs = config.pollDelayMs ?? 50
+        this.heartbeatTimeoutMs = config.heartbeatTimeoutMs ?? 30000
+        const pollDelayMaxMs = config.pollDelayMaxMs ?? this.pollDelayMs
+        this.pollDelayMaxMs = Number.isFinite(pollDelayMaxMs)
+            ? Math.max(pollDelayMaxMs, this.pollDelayMs)
+            : this.pollDelayMs
+        this.assertBackOffFitsHeartbeat()
+        this.nextPollDelayMs = this.pollDelayMs
+        this.releaseWriteHeartbeatLimitMs = config.releaseWriteHeartbeatLimitMs ?? 20000
+        this.releaseWriteRetry = config.releaseWriteRetry ?? false
+        this.includeEmptyBatches = config.includeEmptyBatches ?? false
+        this.boundedPolls = config.boundedPolls ?? false
+        this.ownershipReadTimeoutMs = config.ownershipReadTimeoutMs ?? 5_000
+        this.boundedFairDequeue = config.boundedFairDequeue ?? false
+        // Fair (per-team round-robin) dequeue is the email queue's ordering.
+        // `dequeue_seq` is only ever assigned for email jobs (see
+        // CyclotronV2Manager), so deriving this from the queue name keeps the
+        // worker's ORDER BY in lockstep with where the sort key actually exists.
+        this.fairDequeue = config.queueName === 'email'
+    }
+
+    private assertBackOffFitsHeartbeat(): void {
+        const longestSleepWithinHeartbeatMs = this.heartbeatTimeoutMs / 2
+        if (this.pollDelayMaxMs > this.pollDelayMs && this.pollDelayMaxMs > longestSleepWithinHeartbeatMs) {
+            throw new Error(
+                `pollDelayMaxMs (${this.pollDelayMaxMs}) must be at most half of heartbeatTimeoutMs (${this.heartbeatTimeoutMs})`
+            )
+        }
+    }
+
+    async connect(processBatch: (jobs: CyclotronV2DequeuedJob[]) => Promise<void>): Promise<void> {
+        const client = await this.pool.connect()
+        client.release()
+
+        this.isConsuming = true
+        this.consumerLoopPromise = this.runConsumerLoop(processBatch)
+    }
+
+    protected async runConsumerLoop(processBatch: (jobs: CyclotronV2DequeuedJob[]) => Promise<void>): Promise<void> {
+        while (this.isConsuming) {
+            try {
+                this.lastPollTime = new Date()
+                const rows = this.fairDequeue ? await this.fairDequeueJobs() : await this.dequeueJobs()
+
+                await this.handleDequeuedRows(rows, processBatch)
+            } catch (err) {
+                consumerLoopErrorsCounter.labels({ queue: this.queueName }).inc()
+                logger.error('CyclotronV2Worker consumer loop error', { error: String(err) })
+                await this.backOff()
+            }
+        }
+    }
+
+    protected async handleDequeuedRows(
+        rows: RawJobRow[],
+        processBatch: (jobs: CyclotronV2DequeuedJob[]) => Promise<void>
+    ): Promise<void> {
+        if (rows.length === 0) {
+            pollsCounter.labels({ queue: this.queueName, outcome: 'empty' }).inc()
+            if (this.includeEmptyBatches) {
+                await processBatch([])
+            }
+            await this.backOff()
+            return
+        }
+
+        pollsCounter.labels({ queue: this.queueName, outcome: 'jobs' }).inc()
+        this.resetBackOff()
+        await processBatch(rows.map((row) => this.wrapJob(row)))
+    }
+
+    protected async backOff(): Promise<void> {
+        const delayMs = this.nextPollDelayMs
+        this.nextPollDelayMs = Math.min(Math.max(delayMs * 2, 1), this.pollDelayMaxMs)
+        await this.sleepUntilStopped(delayMs)
+    }
+
+    protected resetBackOff(): void {
+        this.nextPollDelayMs = this.pollDelayMs
+    }
+
+    protected sleepUntilStopped(ms: number): Promise<void> {
+        if (!this.isConsuming) {
+            return Promise.resolve()
+        }
+        return new Promise((resolve) => {
+            const wake = (): void => {
+                clearTimeout(timer)
+                this.wakeFromPollSleep = null
+                resolve()
+            }
+            const timer = setTimeout(wake, ms)
+            this.wakeFromPollSleep = wake
+        })
+    }
+
+    /**
+     * Cheap pre-check that returns how many jobs are currently dequeueable from
+     * this worker's queue, capped at `limit`. Used by rate-limited subclasses
+     * to size their token-bucket claim to "exactly what we plan to dequeue"
+     * instead of always claiming the bucket's full capacity — keeps unused
+     * tokens in the bucket when traffic is sparse and a single job per poll is
+     * what we end up dequeuing.
+     *
+     * Hits the same partial index as `dequeueJobs` (`idx_cyclotron_jobs_dequeue`,
+     * filtered on `status = 'available'`), so the query is sub-millisecond and
+     * strictly cheaper than the `UPDATE ... SKIP LOCKED` we'd otherwise run.
+     * A short race exists between this count and the subsequent dequeue —
+     * concurrent pods may grab some rows in the gap via `SKIP LOCKED` — so
+     * `dequeueJobs` can return fewer rows than counted. That's bounded by
+     * concurrency × poll rate and rate-limiter refill absorbs the slack.
+     */
+    protected async countWork(limit: number): Promise<number> {
+        const result = await this.pool.query<{ n: number }>(
+            this.boundedPolls ? COUNT_WORK_SQL : LEGACY_COUNT_WORK_SQL,
+            [this.config.queueName, limit]
+        )
+        return result.rows[0].n
+    }
+
+    protected async dequeueJobs(limit: number = this.batchMaxSize): Promise<RawJobRow[]> {
+        const lockId = uuidv7()
+        const result = await this.pool.query<RawJobRow>(
+            this.boundedPolls ? DEQUEUE_JOBS_SQL : LEGACY_DEQUEUE_JOBS_SQL,
+            [this.config.queueName, limit, lockId]
+        )
+        // UPDATE...RETURNING doesn't preserve the CTE's ORDER BY,
+        // so re-sort to maintain priority ordering within the batch
+        // TODO: Do we care about this in reality?
+        return result.rows.sort(
+            (a, b) => a.priority - b.priority || new Date(a.scheduled).getTime() - new Date(b.scheduled).getTime()
+        )
+    }
+
+    /**
+     * Fair dequeue: priority class leads the sort so transactional-class sends
+     * aren't stuck behind a broadcast backlog, then the precomputed
+     * `dequeue_seq` interleaves jobs across tenants within a class instead of
+     * being strict FIFO. The sort key is assigned at insert time (see
+     * `CyclotronV2Manager.bulkCreateJobs` and the helper
+     * `cyclotron_email_team_seq`); this method just reads them back in order.
+     *
+     * NULLS FIRST drains any pre-migration legacy rows ahead of new
+     * fair-ordered ones.
+     */
+    protected async fairDequeueJobs(limit: number = this.batchMaxSize): Promise<RawJobRow[]> {
+        const lockId = uuidv7()
+        const result = await this.pool.query<RawJobRow>(
+            this.boundedFairDequeue ? FAIR_DEQUEUE_JOBS_SQL : LEGACY_FAIR_DEQUEUE_JOBS_SQL,
+            [this.config.queueName, limit, lockId]
+        )
+        // Within-batch order is undefined (UPDATE...RETURNING doesn't preserve
+        // the CTE's ORDER BY), but the guarantee is *across* batches: the CTE
+        // picks the rows with the lowest priority, then the lowest dequeue_seq,
+        // so a transactional send never waits behind a marketing backlog and a
+        // small-tenant job never gets stuck behind a large-tenant one.
+        return result.rows
+    }
+
+    protected wrapJob(row: RawJobRow): CyclotronV2DequeuedJob {
+        const pool = this.pool
+        const dbUrl = this.config.pool.dbUrl
+        const releaseRetrySlots = this.releaseRetrySlots
+        const assignEmailDequeueSeq = this.assignEmailDequeueSeq
+        let reservedEmailDequeueSeq: Promise<string> | null = null
+        const reserveEmailDequeueSeqOnce = (db: ReleaseDb): Promise<string> => {
+            reservedEmailDequeueSeq ??= (
+                db === pool
+                    ? assignEmailDequeueSeq(row.team_id)
+                    : allocateEmailDequeueSeqs(db, [row.team_id]).then(([dequeueSeq]) => dequeueSeq)
+            ).catch((error: unknown) => {
+                reservedEmailDequeueSeq = null
+                throw error
+            })
+            return reservedEmailDequeueSeq
+        }
+        const lockId = row.lock_id
+        const releaseWriteHeartbeatLimitMs = this.releaseWriteHeartbeatLimitMs
+        const releaseWriteRetry = this.releaseWriteRetry
+        const ownershipReadTimeoutMs = this.ownershipReadTimeoutMs
+        let releaseStartedAt: number | null = null
+        let releaseWritten = false
+
+        if (isChurning(row)) {
+            highTransitionDequeuesCounter.labels({ queue: row.queue_name }).inc()
+        }
+
+        const releaseGuard = (method: string) => {
+            if (releaseStartedAt !== null) {
+                throw new Error(`Job ${row.id} already released, cannot call ${method}`)
+            }
+            releaseStartedAt = Date.now()
+        }
+
+        const releaseWriteOutlivedHeartbeats = (): boolean =>
+            releaseStartedAt !== null && Date.now() - releaseStartedAt > releaseWriteHeartbeatLimitMs
+
+        let ownershipLost = false
+        const noteOwnershipLost = (operation: string): void => {
+            ownershipLost = true
+            countStaleCommit(row.queue_name, operation)
+            logger.warn('CyclotronV2Worker lost ownership of a job', { id: row.id, operation })
+        }
+        const ownsJobNow = async (): Promise<boolean> => {
+            const ownershipRead = {
+                text: 'SELECT 1 FROM cyclotron_jobs WHERE id = $1 AND lock_id = $2',
+                values: [row.id, lockId],
+                query_timeout: ownershipReadTimeoutMs,
+            }
+            const result = await pool.query(ownershipRead)
+            return result.rowCount === 1
+        }
+
+        // The retry runs outside the worker pool with the remaining heartbeat
+        // budget as its statement timeout, so Postgres cancels a retry that
+        // stalls, and a stalled retry never holds a client that dequeues,
+        // heartbeats and shutdown need. At most the pool's size of retries
+        // run at once; the rest wait for a slot until the deadline.
+        const retryOnOwnConnection = async (attempt: ReleaseAttempt): Promise<{ rowCount: number | null }> => {
+            const deadline = (releaseStartedAt ?? Date.now()) + releaseWriteHeartbeatLimitMs
+            const freeSlot = await releaseRetrySlots.acquire(deadline - Date.now())
+            if (!freeSlot) {
+                throw new Error(
+                    `Release write retry for job ${row.id} found no free connection before the heartbeat limit`
+                )
+            }
+            const msLeft = (): number => Math.max(1, Math.ceil(deadline - Date.now()))
+            const client = new Client({ connectionString: dbUrl, connectionTimeoutMillis: msLeft() })
+            client.on('error', () => undefined)
+            const run = <R extends QueryResultRow>(text: string, values?: unknown[]): Promise<QueryResult<R>> => {
+                const query = { text, values, query_timeout: msLeft() }
+                return client.query<R>(query)
+            }
+            // Every statement gets only what is left of the heartbeat limit, so the
+            // retry as a whole ends by then. PgBouncer rejects statement_timeout as a
+            // startup parameter, and a session SET would leak to the next client of
+            // its server connection, so it is set per transaction.
+            const bounded: SqlRunner = {
+                query: async <R extends QueryResultRow>(text: string, values?: unknown[]) => {
+                    await run(`SET LOCAL statement_timeout = ${msLeft()}`)
+                    return run<R>(text, values)
+                },
+            }
+            try {
+                await client.connect()
+                await run('BEGIN')
+                const result = await attempt(bounded)
+                await bounded.query('COMMIT')
+                return result
+            } finally {
+                void client.end().catch(() => undefined)
+                freeSlot()
+            }
+        }
+
+        const writeRetryingLostConnection = async (
+            method: string,
+            attempt: ReleaseAttempt
+        ): Promise<{ rowCount: number | null }> => {
+            try {
+                return await attempt(pool)
+            } catch (error) {
+                if (!releaseWriteRetry || !isConnectionLost(error) || releaseWriteOutlivedHeartbeats()) {
+                    throw error
+                }
+                logger.warn('CyclotronV2Worker retrying a release write after its connection dropped', {
+                    id: row.id,
+                    operation: method,
+                    error: String(error),
+                })
+                const retried = { queue: row.queue_name, operation: method }
+                try {
+                    const result = await retryOnOwnConnection(attempt)
+                    releaseWriteRetriesCounter
+                        .labels({ ...retried, outcome: result.rowCount === 0 ? 'no_row' : 'written' })
+                        .inc()
+                    return result
+                } catch (retryError) {
+                    releaseWriteRetriesCounter.labels({ ...retried, outcome: 'failed' }).inc()
+                    throw retryError
+                }
+            }
+        }
+
+        const releaseWrite =
+            <A extends unknown[]>(
+                method: string,
+                write: (db: ReleaseDb, ...args: A) => Promise<{ rowCount: number | null }>
+            ) =>
+            async (...args: A): Promise<void> => {
+                releaseGuard(method)
+                try {
+                    const result = await writeRetryingLostConnection(method, (db) => write(db, ...args))
+                    if (result.rowCount === 0) {
+                        noteOwnershipLost(method)
+                    }
+                } finally {
+                    releaseWritten = true
+                }
+            }
+
+        return {
+            id: row.id,
+            lockId,
+            teamId: row.team_id,
+            functionId: row.function_id,
+            queueName: row.queue_name,
+            priority: row.priority,
+            scheduled: DateTime.fromISO(row.scheduled, { zone: 'utc' }),
+            created: DateTime.fromISO(row.created, { zone: 'utc' }),
+            parentRunId: row.parent_run_id,
+            transitionCount: row.transition_count,
+            state: row.state,
+            distinctId: row.distinct_id,
+            personId: row.person_id,
+            actionId: row.action_id,
+            cancelRequestedAt: row.cancel_requested_at
+                ? DateTime.fromISO(row.cancel_requested_at, { zone: 'utc' })
+                : null,
+
+            ack: releaseWrite('ack', (db) =>
+                db.query(
+                    `UPDATE cyclotron_jobs
+                     SET status = 'completed', lock_id = NULL, last_heartbeat = NULL,
+                         last_transition = NOW(), transition_count = LEAST(transition_count + 1, ${CYCLOTRON_COUNTER_MAX}),
+                         janitor_touch_count = 0
+                     WHERE id = $1 AND lock_id = $2`,
+                    [row.id, lockId]
+                )
+            ),
+
+            fail: releaseWrite('fail', (db) =>
+                db.query(
+                    `UPDATE cyclotron_jobs
+                     SET status = 'failed', lock_id = NULL, last_heartbeat = NULL,
+                         last_transition = NOW(), transition_count = LEAST(transition_count + 1, ${CYCLOTRON_COUNTER_MAX}),
+                         janitor_touch_count = 0
+                     WHERE id = $1 AND lock_id = $2`,
+                    [row.id, lockId]
+                )
+            ),
+
+            reschedule: releaseWrite('reschedule', async (db, input?: CyclotronV2RescheduleOptions) => {
+                const options = input ? CyclotronV2RescheduleOptionsSchema.parse(input) : undefined
+                const scheduled = options?.scheduledAt ?? new Date()
+
+                const setClauses = [
+                    `status = 'available'`,
+                    `lock_id = NULL`,
+                    `last_heartbeat = NULL`,
+                    `last_transition = NOW()`,
+                    `transition_count = LEAST(transition_count + 1, ${CYCLOTRON_COUNTER_MAX})`,
+                    // A deliberate release means the worker is healthy, so the
+                    // poison budget counts CONSECUTIVE stalls — long-lived jobs
+                    // (e.g. wait_until_condition polls) don't accrue touches for
+                    // their whole life and get mistaken for poison pills.
+                    `janitor_touch_count = 0`,
+                    // A cancel requested while this worker held the job must not
+                    // sleep the full next delay before it's observed, so it
+                    // wakes immediately instead.
+                    `scheduled = CASE WHEN cancel_requested_at IS NOT NULL THEN LEAST($3::timestamptz, NOW()) ELSE $3::timestamptz END`,
+                ]
+                const params: any[] = [row.id, lockId, scheduled]
+
+                if (options?.state !== undefined) {
+                    params.push(options.state ?? null)
+                    setClauses.push(`state = $${params.length}`)
+                }
+                if (options?.distinctId !== undefined) {
+                    params.push(options.distinctId ?? null)
+                    setClauses.push(`distinct_id = $${params.length}`)
+                }
+                if (options?.personId !== undefined) {
+                    params.push(options.personId ?? null)
+                    setClauses.push(`person_id = $${params.length}`)
+                }
+                if (options?.actionId !== undefined) {
+                    params.push(options.actionId ?? null)
+                    setClauses.push(`action_id = $${params.length}`)
+                }
+                if (options?.queueName !== undefined) {
+                    params.push(options.queueName)
+                    setClauses.push(`queue_name = $${params.length}`)
+                }
+                if (options?.priority !== undefined) {
+                    params.push(options.priority)
+                    setClauses.push(`priority = $${params.length}`)
+                }
+
+                // Cross-queue routing into the email queue: assign a fresh
+                // dequeue_seq so the row participates in fair ordering. Without
+                // this, hogflow → email re-routing (via job.reschedule({
+                // queueName: 'email' })) lands the row with NULL dequeue_seq,
+                // which `NULLS FIRST` drains ahead of every fair-ordered row —
+                // defeating the per-team interleave for the most common email
+                // path. Skipped when the row was already on the email queue,
+                // so existing fair-ordered rows keep their place after retry/
+                // reschedule without bumping the counter.
+                if (options?.queueName === 'email' && row.queue_name !== 'email') {
+                    const dequeueSeq = await reserveEmailDequeueSeqOnce(db)
+                    params.push(dequeueSeq)
+                    setClauses.push(`dequeue_seq = $${params.length}`)
+                }
+
+                return db.query(
+                    `UPDATE cyclotron_jobs SET ${setClauses.join(', ')}
+                     WHERE id = $1 AND lock_id = $2`,
+                    params
+                )
+            }),
+
+            defer: releaseWrite('defer', async (db, { scheduledAt, state }: { scheduledAt: Date; state?: Buffer }) => {
+                const dequeueSeq = row.queue_name === 'email' ? await reserveEmailDequeueSeqOnce(db) : null
+                return db.query(
+                    `UPDATE cyclotron_jobs
+                     SET status = 'available', lock_id = NULL, last_heartbeat = NULL,
+                         last_transition = NOW(), transition_count = LEAST(transition_count + 1, ${CYCLOTRON_COUNTER_MAX}),
+                         scheduled = CASE WHEN cancel_requested_at IS NOT NULL THEN LEAST($3::timestamptz, NOW()) ELSE $3::timestamptz END,
+                         dequeue_seq = COALESCE($4, dequeue_seq),
+                         state = COALESCE($5, state)
+                     WHERE id = $1 AND lock_id = $2`,
+                    [row.id, lockId, scheduledAt, dequeueSeq, state ?? null]
+                )
+            }),
+
+            cancel: releaseWrite('cancel', (db) =>
+                db.query(
+                    `UPDATE cyclotron_jobs
+                     SET status = 'canceled', lock_id = NULL, last_heartbeat = NULL,
+                         last_transition = NOW(), transition_count = LEAST(transition_count + 1, ${CYCLOTRON_COUNTER_MAX}),
+                         janitor_touch_count = 0
+                     WHERE id = $1 AND lock_id = $2`,
+                    [row.id, lockId]
+                )
+            ),
+
+            async heartbeat(): Promise<void> {
+                if (releaseWritten || releaseWriteOutlivedHeartbeats()) {
+                    throw new Error(`Job ${row.id} already released, cannot heartbeat`)
+                }
+                if (ownershipLost) {
+                    return
+                }
+                const result = await pool.query(
+                    `UPDATE cyclotron_jobs
+                     SET last_heartbeat = NOW()
+                     WHERE id = (
+                         SELECT id FROM cyclotron_jobs
+                         WHERE id = $1 AND lock_id = $2
+                         FOR UPDATE SKIP LOCKED
+                     )`,
+                    [row.id, lockId]
+                )
+                if (result.rowCount === 0 && !(await ownsJobNow()) && releaseStartedAt === null) {
+                    noteOwnershipLost('heartbeat')
+                }
+            },
+
+            async stillOwned(): Promise<boolean> {
+                if (ownershipLost) {
+                    return false
+                }
+                if (await ownsJobNow()) {
+                    return true
+                }
+                ownershipLost = true
+                return false
+            },
+
+            async bulkCreateAndCheckIn(
+                input: CyclotronV2BulkCreateAndCheckInInput
+            ): Promise<{ newJobIds: string[]; cancelRequested?: boolean }> {
+                releaseGuard('bulkCreateAndCheckIn')
+
+                // Validate new jobs up front, outside the TX, so a malformed
+                // input doesn't burn a connection slot mid-transaction.
+                const newJobs: CyclotronV2JobInit[] = input.newJobs.map((j) => CyclotronV2JobInitSchema.parse(j))
+
+                const client = await pool.connect()
+                try {
+                    await client.query('BEGIN')
+
+                    // Cancel tombstone, checked inside the transaction. The FOR UPDATE takes the
+                    // self row's lock, so this serializes against cancelJobs' flag write: a flag
+                    // that committed first refuses the whole page here (nothing inserted), and a
+                    // page that locked first commits before the flag can land — the cancel
+                    // sweep's remaining-count then still sees its jobs. Without this check, a
+                    // page could commit after a cancel sweep counted zero remaining, leaving
+                    // jobs that never get flagged.
+                    const selfRow = await client.query<{ cancel_requested_at: string | null }>(
+                        `SELECT cancel_requested_at FROM cyclotron_jobs
+                         WHERE id = $1 AND lock_id = $2
+                         FOR UPDATE`,
+                        [row.id, lockId]
+                    )
+                    if (selfRow.rowCount === 0) {
+                        noteOwnershipLost('check_in')
+                    }
+                    assertSelfRowAffected(selfRow.rowCount, row.id, 'precheck')
+                    if (selfRow.rows[0].cancel_requested_at !== null) {
+                        await client.query('ROLLBACK')
+                        // The job was never released — hand it back to the caller to dispose.
+                        releaseStartedAt = null
+                        return { newJobIds: [], cancelRequested: true }
+                    }
+
+                    const newJobIds = await insertNewJobsInTx(client, newJobs)
+                    await updateSelfInTx(client, row.id, lockId, input.selfDisposition)
+
+                    await client.query('COMMIT')
+                    releaseWritten = true
+                    return { newJobIds }
+                } catch (err) {
+                    releaseWritten = true
+                    try {
+                        await client.query('ROLLBACK')
+                    } catch (rollbackErr) {
+                        logger.warn('bulkCreateAndCheckIn rollback failed', {
+                            error: String(rollbackErr),
+                            originalError: String(err),
+                        })
+                    }
+                    throw err
+                } finally {
+                    client.release()
+                }
+            },
+        }
+    }
+
+    isHealthy(): boolean {
+        return this.isConsuming && Date.now() - this.lastPollTime.getTime() < this.heartbeatTimeoutMs
+    }
+
+    async stopConsuming(): Promise<void> {
+        this.isConsuming = false
+        this.wakeFromPollSleep?.()
+        if (this.consumerLoopPromise) {
+            await this.consumerLoopPromise
+            this.consumerLoopPromise = null
+        }
+    }
+
+    async disconnect(): Promise<void> {
+        await this.stopConsuming()
+        await this.pool.end()
+    }
+}

@@ -1,0 +1,188 @@
+"""
+Core Bayesian calculation utilities for A/B testing.
+
+This module provides fundamental Bayesian statistical calculations including
+posterior updates, credible intervals, and probability calculations.
+"""
+
+from typing import TYPE_CHECKING
+
+from scipy.stats import norm
+
+from ..shared.enums import DifferenceType
+from ..shared.statistics import AnyStatistic, StatisticError
+from ..shared.utils import (
+    get_mean,
+    get_sample_size,
+    get_variance,
+    relative_effect,
+    relative_effect_variance,
+    validate_test_inputs,
+)
+from .priors import GaussianPrior
+
+if TYPE_CHECKING:
+    from ..shared.statistics import RelativeEffectBaseline
+
+
+def calculate_effect_size_and_variance(
+    treatment_stat: AnyStatistic,
+    control_stat: AnyStatistic,
+    difference_type: DifferenceType,
+    relative_effect_baseline: RelativeEffectBaseline | None = None,
+) -> tuple[float, float]:
+    """
+    Calculate effect size and its variance for Bayesian analysis.
+
+    Args:
+        treatment_stat: Treatment group statistic
+        control_stat: Control group statistic
+        difference_type: Type of difference to calculate
+        relative_effect_baseline: Raw baseline moments for CUPED relative effects.
+            Includes its covariance with the adjusted treatment-control difference.
+
+    Returns:
+        Tuple of (effect_size, effect_variance)
+
+    Raises:
+        StatisticError: If the baseline mean is zero for relative calculations
+    """
+    treatment_mean = get_mean(treatment_stat)
+    control_mean = get_mean(control_stat)
+    treatment_var = get_variance(treatment_stat)
+    control_var = get_variance(control_stat)
+    treatment_n = get_sample_size(treatment_stat)
+    control_n = get_sample_size(control_stat)
+
+    if difference_type == DifferenceType.ABSOLUTE:
+        # Absolute difference: μ_T - μ_C
+        effect = treatment_mean - control_mean
+        effect_variance = treatment_var / treatment_n + control_var / control_n
+
+    elif difference_type == DifferenceType.RELATIVE:
+        effect = relative_effect(treatment_stat, control_stat, relative_effect_baseline)
+        effect_variance = relative_effect_variance(treatment_stat, control_stat, relative_effect_baseline)
+
+    else:
+        raise StatisticError(f"Unsupported difference type: {difference_type}")
+
+    return effect, effect_variance
+
+
+def calculate_posterior(effect_size: float, effect_variance: float, prior: GaussianPrior) -> tuple[float, float]:
+    """
+    Calculate posterior distribution parameters using Bayesian updating.
+
+    For Gaussian prior and Gaussian likelihood:
+    - Prior: μ ~ N(μ₀, σ₀²)
+    - Likelihood: x̄ ~ N(μ, σ²)
+    - Posterior: μ ~ N(μₙ, σₙ²)
+
+    Where:
+    - Posterior precision: τₙ = τ₀ + τ_data
+    - Posterior mean: μₙ = (τ₀μ₀ + τ_data·x̄) / τₙ
+    - Posterior variance: σₙ² = 1/τₙ
+
+    Args:
+        effect_size: Observed effect size (sample mean)
+        effect_variance: Variance of effect size estimate
+        prior: Gaussian prior distribution
+
+    Returns:
+        Tuple of (posterior_mean, posterior_variance)
+    """
+    if effect_variance <= 0:
+        raise StatisticError("Effect variance must be positive")
+
+    # Data precision (inverse of variance)
+    data_precision = 1.0 / effect_variance
+
+    # Prior precision (0 for non-informative priors)
+    prior_precision = prior.precision
+
+    # Posterior precision
+    posterior_precision = prior_precision + data_precision
+
+    if posterior_precision <= 0:
+        raise StatisticError("Posterior precision must be positive")
+
+    # Posterior mean (weighted average of prior and data)
+    if prior.is_proper():
+        posterior_mean = (prior_precision * prior.mean + data_precision * effect_size) / posterior_precision
+    else:
+        # Non-informative prior: posterior = likelihood
+        posterior_mean = effect_size
+
+    # Posterior variance
+    posterior_variance = 1.0 / posterior_precision
+
+    return posterior_mean, posterior_variance
+
+
+def chance_to_win(posterior_mean: float, posterior_std: float, inverse: bool = False) -> float:
+    """
+    Calculate probability that treatment outperforms control.
+
+    For effect size θ, calculates P(θ > 0 | data) or P(θ < 0 | data).
+
+    Args:
+        posterior_mean: Posterior mean of effect size
+        posterior_std: Posterior standard deviation of effect size
+        inverse: If True, "lower is better" (calculate P(θ < 0))
+
+    Returns:
+        Probability between 0 and 1
+    """
+    if posterior_std <= 0:
+        raise StatisticError("Posterior standard deviation must be positive")
+
+    if inverse:
+        # Lower is better
+        return float(norm.cdf(0, loc=posterior_mean, scale=posterior_std))
+    else:
+        # Higher is better
+        return float(norm.sf(0, loc=posterior_mean, scale=posterior_std))
+
+
+def credible_interval(posterior_mean: float, posterior_std: float, alpha: float = 0.05) -> tuple[float, float]:
+    """
+    Calculate Bayesian credible interval.
+
+    A credible interval gives the range that contains the true parameter
+    with specified probability, based on the posterior distribution.
+    Unlike frequentist confidence intervals, credible intervals can be
+    interpreted as "there is a 95% probability the true value lies in this range."
+
+    Args:
+        posterior_mean: Posterior mean
+        posterior_std: Posterior standard deviation
+        alpha: Significance level (default: 0.05 for 95% credible interval)
+
+    Returns:
+        Tuple of (lower_bound, upper_bound)
+    """
+    if not (0 < alpha < 1):
+        raise StatisticError("Alpha must be between 0 and 1")
+    if posterior_std <= 0:
+        raise StatisticError("Posterior standard deviation must be positive")
+
+    bounds = norm.ppf([alpha / 2, 1 - alpha / 2], loc=posterior_mean, scale=posterior_std)
+    return (float(bounds[0]), float(bounds[1]))
+
+
+def validate_inputs(
+    treatment_stat: AnyStatistic,
+    control_stat: AnyStatistic,
+) -> None:
+    """
+    Validate input statistics for Bayesian analysis.
+
+    Args:
+        treatment_stat: Treatment group statistic
+        control_stat: Control group statistic
+
+    Raises:
+        StatisticError: If inputs are invalid
+    """
+    # Use comprehensive shared validation
+    validate_test_inputs(treatment_stat, control_stat)

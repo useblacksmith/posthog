@@ -1,0 +1,726 @@
+import clsx from 'clsx'
+import { useActions, useValues } from 'kea'
+import { Suspense } from 'react'
+
+import { LemonButton, Spinner } from '@posthog/lemon-ui'
+
+import { isBoxPlotMissingProperty } from 'lib/components/ChartFilter/isBoxPlotMissingProperty'
+import { ExportButton, ExportButtonItem } from 'lib/components/ExportButton/ExportButton'
+import { QuillExportButton } from 'lib/components/ExportButton/QuillExportButton'
+import { InsightLegend } from 'lib/components/InsightLegend/InsightLegend'
+import { QuillSurfaceContext, useQuillSurface } from 'lib/components/QuillSurface/quillSurfaceContext'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { ExplainEmptyInsightContext } from 'lib/insights/explainEmptyInsightContext'
+import { keyForInsightLogicProps } from 'lib/insights/sharedUtils'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { lazyWithRetry } from 'lib/utils/retryImport'
+import { ChunkLoadErrorBoundary } from 'scenes/ChunkLoadErrorBoundary'
+import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
+import {
+    BoxPlotMissingPropertyState,
+    FunnelDataWarehouseStepIncompleteState,
+    FunnelSingleStepState,
+    InsightEmptyState,
+    InsightErrorState,
+    InsightLoadingState,
+    InsightRefreshDataHint,
+    InsightTimeoutState,
+    InsightValidationError,
+} from 'scenes/insights/EmptyStates'
+import {
+    SUPPORTED_PROPERTY_MATH_FOR_HISTOGRAM_BREAKDOWN,
+    isPropertyValueMath,
+} from 'scenes/insights/filters/ActionFilter/ActionFilterRow/mathUtils'
+import { insightDataLogic } from 'scenes/insights/insightDataLogic'
+import { insightLogic } from 'scenes/insights/insightLogic'
+import { insightVizDataLogic } from 'scenes/insights/insightVizDataLogic'
+
+import { SceneSection } from '~/layout/scenes/components/SceneSection'
+import { INSIGHT_GRAPH_DATA_ATTR } from '~/queries/nodes/InsightViz/insightImageCapture'
+import { InsightVizNode, TrendsQuery } from '~/queries/schema/schema-general'
+import { QueryContext } from '~/queries/types'
+import { shouldQueryBeAsync } from '~/queries/utils'
+import {
+    ChartDisplayType,
+    ExporterFormat,
+    FunnelVizType,
+    InsightLogicProps,
+    InsightType,
+    PropertyMathType,
+} from '~/types'
+
+import { ChartAlternatives } from 'products/product_analytics/frontend/insights/chartAlternatives/ChartAlternatives'
+import { InsightDataChecks } from 'products/product_analytics/frontend/insights/dataChecks/InsightDataChecks'
+import { InsightDisplayConfig } from 'products/product_analytics/frontend/insights/editor/InsightDisplayConfig'
+import { Funnel } from 'products/product_analytics/frontend/insights/funnels/Funnel'
+import { FunnelCanvasLabel } from 'products/product_analytics/frontend/insights/funnels/FunnelCanvasLabel'
+import { funnelDataLogic } from 'products/product_analytics/frontend/insights/funnels/funnelDataLogic'
+import { FunnelStepsTable } from 'products/product_analytics/frontend/insights/funnels/FunnelStepsTable/FunnelStepsTable'
+import { FunnelTimeToConvertTable } from 'products/product_analytics/frontend/insights/funnels/FunnelTimeToConvertTable/FunnelTimeToConvertTable'
+import { FunnelTrendsTable } from 'products/product_analytics/frontend/insights/funnels/FunnelTrendsTable/FunnelTrendsTable'
+import { insightNavLogic } from 'products/product_analytics/frontend/insights/InsightNav/insightNavLogic'
+import { Journeys } from 'products/product_analytics/frontend/insights/journeys/Journeys'
+import { Paths } from 'products/product_analytics/frontend/insights/paths/Paths'
+import { PathCanvasLabel } from 'products/product_analytics/frontend/insights/paths/PathsLabel'
+import { RetentionContainer } from 'products/product_analytics/frontend/insights/retention/RetentionContainer'
+import { InsightAIAnalysis } from 'products/product_analytics/frontend/insights/shared/InsightAIAnalysis'
+import { InsightsTable } from 'products/product_analytics/frontend/insights/shared/InsightsTable/InsightsTable'
+import { BoxPlotLegend } from 'products/product_analytics/frontend/insights/trends/BoxPlot/BoxPlotLegend'
+import { BoxPlotResultsTable } from 'products/product_analytics/frontend/insights/trends/BoxPlot/BoxPlotResultsTable'
+import { TrendInsight } from 'products/product_analytics/frontend/insights/trends/Trends'
+
+import { DetailedResultsHeading } from './DetailedResultsHeading'
+import { FlagCallsRetentionNotice } from './FlagCallsRetentionNotice'
+import { InsightResultMetadata } from './InsightResultMetadata'
+import { ResultCustomizationsModal } from './ResultCustomizationsModal'
+
+// Query.tsx reaches this file through static imports, so a static import of web analytics puts its
+// tiles on every page that shows an insight.
+const WebAnalyticsInsight = lazyWithRetry(() =>
+    import('scenes/web-analytics/WebAnalyticsInsight').then((m) => ({ default: m.WebAnalyticsInsight }))
+)
+const InsightExplainChart = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/explainChart/InsightExplainChart').then((m) => ({
+        default: m.InsightExplainChart,
+    }))
+)
+const FunnelCardSummary = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/funnels/FunnelCardSummary').then((m) => ({
+        default: m.FunnelCardSummary,
+    }))
+)
+const ExplainChartButton = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/explainChart/ExplainChartButton').then((m) => ({
+        default: m.ExplainChartButton,
+    }))
+)
+const ExplainChartAgentBridge = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/explainChart/ExplainChartAgentBridge').then((m) => ({
+        default: m.ExplainChartAgentBridge,
+    }))
+)
+const ExplainChartAIAnalysisFallback = lazyWithRetry(() =>
+    import('products/product_analytics/frontend/insights/explainChart/ExplainChartAIAnalysisFallback').then((m) => ({
+        default: m.ExplainChartAIAnalysisFallback,
+    }))
+)
+
+/** When the dashboard is still streaming/refreshing tiles, prefer loading UX over "Chart data didn't load". */
+function DashboardInsightRefreshHintOrLoading({
+    dashboardId,
+    dashboardItemId,
+    insightProps,
+    queryId,
+    context,
+    onRetry,
+}: {
+    dashboardId: number
+    dashboardItemId: InsightLogicProps['dashboardItemId']
+    insightProps: InsightLogicProps
+    queryId: string | null
+    context?: QueryContext<InsightVizNode>
+    onRetry: () => void
+}): JSX.Element {
+    const { itemsLoading, isRefreshingQueued, isRefreshing } = useValues(dashboardLogic({ id: dashboardId }))
+    const shortId =
+        dashboardItemId && typeof dashboardItemId === 'string' && !dashboardItemId.startsWith('new')
+            ? dashboardItemId
+            : null
+    const tilePending = shortId !== null && (isRefreshingQueued(shortId) || isRefreshing(shortId))
+    if (itemsLoading || tilePending) {
+        return (
+            <InsightLoadingState
+                queryId={queryId}
+                key={queryId}
+                insightProps={insightProps}
+                renderEmptyStateAsSkeleton={context?.renderEmptyStateAsSkeleton}
+                suppressSlowQuerySuggestions
+            />
+        )
+    }
+    return <InsightRefreshDataHint onRetry={onRetry} insightProps={insightProps} />
+}
+
+function exportItems(exportContext: ExportButtonItem['export_context']): ExportButtonItem[] {
+    return [
+        { export_format: ExporterFormat.CSV, export_context: exportContext },
+        { export_format: ExporterFormat.XLSX, export_context: exportContext },
+    ]
+}
+
+function isNonEmptyResult(rows: unknown): boolean {
+    return Array.isArray(rows) ? rows.length > 0 : rows != null
+}
+
+/** A settled query came back with rows. An empty success is `result: []`, so presence alone is not enough. */
+export function hasResultRows(insightData: Record<string, any> | null | undefined): boolean {
+    return isNonEmptyResult(insightData?.result) || isNonEmptyResult(insightData?.results)
+}
+
+/**
+ * The "PostHog AI" section offers to explain the insight, so it only belongs next to results worth explaining.
+ * It stays up while the query is in flight so it doesn't appear only once the chart draws. A query that
+ * returned rows keeps it, even when the chart reads as empty, since that is what people ask PostHog AI about.
+ */
+export function shouldShowAIAnalysisSection({
+    editMode,
+    embedded,
+    inSharedMode,
+    hasQuerySource,
+    insightDataLoading,
+    hasBlockingEmptyState,
+    hasResults,
+}: {
+    editMode?: boolean
+    embedded?: boolean
+    inSharedMode?: boolean
+    hasQuerySource: boolean
+    insightDataLoading: boolean
+    hasBlockingEmptyState: boolean
+    hasResults: boolean
+}): boolean {
+    if (editMode || embedded || inSharedMode || !hasQuerySource) {
+        return false
+    }
+    if (insightDataLoading) {
+        return true
+    }
+    return !hasBlockingEmptyState && hasResults
+}
+
+/** Dashboard tile: show refresh when merged `result` is still nullish (empty success is `[]`, not `null`). */
+export function shouldShowDashboardInsightRefreshHint({
+    isInDashboardContext,
+    doNotLoad,
+    activeView,
+    insightData,
+}: {
+    isInDashboardContext: boolean
+    doNotLoad?: boolean
+    activeView: InsightType
+    insightData: Record<string, any> | null | undefined
+}): boolean {
+    if (!isInDashboardContext || doNotLoad || activeView === InsightType.WEB_ANALYTICS) {
+        return false
+    }
+    const rawResult = insightData?.result
+    return rawResult === null || rawResult === undefined
+}
+
+export function InsightVizDisplay({
+    disableHeader,
+    disableTable,
+    disableLastComputation,
+    disableLastComputationRefresh,
+    showingResults,
+    context,
+    embedded,
+    inSharedMode,
+    editMode,
+}: {
+    disableHeader?: boolean
+    disableTable?: boolean
+    disableLastComputation?: boolean
+    disableLastComputationRefresh?: boolean
+    showingResults?: boolean
+    context?: QueryContext<InsightVizNode>
+    embedded: boolean
+    inSharedMode?: boolean
+    editMode?: boolean
+}): JSX.Element | null {
+    const { insightProps, canEditInsight, isInDashboardContext } = useValues(insightLogic)
+
+    const { activeView } = useValues(insightNavLogic(insightProps))
+
+    const {
+        isFunnels,
+        isPaths,
+        hasDetailedResultsTable,
+        showLegend,
+        usesInChartLegend,
+        hasFormula,
+        supportsDisplay,
+        samplingFactor,
+        insightDataLoading,
+        hasRenderableResults,
+        erroredQueryId,
+        timedOutQueryId,
+        vizSpecificOptions,
+        query,
+        querySource,
+        display,
+        series,
+        insightData,
+        validationError,
+        validationErrorCode,
+        theme,
+        flagCallsRetentionGap,
+        flagCallsRetentionStartDate,
+    } = useValues(insightVizDataLogic(insightProps))
+    const { loadData, updateQuerySource } = useActions(insightVizDataLogic(insightProps))
+    const { exportContext, queryId, insightDataError } = useValues(insightDataLogic(insightProps))
+    const {
+        funnelsFilter,
+        funnelVizType,
+        hasFunnelResults,
+        isFunnelWithEnoughSteps,
+        isFunnelWithIncompleteDataWarehouseStep,
+    } = useValues(funnelDataLogic(insightProps))
+
+    const explainChartEnabled = useFeatureFlag('EXPLAIN_CHART')
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+    // An embedded viz is quill only when its host, such as a quill dashboard tile, says so.
+    const hostQuillSurface = useQuillSurface()
+    const quillSurface = todayRailNav && (!embedded || hostQuillSurface)
+
+    const isFlowViz = funnelVizType === FunnelVizType.Flow
+    const actionable = !embedded && editMode
+
+    const insightLoadingState = (
+        <InsightLoadingState
+            queryId={queryId}
+            key={queryId}
+            insightProps={insightProps}
+            renderEmptyStateAsSkeleton={context?.renderEmptyStateAsSkeleton}
+            suppressSlowQuerySuggestions={context?.suppressSlowQuerySuggestions}
+        />
+    )
+
+    // Empty states that completely replace the graph
+    const BlockingEmptyState = (() => {
+        if (insightDataLoading) {
+            if (hasRenderableResults) {
+                return null
+            }
+            return insightLoadingState
+        }
+
+        // Insight specific empty states - note order is important here
+        if (
+            display === ChartDisplayType.BoxPlot &&
+            isBoxPlotMissingProperty(series as TrendsQuery['series'] | null | undefined)
+        ) {
+            return <BoxPlotMissingPropertyState />
+        }
+
+        if (activeView === InsightType.FUNNELS && !isFlowViz) {
+            if (isFunnelWithIncompleteDataWarehouseStep) {
+                return <FunnelDataWarehouseStepIncompleteState />
+            }
+
+            if (!isFunnelWithEnoughSteps) {
+                return <FunnelSingleStepState actionable={actionable} />
+            }
+        }
+
+        if (validationError) {
+            const isUnsupportedDataWarehouseSettings =
+                validationErrorCode === 'data_warehouse_series_unsupported_settings'
+            const resetCta = isUnsupportedDataWarehouseSettings ? (
+                <LemonButton
+                    type="primary"
+                    loading={insightDataLoading}
+                    // updateQuerySource also clears the filter groups and test account filtering that the series cannot take.
+                    onClick={() => updateQuerySource({ samplingFactor: undefined })}
+                >
+                    Reset unsupported settings
+                </LemonButton>
+            ) : undefined
+            const useAverageCta =
+                validationErrorCode === 'property_math_unsupported_with_histogram_breakdown' ? (
+                    <LemonButton
+                        type="primary"
+                        loading={insightDataLoading}
+                        onClick={() =>
+                            updateQuerySource({
+                                series: ((series as TrendsQuery['series']) ?? []).map((s) =>
+                                    isPropertyValueMath(s.math) &&
+                                    !SUPPORTED_PROPERTY_MATH_FOR_HISTOGRAM_BREAKDOWN.has(s.math)
+                                        ? { ...s, math: PropertyMathType.Average }
+                                        : s
+                                ),
+                            } as Partial<TrendsQuery>)
+                        }
+                    >
+                        Use average instead
+                    </LemonButton>
+                ) : undefined
+            const cta = resetCta ?? useAverageCta
+            return (
+                <InsightValidationError
+                    query={query}
+                    detail={validationError}
+                    validationErrorCode={validationErrorCode}
+                    onRetry={
+                        cta
+                            ? undefined
+                            : () => {
+                                  loadData(query && shouldQueryBeAsync(query) ? 'force_async' : 'force_blocking')
+                              }
+                    }
+                    cta={cta}
+                />
+            )
+        }
+
+        // Insight agnostic empty states
+        if (erroredQueryId) {
+            return (
+                <InsightErrorState
+                    query={query}
+                    queryId={erroredQueryId}
+                    titleStatus={insightDataError?.status}
+                    retryAfterTimestamp={insightDataError?.retryAfterTimestamp}
+                    onRetry={() => {
+                        loadData(query && shouldQueryBeAsync(query) ? 'force_async' : 'force_blocking')
+                    }}
+                />
+            )
+        }
+        if (timedOutQueryId) {
+            return <InsightTimeoutState queryId={timedOutQueryId} />
+        }
+
+        // On a dashboard, users sometimes see an empty chart even though the insight is valid—often because
+        // they navigated away while numbers were still loading, or nothing was cached yet. Prompt them to
+        // refresh rather than staring at a blank tile. this is possible if the redis cache is a miss, and they dont have anything
+        // cached on their browser yet either.
+        if (
+            shouldShowDashboardInsightRefreshHint({
+                isInDashboardContext,
+                doNotLoad: insightProps.doNotLoad,
+                activeView,
+                insightData,
+            })
+        ) {
+            const onRetry = (): void => loadData(query && shouldQueryBeAsync(query) ? 'force_async' : 'force_blocking')
+            if (insightProps.dashboardId != null) {
+                return (
+                    <DashboardInsightRefreshHintOrLoading
+                        dashboardId={insightProps.dashboardId}
+                        dashboardItemId={insightProps.dashboardItemId}
+                        insightProps={insightProps}
+                        queryId={queryId}
+                        context={context}
+                        onRetry={onRetry}
+                    />
+                )
+            }
+            return <InsightRefreshDataHint onRetry={onRetry} insightProps={insightProps} />
+        }
+
+        if (activeView === InsightType.FUNNELS && !isFlowViz) {
+            if (!hasFunnelResults && !erroredQueryId && !insightDataLoading) {
+                return (
+                    <InsightEmptyState
+                        heading={context?.emptyStateHeading}
+                        detail={context?.emptyStateDetail}
+                        sampleDataVariant="funnel"
+                    />
+                )
+            }
+        }
+
+        return null
+    })()
+
+    // A chart that draws its own legend inside the plot opts out of the side-legend column, so we
+    // don't render two legends. The slope graph always does; trends/stickiness/lifecycle charts
+    // (including pie) do when the quill in-chart legend is on (`usesInChartLegend`).
+    const chartDrawsOwnLegend = display === ChartDisplayType.SlopeGraph || usesInChartLegend
+    const showSideLegend = supportsDisplay && showLegend && !chartDrawsOwnLegend
+
+    function renderActiveView(viewContext = context): JSX.Element | null {
+        switch (activeView) {
+            case InsightType.TRENDS:
+                return (
+                    <TrendInsight
+                        view={InsightType.TRENDS}
+                        editMode={editMode}
+                        context={viewContext}
+                        embedded={embedded}
+                        inSharedMode={inSharedMode}
+                    />
+                )
+            case InsightType.STICKINESS:
+                return (
+                    <TrendInsight
+                        view={InsightType.STICKINESS}
+                        editMode={editMode}
+                        context={context}
+                        embedded={embedded}
+                        inSharedMode={inSharedMode}
+                    />
+                )
+            case InsightType.LIFECYCLE:
+                return (
+                    <TrendInsight
+                        view={InsightType.LIFECYCLE}
+                        editMode={editMode}
+                        context={context}
+                        embedded={embedded}
+                        inSharedMode={inSharedMode}
+                    />
+                )
+            case InsightType.FUNNELS:
+                return (
+                    <Funnel
+                        context={viewContext}
+                        inCardView={embedded}
+                        inSharedMode={inSharedMode}
+                        showPersonsModal={!inSharedMode}
+                    />
+                )
+            case InsightType.RETENTION:
+                return (
+                    <RetentionContainer
+                        context={context}
+                        vizSpecificOptions={vizSpecificOptions?.[InsightType.RETENTION]}
+                        inCardView={embedded}
+                        embedded={embedded}
+                        inSharedMode={inSharedMode}
+                    />
+                )
+            case InsightType.PATHS:
+                return <Paths />
+            case InsightType.JOURNEYS:
+                return <Journeys showPersonsModal={!inSharedMode} />
+            case InsightType.WEB_ANALYTICS:
+                return (
+                    <ChunkLoadErrorBoundary>
+                        {/* The image exporter waits for every .Spinner to detach, so a Spinner fallback stops it capturing the page before this chunk loads. */}
+                        <Suspense
+                            fallback={
+                                <div className="flex justify-center my-8">
+                                    <Spinner className="text-3xl" />
+                                </div>
+                            }
+                        >
+                            <WebAnalyticsInsight context={context} editMode={editMode} />
+                        </Suspense>
+                    </ChunkLoadErrorBoundary>
+                )
+            default:
+                return null
+        }
+    }
+
+    function renderTable(): JSX.Element | null {
+        if (
+            isFunnels &&
+            erroredQueryId === null &&
+            timedOutQueryId === null &&
+            isFunnelWithEnoughSteps &&
+            hasFunnelResults &&
+            !disableTable
+        ) {
+            const funnelTable =
+                funnelVizType === FunnelVizType.TimeToConvert ? (
+                    <FunnelTimeToConvertTable />
+                ) : funnelVizType === FunnelVizType.Trends ? (
+                    <FunnelTrendsTable />
+                ) : funnelVizType === FunnelVizType.Steps || funnelVizType === FunnelVizType.Flow ? (
+                    <FunnelStepsTable />
+                ) : null
+
+            if (funnelTable) {
+                return (
+                    <SceneSection title={<DetailedResultsHeading as="span" />} className="mt-4">
+                        {funnelTable}
+                    </SceneSection>
+                )
+            }
+        }
+
+        if (display === ChartDisplayType.BoxPlot && !disableTable) {
+            return (
+                <div className="mt-4">
+                    <DetailedResultsHeading className="mb-2" />
+                    <BoxPlotResultsTable />
+                </div>
+            )
+        }
+
+        if (hasDetailedResultsTable && !disableTable) {
+            return (
+                <>
+                    {exportContext &&
+                        (quillSurface ? (
+                            <div className="flex items-center justify-between gap-2 my-4">
+                                <DetailedResultsHeading />
+                                <QuillExportButton tooltip="Export this table" items={exportItems(exportContext)} />
+                            </div>
+                        ) : (
+                            <div className="flex items-center justify-between my-4 mx-0">
+                                <DetailedResultsHeading />
+                                <Tooltip title="Export this table" placement="left">
+                                    <ExportButton type="secondary" items={exportItems(exportContext)} />
+                                </Tooltip>
+                            </div>
+                        ))}
+
+                    <InsightsTable
+                        // Do not show ribbons for world map insight table. All ribbons are nuances of blue, and do not bring any UX value
+                        isLegend={display !== ChartDisplayType.WorldMap}
+                        embedded={embedded}
+                        editMode={editMode}
+                        filterKey={keyForInsightLogicProps('new')(insightProps)}
+                        canEditSeriesNameInline={!hasFormula && editMode}
+                        seriesNameTooltip={hasFormula && editMode ? 'Formula series names are not editable' : undefined}
+                        canCheckUncheckSeries={canEditInsight}
+                    />
+                </>
+            )
+        }
+
+        return null
+    }
+
+    function renderAIAnalysisSection(): JSX.Element | null {
+        return shouldShowAIAnalysisSection({
+            editMode,
+            embedded,
+            inSharedMode,
+            hasQuerySource: !!querySource,
+            insightDataLoading,
+            hasBlockingEmptyState: !!BlockingEmptyState,
+            hasResults: hasResultRows(insightData),
+        }) ? (
+            showsExplainChart ? (
+                <Suspense fallback={null}>
+                    <ExplainChartAIAnalysisFallback insightProps={insightProps} />
+                </Suspense>
+            ) : (
+                <InsightAIAnalysis />
+            )
+        ) : null
+    }
+
+    const showComputationMetadata = !disableLastComputation || !!samplingFactor
+    const showsDataChecks = !!context?.showDataChecks && !inSharedMode
+    const showsExplainChart =
+        explainChartEnabled &&
+        !embedded &&
+        !inSharedMode &&
+        (activeView === InsightType.TRENDS || activeView === InsightType.FUNNELS)
+    const chart = showsExplainChart ? (
+        <Suspense fallback={renderActiveView()}>
+            <InsightExplainChart
+                insightProps={insightProps}
+                renderChart={(overlay) => renderActiveView(overlay ? { ...context, chartOverlay: overlay } : context)}
+            />
+        </Suspense>
+    ) : (
+        renderActiveView()
+    )
+
+    // Web Analytics insights don't use themes, so allow them to render without waiting for theme to load
+    if (!theme && activeView !== InsightType.WEB_ANALYTICS) {
+        return insightLoadingState
+    }
+
+    return (
+        <>
+            {/* These are filters that are reused between insight features. They each have generic logic that updates the url */}
+            <div
+                className={clsx(
+                    `InsightVizDisplay InsightVizDisplay--type-${activeView.toLowerCase()}`,
+                    !embedded && 'border rounded bg-surface-primary'
+                )}
+                data-attr={INSIGHT_GRAPH_DATA_ATTR}
+            >
+                {disableHeader ? null : (
+                    <InsightDisplayConfig
+                        chartTypeControl={
+                            <ChartAlternatives
+                                insightProps={insightProps}
+                                embedded={embedded}
+                                inSharedMode={inSharedMode}
+                            />
+                        }
+                    />
+                )}
+                {showingResults && (
+                    <QuillSurfaceContext.Provider value={quillSurface}>
+                        <ExplainEmptyInsightContext.Provider value={!embedded}>
+                            {embedded &&
+                                isFunnels &&
+                                hasFunnelResults &&
+                                funnelsFilter?.showSummaryOnDashboards === true && (
+                                    <Suspense fallback={<Spinner />}>
+                                        <FunnelCardSummary />
+                                    </Suspense>
+                                )}
+                            {!embedded &&
+                                ((isFunnels && hasFunnelResults) ||
+                                    isPaths ||
+                                    (showComputationMetadata && !BlockingEmptyState)) && (
+                                    <div className="flex items-center justify-between gap-2 p-2 flex-wrap-reverse border-b">
+                                        <div className="flex items-center gap-2">
+                                            {showComputationMetadata && (
+                                                <InsightResultMetadata
+                                                    disableLastComputation={disableLastComputation}
+                                                    disableLastComputationRefresh={disableLastComputationRefresh}
+                                                />
+                                            )}
+                                        </div>
+
+                                        <div className="flex items-center gap-2">
+                                            {isPaths && <PathCanvasLabel />}
+                                            {isFunnels && <FunnelCanvasLabel />}
+                                            {showsExplainChart && (
+                                                <Suspense fallback={null}>
+                                                    <ExplainChartButton insightProps={insightProps} />
+                                                </Suspense>
+                                            )}
+                                            {showsDataChecks && <InsightDataChecks insightProps={insightProps} />}
+                                        </div>
+                                    </div>
+                                )}
+
+                            {!embedded && flagCallsRetentionGap && (
+                                <FlagCallsRetentionNotice
+                                    gap={flagCallsRetentionGap}
+                                    retentionStartDate={flagCallsRetentionStartDate}
+                                />
+                            )}
+                            <div
+                                className={clsx(
+                                    'InsightVizDisplay__content',
+                                    showSideLegend && 'InsightVizDisplay__content--with-legend'
+                                )}
+                            >
+                                {BlockingEmptyState ? (
+                                    BlockingEmptyState
+                                ) : showSideLegend ? (
+                                    <>
+                                        <div className="InsightVizDisplay__content__left">{chart}</div>
+                                        <div className="InsightVizDisplay__content__right empty:hidden">
+                                            {display === ChartDisplayType.BoxPlot ? (
+                                                <BoxPlotLegend />
+                                            ) : (
+                                                <InsightLegend />
+                                            )}
+                                        </div>
+                                    </>
+                                ) : (
+                                    chart
+                                )}
+                            </div>
+                        </ExplainEmptyInsightContext.Provider>
+                    </QuillSurfaceContext.Provider>
+                )}
+            </div>
+            <ResultCustomizationsModal />
+            {showsExplainChart && (
+                <Suspense fallback={null}>
+                    <ExplainChartAgentBridge insightProps={insightProps} />
+                </Suspense>
+            )}
+            <QuillSurfaceContext.Provider value={quillSurface}>
+                {renderAIAnalysisSection()}
+                {renderTable()}
+            </QuillSurfaceContext.Provider>
+        </>
+    )
+}

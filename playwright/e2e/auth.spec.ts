@@ -1,0 +1,135 @@
+import { NodeKind } from '../../frontend/src/queries/schema/schema-general'
+import { LoginPage } from '../page-models/loginPage'
+import { LOGIN_PASSWORD, LOGIN_USERNAME } from '../utils/playwright-test-core'
+import { PlaywrightWorkspaceSetupResult, expect, test } from '../utils/workspace-test-base'
+
+test.describe('Auth', () => {
+    let loginPage: LoginPage
+    let workspace: PlaywrightWorkspaceSetupResult | null = null
+    const redirectInsightName = 'Authentication redirect insight'
+
+    test.beforeAll(async ({ playwrightSetup }) => {
+        workspace = await playwrightSetup.createWorkspace({
+            skip_onboarding: true,
+            no_demo_data: true,
+            insights: [
+                {
+                    name: redirectInsightName,
+                    query: {
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            kind: NodeKind.TrendsQuery,
+                            series: [{ kind: NodeKind.EventsNode, event: '$pageview' }],
+                        },
+                    },
+                },
+            ],
+        })
+    })
+
+    test.beforeEach(async ({ page, playwrightSetup }) => {
+        await playwrightSetup.loginAndNavigateToTeam(page, workspace!)
+        await page.locator('[data-attr=new-account-menu-button]').click()
+        loginPage = new LoginPage(page)
+    })
+
+    test('Logout and login', async ({ page }) => {
+        await page.locator('[data-attr=new-account-menu-logout-button]').click()
+
+        await loginPage.enterUsername(LOGIN_USERNAME)
+        await expect(page.locator('[data-attr=login-email]')).toHaveValue(LOGIN_USERNAME)
+
+        await loginPage.continueWithEmail()
+
+        await loginPage.enterPassword(LOGIN_PASSWORD)
+        await expect(page.locator('[data-attr=password]')).toHaveValue(LOGIN_PASSWORD)
+
+        await loginPage.clickLogin()
+        await expect(page).toHaveURL(/\/project\/\d+/)
+    })
+
+    test('Logout and verify Google login button has correct link', async ({ page }) => {
+        // available_social_auth_providers comes from POSTHOG_APP_CONTEXT, which is server-rendered into the
+        // login page HTML and read directly by preflightLogic on mount — so API mocks don't apply. Patch the
+        // context before the page scripts run; mutating it after the page has loaded is racy and only
+        // renders the button on lucky timing.
+        await page.addInitScript(() => {
+            let _context: any = undefined
+            Object.defineProperty(window, 'POSTHOG_APP_CONTEXT', {
+                get() {
+                    if (_context?.preflight) {
+                        _context.preflight.available_social_auth_providers ??= {}
+                        _context.preflight.available_social_auth_providers['google-oauth2'] = true
+                    }
+                    return _context
+                },
+                set(value) {
+                    _context = value
+                },
+                configurable: true,
+            })
+        })
+
+        await page.locator('[data-attr=new-account-menu-logout-button]').click()
+
+        await expect(page.locator('a[href="/login/google-oauth2/"]')).toBeVisible()
+    })
+
+    test('Try logging in improperly and then properly', async ({ page }) => {
+        await page.locator('[data-attr=new-account-menu-logout-button]').click()
+
+        await loginPage.enterUsername(LOGIN_USERNAME)
+        await expect(page.locator('[data-attr=login-email]')).toHaveValue(LOGIN_USERNAME)
+
+        await loginPage.continueWithEmail()
+
+        await loginPage.enterPassword('wrong password')
+        await expect(page.locator('[data-attr=password]')).toHaveValue('wrong password')
+
+        await loginPage.clickLogin()
+        await expect(page.getByText('Invalid email or password.')).toBeVisible()
+
+        await loginPage.enterPassword(LOGIN_PASSWORD)
+        await loginPage.clickLogin()
+
+        await expect(page).toHaveURL(/\/project\/\d+/)
+    })
+
+    test('Redirect to appropriate place after login with complex URL', async ({ page, context }) => {
+        await context.clearCookies()
+        await page.goto('/insights?search=testString', { waitUntil: 'commit' })
+        await expect(page).toHaveURL(/\/login/)
+
+        await loginPage.enterUsername(LOGIN_USERNAME)
+        await loginPage.continueWithEmail()
+
+        await loginPage.enterPassword(LOGIN_PASSWORD)
+        await loginPage.clickLogin()
+
+        await expect(page).toHaveURL(/search%3DtestString/)
+        await expect(page.locator('.saved-insight-empty-state')).toContainText('testString')
+    })
+
+    test('Redirect to a saved insight after login', async ({ page, context }) => {
+        const insightShortId = workspace!.created_insights![0].short_id
+        const insightUrl = `/project/${workspace!.team_id}/insights/${insightShortId}`
+
+        await context.clearCookies()
+        await page.goto(insightUrl, { waitUntil: 'commit' })
+        await expect(page).toHaveURL(/\/login/)
+
+        await loginPage.enterUsername(workspace!.user_email)
+        await loginPage.continueWithEmail()
+
+        await loginPage.enterPassword(LOGIN_PASSWORD)
+        await loginPage.clickLogin()
+
+        await expect(page).toHaveURL(insightUrl)
+        await expect(page.getByTestId('scene-name')).toContainText(redirectInsightName)
+    })
+
+    test('Cannot access signup page if authenticated', async ({ page }) => {
+        await page.goto('/signup')
+        await expect(page).toHaveURL(/\/project\/\d+/)
+    })
+})

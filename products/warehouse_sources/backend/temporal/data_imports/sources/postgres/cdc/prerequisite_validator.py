@@ -1,0 +1,344 @@
+"""CDC prerequisite validator for PostgreSQL.
+
+Checks whether a PostgreSQL database is ready for CDC via logical replication.
+Returns a list of user-facing error messages (empty = all checks passed).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Literal
+
+import psycopg
+from psycopg import sql
+
+from posthog.dataclasses import frozen
+
+from products.warehouse_sources.backend.temporal.data_imports.sources.postgres.cdc.slot_manager import (
+    publication_exists,
+    slot_exists,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@frozen
+class _QualifiedTable:
+    schema: str
+    table: str
+
+
+def validate_cdc_prerequisites(
+    conn: psycopg.Connection,
+    management_mode: Literal["posthog", "self_managed"],
+    tables: list[str],
+    schema: str | None = "public",
+    slot_name: str | None = None,
+    publication_name: str | None = None,
+) -> list[str]:
+    """Validate that the database is ready for CDC.
+
+    `schema` is the single schema the source is configured to read. Pass None when the source
+    reads every schema, because schema discovery then names each table `schema.table` and the
+    entries in `tables` carry their own schema.
+
+    Returns a list of user-facing error messages. Empty list = valid.
+    """
+    errors: list[str] = []
+    qualified_tables = _resolve_table_schemas(tables, schema)
+
+    errors.extend(_check_pg_version(conn))
+    errors.extend(_check_wal_level(conn))
+    errors.extend(_check_tables_have_primary_keys(conn, qualified_tables))
+    errors.extend(_check_select_permission(conn, qualified_tables))
+
+    if management_mode == "posthog":
+        errors.extend(_check_replication_role(conn))
+        errors.extend(_check_replication_slot_capacity(conn))
+        errors.extend(_check_can_create_publication(conn, publication_name))
+        errors.extend(_check_table_ownership(conn, qualified_tables))
+    elif management_mode == "self_managed":
+        # Self-managed: the DBA creates the publication out-of-band, PostHog creates
+        # and owns the slot at source-creation time. So we only verify the publication
+        # exists post-setup; the slot is ours to manage.
+        errors.extend(_check_replication_role(conn))
+        errors.extend(_check_replication_slot_capacity(conn))
+        if publication_name:
+            errors.extend(_check_publication_exists(conn, publication_name))
+
+    return errors
+
+
+def _check_pg_version(conn: psycopg.Connection) -> list[str]:
+    """PG version >= 13 (required for publish_via_partition_root)."""
+    with conn.cursor() as cur:
+        cur.execute("SHOW server_version_num")
+        row = cur.fetchone()
+        if row is None:
+            return ["Could not determine PostgreSQL version."]
+        version_num = int(row[0])
+        if version_num < 130000:
+            return [
+                f"PostgreSQL 13 or later is required for CDC. Your server is running version {version_num // 10000}."
+            ]
+    return []
+
+
+def _check_wal_level(conn: psycopg.Connection) -> list[str]:
+    """wal_level must be 'logical'."""
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SHOW wal_level")
+        except psycopg.errors.UndefinedObject:
+            # A database that doesn't expose wal_level can't support logical replication CDC.
+            # Usually a connection pooler (e.g. PgBouncer in transaction mode) or a
+            # non-logical-replication-capable, wire-compatible database.
+            conn.rollback()
+            return [
+                "This database doesn't expose the wal_level setting, so it can't support logical "
+                "replication CDC. This usually means the connection goes through a pooler (such as "
+                "PgBouncer in transaction mode) or to a database that isn't a logical-replication-capable "
+                "PostgreSQL. Connect directly to the primary PostgreSQL server, or switch these tables "
+                "to Incremental sync."
+            ]
+        row = cur.fetchone()
+        if row is None:
+            return ["Could not determine wal_level."]
+        if row[0] != "logical":
+            return [
+                f"wal_level must be set to 'logical' (currently '{row[0]}'). "
+                "This requires a PostgreSQL server restart after changing the configuration."
+            ]
+    return []
+
+
+def _resolve_table_schemas(tables: list[str], schema: str | None) -> list[_QualifiedTable]:
+    """Pair each table with the schema that holds it.
+
+    A source configured for one schema lists bare table names, so they all take that schema. A
+    source that reads every schema lists them as `schema.table`, which must be split before a
+    catalog lookup, because `relname` holds the table name alone.
+    """
+    if schema is not None:
+        return [_QualifiedTable(schema=schema, table=table) for table in tables]
+
+    resolved: list[_QualifiedTable] = []
+    for table in tables:
+        schema_name, separator, table_name = table.partition(".")
+        if separator:
+            resolved.append(_QualifiedTable(schema=schema_name, table=table_name))
+        else:
+            resolved.append(_QualifiedTable(schema="public", table=table))
+    return resolved
+
+
+def _check_tables_have_primary_keys(conn: psycopg.Connection, tables: list[_QualifiedTable]) -> list[str]:
+    """Each target table must have a primary key.
+
+    Uses pg_catalog rather than information_schema because information_schema views
+    are ACL-filtered — a SELECT-only user may see an empty result even when the
+    primary key exists. pg_catalog is always readable.
+    """
+    if not tables:
+        return []
+
+    errors: list[str] = []
+    with conn.cursor() as cur:
+        for qualified in tables:
+            cur.execute(
+                sql.SQL(
+                    "SELECT COUNT(*) FROM pg_index i "
+                    "JOIN pg_class c ON c.oid = i.indrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE i.indisprimary AND n.nspname = {} AND c.relname = {}"
+                ).format(sql.Literal(qualified.schema), sql.Literal(qualified.table))
+            )
+            row = cur.fetchone()
+            if row is None or row[0] == 0:
+                errors.append(
+                    f"Table '{qualified.schema}.{qualified.table}' has no primary key. "
+                    "CDC requires a primary key on each table."
+                )
+    return errors
+
+
+def _check_select_permission(conn: psycopg.Connection, tables: list[_QualifiedTable]) -> list[str]:
+    """Check SELECT permission on target tables."""
+    errors: list[str] = []
+    with conn.cursor() as cur:
+        for qualified in tables:
+            try:
+                cur.execute(
+                    sql.SQL("SELECT 1 FROM {}.{} LIMIT 0").format(
+                        sql.Identifier(qualified.schema), sql.Identifier(qualified.table)
+                    )
+                )
+            except psycopg.errors.InsufficientPrivilege:
+                conn.rollback()
+                errors.append(f"No SELECT permission on table '{qualified.schema}.{qualified.table}'.")
+            except psycopg.errors.UndefinedTable:
+                conn.rollback()
+                errors.append(f"Table '{qualified.schema}.{qualified.table}' does not exist.")
+    return errors
+
+
+def _check_table_ownership(conn: psycopg.Connection, tables: list[_QualifiedTable]) -> list[str]:
+    """Each target table must be owned by the connecting role (PostHog-managed mode).
+
+    PostHog builds the publication itself, and PostgreSQL only lets a table's owner put it
+    in one. A role with REPLICATION and SELECT but no ownership passes every other check
+    here and then fails at CREATE PUBLICATION / ALTER PUBLICATION ADD TABLE with
+    "must be owner of table". Membership in the owning role counts as ownership, which is
+    what pg_has_role reports.
+
+    A table with no pg_class row is skipped, because the primary-key and SELECT checks
+    already report it as missing.
+    """
+    if not tables:
+        return []
+
+    errors: list[str] = []
+    with conn.cursor() as cur:
+        for qualified in tables:
+            cur.execute(
+                sql.SQL(
+                    "SELECT pg_has_role(current_user, c.relowner, 'USAGE') FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = {} AND c.relname = {}"
+                ).format(sql.Literal(qualified.schema), sql.Literal(qualified.table))
+            )
+            row = cur.fetchone()
+            if row is not None and row[0] is False:
+                # The user pastes this command, so the identifiers must survive PostgreSQL's
+                # folding of unquoted names to lower case. A table named "Orders" is addressed by
+                # ALTER TABLE public.Orders as `orders`, which does not exist.
+                quoted_name = sql.Identifier(qualified.schema, qualified.table).as_string(None)
+                errors.append(
+                    f"The database user does not own table '{qualified.schema}.{qualified.table}'. "
+                    "PostgreSQL only lets a table's owner publish it, and CDC publishes every table it syncs. "
+                    f"Grant ownership with ALTER TABLE {quoted_name} OWNER TO <username>, "
+                    "or add the user to the role that owns the table with GRANT <owner_role> TO <username>. "
+                    "If you can't change ownership, switch this table to Incremental sync instead of CDC. "
+                    "Incremental needs only SELECT permission."
+                )
+    return errors
+
+
+def _check_replication_role(conn: psycopg.Connection) -> list[str]:
+    """Check if current user can create logical replication slots (PostHog-managed mode).
+
+    Any of the following is sufficient:
+      - rolsuper: superusers can always create slots
+      - rolreplication: the standard REPLICATION attribute
+      - membership in rds_replication or rds_superuser: AWS RDS's equivalent
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                r.rolsuper
+                OR r.rolreplication
+                OR EXISTS (
+                    SELECT 1
+                    FROM pg_auth_members m
+                    JOIN pg_roles parent ON parent.oid = m.roleid
+                    WHERE m.member = r.oid
+                      AND parent.rolname IN ('rds_replication', 'rds_superuser')
+                )
+            FROM pg_roles r
+            WHERE r.rolname = current_user
+            """
+        )
+        row = cur.fetchone()
+        if row is None:
+            return ["Could not determine user roles."]
+        if not row[0]:
+            return [
+                "The database user cannot create logical replication slots. "
+                "Grant one of: REPLICATION attribute (ALTER USER <username> WITH REPLICATION), "
+                "superuser, or membership in rds_replication / rds_superuser on RDS. "
+                "If you can't grant replication access, switch these tables to Incremental sync "
+                "instead of CDC. Incremental needs only SELECT permission."
+            ]
+    return []
+
+
+def _check_can_create_publication(conn: psycopg.Connection, publication_name: str | None) -> list[str]:
+    """The connecting role needs CREATE on the database to create the publication (PostHog-managed mode).
+
+    PostgreSQL checks this privilege for CREATE PUBLICATION separately from the replication
+    attribute, so a role that can create a slot can still be refused with "permission denied
+    for database". A publication that already exists is adopted, not created, so it needs no
+    privilege.
+    """
+    if publication_name and publication_exists(conn, publication_name):
+        return []
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_database(), has_database_privilege(current_user, current_database(), 'CREATE')")
+        row = cur.fetchone()
+        if row is not None and row[1] is False:
+            quoted_database = sql.Identifier(row[0]).as_string(None)
+            return [
+                "The database user cannot create a publication. "
+                f"Grant it with GRANT CREATE ON DATABASE {quoted_database} TO <username>. "
+                "If you can't grant that, use self-managed mode and create the publication yourself, "
+                "or switch these tables to Incremental sync instead of CDC. "
+                "Incremental needs only SELECT permission."
+            ]
+    return []
+
+
+def _check_replication_slot_capacity(conn: psycopg.Connection) -> list[str]:
+    """Check if there's capacity for a new replication slot."""
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SHOW max_replication_slots")
+        except psycopg.errors.UndefinedObject:
+            # Twin of the `_check_wal_level` guard above: a pooler or wire-compatible database
+            # that doesn't expose this parameter can't support logical replication CDC either.
+            conn.rollback()
+            return [
+                "This database doesn't expose the max_replication_slots setting, so it can't "
+                "support logical replication CDC. This usually means the connection goes through "
+                "a pooler (such as PgBouncer in transaction mode) or to a database that isn't a "
+                "logical-replication-capable PostgreSQL. Connect directly to the primary "
+                "PostgreSQL server, or switch these tables to Incremental sync."
+            ]
+        max_row = cur.fetchone()
+        if max_row is None:
+            return ["Could not determine max_replication_slots."]
+
+        max_slots = int(max_row[0])
+
+        cur.execute("SELECT COUNT(*) FROM pg_replication_slots")
+        count_row = cur.fetchone()
+        if count_row is None:
+            return ["Could not count existing replication slots."]
+
+        current_slots = int(count_row[0])
+
+        if current_slots >= max_slots:
+            return [
+                f"No replication slot capacity available ({current_slots}/{max_slots} slots in use). "
+                "Increase max_replication_slots in your PostgreSQL configuration."
+            ]
+    return []
+
+
+def _check_slot_exists(conn: psycopg.Connection, slot_name: str) -> list[str]:
+    """Self-managed: verify the provided slot exists."""
+    if not slot_exists(conn, slot_name):
+        return [
+            f"Replication slot '{slot_name}' does not exist. Create it with: SELECT pg_create_logical_replication_slot('{slot_name}', 'pgoutput');"
+        ]
+    return []
+
+
+def _check_publication_exists(conn: psycopg.Connection, pub_name: str) -> list[str]:
+    """Self-managed: verify the provided publication exists."""
+    if not publication_exists(conn, pub_name):
+        return [
+            f"Publication '{pub_name}' does not exist. Create it with: CREATE PUBLICATION {pub_name} FOR TABLE ...;"
+        ]
+    return []

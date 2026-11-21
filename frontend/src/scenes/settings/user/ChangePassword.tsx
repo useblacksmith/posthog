@@ -1,0 +1,116 @@
+import { useActions, useValues } from 'kea'
+import { Form } from 'kea-forms'
+
+import { LemonButton, LemonInput } from '@posthog/lemon-ui'
+
+import PasswordStrength from 'lib/components/PasswordStrength'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { LemonField } from 'lib/lemon-ui/LemonField'
+import { userLogic } from 'scenes/userLogic'
+
+import { changePasswordLogic } from './changePasswordLogic'
+
+export function ChangePasswordTitle(): JSX.Element {
+    const { user } = useValues(userLogic)
+    const hasPassword = user?.has_password ?? false
+    return <>{hasPassword ? 'Change password' : 'Set password'}</>
+}
+
+export function ChangePassword(): JSX.Element {
+    const {
+        validatedPassword,
+        isChangePasswordSubmitting,
+        user,
+        passwordResetEmailSent,
+        passwordResetEmailSentLoading,
+    } = useValues(changePasswordLogic)
+    const { requestPasswordResetEmail } = useActions(changePasswordLogic)
+    const hasPassword = user?.has_password ?? false
+
+    return (
+        <Form logic={changePasswordLogic} formKey="changePassword" enableFormOnSubmit className="max-w-160">
+            {/* Password managers match a saved login by username, so without one they offer a generated password for the current password too */}
+            <input
+                type="email"
+                name="email"
+                autoComplete="username"
+                value={user?.email || ''}
+                readOnly
+                tabIndex={-1}
+                aria-hidden
+                className="sr-only"
+            />
+            {/* Spacing lives on this wrapper so the hidden input above does not push the first field down */}
+            <div className="deprecated-space-y-4">
+                {hasPassword && (
+                    <>
+                        <LemonField
+                            name="current_password"
+                            label={
+                                <div className="flex flex-1 items-center justify-between gap-2">
+                                    <span>Current password</span>
+                                    <LemonButton
+                                        size="xsmall"
+                                        type="tertiary"
+                                        data-attr="settings-forgot-password"
+                                        onClick={requestPasswordResetEmail}
+                                        loading={passwordResetEmailSentLoading}
+                                    >
+                                        {passwordResetEmailSent ? 'Resend link' : 'Forgot password?'}
+                                    </LemonButton>
+                                </div>
+                            }
+                        >
+                            <LemonInput
+                                autoComplete="current-password"
+                                type="password"
+                                className="ph-ignore-input"
+                                placeholder="••••••••••"
+                            />
+                        </LemonField>
+
+                        {passwordResetEmailSent && (
+                            <LemonBanner type="info">
+                                We emailed a reset link to <span translate="no">{user?.email}</span>. Open it to set a
+                                new password without your current one. Resetting signs you out of PostHog on every
+                                device.
+                            </LemonBanner>
+                        )}
+                    </>
+                )}
+
+                <LemonField
+                    name="password"
+                    label={
+                        <div className="flex flex-1 items-center justify-between">
+                            <span>Password</span>
+                            <PasswordStrength validatedPassword={validatedPassword} />
+                        </div>
+                    }
+                >
+                    <LemonInput
+                        autoComplete="new-password"
+                        type="password"
+                        className="ph-ignore-input"
+                        placeholder="••••••••••"
+                    />
+                </LemonField>
+
+                {!hasPassword && (
+                    <LemonField name="confirm_password" label="Confirm password">
+                        <LemonInput
+                            autoComplete="new-password"
+                            type="password"
+                            className="ph-ignore-input"
+                            placeholder="••••••••••"
+                        />
+                    </LemonField>
+                )}
+
+                <LemonButton type="primary" htmlType="submit" loading={isChangePasswordSubmitting}>
+                    {hasPassword ? 'Change password' : 'Set password'}
+                </LemonButton>
+            </div>
+        </Form>
+    )
+}

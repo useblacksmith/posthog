@@ -1,0 +1,54 @@
+// Build-time entry. Imports + the export below keep these npm packages
+// from being tree-shaken so esbuild's splitter places them in their own
+// shared chunk, keeping the largest chunk under CloudFront's 10 MB cap.
+//
+// An anchor keeps every export of its package, and a package that eager code imports then ships
+// whole on the logged-in path. @base-ui/react is not anchored for that reason: the app shell
+// uses only part of it.
+
+import * as DndKitCore from '@dnd-kit/core'
+import * as TiptapCore from '@tiptap/core'
+import * as XyflowReact from '@xyflow/react'
+// Just the core engine. Importing the package barrel pulls every language
+// module via highlight.js/lib/index.js's registerLanguage() side effects,
+// adding ~1 MB of unused languages to disk.
+import * as HighlightJsCore from 'highlight.js/lib/core'
+import * as Kea from 'kea'
+import * as KeaForms from 'kea-forms'
+import * as KeaLoaders from 'kea-loaders'
+import * as KeaLocalstorage from 'kea-localstorage'
+import * as KeaRouter from 'kea-router'
+import * as KeaSubscriptions from 'kea-subscriptions'
+import * as KeaWindowValues from 'kea-window-values'
+import * as Liquidjs from 'liquidjs'
+import * as Marked from 'marked'
+import * as PosthogJs from 'posthog-js'
+import * as PosthogRrweb from 'posthog-js/rrweb'
+import * as Re2Js from 're2js'
+import * as React from 'react'
+import * as ReactDom from 'react-dom'
+import * as ReactDomClient from 'react-dom/client'
+import * as Zod from 'zod'
+
+export const __chunkAnchors = {
+    DndKitCore,
+    HighlightJsCore,
+    Kea,
+    KeaForms,
+    KeaLoaders,
+    KeaLocalstorage,
+    KeaRouter,
+    KeaSubscriptions,
+    KeaWindowValues,
+    Liquidjs,
+    Marked,
+    PosthogJs,
+    PosthogRrweb,
+    React,
+    ReactDom,
+    ReactDomClient,
+    Re2Js,
+    TiptapCore,
+    XyflowReact,
+    Zod,
+}

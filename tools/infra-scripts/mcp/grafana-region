@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Switch Grafana MCP server between prod-us, prod-eu, dev, internal, mw-dev, mw-prod-us, mw-prod-eu, infra-dev, and infra-dev-wl
+#
+# Usage:
+#   grafana-region         # Show current region
+#   grafana-region us      # Switch to prod-us
+#   grafana-region eu      # Switch to prod-eu
+#   grafana-region dev     # Switch to dev
+#   grafana-region internal # Switch to internal
+#   grafana-region mw-dev   # Switch to mw-dev (same for mw-prod-us, mw-prod-eu, infra-dev, infra-dev-wl)
+#
+# After switching, restart your MCP client (e.g., Claude Code: /exit)
+
+REGION_FILE="$HOME/.grafana-region"
+
+show_current() {
+    if [ -f "$REGION_FILE" ] && [ -s "$REGION_FILE" ]; then
+        local region=$(head -n1 "$REGION_FILE" | tr -cd '[:alnum:]-')
+        echo "Current Grafana region: $region"
+    else
+        echo "Current Grafana region: us (default)"
+    fi
+}
+
+show_usage() {
+    echo "Usage: grafana-region [us|eu|dev|internal|mw-dev|mw-prod-us|mw-prod-eu|infra-dev|infra-dev-wl]"
+    echo ""
+    echo "Commands:"
+    echo "  (no args)     Show current region"
+    echo "  us            Switch to prod-us (us-east-1)"
+    echo "  eu            Switch to prod-eu (eu-central-1)"
+    echo "  dev           Switch to dev (us-east-1)"
+    echo "  internal      Switch to internal"
+    echo "  mw-dev        Switch to mw-dev"
+    echo "  mw-prod-us    Switch to mw-prod-us"
+    echo "  mw-prod-eu    Switch to mw-prod-eu"
+    echo "  infra-dev     Switch to infra-dev"
+    echo "  infra-dev-wl  Switch to infra-dev-wl"
+    echo ""
+    echo "After switching, restart your MCP client to apply the change."
+}
+
+case "${1:-}" in
+    "")
+        show_current
+        ;;
+    us|eu|dev|internal|mw-dev|mw-prod-us|mw-prod-eu|infra-dev|infra-dev-wl)
+        echo "$1" > "$REGION_FILE"
+        echo "Switched Grafana region to: $1"
+        echo ""
+        echo "Restart your MCP client to apply the change."
+        ;;
+    -h|--help)
+        show_usage
+        ;;
+    *)
+        echo "Error: Invalid region '$1'. Must be 'us', 'eu', 'dev', 'internal', 'mw-dev', 'mw-prod-us', 'mw-prod-eu', 'infra-dev', or 'infra-dev-wl'." >&2
+        echo ""
+        show_usage
+        exit 1
+        ;;
+esac

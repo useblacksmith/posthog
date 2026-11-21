@@ -1,0 +1,242 @@
+import { Counter } from 'prom-client'
+
+import { parseJSON } from '~/common/utils/json-parse'
+
+import { Team } from '../../types'
+
+// A destination that fetches one of PostHog's own ingestion endpoints, authenticating
+// as its own project, re-enters the event pipeline. If that re-ingested event then
+// re-triggers the same destination, the chain forms an event-forwarding loop that
+// doubles traffic on every hop. The guard bounds the loop by counting how many times
+// *this specific destination* has re-fed the pipeline - allowing the first
+// SELF_LOOP_MAX_DEPTH hops, then breaking it.
+
+// Event property carrying the self-loop depth *per hog function*, keyed by function id:
+//   { "<functionId>": <hops this destination has re-fed itself> }
+// Keying by function id is deliberate: a destination is bounded only by its OWN re-entries,
+// so an event that merely passed through many unrelated functions can never trip the guard
+// for a legitimately-running destination. Distinct from the shared
+// `$hog_function_execution_count` that bounds the `postHogCapture` path.
+export const SELF_LOOP_DEPTH_PROPERTY = '$hog_function_self_loop_depth'
+
+// Max self-capture hops, for a single destination, before its loop is broken.
+export const SELF_LOOP_MAX_DEPTH = 10
+
+// Capture v1 routes, which take the project token only from an `Authorization: Bearer` header.
+// The AI route can loop too, because ingestion writes `$ai_*` events to the topic destinations consume.
+const V1_INGEST_PATHS = new Set(['/i/v1/analytics/events', '/i/v1/ai/events'])
+
+// Only these paths re-enter the event pipeline. Observability (`/i/v1/logs`) and the
+// REST API (`/api/...`, `/decide`) do NOT re-trigger event processing, so a fetch to
+// them - even with the project's own token - cannot form an event-forwarding loop.
+const INGEST_PATHS = new Set(['/capture', '/batch', '/e', '/track', '/i/v0/e', ...V1_INGEST_PATHS])
+
+// Body fields capture reads the project token from, on a request or on one of its events.
+const API_KEY_FIELDS = ['api_key', 'token', '$token'] as const
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+    !!value && typeof value === 'object' && !Array.isArray(value)
+
+export const selfLoopGuardCounter = new Counter({
+    name: 'cdp_self_loop_guard_total',
+    help: 'Count of fetches the self-loop guard acted on, by mode and action',
+    labelNames: ['mode', 'action'],
+})
+
+const ingestPath = (urlString: string): string | null => {
+    try {
+        const url = new URL(urlString)
+        const host = url.hostname.toLowerCase()
+        const isIngestHost = host === 'posthog.com' || host.endsWith('.posthog.com')
+        if (!isIngestHost) {
+            return null
+        }
+        const path = url.pathname.replace(/\/+$/, '') || '/'
+        return INGEST_PATHS.has(path) ? path : null
+    } catch {
+        return null
+    }
+}
+
+export const isPostHogIngestUrl = (urlString: string): boolean => ingestPath(urlString) !== null
+
+// Mirrors capture's `RawEvent::extract_token`: the event's token field, else `properties.token`.
+const eventToken = (event: unknown): string | null => {
+    if (!event || typeof event !== 'object' || Array.isArray(event)) {
+        return null
+    }
+    const obj = event as Record<string, unknown>
+    for (const field of API_KEY_FIELDS) {
+        if (typeof obj[field] === 'string') {
+            return obj[field] as string
+        }
+    }
+    const properties = obj.properties
+    if (properties && typeof properties === 'object' && !Array.isArray(properties)) {
+        const token = (properties as Record<string, unknown>).token
+        return typeof token === 'string' ? token : null
+    }
+    return null
+}
+
+// The credential a legacy capture request authenticates with - a top-level body field, an event's
+// own token, or an `api_key`/`token` query parameter. An array body counts only when exactly one
+// distinct token appears, because capture rejects several. Deliberately does NOT look at `$lib_token`
+// (SDK metadata auto-attached to event properties) or `Authorization` headers, both of
+// which carry a token without expressing intent to ingest as that project.
+export const extractRequestApiKey = (body: string | null | undefined, urlString: string): string | null => {
+    if (body) {
+        try {
+            const parsed = parseJSON(body)
+            if (Array.isArray(parsed)) {
+                // Capture drops `$performance_event` entries before it reads the tokens.
+                const tokens = new Set(
+                    parsed
+                        .filter((event) => (event as Record<string, unknown> | null)?.event !== '$performance_event')
+                        .map(eventToken)
+                        .filter((token) => token !== null)
+                )
+                if (tokens.size === 1) {
+                    return [...tokens][0]
+                }
+            } else {
+                // Capture ignores `api_token`, so it counts only when the body has no token capture reads.
+                const token = eventToken(parsed) ?? (isPlainObject(parsed) ? parsed.api_token : null)
+                if (typeof token === 'string') {
+                    return token
+                }
+            }
+        } catch {
+            // Not JSON - fall through to the query string.
+        }
+    }
+    try {
+        const params = new URL(urlString).searchParams
+        return params.get('api_key') ?? params.get('token')
+    } catch {
+        return null
+    }
+}
+
+// Mirrors capture v1: the header name and the scheme are case-insensitive, and the token is trimmed.
+export const extractBearerToken = (headers: Record<string, string> | null | undefined): string | null => {
+    if (!headers) {
+        return null
+    }
+    const name = Object.keys(headers).find((key) => key.toLowerCase() === 'authorization')
+    const value = name ? headers[name]?.trim() : undefined
+    if (!value || value.length <= 7 || value.slice(0, 7).toLowerCase() !== 'bearer ') {
+        return null
+    }
+    return value.slice(7).trim() || null
+}
+
+const ownsToken = (team: Pick<Team, 'api_token' | 'secret_api_token'>, token: string): boolean => {
+    return token === team.api_token || (team.secret_api_token !== null && token === team.secret_api_token)
+}
+
+// True when a fetch targets a PostHog ingestion endpoint authenticating with the
+// invocation's own project token - i.e. the shape that can form an event-forwarding
+// loop. Returns false for cross-project replication (a different project's token),
+// non-ingest endpoints, and requests carrying no project credential.
+export const isSelfReferentialIngestFetch = (input: {
+    url: string
+    body: string | null | undefined
+    headers?: Record<string, string> | null
+    team: Pick<Team, 'api_token' | 'secret_api_token'>
+}): boolean => {
+    const path = ingestPath(input.url)
+    if (path === null) {
+        return false
+    }
+    const requestToken = V1_INGEST_PATHS.has(path)
+        ? extractBearerToken(input.headers)
+        : extractRequestApiKey(input.body, input.url)
+    return requestToken !== null && ownsToken(input.team, requestToken)
+}
+
+// Capture v1 also reads an event, or the whole batch, written as a positional array. The depth
+// cannot be stamped onto those, so such a request would loop without ever reaching the cap.
+export const canCarrySelfLoopDepth = (urlString: string, body: string | null | undefined): boolean => {
+    const path = ingestPath(urlString)
+    if (path === null || !V1_INGEST_PATHS.has(path)) {
+        return true
+    }
+    try {
+        const parsed = parseJSON(body ?? '')
+        return isPlainObject(parsed) && Array.isArray(parsed.batch) && parsed.batch.every(isPlainObject)
+    } catch {
+        return false
+    }
+}
+
+// How many times the given hog function has already re-fed the pipeline on this chain,
+// read from the per-function depth map. Returns 0 when absent or malformed.
+//
+// The depth rides on event properties a project owner can set, so it is untrusted: clamp
+// to a non-negative integer. Without this, a seeded negative value (e.g. -999) would read
+// straight through and delay the cap by ~1000 hops; non-finite values are ignored too.
+export const getSelfLoopDepth = (
+    properties: Record<string, unknown> | null | undefined,
+    functionId: string
+): number => {
+    const map = properties?.[SELF_LOOP_DEPTH_PROPERTY]
+    if (map && typeof map === 'object' && !Array.isArray(map)) {
+        const depth = (map as Record<string, unknown>)[functionId]
+        if (typeof depth === 'number' && Number.isFinite(depth)) {
+            return Math.max(0, Math.floor(depth))
+        }
+    }
+    return 0
+}
+
+// Stamp the given function's incremented self-loop depth onto the outgoing capture body so
+// the re-ingested event carries it forward. Only this function's entry is touched - other
+// functions' depths in the map are preserved. Handles single-event and batch shapes.
+// Returns the body unchanged if it can't be parsed as a capture payload.
+export const injectSelfLoopDepth = (
+    body: string | null | undefined,
+    functionId: string,
+    depth: number
+): string | null | undefined => {
+    if (!body) {
+        return body
+    }
+    let parsed: unknown
+    try {
+        parsed = parseJSON(body)
+    } catch {
+        return body
+    }
+    if (!parsed || typeof parsed !== 'object') {
+        return body
+    }
+    const stamp = (event: Record<string, unknown>): void => {
+        const properties = (event.properties && typeof event.properties === 'object' ? event.properties : {}) as Record<
+            string,
+            unknown
+        >
+        // Reject an array here: it passes `typeof === 'object'` but `JSON.stringify` drops the
+        // non-index `functionId` property, so a seeded array would silently lose the depth and
+        // let the loop run uncapped. Start fresh instead.
+        const existing = properties[SELF_LOOP_DEPTH_PROPERTY]
+        const depthMap = (
+            existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {}
+        ) as Record<string, unknown>
+        depthMap[functionId] = depth
+        properties[SELF_LOOP_DEPTH_PROPERTY] = depthMap
+        event.properties = properties
+    }
+    const obj = parsed as Record<string, unknown>
+    const entries = Array.isArray(parsed) ? parsed : Array.isArray(obj.batch) ? obj.batch : null
+    if (entries) {
+        for (const entry of entries) {
+            if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+                stamp(entry as Record<string, unknown>)
+            }
+        }
+    } else {
+        stamp(obj)
+    }
+    return JSON.stringify(parsed)
+}

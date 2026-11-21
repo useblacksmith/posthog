@@ -1,0 +1,433 @@
+.dashboard-items-wrapper {
+    // Sidebar geometry changes must not invalidate styles throughout the tile grid.
+    --scene-layout-rect-width: initial;
+
+    width: 100%; // This provides the width for the dashboard items grid
+    padding-top: 0.5rem;
+
+    .InsightCard__viz {
+        z-index: 0; // Keep viz below CardMeta details overlay on dashboards
+
+        .InsightVizDisplay .LineGraph {
+            padding: 0.25rem;
+        }
+    }
+
+    // Tiles are always movable for editors, so the cell guides and the drop space only show mid-gesture.
+    .DashboardGridBackground {
+        display: none;
+    }
+
+    &.dashboard-layout-gesture {
+        .DashboardGridBackground {
+            display: block;
+        }
+
+        // Dragging is bounded to the grid's clientHeight, so padding (counted only under content-box)
+        // opens room below the last tile to drop it into a new row.
+        .dashboard-drop-space-end {
+            box-sizing: content-box;
+            padding-bottom: 40vh;
+        }
+
+        .dashboard-drop-space-between {
+            box-sizing: content-box;
+            padding-bottom: 6rem;
+        }
+    }
+
+    // A drag shows its own preview under the tile, so the grid's stacked placeholder would be a second outline.
+    // Toggling this class on the container restyles only what the selector's last part matches. Keep every rule
+    // under it ending on a narrow class: a rule that reaches tile content restyles the whole grid at drag start and drop.
+    &.dashboard-tile-drag .react-grid-item.react-grid-placeholder {
+        visibility: hidden;
+    }
+
+    .DashboardDragPreview {
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 2;
+        pointer-events: none;
+        background: color-mix(in sRGB, var(--color-accent) 8%, transparent);
+        border: 2px dashed var(--color-accent);
+        border-radius: var(--radius);
+        transition: transform 100ms ease;
+
+        @media (prefers-reduced-motion: reduce) {
+            transition: none;
+        }
+    }
+}
+
+.react-grid-layout {
+    --tile-hog-slide-duration: 200ms; // Also drives the hog's slide in TileDecorations.scss
+    --dashboard-tile-transition:
+        transform 220ms ease-out, width 220ms ease-out, height 220ms ease-out, border-color 100ms ease;
+
+    position: relative;
+    transition: height 100ms ease;
+
+    .react-grid-item {
+        /* Entry into edit mode must not force layout for off-screen charts. */
+        content-visibility: auto;
+        contain-intrinsic-size: auto 30rem;
+
+        /* content-visibility paint-clips the resize handles revealed on border hover; lift it while one shows */
+        &:hover:has(> .handle),
+        &.resizing,
+        &.react-draggable-dragging {
+            content-visibility: visible;
+        }
+
+        /* Tile decorations draw outside the tile box, so the same paint clip would cut them off */
+        &:has(
+            > .TileDecorations__group-title,
+            > .TileDecorations__crown,
+            > .InsightCard > .TileDecorations__group-title,
+            > .InsightCard > .TileDecorations__crown
+        ) {
+            content-visibility: visible;
+        }
+
+        /* The hog only shows while hovered. On leave, hold the lift for the hog's slide down (browsers without discrete content-visibility transitions hide it at once) */
+        &:where(:has(> .TileDecorations__hog, > .InsightCard > .TileDecorations__hog)) {
+            &:hover {
+                content-visibility: visible;
+                transition-delay: 0s;
+            }
+
+            @supports (transition-behavior: allow-discrete) {
+                transition:
+                    var(--dashboard-tile-transition),
+                    content-visibility 0s linear var(--tile-hog-slide-duration) allow-discrete;
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+                transition: var(--dashboard-tile-transition);
+            }
+        }
+    }
+
+    /* Preserve the tile border transition while spacing changes animate. */
+    &.dashboard-layout-static .react-grid-item {
+        transition: var(--dashboard-tile-transition);
+    }
+
+    &.dashboard-tile-spacing-changing {
+        transition: none;
+
+        .react-grid-item {
+            transition: none;
+        }
+    }
+
+    &.dashboard-layout-interaction .react-grid-item {
+        transition: none;
+    }
+
+    &.dashboard-layout-editable .react-grid-item:not(:hover, .resizing, .react-draggable-dragging) > .handle {
+        visibility: hidden;
+    }
+
+    &.dashboard-layout-editable [data-attr='dashboard-edit-mode-from-card-edge'] {
+        display: none;
+    }
+
+    &.dashboard-layout-settling .react-grid-item:not(.react-draggable-dragging, .resizing) {
+        transition: transform 180ms ease-out;
+    }
+}
+
+.dashboard-insight-tile {
+    z-index: 3;
+
+    &__placeholder {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+        width: 100%;
+        height: 100%;
+        padding: 1rem;
+        background: var(--color-bg-surface-primary);
+        border: 1px solid var(--color-border-primary);
+        border-radius: var(--radius);
+
+        &--quill {
+            background: none;
+            border: 0;
+        }
+    }
+
+    > .InsightCard {
+        height: 100%;
+    }
+
+    &:has(> .InsightCard--details-shown) {
+        z-index: var(--z-raised);
+    }
+}
+
+.dashboard-container-width-changing .react-grid-layout {
+    transition: none;
+
+    .react-grid-item {
+        transition: none;
+    }
+}
+
+.react-grid-item.cssTransforms {
+    transition-property: transform;
+}
+
+.react-grid-item.resizing {
+    z-index: 1;
+
+    // Snap to the pointer — without this the cssTransforms transition eases the move and the tile trails the cursor.
+    transition: none;
+    will-change: width, height;
+}
+
+.react-grid-item.react-draggable.DashboardTileCard {
+    .CardMeta,
+    .DashboardTileCard__body,
+    .WidgetCard__header,
+    .drag-handle {
+        // CardMeta: insight + widget (dashboard_tile layout). Bodies: text/button tiles. Header: widget (simple layout).
+        cursor: grab;
+        user-select: none; // Prevent accidental text selection while dragging
+    }
+
+    // The grid's drag `cancel` skips these, so they keep text selection instead of acting as a handle.
+    :is(p, h4, [role='heading'], .LemonMarkdown) {
+        cursor: auto;
+        user-select: text;
+    }
+}
+
+.react-grid-item.react-draggable-dragging {
+    z-index: 105;
+    cursor: grabbing;
+
+    // See-through, so the drop preview and the tiles under it stay visible.
+    opacity: 0.8;
+    transition: none;
+    will-change: transform;
+}
+
+// The tile stays under the pointer, so its chart would show tooltips and hover states mid-drag. The tile itself
+// keeps pointer events, which also stops the tiles under it from reacting. The drag start handler sets this class
+// after the drag threshold. The grid adds `react-draggable-dragging` on mouse-down, and blocking pointer events
+// from then on would retarget the click that starts click-to-move.
+.react-grid-item.dashboard-tile-moving > * {
+    pointer-events: none;
+}
+
+.react-grid-item.dropping {
+    visibility: hidden;
+}
+
+.react-grid-item.react-grid-placeholder {
+    position: relative;
+    z-index: 2;
+    max-width: 100%;
+    user-select: none;
+    background:
+        linear-gradient(var(--color-accent-highlight-secondary), var(--color-accent-highlight-secondary)),
+        var(--color-bg-surface-primary);
+    border: 2px dashed var(--color-accent);
+    border-radius: var(--radius);
+    transition: 100ms ease;
+
+    // A resize preview sits under the tile, so a fill would hide its content.
+    &.placeholder-resizing {
+        background: none;
+        border: 1px solid var(--color-accent);
+        outline: 1px solid var(--color-accent);
+    }
+}
+
+.react-resizable-hide > .react-resizable-handle {
+    display: none;
+}
+
+@keyframes DashboardResizeHandle__Reveal {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+.react-grid-item {
+    box-sizing: border-box;
+    transition:
+        transform 220ms ease-out,
+        width 220ms ease-out,
+        height 220ms ease-out;
+
+    // Drop InsightCard's fixed 30rem so RGL's inline height is the only constraint.
+    &.DashboardTileCard.InsightCard {
+        height: unset;
+    }
+
+    // Decorative resize overlays: anchor to the grid cell, not an inner wrapper.
+    & > .handle {
+        position: absolute;
+        inset: 0;
+        z-index: var(--z-raised);
+        display: flex;
+        align-items: flex-end;
+        justify-content: center;
+        pointer-events: none;
+        animation: DashboardResizeHandle__Reveal 300ms step-end;
+
+        &.horizontal {
+            svg {
+                transform: rotate(90deg) translateX(0.75rem);
+            }
+
+            &.top {
+                align-items: flex-start;
+
+                svg {
+                    transform: rotate(90deg) translateX(-0.75rem);
+                }
+            }
+        }
+
+        &.vertical {
+            flex-direction: column;
+
+            &.right {
+                align-items: flex-end;
+                justify-content: center;
+
+                svg {
+                    transform: translateX(0.5rem);
+                }
+            }
+
+            &.left {
+                align-items: flex-start;
+                justify-content: center;
+
+                svg {
+                    transform: translateX(-0.5rem);
+                }
+            }
+        }
+
+        &.corner {
+            align-items: flex-end;
+            justify-content: flex-end;
+
+            svg {
+                transform: translate(0.5rem, 0.5rem);
+            }
+
+            &.bottom-right svg {
+                transform: translate(-0.25rem, -0.25rem);
+            }
+
+            &.bottom-left {
+                align-items: flex-end;
+                justify-content: flex-start;
+
+                svg {
+                    transform: translate(-0.5rem, 0.5rem) rotateY(180deg);
+                }
+            }
+
+            &.top-right {
+                align-items: flex-start;
+                justify-content: flex-end;
+
+                svg {
+                    transform: translate(0.5rem, -0.5rem) rotateX(180deg);
+                }
+            }
+
+            &.top-left {
+                align-items: flex-start;
+                justify-content: flex-start;
+
+                svg {
+                    transform: translate(-0.5rem, -0.5rem) rotateX(180deg) rotateY(180deg);
+                }
+            }
+        }
+    }
+
+    &.resizing > .handle {
+        animation: none;
+    }
+
+    & > .react-resizable-handle {
+        position: absolute;
+        right: -0.5rem;
+        bottom: -0.5rem;
+        z-index: 10;
+        width: 2rem;
+        height: 2rem;
+        cursor: se-resize;
+    }
+
+    & > .react-resizable-handle.react-resizable-handle-se {
+        right: 0;
+        bottom: 0;
+        cursor: se-resize;
+    }
+
+    & > .react-resizable-handle.react-resizable-handle-e {
+        top: 0;
+        bottom: 2rem;
+        height: auto;
+
+        // Notch out the tile's "more" button so it gets the pointer, while the outer strip still resizes up to the corner.
+        clip-path: polygon(0.75rem 0, 100% 0, 100% 100%, 0 100%, 0 3rem, 0.75rem 3rem);
+        cursor: ew-resize;
+    }
+
+    & > .react-resizable-handle.react-resizable-handle-s {
+        right: 2rem;
+        left: 0;
+        width: auto;
+        cursor: ns-resize;
+    }
+
+    // A bottom or right legend sits under the handle's inner strip, so give that strip to the legend and resize from the outer one.
+    &:has([data-legend-position='bottom']) > .react-resizable-handle.react-resizable-handle-s {
+        clip-path: inset(1rem 0 0);
+    }
+
+    &:has([data-legend-position='right']) > .react-resizable-handle.react-resizable-handle-e {
+        clip-path: inset(0 0 0 1rem);
+    }
+
+    & > .react-resizable-handle.react-resizable-handle-w {
+        top: 0;
+        bottom: 2rem;
+        left: -0.5rem;
+        width: 2rem;
+        height: auto;
+        cursor: ew-resize;
+    }
+
+    & > .react-resizable-handle.react-resizable-handle-sw {
+        bottom: -0.5rem;
+        left: -0.5rem;
+        width: 2rem;
+        height: 2rem;
+        cursor: sw-resize;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .react-grid-layout.dashboard-layout-static .react-grid-item,
+    .react-grid-layout .react-grid-item {
+        transition: none;
+    }
+}

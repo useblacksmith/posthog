@@ -1,0 +1,1657 @@
+import { MakeLogicType, actions, afterMount, kea, listeners, path, props, reducers, selectors } from 'kea'
+import { combineUrl, router, urlToAction } from 'kea-router'
+import posthog from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import api, { ApiConfig } from 'lib/api'
+import { uuid } from 'lib/utils/dom'
+import { isObject } from 'lib/utils/guards'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { llmEvaluationLogic } from '../evaluations/llmEvaluationLogic'
+import type { EvaluationConfig } from '../evaluations/types'
+import {
+    evaluationsRetrieve,
+    llmPromptsCreate,
+    llmPromptsNamePartialUpdate,
+    llmPromptsNameRetrieve,
+} from '../generated/api'
+import { normalizeMessage } from '../messageNormalization'
+import { llmPromptLogic } from '../prompts/llmPromptLogic'
+import { getApiErrorDetail } from '../prompts/utils'
+import { normalizeLLMProvider } from '../settings/llmProviderKeysLogic'
+import { isOTelPartsMessage, normalizeRole } from '../utils'
+import { type PlaygroundQuestion, createPlaygroundQuestion } from './playgroundDecisions'
+import { isTraceLikeSelection } from './playgroundModelMatching'
+import { type PlaygroundModelConfig, parsePlaygroundConfig, serializePlaygroundConfig } from './playgroundPromptConfig'
+import { type RawMessage, appendRawMessage, flattenOutputMessages } from './playgroundTraceImport'
+
+const SOURCE_PARAM_KEYS = ['source_prompt_name', 'source_prompt_version', 'source_evaluation_id'] as const
+
+/** Strip all source-linking URL params, returning only the unrelated params. */
+export function cleanSourceSearchParams(searchParams: Record<string, any>): Record<string, any> {
+    const clean = { ...searchParams }
+    for (const key of SOURCE_PARAM_KEYS) {
+        delete clean[key]
+    }
+    return clean
+}
+
+export type MessageRole = 'user' | 'assistant' | 'system' | 'tool'
+export type ReasoningLevel = 'minimal' | 'low' | 'medium' | 'high' | null
+
+// The OpenAI `response_format` shape, so an SDK that fetches the prompt can pass it to a provider unchanged.
+export interface PlaygroundResponseFormat {
+    type: 'json_schema'
+    json_schema: {
+        name: string
+        schema: Record<string, unknown>
+        strict: boolean
+    }
+}
+
+export interface MessageToolCall {
+    id: string
+    name: string
+    /** JSON string, the shape providers stream. Parsed into an object at request time. */
+    arguments: string
+}
+
+export interface Message {
+    role: MessageRole
+    content: string
+    /** Assistant messages only. */
+    toolCalls?: MessageToolCall[]
+    /** Tool messages only: id of the tool call this result answers. */
+    toolCallId?: string
+    /** Tool messages only. */
+    toolName?: string
+}
+
+export interface PromptConfig {
+    id: string
+    model: string
+    selectedProviderKeyId: string | null
+    systemPrompt: string
+    maxTokens: number | null
+    temperature: number | null
+    topP: number | null
+    thinking: boolean
+    reasoningLevel: ReasoningLevel
+    tools: Record<string, unknown>[] | null
+    responseFormat: PlaygroundResponseFormat | null
+    sourceType: 'prompt' | 'evaluation' | null
+    sourcePromptName: string | null
+    sourcePromptVersion: number | null
+    sourceEvaluationId: string | null
+    sourceEvaluationName: string | null
+    messages: Message[]
+    decisionInput: string
+    decisionQuestions: PlaygroundQuestion[]
+}
+
+export interface PlaygroundSetupPayload {
+    model?: string
+    provider?: string
+    providerKeyId?: string
+    systemPrompt?: string
+    sourceType?: 'prompt' | 'evaluation'
+    sourcePromptName?: string
+    sourcePromptVersion?: number
+    sourceEvaluationId?: string
+    input?: unknown
+    output?: unknown
+    tools?: unknown
+}
+
+function normalizePlaygroundTools(tools: unknown): Record<string, unknown>[] | undefined {
+    if (Array.isArray(tools)) {
+        return tools.every(isObject) ? tools : undefined
+    }
+    if (!isObject(tools)) {
+        return undefined
+    }
+    const values = Object.values(tools)
+    return values.every(isObject) ? values : [tools]
+}
+
+export const DEFAULT_SYSTEM_PROMPT = 'You are a helpful AI assistant.'
+
+/**
+ * Module-level store for a pending playground setup payload. External callers (trace scene,
+ * conversation display) write here before navigating to the playground, so the playground
+ * instance can pick it up in urlToAction/afterMount and run setupPlaygroundFromEvent on itself.
+ *
+ * This avoids the fragile "transfer state between instances" pattern, which breaks when the
+ * source component unmounts before the playground's urlToAction fires.
+ */
+let pendingPlaygroundSetup: PlaygroundSetupPayload | null = null
+
+/** Queue a setup payload and navigate to the playground. */
+export function openInPlayground(payload: PlaygroundSetupPayload): void {
+    pendingPlaygroundSetup = payload
+    router.actions.push(urls.aiObservabilityPlayground())
+}
+
+function consumePendingPlaygroundSetup(): PlaygroundSetupPayload | null {
+    const payload = pendingPlaygroundSetup
+    pendingPlaygroundSetup = null
+    return payload
+}
+
+/**
+ * Returns a human-readable label for the linked source, e.g. `prompt "my-prompt"` or `evaluation "my-eval"`.
+ * Returns null when no source is linked.
+ */
+export function getLinkedSourceLabel(source: {
+    type: 'prompt' | 'evaluation' | null
+    promptName: string | null
+    promptVersion?: number | null
+    evaluationId: string | null
+    evaluationName: string | null
+}): string | null {
+    if (source.type === 'prompt') {
+        if (!source.promptName) {
+            return null
+        }
+        const versionSuffix = source.promptVersion ? ` v${source.promptVersion}` : ''
+        return `prompt "${source.promptName}"${versionSuffix}`
+    }
+    if (source.type === 'evaluation') {
+        if (source.evaluationName) {
+            return `evaluation "${source.evaluationName}"`
+        }
+        if (source.evaluationId) {
+            return `evaluation ${source.evaluationId.slice(0, 8)}`
+        }
+    }
+    return null
+}
+
+export function createPromptConfig(partial: Partial<PromptConfig> = {}): PromptConfig {
+    return {
+        id: partial.id ?? uuid(),
+        model: partial.model ?? '',
+        selectedProviderKeyId: partial.selectedProviderKeyId ?? null,
+        systemPrompt: partial.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
+        maxTokens: partial.maxTokens ?? null,
+        temperature: partial.temperature ?? null,
+        topP: partial.topP ?? null,
+        thinking: partial.thinking ?? false,
+        reasoningLevel: partial.reasoningLevel ?? 'medium',
+        tools: partial.tools ?? null,
+        responseFormat: partial.responseFormat ?? null,
+        sourceType: partial.sourceType ?? null,
+        sourcePromptName: partial.sourcePromptName ?? null,
+        sourcePromptVersion: partial.sourcePromptVersion ?? null,
+        sourceEvaluationId: partial.sourceEvaluationId ?? null,
+        sourceEvaluationName: partial.sourceEvaluationName ?? null,
+        messages: partial.messages ?? [],
+        decisionInput: partial.decisionInput ?? '',
+        decisionQuestions: partial.decisionQuestions ?? [createPlaygroundQuestion()],
+    }
+}
+
+export const INITIAL_PROMPT = createPromptConfig()
+
+function resolveTargetPromptId(promptConfigs: PromptConfig[], promptId?: string): string | null {
+    if (promptId) {
+        return promptId
+    }
+    return promptConfigs[0]?.id ?? null
+}
+
+export function updatePromptConfigs(
+    state: PromptConfig[],
+    promptId: string | undefined,
+    updater: (prompt: PromptConfig) => PromptConfig
+): PromptConfig[] {
+    const targetPromptId = resolveTargetPromptId(state, promptId)
+    if (!targetPromptId) {
+        return state
+    }
+    return state.map((prompt) => (prompt.id === targetPromptId ? updater(prompt) : prompt))
+}
+
+export type LLMPlaygroundPromptsLogicProps = Record<string, never>
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface llmPlaygroundPromptsLogicValues {
+    activePromptConfig: PromptConfig
+    activePromptId: string | null
+    collapsedSections: Record<string, boolean>
+    editModal: {
+        messageIndex?: number
+        promptId: string
+        type: 'message' | 'response_format' | 'system' | 'tools'
+    } | null
+    linkedSource: {
+        evaluationId: string | null
+        evaluationName: string | null
+        promptName: string | null
+        promptVersion: number | null
+        type: 'evaluation' | 'prompt' | null
+    }
+    localResponseSchemaJsonByPromptId: Record<string, string | null>
+    localToolsJsonByPromptId: Record<string, string | null>
+    maxTokens: number | null
+    messages: Message[]
+    model: string
+    pendingTargetIsTrace: boolean
+    pendingTargetModel: string | null
+    pendingTargetProvider: string | null
+    pendingTargetProviderKeyId: string | null
+    promptConfigs: PromptConfig[]
+    reasoningLevel: ReasoningLevel
+    responseFormat: PlaygroundResponseFormat | null
+    responseSchemaJsonErrorByPromptId: Record<string, string | null>
+    saving: boolean
+    selectedProviderKeyId: string | null
+    sourceSetupLoading: boolean
+    systemPrompt: string
+    temperature: number | null
+    thinking: boolean
+    tools: Record<string, unknown>[] | null
+    toolsJsonErrorByPromptId: Record<string, string | null>
+    topP: number | null
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface llmPlaygroundPromptsLogicActions {
+    addMessage: (
+        message?: Partial<Message>,
+        promptId?: string
+    ) => {
+        message: Partial<Message> | undefined
+        promptId: string | undefined
+    }
+    addPromptConfig: (sourcePromptId?: string) => {
+        newPromptId: string
+        sourcePromptId: string | undefined
+    }
+    addResultToConversation: (
+        response: string,
+        toolCalls?: MessageToolCall[],
+        promptId?: string
+    ) => {
+        promptId: string | undefined
+        response: string
+        toolCalls: MessageToolCall[] | undefined
+    }
+    applySavedModelSelection: (selection: { model: string; provider: string | null; providerKeyId: string | null }) => {
+        selection: {
+            model: string
+            provider: string | null
+            providerKeyId: string | null
+        }
+    }
+    clearConversation: (promptId?: string) => {
+        promptId: string | undefined
+    }
+    clearLinkedSource: () => {
+        value: true
+    }
+    clearPendingTargetModel: () => {
+        value: true
+    }
+    deleteMessage: (
+        index: number,
+        promptId?: string
+    ) => {
+        index: number
+        promptId: string | undefined
+    }
+    moveMessage: (
+        index: number,
+        direction: 'down' | 'up',
+        promptId?: string
+    ) => {
+        direction: 'down' | 'up'
+        index: number
+        promptId: string | undefined
+    }
+    removePromptConfig: (promptId: string) => {
+        promptId: string
+    }
+    resetPlayground: () => {
+        value: true
+    }
+    saveAsNewEvaluation: (
+        promptId: string,
+        name: string,
+        modelConfig: {
+            model: string
+            provider: string
+            provider_key_id: string | null
+        } | null
+    ) => {
+        modelConfig: {
+            model: string
+            provider: string
+            provider_key_id: string | null
+        } | null
+        name: string
+        promptId: string
+    }
+    saveAsNewPrompt: (
+        promptId: string,
+        name: string,
+        modelConfig: PlaygroundModelConfig | null
+    ) => {
+        modelConfig: PlaygroundModelConfig | null
+        name: string
+        promptId: string
+    }
+    saveComplete: () => {
+        value: true
+    }
+    saveToLinkedEvaluation: (
+        promptId: string,
+        modelConfig: {
+            model: string
+            provider: string
+            provider_key_id: string | null
+        } | null
+    ) => {
+        modelConfig: {
+            model: string
+            provider: string
+            provider_key_id: string | null
+        } | null
+        promptId: string
+    }
+    saveToLinkedPrompt: (
+        promptId: string,
+        modelConfig: PlaygroundModelConfig | null
+    ) => {
+        modelConfig: PlaygroundModelConfig | null
+        promptId: string
+    }
+    setActivePromptId: (promptId: string | null) => {
+        promptId: string | null
+    }
+    setDecisionInput: (
+        decisionInput: string,
+        promptId?: string
+    ) => {
+        decisionInput: string
+        promptId: string | undefined
+    }
+    setDecisionQuestions: (
+        decisionQuestions: PlaygroundQuestion[],
+        promptId?: string
+    ) => {
+        decisionQuestions: PlaygroundQuestion[]
+        promptId: string | undefined
+    }
+    setEditModal: (
+        target: {
+            messageIndex?: number
+            promptId: string
+            type: 'message' | 'response_format' | 'system' | 'tools'
+        } | null
+    ) => {
+        target: {
+            messageIndex?: number | undefined
+            promptId: string
+            type: 'message' | 'response_format' | 'system' | 'tools'
+        } | null
+    }
+    setLocalResponseSchemaJson: (
+        json: string | null,
+        promptId?: string
+    ) => {
+        json: string | null
+        promptId: string | undefined
+    }
+    setLocalToolsJson: (
+        json: string | null,
+        promptId?: string
+    ) => {
+        json: string | null
+        promptId: string | undefined
+    }
+    setMaxTokens: (
+        maxTokens: number | null,
+        promptId?: string
+    ) => {
+        maxTokens: number | null
+        promptId: string | undefined
+    }
+    setMessages: (
+        messages: Message[],
+        promptId?: string
+    ) => {
+        messages: Message[]
+        promptId: string | undefined
+    }
+    setModel: (
+        model: string,
+        providerKeyId?: string,
+        promptId?: string
+    ) => {
+        model: string
+        promptId: string | undefined
+        providerKeyId: string | undefined
+    }
+    setPromptConfigs: (promptConfigs: PromptConfig[]) => {
+        promptConfigs: PromptConfig[]
+    }
+    setReasoningLevel: (
+        reasoningLevel: ReasoningLevel,
+        promptId?: string
+    ) => {
+        promptId: string | undefined
+        reasoningLevel: ReasoningLevel
+    }
+    setResponseFormat: (
+        responseFormat: PlaygroundResponseFormat | null,
+        promptId?: string
+    ) => {
+        promptId: string | undefined
+        responseFormat: PlaygroundResponseFormat | null
+    }
+    setResponseSchemaJsonError: (
+        promptId: string,
+        error: string | null
+    ) => {
+        error: string | null
+        promptId: string
+    }
+    setSourceNames: (
+        promptName: string | null,
+        evaluationName: string | null,
+        promptId?: string
+    ) => {
+        evaluationName: string | null
+        promptId: string | undefined
+        promptName: string | null
+    }
+    setSourceSetupLoading: (isLoading: boolean) => {
+        isLoading: boolean
+    }
+    setSystemPrompt: (
+        systemPrompt: string,
+        promptId?: string
+    ) => {
+        promptId: string | undefined
+        systemPrompt: string
+    }
+    setTemperature: (
+        temperature: number | null,
+        promptId?: string
+    ) => {
+        promptId: string | undefined
+        temperature: number | null
+    }
+    setThinking: (
+        thinking: boolean,
+        promptId?: string
+    ) => {
+        promptId: string | undefined
+        thinking: boolean
+    }
+    setTools: (
+        tools: Record<string, unknown>[] | null,
+        promptId?: string
+    ) => {
+        promptId: string | undefined
+        tools: Record<string, unknown>[] | null
+    }
+    setToolsJsonError: (
+        promptId: string,
+        error: string | null
+    ) => {
+        error: string | null
+        promptId: string
+    }
+    setTopP: (
+        topP: number | null,
+        promptId?: string
+    ) => {
+        promptId: string | undefined
+        topP: number | null
+    }
+    setupPlaygroundFromEvent: (payload: PlaygroundSetupPayload) => {
+        payload: PlaygroundSetupPayload
+    }
+    toggleCollapsed: (key: string) => {
+        key: string
+    }
+    updateMessage: (
+        index: number,
+        payload: Partial<Message>,
+        promptId?: string
+    ) => {
+        index: number
+        payload: Partial<Message>
+        promptId: string | undefined
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface llmPlaygroundPromptsLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        activePromptConfig: (promptConfigs: PromptConfig[], activePromptId: string | null) => PromptConfig
+        model: (activePromptConfig: PromptConfig) => string
+        selectedProviderKeyId: (activePromptConfig: PromptConfig) => string | null
+        systemPrompt: (activePromptConfig: PromptConfig) => string
+        maxTokens: (activePromptConfig: PromptConfig) => number | null
+        thinking: (activePromptConfig: PromptConfig) => boolean
+        temperature: (activePromptConfig: PromptConfig) => number | null
+        topP: (activePromptConfig: PromptConfig) => number | null
+        reasoningLevel: (activePromptConfig: PromptConfig) => ReasoningLevel
+        tools: (activePromptConfig: PromptConfig) => Record<string, unknown>[] | null
+        responseFormat: (activePromptConfig: PromptConfig) => PlaygroundResponseFormat | null
+        messages: (activePromptConfig: PromptConfig) => Message[]
+        linkedSource: (promptConfigs: PromptConfig[]) => {
+            evaluationId: string | null
+            evaluationName: string | null
+            promptName: string | null
+            promptVersion: number | null
+            type: 'evaluation' | 'prompt' | null
+        }
+    }
+}
+
+export type llmPlaygroundPromptsLogicType = MakeLogicType<
+    llmPlaygroundPromptsLogicValues,
+    llmPlaygroundPromptsLogicActions,
+    LLMPlaygroundPromptsLogicProps,
+    llmPlaygroundPromptsLogicMeta
+>
+
+export const llmPlaygroundPromptsLogic = kea<llmPlaygroundPromptsLogicType>([
+    path(['products', 'ai_observability', 'frontend', 'playground', 'llmPlaygroundPromptsLogic']),
+    props({} as LLMPlaygroundPromptsLogicProps),
+
+    actions({
+        addPromptConfig: (sourcePromptId?: string) => ({ sourcePromptId, newPromptId: uuid() }),
+        removePromptConfig: (promptId: string) => ({ promptId }),
+        setActivePromptId: (promptId: string | null) => ({ promptId }),
+        setPromptConfigs: (promptConfigs: PromptConfig[]) => ({ promptConfigs }),
+        setModel: (model: string, providerKeyId?: string, promptId?: string) => ({ model, providerKeyId, promptId }),
+        setSystemPrompt: (systemPrompt: string, promptId?: string) => ({ systemPrompt, promptId }),
+        setMaxTokens: (maxTokens: number | null, promptId?: string) => ({ maxTokens, promptId }),
+        setTemperature: (temperature: number | null, promptId?: string) => ({ temperature, promptId }),
+        setTopP: (topP: number | null, promptId?: string) => ({ topP, promptId }),
+        setThinking: (thinking: boolean, promptId?: string) => ({ thinking, promptId }),
+        setReasoningLevel: (reasoningLevel: ReasoningLevel, promptId?: string) => ({ reasoningLevel, promptId }),
+        setTools: (tools: Record<string, unknown>[] | null, promptId?: string) => ({ tools, promptId }),
+        setDecisionInput: (decisionInput: string, promptId?: string) => ({ decisionInput, promptId }),
+        setDecisionQuestions: (decisionQuestions: PlaygroundQuestion[], promptId?: string) => ({
+            decisionQuestions,
+            promptId,
+        }),
+        setResponseFormat: (responseFormat: PlaygroundResponseFormat | null, promptId?: string) => ({
+            responseFormat,
+            promptId,
+        }),
+        clearConversation: (promptId?: string) => ({ promptId }),
+        setMessages: (messages: Message[], promptId?: string) => ({ messages, promptId }),
+        deleteMessage: (index: number, promptId?: string) => ({ index, promptId }),
+        moveMessage: (index: number, direction: 'up' | 'down', promptId?: string) => ({ index, direction, promptId }),
+        addMessage: (message?: Partial<Message>, promptId?: string) => ({ message, promptId }),
+        addResultToConversation: (response: string, toolCalls?: MessageToolCall[], promptId?: string) => ({
+            response,
+            toolCalls,
+            promptId,
+        }),
+        updateMessage: (index: number, payload: Partial<Message>, promptId?: string) => ({ index, payload, promptId }),
+        clearLinkedSource: true,
+        setSourceNames: (promptName: string | null, evaluationName: string | null, promptId?: string) => ({
+            promptName,
+            evaluationName,
+            promptId,
+        }),
+        setupPlaygroundFromEvent: (payload: PlaygroundSetupPayload) => ({ payload }),
+        setLocalToolsJson: (json: string | null, promptId?: string) => ({ json, promptId }),
+        setLocalResponseSchemaJson: (json: string | null, promptId?: string) => ({ json, promptId }),
+        clearPendingTargetModel: true,
+        setEditModal: (
+            target: {
+                type: 'tools' | 'system' | 'message' | 'response_format'
+                promptId: string
+                messageIndex?: number
+            } | null
+        ) => ({ target }),
+        toggleCollapsed: (key: string) => ({ key }),
+        setToolsJsonError: (promptId: string, error: string | null) => ({ promptId, error }),
+        setResponseSchemaJsonError: (promptId: string, error: string | null) => ({ promptId, error }),
+        setSourceSetupLoading: (isLoading: boolean) => ({ isLoading }),
+        applySavedModelSelection: (selection: {
+            model: string
+            provider: string | null
+            providerKeyId: string | null
+        }) => ({ selection }),
+        saveToLinkedPrompt: (promptId: string, modelConfig: PlaygroundModelConfig | null) => ({
+            promptId,
+            modelConfig,
+        }),
+        saveToLinkedEvaluation: (
+            promptId: string,
+            modelConfig: { model: string; provider: string; provider_key_id: string | null } | null
+        ) => ({ promptId, modelConfig }),
+        saveAsNewPrompt: (promptId: string, name: string, modelConfig: PlaygroundModelConfig | null) => ({
+            promptId,
+            name,
+            modelConfig,
+        }),
+        saveAsNewEvaluation: (
+            promptId: string,
+            name: string,
+            modelConfig: { model: string; provider: string; provider_key_id: string | null } | null
+        ) => ({ promptId, name, modelConfig }),
+        saveComplete: true,
+        resetPlayground: true,
+    }),
+
+    reducers({
+        promptConfigs: [
+            [INITIAL_PROMPT] as PromptConfig[],
+            {
+                resetPlayground: () => [createPromptConfig()],
+                setPromptConfigs: (_: PromptConfig[], { promptConfigs }: { promptConfigs: PromptConfig[] }) =>
+                    promptConfigs.length > 0 ? promptConfigs : [createPromptConfig({ id: INITIAL_PROMPT.id })],
+                addPromptConfig: (
+                    state: PromptConfig[],
+                    { sourcePromptId, newPromptId }: { sourcePromptId?: string; newPromptId: string }
+                ) => {
+                    const sourcePrompt = state.find((prompt) => prompt.id === sourcePromptId) ?? state[state.length - 1]
+                    return [...state, createPromptConfig({ ...sourcePrompt, id: newPromptId })]
+                },
+                removePromptConfig: (state: PromptConfig[], { promptId }: { promptId: string }) => {
+                    if (state.length <= 1) {
+                        return state
+                    }
+                    const nextState = state.filter((prompt) => prompt.id !== promptId)
+                    return nextState.length > 0 ? nextState : [createPromptConfig()]
+                },
+                setModel: (
+                    state: PromptConfig[],
+                    { model, providerKeyId, promptId }: { model: string; providerKeyId?: string; promptId?: string }
+                ) =>
+                    updatePromptConfigs(state, promptId, (prompt) => ({
+                        ...prompt,
+                        model,
+                        selectedProviderKeyId: providerKeyId ?? null,
+                    })),
+                setSystemPrompt: (
+                    state: PromptConfig[],
+                    { systemPrompt, promptId }: { systemPrompt: string; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, systemPrompt })),
+                setMaxTokens: (
+                    state: PromptConfig[],
+                    { maxTokens, promptId }: { maxTokens: number | null; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, maxTokens })),
+                setTemperature: (
+                    state: PromptConfig[],
+                    { temperature, promptId }: { temperature: number | null; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, temperature })),
+                setTopP: (state: PromptConfig[], { topP, promptId }: { topP: number | null; promptId?: string }) =>
+                    updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, topP })),
+                setThinking: (
+                    state: PromptConfig[],
+                    { thinking, promptId }: { thinking: boolean; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, thinking })),
+                setReasoningLevel: (
+                    state: PromptConfig[],
+                    { reasoningLevel, promptId }: { reasoningLevel: ReasoningLevel; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, reasoningLevel })),
+                setTools: (
+                    state: PromptConfig[],
+                    { tools, promptId }: { tools: Record<string, unknown>[] | null; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, tools })),
+                setDecisionInput: (
+                    state: PromptConfig[],
+                    { decisionInput, promptId }: { decisionInput: string; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, decisionInput })),
+                setDecisionQuestions: (
+                    state: PromptConfig[],
+                    { decisionQuestions, promptId }: { decisionQuestions: PlaygroundQuestion[]; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, decisionQuestions })),
+                setResponseFormat: (
+                    state: PromptConfig[],
+                    { responseFormat, promptId }: { responseFormat: PlaygroundResponseFormat | null; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, responseFormat })),
+                clearConversation: (state: PromptConfig[], { promptId }: { promptId?: string }) =>
+                    updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, messages: [] })),
+                setMessages: (
+                    state: PromptConfig[],
+                    { messages, promptId }: { messages: Message[]; promptId?: string }
+                ) => updatePromptConfigs(state, promptId, (prompt) => ({ ...prompt, messages })),
+                deleteMessage: (state: PromptConfig[], { index, promptId }: { index: number; promptId?: string }) =>
+                    updatePromptConfigs(state, promptId, (prompt) => {
+                        if (index < 0 || index >= prompt.messages.length) {
+                            return prompt
+                        }
+                        return { ...prompt, messages: prompt.messages.filter((_, i) => i !== index) }
+                    }),
+                moveMessage: (
+                    state: PromptConfig[],
+                    { index, direction, promptId }: { index: number; direction: 'up' | 'down'; promptId?: string }
+                ) =>
+                    updatePromptConfigs(state, promptId, (prompt) => {
+                        const target = direction === 'up' ? index - 1 : index + 1
+                        if (
+                            index < 0 ||
+                            index >= prompt.messages.length ||
+                            target < 0 ||
+                            target >= prompt.messages.length
+                        ) {
+                            return prompt
+                        }
+                        const messages = [...prompt.messages]
+                        ;[messages[index], messages[target]] = [messages[target], messages[index]]
+                        return { ...prompt, messages }
+                    }),
+                addMessage: (
+                    state: PromptConfig[],
+                    { message, promptId }: { message?: Partial<Message>; promptId?: string }
+                ) =>
+                    updatePromptConfigs(state, promptId, (prompt) => {
+                        const defaultMessage: Message = { role: 'user', content: '' }
+                        return { ...prompt, messages: [...prompt.messages, { ...defaultMessage, ...message }] }
+                    }),
+                addResultToConversation: (
+                    state: PromptConfig[],
+                    {
+                        response,
+                        toolCalls,
+                        promptId,
+                    }: { response: string; toolCalls?: MessageToolCall[]; promptId?: string }
+                ) => {
+                    if (!response.trim() && !toolCalls?.length) {
+                        return state
+                    }
+                    // A result with tool calls continues with empty tool results to fill in and
+                    // run again (the mock loop); a plain response continues with a user turn.
+                    const nextTurns: Message[] = toolCalls?.length
+                        ? toolCalls.map((toolCall) => ({
+                              role: 'tool',
+                              content: '',
+                              toolCallId: toolCall.id,
+                              toolName: toolCall.name,
+                          }))
+                        : [{ role: 'user', content: '' }]
+                    return updatePromptConfigs(state, promptId, (prompt) => ({
+                        ...prompt,
+                        messages: [
+                            ...prompt.messages,
+                            {
+                                role: 'assistant',
+                                content: response,
+                                ...(toolCalls?.length ? { toolCalls } : {}),
+                            },
+                            ...nextTurns,
+                        ],
+                    }))
+                },
+                updateMessage: (
+                    state: PromptConfig[],
+                    { index, payload, promptId }: { index: number; payload: Partial<Message>; promptId?: string }
+                ) =>
+                    updatePromptConfigs(state, promptId, (prompt) => {
+                        if (index < 0 || index >= prompt.messages.length) {
+                            return prompt
+                        }
+                        const newMessages = [...prompt.messages]
+                        newMessages[index] = { ...newMessages[index], ...payload }
+                        return { ...prompt, messages: newMessages }
+                    }),
+                clearLinkedSource: (state: PromptConfig[]) =>
+                    updatePromptConfigs(state, state[0]?.id, (prompt) => ({
+                        ...prompt,
+                        sourceType: null,
+                        sourcePromptName: null,
+                        sourcePromptVersion: null,
+                        sourceEvaluationId: null,
+                        sourceEvaluationName: null,
+                    })),
+                setSourceNames: (
+                    state: PromptConfig[],
+                    {
+                        promptName,
+                        evaluationName,
+                        promptId,
+                    }: { promptName: string | null; evaluationName: string | null; promptId?: string }
+                ) =>
+                    updatePromptConfigs(state, promptId, (prompt) => ({
+                        ...prompt,
+                        sourcePromptName: promptName,
+                        sourceEvaluationName: evaluationName,
+                    })),
+                setupPlaygroundFromEvent: (state: PromptConfig[], { payload }: { payload: PlaygroundSetupPayload }) => {
+                    const targetPrompt = state[0] ?? createPromptConfig({ id: INITIAL_PROMPT.id })
+                    const normalizedModel = payload.model ?? targetPrompt.model
+                    return [
+                        {
+                            ...targetPrompt,
+                            model: normalizedModel,
+                            selectedProviderKeyId: payload.providerKeyId ?? null,
+                            sourceType: payload.sourceType ?? null,
+                            sourcePromptName: payload.sourcePromptName ?? null,
+                            sourcePromptVersion: payload.sourcePromptVersion ?? null,
+                            sourceEvaluationId: payload.sourceEvaluationId ?? null,
+                            sourceEvaluationName: null,
+                            decisionInput: '',
+                        },
+                    ]
+                },
+            },
+        ],
+        activePromptId: [
+            INITIAL_PROMPT.id as string | null,
+            {
+                resetPlayground: () => null,
+                addPromptConfig: (_: string | null, { newPromptId }: { newPromptId: string }) => newPromptId,
+                setActivePromptId: (_: string | null, { promptId }: { promptId: string | null }) => promptId,
+                removePromptConfig: (state: string | null, { promptId }: { promptId: string }) =>
+                    state === promptId ? null : state,
+                setupPlaygroundFromEvent: () => INITIAL_PROMPT.id,
+            },
+        ],
+        localToolsJsonByPromptId: [
+            {} as Record<string, string | null>,
+            {
+                resetPlayground: () => ({}),
+                setLocalToolsJson: (
+                    state: Record<string, string | null>,
+                    { json, promptId }: { json: string | null; promptId?: string }
+                ) => {
+                    if (!promptId) {
+                        return state
+                    }
+                    return { ...state, [promptId]: json }
+                },
+                setTools: (state: Record<string, string | null>, { promptId }: { promptId?: string }) => {
+                    if (!promptId) {
+                        return state
+                    }
+                    return { ...state, [promptId]: null }
+                },
+                removePromptConfig: (state: Record<string, string | null>, { promptId }: { promptId: string }) => {
+                    const { [promptId]: _, ...rest } = state
+                    return rest
+                },
+            },
+        ],
+        localResponseSchemaJsonByPromptId: [
+            {} as Record<string, string | null>,
+            {
+                resetPlayground: () => ({}),
+                setLocalResponseSchemaJson: (
+                    state: Record<string, string | null>,
+                    { json, promptId }: { json: string | null; promptId?: string }
+                ) => {
+                    if (!promptId) {
+                        return state
+                    }
+                    return { ...state, [promptId]: json }
+                },
+                setResponseFormat: (state: Record<string, string | null>, { promptId }: { promptId?: string }) => {
+                    if (!promptId) {
+                        return state
+                    }
+                    return { ...state, [promptId]: null }
+                },
+                removePromptConfig: (state: Record<string, string | null>, { promptId }: { promptId: string }) => {
+                    const { [promptId]: _, ...rest } = state
+                    return rest
+                },
+            },
+        ],
+        pendingTargetModel: [
+            null as string | null,
+            {
+                resetPlayground: () => null,
+                setupPlaygroundFromEvent: (_: string | null, { payload }: { payload: { model?: string } }) =>
+                    payload.model ?? null,
+                applySavedModelSelection: (_: string | null, { selection }: { selection: { model: string } }) =>
+                    selection.model,
+                clearPendingTargetModel: () => null,
+            },
+        ],
+        pendingTargetProvider: [
+            null as string | null,
+            {
+                resetPlayground: () => null,
+                setupPlaygroundFromEvent: (_: string | null, { payload }: { payload: { provider?: string } }) =>
+                    normalizeLLMProvider(payload.provider),
+                applySavedModelSelection: (
+                    _: string | null,
+                    { selection }: { selection: { provider: string | null } }
+                ) => normalizeLLMProvider(selection.provider ?? undefined),
+                clearPendingTargetModel: () => null,
+            },
+        ],
+        pendingTargetProviderKeyId: [
+            null as string | null,
+            {
+                resetPlayground: () => null,
+                setupPlaygroundFromEvent: () => null,
+                applySavedModelSelection: (
+                    _: string | null,
+                    { selection }: { selection: { providerKeyId: string | null } }
+                ) => selection.providerKeyId,
+                clearPendingTargetModel: () => null,
+            },
+        ],
+        pendingTargetIsTrace: [
+            false as boolean,
+            {
+                resetPlayground: () => false,
+                setupPlaygroundFromEvent: (
+                    _: boolean,
+                    { payload }: { payload: { model?: string; provider?: string } }
+                ) => isTraceLikeSelection(payload.model, payload.provider),
+                // Saved selections resolve through the trace-matching path: no default-model
+                // fallback, so an unmatched saved model id survives as-is.
+                applySavedModelSelection: () => true,
+                clearPendingTargetModel: () => false,
+            },
+        ],
+        editModal: [
+            null as {
+                type: 'tools' | 'system' | 'message' | 'response_format'
+                promptId: string
+                messageIndex?: number
+            } | null,
+            {
+                resetPlayground: () => null,
+                setEditModal: (
+                    _: { type: string; promptId: string; messageIndex?: number } | null,
+                    {
+                        target,
+                    }: {
+                        target: {
+                            type: 'tools' | 'system' | 'message' | 'response_format'
+                            promptId: string
+                            messageIndex?: number
+                        } | null
+                    }
+                ) => target,
+            },
+        ],
+        collapsedSections: [
+            {} as Record<string, boolean>,
+            {
+                resetPlayground: () => ({}),
+                toggleCollapsed: (state: Record<string, boolean>, { key }: { key: string }) => ({
+                    ...state,
+                    [key]: !state[key],
+                }),
+            },
+        ],
+        toolsJsonErrorByPromptId: [
+            {} as Record<string, string | null>,
+            {
+                resetPlayground: () => ({}),
+                setToolsJsonError: (
+                    state: Record<string, string | null>,
+                    { promptId, error }: { promptId: string; error: string | null }
+                ) => ({ ...state, [promptId]: error }),
+                removePromptConfig: (state: Record<string, string | null>, { promptId }: { promptId: string }) => {
+                    const { [promptId]: _, ...rest } = state
+                    return rest
+                },
+            },
+        ],
+        responseSchemaJsonErrorByPromptId: [
+            {} as Record<string, string | null>,
+            {
+                resetPlayground: () => ({}),
+                setResponseSchemaJsonError: (
+                    state: Record<string, string | null>,
+                    { promptId, error }: { promptId: string; error: string | null }
+                ) => ({ ...state, [promptId]: error }),
+                removePromptConfig: (state: Record<string, string | null>, { promptId }: { promptId: string }) => {
+                    const { [promptId]: _, ...rest } = state
+                    return rest
+                },
+            },
+        ],
+        sourceSetupLoading: [
+            false as boolean,
+            {
+                setSourceSetupLoading: (_: boolean, { isLoading }: { isLoading: boolean }) => isLoading,
+            },
+        ],
+        saving: [
+            false as boolean,
+            {
+                saveToLinkedPrompt: () => true,
+                saveToLinkedEvaluation: () => true,
+                saveAsNewPrompt: () => true,
+                saveAsNewEvaluation: () => true,
+                saveComplete: () => false,
+            },
+        ],
+    }),
+
+    selectors({
+        activePromptConfig: [
+            (s) => [s.promptConfigs, s.activePromptId],
+            (promptConfigs: PromptConfig[], activePromptId: string | null): PromptConfig => {
+                return (
+                    promptConfigs.find((prompt) => prompt.id === activePromptId) ??
+                    promptConfigs[0] ??
+                    createPromptConfig({ id: INITIAL_PROMPT.id })
+                )
+            },
+        ],
+        model: [(s) => [s.activePromptConfig], (activePromptConfig: PromptConfig): string => activePromptConfig.model],
+        selectedProviderKeyId: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): string | null => activePromptConfig.selectedProviderKeyId,
+        ],
+        systemPrompt: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): string => activePromptConfig.systemPrompt,
+        ],
+        maxTokens: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): number | null => activePromptConfig.maxTokens,
+        ],
+        thinking: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): boolean => activePromptConfig.thinking,
+        ],
+        temperature: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): number | null => activePromptConfig.temperature,
+        ],
+        topP: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): number | null => activePromptConfig.topP,
+        ],
+        reasoningLevel: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): ReasoningLevel => activePromptConfig.reasoningLevel,
+        ],
+        tools: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): Record<string, unknown>[] | null => activePromptConfig.tools,
+        ],
+        responseFormat: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): PlaygroundResponseFormat | null => activePromptConfig.responseFormat,
+        ],
+        messages: [
+            (s) => [s.activePromptConfig],
+            (activePromptConfig: PromptConfig): Message[] => activePromptConfig.messages,
+        ],
+        linkedSource: [
+            (s) => [s.promptConfigs],
+            (
+                promptConfigs: PromptConfig[]
+            ): {
+                type: 'prompt' | 'evaluation' | null
+                promptName: string | null
+                promptVersion: number | null
+                evaluationId: string | null
+                evaluationName: string | null
+            } => {
+                const first = promptConfigs[0]
+                if (!first) {
+                    return {
+                        type: null,
+                        promptName: null,
+                        promptVersion: null,
+                        evaluationId: null,
+                        evaluationName: null,
+                    }
+                }
+                return {
+                    type: first.sourceType,
+                    promptName: first.sourcePromptName,
+                    promptVersion: first.sourcePromptVersion,
+                    evaluationId: first.sourceEvaluationId,
+                    evaluationName: first.sourceEvaluationName,
+                }
+            },
+        ],
+    }),
+
+    listeners(({ actions, values }) => ({
+        resetPlayground: () => {
+            posthog.capture('llma playground reset')
+            router.actions.replace(
+                combineUrl(urls.aiObservabilityPlayground(), cleanSourceSearchParams(router.values.searchParams)).url
+            )
+        },
+        addPromptConfig: () => {
+            // New total after adding — listeners run post-reducer
+            posthog.capture('llma playground prompt config added', {
+                prompt_count: values.promptConfigs.length,
+            })
+        },
+        removePromptConfig: ({ promptId }) => {
+            posthog.capture('llma playground prompt config removed', {
+                prompt_count: values.promptConfigs.length,
+            })
+            if (values.promptConfigs.length === 0) {
+                actions.setPromptConfigs([createPromptConfig({ id: INITIAL_PROMPT.id })])
+                actions.setActivePromptId(INITIAL_PROMPT.id)
+                return
+            }
+
+            if (values.activePromptId === null || values.activePromptId === promptId) {
+                actions.setActivePromptId(values.promptConfigs[0]?.id ?? null)
+            }
+        },
+
+        addMessage: ({ message }) => {
+            posthog.capture('llma playground message added', {
+                message_count: values.activePromptConfig?.messages.length ?? 0,
+                role: message?.role ?? 'user',
+            })
+        },
+        deleteMessage: () => {
+            posthog.capture('llma playground message removed', {
+                message_count: values.activePromptConfig?.messages.length ?? 0,
+            })
+        },
+        addResultToConversation: ({ toolCalls }) => {
+            posthog.capture('llma playground result added to conversation', {
+                has_tool_calls: !!toolCalls?.length,
+                tool_call_count: toolCalls?.length ?? 0,
+            })
+        },
+        moveMessage: ({ direction }) => {
+            posthog.capture('llma playground message moved', { direction })
+        },
+        setTools: ({ tools }) => {
+            posthog.capture('llma playground tools configured', {
+                action: tools ? 'set' : 'clear',
+                tool_count: tools?.length ?? 0,
+            })
+        },
+        setResponseFormat: ({ responseFormat }) => {
+            posthog.capture('llma playground response format configured', {
+                action: responseFormat ? 'set' : 'clear',
+            })
+        },
+
+        setupPlaygroundFromEvent: async ({ payload }) => {
+            const sourceType = payload.sourceType ?? (payload.input ? 'trace' : null)
+            posthog.capture('llma playground opened from source', {
+                source_type: sourceType ?? 'unknown',
+            })
+            actions.setSourceSetupLoading(true)
+            const { input, systemPrompt } = payload
+            const tools = normalizePlaygroundTools(payload.tools)
+            const currentPrompt = values.promptConfigs[0] ?? createPromptConfig({ id: INITIAL_PROMPT.id })
+            const promptId = currentPrompt.id
+
+            const finishSourceSetup = (sourceParam: Record<string, string>): void => {
+                actions.setMessages([], promptId)
+                actions.setActivePromptId(promptId)
+                const cleanParams = cleanSourceSearchParams(router.values.searchParams)
+                // Use `replace` (not `push`) so we don't add a history entry — and a $pageview — on every
+                // setup. If the URL-driven path ever re-enters this listener, `push` turns a single
+                // missed dedup into a runaway pageview loop. See `urlToAction` for the dedup guard.
+                router.actions.replace(
+                    combineUrl(urls.aiObservabilityPlayground(), { ...cleanParams, ...sourceParam }).url
+                )
+            }
+
+            try {
+                if (payload.sourcePromptName) {
+                    try {
+                        const versionParam = payload.sourcePromptVersion
+                            ? { version: payload.sourcePromptVersion }
+                            : undefined
+                        const fetchedPrompt = await llmPromptsNameRetrieve(
+                            String(ApiConfig.getCurrentTeamId()),
+                            payload.sourcePromptName,
+                            versionParam
+                        )
+                        // Generated schemas type the payload as unknown; this app only stores strings.
+                        actions.setSystemPrompt((fetchedPrompt.prompt as string) || DEFAULT_SYSTEM_PROMPT, promptId)
+                        actions.setSourceNames(fetchedPrompt.name ?? null, null, promptId)
+                        const sourceParams: Record<string, string> = {
+                            source_prompt_name: payload.sourcePromptName,
+                        }
+                        if (payload.sourcePromptVersion) {
+                            sourceParams.source_prompt_version = String(payload.sourcePromptVersion)
+                        }
+                        finishSourceSetup(sourceParams)
+                        // Prompts saved from the playground carry the whole panel in config.
+                        // Prompts without playground keys (older, or API-authored) parse to null
+                        // and load as before: body into the system prompt, panel untouched.
+                        const parsedConfig = parsePlaygroundConfig(fetchedPrompt.config)
+                        if (parsedConfig) {
+                            actions.setPromptConfigs(
+                                updatePromptConfigs(values.promptConfigs, promptId, (p) => ({
+                                    ...p,
+                                    temperature: parsedConfig.temperature,
+                                    maxTokens: parsedConfig.maxTokens,
+                                    topP: parsedConfig.topP,
+                                    thinking: parsedConfig.thinking,
+                                    reasoningLevel: parsedConfig.reasoningLevel,
+                                    tools: parsedConfig.tools,
+                                    responseFormat: parsedConfig.responseFormat,
+                                    messages: parsedConfig.messages,
+                                }))
+                            )
+                            if (parsedConfig.model) {
+                                actions.applySavedModelSelection({
+                                    model: parsedConfig.model,
+                                    provider: parsedConfig.provider,
+                                    providerKeyId: parsedConfig.providerKeyId,
+                                })
+                            }
+                        }
+                    } catch {
+                        lemonToast.error('Error loading prompt for playground')
+                    }
+                    return
+                }
+
+                if (payload.sourceEvaluationId) {
+                    try {
+                        const teamId = teamLogic.values.currentTeamId
+                        if (!teamId) {
+                            lemonToast.error('Could not determine team')
+                            return
+                        }
+                        // nosemgrep: prefer-codegen-api -- Legacy raw API call with a hand-written URL and an unchecked response type. Use evaluationsRetrieve() from 'products/ai_observability/frontend/generated/api' instead.
+                        const fetchedEvaluation = await api.get<EvaluationConfig>(
+                            `/api/environments/${teamId}/evaluations/${payload.sourceEvaluationId}/`
+                        )
+                        actions.setSourceNames(null, fetchedEvaluation.name ?? null, promptId)
+                        if (fetchedEvaluation.evaluation_type === 'llm_judge') {
+                            actions.setSystemPrompt(
+                                fetchedEvaluation.evaluation_config.prompt || DEFAULT_SYSTEM_PROMPT,
+                                promptId
+                            )
+                            const model = fetchedEvaluation.model_configuration?.model
+                            const providerKeyId = fetchedEvaluation.model_configuration?.provider_key_id
+                            if (model) {
+                                actions.setModel(model, providerKeyId ?? undefined, promptId)
+                            }
+                        }
+                        finishSourceSetup({ source_evaluation_id: payload.sourceEvaluationId })
+                    } catch {
+                        lemonToast.error('Error loading evaluation for playground')
+                    }
+                    return
+                }
+
+                if (tools) {
+                    actions.setTools(tools, promptId)
+                }
+
+                let systemPromptContent: string | undefined = undefined
+                let conversationMessages: Message[] = []
+                let initialUserPrompt: string | undefined = undefined
+
+                if (input) {
+                    try {
+                        // OTel `parts` messages (Gemini auto-instrumentor and any other gen_ai.* OTel
+                        // provider that follows the OpenTelemetry AI semantic conventions) carry their
+                        // text in `parts: [{type, content}]` instead of `content`. Expand only those
+                        // entries via the shared normalizer the Conversation tab uses, so non-parts
+                        // shapes keep their existing handling and we don't change behavior for
+                        // OpenAI / Anthropic / Vercel / Traceloop / Pydantic traces.
+                        const expandedInput = Array.isArray(input)
+                            ? input.flatMap((msg) =>
+                                  isOTelPartsMessage(msg)
+                                      ? normalizeMessage(msg, normalizeRole(msg.role, 'user'))
+                                      : [msg]
+                              )
+                            : input
+                        if (
+                            Array.isArray(expandedInput) &&
+                            expandedInput.every(
+                                (msg) =>
+                                    // Standard chat message: must have role + content/tool_calls
+                                    (msg.role && (msg.content != null || msg.tool_calls)) ||
+                                    // OpenAI Responses API top-level typed items have no role
+                                    msg.type === 'function_call' ||
+                                    msg.type === 'function_call_output'
+                            )
+                        ) {
+                            const systemContents = expandedInput
+                                .filter((msg) => msg.role === 'system')
+                                .map((msg) => msg.content)
+                                .filter(
+                                    (content): content is string =>
+                                        typeof content === 'string' && content.trim().length > 0
+                                )
+
+                            if (systemContents.length > 0) {
+                                systemPromptContent = systemContents.join('\n\n')
+                            }
+
+                            for (const msg of expandedInput as RawMessage[]) {
+                                if (msg.role === 'system') {
+                                    continue
+                                }
+                                appendRawMessage(conversationMessages, msg)
+                            }
+                        } else if (typeof input === 'string') {
+                            initialUserPrompt = input
+                        } else if (isObject(input)) {
+                            if (typeof input.content === 'string') {
+                                initialUserPrompt = input.content
+                            } else if (input.content && typeof input.content !== 'string') {
+                                initialUserPrompt = JSON.stringify(input.content, null, 2)
+                            } else {
+                                initialUserPrompt = JSON.stringify(input, null, 2)
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Error processing input for playground:', e)
+                        initialUserPrompt = String(input)
+                        conversationMessages = []
+                    }
+                }
+
+                actions.setSystemPrompt(systemPrompt ?? systemPromptContent ?? DEFAULT_SYSTEM_PROMPT, promptId)
+
+                if (initialUserPrompt) {
+                    conversationMessages.unshift({ role: 'user', content: initialUserPrompt })
+                }
+
+                // Append the generation output as assistant turn(s) so users see the full exchange.
+                // `flattenOutputMessages` unwraps LiteLLM/OpenAI `choices` shapes and string outputs,
+                // then `appendRawMessage` turns tool calls and results into structured turns.
+                if (payload.output != null) {
+                    try {
+                        for (const msg of flattenOutputMessages(payload.output)) {
+                            appendRawMessage(conversationMessages, msg)
+                        }
+                    } catch (e) {
+                        console.error('Error processing output for playground:', e)
+                    }
+                }
+
+                actions.setMessages(conversationMessages, promptId)
+                actions.setActivePromptId(promptId)
+            } finally {
+                actions.setSourceSetupLoading(false)
+            }
+        },
+
+        saveToLinkedPrompt: async ({ promptId, modelConfig }) => {
+            const { linkedSource, promptConfigs } = values
+            if (!linkedSource.promptName) {
+                lemonToast.error('No linked prompt to save to')
+                actions.saveComplete()
+                return
+            }
+            const prompt = promptConfigs.find((p) => p.id === promptId)
+            if (!prompt) {
+                lemonToast.error('No prompt configuration to save')
+                actions.saveComplete()
+                return
+            }
+            posthog.capture('llma playground saved to source', {
+                action: 'save_to_linked_prompt',
+                with_messages: prompt.messages.length > 0,
+                with_tools: !!prompt.tools?.length,
+                with_response_format: !!prompt.responseFormat,
+                with_model_config: !!modelConfig,
+            })
+            try {
+                const current = await llmPromptsNameRetrieve(
+                    String(ApiConfig.getCurrentTeamId()),
+                    linkedSource.promptName
+                )
+                await llmPromptsNamePartialUpdate(String(ApiConfig.getCurrentTeamId()), linkedSource.promptName, {
+                    prompt: prompt.systemPrompt,
+                    // Explicit even when null: omitting config would carry the previous
+                    // version's forward, resurrecting panel state the user cleared.
+                    config: serializePlaygroundConfig(prompt, modelConfig, current.config),
+                    base_version: current.latest_version,
+                })
+                const promptName = linkedSource.promptName
+                // After saving, the playground is linked to the latest version
+                if (linkedSource.promptVersion) {
+                    actions.setPromptConfigs(
+                        updatePromptConfigs(values.promptConfigs, prompt.id, (p) => ({
+                            ...p,
+                            sourcePromptVersion: null,
+                        }))
+                    )
+                    const { source_prompt_version: _, ...cleanParams } = router.values.searchParams
+                    router.actions.replace(combineUrl(urls.aiObservabilityPlayground(), cleanParams).url)
+                }
+                const label = getLinkedSourceLabel(values.linkedSource) ?? 'linked prompt'
+                lemonToast.success(`${label.charAt(0).toUpperCase()}${label.slice(1)} updated`, {
+                    button: {
+                        label: 'View',
+                        action: () => router.actions.push(urls.aiObservabilityPrompt(promptName)),
+                    },
+                })
+                for (const logic of llmPromptLogic.findAllMounted()) {
+                    if (logic.props.promptName === promptName) {
+                        logic.actions.loadPrompt()
+                    }
+                }
+            } catch (error: unknown) {
+                lemonToast.error(getApiErrorDetail(error) || 'Failed to update prompt')
+            } finally {
+                actions.saveComplete()
+            }
+        },
+
+        saveToLinkedEvaluation: async ({ promptId, modelConfig }) => {
+            posthog.capture('llma playground saved to source', { action: 'save_to_linked_evaluation' })
+            const { linkedSource, promptConfigs } = values
+            if (!linkedSource.evaluationId) {
+                lemonToast.error('No linked evaluation to save to')
+                actions.saveComplete()
+                return
+            }
+            const prompt = promptConfigs.find((p) => p.id === promptId)
+            if (!prompt) {
+                lemonToast.error('No prompt configuration to save')
+                actions.saveComplete()
+                return
+            }
+            const teamId = teamLogic.values.currentTeamId
+            if (!teamId) {
+                lemonToast.error('Could not determine team')
+                actions.saveComplete()
+                return
+            }
+            try {
+                // nosemgrep: prefer-codegen-api -- Legacy raw API call with a hand-written URL and an unchecked response type. Use evaluationsPartialUpdate() from 'products/ai_observability/frontend/generated/api' instead.
+                await api.update(`/api/environments/${teamId}/evaluations/${linkedSource.evaluationId}/`, {
+                    evaluation_config: { prompt: prompt.systemPrompt },
+                    ...(modelConfig ? { model_configuration: modelConfig } : {}),
+                })
+                const label = getLinkedSourceLabel(linkedSource) ?? 'linked evaluation'
+                const evalId = linkedSource.evaluationId
+                lemonToast.success(`${label.charAt(0).toUpperCase()}${label.slice(1)} updated`, {
+                    button: {
+                        label: 'View',
+                        action: () => router.actions.push(urls.aiObservabilityEvaluation(evalId)),
+                    },
+                })
+                for (const logic of llmEvaluationLogic.findAllMounted()) {
+                    if (logic.props.evaluationId === evalId) {
+                        logic.actions.loadEvaluation()
+                    }
+                }
+            } catch (error: unknown) {
+                lemonToast.error(getApiErrorDetail(error) || 'Failed to update evaluation')
+            } finally {
+                actions.saveComplete()
+            }
+        },
+
+        saveAsNewPrompt: async ({ promptId, name, modelConfig }) => {
+            const prompt = values.promptConfigs.find((p) => p.id === promptId)
+            if (!prompt) {
+                lemonToast.error('No prompt configuration to save')
+                actions.saveComplete()
+                return
+            }
+            posthog.capture('llma playground saved to source', {
+                action: 'save_as_new_prompt',
+                with_messages: prompt.messages.length > 0,
+                with_tools: !!prompt.tools?.length,
+                with_response_format: !!prompt.responseFormat,
+                with_model_config: !!modelConfig,
+            })
+            try {
+                const config = serializePlaygroundConfig(prompt, modelConfig, null)
+                await llmPromptsCreate(String(ApiConfig.getCurrentTeamId()), {
+                    name,
+                    prompt: prompt.systemPrompt,
+                    ...(config ? { config } : {}),
+                })
+                // Link the playground to the newly created prompt
+                actions.setPromptConfigs(
+                    updatePromptConfigs(values.promptConfigs, prompt.id, (p) => ({
+                        ...p,
+                        sourceType: 'prompt',
+                        sourcePromptName: name,
+                        sourcePromptVersion: null,
+                        sourceEvaluationId: null,
+                        sourceEvaluationName: null,
+                    }))
+                )
+                router.actions.replace(
+                    combineUrl(urls.aiObservabilityPlayground(), {
+                        ...cleanSourceSearchParams(router.values.searchParams),
+                        source_prompt_name: name,
+                    }).url
+                )
+                lemonToast.success('Prompt saved', {
+                    button: {
+                        label: 'View',
+                        action: () => router.actions.push(urls.aiObservabilityPrompt(name)),
+                    },
+                })
+            } catch (error: unknown) {
+                lemonToast.error(getApiErrorDetail(error) || 'Failed to save prompt')
+            } finally {
+                actions.saveComplete()
+            }
+        },
+
+        saveAsNewEvaluation: async ({ promptId, name, modelConfig }) => {
+            posthog.capture('llma playground saved to source', { action: 'save_as_new_evaluation' })
+            const prompt = values.promptConfigs.find((p) => p.id === promptId)
+            if (!prompt) {
+                lemonToast.error('No prompt configuration to save')
+                actions.saveComplete()
+                return
+            }
+            const teamId = teamLogic.values.currentTeamId
+            if (!teamId) {
+                lemonToast.error('Could not determine team')
+                actions.saveComplete()
+                return
+            }
+            try {
+                const sourceEvaluation =
+                    prompt.sourceType === 'evaluation' && prompt.sourceEvaluationId
+                        ? await evaluationsRetrieve(String(teamId), prompt.sourceEvaluationId)
+                        : null
+                const compatibleSource = sourceEvaluation?.output_type === 'sentiment' ? null : sourceEvaluation
+                // nosemgrep: prefer-codegen-api -- Legacy raw API call with a hand-written URL and an unchecked response type. Use evaluationsCreate() from 'products/ai_observability/frontend/generated/api' instead.
+                const created = await api.create<EvaluationConfig>(`/api/environments/${teamId}/evaluations/`, {
+                    name,
+                    evaluation_type: 'llm_judge',
+                    evaluation_config: { prompt: prompt.systemPrompt },
+                    model_configuration: modelConfig,
+                    output_type: compatibleSource?.output_type ?? 'boolean',
+                    ...(compatibleSource ? { output_config: compatibleSource.output_config } : {}),
+                    conditions: [],
+                    enabled: false,
+                })
+                // Link the playground to the newly created evaluation
+                actions.setPromptConfigs(
+                    updatePromptConfigs(values.promptConfigs, prompt.id, (p) => ({
+                        ...p,
+                        sourceType: 'evaluation',
+                        sourcePromptName: null,
+                        sourceEvaluationId: created.id,
+                        sourceEvaluationName: created.name,
+                    }))
+                )
+                router.actions.replace(
+                    combineUrl(urls.aiObservabilityPlayground(), {
+                        ...cleanSourceSearchParams(router.values.searchParams),
+                        source_evaluation_id: created.id,
+                    }).url
+                )
+                lemonToast.success('Evaluation saved', {
+                    button: {
+                        label: 'View',
+                        action: () => router.actions.push(urls.aiObservabilityEvaluation(created.id)),
+                    },
+                })
+            } catch (error: unknown) {
+                lemonToast.error(getApiErrorDetail(error) || 'Failed to save evaluation')
+            } finally {
+                actions.saveComplete()
+            }
+        },
+    })),
+
+    urlToAction(({ actions, values }) => ({
+        [urls.aiObservabilityPlayground()]: (_, searchParams) => {
+            // Consume a pending setup payload (set by openInPlayground) before reading source
+            // params from the URL. The payload is one-shot, so this consumes it exactly once.
+            const pending = consumePendingPlaygroundSetup()
+            if (pending) {
+                actions.setupPlaygroundFromEvent(pending)
+                return
+            }
+
+            const sourcePromptName =
+                typeof searchParams?.source_prompt_name === 'string' ? searchParams.source_prompt_name : null
+            const sourcePromptVersion = searchParams?.source_prompt_version
+                ? Number(searchParams.source_prompt_version) || null
+                : null
+            const sourceEvaluationId =
+                typeof searchParams?.source_evaluation_id === 'string' ? searchParams.source_evaluation_id : null
+
+            if (sourcePromptName) {
+                const currentSource = values.linkedSource
+                if (
+                    currentSource.type === 'prompt' &&
+                    currentSource.promptName === sourcePromptName &&
+                    currentSource.promptVersion === sourcePromptVersion
+                ) {
+                    return
+                }
+                actions.setupPlaygroundFromEvent({
+                    sourceType: 'prompt',
+                    sourcePromptName,
+                    sourcePromptVersion: sourcePromptVersion ?? undefined,
+                })
+            } else if (sourceEvaluationId) {
+                const currentSource = values.linkedSource
+                if (currentSource.type === 'evaluation' && currentSource.evaluationId === sourceEvaluationId) {
+                    return
+                }
+                actions.setupPlaygroundFromEvent({
+                    sourceType: 'evaluation',
+                    sourceEvaluationId,
+                })
+            } else {
+                actions.clearLinkedSource()
+            }
+        },
+    })),
+
+    // afterMount runs synchronously during logic.mount(). Consuming the pending payload here
+    // covers the case where openInPlayground queued it just before navigation and urlToAction
+    // hasn't fired yet. The consume is one-shot, so only the first of afterMount/urlToAction dispatches.
+    afterMount(({ actions }) => {
+        const pending = consumePendingPlaygroundSetup()
+        if (pending) {
+            actions.setupPlaygroundFromEvent(pending)
+        }
+    }),
+])

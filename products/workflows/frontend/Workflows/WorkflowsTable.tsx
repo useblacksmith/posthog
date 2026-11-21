@@ -1,0 +1,553 @@
+import { useActions, useValues } from 'kea'
+import { useMemo } from 'react'
+
+import {
+    LemonCheckbox,
+    LemonDivider,
+    LemonInput,
+    LemonSegmentedButton,
+    LemonSelect,
+    LemonTag,
+    Link,
+    Tooltip,
+} from '@posthog/lemon-ui'
+
+import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { AppMetricsSparkline } from 'lib/components/AppMetrics/AppMetricsSparkline'
+import { MemberSelect } from 'lib/components/MemberSelect'
+import { TagSelect } from 'lib/components/TagSelect'
+import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+import { LemonTable, LemonTableColumn, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
+import { updatedAtColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
+import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
+import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture'
+import { accessLevelSatisfied } from 'lib/utils/accessControlUtils'
+import { capitalizeFirstLetter } from 'lib/utils/strings'
+import { urls } from 'scenes/urls'
+
+import { AccessControlLevel, AccessControlResourceType } from '~/types'
+
+import { isLiveOnSandboxSender } from '../Channels/sandboxSender'
+import { AutomationEmptyState } from '../setupGuide/AutomationEmptyState'
+import { AutomationSuggestionBanner } from '../setupGuide/AutomationSuggestionBanner'
+import { MessagingSetupReminderBanner } from '../setupGuide/MessagingSetupReminderBanner'
+import { getHogFlowStep } from './hogflows/steps/HogFlowSteps'
+import { HogFlow } from './hogflows/types'
+import { workflowSuggestionsAvailabilityLogic } from './suggestions/workflowSuggestionsAvailabilityLogic'
+import { workflowLogic } from './workflowLogic'
+import { findMatchingWorkflowSteps } from './workflowSearchMatches'
+import {
+    WORKFLOW_TRIGGER_TYPE_OPTIONS,
+    WorkflowStatusFilter,
+    WorkflowTriggerTypeFilter,
+    WorkflowTypeFilter,
+    workflowsLogic,
+} from './workflowsLogic'
+import { WorkflowStepMatches } from './WorkflowStepMatches'
+import { WorkflowTagsCell } from './WorkflowTagsCell'
+import { hasMessagingAction } from './workflowTypeFilters'
+
+const STATUS_CONFIG: Record<string, { label: string; type: 'success' | 'default' | 'muted' }> = {
+    active: { label: 'Active', type: 'success' },
+    draft: { label: 'Draft', type: 'default' },
+    archived: { label: 'Archived', type: 'muted' },
+}
+
+function WorkflowTypeTag({ workflow }: { workflow: HogFlow }): JSX.Element {
+    const isMessaging = useMemo(() => hasMessagingAction(workflow.actions), [workflow.actions])
+
+    if (workflow.origin_product === 'loops') {
+        return (
+            <Link to={urls.codeLoopLink(workflow.id)}>
+                <LemonTag type="highlight">Loop</LemonTag>
+            </Link>
+        )
+    }
+    if (isMessaging) {
+        return <LemonTag type="completion">Messaging</LemonTag>
+    }
+    return <LemonTag type="default">Automation</LemonTag>
+}
+
+function WorkflowActionsSummary({ workflow }: { workflow: HogFlow }): JSX.Element {
+    const actionsByType = useMemo(() => {
+        return workflow.actions.reduce(
+            (acc, action) => {
+                const step = getHogFlowStep(action, {})
+                if (!step || !step.type.startsWith('function')) {
+                    return acc
+                }
+                const key = 'template_id' in action.config ? action.config.template_id : action.type
+                acc[key] = {
+                    count: (acc[key]?.count || 0) + 1,
+                    icon: step.icon,
+                    color: step.color,
+                }
+                return acc
+            },
+            {} as Record<
+                string,
+                {
+                    count: number
+                    icon: JSX.Element
+                    color: string
+                }
+            >
+        )
+    }, [workflow.actions])
+
+    return (
+        <Link to={urls.workflow(workflow.id, 'workflow')}>
+            <div className="flex flex-row gap-2 items-center">
+                {Object.entries(actionsByType).map(([type, { count, icon, color }]) => (
+                    <div
+                        key={type}
+                        className="rounded px-1 flex items-center justify-center gap-1"
+                        style={{
+                            backgroundColor: `${color}20`,
+                            color,
+                        }}
+                    >
+                        {icon} {count}
+                    </div>
+                ))}
+            </div>
+        </Link>
+    )
+}
+
+export function WorkflowsTable(): JSX.Element {
+    const { suggestionsAvailable } = useValues(workflowSuggestionsAvailabilityLogic)
+    const logic = workflowsLogic()
+    const {
+        workflowsLoading,
+        workflows,
+        pagination,
+        filters,
+        selectedArchivedWorkflowIds,
+        allArchivedSelected,
+        selectedArchivedCount,
+        localWorkflowTags,
+    } = useValues(logic)
+    // Only an unfiltered Automations tab is truly empty. With a search or filter, the plain message fits.
+    const showAutomationEmptyState =
+        filters.type === 'automation' &&
+        !filters.search &&
+        filters.createdBy === null &&
+        filters.status === 'all' &&
+        filters.triggerType === 'all' &&
+        filters.tags.length === 0
+    const {
+        loadWorkflows,
+        toggleWorkflowStatus,
+        duplicateWorkflow,
+        archiveWorkflow,
+        restoreWorkflow,
+        deleteWorkflow,
+        deleteSelectedWorkflows,
+        setFilters,
+        selectTypeTab,
+        toggleArchivedWorkflowSelection,
+        selectAllArchivedWorkflows,
+        clearArchivedWorkflowSelection,
+        updateWorkflowTags,
+        setTagsFilter,
+    } = useActions(logic)
+
+    useOnMountEffect(() => {
+        // Tricky: unmount the new workflow logic when leaving the new workflow scene
+        // We can't just reset state within the logic's unmount as that would trigger when switching tabs
+        const newWorkflowLogic = workflowLogic.findMounted({
+            id: 'new',
+        })
+        newWorkflowLogic?.unmount()
+
+        // Since logic isn't getting unmounted when navigating away from this scene, we need to reload workflows
+        // when the component re-mounts
+        loadWorkflows()
+    })
+
+    const isArchived = filters.status === 'archived'
+
+    const filterByTag = (tag: string): void => {
+        if (!filters.tags.includes(tag)) {
+            setTagsFilter([...filters.tags, tag], 'tag_click')
+        }
+    }
+
+    const columns: LemonTableColumns<HogFlow> = [
+        ...(isArchived
+            ? [
+                  {
+                      title: (
+                          <LemonCheckbox
+                              checked={allArchivedSelected ? true : selectedArchivedCount > 0 ? 'indeterminate' : false}
+                              onChange={(checked: boolean) =>
+                                  checked
+                                      ? selectAllArchivedWorkflows(workflows.results.map((w) => w.id))
+                                      : clearArchivedWorkflowSelection()
+                              }
+                          />
+                      ),
+                      width: 0,
+                      render: (_: any, item: HogFlow) => (
+                          <LemonCheckbox
+                              checked={selectedArchivedWorkflowIds.has(item.id)}
+                              onChange={() => toggleArchivedWorkflowSelection(item.id)}
+                          />
+                      ),
+                  },
+              ]
+            : []),
+        {
+            title: 'Name',
+            key: 'name',
+            sorter: (a, b) => (a.name || '').localeCompare(b.name || ''),
+            render: (_, item) => {
+                const stepMatches = findMatchingWorkflowSteps(item, filters.search)
+                return (
+                    <div className="min-w-48">
+                        {item.status === 'archived' ? (
+                            <Tooltip title="Restore this workflow to make changes">
+                                <span className="font-semibold text-sm text-muted">{item.name}</span>
+                            </Tooltip>
+                        ) : (
+                            <LemonTableLink
+                                to={urls.workflow(
+                                    item.id,
+                                    item.status === 'active' && item.trigger?.type !== 'batch' ? 'overview' : 'workflow'
+                                )}
+                                title={
+                                    <span className="flex items-center gap-2 flex-wrap">
+                                        {item.name}
+                                        {suggestionsAvailable &&
+                                            item.status === 'active' &&
+                                            item.suggestions_enabled && (
+                                                // Reads only: the row link already renders an anchor, and an
+                                                // interactive element inside it is unreachable by keyboard.
+                                                <LemonTag
+                                                    type={item.pending_suggestions ? 'completion' : 'option'}
+                                                    data-attr="workflow-list-suggestions"
+                                                >
+                                                    {!item.pending_suggestions
+                                                        ? 'Self-driving'
+                                                        : item.pending_suggestions === 1
+                                                          ? '1 suggestion'
+                                                          : `${item.pending_suggestions} suggestions`}
+                                                </LemonTag>
+                                            )}
+                                    </span>
+                                }
+                                description={item.description}
+                                truncateDescription
+                            />
+                        )}
+                        {stepMatches.length > 0 && <WorkflowStepMatches workflow={item} matches={stepMatches} />}
+                    </div>
+                )
+            },
+        },
+        {
+            title: 'Tags',
+            key: 'tags',
+            render: (_, item) => {
+                const tags = localWorkflowTags[item.id] ?? item.tags ?? []
+                const canEdit =
+                    item.status !== 'archived' &&
+                    (!item.user_access_level ||
+                        accessLevelSatisfied(
+                            AccessControlResourceType.Workflow,
+                            item.user_access_level,
+                            AccessControlLevel.Editor
+                        ))
+                return (
+                    <WorkflowTagsCell
+                        tags={tags}
+                        canEdit={canEdit}
+                        onChange={(newTags) => updateWorkflowTags(item, newTags)}
+                        onTagClick={filterByTag}
+                    />
+                )
+            },
+        },
+        {
+            title: 'Type',
+            width: 0,
+            render: (_, item) => {
+                return <WorkflowTypeTag workflow={item} />
+            },
+        },
+        {
+            title: 'Trigger',
+            width: 0,
+            render: (_, item) => {
+                return (
+                    <Link to={urls.workflow(item.id, 'workflow') + '?node=trigger_node'}>
+                        <LemonTag type="default">{capitalizeFirstLetter(item.trigger?.type ?? 'unknown')}</LemonTag>
+                    </Link>
+                )
+            },
+        },
+        {
+            title: 'Dispatches',
+            width: 0,
+            render: (_, item) => {
+                return <WorkflowActionsSummary workflow={item} />
+            },
+        },
+        {
+            title: 'Created by',
+            width: 0,
+            render: (_, item) => {
+                if (!item.created_by) {
+                    return <span className="text-muted">Unknown</span>
+                }
+                return (
+                    <div className="flex items-center gap-2">
+                        <ProfilePicture user={item.created_by} size="sm" />
+                        <span>{item.created_by.first_name || item.created_by.email}</span>
+                    </div>
+                )
+            },
+        },
+        {
+            ...(updatedAtColumn() as LemonTableColumn<HogFlow, any>),
+            width: 0,
+        },
+        {
+            title: 'Last 7 days',
+            width: 0,
+            render: (_, { id }) => {
+                return (
+                    <Link to={urls.workflow(id, 'metrics')}>
+                        <AppMetricsSparkline
+                            logicKey={id}
+                            // Lines, not stacked bars: Started counts a run that also lands in
+                            // Completed or Failed the same day, so a stacked total would double-count.
+                            type="line"
+                            metricLabels={{ triggered: 'Started', succeeded: 'Completed', failed: 'Failed' }}
+                            // Same colors as the workflow metrics tab: triggered is blue there too.
+                            metricColors={{ triggered: 'blue', succeeded: 'success', failed: 'danger' }}
+                            forceParams={{
+                                // The versioned mirror keys every run's metrics (including batch runs,
+                                // which the plain hog_flow source keys under the batch job id) as
+                                // `<flow id>/<version>`, so a prefix match covers all activity.
+                                appSource: 'hog_flow_version',
+                                appSourceIdPrefix: `${id}/`,
+                                // Run-level rows carry an empty instance_id; per-action succeeded/failed
+                                // rows carry the action id. Filter to run-level so Completed and Failed
+                                // count runs, not steps. triggered is run-level too, so Started is unaffected.
+                                instanceId: '',
+                                metricName: ['triggered', 'succeeded', 'failed'],
+                                breakdownBy: 'metric_name',
+                                interval: 'day',
+                                dateFrom: '-7d',
+                            }}
+                        />
+                    </Link>
+                )
+            },
+        },
+        {
+            title: 'Status',
+            width: 0,
+            render: (_, item) => {
+                const config = STATUS_CONFIG[item.status] || STATUS_CONFIG.draft
+                return (
+                    <div className="flex flex-wrap items-center gap-1">
+                        <LemonTag type={config.type}>{config.label}</LemonTag>
+                        {isLiveOnSandboxSender(item) && (
+                            <Tooltip title="Email steps on the PostHog test sender reach only verified members of your organization. To reach your users, set up your sending domain and switch those steps to it.">
+                                {/* Focusable so keyboard users can open the tooltip. */}
+                                <span tabIndex={0} className="inline-flex">
+                                    <LemonTag type="warning" data-attr="workflow-list-sandbox-sender">
+                                        Test sender
+                                    </LemonTag>
+                                </span>
+                            </Tooltip>
+                        )}
+                    </div>
+                )
+            },
+        },
+        {
+            width: 0,
+            render: function Render(_, workflow: HogFlow) {
+                return (
+                    <More
+                        overlay={
+                            <>
+                                {workflow.status !== 'archived' && (
+                                    <AccessControlAction
+                                        resourceType={AccessControlResourceType.Workflow}
+                                        minAccessLevel={AccessControlLevel.Editor}
+                                        userAccessLevel={workflow.user_access_level}
+                                    >
+                                        <LemonButton
+                                            data-attr="workflow-edit"
+                                            fullWidth
+                                            status={workflow.status === 'draft' ? 'default' : 'danger'}
+                                            onClick={() => toggleWorkflowStatus(workflow)}
+                                            tooltip={
+                                                workflow.status === 'draft'
+                                                    ? 'Enables the workflow to start sending messages'
+                                                    : 'Disables the workflow from sending any new messages. In-progress workflows will end immediately.'
+                                            }
+                                        >
+                                            {workflow.status === 'draft' ? 'Enable' : 'Disable'}
+                                        </LemonButton>
+                                    </AccessControlAction>
+                                )}
+                                <LemonButton
+                                    data-attr="workflow-duplicate"
+                                    fullWidth
+                                    onClick={() => duplicateWorkflow(workflow)}
+                                >
+                                    Duplicate
+                                </LemonButton>
+                                <LemonDivider />
+                                <AccessControlAction
+                                    resourceType={AccessControlResourceType.Workflow}
+                                    minAccessLevel={AccessControlLevel.Editor}
+                                    userAccessLevel={workflow.user_access_level}
+                                >
+                                    <LemonButton
+                                        data-attr="workflow-archive-restore"
+                                        fullWidth
+                                        status={workflow.status === 'archived' ? 'default' : 'danger'}
+                                        onClick={() => {
+                                            workflow.status === 'archived'
+                                                ? restoreWorkflow(workflow)
+                                                : archiveWorkflow(workflow)
+                                        }}
+                                    >
+                                        {workflow.status === 'archived' ? 'Restore' : 'Archive'}
+                                    </LemonButton>
+                                </AccessControlAction>
+                                {workflow.status === 'archived' && (
+                                    <AccessControlAction
+                                        resourceType={AccessControlResourceType.Workflow}
+                                        minAccessLevel={AccessControlLevel.Editor}
+                                        userAccessLevel={workflow.user_access_level}
+                                    >
+                                        <LemonButton
+                                            data-attr="workflow-delete"
+                                            fullWidth
+                                            status="danger"
+                                            onClick={() => deleteWorkflow(workflow)}
+                                        >
+                                            Delete
+                                        </LemonButton>
+                                    </AccessControlAction>
+                                )}
+                            </>
+                        }
+                    />
+                )
+            },
+        },
+    ]
+
+    return (
+        <div className="workflows-section" data-attr="workflows-table" data-loading={workflowsLoading}>
+            <>
+                <MessagingSetupReminderBanner />
+                <div className="mb-3">
+                    <LemonSegmentedButton<WorkflowTypeFilter>
+                        size="small"
+                        value={filters.type}
+                        onChange={selectTypeTab}
+                        options={[
+                            { value: 'all', label: 'All', 'data-attr': 'workflows-type-tab-all' },
+                            { value: 'messaging', label: 'Messaging', 'data-attr': 'workflows-type-tab-messaging' },
+                            {
+                                value: 'automation',
+                                label: 'Automations',
+                                'data-attr': 'workflows-type-tab-automation',
+                            },
+                            { value: 'loop', label: 'Loops', 'data-attr': 'workflows-type-tab-loop' },
+                        ]}
+                    />
+                </div>
+                <div className="flex justify-between gap-2 flex-wrap mb-4">
+                    <LemonInput
+                        type="search"
+                        placeholder="Search for workflows"
+                        onChange={(search) => setFilters({ search })}
+                        value={filters.search}
+                    />
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <span>
+                            <b>Status</b>
+                        </span>
+                        <LemonSelect
+                            dropdownMatchSelectWidth={false}
+                            size="small"
+                            onChange={(value) => setFilters({ status: value as WorkflowStatusFilter })}
+                            options={[
+                                { label: 'All', value: 'all' },
+                                { label: 'Active', value: 'active' },
+                                { label: 'Draft', value: 'draft' },
+                                { label: 'Archived', value: 'archived' },
+                            ]}
+                            value={filters.status}
+                        />
+                        <span className="ml-1">
+                            <b>Trigger</b>
+                        </span>
+                        <LemonSelect
+                            dropdownMatchSelectWidth={false}
+                            size="small"
+                            onChange={(value) => setFilters({ triggerType: value as WorkflowTriggerTypeFilter })}
+                            options={WORKFLOW_TRIGGER_TYPE_OPTIONS}
+                            value={filters.triggerType}
+                        />
+                        <span className="ml-1">
+                            <b>Created by</b>
+                        </span>
+                        <MemberSelect
+                            value={filters.createdBy}
+                            onChange={(user) => setFilters({ createdBy: user?.uuid || null })}
+                        />
+                        <span className="ml-1">
+                            <b>Tags</b>
+                        </span>
+                        <TagSelect
+                            size="small"
+                            defaultLabel="Any tags"
+                            value={filters.tags}
+                            onChange={(tags) => setTagsFilter(tags, 'filter')}
+                            listDataAttr="workflows-tags-filter-list"
+                        />
+                    </div>
+                </div>
+
+                {isArchived && selectedArchivedCount > 0 && (
+                    <div className="flex items-center gap-2 mb-2">
+                        <span className="text-muted text-sm">
+                            {selectedArchivedCount} workflow{selectedArchivedCount !== 1 ? 's' : ''} selected
+                        </span>
+                        <LemonButton type="secondary" status="danger" size="small" onClick={deleteSelectedWorkflows}>
+                            Delete selected
+                        </LemonButton>
+                    </div>
+                )}
+
+                <LemonTable
+                    dataSource={workflows.results}
+                    loading={workflowsLoading}
+                    rowKey="id"
+                    rowClassName="group"
+                    columns={columns}
+                    defaultSorting={{ columnKey: 'updatedAt', order: 1 }}
+                    pagination={pagination}
+                    nouns={['workflow', 'workflows']}
+                    emptyState={showAutomationEmptyState ? <AutomationEmptyState /> : 'No workflows matching filters'}
+                />
+                <AutomationSuggestionBanner />
+            </>
+        </div>
+    )
+}

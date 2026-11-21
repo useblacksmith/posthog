@@ -1,0 +1,2154 @@
+import re
+import math
+from collections.abc import Callable, Sequence
+from typing import Literal, Optional, TypeGuard, cast
+
+from django.db import models
+from django.db.models import Q
+from django.db.models.functions.comparison import Coalesce
+
+import re2
+import posthoganalytics
+from more_itertools import chunked
+from pydantic import BaseModel
+from rest_framework.exceptions import ValidationError
+
+from posthog.schema import (
+    AccountCustomPropertyFilter,
+    BehavioralPropertyFilter,
+    CohortPropertyFilter,
+    DataWarehousePersonPropertyFilter,
+    DataWarehousePropertyFilter,
+    ElementPropertyFilter,
+    EmptyPropertyFilter,
+    ErrorTrackingIssueFilter,
+    EventMetadataPropertyFilter,
+    EventPropertyFilter,
+    FeaturePropertyFilter,
+    FilterLogicalOperator,
+    FlagPropertyFilter,
+    GroupPropertyFilter,
+    HogQLPropertyFilter,
+    LogEntryPropertyFilter,
+    LogPropertyFilter,
+    MetricPropertyFilter,
+    PersonMetadataPropertyFilter,
+    PersonPropertyFilter,
+    PropertyGroupFilter,
+    PropertyGroupFilterValue,
+    PropertyOperator,
+    RecordingPropertyFilter,
+    RetentionEntity,
+    RevenueAnalyticsPropertyFilter,
+    SessionPropertyFilter,
+    SpanPropertyFilter,
+    WorkflowVariablePropertyFilter,
+)
+
+from posthog.hogql import ast
+from posthog.hogql.base import AST
+from posthog.hogql.constants import EXCEPTION_STRING_ARRAY_PROPERTIES
+from posthog.hogql.database.models import BooleanDatabaseField
+from posthog.hogql.database.schema.sessions_v3 import LAZY_SESSIONS_FIELDS
+from posthog.hogql.errors import NotImplementedError, QueryError
+from posthog.hogql.functions import find_hogql_aggregation
+from posthog.hogql.parser import CacheOrigin, parse_expr
+from posthog.hogql.utils import map_virtual_properties
+from posthog.hogql.visitor import CloningVisitor, TraversingVisitor, clone_expr
+
+from posthog.clickhouse.query_tagging import tag_contains_user_hogql
+from posthog.constants import AUTOCAPTURE_EVENT, TREND_FILTER_TYPE_ACTIONS, PropertyOperatorType
+from posthog.dataclasses import frozen
+from posthog.interval_specs import get_interval_func
+from posthog.models import Property, Team
+from posthog.models.element import Element
+from posthog.models.event import MAX_SELECTOR_LENGTH, Selector
+from posthog.models.property import BehavioralPropertyType, PropertyGroup, ValueT
+from posthog.models.property.util import build_selector_regex
+from posthog.utils import get_from_dict_or_attr, relative_date_parse
+
+from products.actions.backend.facade.api import get_action
+from products.actions.backend.facade.contracts import Action, ActionNotFound, ActionStep
+from products.cohorts.backend.models.cohort import Cohort
+from products.data_tools.backend.models.join import DataWarehouseJoin
+from products.event_definitions.backend.models import PropertyDefinition
+from products.event_definitions.backend.models.property_definition import PropertyType
+from products.warehouse_sources.backend.facade.hogql import get_view_or_table_by_name
+
+# Top-level columns on the persons table that the `person_metadata` filter type can target.
+# Keep in sync with the "person_metadata" group in
+# frontend/src/taxonomy/core-filter-definitions-by-group.json,
+# personMetadataPropertyDefinitions in frontend/src/models/propertyDefinitionsModel.ts,
+# and the per-field injection in rust/feature-flags/src/flags/flag_matching_utils.rs.
+# `test_person_metadata_fields_match_taxonomy` enforces the Python ↔ taxonomy half.
+PERSON_METADATA_FIELDS = {"created_at"}
+
+
+@frozen
+class SemverParts:
+    major: str
+    minor: str
+    patch: str
+
+
+def parse_semver(value: str) -> SemverParts:
+    """
+    Parse a semver string into major, minor and patch components.
+
+    - Strips pre-release suffixes (e.g., -alpha.1)
+    - Defaults missing components to "0" (e.g., 1.0 -> 1.0.0)
+
+    Components stay strings for direct use in version string construction.
+    Raises ValueError if parsing fails.
+    """
+    # Strip pre-release suffix (everything after first hyphen)
+    base_version = value.split("-")[0]
+
+    parts = base_version.split(".")
+    if len(parts) < 1 or not parts[0]:
+        raise ValueError("Invalid semver format")
+
+    major = parts[0]
+    minor = parts[1] if len(parts) > 1 else "0"
+    patch = parts[2] if len(parts) > 2 else "0"
+
+    # Validate they're actually integers
+    int(major), int(minor), int(patch)
+
+    return SemverParts(major=major, minor=minor, patch=patch)
+
+
+# Anchored, strict-semver validator used to gate semver comparisons. We can't rely on
+# `sortableSemver` returning NULL for invalid input because ClickHouse forbids
+# `Nullable(Array(...))`, and an `Array(Nullable(Int64))` with a NULL element sorts
+# as the *greatest* array — which would incorrectly include invalid versions in
+# `>= filter` queries. Instead we gate every semver comparison on this regex
+# matching the property side, so invalid values are dropped before the array
+# comparison happens. Matches Rust `semver::Version::parse` (X.Y.Z, no leading
+# zeros, optional 'v' prefix, optional pre-release / build suffix).
+STRICT_SEMVER_REGEX = r"^\s*v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][^\s]*)?\s*$"
+
+
+def _gate_on_valid_semver(expr: ast.Expr, comparison: ast.Expr) -> ast.And:
+    """Wrap a semver comparison so it only fires on rows where `expr` is strict semver."""
+    return ast.And(
+        exprs=[
+            ast.Call(name="match", args=[expr, ast.Constant(value=STRICT_SEMVER_REGEX)]),
+            comparison,
+        ]
+    )
+
+
+def semver_range_compare(
+    expr: ast.Expr,
+    value: ast.Any,
+    operator_name: str,
+    bounds_calculator: Callable[[str], tuple[str, str]],
+) -> ast.And:
+    """
+    Build a semver range comparison AST (lower_bound <= expr < upper_bound).
+
+    Args:
+        expr: The expression to compare (e.g., person.properties.app_version)
+        value: The semver value from the filter
+        operator_name: Name for error messages (e.g., "Tilde", "Caret", "Wildcard")
+        bounds_calculator: Function that takes the value and returns (lower_bound, upper_bound)
+
+    Returns:
+        AST node representing: match(expr, valid_semver) AND sortableSemver(expr) >= sortableSemver(lower) AND sortableSemver(expr) < sortableSemver(upper)
+    """
+    if not isinstance(value, str):
+        raise QueryError(f"{operator_name} operator requires a semver string value")
+
+    try:
+        lower_bound, upper_bound = bounds_calculator(value)
+    except (ValueError, IndexError):
+        raise QueryError(f"{operator_name} operator requires a valid semver string (e.g., '1.2.3')")
+
+    return ast.And(
+        exprs=[
+            ast.Call(name="match", args=[expr, ast.Constant(value=STRICT_SEMVER_REGEX)]),
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.GtEq,
+                left=ast.Call(name="sortableSemver", args=[expr]),
+                right=ast.Call(name="sortableSemver", args=[ast.Constant(value=lower_bound)]),
+            ),
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.Lt,
+                left=ast.Call(name="sortableSemver", args=[expr]),
+                right=ast.Call(name="sortableSemver", args=[ast.Constant(value=upper_bound)]),
+            ),
+        ]
+    )
+
+
+def _tilde_bounds(value: str) -> tuple[str, str]:
+    """
+    ~1.2.3 means >=1.2.3 <1.3.0 (allows patch-level changes)
+    ~1 means >=1.0.0 <2.0.0 (bare major: allows minor+patch changes)
+    """
+    v = parse_semver(value)
+    parts = value.split("-")[0].split(".")
+    if len(parts) < 2:
+        return f"{v.major}.0.0", f"{int(v.major) + 1}.0.0"
+    next_minor = str(int(v.minor) + 1)
+    return f"{v.major}.{v.minor}.{v.patch}", f"{v.major}.{next_minor}.0"
+
+
+def _caret_bounds(value: str) -> tuple[str, str]:
+    """
+    Caret operator follows semver spec:
+    ^1.2.3 means >=1.2.3 <2.0.0
+    ^0.2.3 means >=0.2.3 <0.3.0
+    ^0.0.3 means >=0.0.3 <0.0.4
+    The leftmost non-zero component determines the upper bound.
+    """
+    v = parse_semver(value)
+    lower_bound = f"{v.major}.{v.minor}.{v.patch}"
+
+    if int(v.major) > 0:
+        upper_bound = f"{int(v.major) + 1}.0.0"
+    elif int(v.minor) > 0:
+        upper_bound = f"0.{int(v.minor) + 1}.0"
+    else:
+        upper_bound = f"0.0.{int(v.patch) + 1}"
+
+    return lower_bound, upper_bound
+
+
+def _wildcard_bounds(value: str) -> tuple[str, str]:
+    """
+    Wildcard matching:
+    1.* means >=1.0.0 <2.0.0
+    1.2.* means >=1.2.0 <1.3.0
+    1.2.3.* means >=1.2.3.0 <1.2.4.0
+    """
+    # Remove trailing .* if present
+    value = value.rstrip(".*")
+    if not value:
+        raise ValueError("Invalid wildcard pattern")
+
+    # Strip pre-release suffix before counting parts
+    base_value = value.split("-")[0]
+    parts = base_value.split(".")
+
+    if len(parts) == 1:
+        major = parts[0]
+        int(major)  # Validate
+        return f"{major}.0.0", f"{int(major) + 1}.0.0"
+    elif len(parts) == 2:
+        major, minor = parts[0], parts[1]
+        int(major), int(minor)  # Validate
+        return f"{major}.{minor}.0", f"{major}.{int(minor) + 1}.0"
+    else:
+        major, minor, patch = parts[0], parts[1], parts[2]
+        int(major), int(minor), int(patch)  # Validate
+        return f"{major}.{minor}.{patch}.0", f"{major}.{minor}.{int(patch) + 1}.0"
+
+
+GROUP_KEY_PATTERN = re.compile(r"^\$group_[0-4]$")
+
+# The group's key is a column on the groups table, not an entry in its property JSON. Flag matching and
+# the release-condition blast radius already resolve it that way; HogQL has to agree everywhere.
+GROUP_KEY_PROPERTY = "$group_key"
+
+
+def group_property_chain(group_type_index: int | float | None, key: str) -> list[str]:
+    """Field chain that reads group property `key` through the events table's `group_N` lazy join.
+
+    `$group_key` is the `key` column, `$virt_*` properties are expression fields on the groups table, and
+    anything else lives in the property JSON. The breakdown builders and `property_to_expr` all go through
+    here so the three shapes cannot drift apart.
+    """
+    if group_type_index is None:
+        raise QueryError("A group property needs a group_type_index")
+    prefix = f"group_{int(group_type_index)}"
+    if key == GROUP_KEY_PROPERTY:
+        return [prefix, "key"]
+    if key.startswith("$virt_"):
+        return [prefix, key]
+    return [prefix, "properties", key]
+
+
+def _stringify_group_key_value(value: object) -> str | list[str]:
+    """Group keys ($group_0–$group_4) are always stored as strings. A numeric filter
+    value would produce equals(<string column>, <number>), which ClickHouse rejects
+    with NO_COMMON_TYPE — so coerce a group-key filter value to its string form."""
+
+    def _scalar(v: object) -> str:
+        # An integer-valued float ('13.0') stringifies to the plain integer ('13')
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
+
+    if isinstance(value, list):
+        return [_scalar(v) for v in value]
+    return _scalar(value)
+
+
+def has_aggregation(expr: AST) -> bool:
+    finder = AggregationFinder()
+    finder.visit(expr)
+    return finder.has_aggregation
+
+
+class AggregationFinder(TraversingVisitor):
+    def __init__(self):
+        super().__init__()
+        self.has_aggregation = False
+
+    def visit(self, node):
+        if self.has_aggregation:
+            return
+        else:
+            super().visit(node)
+
+    def visit_select_query(self, node: ast.SelectQuery):
+        # don't care about aggregations in subqueries
+        pass
+
+    def visit_call(self, node: ast.Call):
+        if find_hogql_aggregation(node.name):
+            self.has_aggregation = True
+        else:
+            for arg in node.args:
+                self.visit(arg)
+
+
+class WindowFunctionFinder(TraversingVisitor):
+    # Window functions evade the order_by and has_aggregation guards but must see every input row,
+    # so limit pushdowns bail on them too.
+    found: bool = False
+
+    def visit(self, node):
+        if not self.found:
+            super().visit(node)
+
+    def visit_select_query(self, node: ast.SelectQuery):
+        pass  # a window inside a scalar subquery doesn't change this query's rows
+
+    def visit_window_function(self, node: ast.WindowFunction):
+        self.found = True
+
+
+def has_window_function(expr: AST) -> bool:
+    finder = WindowFunctionFinder()
+    finder.visit(expr)
+    return finder.found
+
+
+def _handle_bool_values(value: ValueT, expr: ast.Expr, property: Property, team: Team) -> ValueT | bool:
+    if value is True:
+        value = "true"
+    elif value is False:
+        value = "false"
+
+    if value != "true" and value != "false":
+        return value
+
+    # Virtual event properties (e.g. $virt_is_bot) don't have PropertyDefinition
+    # records, so we check the taxonomy directly for boolean type
+    if property.key and property.key.startswith("$virt_"):
+        from posthog.taxonomy.taxonomy import CORE_FILTER_DEFINITIONS_BY_GROUP
+
+        for group_defs in CORE_FILTER_DEFINITIONS_BY_GROUP.values():
+            prop_def = group_defs.get(property.key)
+            if prop_def and prop_def.get("type") == "Boolean":
+                return value == "true"
+        return value
+
+    if property.type == "person":
+        property_types = PropertyDefinition.objects.alias(
+            effective_project_id=Coalesce("project_id", "team_id", output_field=models.BigIntegerField())
+        ).filter(
+            effective_project_id=team.project_id,
+            name=property.key,
+            type=PropertyDefinition.Type.PERSON,
+        )
+    elif property.type == "group":
+        property_types = PropertyDefinition.objects.alias(
+            effective_project_id=Coalesce("project_id", "team_id", output_field=models.BigIntegerField())
+        ).filter(
+            effective_project_id=team.project_id,
+            name=property.key,
+            type=PropertyDefinition.Type.GROUP,
+            group_type_index=property.group_type_index,
+        )
+    elif property.type == "data_warehouse_person_property":
+        if not isinstance(expr, ast.Field):
+            raise Exception(f"Requires a Field expression")
+
+        key = expr.chain[-2]
+
+        # TODO: pass id of table item being filtered on instead of searching through joins
+        current_join: DataWarehouseJoin | None = (
+            DataWarehouseJoin.objects.filter(Q(deleted__isnull=True) | Q(deleted=False))
+            .filter(team=team, source_table_name="persons", field_name=key)
+            .first()
+        )
+
+        if not current_join:
+            raise Exception(f"Could not find join for key {key}")
+
+        prop_type = None
+
+        table_or_view = get_view_or_table_by_name(team, current_join.joining_table_name)
+        if table_or_view and table_or_view.columns is not None:
+            prop_type_dict = table_or_view.columns.get(property.key, None)
+            if prop_type_dict is not None:
+                prop_type = prop_type_dict.get("hogql")
+
+        if not table_or_view:
+            raise Exception(f"Could not find table or view for key {key}")
+
+        if prop_type == "BooleanDatabaseField":
+            if value == "true":
+                value = True
+            if value == "false":
+                value = False
+
+        return value
+
+    elif property.type == "session":
+        field_definition = LAZY_SESSIONS_FIELDS.get(property.key)
+        if isinstance(field_definition, BooleanDatabaseField):
+            if value == "true":
+                return True
+            if value == "false":
+                return False
+        return value
+
+    else:
+        property_types = PropertyDefinition.objects.alias(
+            effective_project_id=Coalesce("project_id", "team_id", output_field=models.BigIntegerField())
+        ).filter(
+            effective_project_id=team.project_id,
+            name=property.key,
+            type=PropertyDefinition.Type.EVENT,
+        )
+    property_type = property_types[0].property_type if len(property_types) > 0 else None
+
+    if property_type == PropertyType.Boolean:
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+    return value
+
+
+# bool is a subclass of int — exclude it so booleans keep flowing through _handle_bool_values
+def _is_numeric_filter_value(v: object) -> bool:
+    return not isinstance(v, bool) and isinstance(v, (int, float))
+
+
+def _property_lhs_stays_string(property: Property, team: Team) -> bool:
+    """Whether the property's LHS compiles to a JSON-extracted String.
+
+    Numeric-, Boolean-, and DateTime-typed properties are cast to a Float / Bool / DateTime
+    LHS by PropertySwapper, so their comparisons already resolve to a common type.
+    A String-typed or as-yet-undefined property keeps its String LHS, and a numeric
+    comparison against it needs coercion on one side or the other."""
+    # map_virtual_properties rewrites a $virt_ key to a typed column on the parent table instead
+    # of a JSON extract, so its LHS is already numeric and has no PropertyDefinition row to look
+    # up. Without this guard the lookup below misses and coerces, which breaks numeric virtual
+    # properties such as $virt_revenue.
+    if property.key and property.key.startswith("$virt_"):
+        return False
+
+    if property.type == "person":
+        type_filters: dict[str, object] = {"type": PropertyDefinition.Type.PERSON}
+    elif property.type == "group":
+        type_filters = {"type": PropertyDefinition.Type.GROUP, "group_type_index": property.group_type_index}
+    elif property.type == "event":
+        # legacy definitions may carry a NULL type; load_property_metadata treats those as event
+        # properties (so the swapper casts their LHS) — mirror it, or the two sides disagree
+        type_filters = {"type__in": [None, PropertyDefinition.Type.EVENT]}
+    else:
+        # Other property types (session, data warehouse, logs, spans, …) resolve to properly
+        # typed columns, so a numeric comparison already has a common type — leave them alone.
+        return False
+
+    property_type = (
+        PropertyDefinition.objects.alias(
+            effective_project_id=Coalesce("project_id", "team_id", output_field=models.BigIntegerField())
+        )
+        .filter(effective_project_id=team.project_id, name=property.key, **type_filters)
+        # load_property_metadata skips definitions without a property_type — match it so a
+        # typeless row can't shadow a typed one when both NULL-type and event-type rows exist
+        .exclude(property_type__isnull=True)
+        .exclude(property_type="")
+        .values_list("property_type", flat=True)
+        .first()
+    )
+
+    return property_type not in (PropertyType.Numeric, PropertyType.Boolean, PropertyType.Datetime)
+
+
+def _coerce_numeric_value_for_string_property(value: ValueT, property: Property, team: Team) -> ValueT:
+    """Person, event, and group properties are pulled out of JSON as strings, so a numeric
+    filter value against a string-typed one compiles to equals(<String>, <number>), which
+    ClickHouse rejects with NO_COMMON_TYPE. Stringify the numeric value in that case,
+    mirroring _stringify_group_key_value for group keys.
+
+    Only the narrow numeric-value-vs-string-property shape is coerced; a typed LHS is
+    left untouched (stringifying it would reintroduce the mismatch the other way around).
+
+    Accepts a scalar or a list of values; the type lookup runs at most once either way."""
+    values = value if isinstance(value, list) else [value]
+    if not any(_is_numeric_filter_value(v) for v in values):
+        return value
+
+    if not _property_lhs_stays_string(property, team):
+        return value
+
+    # An integer-valued float loses its '.0' (13.0 -> '13').
+    def _stringify(v: object) -> object:
+        if not _is_numeric_filter_value(v):
+            return v
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
+
+    if isinstance(value, list):
+        return cast(ValueT, [_stringify(v) for v in value])
+    return cast(ValueT, _stringify(value))
+
+
+def _parse_numeric_bound(value: ValueT) -> int | float | None:
+    """Read an ordered-comparison bound as a number, or None when it is not one.
+
+    The filter UI submits a typed-in bound as text ('200'), so numeric text counts as
+    numeric here. NaN parses without error but orders meaninglessly, so it is rejected."""
+    if _is_numeric_filter_value(value):
+        return cast(int | float, value)
+    if isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError:
+            return None
+        return None if math.isnan(parsed) else parsed
+    return None
+
+
+def _coerce_ordered_bound(
+    expr: ast.Expr, value: ValueT, property: Property, team: Team
+) -> tuple[ast.Expr, ValueT | int | float]:
+    """Coerce an ordered comparison (lt/gt/lte/gte) of a numeric bound against a String LHS.
+
+    Stringifying the value, the way exact/is_not do, would order lexicographically
+    ('9' > '10'), so the cast has to go on the LHS instead. HogQL's toFloat prints as
+    accurateCastOrNull(..., 'Float64'), so a row whose value does not parse as a number
+    becomes NULL and drops out of the comparison, same as a row missing the property.
+    The bound comes back in parsed form, or a numeric-text bound would compare as
+    String against the Float64 LHS."""
+    bound = _parse_numeric_bound(value)
+    if bound is None:
+        return expr, value
+
+    if not _property_lhs_stays_string(property, team):
+        return expr, value
+
+    return ast.Call(name="toFloat", args=[expr]), bound
+
+
+def _resolve_date_value(value: ValueT, team: Team) -> ValueT:
+    """Resolve a date value for IS_DATE_* operators.
+
+    Relative dates (e.g. ``-7d``, ``-10m`` for months, ``-10M`` for minutes) are
+    resolved against the team timezone and rendered as a naive ``YYYY-MM-DD HH:MM:SS``
+    wall-clock string — the printer's constant-folding fast-path then lowers that
+    to ``toDateTime(str, <team_tz>)``, which interprets it in the team timezone.
+    Because ``relative_date_parse`` already computed the wall clock in the team
+    timezone, the round-trip is correct.
+
+    Absolute values are returned untouched. In particular, ISO 8601 strings with
+    an explicit ``T``/``Z`` (e.g. ``2026-03-19T14:00:00Z``) are preserved so that
+    ClickHouse's ``parseDateTime64BestEffort`` — which honors the embedded offset
+    — can parse them to the correct UTC moment regardless of the team's timezone.
+    Stripping the ``Z`` and fast-pathing to ``toDateTime`` would silently reinterpret
+    the value in the team timezone and shift it by the offset.
+    """
+    if not isinstance(value, str):
+        return value
+
+    relative_regex = r"^-?[0-9]+[hdwmqysHDWMQY]"
+    if re.match(relative_regex, value):
+        from posthog.utils import relative_date_parse
+
+        resolved = relative_date_parse(value, team.timezone_info)
+        return resolved.strftime("%Y-%m-%d %H:%M:%S")
+
+    return value
+
+
+def _force_datetime(expr: ast.Expr) -> ast.Expr:
+    """Coerce ``expr`` to DateTime for chronological IS_DATE_* comparison.
+
+    PropertySwapper only wraps the LHS of a comparison in ``toDateTime()``
+    when a DateTime PropertyDefinition exists for the property. Without one,
+    the LHS stays as a raw JSON-extracted String, and a String-vs-String
+    comparison becomes lexicographic — which silently diverges from
+    chronological order when one side uses the ISO 8601 ``T``/``Z`` form and
+    the other the normalized MySQL form (``'T'`` = 0x54 sorts after
+    ``' '`` = 0x20).
+
+    Wrapping both sides in HogQL's ``toDateTime`` forces ClickHouse to parse
+    and compare as DateTime regardless of the underlying column type.
+
+    The ``toString`` hop on non-constant expressions is load-bearing: when
+    PropertySwapper *does* wrap the LHS (DateTime PropertyDefinition exists),
+    HogQL's overload resolution for the outer ``toDateTime`` cannot see
+    through PropertySwapper's freshly created Call node and falls back to
+    the default ``parseDateTime64BestEffortOrNull`` mapping. That function
+    rejects DateTime64 input (``ILLEGAL_TYPE_OF_ARGUMENT``), so we must
+    stringify first. String constants already skip the hop because
+    ``toString('x')`` is pointless and omitting it lets the printer apply
+    its ``parseDateTime64BestEffortOrNull`` → ``toDateTime`` constant
+    folding optimization.
+    """
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return ast.Call(name="toDateTime", args=[expr])
+    return ast.Call(
+        name="toDateTime",
+        args=[ast.Call(name="toString", args=[expr])],
+    )
+
+
+def _validate_between_values(value: ValueT, operator: PropertyOperator) -> TypeGuard[list[str]]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise QueryError(f"{operator} operator requires a two-element array [min, max]")
+
+    # ValueT declares list[str], but a filter value reaches here as parsed JSON, so a bound can be
+    # any scalar. Taking `object` keeps the runtime checks below reachable.
+    def _to_bound(bound: object) -> float:
+        # bool is a subclass of int, so float() would silently accept it, and float("NaN") parses
+        # to a real NaN. The Rust evaluator (rust/feature-flags/src/properties/property_matching.rs)
+        # rejects both as bounds.
+        not_numeric = QueryError(f"{operator} operator requires numeric values")
+        if isinstance(bound, bool) or not isinstance(bound, (str, int, float)):
+            raise not_numeric
+        try:
+            parsed = float(bound)
+        except (ValueError, TypeError):
+            raise not_numeric
+        if math.isnan(parsed):
+            raise not_numeric
+        return parsed
+
+    low, high = _to_bound(value[0]), _to_bound(value[1])
+    if low > high:
+        raise QueryError(f"{operator} operator requires min value to be less than or equal to max value")
+    return True
+
+
+@frozen
+class _BetweenComparison:
+    left: ast.Expr
+    low: int | float | str
+    high: int | float | str
+
+
+def _coerce_between_bounds(expr: ast.Expr, value: list, property: Property, team: Team) -> _BetweenComparison:
+    """Coerce a between/not_between comparison against a String LHS to numeric.
+
+    _validate_between_values already guaranteed both bounds parse as numbers, so a String
+    LHS always gets the toFloat cast (see _coerce_ordered_bound for the semantics). The
+    bounds are parsed with it, or a numeric-text bound ('10') would compare as String
+    against the Float64 LHS."""
+    if not _property_lhs_stays_string(property, team):
+        return _BetweenComparison(left=expr, low=value[0], high=value[1])
+
+    def _parse(v: object) -> int | float:
+        return float(v) if isinstance(v, str) else cast(int | float, v)
+
+    return _BetweenComparison(left=ast.Call(name="toFloat", args=[expr]), low=_parse(value[0]), high=_parse(value[1]))
+
+
+def _multi_search_found(search_call: ast.Call) -> ast.CompareOperation:
+    """Create comparison operation to check if multiSearchAnyCaseInsensitive found a match."""
+    return ast.CompareOperation(op=ast.CompareOperationOp.Gt, left=search_call, right=ast.Constant(value=0))
+
+
+def _multi_search_not_found(search_call: ast.Call) -> ast.Expr:
+    """Create an expression that is true when multiSearchAnyCaseInsensitive found no match.
+
+    Negates the positive form instead of adding a separate NULL check: multiSearchAnyCaseInsensitive
+    resolves as nullable, so the printer already wraps the found comparison in ifNull(..., 0), and a
+    missing property therefore makes the found check false and this negation true, matching every
+    other negative operator. The bare multiSearchAnyCaseInsensitive call also stays what
+    _optimize_materialized_array_multisearch matches on to build an arrayExists scan."""
+    return ast.Not(expr=_multi_search_found(search_call))
+
+
+_NEGATIVE_OPERATOR_COMPLEMENTS = {
+    PropertyOperator.IS_NOT: PropertyOperator.EXACT,
+    PropertyOperator.NOT_IN: PropertyOperator.IN_,
+    PropertyOperator.IS_NOT_SET: PropertyOperator.IS_SET,
+    PropertyOperator.NOT_ICONTAINS: PropertyOperator.ICONTAINS,
+    PropertyOperator.NOT_ICONTAINS_MULTI: PropertyOperator.ICONTAINS_MULTI,
+    PropertyOperator.NOT_REGEX: PropertyOperator.REGEX,
+    PropertyOperator.NOT_STARTS_WITH: PropertyOperator.STARTS_WITH,
+    PropertyOperator.NOT_ENDS_WITH: PropertyOperator.ENDS_WITH,
+    PropertyOperator.NOT_BETWEEN: PropertyOperator.BETWEEN,
+    PropertyOperator.IS_CLEANED_PATH_NOT_EXACT: PropertyOperator.IS_CLEANED_PATH_EXACT,
+    # The scalar semver_neq arm drops missing and non-semver values, so it is not NOT(semver_eq).
+    # Callers that negate this complement instead keep those values.
+    PropertyOperator.SEMVER_NEQ: PropertyOperator.SEMVER_EQ,
+}
+
+
+def operator_is_negative(operator: PropertyOperator) -> bool:
+    return operator in _NEGATIVE_OPERATOR_COMPLEMENTS
+
+
+def negative_operator_complement(operator: PropertyOperator) -> PropertyOperator:
+    """Return the positive form of a negative operator, and any other operator unchanged."""
+    return _NEGATIVE_OPERATOR_COMPLEMENTS.get(operator, operator)
+
+
+def _array_property_filter(array: ast.Expr, element_predicate: ast.Expr, negate: bool) -> ast.Expr:
+    """`element_predicate` is the positive form even when `negate` is set: a negative operator
+    negates the whole arrayExists, so an empty or missing array is kept and an array holding any
+    matching element is dropped. Negating per element instead keeps a row as soon as one element
+    fails to match and drops a row whose array is empty."""
+    exists = ast.Call(name="arrayExists", args=[ast.Lambda(args=["v"], expr=element_predicate), array])
+    return ast.Not(expr=exists) if negate else exists
+
+
+def _create_multi_search_call(expr: ast.Expr, value: list) -> ast.Call:
+    """Create a multiSearchAnyCaseInsensitive call for the given expression and values."""
+    return ast.Call(
+        name="multiSearchAnyCaseInsensitive",
+        args=[
+            ast.Call(name="toString", args=[expr]),
+            ast.Array(exprs=[ast.Constant(value=str(v)) for v in value]),
+        ],
+    )
+
+
+# ClickHouse 26.6.2 rejects a nonconstant multiSearchAnyCaseInsensitive call with more than 255
+# needles ("passed N, should be at most 255").
+_MULTI_SEARCH_NEEDLE_LIMIT = 255
+
+
+def _chunk_needles(value: list) -> list[list]:
+    return [list(chunk) for chunk in chunked(value, _MULTI_SEARCH_NEEDLE_LIMIT)]
+
+
+def _multi_search_found_for_values(expr: ast.Expr, value: list) -> ast.Expr:
+    """True if `expr` matches any of `value`, chunking past ClickHouse's needle limit and ORing
+    the chunks together."""
+    found_exprs: list[ast.Expr] = [
+        _multi_search_found(_create_multi_search_call(expr, chunk)) for chunk in _chunk_needles(value)
+    ]
+    return found_exprs[0] if len(found_exprs) == 1 else ast.Or(exprs=found_exprs)
+
+
+def _multi_search_not_found_for_values(expr: ast.Expr, value: list) -> ast.Expr:
+    """True if `expr` matches none of `value`, chunking past ClickHouse's needle limit."""
+    return ast.Not(expr=_multi_search_found_for_values(expr, value))
+
+
+# log_errors=False keeps RE2 from writing rejected patterns to stderr.
+_RE2_QUIET = re2.Options()
+_RE2_QUIET.log_errors = False
+
+
+def validate_regex(value: ValueT) -> None:
+    """Reject an invalid regular expression with a clear user-facing error rather
+    than letting ClickHouse fail the whole query with CANNOT_COMPILE_REGEXP. The
+    same RE2 engine ClickHouse uses validates the pattern here."""
+    if not isinstance(value, str):
+        return
+    try:
+        re2.compile(value, options=_RE2_QUIET)
+    except re2.error as err:
+        raise QueryError(f"Invalid regular expression: '{value}'") from err
+
+
+# EXACT and IS_NOT stay out because their _expr_to_compare_op arms compare against one scalar.
+_WHOLE_LIST_OPERATORS = frozenset(
+    {
+        PropertyOperator.IN_,
+        PropertyOperator.NOT_IN,
+        PropertyOperator.ICONTAINS,
+        PropertyOperator.NOT_ICONTAINS,
+        PropertyOperator.ICONTAINS_MULTI,
+        PropertyOperator.NOT_ICONTAINS_MULTI,
+        PropertyOperator.BETWEEN,
+        PropertyOperator.NOT_BETWEEN,
+    }
+)
+
+
+def _expr_to_compare_op(
+    expr: ast.Expr, value: ValueT, operator: PropertyOperator, property: Property, is_json_field: bool, team: Team
+) -> ast.Expr:
+    if operator == PropertyOperator.IS_SET:
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.NotEq,
+            left=expr,
+            right=ast.Constant(value=None),
+        )
+    elif operator == PropertyOperator.IS_NOT_SET:
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.Eq,
+            left=expr,
+            right=ast.Constant(value=None),
+        )
+    elif operator == PropertyOperator.ICONTAINS:
+        if isinstance(value, list) and len(value) > 1:
+            # Multiple values: use ClickHouse's multiSearchAnyCaseInsensitive for efficient searching
+            return _multi_search_found_for_values(expr, value)
+        else:
+            # Single value (or single-element array): keep existing ILIKE logic for backward compatibility
+            single_value = value[0] if isinstance(value, list) and len(value) == 1 else value
+            return ast.CompareOperation(
+                op=ast.CompareOperationOp.ILike,
+                left=ast.Call(name="toString", args=[expr]),
+                right=ast.Constant(value=f"%{single_value}%"),
+            )
+    elif operator == PropertyOperator.NOT_ICONTAINS:
+        if isinstance(value, list) and len(value) > 1:
+            # Multiple values: use ClickHouse's multiSearchAnyCaseInsensitive with negation
+            return _multi_search_not_found_for_values(expr, value)
+        else:
+            # Single value (or single-element array): keep existing NOT ILIKE logic for backward compatibility
+            single_value = value[0] if isinstance(value, list) and len(value) == 1 else value
+            return ast.CompareOperation(
+                op=ast.CompareOperationOp.NotILike,
+                left=ast.Call(name="toString", args=[expr]),
+                right=ast.Constant(value=f"%{single_value}%"),
+            )
+    elif operator in (PropertyOperator.STARTS_WITH, PropertyOperator.NOT_STARTS_WITH):
+        single_value = value[0] if isinstance(value, list) and len(value) == 1 else value
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.ILike
+            if operator == PropertyOperator.STARTS_WITH
+            else ast.CompareOperationOp.NotILike,
+            left=ast.Call(name="toString", args=[expr]),
+            right=ast.Constant(value=f"{single_value}%"),
+        )
+    elif operator in (PropertyOperator.ENDS_WITH, PropertyOperator.NOT_ENDS_WITH):
+        single_value = value[0] if isinstance(value, list) and len(value) == 1 else value
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.ILike
+            if operator == PropertyOperator.ENDS_WITH
+            else ast.CompareOperationOp.NotILike,
+            left=ast.Call(name="toString", args=[expr]),
+            right=ast.Constant(value=f"%{single_value}"),
+        )
+    elif operator == PropertyOperator.ICONTAINS_MULTI:
+        # Always expect multiple values for multi-contains operator
+        if isinstance(value, list):
+            values_list = value
+        else:
+            values_list = cast(list, [value])
+        return _multi_search_found_for_values(expr, values_list)
+    elif operator == PropertyOperator.NOT_ICONTAINS_MULTI:
+        # Always expect multiple values for multi-not-contains operator
+        if isinstance(value, list):
+            values_list = value
+        else:
+            values_list = cast(list, [value])
+        return _multi_search_not_found_for_values(expr, values_list)
+    elif operator == PropertyOperator.REGEX:
+        validate_regex(value)
+        return ast.Call(
+            name="ifNull",
+            args=[
+                ast.Call(name="match", args=[ast.Call(name="toString", args=[expr]), ast.Constant(value=value)]),
+                ast.Constant(value=0),
+            ],
+        )
+    elif operator == PropertyOperator.NOT_REGEX:
+        validate_regex(value)
+        return ast.Call(
+            name="ifNull",
+            args=[
+                ast.Call(
+                    name="not",
+                    args=[
+                        ast.Call(name="match", args=[ast.Call(name="toString", args=[expr]), ast.Constant(value=value)])
+                    ],
+                ),
+                ast.Constant(value=1),
+            ],
+        )
+    elif operator == PropertyOperator.EXACT:
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.Eq,
+            left=expr,
+            right=ast.Constant(
+                value=_coerce_numeric_value_for_string_property(
+                    _handle_bool_values(value, expr, property, team), property, team
+                )
+            ),
+        )
+    elif operator == PropertyOperator.IS_DATE_EXACT:
+        assert isinstance(value, str)
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.Eq,
+            left=_force_datetime(expr),
+            right=_force_datetime(ast.Constant(value=_resolve_date_value(value, team))),
+        )
+    elif operator == PropertyOperator.IS_NOT:
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.NotEq,
+            left=expr,
+            right=ast.Constant(
+                value=_coerce_numeric_value_for_string_property(
+                    _handle_bool_values(value, expr, property, team), property, team
+                )
+            ),
+        )
+    elif operator == PropertyOperator.LT:
+        left, bound = _coerce_ordered_bound(expr, value, property, team)
+        return ast.CompareOperation(op=ast.CompareOperationOp.Lt, left=left, right=ast.Constant(value=bound))
+    elif operator == PropertyOperator.IS_DATE_BEFORE:
+        assert isinstance(value, str)
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.Lt,
+            left=_force_datetime(expr),
+            right=_force_datetime(ast.Constant(value=_resolve_date_value(value, team))),
+        )
+    elif operator == PropertyOperator.GT:
+        left, bound = _coerce_ordered_bound(expr, value, property, team)
+        return ast.CompareOperation(op=ast.CompareOperationOp.Gt, left=left, right=ast.Constant(value=bound))
+    elif operator == PropertyOperator.IS_DATE_AFTER:
+        assert isinstance(value, str)
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.Gt,
+            left=_force_datetime(expr),
+            right=_force_datetime(ast.Constant(value=_resolve_date_value(value, team))),
+        )
+    elif operator == PropertyOperator.LTE or operator == PropertyOperator.MAX:
+        left, bound = _coerce_ordered_bound(expr, value, property, team)
+        return ast.CompareOperation(op=ast.CompareOperationOp.LtEq, left=left, right=ast.Constant(value=bound))
+    elif operator == PropertyOperator.GTE or operator == PropertyOperator.MIN:
+        left, bound = _coerce_ordered_bound(expr, value, property, team)
+        return ast.CompareOperation(op=ast.CompareOperationOp.GtEq, left=left, right=ast.Constant(value=bound))
+    elif operator == PropertyOperator.BETWEEN:
+        _validate_between_values(value, operator)
+        assert isinstance(value, list)
+        between = _coerce_between_bounds(expr, value, property, team)
+        return ast.And(
+            exprs=[
+                ast.CompareOperation(
+                    op=ast.CompareOperationOp.GtEq, left=between.left, right=ast.Constant(value=between.low)
+                ),
+                ast.CompareOperation(
+                    op=ast.CompareOperationOp.LtEq, left=between.left, right=ast.Constant(value=between.high)
+                ),
+            ]
+        )
+    elif operator == PropertyOperator.NOT_BETWEEN:
+        _validate_between_values(value, operator)
+        assert isinstance(value, list)
+        between = _coerce_between_bounds(expr, value, property, team)
+        return ast.Or(
+            exprs=[
+                ast.CompareOperation(
+                    op=ast.CompareOperationOp.Lt, left=between.left, right=ast.Constant(value=between.low)
+                ),
+                ast.CompareOperation(
+                    op=ast.CompareOperationOp.Gt, left=between.left, right=ast.Constant(value=between.high)
+                ),
+                # A missing property makes both comparisons NULL and drops the row; keep it, matching
+                # every other negative operator. With a coerced LHS this also keeps rows whose value
+                # does not parse as a number: they match no range, so "not between" holds for them.
+                ast.Call(name="isNull", args=[between.left]),
+            ]
+        )
+    elif operator == PropertyOperator.IS_CLEANED_PATH_EXACT:
+        return ast.CompareOperation(
+            op=ast.CompareOperationOp.Eq,
+            left=apply_path_cleaning(expr, team),
+            right=apply_path_cleaning(ast.Constant(value=value), team),
+        )
+    elif operator == PropertyOperator.IS_CLEANED_PATH_NOT_EXACT:
+        return ast.Or(
+            exprs=[
+                ast.CompareOperation(
+                    op=ast.CompareOperationOp.NotEq,
+                    left=apply_path_cleaning(expr, team),
+                    right=apply_path_cleaning(ast.Constant(value=value), team),
+                ),
+                # Keep rows where the property is missing, matching every other negative operator.
+                ast.Call(name="isNull", args=[expr]),
+            ]
+        )
+    elif operator == PropertyOperator.IN_ or operator == PropertyOperator.NOT_IN:
+        values: list
+        if isinstance(value, list):
+            values = value
+        elif isinstance(value, str | int | float):
+            # Stored filters sometimes carry a single scalar for IN/NOT IN (filters created via
+            # the API); treat it as a one-element list, the way `exact` accepts both shapes.
+            values = [value]
+        else:
+            raise QueryError("IN and NOT IN operators require a list of values")
+        op = ast.CompareOperationOp.NotIn if operator == PropertyOperator.NOT_IN else ast.CompareOperationOp.In
+        coerced = cast(list, _coerce_numeric_value_for_string_property(values, property, team))
+        return ast.CompareOperation(
+            op=op,
+            left=expr,
+            right=ast.Array(exprs=[ast.Constant(value=v) for v in coerced]),
+        )
+    elif operator == PropertyOperator.SEMVER_EQ:
+        return _gate_on_valid_semver(
+            expr,
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.Eq,
+                left=ast.Call(name="sortableSemver", args=[expr]),
+                right=ast.Call(name="sortableSemver", args=[ast.Constant(value=value)]),
+            ),
+        )
+    elif operator == PropertyOperator.SEMVER_NEQ:
+        return _gate_on_valid_semver(
+            expr,
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.NotEq,
+                left=ast.Call(name="sortableSemver", args=[expr]),
+                right=ast.Call(name="sortableSemver", args=[ast.Constant(value=value)]),
+            ),
+        )
+    elif operator == PropertyOperator.SEMVER_GT:
+        return _gate_on_valid_semver(
+            expr,
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.Gt,
+                left=ast.Call(name="sortableSemver", args=[expr]),
+                right=ast.Call(name="sortableSemver", args=[ast.Constant(value=value)]),
+            ),
+        )
+    elif operator == PropertyOperator.SEMVER_GTE:
+        return _gate_on_valid_semver(
+            expr,
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.GtEq,
+                left=ast.Call(name="sortableSemver", args=[expr]),
+                right=ast.Call(name="sortableSemver", args=[ast.Constant(value=value)]),
+            ),
+        )
+    elif operator == PropertyOperator.SEMVER_LT:
+        return _gate_on_valid_semver(
+            expr,
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.Lt,
+                left=ast.Call(name="sortableSemver", args=[expr]),
+                right=ast.Call(name="sortableSemver", args=[ast.Constant(value=value)]),
+            ),
+        )
+    elif operator == PropertyOperator.SEMVER_LTE:
+        return _gate_on_valid_semver(
+            expr,
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.LtEq,
+                left=ast.Call(name="sortableSemver", args=[expr]),
+                right=ast.Call(name="sortableSemver", args=[ast.Constant(value=value)]),
+            ),
+        )
+    elif operator == PropertyOperator.SEMVER_TILDE:
+        return semver_range_compare(expr, value, "Tilde", _tilde_bounds)
+    elif operator == PropertyOperator.SEMVER_CARET:
+        return semver_range_compare(expr, value, "Caret", _caret_bounds)
+    elif operator == PropertyOperator.SEMVER_WILDCARD:
+        return semver_range_compare(expr, value, "Wildcard", _wildcard_bounds)
+    else:
+        raise NotImplementedError(f"PropertyOperator {operator} not implemented")
+
+
+def apply_path_cleaning(path_expr: ast.Expr, team: Team) -> ast.Expr:
+    if not team.path_cleaning_filters:
+        return path_expr
+
+    for replacement in team.path_cleaning_filter_models():
+        path_expr = ast.Call(
+            name="replaceRegexpAll",
+            args=[
+                path_expr,
+                ast.Constant(value=replacement.regex),
+                ast.Constant(value=replacement.alias),
+            ],
+        )
+
+    return path_expr
+
+
+# get_interval_func also resolves minute/hour/quarter; behavioral windows are restricted to calendar intervals.
+_BEHAVIORAL_INTERVALS = frozenset({"day", "week", "month", "year"})
+
+_BEHAVIORAL_COUNT_OPERATORS = {
+    "gte": ast.CompareOperationOp.GtEq,
+    "lte": ast.CompareOperationOp.LtEq,
+    "gt": ast.CompareOperationOp.Gt,
+    "lt": ast.CompareOperationOp.Lt,
+    "eq": ast.CompareOperationOp.Eq,
+    "exact": ast.CompareOperationOp.Eq,
+}
+
+
+# Keep in sync with FEATURE_FLAGS.BEHAVIORAL_PROPERTY_FILTER in frontend/src/lib/constants.tsx.
+BEHAVIORAL_PROPERTY_FILTER_FLAG = "behavioral-property-filter"
+
+
+def _is_behavioral_property_filter_enabled(team: Team) -> bool:
+    # Fails closed: this runs on the query compile path, so an inconclusive local evaluation must
+    # mean "off" rather than an HTTP call, and a flag-service error must not open the gate.
+    try:
+        return bool(
+            posthoganalytics.feature_enabled(
+                BEHAVIORAL_PROPERTY_FILTER_FLAG,
+                str(team.uuid),
+                groups={"organization": str(team.organization_id), "project": str(team.id)},
+                group_properties={
+                    "organization": {"id": str(team.organization_id)},
+                    "project": {"id": str(team.id)},
+                },
+                only_evaluate_locally=True,
+                send_feature_flag_events=False,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _behavioral_property_to_expr(property: Property, team: Team, scope: str, strict: bool = False) -> ast.Expr:
+    """Compile a behavioral ("performed event") filter into a `person_id IN (...)` subquery.
+
+    Unlike cohort-backed behavioral criteria this runs at query time, with no saved cohort and no
+    precalculated cohortpeople.
+    """
+    # Gates every entry point, not just the UI: /query, MCP query tools, and saved insights all land here.
+    if not _is_behavioral_property_filter_enabled(team):
+        raise QueryError(
+            "Behavioral (performed event) filters aren't available for this project. "
+            "Use a cohort to filter on past behavior."
+        )
+    # Person scope needs `id IN (SELECT person_id FROM events ...)`, which HogQL can't resolve under a `persons` FROM.
+    if scope != "event":
+        raise QueryError(f"The 'behavioral' property filter does not work in '{scope}' scope")
+    if property.value not in (
+        BehavioralPropertyType.PERFORMED_EVENT,
+        BehavioralPropertyType.PERFORMED_EVENT_MULTIPLE,
+    ):
+        raise QueryError(f"The behavioral criterion '{property.value}' requires a cohort, it cannot be used inline")
+
+    if property.event_type == "actions":
+        try:
+            action = get_action(action_id=int(property.key), project_id=team.project_id)
+        except (ActionNotFound, ValueError, TypeError):
+            raise QueryError(f"Action '{property.key}' in behavioral filter not found")
+        conditions: list[ast.Expr] = [action_to_expr(action)]
+    else:
+        conditions = [
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.Eq,
+                left=ast.Field(chain=["event"]),
+                right=ast.Constant(value=str(property.key)),
+            )
+        ]
+
+    if property.explicit_datetime:
+        date_from = relative_date_parse(property.explicit_datetime, team.timezone_info)
+        conditions.append(
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.Gt, left=ast.Field(chain=["timestamp"]), right=ast.Constant(value=date_from)
+            )
+        )
+    elif property.time_value is not None and property.time_interval is not None:
+        if property.time_interval not in _BEHAVIORAL_INTERVALS:
+            raise QueryError(f"Invalid behavioral filter time interval: {property.time_interval}")
+        interval_function = get_interval_func(property.time_interval)
+        try:
+            time_value = int(property.time_value)
+        except (ValueError, TypeError):
+            raise QueryError(f"Invalid behavioral filter time value: {property.time_value}")
+        if time_value <= 0:
+            raise QueryError(f"Invalid behavioral filter time value: {property.time_value}")
+        conditions.append(
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.Gt,
+                left=ast.Field(chain=["timestamp"]),
+                right=ast.ArithmeticOperation(
+                    op=ast.ArithmeticOperationOp.Sub,
+                    left=ast.Call(name="now", args=[]),
+                    right=ast.Call(name=interval_function, args=[ast.Constant(value=time_value)]),
+                ),
+            )
+        )
+    else:
+        # An unbounded "ever performed" filter would scan every partition of the events table.
+        raise QueryError("Behavioral filters require a time window (time_value/time_interval or explicit_datetime)")
+
+    if property.explicit_datetime_to:
+        date_to = relative_date_parse(property.explicit_datetime_to, team.timezone_info)
+        conditions.append(
+            ast.CompareOperation(
+                op=ast.CompareOperationOp.Lt,
+                left=ast.Field(chain=["timestamp"]),
+                right=ast.Constant(value=date_to),
+            )
+        )
+
+    if property.event_filters:
+        conditions.append(property_to_expr(list(property.event_filters), team, scope="event", strict=strict))
+
+    having: Optional[ast.Expr] = None
+    if property.value == BehavioralPropertyType.PERFORMED_EVENT_MULTIPLE:
+        try:
+            count = int(property.operator_value)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            raise QueryError(f"Invalid behavioral filter count: {property.operator_value}")
+        # count() = 0 can never match a grouped row, so a non-positive threshold silently matches nobody.
+        if count <= 0:
+            raise QueryError(f"Invalid behavioral filter count: {property.operator_value}")
+        count_op = _BEHAVIORAL_COUNT_OPERATORS.get(property.operator or "exact")
+        if count_op is None:
+            raise QueryError(f"Invalid behavioral filter count operator: {property.operator}")
+        having = ast.CompareOperation(
+            op=count_op,
+            left=ast.Call(name="count", args=[]),
+            right=ast.Constant(value=count),
+        )
+
+    subquery = ast.SelectQuery(
+        select=[ast.Field(chain=["person_id"])],
+        select_from=ast.JoinExpr(table=ast.Field(chain=["events"])),
+        where=ast.And(exprs=conditions) if len(conditions) > 1 else conditions[0],
+        group_by=[ast.Field(chain=["person_id"])],
+        having=having,
+    )
+    return ast.CompareOperation(
+        left=ast.Field(chain=["person_id"]),
+        op=ast.CompareOperationOp.NotIn if property.negation else ast.CompareOperationOp.In,
+        right=subquery,
+    )
+
+
+def property_to_expr(
+    property: (
+        list
+        | dict
+        | PropertyGroup
+        | PropertyGroupFilter
+        | PropertyGroupFilterValue
+        | Property
+        | ast.Expr
+        | BehavioralPropertyFilter
+        | EventPropertyFilter
+        | PersonPropertyFilter
+        | ElementPropertyFilter
+        | SessionPropertyFilter
+        | EventMetadataPropertyFilter
+        | PersonMetadataPropertyFilter
+        | RevenueAnalyticsPropertyFilter
+        | AccountCustomPropertyFilter
+        | CohortPropertyFilter
+        | RecordingPropertyFilter
+        | LogEntryPropertyFilter
+        | GroupPropertyFilter
+        | FeaturePropertyFilter
+        | FlagPropertyFilter
+        | HogQLPropertyFilter
+        | EmptyPropertyFilter
+        | DataWarehousePropertyFilter
+        | DataWarehousePersonPropertyFilter
+        | ErrorTrackingIssueFilter
+        | LogPropertyFilter
+        | MetricPropertyFilter
+        | SpanPropertyFilter
+        | WorkflowVariablePropertyFilter
+    ),
+    team: Team,
+    scope: Literal[
+        "event", "person", "group", "session", "replay", "replay_entity", "revenue_analytics", "log_resource"
+    ] = "event",
+    strict: bool = False,
+    cohort_via_distinct_id: bool = False,
+) -> ast.Expr:
+    if isinstance(property, dict):
+        is_behavioral = property.get("type") == "behavioral"
+        try:
+            property = Property(**property)
+        # The property was saved as an incomplete object. Instead of crashing the entire query, pretend it's not there.
+        # TODO: revert this when removing legacy insights?
+        except (ValueError, TypeError) as e:
+            if strict:
+                raise
+            # Dropping a behavioral filter would widen the query to every person instead of narrowing it.
+            if is_behavioral:
+                raise QueryError(f"Invalid behavioral property filter: {e}")
+            return ast.Constant(value=1)
+    elif isinstance(property, list):
+        properties = [
+            property_to_expr(p, team, scope, strict=strict, cohort_via_distinct_id=cohort_via_distinct_id)
+            for p in property
+        ]
+        if len(properties) == 0:
+            return ast.Constant(value=1)
+        if len(properties) == 1:
+            return properties[0]
+        return ast.And(exprs=properties)
+    elif isinstance(property, Property):
+        pass
+    elif isinstance(property, ast.Expr):
+        return clone_expr(property)
+    elif (
+        isinstance(property, PropertyGroup)
+        or isinstance(property, PropertyGroupFilter)
+        or isinstance(property, PropertyGroupFilterValue)
+    ):
+        if (
+            isinstance(property, PropertyGroup)
+            and property.type != PropertyOperatorType.AND
+            and property.type != PropertyOperatorType.OR
+        ):
+            raise QueryError(f'PropertyGroup of unknown type "{property.type}"')
+        if (
+            (isinstance(property, PropertyGroupFilter) or isinstance(property, PropertyGroupFilterValue))
+            and property.type != FilterLogicalOperator.AND_
+            and property.type != FilterLogicalOperator.OR_
+        ):
+            raise QueryError(f'PropertyGroupFilter of unknown type "{property.type}"')
+
+        if len(property.values) == 0:
+            return ast.Constant(value=1)
+        if len(property.values) == 1:
+            return property_to_expr(
+                property.values[0], team, scope, strict=strict, cohort_via_distinct_id=cohort_via_distinct_id
+            )
+
+        if property.type == PropertyOperatorType.AND or property.type == FilterLogicalOperator.AND_:
+            return ast.And(
+                exprs=[
+                    property_to_expr(p, team, scope, strict=strict, cohort_via_distinct_id=cohort_via_distinct_id)
+                    for p in property.values
+                ]
+            )
+        else:
+            return ast.Or(
+                exprs=[
+                    property_to_expr(p, team, scope, strict=strict, cohort_via_distinct_id=cohort_via_distinct_id)
+                    for p in property.values
+                ]
+            )
+    elif isinstance(property, EmptyPropertyFilter):
+        return ast.Constant(value=1)
+    elif isinstance(property, FlagPropertyFilter):
+        # Flag dependencies are evaluated at the API layer, not in HogQL.
+        # They should never reach this point, but we handle them gracefully
+        # to satisfy type checking since FlagPropertyFilter is part
+        # of the AnyPropertyFilter union used throughout the codebase.
+        # Return a neutral filter that doesn't affect the query.
+        return ast.Constant(value=1)
+    elif isinstance(property, BaseModel):
+        try:
+            property = Property(**property.dict())
+        except ValueError as e:
+            if strict:
+                raise
+            # Dropping a behavioral filter would widen the query to every person instead of narrowing it.
+            if isinstance(property, BehavioralPropertyFilter):
+                raise QueryError(f"Invalid behavioral property filter: {e}")
+            # The property was saved as an incomplete object. Instead of crashing the entire query, pretend it's not there.
+            return ast.Constant(value=1)
+    else:
+        raise QueryError(f"property_to_expr with property of type {type(property).__name__} not implemented")
+
+    if property.type == "flag":
+        # Flag dependencies are evaluated at flag-matching time and can't be expressed
+        # in HogQL — return a neutral filter, mirroring the FlagPropertyFilter handling above.
+        return ast.Constant(value=1)
+    elif property.type == "hogql":
+        tag_contains_user_hogql()
+        return parse_expr(property.key, cache_origin=CacheOrigin.USER)
+    elif property.type == "behavioral":
+        if not team:
+            raise Exception("Can not convert behavioral property to expression without team")
+        return _behavioral_property_to_expr(property, team, scope, strict=strict)
+    elif property.type == "event_metadata" and scope == "group" and GROUP_KEY_PATTERN.match(property.key) is not None:
+        group_type_index = property.key.split("_")[1]
+        operator = cast(Optional[PropertyOperator], property.operator) or PropertyOperator.EXACT
+        value = property.value
+        if isinstance(property.value, list):
+            if len(property.value) > 1:
+                raise QueryError(f"The '{property.key}' property filter only supports one value in 'group' scope")
+            value = property.value[0]
+
+        value = _stringify_group_key_value(value)
+
+        # For groups table, $group_N filters should match both index and key
+        # index should equal N, and key should match the value
+        index_condition = ast.CompareOperation(
+            op=ast.CompareOperationOp.Eq,
+            left=ast.Field(chain=["index"]),
+            right=ast.Constant(value=int(group_type_index)),
+        )
+
+        key_condition = _expr_to_compare_op(
+            expr=ast.Field(chain=["key"]),
+            value=value,
+            operator=operator,
+            property=property,
+            is_json_field=False,
+            team=team,
+        )
+
+        return ast.And(exprs=[key_condition, index_condition])
+    elif (
+        property.type == "event"
+        or property.type == "event_metadata"
+        or property.type == "feature"
+        or property.type == "person"
+        or property.type == "person_metadata"
+        or property.type == "group"
+        or property.type == "data_warehouse"
+        or property.type == "data_warehouse_person_property"
+        or property.type == "session"
+        or property.type == "recording"
+        or property.type == "log_entry"
+        or property.type == "error_tracking_issue"
+        or property.type == "log"
+        or property.type == "log_attribute"
+        or property.type == "log_resource_attribute"
+        or property.type == "span"
+        or property.type == "span_attribute"
+        or property.type == "span_resource_attribute"
+        or property.type == "revenue_analytics"
+        or property.type == "account_custom_property"
+        or property.type == "workflow_variable"
+    ):
+        if (
+            (scope == "person" and property.type != "person" and property.type != "person_metadata")
+            or (scope == "session" and property.type != "session")
+            or (scope != "event" and property.type == "event_metadata")
+            or (scope == "revenue_analytics" and property.type != "revenue_analytics")
+            or (property.type == "revenue_analytics" and scope != "revenue_analytics")
+            # Account custom properties resolve inside customer analytics queries only;
+            # no generic HogQL scope can join them, so fail loudly instead of no-oping.
+            or property.type == "account_custom_property"
+        ):
+            raise QueryError(f"The '{property.type}' property filter does not work in '{scope}' scope")
+
+        if property.type == "person_metadata" and property.key not in PERSON_METADATA_FIELDS:
+            raise QueryError(f"Unsupported person_metadata field: '{property.key}'")
+        operator = cast(Optional[PropertyOperator], property.operator) or PropertyOperator.EXACT
+        value = property.value
+
+        # `$group_key` is the group's key column, not an entry in its property JSON. Flag
+        # matching and the blast radius already resolve it that way, so resolve it here too;
+        # otherwise the same filter silently matches nothing in insights, cohorts and the
+        # groups list.
+        is_group_key_column = property.type == "group" and property.key == GROUP_KEY_PROPERTY
+
+        if property.key and (is_group_key_column or GROUP_KEY_PATTERN.match(str(property.key))):
+            value = _stringify_group_key_value(value)
+
+        if property.type == "person" and property.key == "distinct_id":
+            # distinct_id is not stored in person.properties.
+            # - In event scope, events.distinct_id is a real column — no join needed.
+            # - In person scope, persons.pdi.distinct_id resolves via the lazy join on persons.
+            # Routing through `events.person.pdi` would break under person-on-events mode,
+            # where `events.person` is rebound to the `poe` virtual table which has no `pdi` field.
+            if scope == "event":
+                chain = []
+            elif scope == "person":
+                chain = ["pdi"]
+            else:
+                chain = ["person", "pdi"]
+        elif property.type == "person" and scope != "person":
+            chain = ["person", "properties"]
+        elif property.type == "person_metadata":
+            chain = ["person"] if scope != "person" else []
+        elif property.type == "event" and scope == "replay_entity":
+            chain = ["events", "properties"]
+        elif property.type == "session" and scope == "replay_entity":
+            chain = ["events", "session"]
+        elif property.type == "data_warehouse":
+            if not isinstance(property.key, str):
+                raise QueryError("Data warehouse property filter value must be a string")
+            else:
+                split = property.key.split(".")
+                chain = split[:-1]
+                property.key = split[-1]
+
+            # The shared list handling below rebuilds the Property from property.key to split a list
+            # per value. That key no longer holds the table chain, so this branch splits the list itself.
+            # It falls through for the whole-list operators, which the shared handling never splits.
+            if isinstance(value, list) and len(value) > 1 and operator not in _WHOLE_LIST_OPERATORS:
+                field = ast.Field(chain=[*chain, property.key])
+                exprs = [
+                    _expr_to_compare_op(
+                        expr=field,
+                        value=v,
+                        operator=operator,
+                        team=team,
+                        property=property,
+                        is_json_field=False,
+                    )
+                    for v in value
+                ]
+                if operator_is_negative(operator):
+                    return ast.And(exprs=exprs)
+                return ast.Or(exprs=exprs)
+        elif property.type == "data_warehouse_person_property":
+            if isinstance(property.key, str):
+                table, key = property.key.split(".")
+                chain = ["person", table]
+                property.key = key
+            else:
+                raise QueryError("Data warehouse person property filter value must be a string")
+        elif is_group_key_column:
+            chain = ["key"] if scope == "group" else group_property_chain(property.group_type_index, GROUP_KEY_PROPERTY)
+        elif property.type == "group" and scope != "group":
+            chain = [f"group_{property.group_type_index}", "properties"]
+        elif property.type == "session" and scope in ["event", "replay"]:
+            chain = ["session"]
+        elif property.type == "session" and scope == "session":
+            chain = ["sessions"]
+        elif property.type in ["recording", "data_warehouse", "log_entry", "event_metadata"]:
+            chain = []
+        elif property.type == "log":
+            chain = [property.key]
+            property.key = ""
+        elif property.type == "span":
+            chain = [property.key]
+            property.key = ""
+        elif scope == "log_resource":
+            # log resource attributes are stored in a separate table as `attribute_key` and `attribute_value`
+            # columns. The `attribute_key` filter needs to be added separately outside of property_to_expr
+            chain = ["attribute_value"]
+            property.key = ""
+        elif property.type == "log_attribute":
+            chain = ["attributes"]
+        elif property.type == "log_resource_attribute":
+            chain = ["resource_attributes"]
+        elif property.type == "span_attribute":
+            chain = ["attributes"]
+        elif property.type == "span_resource_attribute":
+            chain = ["resource_attributes"]
+        elif property.type == "revenue_analytics":
+            *chain, property.key = property.key.split(".")
+        elif property.type == "workflow_variable":
+            chain = ["variables"]
+        else:
+            chain = ["properties"]
+
+        # We pretend elements chain is a property, but it is actually a column on the events table
+        if chain == ["properties"] and property.key == "$elements_chain":
+            field = ast.Field(chain=["elements_chain"])
+        elif property.key == "" or is_group_key_column:
+            field = ast.Field(chain=[*chain])
+        else:
+            field = ast.Field(chain=[*chain, property.key])
+
+        expr: ast.Expr = map_virtual_properties(field)
+
+        if property.type == "recording" and property.key in ("snapshot_source", "snapshot_library"):
+            expr = ast.Call(name="argMinMerge", args=[field])
+
+        is_visited_page_property = property.type == "recording" and property.key == "visited_page"
+        is_exception_string_array_property = (
+            property.type == "event" and property.key in EXCEPTION_STRING_ARRAY_PROPERTIES
+        )
+
+        array_field: ast.Expr | None = None
+        if is_visited_page_property:
+            # Use the all_urls array field to filter for pages visited during recording.
+            array_field = ast.Call(name="groupUniqArrayArray", args=[ast.Field(chain=["all_urls"])])
+        elif is_exception_string_array_property:
+            # if materialized these columns will be strings so we need to extract them
+            array_field = ast.Call(
+                name="JSONExtract",
+                args=[
+                    ast.Call(name="ifNull", args=[field, ast.Constant(value="")]),
+                    ast.Constant(value="Array(String)"),
+                ],
+            )
+
+        if isinstance(value, list) and operator not in (
+            PropertyOperator.BETWEEN,
+            PropertyOperator.NOT_BETWEEN,
+            PropertyOperator.ICONTAINS,
+            PropertyOperator.NOT_ICONTAINS,
+            # starts_with/ends_with intentionally excluded: no ClickHouse anchored multi-search
+            # primitive exists, so multi-value use falls through to per-value ILIKE scans below.
+        ):
+            if len(value) == 0:
+                # An unconfigured filter matches every row. multiSearchAnyCaseInsensitive(x, [])
+                # would instead fail the query with ILLEGAL_TYPE_OF_ARGUMENT.
+                return ast.Constant(value=1)
+            elif len(value) == 1:
+                # _expr_to_compare_op's ICONTAINS_MULTI/NOT_ICONTAINS_MULTI arms re-wrap a scalar
+                # into a single-element list, so collapsing here is a no-op round trip for them too.
+                value = value[0]
+            elif operator in (
+                PropertyOperator.EXACT,
+                PropertyOperator.IS_NOT,
+                PropertyOperator.IN_,
+                PropertyOperator.NOT_IN,
+            ):
+                coerced = cast(list, _coerce_numeric_value_for_string_property(value, property, team))
+                values = ast.Tuple(exprs=[ast.Constant(value=v) for v in coerced])
+                negate = operator_is_negative(operator)
+                if array_field is not None:
+                    return _array_property_filter(
+                        array_field,
+                        ast.CompareOperation(op=ast.CompareOperationOp.In, left=ast.Field(chain=["v"]), right=values),
+                        negate=negate,
+                    )
+                return ast.CompareOperation(
+                    op=ast.CompareOperationOp.NotIn if negate else ast.CompareOperationOp.In,
+                    left=expr,
+                    right=values,
+                )
+            elif operator not in _WHOLE_LIST_OPERATORS:
+                exprs = [
+                    property_to_expr(
+                        Property(
+                            type=property.type,
+                            key=property.key,
+                            operator=property.operator,
+                            group_type_index=property.group_type_index,
+                            value=v,
+                        ),
+                        team,
+                        scope,
+                        strict=strict,
+                    )
+                    for v in value
+                ]
+                if operator_is_negative(operator):
+                    return ast.And(exprs=exprs)
+                return ast.Or(exprs=exprs)
+
+        is_json_field = property.type != "session"
+
+        if array_field is None:
+            return _expr_to_compare_op(
+                expr=expr,
+                value=value,
+                operator=operator,
+                team=team,
+                property=property,
+                is_json_field=is_json_field,
+            )
+
+        if operator in (PropertyOperator.IS_SET, PropertyOperator.IS_NOT_SET):
+            return ast.CompareOperation(
+                op=ast.CompareOperationOp.Gt if operator == PropertyOperator.IS_SET else ast.CompareOperationOp.Eq,
+                left=ast.Call(name="length", args=[array_field]),
+                right=ast.Constant(value=0),
+            )
+
+        element_predicate = _expr_to_compare_op(
+            expr=ast.Field(chain=["v"]),
+            value=value,
+            operator=negative_operator_complement(operator),
+            team=team,
+            property=property,
+            is_json_field=is_json_field,
+        )
+        return _array_property_filter(array_field, element_predicate, negate=operator_is_negative(operator))
+    elif property.type == "element":
+        if scope == "person":
+            raise NotImplementedError(f"property_to_expr for scope {scope} not implemented for type '{property.type}'")
+        value = property.value
+        operator = cast(Optional[PropertyOperator], property.operator) or PropertyOperator.EXACT
+        if isinstance(value, list):
+            if len(value) == 1:
+                value = value[0]
+            else:
+                exprs = [
+                    property_to_expr(
+                        Property(
+                            type=property.type,
+                            key=property.key,
+                            operator=property.operator,
+                            group_type_index=property.group_type_index,
+                            value=v,
+                        ),
+                        team,
+                        scope,
+                        strict=strict,
+                    )
+                    for v in value
+                ]
+                if operator_is_negative(operator):
+                    return ast.And(exprs=exprs)
+                return ast.Or(exprs=exprs)
+
+        if property.key == "selector" or property.key == "tag_name":
+            if operator != PropertyOperator.EXACT and operator != PropertyOperator.IS_NOT:
+                raise NotImplementedError(
+                    f"property_to_expr for element {property.key} only supports exact and is_not operators, not {operator}"
+                )
+            expr = selector_to_expr(str(value)) if property.key == "selector" else tag_name_to_expr(str(value))
+            if operator == PropertyOperator.IS_NOT:
+                return ast.Call(name="not", args=[expr])
+            return expr
+
+        if property.key == "href":
+            return _expr_to_compare_op(
+                expr=ast.Field(chain=["elements_chain_href"]),
+                value=value,
+                operator=operator,
+                team=team,
+                property=property,
+                is_json_field=False,
+            )
+
+        # `$el_text` is the autocapture event property for the same text. The action editor saves it as
+        # `text`, but actions saved through other paths can still carry the event-property key.
+        if property.key == "text" or property.key == "$el_text":
+            return parse_expr(
+                "arrayExists(text -> {compare}, elements_chain_texts)",
+                {
+                    "compare": _expr_to_compare_op(
+                        expr=ast.Field(chain=["text"]),
+                        value=value,
+                        operator=operator,
+                        team=team,
+                        property=property,
+                        is_json_field=False,
+                    )
+                },
+            )
+
+        raise NotImplementedError(f"property_to_expr for type element not implemented for key {property.key}")
+    elif property.type == "cohort" or property.type == "static-cohort" or property.type == "precalculated-cohort":
+        if not team:
+            raise Exception("Can not convert cohort property to expression without team")
+        if not isinstance(property.value, (str, int)):
+            raise ValidationError("Cohort property value must be a cohort ID")
+        try:
+            cohort = Cohort.objects.get(team__project_id=team.project_id, id=property.value, deleted=False)
+        except Cohort.DoesNotExist:
+            # The id comes from the request, so a deleted or foreign cohort must read as
+            # bad input rather than escaping as an unhandled DoesNotExist. `cohort()` and the
+            # IN COHORT transform skip deleted cohorts too, so the filter must fail here, not
+            # at print time when the whole query has already been built.
+            raise QueryError(f"Cohort {property.value} does not exist")
+        # Kludge: negation is outdated but still used in places
+        negated = property.negation or property.operator == PropertyOperator.NOT_IN.value
+
+        if cohort_via_distinct_id:
+            # `person_id` on a warehouse table can be an alias of the configured `distinct_id_field`,
+            # which holds arbitrary strings. Cohort membership is defined over person UUIDs, so
+            # comparing the two makes ClickHouse parse those strings as UUIDs and fail the query.
+            return ast.CompareOperation(
+                left=ast.Field(chain=["distinct_id"]),
+                op=(ast.CompareOperationOp.NotIn if negated else ast.CompareOperationOp.In),
+                right=ast.SelectQuery(
+                    select=[ast.Field(chain=["distinct_id"])],
+                    select_from=ast.JoinExpr(table=ast.Field(chain=["person_distinct_ids"])),
+                    where=ast.CompareOperation(
+                        left=ast.Field(chain=["person_id"]),
+                        op=ast.CompareOperationOp.InCohort,
+                        right=ast.Constant(value=cohort.pk),
+                    ),
+                ),
+            )
+
+        return ast.CompareOperation(
+            left=ast.Field(chain=["id" if scope == "person" else "person_id"]),
+            op=(ast.CompareOperationOp.NotInCohort if negated else ast.CompareOperationOp.InCohort),
+            right=ast.Constant(value=cohort.pk),
+        )
+
+    # TODO: Add support for these types: "recording"
+
+    raise NotImplementedError(
+        f"property_to_expr not implemented for filter type {type(property).__name__} and {property.type}"
+    )
+
+
+def bound_property_to_expr(property: Property, expr: ast.Expr, team: Team) -> ast.Expr:
+    """Apply a property filter's operator and value to a caller-supplied expression, instead of
+    resolving the filter's key to a table field. Backs the column-bound `{filters(...)}` placeholder,
+    where the query author maps filter keys onto their own columns. Mirrors `property_to_expr`'s
+    multi-value handling, without the events-table special cases that don't apply to bound columns."""
+    operator = cast(Optional[PropertyOperator], property.operator) or PropertyOperator.EXACT
+    value = property.value
+
+    if property.key and GROUP_KEY_PATTERN.match(str(property.key)):
+        value = _stringify_group_key_value(value)
+
+    if isinstance(value, list) and operator not in (
+        PropertyOperator.BETWEEN,
+        PropertyOperator.NOT_BETWEEN,
+        PropertyOperator.ICONTAINS,
+        PropertyOperator.NOT_ICONTAINS,
+    ):
+        if len(value) == 0:
+            return ast.Constant(value=1)
+        if len(value) == 1:
+            value = value[0]
+        elif operator in (
+            PropertyOperator.EXACT,
+            PropertyOperator.IS_NOT,
+            PropertyOperator.IN_,
+            PropertyOperator.NOT_IN,
+        ):
+            op = (
+                ast.CompareOperationOp.In
+                if operator in (PropertyOperator.EXACT, PropertyOperator.IN_)
+                else ast.CompareOperationOp.NotIn
+            )
+            return ast.CompareOperation(
+                op=op,
+                left=clone_expr(expr),
+                right=ast.Tuple(exprs=[ast.Constant(value=v) for v in value]),
+            )
+        elif operator not in _WHOLE_LIST_OPERATORS:
+            exprs = [
+                bound_property_to_expr(
+                    Property(
+                        type=property.type,
+                        key=property.key,
+                        operator=property.operator,
+                        group_type_index=property.group_type_index,
+                        value=v,
+                    ),
+                    expr,
+                    team,
+                )
+                for v in value
+            ]
+            if operator_is_negative(operator):
+                return ast.And(exprs=exprs)
+            return ast.Or(exprs=exprs)
+
+    return _expr_to_compare_op(
+        expr=clone_expr(expr),
+        value=value,
+        operator=operator,
+        property=property,
+        is_json_field=False,
+        team=team,
+    )
+
+
+def steps_to_expr(steps: Sequence[ActionStep], team: Team, events_alias: Optional[str] = None) -> ast.Expr:
+    if len(steps) == 0:
+        return ast.Constant(value=True)
+
+    or_queries = []
+    for step in steps:
+        exprs: list[ast.Expr] = []
+        if step.event:
+            exprs.append(parse_expr("event = {event}", {"event": ast.Constant(value=step.event)}))
+
+        if step.event == AUTOCAPTURE_EVENT:
+            if step.selector:
+                exprs.append(selector_to_expr(step.selector))
+            if step.tag_name is not None:
+                exprs.append(tag_name_to_expr(step.tag_name))
+            if step.href is not None:
+                if step.href_matching == "regex":
+                    validate_regex(step.href)
+                    exprs.append(
+                        ast.CompareOperation(
+                            op=ast.CompareOperationOp.Regex,
+                            left=ast.Field(chain=["elements_chain_href"]),
+                            right=ast.Constant(value=step.href),
+                        )
+                    )
+                elif step.href_matching == "contains":
+                    exprs.append(
+                        ast.CompareOperation(
+                            op=ast.CompareOperationOp.ILike,
+                            left=ast.Field(chain=["elements_chain_href"]),
+                            right=ast.Constant(value=f"%{step.href}%"),
+                        )
+                    )
+                else:
+                    exprs.append(
+                        ast.CompareOperation(
+                            op=ast.CompareOperationOp.Eq,
+                            left=ast.Field(chain=["elements_chain_href"]),
+                            right=ast.Constant(value=step.href),
+                        )
+                    )
+            if step.text is not None:
+                value = step.text
+                if step.text_matching == "regex":
+                    validate_regex(value)
+                    exprs.append(
+                        parse_expr(
+                            "arrayExists(x -> x =~ {value}, elements_chain_texts)",
+                            {"value": ast.Constant(value=value)},
+                        )
+                    )
+                elif step.text_matching == "contains":
+                    exprs.append(
+                        parse_expr(
+                            "arrayExists(x -> x ilike {value}, elements_chain_texts)",
+                            {"value": ast.Constant(value=f"%{value}%")},
+                        )
+                    )
+                else:
+                    exprs.append(
+                        parse_expr(
+                            "arrayExists(x -> x = {value}, elements_chain_texts)",
+                            {"value": ast.Constant(value=value)},
+                        )
+                    )
+
+        if step.url:
+            if step.url_matching == "exact":
+                expr = ast.CompareOperation(
+                    op=ast.CompareOperationOp.Eq,
+                    left=ast.Field(
+                        chain=(
+                            [events_alias, "properties", "$current_url"]
+                            if events_alias
+                            else ["properties", "$current_url"]
+                        )
+                    ),
+                    right=ast.Constant(value=step.url),
+                )
+            elif step.url_matching == "regex":
+                validate_regex(step.url)
+                expr = ast.CompareOperation(
+                    op=ast.CompareOperationOp.Regex,
+                    left=ast.Field(
+                        chain=(
+                            [events_alias, "properties", "$current_url"]
+                            if events_alias
+                            else ["properties", "$current_url"]
+                        )
+                    ),
+                    right=ast.Constant(value=step.url),
+                )
+            else:
+                expr = ast.CompareOperation(
+                    op=ast.CompareOperationOp.Like,
+                    left=ast.Field(
+                        chain=(
+                            [events_alias, "properties", "$current_url"]
+                            if events_alias
+                            else ["properties", "$current_url"]
+                        )
+                    ),
+                    right=ast.Constant(value=f"%{step.url}%"),
+                )
+            exprs.append(expr)
+
+        if step.properties:
+            # An action referencing itself here would re-enter action_to_expr until Python's recursion limit.
+            if any(isinstance(prop, dict) and prop.get("type") == "behavioral" for prop in step.properties):
+                raise QueryError("Action steps can't filter on behavioral properties")
+            exprs.append(property_to_expr(step.properties, team))
+
+        if len(exprs) == 1:
+            or_queries.append(exprs[0])
+        elif len(exprs) > 1:
+            or_queries.append(ast.And(exprs=exprs))
+        else:
+            or_queries.append(ast.Constant(value=True))
+
+    if len(or_queries) == 1:
+        return or_queries[0]
+    else:
+        return ast.Or(exprs=or_queries)
+
+
+def action_to_expr(action: Action, events_alias: Optional[str] = None, *, team: Optional[Team] = None) -> ast.Expr:
+    """The condition an event must meet to match the action, compiled against the action's own team.
+
+    The action's team is read by id. A caller that holds that team, or a child environment of it, can
+    pass it as `team` to skip the read; any other team is not used. Actions live on the project's root
+    team, so a child environment reaches it through its cached `parent_team`.
+    """
+    if team is not None and team.pk != action.team_id and team.parent_team_id == action.team_id:
+        team = team.parent_team
+    if team is None or team.pk != action.team_id:
+        team = Team.objects.get(pk=action.team_id)
+    return steps_to_expr(action.steps, team, events_alias)
+
+
+def entity_to_expr(entity: RetentionEntity, team: Team) -> ast.Expr:
+    if entity.type == TREND_FILTER_TYPE_ACTIONS and entity.id is not None:
+        # action
+        action_id = int(entity.id) if isinstance(entity.id, float) else entity.id
+        try:
+            action = get_action(action_id=int(action_id), team_id=team.pk)
+        except ActionNotFound:
+            raise ValidationError(f"Action ID {entity.id} does not exist!")
+        event_expr = action_to_expr(action)
+    elif entity.id is None:
+        # all events
+        event_expr = ast.Constant(value=True)
+    else:
+        # event
+        event_expr = parse_expr("events.event = {event}", {"event": ast.Constant(value=entity.id)})
+
+    if entity.properties is not None and entity.properties != []:
+        # add property filters
+        filter_expr = property_to_expr(entity.properties, team)
+        return ast.And(exprs=[event_expr, filter_expr])
+    else:
+        return event_expr
+
+
+def tag_name_to_expr(tag_name: str):
+    regex = rf"(^|;){tag_name}(\.|$|;|:)"
+    expr = parse_expr("elements_chain =~ {regex}", {"regex": ast.Constant(value=str(regex))})
+    return expr
+
+
+def element_property_key_to_breakdown_expr(key: str) -> ast.Expr:
+    """Map an element property filter key to the breakdown column expression for the same key.
+
+    Keep this in sync with the element branch of `property_to_expr`: a breakdown value must be a
+    value the same key's filter can match, or a broken-down series and its actors query disagree.
+    """
+    if key == "href":
+        # elements_chain_href is the first href in the chain, which is the innermost element with an href.
+        return ast.Field(chain=["elements_chain_href"])
+    if key == "text":
+        # elements_chain_texts holds one entry per chain element that has a text, innermost first.
+        # The filter matches on any entry, so the first entry is the deterministic innermost pick.
+        return parse_expr("arrayElement(elements_chain_texts, 1)")
+    if key == "tag_name":
+        # The materialized elements_chain_elements column contains only interactive tags, while the
+        # tag_name filter matches every tag in the chain. Extract the innermost tag directly so the
+        # breakdown uses the same set of values as the filter.
+        return parse_expr("extract(elements_chain, '(?:^|;)([A-Za-z][A-Za-z0-9_-]*)(?:[.]|$|:|;)')")
+    # A selector filter is a regex over the whole chain, so there is no per-event value that a
+    # selector breakdown could return without disagreeing with the filter.
+    raise QueryError(f"Breakdown by element property '{key}' is not supported. Use 'tag_name', 'text', or 'href'.")
+
+
+def selector_to_expr(selector_string: str):
+    if len(selector_string) > MAX_SELECTOR_LENGTH:
+        raise QueryError(f"Selector is too long. The maximum length is {MAX_SELECTOR_LENGTH} characters.")
+    selector = Selector(selector_string, escape_slashes=False)
+    if selector.is_unsatisfiable():
+        # The id-only shortcut below skips the regex, so [id="a"][id="b"] would match every
+        # element with id "b". A selector that no element can satisfy matches no event.
+        return ast.Constant(value=False)
+    exprs = []
+    regex = build_selector_regex(selector)
+    exprs.append(parse_expr("elements_chain =~ {regex}", {"regex": ast.Constant(value=regex)}))
+
+    useful_elements: list[ast.Expr] = []
+    for part in selector.parts:
+        if "tag_name" in part.data:
+            if part.data["tag_name"] in Element.USEFUL_ELEMENTS:
+                useful_elements.append(ast.Constant(value=part.data["tag_name"]))
+
+        if "attr_id" in part.data:
+            id_expr = parse_expr(
+                "indexOf(elements_chain_ids, {value}) > 0", {"value": ast.Constant(value=part.data["attr_id"])}
+            )
+            if len(selector.parts) == 1 and len(part.data.keys()) == 1:
+                # OPTIMIZATION: if there's only one selector part and that only filters on an ID, we don't need to also query elements_chain separately
+                return id_expr
+            exprs.append(id_expr)
+    if len(useful_elements) > 0:
+        exprs.append(
+            parse_expr(
+                "arrayCount(x -> x IN {value}, elements_chain_elements) > 0",
+                {"value": ast.Array(exprs=useful_elements)},
+            )
+        )
+
+    if len(exprs) == 1:
+        return exprs[0]
+    return ast.And(exprs=exprs)
+
+
+def get_property_type(property):
+    return get_from_dict_or_attr(property, "type")
+
+
+def get_property_key(property):
+    return get_from_dict_or_attr(property, "key")
+
+
+def get_property_value(property):
+    return get_from_dict_or_attr(property, "value")
+
+
+def get_property_operator(property):
+    return get_from_dict_or_attr(property, "operator")
+
+
+def get_lowercase_index_hint(property, team: Team) -> ast.Call:
+    """
+    Returns an index hint for a case insensitive index on `lower(key)`
+    e.g. for the property `body ILIKE '%STR%'` return `indexHint(lower(body) ILIKE '%str%')`
+         this means we can use ngram indexes on `lower(body)` efficiently
+    """
+    expr = property_to_expr(property, team=team)
+    return ast.Call(name="indexHint", args=[_LowercaseIndexRewriter().visit(expr)])
+
+
+class _LowercaseIndexRewriter(CloningVisitor):
+    """Rewrites an expression tree so it can leverage a case-insensitive index on ``lower(key)``.
+
+    Transformations applied:
+    - All ``toString(x)`` calls are unwrapped to just ``x`` (stripped, not replaced).
+    - ``ILike`` → ``lower(left) Like lower_const`` / ``NotILike`` → ``lower(left) NotLike lower_const``
+    - ``multiSearchAnyCaseInsensitive(haystack, needles)`` → ``multiSearchAny(lower(haystack), lowered_needles)``
+    """
+
+    def visit_call(self, node: ast.Call):
+        if node.name == "toString" and len(node.args) == 1:
+            # Strip toString
+            return self.visit(node.args[0])
+
+        if node.name == "ifNull" and len(node.args) >= 1:
+            # Strip ifNull
+            return self.visit(node.args[0])
+
+        if node.name == "multiSearchAnyCaseInsensitive" and len(node.args) == 2:
+            # multiSearchAnyCaseInsensitive(haystack, needles)
+            # → multiSearchAny(lower(haystack), lowered_needles)
+            haystack = self.visit(node.args[0])
+            haystack = ast.Call(name="lower", args=[haystack])
+            needles = node.args[1]
+            # Lowercase all needle constants
+            if isinstance(needles, ast.Array):
+                needles = ast.Array(
+                    exprs=[
+                        ast.Constant(value=str(e.value).lower())
+                        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        else self.visit(e)
+                        for e in needles.exprs
+                    ]
+                )
+            else:
+                needles = self.visit(needles)
+            return ast.Call(name="multiSearchAny", args=[haystack, needles])
+
+        return super().visit_call(node)
+
+    def visit_compare_operation(self, node: ast.CompareOperation):
+        op = node.op
+        wrap_left_lower = False
+
+        if op == ast.CompareOperationOp.ILike:
+            op = ast.CompareOperationOp.Like
+            wrap_left_lower = True
+        elif op == ast.CompareOperationOp.NotILike:
+            op = ast.CompareOperationOp.NotLike
+            wrap_left_lower = True
+
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+
+        if wrap_left_lower:
+            left = ast.Call(name="lower", args=[left])
+            if isinstance(right, ast.Constant) and isinstance(right.value, str):
+                right = ast.Constant(value=right.value.lower())
+
+        return ast.CompareOperation(
+            left=left,
+            right=right,
+            op=op,
+        )

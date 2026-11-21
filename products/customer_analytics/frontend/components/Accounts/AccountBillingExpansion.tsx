@@ -1,0 +1,140 @@
+import { useActions, useValues } from 'kea'
+
+import * as burningMoneyHogPng from '@posthog/brand/hoggies/png/burning-money'
+import * as magnifyingGlassPng from '@posthog/brand/hoggies/png/magnifying-glass'
+import { LemonSelect, LemonSkeleton } from '@posthog/lemon-ui'
+
+import { pngHoggie } from 'lib/brand/hoggies'
+import { DateFilter } from 'lib/components/DateFilter/DateFilter'
+
+import { Query } from '~/queries/Query/Query'
+import { InsightShortId } from '~/types'
+
+import { AccountBillingChart, canRenderBillingChart } from './AccountBillingChart'
+import { AccountBillingKind, accountBillingLogic } from './accountBillingLogic'
+import type { AccountViewTileLogicProps } from './accountViewTileConfig'
+
+const HedgehogBurningMoney = pngHoggie(burningMoneyHogPng)
+const HedgehogMagnifyingGlass = pngHoggie(magnifyingGlassPng)
+
+function BillingInsightNotFound({ kind }: { kind: AccountBillingKind }): JSX.Element {
+    const Hog = kind === 'spend' ? HedgehogBurningMoney : HedgehogMagnifyingGlass
+
+    return (
+        <div
+            className="flex flex-col items-center justify-center gap-2 p-8 text-center"
+            data-attr="account-billing-insight-not-found"
+        >
+            <Hog className="w-24 h-24" />
+            <h4 className="mb-0">No billing {kind} insight here</h4>
+            <p className="text-secondary max-w-sm mb-0">
+                We couldn't find the saved billing {kind} insight in this environment.
+            </p>
+        </div>
+    )
+}
+
+interface AccountBillingExpansionProps extends AccountViewTileLogicProps {
+    accountId: string
+    externalId: string
+    kind: AccountBillingKind
+}
+
+export function AccountBillingExpansion({
+    accountId,
+    externalId,
+    kind,
+    ...tileProps
+}: AccountBillingExpansionProps): JSX.Element {
+    const logicProps = { accountId, externalId, kind, ...tileProps }
+    const logic = accountBillingLogic(logicProps)
+    const {
+        displayInsights: savedInsights,
+        savedInsightsLoading,
+        dateRange,
+        variableOverridesByShortId,
+        queryKeyFor,
+        usageInterval,
+        canAggregateUsage,
+    } = useValues(logic)
+    const { setDateRange, setUsageInterval } = useActions(logic)
+
+    if (!externalId) {
+        return <div className="p-4 text-secondary">This account has no linked organization.</div>
+    }
+
+    if (savedInsightsLoading) {
+        return <LemonSkeleton className="h-64 w-full" />
+    }
+
+    if (!savedInsights || savedInsights.length === 0) {
+        return <BillingInsightNotFound kind={kind} />
+    }
+
+    const showTitles = savedInsights.length > 1
+
+    return (
+        <div className="flex flex-col gap-3 mb-2">
+            <div className="flex flex-wrap items-center gap-2">
+                <DateFilter
+                    dateFrom={dateRange.date_from}
+                    dateTo={dateRange.date_to}
+                    onChange={(from, to) => setDateRange(from, to)}
+                />
+                {canAggregateUsage && (
+                    <LemonSelect
+                        value={usageInterval}
+                        onChange={setUsageInterval}
+                        options={[
+                            { value: 'day', label: 'Daily' },
+                            { value: 'week', label: 'Weekly' },
+                            { value: 'month', label: 'Monthly' },
+                        ]}
+                        aria-label="Usage aggregation"
+                        data-attr="account-usage-interval"
+                    />
+                )}
+            </div>
+            {savedInsights.map((insight) => {
+                const queryKey = queryKeyFor(insight.short_id)
+                const variablesOverride = variableOverridesByShortId[insight.short_id] ?? null
+                return (
+                    <div key={insight.short_id} className="flex flex-col gap-1">
+                        {showTitles && insight.name ? <h4 className="mb-0 text-sm">{insight.name}</h4> : null}
+                        {canRenderBillingChart(insight.query) ? (
+                            <AccountBillingChart
+                                key={queryKey}
+                                logicProps={logicProps}
+                                shortId={insight.short_id}
+                                query={insight.query}
+                                queryKey={queryKey}
+                                variablesOverride={variablesOverride}
+                            />
+                        ) : (
+                            /* Embedded DataVisualization collapses to a sliver without a fixed-height parent (InsightCard__viz is flex:1, min-height:0). */
+                            <div className="h-80 flex flex-col overflow-hidden">
+                                <Query
+                                    key={queryKey}
+                                    uniqueKey={queryKey}
+                                    query={insight.query}
+                                    variablesOverride={variablesOverride}
+                                    readOnly
+                                    embedded
+                                    // Attach the insight's data logic to accountBillingLogic (mounted at the expanded-row
+                                    // root) so the loaded results survive tab switches instead of refetching on return.
+                                    attachTo={logic}
+                                    context={{
+                                        insightProps: {
+                                            dashboardItemId: queryKey as InsightShortId,
+                                            dataNodeCollectionId: queryKey,
+                                        },
+                                    }}
+                                />
+                            </div>
+                        )}
+                    </div>
+                )
+            })}
+        </div>
+    )
+}

@@ -1,0 +1,322 @@
+"""
+Capability surface for managed_warehouse.
+
+Provisioning state, per-team backfill state, schema naming, Duckgres session setup,
+and direct-connection lifecycle commands cross this boundary as contracts or narrow
+commands. Django models remain implementation details of the product.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import TYPE_CHECKING
+from uuid import UUID
+
+from products.managed_warehouse.backend import common, storage
+from products.managed_warehouse.backend.common import DUCKGRES_BUCKET_REGION, EARLIEST_BACKFILL_DATE
+from products.managed_warehouse.backend.facade.contracts import (
+    ControlPlaneStorage,
+    DuckgresQueryServerConfig,
+    DuckgresStoredBucketConfig,
+    DuckgresStoredServerConfig,
+    DuckLakeCatalogConnectionConfig,
+    ManagedWarehouseBackfillState,
+    ManagedWarehouseProvisionStatus,
+    ManagedWarehouseTarget,
+)
+
+if TYPE_CHECKING:
+    import psycopg
+
+    from products.managed_warehouse.backend.models import DuckgresServer
+    from products.warehouse_sources.backend.facade.models import ExternalDataSchema
+
+__all__ = [
+    "DUCKGRES_BUCKET_REGION",
+    "EARLIEST_BACKFILL_DATE",
+    "default_bucket_region",
+    "deprovision_for_org_deletion",
+    "duckgres_data_imports_schema",
+    "duckgres_data_imports_table_name",
+    "duckgres_data_modeling_schema",
+    "ducklake_data_modeling_schema",
+    "get_data_modeling_table_name",
+    "get_catalog_connection_config",
+    "get_control_plane_bucket",
+    "get_control_plane_data_path",
+    "get_control_plane_storage",
+    "get_duckgres_query_server_config",
+    "get_managed_warehouse_trino_password",
+    "get_org_id_for_team",
+    "get_managed_warehouse_target",
+    "managed_warehouse_domain",
+    "managed_warehouse_ingress_ips",
+    "get_team_deletion_block_reason",
+    "get_stored_bucket_config",
+    "get_stored_warehouse_config",
+    "get_team_backfill_state",
+    "get_warehouse_provision_status",
+    "has_provisioned_warehouse",
+    "is_data_modeling_shadow_ready",
+    "is_dev_mode",
+    "organization_is_pending_deletion",
+    "persist_duckgres_server_for_org",
+    "reconcile_stored_bucket_config",
+    "resolve_team_earliest_event_date",
+    "setup_duckgres_session",
+    "update_team_earliest_event_date",
+    "validate_schema_name",
+]
+
+
+def _to_stored_server_config(server: DuckgresServer) -> DuckgresStoredServerConfig:
+    catalog = None
+    if server.catalog_host:
+        catalog = DuckLakeCatalogConnectionConfig(
+            host=server.catalog_host,
+            port=server.catalog_port,
+            database=server.catalog_database,
+            username=server.catalog_username,
+            password=server.catalog_password,
+        )
+    bucket = None
+    if server.bucket:
+        bucket = DuckgresStoredBucketConfig(bucket=server.bucket, region=server.bucket_region)
+    return DuckgresStoredServerConfig(
+        organization_id=server.organization_id,
+        query_server=DuckgresQueryServerConfig(
+            host=server.host,
+            port=server.port,
+            flight_port=server.flight_port,
+            database=server.database,
+            username=server.username,
+            password=server.password,
+        ),
+        catalog=catalog,
+        bucket=bucket,
+    )
+
+
+def is_dev_mode() -> bool:
+    """Whether Duckgres runs in the env-var-configured local mode."""
+    return common.is_dev_mode()
+
+
+def default_bucket_region() -> str:
+    return common.default_bucket_region()
+
+
+def get_managed_warehouse_target(organization_id: str, *, source_type: str) -> ManagedWarehouseTarget | None:
+    """The managed warehouse `organization_id` may reach from a `source_type` source, or None.
+
+    The warehouse-source host guard is the only caller. It decides whether a source's host is
+    exempt from the private-address check, so it needs the control plane's own answer for this
+    organization rather than any stored row.
+    """
+    from products.managed_warehouse.backend.managed_ingress import get_managed_warehouse_target as _get  # noqa: PLC0415
+
+    return _get(organization_id, source_type=source_type)
+
+
+def managed_warehouse_ingress_ips() -> tuple[str, ...]:
+    """The address set the managed warehouse ingress answers on, read per call.
+
+    The warehouse-source host guard passes this to `ManagedWarehouseTarget.accepts`, so a settings
+    override in a test takes effect without a reload.
+    """
+    from products.managed_warehouse.backend.managed_ingress import _ingress_ips  # noqa: PLC0415
+
+    return _ingress_ips()
+
+
+def managed_warehouse_domain() -> str:
+    """The zone managed warehouse hostnames are served under in this deployment."""
+    from products.managed_warehouse.backend.managed_ingress import managed_warehouse_domain as _domain  # noqa: PLC0415
+
+    return _domain()
+
+
+def get_org_id_for_team(team_id: int) -> str:
+    return common._get_org_id_for_team(team_id)
+
+
+def organization_is_pending_deletion(organization_id: str | UUID) -> bool:
+    from posthog.models.organization import Organization  # noqa: PLC0415
+
+    return Organization.objects.filter(id=organization_id, is_pending_deletion=True).exists()
+
+
+def get_stored_warehouse_config(organization_id: str) -> DuckgresStoredServerConfig | None:
+    server = common.get_duckgres_server_for_organization(organization_id)
+    return _to_stored_server_config(server) if server is not None else None
+
+
+def get_warehouse_provision_status(organization_id: str) -> ManagedWarehouseProvisionStatus:
+    return ManagedWarehouseProvisionStatus(provisioned=has_provisioned_warehouse(organization_id))
+
+
+def has_provisioned_warehouse(organization_id: str | UUID) -> bool:
+    from products.managed_warehouse.backend.models import DuckgresServer  # noqa: PLC0415
+
+    return DuckgresServer.objects.filter(organization_id=organization_id).exists()
+
+
+def is_data_modeling_shadow_ready(
+    *,
+    organization_id: str | UUID,
+    team_id: int,
+) -> bool:
+    from products.managed_warehouse.backend.facade.cp_teams import (  # noqa: PLC0415 -- keeps control-plane imports off startup paths
+        get_org_team_membership,
+    )
+    from products.managed_warehouse.backend.trino_compiler import (  # noqa: PLC0415 -- keeps optional compiler imports off startup paths
+        get_ready_trino_catalog_name,
+    )
+
+    if get_ready_trino_catalog_name(str(organization_id)) is None:
+        return False
+    return get_org_team_membership(str(organization_id), team_id) is not None
+
+
+def get_duckgres_query_server_config(organization_id: str) -> DuckgresQueryServerConfig:
+    config = common.get_duckgres_config_for_org(organization_id)
+    return DuckgresQueryServerConfig(
+        host=config["DUCKGRES_HOST"],
+        port=int(config["DUCKGRES_PORT"]),
+        flight_port=int(config["DUCKGRES_FLIGHT_PORT"]),
+        database=config["DUCKGRES_DATABASE"],
+        username=config["DUCKGRES_USERNAME"],
+        password=config["DUCKGRES_PASSWORD"],
+    )
+
+
+def get_managed_warehouse_trino_password(organization_id: str) -> str:
+    return common.get_trino_password_for_org(organization_id)
+
+
+def get_catalog_connection_config(organization_id: str) -> DuckLakeCatalogConnectionConfig | None:
+    stored = get_stored_warehouse_config(organization_id)
+    return stored.catalog if stored is not None else None
+
+
+def get_stored_bucket_config(organization_id: str) -> DuckgresStoredBucketConfig | None:
+    stored = get_stored_warehouse_config(organization_id)
+    return stored.bucket if stored is not None else None
+
+
+def persist_duckgres_server_for_org(
+    organization_id: str | UUID,
+    *,
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str,
+    bucket: str | None = None,
+    bucket_region: str | None = None,
+) -> DuckgresStoredServerConfig:
+    return _to_stored_server_config(
+        common.upsert_duckgres_server_for_org(
+            organization_id,
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            password=password,
+            bucket=bucket,
+            bucket_region=bucket_region,
+        )
+    )
+
+
+def reconcile_stored_bucket_config(organization_id: str | UUID, *, bucket: str, bucket_region: str) -> bool:
+    from products.managed_warehouse.backend.models import DuckgresServer  # noqa: PLC0415
+
+    return bool(
+        DuckgresServer.objects.filter(organization_id=organization_id)
+        .exclude(bucket=bucket, bucket_region=bucket_region)
+        .update(bucket=bucket, bucket_region=bucket_region)
+    )
+
+
+def get_control_plane_bucket(organization_id: str | UUID) -> str | None:
+    from products.managed_warehouse.backend.presentation.views import cp_bucket_for  # noqa: PLC0415
+
+    return cp_bucket_for(organization_id)
+
+
+def get_control_plane_data_path(organization_id: str | UUID) -> str | None:
+    from products.managed_warehouse.backend.presentation.views import cp_data_path_for  # noqa: PLC0415
+
+    return cp_data_path_for(organization_id)
+
+
+def get_control_plane_storage(organization_id: str | UUID) -> ControlPlaneStorage | None:
+    from products.managed_warehouse.backend.presentation.views import cp_storage_for  # noqa: PLC0415
+
+    return cp_storage_for(organization_id)
+
+
+def update_team_earliest_event_date(
+    organization_id: str | UUID, team_id: int, earliest_event_date: date | None
+) -> bool:
+    from products.managed_warehouse.backend.presentation.views import push_team_earliest_event_date  # noqa: PLC0415
+
+    return push_team_earliest_event_date(organization_id, team_id, earliest_event_date)
+
+
+def get_team_deletion_block_reason(team_id: int, organization_id: str | UUID) -> str | None:
+    from products.managed_warehouse.backend.presentation.views import block_team_deletion  # noqa: PLC0415
+
+    return block_team_deletion(team_id, organization_id)
+
+
+def deprovision_for_org_deletion(organization_id: str | UUID) -> None:
+    from products.managed_warehouse.backend.presentation.views import (  # noqa: PLC0415
+        deprovision_for_org_deletion as deprovision,
+    )
+
+    deprovision(organization_id)
+
+
+def duckgres_data_imports_schema(team_id: int) -> str:
+    return common.duckgres_data_imports_schema(team_id)
+
+
+def duckgres_data_imports_table_name(schema: ExternalDataSchema) -> str:
+    return common.duckgres_data_imports_table_name(schema)
+
+
+def duckgres_data_modeling_schema(team_id: int) -> str:
+    return common.duckgres_data_modeling_schema(team_id)
+
+
+def ducklake_data_modeling_schema(team_id: int) -> str:
+    return common.ducklake_data_modeling_schema(team_id)
+
+
+def get_data_modeling_table_name(team_id: int, saved_query_id: UUID) -> str:
+    from products.managed_warehouse.backend.table_binding import (
+        get_data_modeling_table_names,  # noqa: PLC0415 -- defer compiler dependencies until model resolution
+    )
+
+    return get_data_modeling_table_names(team_id, [saved_query_id])[saved_query_id]
+
+
+def validate_schema_name(name: str | None) -> str | None:
+    return common.validate_schema_name(name)
+
+
+def get_team_backfill_state(team_id: int) -> ManagedWarehouseBackfillState:
+    return common.get_team_backfill_state(team_id)
+
+
+def resolve_team_earliest_event_date(team_id: int) -> date:
+    return common.resolve_team_earliest_event_date(team_id)
+
+
+def setup_duckgres_session(
+    conn: psycopg.Connection,
+    extensions: tuple[str, ...] = ("ducklake", "httpfs", "delta"),
+) -> None:
+    storage.setup_duckgres_session(conn, extensions)
