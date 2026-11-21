@@ -1,0 +1,320 @@
+# DuckLake copy workflow configuration
+
+## DuckgresServer retirement telemetry
+
+ORM access to `DuckgresServer` emits the counter
+`warehouse.duckgres.server.model.access`. It has five bounded attributes: `operation`
+(`read`, `create`, `update`, or `delete`), the immediate `accessor_module` and
+`accessor_function`, and the meaningful outer `caller_module` and `caller_function`.
+The outer caller skips shared managed-warehouse configuration gateways so the result
+identifies the business workflow that still depends on the model. Caller names are
+limited to 160 characters. The metric deliberately excludes model fields,
+organization identifiers, connection details, and other customer data.
+
+Use the PostHog Metrics SQL editor to find active callers over a representative
+period:
+
+```sql
+SELECT
+    attributes['operation'] AS operation,
+    attributes['accessor_module'] AS accessor_module,
+    attributes['accessor_function'] AS accessor_function,
+    attributes['caller_module'] AS caller_module,
+    attributes['caller_function'] AS caller_function,
+    sum(value) AS accesses
+FROM posthog.metrics
+WHERE metric_name = 'warehouse.duckgres.server.model.access'
+    AND metric_type = 'counter'
+    AND aggregation_temporality = 'delta'
+    AND timestamp >= now() - INTERVAL 7 DAY
+GROUP BY operation, accessor_module, accessor_function, caller_module, caller_function
+ORDER BY accesses DESC
+```
+
+Reads are recorded through the model's default `objects` manager when a normal
+queryset is evaluated, or when `get`, `count`, `exists`, or `iterator` executes.
+Re-evaluating the same cached queryset does not emit another access. Normal model
+saves and deletes and queryset updates and deletes are also recorded once per ORM
+operation. Normal `async for` queryset evaluation uses `_fetch_all` and is recorded,
+although attribution may become `unknown` across its thread boundary.
+
+This is deliberately a probe of the default manager rather than proof of all model
+use. It does not observe reads through `_base_manager`, reverse one-to-one access,
+`select_related` or `prefetch_related` hydration, raw SQL, `raw()`/`RawQuerySet`, or
+`.aiterator()`. `bulk_create` bypasses the save signals. These paths can construct or
+write `DuckgresServer` instances without incrementing the counter.
+
+Before using an empty result as retirement evidence, confirm that another known
+metric from every relevant service is reaching the same Metrics project. Observe
+for at least one complete schedule window, remove the remaining callers, then
+repeat the query. An empty result cannot prove that the model is unused: a final
+static search for the model, its table, and reverse relation is mandatory before
+removal because telemetry cannot discover dormant or uninstrumented code paths.
+
+The DuckLake copy and registration workflows write data into a DuckLake-managed S3 bucket. There are three workflows:
+
+1. **Data Modeling** (`ducklake-copy.data-modeling`) - copies materialized saved query outputs
+2. **Data Imports** (`ducklake-copy.data-imports`) - copies external data source imports (Stripe, Hubspot, etc.)
+3. **Data Import Registration** (`ducklake-register.data-imports`) - copies and registers prepared Parquet files from completed imports
+
+The workflows share the same infrastructure and configuration. Workers running these workflows must be configured explicitly; otherwise copies will fail before they even reach the first activity.
+
+## Managed view translation pass
+
+The `managed-warehouse.translate-views` Temporal workflow performs a best-effort HogQL-to-Trino compilation pass for an existing managed warehouse. It snapshots active views and materialized views for control-plane-enabled teams in the organization, excluding endpoint queries. Each view compiles through the managed-warehouse compiler facade in Django expansion mode, so references to other saved queries and copied warehouse tables resolve to their DuckLake relations. Each result is stored in `ManagedWarehouseViewTranslationResult`; it does not replace the saved query's canonical HogQL, execute SQL, or create Trino objects.
+
+Provisioning does not start this workflow. To run it, add a `Managed warehouse view translation job` row in Django admin and select the provisioned organization. Choose `Entire organization` to snapshot every eligible view, or choose `Selected views` and enter the saved-query UUIDs to test. The admin starts the workflow after the row commits. Only one pending or running job may exist for an organization.
+
+The job ends as completed when every snapshot compiles, completed with errors when individual views fail or become stale, and failed when setup or workflow infrastructure prevents the pass. Individual failures do not stop later views from compiling. A view becomes stale when its definition changes or is removed after the snapshot. The result rows retain the generated Trino SQL, named values, normalized HogQL, and any compilation error for inspection.
+
+To retry specific failures, select failed or stale rows in `Managed warehouse view translation results` and run `Retry selected translations`. The action creates a new selected-view job linked to the original job. Completed jobs and results remain immutable.
+
+The manual trigger is deliberately separate from provisioning. A future provisioning trigger should call the same job starter instead of adding compilation to the provisioning request path.
+
+Data modeling shadow materialization starts when its feature flag is enabled, the managed warehouse is provisioned, and the organization has a ready Trino target. Each dispatched job compiles its current HogQL in Django expansion mode and executes the generated Trino SQL with bound parameters. Endpoint queries are prepared before compilation. The shadow path does not read stored translation results; the manual translation pass remains available for diagnostics. Compilation errors are recorded as failed modeling jobs.
+
+Trino shadow materialization has a six-hour execution deadline. Its Temporal activity allows six hours and five minutes so cancellation and cleanup can finish before the activity times out, and requires a heartbeat every two minutes. Deadline failures retain an explicit timeout message on the modeling job. Alias reconciliation keeps its separate five-minute execution deadline.
+
+## Member teams pushed to hogtower
+
+hogtower mints team-scoped hoglake tokens from its own copy of which projects each organization member can see. With `HOGTOWER_MEMBER_TEAMS_PUSH_ENABLED` and `HOGTOWER_API_URL` set, `member_teams.py` keeps that copy current:
+
+- Each visible project goes in at the member's level on warehouse objects. `viewer` becomes `read`, and `editor` or above becomes `write`. A project where the level is `none` is left out.
+- A team grant covers the whole namespace, so it cannot honor a rule on a single table, view, source or property, and it cannot follow PostHog's resolution of rules either. The level is therefore capped by the floor of the member's stored rules: the lowest level any of them can give, under either resolution mode and with or without the access-control entitlements (`UserAccessControl.stored_rule_floor` and `stored_property_rule_floor`). A member denied one table or property, or a private project, gets no grant. `viewer` on one object, or a read-only property, caps the grant at `read`. The cap can be stricter than PostHog, never looser. For example, a role that shares a hidden table does not lift the floor, because the role rule may not apply. So a switch of resolution mode or entitlement needs no push.
+- A member who leaves the organization, or whose user is deactivated, is removed. hogtower then revokes every team credential they own.
+- `signals.py` enqueues a push after a change to a membership, a role membership, or a project (created, deleted, or moved to another organization), or to an access rule on the project, on warehouse data, or on a property. Receivers that read state before a write only record it; the enqueue runs after the write, so a push never reads the old state. The push runs as a Celery task that retries for about ten hours.
+- `push managed warehouse member teams to hogtower` runs every hour and pushes every member of every Trino warehouse that hogtower lists. It catches changes that no signal reports, such as a user's reactivation. It also removes the members that hogtower still holds who have left, so a removal whose own push gave up is still reconciled.
+
+Each push sends the member's whole team set, versioned by the database clock. hogtower keeps the highest version, so pushes may finish in any order.
+
+## Environment variables
+
+The workflow obtains its DuckLake configuration from the following environment variables:
+
+- `DUCKLAKE_RDS_HOST` - Postgres catalog host
+- `DUCKLAKE_RDS_PORT` - Postgres catalog port
+- `DUCKLAKE_RDS_DATABASE` - Postgres catalog database name
+- `DUCKLAKE_RDS_USERNAME` - Postgres catalog username
+- `DUCKLAKE_RDS_PASSWORD` - Postgres catalog password
+- `DUCKLAKE_BUCKET` - S3 bucket for DuckLake data
+- `DUCKLAKE_BUCKET_REGION` - AWS region for the S3 bucket
+- `DUCKLAKE_S3_ACCESS_KEY` - S3 access key (optional, for local dev; production uses IRSA)
+- `DUCKLAKE_S3_SECRET_KEY` - S3 secret key (optional, for local dev; production uses IRSA)
+
+`bin/start` exports sensible defaults for local development, so you usually get a working DuckLake setup just by running the dev script. Temporal workers in staging/production must set these variables directly in their process environment (or via Helm/k8s secrets). If you need to run the workflow against a bespoke DuckLake deployment, override the environment variables before starting the worker—no code changes are required.
+
+For local dev the defaults are:
+
+- `DUCKLAKE_RDS_HOST=localhost`
+- `DUCKLAKE_RDS_PORT=5432`
+- `DUCKLAKE_RDS_DATABASE=ducklake`
+- `DUCKLAKE_RDS_USERNAME=posthog`
+- `DUCKLAKE_RDS_PASSWORD=posthog`
+- `DUCKLAKE_BUCKET=ducklake-dev`
+- `DUCKLAKE_BUCKET_REGION=us-east-1`
+- `DUCKLAKE_S3_ACCESS_KEY=object_storage_root_user`
+- `DUCKLAKE_S3_SECRET_KEY=object_storage_root_password`
+- `DUCKGRES_HOST=localhost`
+- `DUCKGRES_PORT=15432`
+- `DUCKGRES_DATABASE=ducklake`
+- `DUCKGRES_USERNAME=posthog`
+- `DUCKGRES_PASSWORD=posthog`
+
+## Self-managed object storage reads
+
+The DuckLake query path can read credentialed self-managed Parquet tables directly from S3-compatible object storage. HogQL compiles these tables to DuckDB's `read_parquet` function. Before each query, the Duckgres client creates a temporary secret from the table's `DataWarehouseCredential`. Secrets cover only the tables the compiled query's schema still exposes after warehouse access control, so a query cannot borrow credentials from a table it may not read. Each secret is scoped to the table's object path and disappears when the connection closes. Credentials use query parameters and never appear in the compiled SQL.
+
+Supported URL forms include AWS S3, Google Cloud Storage with HMAC credentials, Cloudflare R2, and other path-style S3-compatible HTTPS endpoints. Local HTTP endpoints such as SeaweedFS are also supported. AWS regions are inferred from regional endpoints. Other providers use `us-east-1` for S3 request signing.
+
+This path currently supports Parquet only. Support for Azure Blob Storage, CSV, JSON, and Delta will follow. Until then, these sources continue to use the existing non-DuckLake query path.
+
+## Feature flag gating
+
+Each workflow evaluates a feature flag through `feature_enabled`. Create or update the appropriate flag locally. The copy flags target the project, while `data-warehouse-scene` and `managed-warehouse-trino-query` target the organization. Otherwise, the workflow will be skipped even if the rest of the configuration is correct.
+
+| Workflow                 | Feature Flag                                              |
+| ------------------------ | --------------------------------------------------------- |
+| Data Modeling            | `ducklake-data-modeling-copy-workflow`                    |
+| Data Imports             | `ducklake-data-imports-copy-workflow`                     |
+| Data Import Registration | `data-warehouse-scene` or `managed-warehouse-trino-query` |
+
+The data-import copy and registration paths target the same stable DuckLake table. An organization with either managed warehouse flag enabled runs registration. Disable `ducklake-data-imports-copy-workflow` for its projects to avoid both paths applying the same import. If both run, the last atomic table swap wins.
+
+The two organization flags also select the Data ops variant. `managed-warehouse-trino-query` gives the Trino variant and wins when both are on. `data-warehouse-scene` alone gives the DuckDB variant. `data_ops_variant` in `presentation/views.py` is the single backend implementation of that rule.
+
+## Trino canary hostname
+
+`MANAGED_WAREHOUSE_TRINO_CANARY_DOMAIN` (empty by default) names the domain of the canary Trino lane, for example `canary.dw.us.postwh.com`.
+A canary connection keeps the minted credential and replaces the host with `<database label>.<canary domain>`.
+The minted host must be a single label under `dw.<region>.postwh.com`.
+Any other minted host, or an empty canary domain, makes a canary connection fail with an explicit error instead of falling back to the normal host.
+
+An interactive run uses the canary host when the requesting user has the `managed-warehouse-trino-canary` flag, evaluated with `user.distinct_id` and the organization group.
+This covers the SQL editor, the schema browser, and the managed warehouse connection of the SQL editor.
+These runs never use the canary host:
+
+- Alert runs and cache-warming runs, which carry alert and warming query tags.
+- Runs with the export, SQL alert, or PostHog AI limit context. Exports and subscriptions run as their creator and carry no tag, so the limit context identifies them.
+- Schema discovery, data modeling, and model aliases, which never pass the canary option.
+
+A Dagster backfill uses the canary host only when its run config sets `use_trino_canary: true`.
+It does not evaluate the flag.
+
+The query runner decides once per query and uses that decision for the cache key and for the connection.
+A canary result is cached under its own key, so the normal lane never serves it.
+The decision is made again for each runner, so the web request and the Celery task that continues it each agree with themselves.
+
+Before you turn the flag on, run one real query through the canary host.
+The canary host must return `nextUri` and `infoUri` values on the canary host.
+The connection accepts only responses that name the host it dialed, so a response on the normal host fails with "Trino returned a different service credential destination".
+
+## Data Ops workflow status
+
+The copy and registration workflows both write their lifecycle to `ManagedWarehouseSourceJob`. Each row identifies the project, source schema, external data job, workflow type, and workflow attempt. The supported states are running, completed, failed, skipped, and stale.
+
+The Data Ops overview reads the latest workflow attempt for each source schema from this shared model. It also reads the most recent completed attempt separately, so a later failed or stale attempt does not erase when data was last applied successfully. The Duckgres consumer sink state is not used for source readiness.
+
+## Target bucket layout
+
+Every copy is written to a deterministic schema inside DuckLake. Each workflow namespaces its data under a workflow-specific schema:
+
+### Data Modeling
+
+- **Schema**: `posthog_data_modeling_team_<team_id>`
+- **Table**: the sanitized model label, with the normalized saved query name as a fallback
+- **Example**: `ducklake.posthog_data_modeling_team_123.model_12345678123456781234567812345678`
+
+### Data Imports and Data Import Registration
+
+- **Schema**: `posthog_data_imports_team_<team_id>`
+- **Table**: a physical name derived from the organization's naming version
+- **Example**: `ducklake.posthog_data_imports_team_123.stripe_prod_invoices`
+- **Registered files**: `s3://<ducklake-bucket>/<ducklake-schema>/<ducklake-table>/_imports/<source-schema-id>/<job-id>/<generation-token>/<prepared-relative-path>`
+- **Registered files through Trino**: `<DuckLake data path>_ph_imports/<ducklake-schema>/<ducklake-table>/<source-schema-id>/<job-id>/<generation-token>/<attempt>/<execution>/<prepared-relative-path>`. The control plane returns the data path, and it includes the warehouse prefix.
+
+Duckgres stores a table-naming version on the organization. Organizations that existed when versioning was introduced keep the batch sink's snake-case format, such as `tik_tok_ads_ad_report`. New organizations use the copy workflow format, such as `tiktokads_ad_report`. Copy, registration, the batch sink, and query binding derive the same physical name from that organization-level policy. Do not change the policy after an organization has written data unless the underlying tables are migrated at the same time.
+
+Each completed import creates a timestamped prepared Parquet snapshot in the data warehouse bucket. The registration workflow copies those objects directly into the DuckLake bucket, preserving Hive partition directories. Schema creation still uses one recursive Parquet glob. File registration calls `ducklake_add_data_files` in batches of copied object paths so each catalog transaction stays short. The workflow verifies the shadow table's row count, then swaps it into the stable table name through the Duckgres PostgreSQL connection. Publication uses one short transaction that renames the current table to an attempt-owned backup and the verified shadow to the stable name. A mismatch never enters the publication transaction, so the previous table remains live. The backup is dropped after publication. Each prepared generation gets its own object prefix. The workflow id is one per schema, so a later start is skipped while a run is in flight. The next import after that run finishes can start.
+
+Organizations with the `managed-warehouse-trino-data-imports-registration` flag register through their Trino catalog instead of Duckgres, so a warehouse without Duckgres can register. This flag is separate from `managed-warehouse-trino-import-registration`, which moves only the event, person and group backfills, so an organization can move backfills and data imports at different times. While the organization's Trino target is not ready, the gate skips the run and does not fall back to Duckgres, and the next completed sync starts registration again. The staging table's columns and the expected row count come from the Parquet footers of the copied files, because `add_files` compares each file's own types exactly. The Hive partition columns become VARCHAR partition columns. The workflow adds the files with the `add_files` table procedure in batches of at most 2,000 files and 500,000 characters of file paths, and each batch has a stable import id that derives from the attempt, so a repeated batch is a no-op. It then compares the footer row count with `SELECT count(*)` on the staging table, and a mismatch stops the run before publication. `publish_as` ends the live table and renames the staging table to its name in one snapshot. Trino refuses a file inside another table's directory, so the files land below `_ph_imports`, outside every table directory. The catalog also refuses a file that it has recorded before, so each execution of the copy activity copies into its own directory. An execution that fails before it adds any file to the staging table deletes its directory, because the catalog never cleans files it did not record. The cleanup finalizer drops the staging table. Staging table names carry the time the workflow minted them, and the finalizer's sweep drops staging tables whose names show they are older than six hours. The older copy workflow refuses organizations whose data imports register through Trino.
+
+Without the flag, an organization that duckgres does not have also registers through Trino.
+hogtower provisions new warehouses without a duckgres organization, so the gate and the engine choice open a short probe connection (`ducklake-register-probe`, 15 second timeout) to the organization's duckgres server.
+Only a "this server requires connecting via" refusal for a managed warehouse hostname counts as "duckgres does not have the organization".
+The answer is cached per organization: "has the organization" for a day and a refusal for ten minutes, because duckgres sends the same refusal while a control-plane replica has no config snapshot for a new organization yet. A timeout or any other error keeps duckgres for an hour before the next probe.
+The Trino readiness handling is the same as for the flag.
+
+To register one schema through Trino before its organization has the flag, start the workflow by hand with the `register_through_trino` override.
+`true` forces Trino and `false` forces Duckgres, and leaving it out follows the flag.
+Set `use_trino_canary` to `true` to connect to the canary Trino host instead of the main one.
+The canary applies only when the run uses Trino.
+Start the workflow on the DuckLake task queue, `settings.DUCKLAKE_TASK_QUEUE`, which is `ducklake-task-queue` unless the deployment isolates its queues:
+
+```bash
+python manage.py start_temporal_workflow ducklake-register.data-imports \
+  '{"team_id": 1, "job_id": "<job id>", "schema_id": "<schema uuid>", "prepared_queryable_folder": "<current queryable_folder of the table>", "register_through_trino": true, "use_trino_canary": true}' \
+  --task-queue ducklake-task-queue \
+  --workflow-id ducklake-register-data-imports-<team_id>-<schema_id>
+```
+
+That workflow id is the one that scheduled syncs use, so a scheduled sync cannot register the same schema at the same time.
+A `prepared_queryable_folder` that is not the table's current `queryable_folder` skips the run as stale.
+
+A run that is no longer the latest prepared snapshot still publishes after a successful verify, so a long registration can land instead of losing the race to the next snapshot. A later run replaces it. Publication is skipped only when a newer snapshot has already been published, so the live table does not move backward. Prepare still skips a snapshot that is already obsolete before any copy or catalog work starts.
+
+The registered objects are permanent DuckLake data files, not staging files. Old generations remain reachable through DuckLake snapshots until snapshot expiration and old-file cleanup make them eligible for object deletion. Choose the bucket lifecycle policy with that retention behavior in mind.
+
+## Required permissions
+
+Temporal workers must be able to:
+
+1. Read from the existing PostHog object storage bucket where Delta tables live (already required for the modeling pipeline).
+2. Read/write/delete within the DuckLake data bucket referenced by `DUCKLAKE_BUCKET`.
+
+For AWS S3, grant the worker role at least `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the DuckLake bucket/prefix (plus `s3:CreateBucket` for local auto-creation). Local development uses the configured SeaweedFS object store and the `DUCKLAKE_*` access keys.
+
+## Local testing (dev)
+
+Follow these checklists to exercise the DuckLake copy workflows on a local checkout.
+
+### Testing Data Modeling workflow
+
+1. **Start the dev stack**
+   Run `hogli start` (or `bin/start`) so Postgres, SeaweedFS, Temporal, and all DuckLake defaults are up. Make sure the `ducklake-data-modeling-copy-workflow` feature flag is enabled for the team you plan to use.
+
+2. **Trigger a model materialization from the app**
+   In the PostHog UI, open Data Warehouse → Views, pick (or create) a view, open the Materialization section, enable it if needed, and click **Sync now**. This starts a `data-modeling-materialize-view` workflow for that view's DAG node.
+
+3. **Observe the data-modeling workflow**
+   Visit the Temporal UI at `http://localhost:8081/namespaces/default/workflows` and confirm a `materialize-view-{node_id}` execution appears. Wait for it to finish successfully.
+
+4. **Verify the DuckLake copy workflow runs**
+   Once the modeling workflow completes it automatically starts `ducklake-copy.data-modeling` as a child run. You should see it listed in the same Temporal UI; wait for the run to complete.
+
+5. **Query the new DuckLake table**
+   The copy activity creates a table at `ducklake.posthog_data_modeling_team_<team_id>.<model_label>`. From any DuckDB shell you can inspect it, for example:
+
+   ```sql
+   duckdb -c "
+     INSTALL ducklake;
+     LOAD ducklake;
+     SET s3_endpoint='localhost:19000';
+     SET s3_use_ssl=false;
+     SET s3_access_key_id='object_storage_root_user';
+     SET s3_secret_access_key='object_storage_root_password';
+     SET s3_url_style='path';
+
+     ATTACH 'ducklake:postgres:dbname=ducklake host=localhost user=posthog password=posthog'
+       AS ducklake (DATA_PATH 's3://ducklake-dev/');
+
+     -- Discover available schemas
+     SELECT * FROM information_schema.schemata WHERE catalog_name = 'ducklake';
+
+     -- List tables in the ducklake catalog
+     SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'ducklake';
+
+     -- Query a specific table
+     SELECT * FROM ducklake.posthog_data_modeling_team_${TEAM_ID}.${MODEL_LABEL} LIMIT 10;
+   "
+   ```
+
+### Testing Data Imports workflows
+
+1. **Start the dev stack**
+   Run `hogli start` (or `bin/start`) so Postgres, Duckgres, SeaweedFS, Temporal, and all DuckLake defaults are up. Enable `data-warehouse-scene` for the prepared-Parquet path. Enable `ducklake-data-imports-copy-workflow` only when testing the existing Delta-copy path; both paths run when both flags are enabled.
+
+2. **Trigger a data import sync from the app**
+   In the PostHog UI, open Data Warehouse → Sources, connect a source (e.g., Stripe, Hubspot), select the schemas to sync, and click **Sync**. This schedules the `external-data-job` workflow.
+
+3. **Observe the external-data-job workflow**
+   Visit the Temporal UI at `http://localhost:8081/namespaces/default/workflows` and confirm an `external-data-job` execution appears. Wait for it to finish successfully.
+
+4. **Verify the selected DuckLake workflow runs**
+   Once the import workflow completes it starts both independently gated child workflows. The enabled path appears as either `ducklake-copy.data-imports` or `ducklake-register.data-imports`; the disabled path exits after its gate activity.
+
+5. **Query the new DuckLake table**
+   The copy activity creates a table at `ducklake.posthog_data_imports_team_<team_id>.<source_type>_<prefix>_<table_name>`. From any DuckDB shell you can inspect it:
+
+   ```sql
+   duckdb -c "
+     INSTALL ducklake;
+     LOAD ducklake;
+     SET s3_endpoint='localhost:19000';
+     SET s3_use_ssl=false;
+     SET s3_access_key_id='object_storage_root_user';
+     SET s3_secret_access_key='object_storage_root_password';
+     SET s3_url_style='path';
+
+     ATTACH 'ducklake:postgres:dbname=ducklake host=localhost user=posthog password=posthog'
+       AS ducklake (DATA_PATH 's3://ducklake-dev/');
+
+     -- Discover available schemas
+     SELECT * FROM information_schema.schemata WHERE catalog_name = 'ducklake';
+
+     -- List tables in the ducklake catalog
+     SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'ducklake';
+
+     -- Query a specific table
+     SELECT * FROM ducklake.posthog_data_imports_team_${TEAM_ID}.${SOURCE_TYPE}_${PREFIX}_${TABLE_NAME} LIMIT 10;
+   "
+   ```

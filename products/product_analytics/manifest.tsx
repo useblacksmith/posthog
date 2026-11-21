@@ -1,0 +1,303 @@
+import { combineUrl } from 'kea-router'
+
+import { FEATURE_FLAGS, INSIGHT_VISUAL_ORDER } from 'lib/constants'
+import { urls } from 'scenes/urls'
+
+import { examples } from '~/queries/examples'
+import {
+    isBIVisualizationNode,
+    isDataTableNode,
+    isDataVisualizationNode,
+    isHogQLQuery,
+} from '~/queries/schema/node-guards'
+import {
+    DashboardFilter,
+    HogQLFilters,
+    HogQLQuery,
+    HogQLVariable,
+    Node,
+    NodeKind,
+    ProductItemCategory,
+    ProductKey,
+    TileFilters,
+} from '~/queries/schema/schema-general'
+
+import { AlertType } from 'products/alerts/frontend/types'
+
+import {
+    ActivityScope,
+    DashboardType,
+    InsightSceneSource,
+    InsightShortId,
+    InsightType,
+    ProductManifest,
+    SavedInsightsTabs,
+} from '../../frontend/src/types'
+
+export const manifest: ProductManifest = {
+    name: 'Product Analytics',
+    activityDescribers: {
+        [ActivityScope.INSIGHT]: () =>
+            import('./frontend/insights/activityDescriptions').then((module) => module.insightActivityDescriber),
+    },
+    urls: {
+        insights: (): string => '/insights',
+        insightNew: ({
+            type,
+            dashboardId,
+            tileGroupKey,
+            query,
+            sceneSource,
+        }: {
+            type?: InsightType
+            dashboardId?: DashboardType['id'] | null
+            /** The dashboard tile group the saved insight goes into. Only applies with `dashboardId`. */
+            tileGroupKey?: string | null
+            query?: Node
+            sceneSource?: InsightSceneSource
+        } = {}): string => {
+            if (isBIVisualizationNode(query)) {
+                return combineUrl(urls.businessIntelligence(), dashboardId ? { dashboard: dashboardId } : {}, {
+                    q: JSON.stringify(query),
+                }).url
+            }
+            // Redirect HogQL queries to SQL editor
+            if (isHogQLQuery(query)) {
+                return urls.sqlEditor({ query: query.query, dashboard: dashboardId ?? undefined, tileGroupKey })
+            }
+
+            // Redirect DataNode and DataViz queries with HogQL source to SQL editor,
+            // passing the whole node so display/chartSettings/filters survive the trip
+            if ((isDataVisualizationNode(query) || isDataTableNode(query)) && isHogQLQuery(query.source)) {
+                return urls.sqlEditor({ query, dashboard: dashboardId ?? undefined, tileGroupKey })
+            }
+
+            return combineUrl(
+                '/insights/new',
+                dashboardId ? { dashboard: dashboardId, ...(tileGroupKey ? { tile_group: tileGroupKey } : {}) } : {},
+                {
+                    ...(type ? { insight: type } : {}),
+                    ...(query ? { q: typeof query === 'string' ? query : JSON.stringify(query) } : {}),
+                    ...(sceneSource ? { sceneSource } : {}),
+                }
+            ).url
+        },
+        insightNewHogQL: ({ query, filters }: { query: string; filters?: HogQLFilters }): string =>
+            urls.insightNew({
+                query: {
+                    kind: NodeKind.DataTableNode,
+                    source: { kind: 'HogQLQuery', query, filters },
+                } as any,
+            }),
+        insightEdit: (id: InsightShortId, dashboardId?: number): string =>
+            `/insights/${id}/edit${dashboardId ? `?dashboard=${dashboardId}` : ''}`,
+        insightView: (
+            id: InsightShortId,
+            dashboardId?: number,
+            variablesOverride?: Record<string, HogQLVariable>,
+            filtersOverride?: DashboardFilter,
+            tileFiltersOverride?: TileFilters
+        ): string => {
+            const params = [
+                { param: 'dashboard', value: dashboardId },
+                { param: 'variables_override', value: variablesOverride },
+                { param: 'filters_override', value: filtersOverride },
+                { param: 'tile_filters_override', value: tileFiltersOverride },
+            ]
+                .filter((n) => Boolean(n.value))
+                .map((n) => `${n.param}=${encodeURIComponent(JSON.stringify(n.value))}`)
+                .join('&')
+            return `/insights/${id}${params.length ? `?${params}` : ''}`
+        },
+        insightSubcriptions: (id: InsightShortId): string => `/insights/${id}/subscriptions`,
+        insightSubcription: (id: InsightShortId, subscriptionId: string): string =>
+            `/insights/${id}/subscriptions/${subscriptionId}`,
+        insightSharing: (id: InsightShortId): string => `/insights/${id}/sharing`,
+        savedInsights: (tab?: SavedInsightsTabs): string => `/insights${tab ? `?tab=${tab}` : ''}`,
+        insightAlerts: (insightShortId: InsightShortId): string => `/insights/${insightShortId}/alerts`,
+        insightAlert: (insightShortId: InsightShortId, alertId: AlertType['id']): string =>
+            `/insights/${insightShortId}/alerts?alert_id=${alertId}`,
+        insightQuickStart: (): string => '/insights/quick-start',
+    },
+    fileSystemTypes: {
+        insight: {
+            name: 'Insight',
+            iconType: 'product_analytics',
+            href: (ref: string) => urls.insightView(ref as InsightShortId),
+            listHref: () => urls.savedInsights(),
+            listSearchParam: 'search',
+            iconColor: ['var(--color-product-product-analytics-light)', 'var(--color-product-product-analytics-dark)'],
+            filterKey: 'insight',
+        },
+    },
+    treeItemsNew: [
+        {
+            path: `Insight/Trends`,
+            type: 'insight',
+            href: urls.insightNew({ type: InsightType.TRENDS }),
+            iconType: 'insight/trends',
+            visualOrder: INSIGHT_VISUAL_ORDER.trends,
+            sceneKeys: ['Insight'],
+        },
+        {
+            path: `Insight/Funnel`,
+            type: 'insight',
+            href: urls.insightNew({ type: InsightType.FUNNELS }),
+            iconType: 'insight/funnels',
+            visualOrder: INSIGHT_VISUAL_ORDER.funnel,
+            sceneKeys: ['Insight'],
+        },
+        {
+            path: `Insight/Retention`,
+            type: 'insight',
+            href: urls.insightNew({ type: InsightType.RETENTION }),
+            iconType: 'insight/retention',
+            visualOrder: INSIGHT_VISUAL_ORDER.retention,
+            sceneKeys: ['Insight'],
+        },
+        {
+            path: `Insight/User paths`,
+            type: 'insight',
+            href: urls.insightNew({ type: InsightType.PATHS }),
+            iconType: 'insight/paths',
+            visualOrder: INSIGHT_VISUAL_ORDER.paths,
+            sceneKeys: ['Insight'],
+        },
+        {
+            path: `Insight/Journeys`,
+            type: 'insight',
+            href: urls.insightNew({ type: InsightType.JOURNEYS }),
+            flag: FEATURE_FLAGS.PRODUCT_ANALYTICS_PATHS_V2,
+            iconType: 'insight/paths',
+            visualOrder: INSIGHT_VISUAL_ORDER.journeys,
+            sceneKeys: ['Insight'],
+        },
+        {
+            path: `Insight/Stickiness`,
+            type: 'insight',
+            href: urls.insightNew({ type: InsightType.STICKINESS }),
+            iconType: 'insight/stickiness',
+            visualOrder: INSIGHT_VISUAL_ORDER.stickiness,
+            sceneKeys: ['Insight'],
+        },
+        {
+            path: `Insight/Lifecycle`,
+            type: 'insight',
+            href: urls.insightNew({ type: InsightType.LIFECYCLE }),
+            iconType: 'insight/lifecycle',
+            visualOrder: INSIGHT_VISUAL_ORDER.lifecycle,
+            sceneKeys: ['Insight'],
+        },
+        {
+            path: `Insight/SQL`,
+            type: 'insight',
+            href: urls.sqlEditor({ query: (examples.HogQLForDataVisualization as HogQLQuery).query }),
+            // The sibling insight items get a "New " prefix automatically because their hrefs include "new";
+            // the SQL editor href doesn't, so set the label explicitly to stay consistent.
+            displayLabel: 'New SQL',
+            iconType: 'insight/hog',
+            visualOrder: INSIGHT_VISUAL_ORDER.sql,
+            sceneKeys: ['Insight'],
+        },
+    ],
+    treeItemsProducts: [
+        {
+            path: 'Product analytics',
+            intents: [ProductKey.PRODUCT_ANALYTICS],
+            category: ProductItemCategory.ANALYTICS,
+            type: 'insight',
+            href: urls.insights(),
+            searchKeywords: [
+                'insights',
+                'trends',
+                'funnels',
+                'retention',
+                'paths',
+                'journeys',
+                'stickiness',
+                'lifecycle',
+                'calendar heatmap',
+                'charts',
+            ],
+            searchTabs: [
+                { name: 'My insights', href: urls.savedInsights(SavedInsightsTabs.Yours) },
+                { name: 'Alerts', href: urls.alerts() },
+                { name: 'Notifications', href: urls.savedInsights(SavedInsightsTabs.Notifications) },
+            ],
+            iconType: 'product_analytics',
+            iconColor: ['var(--color-product-product-analytics-light)', 'var(--color-product-product-analytics-dark)'],
+            sceneKey: 'SavedInsights',
+            sceneKeys: ['SavedInsights', 'Insight'],
+        },
+        {
+            path: 'Notebooks',
+            intents: [ProductKey.NOTEBOOKS],
+            category: ProductItemCategory.TOOLS,
+            type: 'notebook',
+            iconType: 'notebook',
+            href: urls.notebooks(),
+            searchKeywords: ['documents', 'scratchpad'],
+            searchTabs: [
+                {
+                    name: 'Reusable widgets',
+                    href: urls.notebooks('widgets'),
+                },
+            ],
+            sceneKey: 'Notebooks',
+            sceneKeys: ['Notebook', 'Notebooks'],
+        },
+    ],
+    treeItemsMetadata: [
+        {
+            path: 'Event definitions',
+            category: 'Schema',
+            iconType: 'event_definition',
+            iconColor: ['var(--color-product-event-definitions-light)', 'var(--color-product-event-definitions-dark)'],
+            href: urls.eventDefinitions(),
+            searchKeywords: ['taxonomy', 'tracking plan'],
+            sceneKey: 'EventDefinitions',
+            sceneKeys: ['EventDefinition', 'EventDefinitions'],
+        },
+        {
+            path: 'Property definitions',
+            category: 'Schema',
+            iconType: 'property_definition',
+            iconColor: [
+                'var(--color-product-property-definitions-light)',
+                'var(--color-product-property-definitions-dark)',
+            ],
+            href: urls.propertyDefinitions(),
+            searchKeywords: ['attributes', 'traits'],
+            sceneKey: 'PropertyDefinitions',
+            sceneKeys: ['PropertyDefinition', 'PropertyDefinitions'],
+        },
+        {
+            path: 'Property groups',
+            category: 'Schema',
+            iconType: 'property_group',
+            iconColor: ['var(--color-product-property-groups-light)', 'var(--color-product-property-groups-dark)'],
+            href: urls.schemaManagement(),
+            searchKeywords: ['property schema'],
+            flag: FEATURE_FLAGS.SCHEMA_MANAGEMENT,
+        },
+        {
+            path: 'SQL variables',
+            category: 'Schema',
+            iconType: 'sql_variable',
+            iconColor: ['var(--color-product-sql-variables-light)', 'var(--color-product-sql-variables-dark)'],
+            href: urls.variables(),
+            searchKeywords: ['parameters', 'placeholders'],
+            sceneKeys: ['SqlVariableEdit'],
+        },
+        {
+            path: 'Annotations',
+            category: 'Schema',
+            iconType: 'annotation',
+            iconColor: ['var(--color-product-annotations-light)', 'var(--color-product-annotations-dark)'],
+            href: urls.annotations(),
+            searchKeywords: ['markers', 'releases'],
+            sceneKey: 'Annotations',
+            sceneKeys: ['Annotations'],
+        },
+    ],
+}

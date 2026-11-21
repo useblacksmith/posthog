@@ -1,0 +1,1916 @@
+import { JSONContent } from '@tiptap/core'
+import {
+    MakeLogicType,
+    actions,
+    afterMount,
+    beforeUnmount,
+    connect,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    reducers,
+    selectors,
+} from 'kea'
+import { loaders } from 'kea-loaders'
+import { beforeUnload, router } from 'kea-router'
+import posthog from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import { ApiError } from 'lib/api-error'
+import { commentsLogic } from 'lib/components/Comments/commentsLogic'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { getAccessControlDisabledReason } from 'lib/utils/accessControlUtils'
+import { getCurrentTeamId } from 'lib/utils/getAppContext'
+import { isUUIDLike } from 'lib/utils/guards'
+import { markdownToHtml } from 'lib/utils/markdown'
+import { objectsEqual } from 'lib/utils/objects'
+import { fullName } from 'lib/utils/strings'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { SIDE_PANEL_CONTEXT_KEY, SidePanelSceneContext } from '~/layout/navigation-3000/sidepanel/types'
+import {
+    ImpersonationTicketContext,
+    impersonationNoticeLogic,
+} from '~/layout/navigation/ImpersonationNotice/impersonationNoticeLogic'
+import { TodayPeopleRecent } from '~/layout/today/todayPeople'
+import { TODAY_RECENT_KEY } from '~/layout/today/todayRecents'
+import api, { ApiConfig } from '~/lib/api'
+import { PERSON_DISPLAY_NAME_COLUMN_NAME } from '~/lib/constants'
+import { CLOUD_HOSTNAMES } from '~/lib/constants'
+import { defaultDataTableColumns } from '~/queries/nodes/DataTable/utils'
+import { DataTableNode, NodeKind } from '~/queries/schema/schema-general'
+import type { Breadcrumb, CommentType, PersonType, UserType } from '~/types'
+import {
+    AccessControlLevel,
+    AccessControlResourceType,
+    ActivityScope,
+    AvailableFeature,
+    PropertyFilterType,
+    PropertyOperator,
+    Region,
+} from '~/types'
+
+import {
+    conversationsTicketsAiFeedbackCreate,
+    conversationsTicketsAiHumanOutcomeCreate,
+    conversationsTicketsDestroy,
+    conversationsTicketsMessagesFullEmailRetrieve,
+    conversationsTicketsNotesDestroy,
+    conversationsTicketsNotesPartialUpdate,
+    conversationsTicketsPartialUpdate,
+    conversationsMacrosUsedCreate,
+} from 'products/conversations/frontend/generated/api'
+import type { TicketMacroApi } from 'products/conversations/frontend/generated/api.schemas'
+import { getCommentsCreateUrl } from 'products/platform_features/frontend/generated/api'
+import { signalsReportsList } from 'products/signals/frontend/generated/api'
+import type { SignalReportApi } from 'products/signals/frontend/generated/api.schemas'
+import { SignalSourceProductApi } from 'products/signals/frontend/generated/api.schemas'
+
+import type { FeatureFlagsSet } from '../../../../../frontend/src/lib/logic/featureFlagLogic'
+import type { TeamPublicType, TeamType } from '../../../../../frontend/src/types'
+import { assigneeSelectLogic } from '../../components/Assignee'
+import type { Assignee, TicketAssignee } from '../../components/Assignee'
+import { aiDraftAction, aiDraftComposerHtml } from '../../components/Chat/aiDraftAction'
+import { macroContextFromTicket, renderMacro } from '../../components/Macros/renderMacro'
+import { supportMacrosLogic } from '../../components/Macros/supportMacrosLogic'
+import { supportTicketCounterLogic } from '../../supportTicketCounterLogic'
+import { priorityOptions } from '../../types'
+import type {
+    AiReplyFeedbackRating,
+    ChatMessage,
+    MessageDeliveryStatus,
+    Ticket,
+    TicketChannel,
+    TicketPriority,
+    TicketStatus,
+} from '../../types'
+import { conversationsDraftModeLogic } from '../settings/conversationsDraftModeLogic'
+import { supportTicketsSceneLogic } from '../tickets/supportTicketsSceneLogic'
+import { changedTicketFields } from './ticketFieldChanges'
+
+const MESSAGE_POLL_INTERVAL = 5000 // 5 seconds
+/** Discussions ride the message timer at 1/4 the rate, so ~20s. */
+const DISCUSSION_POLL_EVERY_N_TICKS = 4
+/** Must not exceed the server's replay window, or recovery could adopt a message from an older send. */
+const SEND_RECOVERY_WINDOW_SECONDS = 120
+const EMPTY_DELIVERY_STATUS_BY_MESSAGE_ID = new Map<string, MessageDeliveryStatus>()
+
+/**
+ * How a failed send request should be treated. `null` means the send definitely did not happen:
+ * the server rejected the request before writing anything, so the draft is safe to keep and resend.
+ * Every other value means we don't know, and have to look at the thread before telling the operator.
+ */
+type UnconfirmedSendReason = 'network' | 'timeout' | 'in_progress' | 'server_error' | null
+
+function classifySendFailure(error: any): UnconfirmedSendReason {
+    const status = error?.status
+    if (typeof status !== 'number') {
+        // No response reached us, so the request may still have been processed.
+        return 'network'
+    }
+    if (status === 408) {
+        return 'timeout'
+    }
+    if (status === 409) {
+        // The dedupe guard is still creating an identical message from an earlier attempt.
+        return 'in_progress'
+    }
+    if (status >= 500) {
+        return 'server_error'
+    }
+    // Includes 429: throttling rejects before the request body is handled, so nothing was written.
+    return null
+}
+
+function regionFromUrl(url?: string): Region | undefined {
+    if (url) {
+        try {
+            const hostname = new URL(url).hostname
+            for (const [region, domain] of Object.entries(CLOUD_HOSTNAMES)) {
+                if (hostname === domain || hostname.endsWith(`.${domain}`)) {
+                    return region as Region
+                }
+            }
+        } catch {
+            // ignore malformed URLs
+        }
+    }
+    return undefined
+}
+
+// A verified ticket on these channels holds an attested identity that the admin user search matches:
+// the signed distinct ID of a widget request, or the sender's address. A GitHub ticket holds a GitHub
+// login in distinct_id, which matches no PostHog user.
+const ATTESTED_LOOKUP_CHANNELS: TicketChannel[] = ['widget', 'email', 'slack', 'teams']
+
+export function getImpersonationTicketContext(
+    ticket: Pick<
+        Ticket,
+        | 'id'
+        | 'channel_source'
+        | 'distinct_id'
+        | 'identity_verified'
+        | 'anonymous_traits'
+        | 'email_from'
+        | 'session_context'
+    >
+): ImpersonationTicketContext {
+    // The ticket update API stores traits as any JSON value, so the email trait can be a non-string.
+    const traitEmail = ticket.anonymous_traits?.email
+    // email_from is the customer's address on email tickets, and it's the only
+    // place it lives on tickets whose traits were never populated.
+    const email = (typeof traitEmail === 'string' && traitEmail) || ticket.email_from || ''
+    // An outbound email ticket keeps the recipient's analytics ID in distinct_id. A later authenticated
+    // reply from email_from verifies the ticket, so email_from is the attested identity on email tickets.
+    const attestedIdentity =
+        ticket.channel_source === 'email' ? ticket.email_from || ticket.distinct_id : ticket.distinct_id
+    const verifiedDistinctId =
+        ticket.identity_verified === true && ATTESTED_LOOKUP_CHANNELS.includes(ticket.channel_source)
+            ? attestedIdentity || undefined
+            : undefined
+    return {
+        ticketId: ticket.id,
+        email,
+        region: regionFromUrl(ticket.session_context?.current_url),
+        // The widget form supplies the traits email, so the sender can enter the address of another
+        // account. The email counts as verified only when it is the attested identity.
+        isEmailUnverified: !verifiedDistinctId || email.toLowerCase() !== verifiedDistinctId.toLowerCase(),
+        verifiedDistinctId,
+    }
+}
+
+function createEventsQuery(personId: string, sessionId?: string, ticketCreatedAt?: string): DataTableNode {
+    // Show events around ticket creation time (5 min before/after) or last 24h if no timestamp
+    const after = ticketCreatedAt ? new Date(new Date(ticketCreatedAt).getTime() - 5 * 60 * 1000).toISOString() : '-24h'
+    const before = ticketCreatedAt
+        ? new Date(new Date(ticketCreatedAt).getTime() + 5 * 60 * 1000).toISOString()
+        : undefined
+
+    return {
+        kind: NodeKind.DataTableNode,
+        full: false,
+        showEventsFilter: false,
+        hiddenColumns: [PERSON_DISPLAY_NAME_COLUMN_NAME],
+        source: {
+            kind: NodeKind.EventsQuery,
+            select: defaultDataTableColumns(NodeKind.EventsQuery),
+            personId: personId,
+            after,
+            before,
+            // Filter by session_id if available (shows events from the exact session)
+            ...(sessionId && {
+                properties: [
+                    {
+                        type: PropertyFilterType.Event,
+                        key: '$session_id',
+                        value: sessionId,
+                        operator: PropertyOperator.Exact,
+                    },
+                ],
+            }),
+        },
+    }
+}
+
+function createExceptionsQuery(sessionId?: string, ticketCreatedAt?: string): DataTableNode {
+    // Show exceptions from the session or around ticket creation time
+    const after = ticketCreatedAt ? new Date(new Date(ticketCreatedAt).getTime() - 5 * 60 * 1000).toISOString() : '-24h'
+    const before = ticketCreatedAt
+        ? new Date(new Date(ticketCreatedAt).getTime() + 5 * 60 * 1000).toISOString()
+        : undefined
+
+    return {
+        kind: NodeKind.DataTableNode,
+        full: false,
+        showEventFilter: false,
+        hiddenColumns: [PERSON_DISPLAY_NAME_COLUMN_NAME],
+        source: {
+            kind: NodeKind.EventsQuery,
+            select: defaultDataTableColumns(NodeKind.EventsQuery),
+            event: '$exception',
+            after,
+            before,
+            // Filter by session_id if available
+            ...(sessionId && {
+                properties: [
+                    {
+                        type: PropertyFilterType.Event,
+                        key: '$session_id',
+                        value: sessionId,
+                        operator: PropertyOperator.Exact,
+                    },
+                ],
+            }),
+        },
+    }
+}
+
+/** Why a customer-facing email reply on this ticket can never be delivered. */
+export type EmailReplyBlockedReason = 'email_disabled' | 'no_recipient' | 'no_channel'
+
+/**
+ * Mirrors the backend gates in send_email_reply_on_team_message / _process_outbox_row:
+ * a reply that fails any of these is saved as a comment but never delivered.
+ */
+export function getEmailReplyBlockedReason(
+    ticket: Pick<Ticket, 'channel_source' | 'email_from' | 'email_to'> | null,
+    conversationsSettings: { email_enabled?: boolean } | null | undefined
+): EmailReplyBlockedReason | null {
+    if (ticket?.channel_source !== 'email') {
+        return null
+    }
+    if (!conversationsSettings?.email_enabled) {
+        return 'email_disabled'
+    }
+    if (!ticket.email_from) {
+        return 'no_recipient'
+    }
+    if (!ticket.email_to) {
+        return 'no_channel'
+    }
+    return null
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface supportTicketSceneLogicValues {
+    resolveAssignee: (assignee: TicketAssignee) => Assignee // assigneeSelectLogic
+    draftModeDefault: boolean // conversationsDraftModeLogic
+    featureFlags: FeatureFlagsSet // featureFlagLogic
+    currentTeam: TeamPublicType | TeamType | null // teamLogic
+    hasAvailableFeature: (feature: AvailableFeature, currentUsage?: number | undefined) => boolean // userLogic
+    user: UserType | null // userLogic
+    aiDraftApplying: boolean
+    assignee: TicketAssignee
+    breadcrumbs: Breadcrumb[]
+    chatMessages: ChatMessage[]
+    chatPanelWidth: (desiredSize: number | null) => number
+    composerInsertAt: number
+    composerPrefillAt: number
+    deleteDisabledReason: string | undefined
+    deliveryStatusByMessageId: Map<string, MessageDeliveryStatus>
+    discussionsEnabled: boolean
+    draftContent: string | JSONContent | null
+    draftIsPrivate: boolean
+    draftModeEnabled: boolean
+    editingMessageId: string | null
+    emailReplyBlockedReason: EmailReplyBlockedReason | null
+    eventsQuery: DataTableNode | null
+    exceptionsQuery: DataTableNode | null
+    feedbackByMessageId: Record<string, AiReplyFeedbackRating>
+    fullEmailContent: string | null
+    fullEmailContentLoading: boolean
+    fullEmailMessageId: string | null
+    hasMoreMessages: boolean
+    hasPendingWork: boolean
+    hasUnsavedChanges: boolean
+    latestAiDraftId: string | null
+    latestAiMessage: ChatMessage | null
+    linkedReports: SignalReportApi[]
+    linkedReportsLoading: boolean
+    messageSending: boolean
+    messages: CommentType[]
+    messagesLoading: boolean
+    olderMessagesLoading: boolean
+    pendingComposerInsert: string | null
+    person: PersonType | null
+    personLoading: boolean
+    previousTickets: Ticket[]
+    previousTicketsLoading: boolean
+    priority: TicketPriority | null
+    replyRecipientDescription: string
+    sidePanelContext: SidePanelSceneContext | null
+    snoozedUntil: string | null
+    stashedDraftContent: string | JSONContent | null
+    stashedDraftIsPrivate: boolean
+    status: TicketStatus | null
+    tags: string[]
+    ticket: Ticket | null
+    ticketDeleting: boolean
+    ticketLoading: boolean
+    ticketUpdating: boolean
+    todayRecent: TodayPeopleRecent | null
+    unsavedTicketChanges: string[]
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface supportTicketSceneLogicActions {
+    setTicketContext: (context: ImpersonationTicketContext | null) => {
+        context: ImpersonationTicketContext | null
+    } // impersonationNoticeLogic
+    recordMacroUsed: (id: string) => {
+        id: string
+    } // supportMacrosLogic
+    loadTickets: (debounce?: boolean | undefined) => {
+        debounce: boolean
+    } // supportTicketsSceneLogic
+    appendMessage: (message: CommentType) => {
+        message: CommentType
+    }
+    applyAiDraft: (message: ChatMessage) => {
+        message: ChatMessage
+    }
+    bumpComposerInsert: () => {
+        value: true
+    }
+    bumpComposerPrefill: () => {
+        value: true
+    }
+    cancelEditingMessage: () => {
+        value: true
+    }
+    clearEditingMessage: () => {
+        value: true
+    }
+    closeFullEmail: () => {
+        value: true
+    }
+    deleteMessage: (messageId: string) => {
+        messageId: string
+    }
+    deleteTicket: () => {
+        value: true
+    }
+    incrementUnreadCustomerCount: () => {
+        value: true
+    }
+    insertMacro: (
+        macro: Pick<TicketMacroApi, 'body' | 'id' | 'visibility'>,
+        source: 'button' | 'slash'
+    ) => {
+        macro: Pick<TicketMacroApi, 'body' | 'id' | 'visibility'>
+        source: 'button' | 'slash'
+    }
+    loadFullEmail: (messageId: string) => string
+    loadFullEmailFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadFullEmailSuccess: (
+        fullEmailContent: string,
+        payload?: string
+    ) => {
+        fullEmailContent: string
+        payload?: string
+    }
+    loadLinkedReports: () => {
+        value: true
+    }
+    loadLinkedReportsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadLinkedReportsSuccess: (
+        linkedReports: SignalReportApi[],
+        payload?: {
+            value: true
+        }
+    ) => {
+        linkedReports: SignalReportApi[]
+        payload?: {
+            value: true
+        }
+    }
+    loadMessages: () => {
+        value: true
+    }
+    loadOlderMessages: () => {
+        value: true
+    }
+    loadPerson: () => {
+        value: true
+    }
+    loadPersonFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadPersonSuccess: (
+        person: PersonType | null,
+        payload?: {
+            value: true
+        }
+    ) => {
+        person: PersonType | null
+        payload?: {
+            value: true
+        }
+    }
+    loadPreviousTickets: () => {
+        value: true
+    }
+    loadPreviousTicketsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadPreviousTicketsSuccess: (
+        previousTickets: Ticket[],
+        payload?: {
+            value: true
+        }
+    ) => {
+        previousTickets: Ticket[]
+        payload?: {
+            value: true
+        }
+    }
+    loadTicket: () => {
+        value: true
+    }
+    pollDiscussionThread: () => {
+        value: true
+    }
+    recordAiReplyFeedback: (
+        messageId: string,
+        rating: AiReplyFeedbackRating
+    ) => {
+        messageId: string
+        rating: AiReplyFeedbackRating
+    }
+    sendMessage: (
+        content: string,
+        richContent: Record<string, unknown> | null,
+        isPrivate: boolean,
+        onSuccess?: () => void,
+        statusAfterSend?: TicketStatus
+    ) => {
+        content: string
+        isPrivate: boolean
+        onSuccess: (() => void) | undefined
+        richContent: Record<string, unknown> | null
+        statusAfterSend: TicketStatus | undefined
+    }
+    setAiDraftApplying: (applying: boolean) => {
+        applying: boolean
+    }
+    setAssignee: (assignee: TicketAssignee) => {
+        assignee: TicketAssignee
+    }
+    setDraftContent: (content: string | JSONContent | null) => {
+        content: string | JSONContent | null
+    }
+    setDraftIsPrivate: (isPrivate: boolean) => {
+        isPrivate: boolean
+    }
+    setDraftModeEnabled: (enabled: boolean) => {
+        enabled: boolean
+    }
+    setHasMoreMessages: (hasMore: boolean) => {
+        hasMore: boolean
+    }
+    setMessageSending: (sending: boolean) => {
+        sending: boolean
+    }
+    setMessages: (messages: CommentType[]) => {
+        messages: CommentType[]
+    }
+    setMessagesLoading: (loading: boolean) => {
+        loading: boolean
+    }
+    setOlderMessages: (olderMessages: CommentType[]) => {
+        olderMessages: CommentType[]
+    }
+    setOlderMessagesLoading: (loading: boolean) => {
+        loading: boolean
+    }
+    setPendingComposerInsert: (content: string | null) => {
+        content: string | null
+    }
+    setPriority: (priority: TicketPriority) => {
+        priority: TicketPriority
+    }
+    setSavedTicket: (ticket: Ticket) => {
+        ticket: Ticket
+    }
+    setSnoozedUntil: (snoozedUntil: string | null) => {
+        snoozedUntil: string | null
+    }
+    setStatus: (status: TicketStatus) => {
+        status: TicketStatus
+    }
+    setTags: (tags: string[]) => {
+        tags: string[]
+    }
+    setTicket: (ticket: Ticket | null) => {
+        ticket: Ticket | null
+    }
+    setTicketDeleting: (deleting: boolean) => {
+        deleting: boolean
+    }
+    setTicketLoading: (loading: boolean) => {
+        loading: boolean
+    }
+    setTicketUpdating: (updating: boolean) => {
+        updating: boolean
+    }
+    startEditingMessage: (message: ChatMessage) => {
+        message: ChatMessage
+    }
+    stashDraftForEdit: (
+        content: string | JSONContent | null,
+        isPrivate: boolean
+    ) => {
+        content: string | JSONContent | null
+        isPrivate: boolean
+    }
+    submitAiReplyFeedback: (
+        messageId: string,
+        rating: AiReplyFeedbackRating,
+        feedbackText?: string
+    ) => {
+        feedbackText: string | undefined
+        messageId: string
+        rating: AiReplyFeedbackRating
+    }
+    updateTicket: () => {
+        value: true
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface supportTicketSceneLogicProps {
+    id: number | string
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface supportTicketSceneLogicMeta {
+    key: number | string
+    __keaTypeGenInternalSelectorTypes: {
+        todayRecent: (ticket: Ticket | null) => TodayPeopleRecent | null
+        breadcrumbs: (id: number | string) => Breadcrumb[]
+        emailReplyBlockedReason: (
+            ticket: Ticket | null,
+            currentTeam: TeamPublicType | TeamType | null
+        ) => EmailReplyBlockedReason | null
+        discussionsEnabled: (ticket: Ticket | null, featureFlags: FeatureFlagsSet) => boolean
+        sidePanelContext: (ticket: Ticket | null, discussionsEnabled: boolean) => SidePanelSceneContext | null
+        replyRecipientDescription: (ticket: Ticket | null) => string
+        deleteDisabledReason: (
+            ticket: Ticket | null,
+            hasAvailableFeature: (feature: AvailableFeature, currentUsage?: number | undefined) => boolean // userLogic
+        ) => string | undefined
+        unsavedTicketChanges: (
+            priority: TicketPriority | null,
+            assignee: TicketAssignee,
+            tags: string[],
+            snoozedUntil: string | null,
+            ticket: Ticket | null,
+            resolveAssignee: (assignee: TicketAssignee) => Assignee // assigneeSelectLogic
+        ) => string[]
+        hasUnsavedChanges: (
+            status: TicketStatus | null,
+            ticket: Ticket | null,
+            unsavedTicketChanges: string[]
+        ) => boolean
+        hasPendingWork: (hasUnsavedChanges: boolean, editingMessageId: string | null) => boolean
+        chatMessages: (messages: CommentType[], ticket: Ticket | null) => ChatMessage[]
+        deliveryStatusByMessageId: (
+            chatMessages: ChatMessage[],
+            ticket: Ticket | null
+        ) => Map<string, MessageDeliveryStatus>
+        eventsQuery: (ticket: Ticket | null) => DataTableNode | null
+        exceptionsQuery: (ticket: Ticket | null) => DataTableNode | null
+        latestAiMessage: (chatMessages: ChatMessage[]) => ChatMessage | null
+        latestAiDraftId: (chatMessages: ChatMessage[]) => string | null
+    }
+}
+
+export type supportTicketSceneLogicType = MakeLogicType<
+    supportTicketSceneLogicValues,
+    supportTicketSceneLogicActions,
+    supportTicketSceneLogicProps,
+    supportTicketSceneLogicMeta
+>
+
+export const supportTicketSceneLogic = kea<supportTicketSceneLogicType>([
+    path(['products', 'conversations', 'frontend', 'scenes', 'ticket', 'supportTicketSceneLogic']),
+    props({ id: 'new' as string | number }),
+    key((props) => props.id),
+    connect(() => ({
+        actions: [
+            supportTicketsSceneLogic,
+            ['loadTickets'],
+            impersonationNoticeLogic,
+            ['setTicketContext'],
+            supportMacrosLogic,
+            ['recordMacroUsed'],
+        ],
+        values: [
+            teamLogic,
+            ['currentTeam'],
+            featureFlagLogic,
+            ['featureFlags'],
+            conversationsDraftModeLogic,
+            ['draftModeDefault'],
+            assigneeSelectLogic,
+            ['resolveAssignee'],
+            userLogic,
+            ['user', 'hasAvailableFeature'],
+        ],
+    })),
+    actions({
+        loadTicket: true,
+        setTicket: (ticket: Ticket | null) => ({ ticket }),
+        // Unlike setTicket, keeps the sidebar fields so edits made during an in-flight save survive.
+        setSavedTicket: (ticket: Ticket) => ({ ticket }),
+        setTicketLoading: (loading: boolean) => ({ loading }),
+        incrementUnreadCustomerCount: true,
+        updateTicket: true,
+        setTicketUpdating: (updating: boolean) => ({ updating }),
+
+        loadMessages: true,
+        setMessages: (messages: CommentType[]) => ({ messages }),
+        setMessagesLoading: (loading: boolean) => ({ loading }),
+        appendMessage: (message: CommentType) => ({ message }),
+
+        pollDiscussionThread: true,
+
+        applyAiDraft: (message: ChatMessage) => ({ message }),
+        setAiDraftApplying: (applying: boolean) => ({ applying }),
+        bumpComposerPrefill: true,
+        insertMacro: (macro: Pick<TicketMacroApi, 'id' | 'body' | 'visibility'>, source: 'button' | 'slash') => ({
+            macro,
+            source,
+        }),
+        setPendingComposerInsert: (content: string | null) => ({ content }),
+        bumpComposerInsert: true,
+
+        loadOlderMessages: true,
+        setOlderMessages: (olderMessages: CommentType[]) => ({ olderMessages }),
+        setOlderMessagesLoading: (loading: boolean) => ({ loading }),
+        setHasMoreMessages: (hasMore: boolean) => ({ hasMore }),
+
+        sendMessage: (
+            content: string,
+            richContent: Record<string, unknown> | null,
+            isPrivate: boolean,
+            onSuccess?: () => void,
+            statusAfterSend?: TicketStatus
+        ) => ({
+            content,
+            richContent,
+            isPrivate,
+            onSuccess,
+            statusAfterSend,
+        }),
+        setMessageSending: (sending: boolean) => ({ sending }),
+
+        setStatus: (status: TicketStatus) => ({ status }),
+        setPriority: (priority: TicketPriority) => ({ priority }),
+        setAssignee: (assignee: TicketAssignee) => ({ assignee }),
+        setTags: (tags: string[]) => ({ tags }),
+        setSnoozedUntil: (snoozedUntil: string | null) => ({ snoozedUntil }),
+
+        // Session context actions
+        loadPerson: true,
+        loadPreviousTickets: true,
+        loadLinkedReports: true,
+
+        // Draft message state (persists across tab switches)
+        setDraftContent: (content: string | JSONContent | null) => ({ content }),
+        setDraftIsPrivate: (isPrivate: boolean) => ({ isPrivate }),
+        // Per-ticket draft mode override, seeded from the browser-local default on open
+        setDraftModeEnabled: (enabled: boolean) => ({ enabled }),
+
+        startEditingMessage: (message: ChatMessage) => ({ message }),
+        cancelEditingMessage: true,
+        clearEditingMessage: true,
+        stashDraftForEdit: (content: string | JSONContent | null, isPrivate: boolean) => ({ content, isPrivate }),
+        deleteMessage: (messageId: string) => ({ messageId }),
+        deleteTicket: true,
+        setTicketDeleting: (deleting: boolean) => ({ deleting }),
+
+        submitAiReplyFeedback: (messageId: string, rating: AiReplyFeedbackRating, feedbackText?: string) => ({
+            messageId,
+            rating,
+            feedbackText,
+        }),
+        recordAiReplyFeedback: (messageId: string, rating: AiReplyFeedbackRating) => ({
+            messageId,
+            rating,
+        }),
+        closeFullEmail: true,
+    }),
+    loaders(({ values, props }) => ({
+        person: [
+            null as PersonType | null,
+            {
+                loadPerson: async (): Promise<PersonType | null> => {
+                    const ticket = values.ticket
+                    if (!ticket?.distinct_id) {
+                        return null
+                    }
+
+                    try {
+                        // First try to load by distinct_id
+                        const response = await api.persons.list({ distinct_id: ticket.distinct_id })
+                        if (response.results.length > 0) {
+                            return response.results[0]
+                        }
+
+                        // If not found, return null
+                        return null
+                    } catch (error) {
+                        console.error('Failed to load person:', error)
+                        return null
+                    }
+                },
+            },
+        ],
+        linkedReports: [
+            [] as SignalReportApi[],
+            {
+                loadLinkedReports: async (): Promise<SignalReportApi[]> => {
+                    const ticketUuid = values.ticket?.id
+                    if (!ticketUuid) {
+                        return []
+                    }
+                    try {
+                        const response = await signalsReportsList(getCurrentTeamId().toString(), {
+                            source_id: ticketUuid,
+                            source_product: SignalSourceProductApi.Conversations,
+                            // A teammate answering a customer needs to know an investigation was
+                            // dismissed just as much as that one is running.
+                            include_all_statuses: true,
+                        })
+                        return response.results
+                    } catch (error) {
+                        // Supplementary context: a signals or ClickHouse hiccup must not break the ticket.
+                        console.error('Failed to load linked reports:', error)
+                        return []
+                    }
+                },
+            },
+        ],
+        previousTickets: [
+            [] as Ticket[],
+            {
+                loadPreviousTickets: async (): Promise<Ticket[]> => {
+                    const person = values.person
+                    const currentTicketId = props.id
+
+                    if (!person?.distinct_ids || person.distinct_ids.length === 0) {
+                        return []
+                    }
+
+                    // Widen the match to email only when the current ticket's identity was positively
+                    // attested (e.g. SPF-authenticated email). email_from is attacker-controllable on
+                    // unverified tickets, and person.properties.email is customer-controlled analytics
+                    // data with no trusted mapping — trusting either would let a spoofed sender pull a
+                    // real customer's ticket history into their own ticket view.
+                    const emails = new Set<string>()
+                    if (values.ticket?.identity_verified === true && values.ticket.email_from) {
+                        emails.add(values.ticket.email_from)
+                    }
+
+                    try {
+                        const response = await api.conversationsTickets.list({
+                            distinct_ids: person.distinct_ids.join(','),
+                            ...(emails.size > 0 ? { emails: Array.from(emails).join(',') } : {}),
+                        })
+                        const allTickets = response.results || []
+
+                        // Exclude current ticket
+                        const uniqueTickets = allTickets.filter(
+                            (ticket) => ticket.ticket_number !== parseInt(currentTicketId.toString())
+                        )
+
+                        // Sort by created_at descending (most recent first)
+                        return uniqueTickets.sort(
+                            (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+                        )
+                    } catch (error) {
+                        console.error('Failed to load previous tickets:', error)
+                        return []
+                    }
+                },
+            },
+        ],
+        fullEmailContent: [
+            null as string | null,
+            {
+                loadFullEmail: async (messageId: string, breakpoint): Promise<string> => {
+                    const ticket = values.ticket
+                    if (!ticket) {
+                        throw new Error('Ticket is not loaded')
+                    }
+                    const response = await conversationsTicketsMessagesFullEmailRetrieve(
+                        String(getCurrentTeamId()),
+                        ticket.id,
+                        messageId
+                    )
+                    breakpoint()
+                    return response.content
+                },
+            },
+        ],
+    })),
+    reducers({
+        ticket: [
+            null as Ticket | null,
+            {
+                setTicket: (_, { ticket }) => ticket,
+                setSavedTicket: (_, { ticket }) => ticket,
+                incrementUnreadCustomerCount: (state) =>
+                    state ? { ...state, unread_customer_count: state.unread_customer_count + 1 } : state,
+            },
+        ],
+        ticketUpdating: [
+            false,
+            {
+                updateTicket: () => true,
+                setTicketUpdating: (_, { updating }) => updating,
+                setTicket: () => false,
+            },
+        ],
+        ticketLoading: [
+            false,
+            {
+                loadTicket: () => true,
+                setTicket: () => false,
+                setTicketLoading: (_, { loading }) => loading,
+            },
+        ],
+        fullEmailMessageId: [
+            null as string | null,
+            {
+                loadFullEmail: (_, messageId) => messageId,
+                loadFullEmailFailure: () => null,
+                closeFullEmail: () => null,
+            },
+        ],
+        status: [
+            null as TicketStatus | null,
+            {
+                setStatus: (_, { status }) => status,
+                setTicket: (_, { ticket }) => ticket?.status || null,
+            },
+        ],
+        priority: [
+            null as TicketPriority | null,
+            {
+                setPriority: (_, { priority }) => priority,
+                setTicket: (_, { ticket }) => ticket?.priority || null,
+            },
+        ],
+        assignee: [
+            null as TicketAssignee,
+            {
+                setAssignee: (_, { assignee }) => assignee,
+                setTicket: (_, { ticket }) => ticket?.assignee || null,
+            },
+        ],
+        tags: [
+            [] as string[],
+            {
+                setTags: (_, { tags }) => tags,
+                setTicket: (_, { ticket }) => ticket?.tags || [],
+            },
+        ],
+        snoozedUntil: [
+            null as string | null,
+            {
+                setSnoozedUntil: (_, { snoozedUntil }) => snoozedUntil,
+                setTicket: (_, { ticket }) => ticket?.snoozed_until || null,
+            },
+        ],
+        messages: [
+            [] as CommentType[],
+            {
+                setMessages: (_, { messages }) => messages,
+                setOlderMessages: (state, { olderMessages }) => [...olderMessages, ...state],
+                appendMessage: (state, { message }) => {
+                    if (state.some((existing) => existing.id === message.id)) {
+                        return state
+                    }
+                    return [...state, message].sort((a, b) => a.created_at.localeCompare(b.created_at))
+                },
+            },
+        ],
+        messagesLoading: [
+            false,
+            {
+                loadMessages: () => true,
+                setMessages: () => false,
+                setMessagesLoading: (_, { loading }) => loading,
+            },
+        ],
+        olderMessagesLoading: [
+            false,
+            {
+                loadOlderMessages: () => true,
+                setOlderMessages: () => false,
+                setOlderMessagesLoading: (_, { loading }) => loading,
+            },
+        ],
+        hasMoreMessages: [
+            true,
+            {
+                setMessages: (_, { messages }) => messages.length >= 100,
+                setHasMoreMessages: (_, { hasMore }) => hasMore,
+            },
+        ],
+        messageSending: [
+            false,
+            {
+                sendMessage: () => true,
+                setMessageSending: (_, { sending }) => sending,
+            },
+        ],
+        ticketDeleting: [
+            false,
+            {
+                setTicketDeleting: (_, { deleting }) => deleting,
+            },
+        ],
+        aiDraftApplying: [
+            false,
+            {
+                applyAiDraft: () => true,
+                setAiDraftApplying: (_, { applying }) => applying,
+            },
+        ],
+        composerPrefillAt: [
+            0,
+            {
+                bumpComposerPrefill: (state) => state + 1,
+            },
+        ],
+        composerInsertAt: [
+            0,
+            {
+                bumpComposerInsert: (state) => state + 1,
+            },
+        ],
+        pendingComposerInsert: [
+            null as string | null,
+            {
+                setPendingComposerInsert: (_, { content }) => content,
+            },
+        ],
+        draftContent: [
+            null as string | JSONContent | null,
+            {
+                setDraftContent: (_, { content }) => content,
+            },
+        ],
+        draftIsPrivate: [
+            false,
+            {
+                setDraftIsPrivate: (_, { isPrivate }) => isPrivate,
+            },
+        ],
+        draftModeEnabled: [
+            false,
+            {
+                setDraftModeEnabled: (_, { enabled }) => enabled,
+            },
+        ],
+        editingMessageId: [
+            null as string | null,
+            {
+                startEditingMessage: (_, { message }) => message.id,
+                clearEditingMessage: () => null,
+            },
+        ],
+        stashedDraftContent: [
+            null as string | JSONContent | null,
+            {
+                stashDraftForEdit: (_, { content }) => content,
+                clearEditingMessage: () => null,
+            },
+        ],
+        stashedDraftIsPrivate: [
+            false,
+            {
+                stashDraftForEdit: (_, { isPrivate }) => isPrivate,
+                clearEditingMessage: () => false,
+            },
+        ],
+        feedbackByMessageId: [
+            {} as Record<string, AiReplyFeedbackRating>,
+            { persist: true, storageKey: 'conversations_ai_reply_feedback' },
+            {
+                recordAiReplyFeedback: (state, { messageId, rating }) => ({
+                    ...state,
+                    [messageId]: rating,
+                }),
+            },
+        ],
+    }),
+    selectors({
+        [TODAY_RECENT_KEY]: [
+            (s) => [s.ticket],
+            (ticket: Ticket | null): TodayPeopleRecent | null =>
+                ticket?.ticket_number
+                    ? {
+                          type: 'ticket',
+                          name: `Ticket #${ticket.ticket_number}`,
+                          href: urls.supportTicketDetail(ticket.ticket_number),
+                      }
+                    : null,
+        ],
+        breadcrumbs: [
+            (_, p) => [p.id],
+            (id: number | string): Breadcrumb[] => {
+                let name: string
+                if (id === 'new') {
+                    name = 'New ticket'
+                } else if (typeof id === 'string' && isUUIDLike(id)) {
+                    // Legacy UUID URLs: show the first segment without a # (which implies a number)
+                    name = `Ticket ${id.split('-')[0]}`
+                } else {
+                    name = `Ticket #${id}`
+                }
+                return [{ key: ['SupportTicketDetail', id], name }]
+            },
+        ],
+        emailReplyBlockedReason: [
+            (s) => [s.ticket, s.currentTeam],
+            (
+                ticket: Ticket | null,
+                currentTeam: null | import('~/types').TeamPublicType | import('~/types').TeamType
+            ): EmailReplyBlockedReason | null =>
+                getEmailReplyBlockedReason(ticket, currentTeam?.conversations_settings),
+        ],
+        // Whether this ticket has a discussion at all. The side-panel context, the in-thread discussion
+        // cards and the "Discuss with team" button all hang off this one gate so they can't drift into
+        // a state where one of them offers a discussion the others don't know about.
+        discussionsEnabled: [
+            (s) => [s.ticket, s.featureFlags],
+            (ticket: Ticket | null, featureFlags: FeatureFlagsSet): boolean =>
+                !!ticket?.id && !!featureFlags[FEATURE_FLAGS.DISCUSSIONS_SLACK_SYNC],
+        ],
+        [SIDE_PANEL_CONTEXT_KEY]: [
+            (s) => [s.ticket, s.discussionsEnabled],
+            (ticket: Ticket | null, discussionsEnabled: boolean): SidePanelSceneContext | null =>
+                ticket?.id
+                    ? {
+                          access_control_resource: 'ticket',
+                          access_control_resource_id: `${ticket.id}`,
+                          // Scoping the discussion thread to the ticket is still flag-gated; the
+                          // access control fields above are not, so the panel stays gated on
+                          // ticket access either way.
+                          ...(discussionsEnabled
+                              ? {
+                                    activity_scope: ActivityScope.TICKET,
+                                    activity_item_id: `${ticket.id}`,
+                                }
+                              : {}),
+                      }
+                    : null,
+        ],
+        replyRecipientDescription: [
+            (s) => [s.ticket],
+            (ticket: Ticket | null): string => {
+                switch (ticket?.channel_source) {
+                    case 'email': {
+                        // email_from is the customer's address; email_to is our sending identity.
+                        const recipients = [ticket.email_from, ...(ticket.cc_participants ?? [])].filter(Boolean)
+                        return recipients.length ? recipients.join(', ') : 'the customer'
+                    }
+                    case 'slack':
+                        return 'the linked Slack thread'
+                    case 'teams':
+                        return 'the linked Microsoft Teams channel'
+                    case 'github':
+                        return 'the linked GitHub issue'
+                    default:
+                        return 'the customer'
+                }
+            },
+        ],
+        // Without the access control add-on there is no manager role, so the backend lets editors delete.
+        deleteDisabledReason: [
+            (s) => [s.ticket, s.hasAvailableFeature],
+            (
+                ticket: Ticket | null,
+                hasAvailableFeature: (feature: AvailableFeature, currentUsage?: number | undefined) => boolean // userLogic
+            ): string | undefined =>
+                hasAvailableFeature(AvailableFeature.ACCESS_CONTROL)
+                    ? (getAccessControlDisabledReason(
+                          AccessControlResourceType.Ticket,
+                          AccessControlLevel.Manager,
+                          ticket?.user_access_level
+                      ) ?? undefined)
+                    : undefined,
+        ],
+        // Human-readable list of unsaved edits other than status, shown in the send-and-set-status
+        // confirmation. Status is excluded because that action overrides it anyway.
+        unsavedTicketChanges: [
+            (s) => [s.priority, s.assignee, s.tags, s.snoozedUntil, s.ticket, s.resolveAssignee],
+            (
+                priority: TicketPriority | null,
+                assignee: TicketAssignee,
+                tags: string[],
+                snoozedUntil: string | null,
+                ticket: Ticket | null,
+                resolveAssignee: (assignee: TicketAssignee) => Assignee
+            ): string[] => {
+                if (!ticket) {
+                    return []
+                }
+                const changed = changedTicketFields({ status: null, priority, assignee, tags, snoozedUntil }, ticket)
+                const changes: string[] = []
+                if (changed.priority) {
+                    changes.push(`Priority: ${priorityOptions.find((o) => o.value === priority)?.label ?? priority}`)
+                }
+                if ('assignee' in changed) {
+                    const resolved = resolveAssignee(assignee)
+                    const label =
+                        resolved?.type === 'user'
+                            ? fullName(resolved.user) || resolved.user.email
+                            : resolved?.type === 'role'
+                              ? resolved.role.name
+                              : assignee
+                                ? 'updated'
+                                : 'unassigned'
+                    changes.push(`Assignee: ${label}`)
+                }
+                if (changed.tags) {
+                    changes.push(tags.length > 0 ? `Tags: ${tags.join(', ')}` : 'Tags: none')
+                }
+                if ('snoozed_until' in changed) {
+                    changes.push(
+                        snoozedUntil
+                            ? `Snoozed until ${dayjs(snoozedUntil).format('D MMM YYYY, h:mm A')}`
+                            : 'Snooze removed'
+                    )
+                }
+                return changes
+            },
+        ],
+        hasUnsavedChanges: [
+            (s) => [s.status, s.ticket, s.unsavedTicketChanges],
+            (status: TicketStatus | null, ticket: Ticket | null, unsavedTicketChanges: string[]): boolean => {
+                if (!ticket) {
+                    return false
+                }
+                return status !== ticket.status || unsavedTicketChanges.length > 0
+            },
+        ],
+        hasPendingWork: [
+            (s) => [s.hasUnsavedChanges, s.editingMessageId],
+            (hasUnsavedChanges: boolean, editingMessageId: string | null): boolean =>
+                hasUnsavedChanges || !!editingMessageId,
+        ],
+        chatPanelWidth: [
+            () => [],
+            () =>
+                (desiredSize: number | null): number => {
+                    const minWidth = 400
+                    const defaultWidth = 600
+                    if (desiredSize === null) {
+                        return defaultWidth
+                    }
+                    return desiredSize < minWidth ? minWidth : desiredSize
+                },
+        ],
+        chatMessages: [
+            (s) => [s.messages, s.ticket],
+            (messages: CommentType[], ticket: Ticket | null): ChatMessage[] => {
+                return messages.map((message) => {
+                    const authorType = message.item_context?.author_type || 'customer'
+                    let displayName = 'Anonymous user'
+                    if (message.created_by) {
+                        displayName =
+                            [message.created_by.first_name, message.created_by.last_name].filter(Boolean).join(' ') ||
+                            message.created_by.email ||
+                            'Support'
+                    } else if (authorType === 'AI') {
+                        displayName = 'PostHog Assistant'
+                    } else {
+                        // Per-message author identity (e.g. Zendesk import stores each comment's own
+                        // author) takes precedence over the ticket-level requester, so a reply from a
+                        // second requester or an agent shows the real name instead of the ticket owner.
+                        const messageAuthorName =
+                            message.item_context?.author_name ||
+                            message.item_context?.author_email ||
+                            message.item_context?.slack_author_name ||
+                            message.item_context?.teams_author_name ||
+                            message.item_context?.teams_author_email ||
+                            message.item_context?.github_login ||
+                            message.item_context?.email_from_name
+                        if (messageAuthorName) {
+                            displayName = messageAuthorName
+                        } else if (authorType === 'customer') {
+                            displayName =
+                                ticket?.person?.properties?.name ||
+                                ticket?.person?.properties?.email ||
+                                ticket?.anonymous_traits?.name ||
+                                ticket?.anonymous_traits?.email ||
+                                'Anonymous user'
+                        } else {
+                            // Staff message with no resolvable author (e.g. deleted ex-agent).
+                            displayName = 'Support'
+                        }
+                    }
+
+                    return {
+                        id: message.id,
+                        content: message.content || '',
+                        richContent: message.rich_content,
+                        authorType: authorType === 'support' || authorType === 'workflow' ? 'human' : authorType,
+                        authorName: displayName,
+                        createdBy: message.created_by,
+                        createdAt: message.created_at,
+                        isPrivate: message.item_context?.is_private || false,
+                        automatedUpdate: !!message.item_context?.automated_update_key,
+                        version: message.version,
+                        emailDeliveryStatus: message.item_context?.email_delivery_status,
+                        fromExternalImport:
+                            message.item_context?.from_zendesk === true ||
+                            message.item_context?.from_intercom === true ||
+                            message.item_context?.from_pylon === true,
+                        fromGithub: message.item_context?.from_github === true,
+                        hasFullEmailContent: message.item_context?.has_full_email_content === true,
+                        citations: Array.isArray(message.item_context?.citations)
+                            ? message.item_context.citations.filter(
+                                  (item: unknown): item is string => typeof item === 'string' && !!item
+                              )
+                            : undefined,
+                        confidence:
+                            typeof message.item_context?.confidence === 'number'
+                                ? message.item_context.confidence
+                                : undefined,
+                        persistAs:
+                            message.item_context?.persist_as === 'reply' ||
+                            message.item_context?.persist_as === 'findings' ||
+                            message.item_context?.persist_as === 'clarification'
+                                ? message.item_context.persist_as
+                                : undefined,
+                        clarifyingQuestions: Array.isArray(message.item_context?.clarifying_questions)
+                            ? message.item_context.clarifying_questions.filter(
+                                  (item: unknown): item is string => typeof item === 'string'
+                              )
+                            : undefined,
+                    }
+                })
+            },
+        ],
+        deliveryStatusByMessageId: [
+            (s) => [s.chatMessages, s.ticket],
+            (chatMessages: ChatMessage[], ticket: Ticket | null): Map<string, MessageDeliveryStatus> => {
+                if (ticket?.channel_source !== 'widget') {
+                    return EMPTY_DELIVERY_STATUS_BY_MESSAGE_ID
+                }
+
+                const statusMap = new Map<string, MessageDeliveryStatus>()
+                let unreadRemaining = ticket.unread_customer_count ?? 0
+                for (let i = chatMessages.length - 1; i >= 0; i--) {
+                    const message = chatMessages[i]
+                    if (message.authorType === 'customer' || message.isPrivate) {
+                        continue
+                    }
+                    if (unreadRemaining > 0) {
+                        statusMap.set(message.id, 'sent')
+                        unreadRemaining--
+                    } else {
+                        statusMap.set(message.id, 'read')
+                    }
+                }
+                return statusMap
+            },
+        ],
+        eventsQuery: [
+            (s) => [s.ticket],
+            (ticket: Ticket | null): DataTableNode | null => {
+                // Use person from ticket (no extra API call needed)
+                if (!ticket?.person?.id) {
+                    return null
+                }
+                return createEventsQuery(ticket.person.id, ticket.session_id, ticket.created_at)
+            },
+        ],
+        exceptionsQuery: [
+            (s) => [s.ticket],
+            (ticket: Ticket | null): DataTableNode | null => {
+                if (!ticket) {
+                    return null
+                }
+                return createExceptionsQuery(ticket.session_id, ticket.created_at)
+            },
+        ],
+        latestAiMessage: [
+            (s) => [s.chatMessages],
+            (chatMessages: ChatMessage[]): ChatMessage | null => {
+                for (let i = chatMessages.length - 1; i >= 0; i--) {
+                    if (chatMessages[i].authorType === 'AI' && !chatMessages[i].automatedUpdate) {
+                        return chatMessages[i]
+                    }
+                }
+                return null
+            },
+        ],
+        latestAiDraftId: [
+            (s) => [s.chatMessages],
+            (chatMessages: ChatMessage[]): string | null => {
+                let latestDraft: ChatMessage | null = null
+                for (const message of chatMessages) {
+                    if (
+                        aiDraftAction(message) !== null &&
+                        (!latestDraft || new Date(message.createdAt) >= new Date(latestDraft.createdAt))
+                    ) {
+                        latestDraft = message
+                    }
+                }
+                return latestDraft?.id ?? null
+            },
+        ],
+    }),
+    listeners(({ actions, values, props, cache }) => ({
+        loadTicket: async () => {
+            if (values.editingMessageId) {
+                actions.cancelEditingMessage()
+            }
+            if (props.id === 'new') {
+                actions.setTicket(null)
+                return
+            }
+            try {
+                const ticket = await api.conversationsTickets.get(props.id.toString())
+
+                // If accessed via UUID, redirect to ticket_number URL for cleaner URLs
+                const isUuid = props.id.toString().includes('-')
+                if (isUuid && ticket.ticket_number) {
+                    router.actions.replace(urls.supportTicketDetail(ticket.ticket_number))
+                    return
+                }
+
+                actions.setTicket(ticket)
+                actions.loadMessages()
+
+                actions.setTicketContext(getImpersonationTicketContext(ticket))
+
+                // Load session context data
+                actions.loadPerson()
+                actions.loadLinkedReports()
+
+                // Refresh the unread count since viewing a ticket marks it as read
+                supportTicketCounterLogic.findMounted()?.actions.refreshCount()
+
+                // Start message polling using disposables pattern
+                cache.disposables.dispose('messagePolling')
+                cache.discussionPollTick = 0
+                cache.disposables.add(() => {
+                    const intervalId = setInterval(() => {
+                        actions.loadMessages()
+                        // A discussion is a slower conversation than the ticket itself, and a Slack
+                        // reply landing a few seconds late costs nothing — so it rides the same timer
+                        // at a fraction of the rate rather than starting a second one.
+                        cache.discussionPollTick = (cache.discussionPollTick ?? 0) + 1
+                        if (cache.discussionPollTick % DISCUSSION_POLL_EVERY_N_TICKS === 0) {
+                            actions.pollDiscussionThread()
+                        }
+                    }, MESSAGE_POLL_INTERVAL)
+                    return () => clearInterval(intervalId)
+                }, 'messagePolling')
+            } catch (error) {
+                console.error('Failed to load ticket:', error)
+                lemonToast.error('Failed to load ticket')
+                actions.setTicketLoading(false)
+            }
+        },
+        setStatus: () => actions.updateTicket(),
+        setPriority: () => actions.updateTicket(),
+        setAssignee: () => actions.updateTicket(),
+        setTags: () => actions.updateTicket(),
+        setSnoozedUntil: () => actions.updateTicket(),
+        loadPersonSuccess: async () => {
+            // Load previous tickets after person is loaded
+            actions.loadPreviousTickets()
+        },
+        loadFullEmailFailure: () => {
+            lemonToast.error("Couldn't load the full email. Try again.")
+            actions.closeFullEmail()
+        },
+        updateTicket: async (_, breakpoint) => {
+            if (props.id === 'new') {
+                actions.setTicketUpdating(false)
+                return
+            }
+            // Serialize overlapping saves: wait out any in-flight PATCH so requests can't land out of
+            // order, then let only the newest dispatch proceed with the latest local edits.
+            while (cache.ticketUpdateRequest) {
+                await cache.ticketUpdateRequest.catch(() => {})
+            }
+            breakpoint()
+
+            if (!values.ticket) {
+                actions.setTicketUpdating(false)
+                return
+            }
+            const data = changedTicketFields(values, values.ticket)
+            if (Object.keys(data).length === 0) {
+                actions.setTicketUpdating(false)
+                return
+            }
+
+            const request = conversationsTicketsPartialUpdate(String(getCurrentTeamId()), props.id.toString(), data)
+            cache.ticketUpdateRequest = request
+            try {
+                const ticket = (await request) as Ticket
+                actions.setSavedTicket(ticket)
+                breakpoint()
+                actions.setTicket(ticket)
+                lemonToast.success('Ticket saved')
+                actions.loadTickets()
+            } catch (error: any) {
+                if (error?.isBreakpoint) {
+                    throw error
+                }
+                actions.setTicketUpdating(false)
+                lemonToast.error("Couldn't save the ticket change. Try again.")
+                // A newer edit is already queued and will send the latest local values, so only the
+                // last failed save rolls the fields back to what the server holds.
+                breakpoint()
+                if (values.ticket) {
+                    actions.setTicket(values.ticket)
+                }
+            } finally {
+                if (cache.ticketUpdateRequest === request) {
+                    cache.ticketUpdateRequest = null
+                }
+            }
+        },
+        // Refetches the whole discussion rather than checking a count first. A count only moves when a
+        // comment is added or removed, so an edit or a task being completed would leave the card and the
+        // open side panel showing text nobody has written for a while.
+        //
+        // `refreshComments` rather than `loadComments` because refreshing must not move the reader:
+        // `loadComments` scrolls the panel to the newest comment on every success, which is right when
+        // someone opens the thread and wrong every 20 seconds while they read back through it.
+        pollDiscussionThread: async () => {
+            const ticketId = values.ticket?.id
+            if (!values.discussionsEnabled || !ticketId) {
+                return
+            }
+            // findMounted is a null guard, not an optimisation: the ticket page mounts this logic to
+            // render its discussion cards, so on a flagged team it is mounted for every open ticket
+            // whether or not that ticket has any discussion. Every such ticket therefore pays one
+            // indexed comment query per interval. That is deliberate — a teammate starting a
+            // discussion elsewhere should make the card appear here, which is the moment this whole
+            // surface exists for, and it cannot be detected without asking.
+            commentsLogic.findMounted({ scope: ActivityScope.TICKET, item_id: ticketId })?.actions.refreshComments()
+        },
+        loadMessages: async () => {
+            if (props.id === 'new' || !values.ticket?.id) {
+                actions.setMessages([])
+                return
+            }
+            const revision = ++cache.messageRevision
+            const ticketId = values.ticket.id
+            try {
+                const response = await api.comments.list({
+                    scope: 'conversations_ticket',
+                    item_id: ticketId,
+                })
+                if (cache.messageRevision !== revision || values.ticket?.id !== ticketId) {
+                    // setMessages replaces the list wholesale, so a poll that started before a
+                    // newer load or a local write must not apply its older snapshot.
+                    actions.setMessagesLoading(false)
+                    return
+                }
+                // Reverse to show oldest first (bottom = newest)
+                actions.setMessages((response.results || []).reverse())
+            } catch {
+                lemonToast.error('Failed to load messages')
+                actions.setMessagesLoading(false)
+            }
+        },
+        loadOlderMessages: async () => {
+            const currentMessages = values.messages
+            if (props.id === 'new' || !values.ticket?.id || currentMessages.length === 0 || !values.hasMoreMessages) {
+                actions.setOlderMessagesLoading(false)
+                actions.setHasMoreMessages(false)
+                return
+            }
+
+            try {
+                const oldestMessage = currentMessages[0]
+                const response = await api.comments.list({
+                    scope: 'conversations_ticket',
+                    item_id: values.ticket.id,
+                })
+
+                const allMessages = response.results || []
+                const olderMessages = allMessages
+                    .filter((msg) => new Date(msg.created_at) < new Date(oldestMessage.created_at))
+                    .reverse()
+
+                // Prepending is a local write too: a poll that started earlier would replace the
+                // list with just the newest page and drop what we just loaded.
+                cache.messageRevision += 1
+                actions.setOlderMessages(olderMessages)
+                actions.setHasMoreMessages(olderMessages.length > 0)
+            } catch {
+                lemonToast.error('Failed to load older messages')
+                actions.setOlderMessagesLoading(false)
+            }
+        },
+        sendMessage: async ({ content, richContent, isPrivate, onSuccess, statusAfterSend }) => {
+            if (props.id === 'new' || !values.ticket?.id) {
+                actions.setMessageSending(false)
+                return
+            }
+            const ticketId = values.ticket.id
+
+            if (values.editingMessageId) {
+                const editingId = values.editingMessageId
+                try {
+                    await conversationsTicketsNotesPartialUpdate(String(getCurrentTeamId()), ticketId, editingId, {
+                        message: content,
+                        rich_content: richContent,
+                    })
+                } catch {
+                    // A failed PATCH leaves the note as it was, so this is always a definite failure
+                    // and never goes through the create-recovery path below.
+                    lemonToast.error('Failed to update note')
+                    actions.setMessageSending(false)
+                    return
+                }
+                // Optimistic local update so the thread reflects the edit before comments.list returns.
+                cache.messageRevision += 1
+                actions.setMessages(
+                    values.messages.map((message) =>
+                        message.id === editingId
+                            ? {
+                                  ...message,
+                                  content,
+                                  rich_content: richContent,
+                                  version: (message.version ?? 0) + 1,
+                              }
+                            : message
+                    )
+                )
+                lemonToast.success('Private note updated')
+                actions.setMessageSending(false)
+                // Restore the stashed composer draft; skip onSuccess (it clears the editor).
+                actions.cancelEditingMessage()
+                actions.loadMessages()
+                return
+            }
+
+            const attemptStartedAt = dayjs()
+            let sent: CommentType | null = null
+            let unconfirmedReason: UnconfirmedSendReason = null
+            let alreadySent = false
+
+            try {
+                // nosemgrep: prefer-codegen-api -- Legacy raw API call with a URL built at runtime and an unchecked response type. Use a generated function if one covers this endpoint.
+                const response = await api.createResponse(getCommentsCreateUrl(String(getCurrentTeamId())), {
+                    content,
+                    rich_content: richContent,
+                    scope: 'conversations_ticket',
+                    item_id: ticketId,
+                    item_context: {
+                        author_type: 'support',
+                        is_private: isPrivate,
+                    },
+                })
+                alreadySent = response.status === 200
+                sent = (await response.json()) as CommentType
+            } catch (error: any) {
+                unconfirmedReason = classifySendFailure(error)
+                if (unconfirmedReason === null) {
+                    lemonToast.error('Failed to send message')
+                    actions.setMessageSending(false)
+                    return
+                }
+                // The message may already be in the thread, so look before telling the operator
+                // anything. A silent fetch keeps this off the normal loading and error paths.
+                const authorId = values.user?.id
+                try {
+                    const response = await api.comments.list({ scope: 'conversations_ticket', item_id: ticketId })
+                    const earliestAcceptable = attemptStartedAt.subtract(SEND_RECOVERY_WINDOW_SECONDS, 'second')
+                    sent =
+                        (response.results || []).find(
+                            (message) =>
+                                message.content === content &&
+                                objectsEqual(message.rich_content ?? null, richContent ?? null) &&
+                                message.item_context?.is_private === isPrivate &&
+                                message.item_context?.author_type === 'support' &&
+                                // Without a known author we can't tell our own send from a
+                                // colleague's identical one, so treat the outcome as unresolved.
+                                authorId !== undefined &&
+                                message.created_by?.id === authorId &&
+                                !dayjs(message.created_at).isBefore(earliestAcceptable)
+                        ) ?? null
+                } catch {
+                    // Leave `sent` null: an unresolved outcome is the safe answer, and the operator
+                    // does not need a second toast about a fetch they never asked for.
+                }
+            }
+
+            if (!sent) {
+                posthog.capture('support reply send unconfirmed', {
+                    reason: unconfirmedReason,
+                    is_private: isPrivate,
+                })
+                lemonToast.error(
+                    "We couldn't confirm that your message was added. Check the thread before sending it again."
+                )
+                actions.setMessageSending(false)
+                return
+            }
+
+            if (alreadySent) {
+                posthog.capture('support reply send deduplicated', { is_private: isPrivate })
+                cache.messageRevision += 1
+                actions.appendMessage(sent)
+                lemonToast.warning(
+                    isPrivate
+                        ? "You just added this note, so we didn't add it again. Edit your draft to add something different."
+                        : "You just sent this reply, so we didn't send it again. Edit your draft to send something different."
+                )
+                actions.setMessageSending(false)
+                return
+            }
+
+            // "Added", not "sent": email delivery is async (outbox + Celery) and can still fail
+            // after this API call succeeds; the per-message delivery status is the send signal.
+            cache.messageRevision += 1
+            actions.appendMessage(sent)
+            lemonToast.success(isPrivate ? 'Private note added' : 'Reply added')
+            actions.setMessageSending(false)
+            onSuccess?.()
+            if (!isPrivate) {
+                actions.incrementUnreadCustomerCount()
+            }
+            if (statusAfterSend) {
+                actions.setStatus(statusAfterSend)
+            }
+            actions.loadTickets()
+        },
+        applyAiDraft: async ({ message }) => {
+            try {
+                if (values.editingMessageId) {
+                    cache.noteEditActive = false
+                    actions.clearEditingMessage()
+                }
+                actions.setDraftIsPrivate(false)
+                actions.setDraftContent(aiDraftComposerHtml(message))
+                actions.bumpComposerPrefill()
+                if (!values.ticket?.id) {
+                    return
+                }
+                try {
+                    await conversationsTicketsAiHumanOutcomeCreate(String(getCurrentTeamId()), values.ticket.id, {
+                        message_id: message.id,
+                        outcome: 'used',
+                    })
+                    const ticket = values.ticket
+                    if (ticket) {
+                        actions.setTicket({
+                            ...ticket,
+                            ai_triage: { ...ticket.ai_triage, human_outcome: 'used' },
+                        })
+                    }
+                } catch (error: unknown) {
+                    if (!(error instanceof ApiError && error.status === 409)) {
+                        lemonToast.error("Couldn't record that you used the draft.")
+                    }
+                }
+            } finally {
+                actions.setAiDraftApplying(false)
+            }
+        },
+        insertMacro: ({ macro, source }) => {
+            if (values.editingMessageId) {
+                actions.cancelEditingMessage()
+            }
+            // Keep the draft's visibility: switching a private note to public would publish the text already in it.
+            actions.setPendingComposerInsert(
+                renderMacro(macro.body, macroContextFromTicket(values.ticket, values.user))
+            )
+            actions.bumpComposerInsert()
+            posthog.capture('support macro inserted', { macro_id: macro.id, source, visibility: macro.visibility })
+            const teamId = getCurrentTeamId()
+            if (!teamId) {
+                return
+            }
+            void conversationsMacrosUsedCreate(String(teamId), macro.id)
+                .then(() => {
+                    actions.recordMacroUsed(macro.id)
+                })
+                .catch(() => undefined)
+        },
+        startEditingMessage: ({ message }) => {
+            // Only stash the composer draft on first enter; switching notes keeps the original stash.
+            if (!cache.noteEditActive) {
+                actions.stashDraftForEdit(values.draftContent, values.draftIsPrivate)
+                cache.noteEditActive = true
+            }
+            actions.setDraftIsPrivate(true)
+            if (message.richContent) {
+                actions.setDraftContent(message.richContent as JSONContent)
+            } else {
+                // Notes from MCP/reply API are markdown-only; TipTap parses HTML from marked.
+                actions.setDraftContent(markdownToHtml(message.content || ''))
+            }
+        },
+        cancelEditingMessage: () => {
+            actions.setDraftContent(values.stashedDraftContent)
+            actions.setDraftIsPrivate(values.stashedDraftIsPrivate)
+            cache.noteEditActive = false
+            actions.clearEditingMessage()
+        },
+        setMessages: ({ messages }) => {
+            if (values.editingMessageId && !messages.some((m) => m.id === values.editingMessageId)) {
+                actions.cancelEditingMessage()
+            }
+        },
+        deleteTicket: () => {
+            const ticket = values.ticket
+            if (!ticket || values.ticketDeleting) {
+                return
+            }
+            LemonDialog.open({
+                title: `Delete ticket #${ticket.ticket_number}?`,
+                description:
+                    'The ticket and its messages disappear for your team and the customer right away, and are permanently deleted after 14 days. Messages already sent to Slack, Teams, email, or GitHub stay there.',
+                primaryButton: {
+                    children: 'Delete',
+                    status: 'danger',
+                    onClick: async () => {
+                        if (values.ticketDeleting) {
+                            return
+                        }
+                        actions.setTicketDeleting(true)
+                        try {
+                            await conversationsTicketsDestroy(String(getCurrentTeamId()), ticket.id)
+                            const listLogic = supportTicketsSceneLogic.findMounted()
+                            if (listLogic) {
+                                listLogic.actions.setTickets(
+                                    listLogic.values.tickets.filter((item) => item.id !== ticket.id)
+                                )
+                            }
+                            lemonToast.success('Ticket deleted')
+                            // The ticket is gone, so unsaved edits on it can no longer be saved.
+                            cache.skipUnsavedChangesPrompt = true
+                            router.actions.push(urls.supportTickets())
+                        } catch {
+                            lemonToast.error('Failed to delete ticket. Try again.')
+                        } finally {
+                            actions.setTicketDeleting(false)
+                        }
+                    },
+                },
+                secondaryButton: { children: 'Cancel' },
+            })
+        },
+        deleteMessage: async ({ messageId }) => {
+            if (!values.ticket?.id) {
+                return
+            }
+            LemonDialog.open({
+                title: 'Delete private note?',
+                description: 'This removes the note from the ticket thread.',
+                primaryButton: {
+                    children: 'Delete',
+                    status: 'danger',
+                    onClick: async () => {
+                        try {
+                            await conversationsTicketsNotesDestroy(
+                                String(getCurrentTeamId()),
+                                values.ticket!.id,
+                                messageId
+                            )
+                            lemonToast.success('Private note deleted')
+                            if (values.editingMessageId === messageId) {
+                                actions.cancelEditingMessage()
+                            }
+                            actions.loadMessages()
+                        } catch {
+                            lemonToast.error('Failed to delete note')
+                        }
+                    },
+                },
+                secondaryButton: { children: 'Cancel' },
+            })
+        },
+        submitAiReplyFeedback: async ({ messageId, rating, feedbackText }) => {
+            const ticket = values.ticket
+            if (!ticket) {
+                return
+            }
+            try {
+                if (feedbackText) {
+                    if (rating !== 'bad') {
+                        return
+                    }
+                    await conversationsTicketsAiFeedbackCreate(String(ApiConfig.getCurrentProjectId()), ticket.id, {
+                        message_id: messageId,
+                        rating,
+                        feedback_text: feedbackText,
+                    })
+                    return
+                }
+                if (values.feedbackByMessageId[messageId]) {
+                    return
+                }
+                await conversationsTicketsAiFeedbackCreate(String(ApiConfig.getCurrentProjectId()), ticket.id, {
+                    message_id: messageId,
+                    rating,
+                })
+                actions.recordAiReplyFeedback(messageId, rating)
+            } catch {
+                lemonToast.error('Failed to submit feedback')
+            }
+        },
+    })),
+    afterMount(({ actions, props, values, cache }) => {
+        // Guards against a slow poll landing after a newer load or a local message write.
+        cache.messageRevision = 0
+        actions.setDraftModeEnabled(values.draftModeDefault)
+        if (props.id !== 'new') {
+            actions.loadTicket()
+        }
+    }),
+    beforeUnmount(({ actions }) => {
+        // The message poller is registered through cache.disposables, which the plugin tears down.
+        actions.setTicketContext(null)
+    }),
+    beforeUnload(({ values, actions, cache }) => ({
+        enabled: (newLocation) => {
+            if (cache.skipUnsavedChangesPrompt) {
+                cache.skipUnsavedChangesPrompt = false
+                return false
+            }
+            if (!values.hasPendingWork) {
+                return false
+            }
+            // Ignore in-page navigations (e.g. opening a side panel) that keep the same path
+            if (newLocation && newLocation.pathname === router.values.location.pathname) {
+                return false
+            }
+            return true
+        },
+        message: 'You have unsaved changes. Are you sure you want to leave?',
+        onConfirm: () => {
+            // Re-sync local form reducers to the last-known server ticket so hasUnsavedChanges
+            // recomputes to false and the prompt does not re-fire on the next navigation.
+            if (values.ticket) {
+                actions.setTicket(values.ticket)
+            }
+        },
+    })),
+])

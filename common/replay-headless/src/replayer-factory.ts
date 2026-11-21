@@ -1,0 +1,200 @@
+import { Replayer } from 'posthog-js/rrweb'
+import { EventType, type eventWithTime } from 'posthog-js/rrweb-types'
+
+import {
+    AudioMuteReplayerPlugin,
+    CanvasReplayerPlugin,
+    CorsPlugin,
+    COMMON_REPLAYER_CONFIG,
+    HLSPlayerPlugin,
+    noOpTelemetry,
+    processAllSnapshots,
+    speedDependentStyleRules,
+    createSegments,
+    getHrefFromSnapshot,
+    mapSnapshotsToWindowId,
+    mergeInactiveSegments,
+    type ProcessingCache,
+    type RecordingSegment,
+    type ViewportResolution,
+} from '@posthog/replay-shared'
+
+import { loadAllSources } from './data-loader'
+import type { HostBridge } from './host-bridge'
+import type { PlaybackWindow } from './playback-controller'
+import type { PlayerConfig, ViewportEvent } from './types'
+import { UNRECORDED_STYLE_RULES, UnrecordedContentPlugin } from './unrecorded-content'
+
+export interface ReplayerWindow extends PlaybackWindow {
+    /** The element the window's replayer renders into, shown only while the window is on screen. */
+    root: HTMLElement
+    /** Every page URL the window recorded, in time order. */
+    hrefChanges: HrefChange[]
+}
+
+export interface HrefChange {
+    timestamp: number
+    href: string
+}
+
+/** Why no window could be replayed: nothing loaded yet, or snapshots that no window can be drawn from. */
+export type ReplayerSetupFailure = 'no_snapshots' | 'no_full_snapshot'
+
+/** Each window keeps its own iframe and DOM alive for the whole render, and window ids come from the recording. */
+const MAX_REPLAYED_WINDOWS = 20
+
+/** The windows with the most active time, which are the ones worth their memory when a session opened too many. */
+function busiestWindowIds(segments: RecordingSegment[], candidates: Set<number>, limit: number): Set<number> {
+    const activeMs = new Map<number, number>()
+    for (const seg of segments) {
+        if (seg.windowId != null && candidates.has(seg.windowId)) {
+            activeMs.set(seg.windowId, (activeMs.get(seg.windowId) ?? 0) + (seg.isActive ? seg.durationMs : 0))
+        }
+    }
+    const ranked = [...activeMs.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+    return new Set(ranked.map(([windowId]) => windowId))
+}
+
+function hrefChanges(events: eventWithTime[]): HrefChange[] {
+    const changes: HrefChange[] = []
+    for (const event of events) {
+        const href: unknown = getHrefFromSnapshot(event)
+        if (typeof href === 'string' && href && href !== changes[changes.length - 1]?.href) {
+            changes.push({ timestamp: event.timestamp, href })
+        }
+    }
+    return changes
+}
+
+export interface ReplayerSetup {
+    /** Ordered by when each window first appears in the recording. */
+    windows: ReplayerWindow[]
+    segments: RecordingSegment[]
+    firstTimestamp: number
+    windowUuidById: Map<number, string>
+}
+
+function buildViewportLookup(events: ViewportEvent[]): (timestamp: number) => ViewportResolution | undefined {
+    if (!events.length) {
+        return () => undefined
+    }
+
+    const sorted = [...events].sort((a, b) => a.timestamp - b.timestamp)
+
+    return (timestamp: number): ViewportResolution | undefined => {
+        let closest: ViewportEvent | undefined
+        for (const event of sorted) {
+            if (event.timestamp <= timestamp) {
+                closest = event
+            } else {
+                break
+            }
+        }
+        if (!closest) {
+            closest = sorted[0]
+        }
+        return {
+            width: String(closest.width),
+            height: String(closest.height),
+            href: 'unknown',
+        }
+    }
+}
+
+/**
+ * Load recording data, process snapshots, build segments, and create
+ * one rrweb Replayer per recorded window — but don't start playback.
+ *
+ * Returns why not when there are no snapshots, or no window has a full snapshot to build a page from.
+ */
+export async function createReplayers(
+    config: PlayerConfig,
+    rootEl: HTMLElement,
+    bridge: HostBridge
+): Promise<ReplayerSetup | ReplayerSetupFailure> {
+    const { sources, snapshotsBySource, windowUuidById } = await loadAllSources(config, (loaded, total) =>
+        bridge.reportLoadingProgress(loaded, total)
+    )
+
+    const viewportForTimestamp = buildViewportLookup(config.viewportEvents || [])
+
+    const processingCache: ProcessingCache = { snapshots: {} }
+    const snapshots = await processAllSnapshots(
+        sources,
+        snapshotsBySource,
+        processingCache,
+        viewportForTimestamp,
+        config.sessionId,
+        noOpTelemetry
+    )
+
+    if (!snapshots.length) {
+        return 'no_snapshots'
+    }
+
+    const snapshotsByWindowId = mapSnapshotsToWindowId(snapshots)
+    const rawSegments = createSegments(
+        snapshots,
+        snapshots[0].timestamp,
+        snapshots[snapshots.length - 1].timestamp,
+        null,
+        snapshotsByWindowId
+    )
+    const segments = mergeInactiveSegments(rawSegments)
+    const firstTimestamp = snapshots[0].timestamp
+    // rrweb cannot build a page without a full snapshot, and its Replayer throws on fewer than two events.
+    const replayableIds = new Set(
+        Object.entries(snapshotsByWindowId)
+            .filter(([, events]) => events.length >= 2 && events.some((event) => event.type === EventType.FullSnapshot))
+            .map(([windowId]) => Number(windowId))
+    )
+    const keptWindowIds =
+        replayableIds.size > MAX_REPLAYED_WINDOWS
+            ? busiestWindowIds(segments, replayableIds, MAX_REPLAYED_WINDOWS)
+            : replayableIds
+    const windows: ReplayerWindow[] = []
+    for (const [windowId, windowEvents] of Object.entries(snapshotsByWindowId)) {
+        if (!keptWindowIds.has(Number(windowId))) {
+            continue
+        }
+        const root = document.createElement('div')
+        // Hidden but still laid out: a display:none iframe drops the scroll positions its fast-forward sets.
+        root.style.position = 'absolute'
+        root.style.inset = '0'
+        root.style.visibility = 'hidden'
+        rootEl.appendChild(root)
+        const replayer = new Replayer(windowEvents, {
+            root,
+            ...COMMON_REPLAYER_CONFIG,
+            insertStyleRules: [
+                ...(COMMON_REPLAYER_CONFIG.insertStyleRules || []),
+                ...speedDependentStyleRules(config.playbackSpeed),
+                ...UNRECORDED_STYLE_RULES,
+            ],
+            mouseTail: config.mouseTail,
+            useVirtualDom: false,
+            plugins: [
+                CorsPlugin,
+                HLSPlayerPlugin,
+                AudioMuteReplayerPlugin(true),
+                CanvasReplayerPlugin(windowEvents),
+                UnrecordedContentPlugin(windowEvents),
+            ],
+            speed: config.playbackSpeed,
+        })
+        windows.push({
+            windowId: Number(windowId),
+            replayer,
+            root,
+            hrefChanges: hrefChanges(windowEvents),
+            firstTimestamp: windowEvents[0].timestamp,
+            lastTimestamp: windowEvents[windowEvents.length - 1].timestamp,
+        })
+    }
+    if (!windows.length) {
+        return 'no_full_snapshot'
+    }
+    windows.sort((a, b) => a.firstTimestamp - b.firstTimestamp)
+
+    return { windows, segments, firstTimestamp, windowUuidById }
+}

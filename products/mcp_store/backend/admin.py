@@ -1,0 +1,211 @@
+import logging
+from typing import Any
+
+from django import forms
+from django.contrib import admin, messages
+from django.db.models import QuerySet
+from django.http import HttpRequest
+from django.utils.html import format_html
+
+from posthog.models.scoping import team_scope
+
+from products.mcp_store.backend.models import MCPGatewayServer, MCPServerTemplate
+from products.mcp_store.backend.oauth import discover_oauth_metadata
+from products.mcp_store.backend.oauth_credentials import oauth_credentials_source_is_configured
+
+logger = logging.getLogger(__name__)
+
+
+class MCPServerTemplateAdminForm(forms.ModelForm):
+    """Separate plain-text inputs for client_id / client_secret so operators can
+    paste credentials from the provider's dev portal. Values are merged into the
+    encrypted `oauth_credentials` JSON on save; the raw JSON field is never
+    exposed in the admin form."""
+
+    client_id = forms.CharField(required=False, widget=forms.PasswordInput(render_value=False))
+    client_secret = forms.CharField(required=False, widget=forms.PasswordInput(render_value=False))
+
+    class Meta:
+        model = MCPServerTemplate
+        fields = (
+            "name",
+            "url",
+            "description",
+            "auth_type",
+            "icon_key",
+            "icon_domain",
+            "category",
+            "oauth_issuer_url",
+            "oauth_metadata",
+            "oauth_scope_allowlist",
+            "is_active",
+        )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # PasswordInput(render_value=False) deliberately never echoes the existing
+        # credential back into the HTML, so the input always renders blank. Without
+        # a signal, the operator can't tell "template has shared creds I shouldn't
+        # touch" from "template is empty and needs filling." Compute help_text from
+        # the current instance so the distinction is visible.
+        # Django ModelForm always passes `instance` as a kwarg; positional args are form
+        # data, not the instance, so there's nothing to fall back to.
+        instance: MCPServerTemplate | None = kwargs.get("instance")
+        existing_creds = (instance.oauth_credentials or {}) if instance else {}
+        credentials_source = instance.oauth_credentials_source if instance else ""
+
+        if credentials_source:
+            self.fields["client_id"].disabled = True
+            self.fields["client_secret"].disabled = True
+            self.fields["client_id"].help_text = f"Managed by the {credentials_source} instance credential source."
+            self.fields["client_secret"].help_text = f"Managed by the {credentials_source} instance credential source."
+        elif existing_creds.get("client_id"):
+            self.fields["client_id"].help_text = "(stored — leave blank to keep, or type a new value to replace)"
+        else:
+            self.fields["client_id"].help_text = "(not set — template will use per-user DCR on install)"
+
+        if not credentials_source:
+            if existing_creds.get("client_secret"):
+                self.fields[
+                    "client_secret"
+                ].help_text = "(stored — leave blank to keep, or type a new value to replace)"
+            else:
+                self.fields["client_secret"].help_text = "(not set — fine if the provider uses PKCE-only)"
+
+        # The token endpoint comes from the server's own (unauthenticated) metadata
+        # discovery, so show the operator exactly where a pasted secret will be sent
+        # before they commit it — a lying server shouldn't get a secret quietly.
+        token_endpoint = (instance.oauth_metadata or {}).get("token_endpoint", "") if instance else ""
+        if token_endpoint:
+            self.fields["client_secret"].help_text = format_html(
+                "{} Token exchange sends this secret to <code>{}</code> (from discovered metadata) — "
+                "confirm that endpoint belongs to the vendor before saving.",
+                self.fields["client_secret"].help_text,
+                token_endpoint,
+            )
+
+    def save(self, commit: bool = True) -> MCPServerTemplate:
+        instance: MCPServerTemplate = super().save(commit=False)
+        existing_creds = dict(instance.oauth_credentials or {})
+        client_id = self.cleaned_data.get("client_id") or ""
+        client_secret = self.cleaned_data.get("client_secret") or ""
+        if client_id:
+            existing_creds["client_id"] = client_id
+        if client_secret:
+            existing_creds["client_secret"] = client_secret
+        instance.oauth_credentials = existing_creds
+        if commit:
+            instance.save()
+        return instance
+
+
+@admin.register(MCPServerTemplate)
+class MCPServerTemplateAdmin(admin.ModelAdmin):
+    form = MCPServerTemplateAdminForm
+    readonly_fields = ("oauth_credentials_source",)
+    list_display = (
+        "name",
+        "url",
+        "category",
+        "auth_type",
+        "oauth_credentials_source",
+        "has_client_id",
+        "has_metadata",
+        "is_active",
+        "updated_at",
+    )
+    list_filter = ("auth_type", "category", "is_active", "created_at", "updated_at")
+    search_fields = ("name", "url")
+    actions = ("activate_templates", "deactivate_templates", "discover_metadata")
+
+    @admin.display(boolean=True, description="Has client_id")
+    def has_client_id(self, obj: MCPServerTemplate) -> bool:
+        if obj.oauth_credentials_source:
+            return oauth_credentials_source_is_configured(obj.oauth_credentials_source)
+        return bool((obj.oauth_credentials or {}).get("client_id"))
+
+    @admin.display(boolean=True, description="Has metadata")
+    def has_metadata(self, obj: MCPServerTemplate) -> bool:
+        return bool(obj.oauth_metadata)
+
+    @admin.action(description="Mark selected templates active")
+    def activate_templates(self, request: HttpRequest, queryset: Any) -> None:
+        queryset.update(is_active=True)
+
+    @admin.action(description="Mark selected templates inactive")
+    def deactivate_templates(self, request: HttpRequest, queryset: Any) -> None:
+        queryset.update(is_active=False)
+
+    @admin.action(description="Discover OAuth metadata from server URL")
+    def discover_metadata(self, request: HttpRequest, queryset: Any) -> None:
+        ok, failed = 0, 0
+        for template in queryset:
+            try:
+                metadata = discover_oauth_metadata(template.url)
+                template.oauth_metadata = metadata
+                if issuer := metadata.get("issuer"):
+                    template.oauth_issuer_url = issuer
+                template.save(update_fields=["oauth_metadata", "oauth_issuer_url", "updated_at"])
+                ok += 1
+            except Exception as e:
+                logger.exception("oauth metadata discovery failed for template %s", template.id)
+                messages.warning(request, f"{template.name}: {type(e).__name__}: {e}")
+                failed += 1
+        if ok:
+            messages.success(request, f"Discovered metadata for {ok} template(s)")
+        if failed:
+            messages.error(request, f"Discovery failed for {failed} template(s) — paste oauth_metadata manually")
+
+
+class MCPGatewayServerAdminForm(forms.ModelForm):
+    def _post_clean(self) -> None:
+        # The (team, url) unique check reads through the fail-closed default manager, so it needs the row's team.
+        with team_scope(self.instance.team_id):
+            super()._post_clean()  # type: ignore[misc]
+
+
+@admin.register(MCPGatewayServer)
+class MCPGatewayServerAdmin(admin.ModelAdmin):
+    form = MCPGatewayServerAdminForm
+    list_display = ("name", "team", "url", "template", "is_team_enabled", "updated_at")
+    list_select_related = ("team", "template")
+    list_filter = ("category", "is_team_enabled")
+    search_fields = ("name", "url", "=team__id")
+    fields = (
+        "name",
+        "description",
+        "category",
+        "team",
+        "url",
+        "template",
+        "auth_type",
+        "is_team_enabled",
+        "created_by",
+        "created_at",
+        "updated_at",
+    )
+    # The team, URL and template identify the registration, and is_team_enabled controls who can call the server.
+    # Staff edit only the text that the server page shows, so a fix of a label cannot change access.
+    readonly_fields = (
+        "team",
+        "url",
+        "template",
+        "auth_type",
+        "is_team_enabled",
+        "created_by",
+        "created_at",
+        "updated_at",
+    )
+    ordering = ("-updated_at",)
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    # A delete cascades to the team's revocations, agent grants and tool policies, and a team that turned the server
+    # off gets it back through its default posture. The gateway API removes a server safely instead.
+    def has_delete_permission(self, request: HttpRequest, obj: MCPGatewayServer | None = None) -> bool:
+        return False
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[MCPGatewayServer]:
+        # Admin has no team context; MCPGatewayServer's default manager is fail-closed.
+        return MCPGatewayServer.objects.unscoped().select_related("team", "template")

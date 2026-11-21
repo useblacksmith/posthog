@@ -1,0 +1,196 @@
+import React, { useMemo } from 'react'
+
+import { ChartLegend } from '../../components/Legend/ChartLegend'
+import { useResolvedChartTheme } from '../../core/theme'
+import type {
+    AxisLinesConfig,
+    ChartLegendConfig,
+    ChartTheme,
+    ComboChartConfig,
+    PointClickData,
+    SeriesType,
+    Series,
+    TooltipConfig,
+    TooltipContext,
+} from '../../core/types'
+import { ReferenceLines } from '../../overlays/ReferenceLine'
+import { TrendLineOverlay } from '../../overlays/TrendLineOverlay'
+import { ValueLabels } from '../../overlays/ValueLabels'
+import { mergeValueDomains, type GoalLineConfig } from '../../utils/goal-lines'
+import { useTimeSeriesTooltipConfig, type XAxisConfig, type YAxisConfig } from '../../utils/use-axis-formatters'
+import { ComboChart } from '../ComboChart/ComboChart'
+import { useTrendLineSeries, type TrendLineConfig } from '../utils/use-derived-series'
+import { useGoalLines, useTimeSeries, useValueBounds } from '../utils/use-time-series'
+import type { ValueLabelsConfig } from '../utils/use-value-labels'
+
+export interface TimeSeriesComboChartConfig {
+    /** Reserve space for custom overlays; unspecified sides keep their computed margins. */
+    margins?: ComboChartConfig['margins']
+    xAxis?: XAxisConfig
+    /** Single object for a standard left axis; array for dual left+right axes. */
+    yAxis?: YAxisConfig | YAxisConfig[]
+    /** Pin the primary value scale, overriding its automatic data and goal-line extent. */
+    valueDomain?: ComboChartConfig['valueDomain']
+    valueLabels?: boolean | ValueLabelsConfig
+    goalLines?: GoalLineConfig[]
+    /** Type used for series that don't set {@link Series.type}. Defaults to `'line'`. */
+    defaultSeriesType?: SeriesType
+    /** Layout applied to *bar* series only — lines and areas never stack or group. Defaults to
+     *  `'stacked'`. */
+    barLayout?: ComboChartConfig['barLayout']
+    /** Stacked layout only — stack negative bar values below the zero baseline.
+     *  See {@link ComboChartConfig.divergingStack}. */
+    divergingStack?: boolean
+    /** Stacked bars only round the topmost segment. */
+    barCornerRadius?: number
+    /** Inner gap between bar bands as a fraction of their slot. */
+    bandPadding?: number
+    /** Show a vertical crosshair line that follows the cursor. */
+    showCrosshair?: boolean
+    /** Join the shared crosshair of an enclosing `ChartHoverSync`. Defaults to true. */
+    syncHover?: boolean
+    /** Horizontal grid lines, aligned to the primary y-axis ticks. `showGrid` on the primary
+     *  `yAxis` config, when set, wins. */
+    showGrid?: boolean
+    /** Draw L-shaped axis baselines without grid lines (ignored when `yAxis.showGrid` is true). */
+    showAxisLines?: AxisLinesConfig
+    /** Draw short tick marks next to each visible axis label. Pairs with `showAxisLines`. */
+    showTickMarks?: boolean
+    /** Line interpolation for line/area series: `linear` (default) or `monotone` (smooth curve). */
+    curve?: 'linear' | 'monotone'
+    /** Tooltip behaviour and built-in content options. A `tooltip` render prop replaces the content. */
+    tooltip?: TooltipConfig
+    /** Built-in legend with click-to-toggle series visibility. Hidden by default. */
+    legend?: ChartLegendConfig
+    /** Trend line overlays rendered as SVG lines on top of the chart. */
+    trendLines?: TrendLineConfig[]
+}
+
+export interface TimeSeriesComboChartProps<Meta = unknown> {
+    series: Series<Meta>[]
+    labels: string[]
+    /** Defaults to the nearest `ChartThemeProvider`, then the quill CSS vars. */
+    theme?: ChartTheme
+    config?: TimeSeriesComboChartConfig
+    tooltip?: (ctx: TooltipContext<Meta>) => React.ReactNode
+    onPointClick?: (data: PointClickData<Meta>) => void
+    dataAttr?: string
+    className?: string
+    children?: React.ReactNode
+    onError?: (error: Error, info: React.ErrorInfo) => void
+}
+
+/** Time-indexed {@link ComboChart}: mixed bar + line/area series on a timezone/interval-aware band
+ *  x-axis, plus the time-series chrome `ComboChart` lacks — date x-axis, goal lines, a built-in
+ *  legend, and value labels. Mirrors {@link TimeSeriesBarChart}/{@link TimeSeriesLineChart}. */
+export function TimeSeriesComboChart<Meta = unknown>({
+    series,
+    labels,
+    theme: themeProp,
+    config,
+    tooltip,
+    onPointClick,
+    dataAttr,
+    className,
+    children,
+    onError,
+}: TimeSeriesComboChartProps<Meta>): React.ReactElement {
+    const theme = useResolvedChartTheme(themeProp)
+    const {
+        xAxis,
+        yAxis,
+        margins,
+        valueLabels,
+        goalLines,
+        defaultSeriesType,
+        barLayout,
+        divergingStack,
+        barCornerRadius,
+        bandPadding,
+        showCrosshair,
+        syncHover = true,
+        showGrid,
+        showAxisLines,
+        showTickMarks,
+        curve,
+        tooltip: tooltipConfig,
+        legend,
+        trendLines,
+    } = config ?? {}
+    const {
+        xTickFormatter,
+        yTickFormatter,
+        legendProps,
+        visibleSeries,
+        chartSeries,
+        valueLabelsConfig,
+        valueLabelFormatter,
+        primaryYAxis,
+        yAxes,
+    } = useTimeSeries(series, labels, theme, {
+        xAxis,
+        yAxis,
+        valueLabels,
+        legend,
+        isPercent: barLayout === 'percent',
+    })
+    const timeSeriesTooltipConfig = useTimeSeriesTooltipConfig(tooltipConfig, xAxis, labels)
+
+    const { referenceLines, valueDomain: goalLineDomain } = useGoalLines(goalLines, chartSeries)
+    const valueDomain = useMemo(
+        () => mergeValueDomains(config?.valueDomain, goalLineDomain),
+        [config?.valueDomain, goalLineDomain]
+    )
+
+    const trendSeries = useTrendLineSeries(visibleSeries, trendLines)
+    const valueBounds = useValueBounds(primaryYAxis)
+
+    const comboChartConfig: ComboChartConfig = {
+        margins,
+        yScaleType: primaryYAxis?.scale,
+        xTickFormatter,
+        xTickLabelRotation: xAxis?.tickLabelRotation,
+        yTickFormatter,
+        hideXAxis: xAxis?.hide,
+        hideYAxis: yAxes ? yAxes.length > 0 && yAxes.every((a) => a.hide) : primaryYAxis?.hide,
+        xAxisLabel: xAxis?.label,
+        yAxisLabel: primaryYAxis?.label,
+        showGrid: primaryYAxis?.showGrid ?? showGrid,
+        showAxisLines,
+        showTickMarks,
+        curve,
+        showCrosshair,
+        syncHover,
+        defaultSeriesType,
+        barLayout,
+        divergingStack,
+        barCornerRadius,
+        bandPadding,
+        tooltip: timeSeriesTooltipConfig,
+        valueDomain,
+        valueBounds,
+        floatBaseline: primaryYAxis?.startAtZero === false && primaryYAxis?.scale !== 'log',
+        yAxes,
+    }
+
+    return (
+        <ChartLegend {...legendProps} legendDataAttr="hog-chart-timeseries-combo-legend">
+            <ComboChart
+                series={chartSeries}
+                labels={labels}
+                config={comboChartConfig}
+                theme={theme}
+                tooltip={tooltip}
+                onPointClick={onPointClick}
+                className={className}
+                dataAttr={dataAttr}
+                onError={onError}
+            >
+                {referenceLines.length > 0 && <ReferenceLines lines={referenceLines} />}
+                {trendSeries.length > 0 && <TrendLineOverlay trendSeries={trendSeries} />}
+                {valueLabelsConfig && <ValueLabels {...valueLabelsConfig} valueFormatter={valueLabelFormatter} />}
+                {children}
+            </ComboChart>
+        </ChartLegend>
+    )
+}

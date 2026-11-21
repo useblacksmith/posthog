@@ -1,0 +1,795 @@
+/**
+ * Auto-generated Zod validation schemas from the Django backend OpenAPI schema.
+ * To modify these schemas, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+import * as zod from 'zod'
+
+export const conversationsIntercomImportsCreateBodyRegionDefault = `us`
+export const conversationsIntercomImportsCreateBodyAccessTokenMax = 500
+
+export const ConversationsIntercomImportsCreateBody = /* @__PURE__ */ zod.object({
+    region: zod
+        .enum(['us', 'eu', 'au'])
+        .default(conversationsIntercomImportsCreateBodyRegionDefault)
+        .describe(
+            'Region where the Intercom workspace is hosted: us, eu, or au.\n\n\* `us` - United States\n\* `eu` - Europe\n\* `au` - Australia'
+        ),
+    access_token: zod
+        .string()
+        .max(conversationsIntercomImportsCreateBodyAccessTokenMax)
+        .describe('Intercom access token with permission to read conversations and contacts.'),
+    default_email_channel_id: zod
+        .uuid()
+        .nullish()
+        .describe(
+            'Optional support email channel to attach imported tickets to, so agents can reply by email. Omit or null to import tickets without an email channel.'
+        ),
+})
+
+export const conversationsMacrosCreateBodyNameMax = 200
+
+export const conversationsMacrosCreateBodyShortcutMax = 50
+
+export const conversationsMacrosCreateBodyBodyMax = 10000
+
+export const ConversationsMacrosCreateBody = /* @__PURE__ */ zod.object({
+    name: zod
+        .string()
+        .max(conversationsMacrosCreateBodyNameMax)
+        .describe('Name shown in the macro list and the composer menu.'),
+    shortcut: zod
+        .string()
+        .max(conversationsMacrosCreateBodyShortcutMax)
+        .nullish()
+        .describe(
+            "Slash command for this macro, without the leading slash. Lowercase letters, numbers, and hyphens. A shared shortcut is unique among the project's shared macros, and a personal one among the creator's personal macros. Null when the macro has no shortcut."
+        ),
+    body: zod
+        .string()
+        .max(conversationsMacrosCreateBodyBodyMax)
+        .describe(
+            'Reply text in markdown. May contain {{customer.first_name}}, {{customer.name}}, {{customer.email}}, {{agent.first_name}}, {{agent.name}}, and {{ticket.number}}. Variables are filled in when an agent inserts the macro.'
+        ),
+    visibility: zod
+        .enum(['shared', 'personal'])
+        .describe('\* `shared` - Everyone in the project\n\* `personal` - Only the creator')
+        .optional()
+        .describe(
+            "Who can see and use the macro. 'shared' is everyone in the project, the default. 'personal' is only the person who created it.\n\n\* `shared` - Everyone in the project\n\* `personal` - Only the creator"
+        ),
+})
+
+export const conversationsMacrosPartialUpdateBodyNameMax = 200
+
+export const conversationsMacrosPartialUpdateBodyShortcutMax = 50
+
+export const conversationsMacrosPartialUpdateBodyBodyMax = 10000
+
+export const ConversationsMacrosPartialUpdateBody = /* @__PURE__ */ zod.object({
+    name: zod
+        .string()
+        .max(conversationsMacrosPartialUpdateBodyNameMax)
+        .optional()
+        .describe('Name shown in the macro list and the composer menu.'),
+    shortcut: zod
+        .string()
+        .max(conversationsMacrosPartialUpdateBodyShortcutMax)
+        .nullish()
+        .describe(
+            "Slash command for this macro, without the leading slash. Lowercase letters, numbers, and hyphens. A shared shortcut is unique among the project's shared macros, and a personal one among the creator's personal macros. Null when the macro has no shortcut."
+        ),
+    body: zod
+        .string()
+        .max(conversationsMacrosPartialUpdateBodyBodyMax)
+        .optional()
+        .describe(
+            'Reply text in markdown. May contain {{customer.first_name}}, {{customer.name}}, {{customer.email}}, {{agent.first_name}}, {{agent.name}}, and {{ticket.number}}. Variables are filled in when an agent inserts the macro.'
+        ),
+    visibility: zod
+        .enum(['shared', 'personal'])
+        .describe('\* `shared` - Everyone in the project\n\* `personal` - Only the creator')
+        .optional()
+        .describe(
+            "Who can see and use the macro. 'shared' is everyone in the project, the default. 'personal' is only the person who created it.\n\n\* `shared` - Everyone in the project\n\* `personal` - Only the creator"
+        ),
+})
+
+export const conversationsPylonImportsCreateBodyApiTokenMax = 500
+
+export const ConversationsPylonImportsCreateBody = /* @__PURE__ */ zod.object({
+    api_token: zod
+        .string()
+        .max(conversationsPylonImportsCreateBodyApiTokenMax)
+        .describe(
+            'Pylon API token whose role can read issues, messages, and contacts. The region (US or EU) is detected from the token.'
+        ),
+    default_email_channel_id: zod
+        .uuid()
+        .nullish()
+        .describe(
+            'Optional support email channel to attach imported tickets to, so agents can reply by email. Omit or null to import tickets without an email channel.'
+        ),
+})
+
+/**
+ * Handle ticket updates including assignee changes.
+ */
+export const ConversationsTicketsUpdateBody = /* @__PURE__ */ zod
+    .object({
+        status: zod
+            .enum(['new', 'open', 'pending', 'on_hold', 'resolved'])
+            .describe(
+                '\* `new` - New\n\* `open` - Open\n\* `pending` - Pending\n\* `on_hold` - On hold\n\* `resolved` - Resolved'
+            )
+            .optional()
+            .describe(
+                'Ticket status: new, open, pending, on_hold, or resolved.\n\n\* `new` - New\n\* `open` - Open\n\* `pending` - Pending\n\* `on_hold` - On hold\n\* `resolved` - Resolved'
+            ),
+        priority: zod
+            .union([
+                zod
+                    .enum(['low', 'medium', 'high', 'critical'])
+                    .describe('\* `low` - Low\n\* `medium` - Medium\n\* `high` - High\n\* `critical` - Critical'),
+                zod.enum(['']),
+                zod.null(),
+            ])
+            .optional()
+            .describe(
+                'Ticket priority: low, medium, high, or critical. Pass null to clear it.\n\n\* `low` - Low\n\* `medium` - Medium\n\* `high` - High\n\* `critical` - Critical'
+            ),
+        assignee: zod
+            .union([
+                zod.union([
+                    zod.object({
+                        type: zod.enum(['user']).describe('Assign the ticket to a user.'),
+                        id: zod.number().describe('User ID.'),
+                    }),
+                    zod.object({
+                        type: zod.enum(['role']).describe('Assign the ticket to a role.'),
+                        id: zod.uuid().describe('Role ID.'),
+                    }),
+                ]),
+                zod.null(),
+            ])
+            .optional()
+            .describe('User or role to assign. Pass null to remove the current assignee.'),
+        anonymous_traits: zod.unknown().optional().describe('Customer details such as name and email.'),
+        ai_resolved: zod.boolean().optional().describe('Whether AI resolved the ticket.'),
+        escalation_reason: zod.string().nullish().describe('Reason the ticket was escalated. Pass null to clear it.'),
+        sla_due_at: zod.iso.datetime({ offset: true }).nullish().describe('SLA deadline. Pass null to clear it.'),
+        snoozed_until: zod.iso
+            .datetime({ offset: true })
+            .nullish()
+            .describe('Time to reopen the ticket. Pass null to reopen it now.'),
+        tags: zod
+            .array(zod.string())
+            .optional()
+            .describe(
+                "Tag names to set on the ticket. The list replaces the ticket's current tags. A request can add up to 100 new tags."
+            ),
+    })
+    .describe('Fields accepted when updating a ticket.')
+
+export const ConversationsTicketsPartialUpdateBody = /* @__PURE__ */ zod
+    .object({
+        status: zod
+            .enum(['new', 'open', 'pending', 'on_hold', 'resolved'])
+            .describe(
+                '\* `new` - New\n\* `open` - Open\n\* `pending` - Pending\n\* `on_hold` - On hold\n\* `resolved` - Resolved'
+            )
+            .optional()
+            .describe(
+                'Ticket status: new, open, pending, on_hold, or resolved.\n\n\* `new` - New\n\* `open` - Open\n\* `pending` - Pending\n\* `on_hold` - On hold\n\* `resolved` - Resolved'
+            ),
+        priority: zod
+            .union([
+                zod
+                    .enum(['low', 'medium', 'high', 'critical'])
+                    .describe('\* `low` - Low\n\* `medium` - Medium\n\* `high` - High\n\* `critical` - Critical'),
+                zod.enum(['']),
+                zod.null(),
+            ])
+            .optional()
+            .describe(
+                'Ticket priority: low, medium, high, or critical. Pass null to clear it.\n\n\* `low` - Low\n\* `medium` - Medium\n\* `high` - High\n\* `critical` - Critical'
+            ),
+        assignee: zod
+            .union([
+                zod.union([
+                    zod.object({
+                        type: zod.enum(['user']).describe('Assign the ticket to a user.'),
+                        id: zod.number().describe('User ID.'),
+                    }),
+                    zod.object({
+                        type: zod.enum(['role']).describe('Assign the ticket to a role.'),
+                        id: zod.uuid().describe('Role ID.'),
+                    }),
+                ]),
+                zod.null(),
+            ])
+            .optional()
+            .describe('User or role to assign. Pass null to remove the current assignee.'),
+        anonymous_traits: zod.unknown().optional().describe('Customer details such as name and email.'),
+        ai_resolved: zod.boolean().optional().describe('Whether AI resolved the ticket.'),
+        escalation_reason: zod.string().nullish().describe('Reason the ticket was escalated. Pass null to clear it.'),
+        sla_due_at: zod.iso.datetime({ offset: true }).nullish().describe('SLA deadline. Pass null to clear it.'),
+        snoozed_until: zod.iso
+            .datetime({ offset: true })
+            .nullish()
+            .describe('Time to reopen the ticket. Pass null to reopen it now.'),
+        tags: zod
+            .array(zod.string())
+            .optional()
+            .describe(
+                "Tag names to set on the ticket. The list replaces the ticket's current tags. A request can add up to 100 new tags."
+            ),
+    })
+    .describe('Fields accepted when updating a ticket.')
+
+/**
+ * Record reviewer feedback on an AI reply, captured to the internal analytics project.
+ */
+export const conversationsTicketsAiFeedbackCreateBodyMessageIdMax = 200
+
+export const conversationsTicketsAiFeedbackCreateBodyFeedbackTextMax = 2000
+
+export const ConversationsTicketsAiFeedbackCreateBody = /* @__PURE__ */ zod
+    .object({
+        message_id: zod
+            .string()
+            .max(conversationsTicketsAiFeedbackCreateBodyMessageIdMax)
+            .describe('ID of the AI message being rated.'),
+        rating: zod
+            .enum(['good', 'bad'])
+            .describe('\* `good` - good\n\* `bad` - bad')
+            .describe('Reviewer rating: good or bad.\n\n\* `good` - good\n\* `bad` - bad'),
+        feedback_text: zod
+            .string()
+            .max(conversationsTicketsAiFeedbackCreateBodyFeedbackTextMax)
+            .optional()
+            .describe('Optional text explaining a bad rating.'),
+    })
+    .describe('Payload for recording reviewer feedback on an AI reply.')
+
+/**
+ * Record that a human used or edited the latest AI draft.
+ */
+export const conversationsTicketsAiHumanOutcomeCreateBodyMessageIdMax = 200
+
+export const ConversationsTicketsAiHumanOutcomeCreateBody = /* @__PURE__ */ zod
+    .object({
+        message_id: zod
+            .string()
+            .max(conversationsTicketsAiHumanOutcomeCreateBodyMessageIdMax)
+            .describe('ID of the private AI draft being adopted.'),
+        outcome: zod
+            .enum(['used', 'edited'])
+            .describe('\* `used` - used\n\* `edited` - edited')
+            .describe(
+                'used when the human inserts the draft as-is; edited after they change it in the composer.\n\n\* `used` - used\n\* `edited` - edited'
+            ),
+    })
+    .describe('Payload for recording whether a human adopted an AI draft.')
+
+/**
+ * Upload a file to put in a reply to this ticket.
+ *
+ * Images are validated and shown inline. Other files are stored as they are and
+ * served as a download. Widget tickets do not accept file attachments yet.
+ */
+export const ConversationsTicketsAttachmentsCreateBody = /* @__PURE__ */ zod.object({
+    file: zod.instanceof(File).describe('File to attach. Must be under 20 MiB.'),
+})
+
+/**
+ * Add a private note to a ticket.
+ *
+ * The note is visible to your team only. The request has no privacy field, so this
+ * endpoint never sends anything to the customer.
+ */
+export const conversationsTicketsNotesCreateBodyMessageMax = 5000
+
+export const ConversationsTicketsNotesCreateBody = /* @__PURE__ */ zod
+    .object({
+        message: zod
+            .string()
+            .max(conversationsTicketsNotesCreateBodyMessageMax)
+            .describe(
+                'Note content in markdown. The note is visible to your team only and is never sent to the customer.'
+            ),
+        rich_content: zod
+            .unknown()
+            .optional()
+            .describe('Optional TipTap rich content JSON for the note. Omit it to show the markdown message.'),
+    })
+    .describe('Payload for adding a private note to a ticket. It has no privacy field: the note is always private.')
+
+/**
+ * Update a private note on a ticket.
+ *
+ * Only the note's author can edit it. Customer-facing replies cannot be
+ * edited (outbound delivery only runs on create).
+ */
+export const conversationsTicketsNotesPartialUpdateBodyMessageMax = 5000
+
+export const ConversationsTicketsNotesPartialUpdateBody = /* @__PURE__ */ zod
+    .object({
+        message: zod
+            .string()
+            .max(conversationsTicketsNotesPartialUpdateBodyMessageMax)
+            .optional()
+            .describe('Updated note content in markdown.'),
+        rich_content: zod
+            .unknown()
+            .optional()
+            .describe(
+                'Optional TipTap rich content JSON. Omit or pass null to clear previous rich content so the thread falls back to the markdown message.'
+            ),
+    })
+    .describe('Payload for updating a private note on a ticket.')
+
+/**
+ * Post a reply or internal note to a ticket.
+ *
+ * With is_private=false, the reply is delivered to the customer via the
+ * ticket's channel (email, Slack, Teams, GitHub). With is_private=true,
+ * the message is stored as an internal note only visible to team members.
+ *
+ * Retrying an identical message from the same author within a short window returns the
+ * original message with a 200 rather than posting it twice, and a 409 while a concurrent
+ * request is still creating it.
+ */
+export const conversationsTicketsReplyCreateBodyMessageMax = 5000
+
+export const conversationsTicketsReplyCreateBodyIsPrivateDefault = false
+
+export const ConversationsTicketsReplyCreateBody = /* @__PURE__ */ zod
+    .object({
+        message: zod.string().max(conversationsTicketsReplyCreateBodyMessageMax).describe('Reply content in markdown.'),
+        is_private: zod
+            .boolean()
+            .default(conversationsTicketsReplyCreateBodyIsPrivateDefault)
+            .describe(
+                "If true, store as an internal note (not sent to the customer). If false, the reply is delivered to the customer over the ticket's channel."
+            ),
+        rich_content: zod.unknown().optional().describe('Optional TipTap rich content JSON for formatted messages.'),
+    })
+    .describe('Payload for posting a reply or internal note to a ticket.')
+
+/**
+ * Update the status of multiple tickets in a single request.
+ *
+ * Only tickets belonging to the current team are affected; other-team UUIDs
+ * are silently ignored. Tickets the caller lacks editor-level access to (denied
+ * or view-only via object-level access control) are silently skipped too, the
+ * same way single-ticket updates enforce object-level access via get_object().
+ * Tickets already in the requested status are skipped.
+ */
+export const conversationsTicketsBulkUpdateStatusCreateBodyIdsMax = 500
+
+export const ConversationsTicketsBulkUpdateStatusCreateBody = /* @__PURE__ */ zod.object({
+    ids: zod
+        .array(zod.uuid())
+        .max(conversationsTicketsBulkUpdateStatusCreateBodyIdsMax)
+        .describe('List of ticket UUIDs to update.'),
+    status: zod
+        .enum(['new', 'open', 'pending', 'on_hold', 'resolved'])
+        .describe(
+            '\* `new` - New\n\* `open` - Open\n\* `pending` - Pending\n\* `on_hold` - On hold\n\* `resolved` - Resolved'
+        )
+        .describe(
+            'New status to apply to all selected tickets: new, open, pending, on_hold, or resolved.\n\n\* `new` - New\n\* `open` - Open\n\* `pending` - Pending\n\* `on_hold` - On hold\n\* `resolved` - Resolved'
+        ),
+})
+
+/**
+ * Bulk update tags on multiple objects.
+ *
+ * PAT access: this action has no ``required_scopes=`` on the decorator —
+ * inheriting viewsets must add ``"bulk_update_tags"`` to their
+ * ``scope_object_write_actions`` list to accept personal API keys.
+ * Without that opt-in, ``APIScopePermission`` rejects PAT requests with
+ * "This action does not support personal API key access". Done per-viewset
+ * so granting ``<scope>:write`` for one resource doesn't leak access to
+ * sibling resources that share this mixin.
+ *
+ * Accepts:
+ * - {"ids": [...], "action": "add"|"remove"|"set", "tags": ["tag1", "tag2"]}
+ *
+ * Actions:
+ * - "add": Add tags to existing tags on each object
+ * - "remove": Remove specific tags from each object
+ * - "set": Replace all tags on each object with the provided list
+ */
+export const conversationsTicketsBulkUpdateTagsCreateBodyIdsMax = 500
+
+export const conversationsTicketsBulkUpdateTagsCreateBodyTagsItemMax = 255
+
+export const conversationsTicketsBulkUpdateTagsCreateBodyTagsMax = 100
+
+export const ConversationsTicketsBulkUpdateTagsCreateBody = /* @__PURE__ */ zod
+    .object({
+        ids: zod
+            .array(zod.uuid())
+            .max(conversationsTicketsBulkUpdateTagsCreateBodyIdsMax)
+            .describe('List of object UUIDs to update tags on.'),
+        action: zod
+            .enum(['add', 'remove', 'set'])
+            .describe('\* `add` - add\n\* `remove` - remove\n\* `set` - set')
+            .describe(
+                "'add' merges with existing tags, 'remove' deletes specific tags, 'set' replaces all tags.\n\n\* `add` - add\n\* `remove` - remove\n\* `set` - set"
+            ),
+        tags: zod
+            .array(zod.string().max(conversationsTicketsBulkUpdateTagsCreateBodyTagsItemMax))
+            .max(conversationsTicketsBulkUpdateTagsCreateBodyTagsMax)
+            .describe('Tag names to add, remove, or set (up to 100 per request, 255 characters each).'),
+    })
+    .describe('Variant of ``BulkUpdateTagsRequestSerializer`` for resources keyed by UUID (e.g. event definitions).')
+
+/**
+ * Create a new outbound ticket and send the first message to the customer.
+ *
+ * Idempotent within a short window: an identical compose retried while the first is still
+ * in flight returns 409, and one retried after it committed returns the same ticket with a
+ * 200. Only a genuinely new request creates a ticket and emails the customer.
+ */
+export const conversationsTicketsComposeCreateBodyRecipientDistinctIdMax = 400
+
+export const conversationsTicketsComposeCreateBodyEmailSubjectMax = 500
+
+export const conversationsTicketsComposeCreateBodyMessageMax = 5000
+
+export const conversationsTicketsComposeCreateBodyTagsItemMax = 255
+
+export const conversationsTicketsComposeCreateBodyTagsMax = 100
+
+export const ConversationsTicketsComposeCreateBody = /* @__PURE__ */ zod.object({
+    recipient_email: zod.email().describe('Recipient email address.'),
+    recipient_distinct_id: zod
+        .string()
+        .max(conversationsTicketsComposeCreateBodyRecipientDistinctIdMax)
+        .optional()
+        .describe('PostHog distinct_id to link the ticket to a person. Falls back to recipient_email.'),
+    email_subject: zod
+        .string()
+        .max(conversationsTicketsComposeCreateBodyEmailSubjectMax)
+        .optional()
+        .describe('Email subject line.'),
+    email_config_id: zod
+        .uuid()
+        .nullish()
+        .describe(
+            "ID of the support email channel to send from. Omit it to send from the team's default support channel."
+        ),
+    message: zod.string().max(conversationsTicketsComposeCreateBodyMessageMax).describe('Message content in markdown.'),
+    rich_content: zod.unknown().optional().describe('TipTap rich content JSON for formatted messages.'),
+    tags: zod
+        .array(zod.string().max(conversationsTicketsComposeCreateBodyTagsItemMax))
+        .max(conversationsTicketsComposeCreateBodyTagsMax)
+        .optional()
+        .describe(
+            'Tags to apply to the new ticket, e.g. to mark its source. Each is normalized (lowercased, trimmed). Up to 100.'
+        ),
+})
+
+export const conversationsViewsCreateBodyNameMax = 400
+
+export const conversationsViewsCreateBodyFiltersOneSearchMax = 200
+
+export const ConversationsViewsCreateBody = /* @__PURE__ */ zod.object({
+    name: zod
+        .string()
+        .max(conversationsViewsCreateBodyNameMax)
+        .describe('Display name of the view, as it appears in the ticket views list.'),
+    filters: zod
+        .object({
+            status: zod
+                .array(
+                    zod
+                        .enum(['new', 'open', 'pending', 'on_hold', 'resolved'])
+                        .describe(
+                            '\* `new` - New\n\* `open` - Open\n\* `pending` - Pending\n\* `on_hold` - On hold\n\* `resolved` - Resolved'
+                        )
+                )
+                .optional()
+                .describe('Ticket statuses to include. Empty or omitted means all statuses.'),
+            priority: zod
+                .array(
+                    zod
+                        .enum(['low', 'medium', 'high', 'critical'])
+                        .describe('\* `low` - Low\n\* `medium` - Medium\n\* `high` - High\n\* `critical` - Critical')
+                )
+                .optional()
+                .describe('Ticket priorities to include. Empty or omitted means all priorities.'),
+            channel: zod
+                .enum(['widget', 'email', 'slack', 'teams', 'github', 'all'])
+                .describe(
+                    '\* `widget` - widget\n\* `email` - email\n\* `slack` - slack\n\* `teams` - teams\n\* `github` - github\n\* `all` - all'
+                )
+                .optional()
+                .describe(
+                    "Channel the ticket originated from. 'all' disables the filter.\n\n\* `widget` - widget\n\* `email` - email\n\* `slack` - slack\n\* `teams` - teams\n\* `github` - github\n\* `all` - all"
+                ),
+            sla: zod
+                .enum(['breached', 'at-risk', 'on-track', 'all'])
+                .describe('\* `breached` - breached\n\* `at-risk` - at-risk\n\* `on-track` - on-track\n\* `all` - all')
+                .optional()
+                .describe(
+                    "SLA state: 'breached' is past due, 'at-risk' is due within the next hour, 'on-track' has more than an hour remaining. 'all' disables the filter.\n\n\* `breached` - breached\n\* `at-risk` - at-risk\n\* `on-track` - on-track\n\* `all` - all"
+                ),
+            aiTriageResult: zod
+                .array(
+                    zod
+                        .enum([
+                            'persisted',
+                            'suggested',
+                            'escalated_with_findings',
+                            'escalated_with_best',
+                            'escalated_no_reply',
+                            'skipped_unactionable',
+                            'skipped_team_replied',
+                            'skipped_channel_excluded',
+                            'blocked_unsafe',
+                            'blocked_unsafe_reply',
+                            'clarified',
+                            'suggested_clarification',
+                            'in_progress',
+                        ])
+                        .describe(
+                            '\* `persisted` - persisted\n\* `suggested` - suggested\n\* `escalated_with_findings` - escalated_with_findings\n\* `escalated_with_best` - escalated_with_best\n\* `escalated_no_reply` - escalated_no_reply\n\* `skipped_unactionable` - skipped_unactionable\n\* `skipped_team_replied` - skipped_team_replied\n\* `skipped_channel_excluded` - skipped_channel_excluded\n\* `blocked_unsafe` - blocked_unsafe\n\* `blocked_unsafe_reply` - blocked_unsafe_reply\n\* `clarified` - clarified\n\* `suggested_clarification` - suggested_clarification\n\* `in_progress` - in_progress'
+                        )
+                )
+                .optional()
+                .describe(
+                    "AI triage outcomes to include. 'in_progress' matches tickets still being triaged. Valid values: persisted, suggested, escalated_with_findings, escalated_with_best, escalated_no_reply, skipped_unactionable, skipped_team_replied, skipped_channel_excluded, blocked_unsafe, blocked_unsafe_reply, clarified, suggested_clarification, in_progress."
+                ),
+            assignee: zod
+                .array(
+                    zod.union([
+                        zod.enum(['me', 'unassigned']),
+                        zod.object({
+                            type: zod.enum(['user', 'role']),
+                            id: zod.union([zod.string(), zod.number()]),
+                        }),
+                    ])
+                )
+                .optional()
+                .describe(
+                    "Assignees to match (any of): 'unassigned', 'me' (resolved to the requesting user), or an object with type ('user' or 'role') and id. Send a list. Views saved earlier can hold a single value instead of a list, or the value 'all'. Wrap a single value in a list, and replace 'all' with an empty list to apply no assignee filter."
+                ),
+            tags: zod.array(zod.string()).optional().describe('Tag names to match, combined according to tagsMatch.'),
+            tagsMatch: zod
+                .enum(['any', 'all'])
+                .describe('\* `any` - any\n\* `all` - all')
+                .optional()
+                .describe(
+                    "'any' returns tickets with at least one of tags (OR); 'all' requires every tag (AND).\n\n\* `any` - any\n\* `all` - all"
+                ),
+            tagsExclude: zod
+                .array(zod.string())
+                .optional()
+                .describe('Tickets carrying any of these tags are excluded.'),
+            dateFrom: zod
+                .string()
+                .nullish()
+                .describe(
+                    "Only include tickets updated on or after this date. Accepts absolute dates (2026-01-01) or relative ones (-7d). 'all' or null disables the bound."
+                ),
+            dateTo: zod
+                .string()
+                .nullish()
+                .describe('Only include tickets updated on or before this date. Same format as dateFrom.'),
+            sorting: zod
+                .union([
+                    zod.object({
+                        columnKey: zod
+                            .string()
+                            .describe(
+                                'Ticket column to sort by (updated_at, sla_due_at, snoozed_until, created_at, ticket_number). Unknown columns fall back to updated_at.'
+                            ),
+                        order: zod
+                            .union([zod.literal(1), zod.literal(-1)])
+                            .describe('\* `1` - 1\n\* `-1` - -1')
+                            .describe('1 for ascending, -1 for descending.\n\n\* `1` - 1\n\* `-1` - -1'),
+                    }),
+                    zod.null(),
+                ])
+                .optional()
+                .describe('Sort order for the ticket list.'),
+            search: zod
+                .string()
+                .max(conversationsViewsCreateBodyFiltersOneSearchMax)
+                .optional()
+                .describe(
+                    "Free-text search. A numeric value matches a ticket number exactly; otherwise matches the customer's name or email, the email subject, or message content."
+                ),
+        })
+        .describe(
+            "Canonical shape of a saved ticket view's filters. Every field is optional; an omitted\nfield (or an 'all' sentinel) leaves that dimension unfiltered."
+        )
+        .optional()
+        .describe(
+            'Saved ticket filter criteria: status, priority, channel, sla, aiTriageResult, assignee, tags, tagsMatch, tagsExclude, dateFrom, dateTo, sorting, and search.'
+        ),
+    is_favorited: zod
+        .boolean()
+        .optional()
+        .describe(
+            'Whether the current user has favorited this view. Favorited views sort to the top of the list. Favorites are personal to each user.'
+        ),
+})
+
+export const conversationsViewsPartialUpdateBodyNameMax = 400
+
+export const conversationsViewsPartialUpdateBodyFiltersOneSearchMax = 200
+
+export const ConversationsViewsPartialUpdateBody = /* @__PURE__ */ zod.object({
+    name: zod
+        .string()
+        .max(conversationsViewsPartialUpdateBodyNameMax)
+        .optional()
+        .describe('Display name of the view, as it appears in the ticket views list.'),
+    filters: zod
+        .object({
+            status: zod
+                .array(
+                    zod
+                        .enum(['new', 'open', 'pending', 'on_hold', 'resolved'])
+                        .describe(
+                            '\* `new` - New\n\* `open` - Open\n\* `pending` - Pending\n\* `on_hold` - On hold\n\* `resolved` - Resolved'
+                        )
+                )
+                .optional()
+                .describe('Ticket statuses to include. Empty or omitted means all statuses.'),
+            priority: zod
+                .array(
+                    zod
+                        .enum(['low', 'medium', 'high', 'critical'])
+                        .describe('\* `low` - Low\n\* `medium` - Medium\n\* `high` - High\n\* `critical` - Critical')
+                )
+                .optional()
+                .describe('Ticket priorities to include. Empty or omitted means all priorities.'),
+            channel: zod
+                .enum(['widget', 'email', 'slack', 'teams', 'github', 'all'])
+                .describe(
+                    '\* `widget` - widget\n\* `email` - email\n\* `slack` - slack\n\* `teams` - teams\n\* `github` - github\n\* `all` - all'
+                )
+                .optional()
+                .describe(
+                    "Channel the ticket originated from. 'all' disables the filter.\n\n\* `widget` - widget\n\* `email` - email\n\* `slack` - slack\n\* `teams` - teams\n\* `github` - github\n\* `all` - all"
+                ),
+            sla: zod
+                .enum(['breached', 'at-risk', 'on-track', 'all'])
+                .describe('\* `breached` - breached\n\* `at-risk` - at-risk\n\* `on-track` - on-track\n\* `all` - all')
+                .optional()
+                .describe(
+                    "SLA state: 'breached' is past due, 'at-risk' is due within the next hour, 'on-track' has more than an hour remaining. 'all' disables the filter.\n\n\* `breached` - breached\n\* `at-risk` - at-risk\n\* `on-track` - on-track\n\* `all` - all"
+                ),
+            aiTriageResult: zod
+                .array(
+                    zod
+                        .enum([
+                            'persisted',
+                            'suggested',
+                            'escalated_with_findings',
+                            'escalated_with_best',
+                            'escalated_no_reply',
+                            'skipped_unactionable',
+                            'skipped_team_replied',
+                            'skipped_channel_excluded',
+                            'blocked_unsafe',
+                            'blocked_unsafe_reply',
+                            'clarified',
+                            'suggested_clarification',
+                            'in_progress',
+                        ])
+                        .describe(
+                            '\* `persisted` - persisted\n\* `suggested` - suggested\n\* `escalated_with_findings` - escalated_with_findings\n\* `escalated_with_best` - escalated_with_best\n\* `escalated_no_reply` - escalated_no_reply\n\* `skipped_unactionable` - skipped_unactionable\n\* `skipped_team_replied` - skipped_team_replied\n\* `skipped_channel_excluded` - skipped_channel_excluded\n\* `blocked_unsafe` - blocked_unsafe\n\* `blocked_unsafe_reply` - blocked_unsafe_reply\n\* `clarified` - clarified\n\* `suggested_clarification` - suggested_clarification\n\* `in_progress` - in_progress'
+                        )
+                )
+                .optional()
+                .describe(
+                    "AI triage outcomes to include. 'in_progress' matches tickets still being triaged. Valid values: persisted, suggested, escalated_with_findings, escalated_with_best, escalated_no_reply, skipped_unactionable, skipped_team_replied, skipped_channel_excluded, blocked_unsafe, blocked_unsafe_reply, clarified, suggested_clarification, in_progress."
+                ),
+            assignee: zod
+                .array(
+                    zod.union([
+                        zod.enum(['me', 'unassigned']),
+                        zod.object({
+                            type: zod.enum(['user', 'role']),
+                            id: zod.union([zod.string(), zod.number()]),
+                        }),
+                    ])
+                )
+                .optional()
+                .describe(
+                    "Assignees to match (any of): 'unassigned', 'me' (resolved to the requesting user), or an object with type ('user' or 'role') and id. Send a list. Views saved earlier can hold a single value instead of a list, or the value 'all'. Wrap a single value in a list, and replace 'all' with an empty list to apply no assignee filter."
+                ),
+            tags: zod.array(zod.string()).optional().describe('Tag names to match, combined according to tagsMatch.'),
+            tagsMatch: zod
+                .enum(['any', 'all'])
+                .describe('\* `any` - any\n\* `all` - all')
+                .optional()
+                .describe(
+                    "'any' returns tickets with at least one of tags (OR); 'all' requires every tag (AND).\n\n\* `any` - any\n\* `all` - all"
+                ),
+            tagsExclude: zod
+                .array(zod.string())
+                .optional()
+                .describe('Tickets carrying any of these tags are excluded.'),
+            dateFrom: zod
+                .string()
+                .nullish()
+                .describe(
+                    "Only include tickets updated on or after this date. Accepts absolute dates (2026-01-01) or relative ones (-7d). 'all' or null disables the bound."
+                ),
+            dateTo: zod
+                .string()
+                .nullish()
+                .describe('Only include tickets updated on or before this date. Same format as dateFrom.'),
+            sorting: zod
+                .union([
+                    zod.object({
+                        columnKey: zod
+                            .string()
+                            .describe(
+                                'Ticket column to sort by (updated_at, sla_due_at, snoozed_until, created_at, ticket_number). Unknown columns fall back to updated_at.'
+                            ),
+                        order: zod
+                            .union([zod.literal(1), zod.literal(-1)])
+                            .describe('\* `1` - 1\n\* `-1` - -1')
+                            .describe('1 for ascending, -1 for descending.\n\n\* `1` - 1\n\* `-1` - -1'),
+                    }),
+                    zod.null(),
+                ])
+                .optional()
+                .describe('Sort order for the ticket list.'),
+            search: zod
+                .string()
+                .max(conversationsViewsPartialUpdateBodyFiltersOneSearchMax)
+                .optional()
+                .describe(
+                    "Free-text search. A numeric value matches a ticket number exactly; otherwise matches the customer's name or email, the email subject, or message content."
+                ),
+        })
+        .describe(
+            "Canonical shape of a saved ticket view's filters. Every field is optional; an omitted\nfield (or an 'all' sentinel) leaves that dimension unfiltered."
+        )
+        .optional()
+        .describe(
+            'Saved ticket filter criteria: status, priority, channel, sla, aiTriageResult, assignee, tags, tagsMatch, tagsExclude, dateFrom, dateTo, sorting, and search.'
+        ),
+    is_favorited: zod
+        .boolean()
+        .optional()
+        .describe(
+            'Whether the current user has favorited this view. Favorited views sort to the top of the list. Favorites are personal to each user.'
+        ),
+})
+
+export const conversationsZendeskImportsCreateBodySubdomainMax = 255
+
+export const conversationsZendeskImportsCreateBodyApiTokenMax = 500
+
+export const ConversationsZendeskImportsCreateBody = /* @__PURE__ */ zod.object({
+    subdomain: zod
+        .string()
+        .max(conversationsZendeskImportsCreateBodySubdomainMax)
+        .describe("Zendesk subdomain (e.g. 'acme' from acme.zendesk.com)."),
+    email_address: zod.email().describe('Zendesk agent email tied to the API token.'),
+    api_token: zod
+        .string()
+        .max(conversationsZendeskImportsCreateBodyApiTokenMax)
+        .describe('Zendesk API token with ticket read access.'),
+    default_email_channel_id: zod
+        .uuid()
+        .nullish()
+        .describe(
+            "Optional fallback email channel for tickets whose original Zendesk recipient doesn't match a configured support address (or isn't an email). Omit or null to leave those tickets without an email channel."
+        ),
+})

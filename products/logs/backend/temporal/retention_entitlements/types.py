@@ -1,0 +1,17 @@
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class EnforceLogsRetentionEntitlementsInput:
+    dry_run: bool
+    batch_size: int = 100
+
+
+@dataclass(frozen=True)
+class EnforceLogsRetentionEntitlementsOutput:
+    teams_checked: int
+    teams_reset: int
+    rules_checked: int = 0
+    rules_reset: int = 0
+    tracing_configs_reset: int = 0
+    span_rules_reset: int = 0

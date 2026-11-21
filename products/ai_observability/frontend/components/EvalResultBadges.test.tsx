@@ -1,0 +1,262 @@
+import '@testing-library/jest-dom'
+
+import { render, screen } from '@testing-library/react'
+
+import { EvaluationRun } from '../evaluations/types'
+import { EvalTooltipContent, getEvalBadgeProps, getEvalSummaries } from './EvalResultBadges'
+import {
+    compareEvaluationResults,
+    getEvaluationResultDisplay,
+    getEvaluationResultSortValue,
+    isSentimentRun,
+} from './EvaluationResultTag'
+
+function makeRun(overrides: Partial<EvaluationRun> = {}): EvaluationRun {
+    return {
+        id: 'run-1',
+        evaluation_id: 'eval-1',
+        evaluation_name: 'Test Eval',
+        generation_id: 'gen-1',
+        trace_id: 'trace-1',
+        timestamp: '2026-04-10T12:00:00Z',
+        result: true,
+        reasoning: '',
+        status: 'completed',
+        ...overrides,
+    }
+}
+
+describe('EvalResultBadges', () => {
+    it('shows a fallback when a run has no reasoning', () => {
+        render(<EvalTooltipContent latestRun={makeRun()} runCount={1} />)
+
+        expect(screen.getByText('No reasoning provided')).toBeInTheDocument()
+    })
+
+    it('sorts numeric scores together without colliding with status ranks', () => {
+        const rows = [
+            makeRun({ id: 'negative', result_type: 'numeric', score: -10 }),
+            makeRun({ id: 'na', result_type: 'numeric', applicable: false }),
+            makeRun({ id: 'zero', result_type: 'numeric', score: 0 }),
+            makeRun({ id: 'skipped', skipped: true }),
+            makeRun({ id: 'positive', result_type: 'numeric', score: 2 }),
+            makeRun({ id: 'error', status: 'failed' }),
+            makeRun({ id: 'boolean', result: true }),
+        ]
+        expect(rows.sort((a, b) => compareEvaluationResults(b, a)).map((run) => run.id)).toEqual([
+            'positive',
+            'zero',
+            'negative',
+            'boolean',
+            'na',
+            'skipped',
+            'error',
+        ])
+    })
+
+    it.each([
+        [0, '0'],
+        [1 / 3, '0.33'],
+        [123456789, '123456789'],
+        [-123456789, '-123456789'],
+        [0.0000000123456789, '1.2e-8'],
+        [1234567.1234567, '1234567.12'],
+    ])('formats score %s compactly without losing its magnitude', (score, label) => {
+        expect(getEvaluationResultDisplay(makeRun({ result_type: 'numeric', score })).label).toBe(label)
+    })
+
+    it.each([
+        [4.899999, 'gte', 4.9, '4.899999', 'danger'],
+        [4.9, 'gte', 4.9, '4.9', 'success'],
+        [4.900001, 'lte', 4.9, '4.900001', 'danger'],
+        [4.9, 'lte', 4.9, '4.9', 'success'],
+        [4.900001, 'gte', 4.900001, '4.900001', 'success'],
+        [4.899999, 'lte', 4.899999, '4.899999', 'success'],
+        [10.001, 'gte', 10, '10', 'success'],
+        [9.999, 'lte', 10, '10', 'success'],
+    ] as const)('keeps the label for score %s consistent with %s %s', (score, operator, threshold, label, type) => {
+        expect(
+            getEvaluationResultDisplay(makeRun({ result_type: 'numeric', score }), {
+                passingRule: { operator, threshold },
+            })
+        ).toMatchObject({ label, type })
+    })
+
+    it.each([
+        [[], true, ['resolved'], 'danger', 'No categories'],
+        [['resolved'], true, ['resolved'], 'success', 'Resolved'],
+        [['resolved', 'incorrect'], true, ['resolved'], 'danger', 'Resolved, incorrect'],
+        [[], true, [], 'success', 'No categories'],
+        [['resolved'], true, [], 'danger', 'Resolved'],
+        [[], true, null, 'none', 'No categories'],
+        [null, false, ['resolved'], 'muted', 'N/A'],
+        [null, false, [], 'muted', 'N/A'],
+    ] as const)(
+        'renders categorical results %s without confusing empty selections and N/A',
+        (categories, applicable, passingCategories, type, label) => {
+            expect(
+                getEvaluationResultDisplay(
+                    makeRun({
+                        result_type: 'categorical',
+                        result: null,
+                        categories: categories ? [...categories] : null,
+                        applicable,
+                    }),
+                    {
+                        passingRule: passingCategories ? { categories: [...passingCategories] } : null,
+                        categoryOptions: [{ key: 'resolved', label: 'Resolved' }],
+                    }
+                )
+            ).toMatchObject({ type, label })
+        }
+    )
+
+    describe('getEvalSummaries', () => {
+        it('returns empty array for empty input', () => {
+            expect(getEvalSummaries([])).toEqual([])
+        })
+
+        it('groups runs by evaluation_id and counts them', () => {
+            const runs = [
+                makeRun({ id: 'r1', evaluation_id: 'eval-a', timestamp: '2026-04-10T12:00:00Z' }),
+                makeRun({ id: 'r2', evaluation_id: 'eval-a', timestamp: '2026-04-09T12:00:00Z' }),
+                makeRun({ id: 'r3', evaluation_id: 'eval-b', timestamp: '2026-04-10T12:00:00Z' }),
+            ]
+            const summaries = getEvalSummaries(runs)
+            expect(summaries).toHaveLength(2)
+
+            const evalA = summaries.find((s) => s.latestRun.evaluation_id === 'eval-a')!
+            expect(evalA.runCount).toBe(2)
+            expect(evalA.latestRun.id).toBe('r1')
+
+            const evalB = summaries.find((s) => s.latestRun.evaluation_id === 'eval-b')!
+            expect(evalB.runCount).toBe(1)
+        })
+
+        it('picks the latest run regardless of input order', () => {
+            const older = makeRun({ id: 'old', evaluation_id: 'eval-a', timestamp: '2026-04-01T00:00:00Z' })
+            const newer = makeRun({ id: 'new', evaluation_id: 'eval-a', timestamp: '2026-04-10T00:00:00Z' })
+
+            const ascResult = getEvalSummaries([older, newer])
+            expect(ascResult[0].latestRun.id).toBe('new')
+
+            const descResult = getEvalSummaries([newer, older])
+            expect(descResult[0].latestRun.id).toBe('new')
+        })
+
+        it('orders by when a verdict was produced, not by its backdated timestamp', () => {
+            const live = makeRun({
+                id: 'live',
+                timestamp: '2026-04-10T12:00:05Z',
+                start_time: '2026-04-10T12:00:05Z',
+            })
+            const rerun = makeRun({
+                id: 'rerun',
+                timestamp: '2026-04-10T12:00:00.400Z',
+                start_time: '2026-04-12T09:00:00Z',
+                backfill_id: 'backfill-1',
+            })
+
+            expect(getEvalSummaries([live, rerun])[0]).toMatchObject({ latestRun: { id: 'rerun' }, runCount: 2 })
+        })
+
+        it('handles a single run', () => {
+            const summaries = getEvalSummaries([makeRun()])
+            expect(summaries).toHaveLength(1)
+            expect(summaries[0].runCount).toBe(1)
+        })
+    })
+
+    describe('getEvalBadgeProps', () => {
+        it.each([
+            ['failed status', makeRun({ status: 'failed' }), { type: 'danger', label: 'Error' }],
+            ['running status', makeRun({ status: 'running' }), { type: 'primary', label: 'Running' }],
+            ['null result', makeRun({ result: null }), { type: 'muted', label: 'N/A' }],
+            ['true result', makeRun({ result: true }), { type: 'success', label: 'True' }],
+            ['false result', makeRun({ result: false }), { type: 'danger', label: 'False' }],
+            [
+                'positive sentiment',
+                makeRun({
+                    evaluation_type: 'sentiment',
+                    result: null,
+                    sentiment_label: 'positive',
+                    sentiment_score: 0.91,
+                }),
+                { type: 'success', label: 'Positive' },
+            ],
+            [
+                'neutral sentiment',
+                makeRun({
+                    evaluation_type: 'sentiment',
+                    result: null,
+                    sentiment_label: 'neutral',
+                    sentiment_score: 0.67,
+                }),
+                { type: 'none', label: 'Neutral' },
+            ],
+            [
+                'negative sentiment',
+                makeRun({
+                    evaluation_type: 'sentiment',
+                    result: null,
+                    sentiment_label: 'negative',
+                    sentiment_score: 0.82,
+                }),
+                { type: 'danger', label: 'Negative' },
+            ],
+            [
+                'unknown sentiment',
+                makeRun({ evaluation_type: 'sentiment', result: null, sentiment_label: null, sentiment_score: null }),
+                { type: 'muted', label: 'Unknown' },
+            ],
+        ])('%s', (_name, run, expected) => {
+            const props = getEvalBadgeProps(run)
+            expect(props.type).toBe(expected.type)
+            expect(props.label).toBe(expected.label)
+            expect(props.icon).toBeTruthy()
+        })
+
+        it('prioritizes failed status over result value', () => {
+            const props = getEvalBadgeProps(makeRun({ status: 'failed', result: true }))
+            expect(props.label).toBe('Error')
+        })
+
+        it('prioritizes running status over result value', () => {
+            const props = getEvalBadgeProps(makeRun({ status: 'running', result: true }))
+            expect(props.label).toBe('Running')
+        })
+    })
+
+    describe('getEvaluationResultDisplay polarity', () => {
+        it('keeps the True label but marks a detector true result as danger', () => {
+            const run = { status: 'completed', result: true, skipped: false } as any
+            expect(getEvaluationResultDisplay(run, { trueIsFailure: true })).toMatchObject({
+                type: 'danger',
+                label: 'True',
+            })
+            expect(getEvaluationResultDisplay(run)).toMatchObject({ type: 'success', label: 'True' })
+        })
+
+        it('sorts a detector false result above its true result', () => {
+            const trueRun = { status: 'completed', result: true, skipped: false } as any
+            const falseRun = { status: 'completed', result: false, skipped: false } as any
+            expect(getEvaluationResultSortValue(falseRun, { trueIsFailure: true })).toBeGreaterThan(
+                getEvaluationResultSortValue(trueRun, { trueIsFailure: true })
+            )
+        })
+    })
+
+    describe('isSentimentRun', () => {
+        it.each([
+            ['evaluation type', makeRun({ evaluation_type: 'sentiment' })],
+            ['result type', makeRun({ result_type: 'sentiment' })],
+            ['sentiment label', makeRun({ sentiment_label: 'negative' })],
+        ])('detects sentiment by %s', (_label, run) => {
+            expect(isSentimentRun(run)).toBe(true)
+        })
+
+        it('returns false for boolean evaluation runs', () => {
+            expect(isSentimentRun(makeRun())).toBe(false)
+        })
+    })
+})

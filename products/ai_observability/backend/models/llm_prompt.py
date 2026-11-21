@@ -1,0 +1,221 @@
+from typing import Any
+
+from django.db import models, transaction
+from django.db.models import Count, DateTimeField, IntegerField, OuterRef, QuerySet, Subquery, UUIDField
+from django.db.models.signals import post_delete, post_save
+from django.dispatch import receiver
+from django.utils import timezone
+
+from posthog.exceptions_capture import capture_exception
+from posthog.llm_prompt import normalize_prompt_to_string
+from posthog.models.activity_logging.model_activity import ModelActivityMixin
+from posthog.models.utils import UUIDModel
+
+from products.ai_observability.backend.markdown_outline import get_markdown_outline
+
+
+def get_prompt_outline(value: Any) -> list[dict[str, Any]]:
+    """Extract a flat list of markdown headings from a prompt payload.
+
+    Agents consuming the MCP/API can use this as a lightweight table of contents
+    without pulling the full prompt content. Returns `[]` for non-markdown
+    payloads (e.g. message arrays serialized to JSON).
+    """
+    text = normalize_prompt_to_string(value)
+    return get_markdown_outline(text)
+
+
+class LLMPrompt(UUIDModel):
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["team", "name", "version"],
+                condition=models.Q(deleted=False),
+                name="unique_llm_prompt_version_per_team",
+            ),
+            models.UniqueConstraint(
+                fields=["team", "name"],
+                condition=models.Q(deleted=False, is_latest=True),
+                name="unique_llm_prompt_latest_per_team",
+            ),
+        ]
+        db_table = "posthog_llmprompt"
+
+    name = models.CharField(max_length=255)
+
+    # The prompt content as JSON (currently a string, may expand to array of objects)
+    prompt = models.JSONField()
+
+    # Schemaless JSON object with model parameters or any agent configuration (e.g. model,
+    # temperature, tools). Versioned with the prompt: immutable per row, changed via publish.
+    config = models.JSONField(null=True, blank=True)
+
+    version = models.PositiveIntegerField(default=1)
+    is_latest = models.BooleanField(default=True)
+
+    # Optional "what changed" note set when the version is published; immutable like the rest of the row
+    version_description = models.CharField(max_length=400, null=True, blank=True)
+
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+")
+    created_by = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    deleted = models.BooleanField(default=False)
+
+
+class LLMPromptLabel(ModelActivityMixin, UUIDModel):
+    """A movable pointer from a name (e.g. "production") to exactly one version of a prompt.
+
+    Version rows are immutable; releasing a version means pointing a label at it and
+    rolling back means pointing it back. The (team, prompt_name, name) uniqueness is
+    what keeps fetch-by-label single-valued.
+
+    Deliberately not on TeamScopedRootMixin: LLMPrompt stores raw (possibly child-env)
+    team ids, and the mixin's canonical-team rewrite would put labels in a different
+    team-space than the prompt rows they point into. Migrate to fail-closed scoping
+    together with LLMPrompt.
+    """
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["team", "prompt_name", "name"],
+                name="unique_llm_prompt_label_per_prompt",
+            ),
+        ]
+        db_table = "posthog_llmpromptlabel"
+
+    activity_logging_on_delete = True
+
+    name = models.CharField(max_length=128)
+    # Prompts have no parent entity — version rows are grouped by name, so the label
+    # keys the prompt family by name and points at one version row via the FK below.
+    prompt_name = models.CharField(max_length=255)
+    prompt = models.ForeignKey(LLMPrompt, on_delete=models.CASCADE, related_name="labels")
+
+    # db_constraint=False: posthog_team / posthog_user are hot tables — adding a real FK
+    # constraint locks the parent table during migration.
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, db_constraint=False, related_name="+")
+    created_by = models.ForeignKey(
+        "posthog.User", on_delete=models.SET_NULL, null=True, blank=True, db_constraint=False, related_name="+"
+    )
+
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class LLMPromptDependency(UUIDModel):
+    """One `@@@prompt:...@@@` reference found in a prompt version's content.
+
+    Rows are written when a version is created and are immutable like the
+    version row they belong to. The fetch path does not read this table; it
+    re-parses the content. The table exists for validation (reference and
+    nesting checks at publish), archive protection, and "used by" lookups,
+    all of which need the reverse direction: who references prompt X?
+
+    Like LLMPromptLabel, `child_name` keys the referenced prompt family by
+    name rather than FK, because prompts have no parent entity and the
+    referenced family's version rows keep changing.
+
+    Also like LLMPromptLabel, deliberately not on TeamScopedRootMixin: rows
+    must stay in the same team-space as the LLMPrompt rows they point into
+    (see the LLMPromptLabel docstring). Migrate all three models together.
+    """
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(child_version__isnull=False, child_label__isnull=True)
+                | models.Q(child_version__isnull=True, child_label__isnull=False),
+                name="llm_prompt_dependency_version_xor_label",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["team", "child_name"], name="llm_prompt_dep_team_child"),
+        ]
+        db_table = "posthog_llmpromptdependency"
+
+    prompt = models.ForeignKey(LLMPrompt, on_delete=models.CASCADE, related_name="references")
+    parent_name = models.CharField(max_length=255)
+    child_name = models.CharField(max_length=255)
+    child_version = models.PositiveIntegerField(null=True, blank=True)
+    child_label = models.CharField(max_length=128, null=True, blank=True)
+
+    # db_constraint=False for the same reason as LLMPromptLabel: a real FK to the
+    # hot posthog_team table locks the parent during migration.
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, db_constraint=False, related_name="+")
+
+    created_at = models.DateTimeField(default=timezone.now)
+
+
+def annotate_llm_prompt_version_history_metadata(
+    queryset: QuerySet[LLMPrompt], *, deleted: bool = False
+) -> QuerySet[LLMPrompt]:
+    # With deleted=True the metadata describes an archived prompt's own version
+    # set, since none of its rows are active.
+    active_versions = LLMPrompt.objects.filter(team_id=OuterRef("team_id"), name=OuterRef("name"), deleted=deleted)
+
+    version_count = Subquery(
+        active_versions.values("name").annotate(count=Count("id")).values("count")[:1],
+        output_field=IntegerField(),
+    )
+    latest_version = Subquery(
+        active_versions.order_by("-version", "-created_at", "-id").values("version")[:1],
+        output_field=IntegerField(),
+    )
+    first_version_created_at = Subquery(
+        active_versions.filter(version=1).order_by("created_at", "id").values("created_at")[:1],
+        output_field=DateTimeField(),
+    )
+    first_version_id = Subquery(
+        active_versions.filter(version=1).order_by("created_at", "id").values("id")[:1],
+        output_field=UUIDField(),
+    )
+
+    return queryset.annotate(
+        version_count=version_count,
+        latest_version=latest_version,
+        first_version_created_at=first_version_created_at,
+        first_version_id=first_version_id,
+    )
+
+
+@receiver(post_save, sender=LLMPrompt)
+@receiver(post_delete, sender=LLMPrompt)
+def invalidate_llm_prompt_cache(sender: type[LLMPrompt], instance: LLMPrompt, **kwargs) -> None:
+    team_id = instance.team_id
+
+    def clear_cache() -> None:
+        from posthog.storage.llm_prompt_cache import invalidate_prompt_latest_cache, invalidate_prompt_version_cache
+
+        try:
+            invalidate_prompt_latest_cache(team_id, instance.name)
+            invalidate_prompt_version_cache(team_id, instance.name, instance.version)
+        except Exception as err:
+            capture_exception(err)
+
+    transaction.on_commit(clear_cache)
+
+
+@receiver(post_save, sender=LLMPromptLabel)
+@receiver(post_delete, sender=LLMPromptLabel)
+def invalidate_llm_prompt_label_cache(sender: type[LLMPromptLabel], instance: LLMPromptLabel, **kwargs) -> None:
+    # Label pointer changes never touch LLMPrompt rows, so the receiver above can't cover
+    # them — without this, a moved label would keep serving the old version from cache.
+    # post_save covers create (clears a cached 404 miss) and move; post_delete covers
+    # removal, including archive's queryset delete.
+    team_id = instance.team_id
+    prompt_name = instance.prompt_name
+    label_name = instance.name
+
+    def clear_cache() -> None:
+        from posthog.storage.llm_prompt_cache import invalidate_prompt_label_cache
+
+        try:
+            invalidate_prompt_label_cache(team_id, prompt_name, label_name)
+        except Exception as err:
+            capture_exception(err)
+
+    transaction.on_commit(clear_cache)

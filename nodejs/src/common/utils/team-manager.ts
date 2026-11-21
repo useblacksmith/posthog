@@ -1,0 +1,265 @@
+import { Properties } from '~/plugin-scaffold'
+import { OrganizationAvailableFeature, ProjectId, Team } from '~/types'
+
+import { PostgresRouter, PostgresUse } from './db/postgres'
+import { LazyLoader, LoadOptions, LoaderRetryOptions } from './lazy-loader'
+import { logger } from './logger'
+import { captureTeamEvent } from './posthog'
+
+type RawTeam = Omit<Team, 'available_features'> & {
+    available_product_feature_keys: unknown
+}
+
+// One team's row must not throw, because a throw fails the batched lookup for every team in it.
+function availableFeatures(raw: unknown): OrganizationAvailableFeature[] {
+    if (!Array.isArray(raw)) {
+        return []
+    }
+    return raw.flatMap((key) => (typeof key === 'string' ? [key as OrganizationAvailableFeature] : []))
+}
+
+// Postgres stores team ids in int4 columns. A query that compares one of those columns to a
+// non-integer, or to a number above 2_147_483_647, fails. Team ids start at 1. The check therefore
+// also rejects 0 and negative numbers.
+export function isValidTeamId(value: unknown): value is number {
+    return Number.isInteger(value) && (value as number) > 0 && (value as number) <= 2_147_483_647
+}
+
+export function validTeamIds(keys: string[]): number[] {
+    // parseInt would read "1.5" as team 1. Number keeps it 1.5, which isValidTeamId rejects.
+    return keys.map(Number).filter(isValidTeamId)
+}
+
+// Ids and tokens share one cache, so each key carries its kind. A token that looks like a number
+// must only ever match `api_token`, never `id`.
+const ID_KEY_PREFIX = 'id:'
+const TOKEN_KEY_PREFIX = 'token:'
+
+const idKey = (teamId: number | string): string => `${ID_KEY_PREFIX}${teamId}`
+const tokenKey = (token: string): string => `${TOKEN_KEY_PREFIX}${token}`
+
+export interface TeamManagerOptions {
+    /** Retry transient team-load failures (e.g. a Postgres pooler blip) instead of letting them propagate. */
+    loaderRetry?: LoaderRetryOptions
+}
+
+/**
+ * Looks up Teams by id or token, backed by a Postgres-loaded lazy cache.
+ * Pure business surface — no `start` / `stop`. Callers that need to manage
+ * its lifetime as part of a `Lifecycle` use `TeamManagerComponent`.
+ */
+export class TeamManager {
+    private lazyLoader: LazyLoader<Team>
+
+    constructor(
+        private postgres: PostgresRouter,
+        options?: TeamManagerOptions
+    ) {
+        this.lazyLoader = new LazyLoader({
+            name: 'TeamManager',
+            refreshAgeMs: 2 * 60 * 1000, // 2 minute
+            refreshJitterMs: 30 * 1000, // 30 seconds
+            loaderRetry: options?.loaderRetry,
+            loader: async (keys: string[]) => {
+                return await this.fetchTeams(keys)
+            },
+        })
+    }
+
+    public async getTeam(teamId: number): Promise<Team | null> {
+        return this.lazyLoader.get(idKey(teamId))
+    }
+
+    public async getTeamByToken(token: string): Promise<Team | null> {
+        return this.lazyLoader.get(tokenKey(token))
+    }
+
+    public async getTeams(teamIds: number[]): Promise<Record<string, Team | null>> {
+        const loaded = await this.lazyLoader.getMany(teamIds.map(idKey))
+        return Object.fromEntries(teamIds.map((teamId) => [String(teamId), loaded[idKey(teamId)] ?? null]))
+    }
+
+    public async getTeamsByTokens(tokens: string[], options?: LoadOptions): Promise<Record<string, Team | null>> {
+        const loaded = await this.lazyLoader.getMany(tokens.map(tokenKey), options)
+        return Object.fromEntries(tokens.map((token) => [token, loaded[tokenKey(token)] ?? null]))
+    }
+
+    public async hasAvailableFeature(teamId: number, feature: OrganizationAvailableFeature): Promise<boolean> {
+        const team = await this.getTeam(teamId)
+        return team?.available_features.includes(feature) || false
+    }
+
+    // `ingested_event` means "this project received data", so logs, traces and metrics set it too.
+    public async setTeamsIngestedData(teamIds: Iterable<number>): Promise<void> {
+        await Promise.all(
+            [...new Set(teamIds)].map(async (teamId) => {
+                try {
+                    const team = await this.getTeam(teamId)
+                    if (team) {
+                        await this.setTeamIngestedEvent(team, {})
+                    }
+                } catch (error) {
+                    logger.error('⚠️', 'Failed to set ingested_event', { teamId, error })
+                }
+            })
+        )
+    }
+
+    public async setTeamIngestedEvent(team: Team, properties: Properties): Promise<void> {
+        if (!team.ingested_event) {
+            // The cached team can be stale long after the first write, so this fires repeatedly for
+            // a team that is already flagged. The guard makes those repeats match zero rows, which
+            // writes nothing and leaves no dead tuple behind on a hot row.
+            const updateResult = await this.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `UPDATE posthog_team SET ingested_event = $1 WHERE id = $2 AND NOT ingested_event`,
+                [true, team.id],
+                'setTeamIngestedEvent'
+            )
+
+            // Both keys, because a team is cached under its id and its token but ingestion only ever
+            // looks it up by token - refreshing the id alone leaves the entry this worker reads stale.
+            this.lazyLoader.markForRefresh([idKey(team.id), tokenKey(team.api_token)])
+
+            if ((updateResult.rowCount ?? 0) === 0) {
+                // Another worker (or an earlier event seen through a stale cache) already flipped
+                // the flag - skip the first-event side effects so they fire exactly once per team.
+                return
+            }
+
+            // The flag is already committed and no later event retries these, so a throw here loses
+            // the team's first-event capture for good. Swallow it and leave a trail instead.
+            try {
+                const organizationMembers = await this.postgres.query(
+                    PostgresUse.COMMON_WRITE,
+                    'SELECT distinct_id FROM posthog_user JOIN posthog_organizationmembership ON posthog_user.id = posthog_organizationmembership.user_id WHERE organization_id = $1',
+                    [team.organization_id],
+                    'posthog_organizationmembership'
+                )
+
+                const distinctIds: { distinct_id: string }[] = organizationMembers.rows
+                for (const { distinct_id } of distinctIds) {
+                    captureTeamEvent(
+                        team,
+                        'first team event ingested',
+                        {
+                            $update_person_last_seen_at: false,
+                            sdk: properties.$lib,
+                            realm: properties.realm,
+                            host: properties.$host,
+                        },
+                        distinct_id
+                    )
+                }
+            } catch (error) {
+                logger.error('⚠️', 'Failed to capture first team event ingested', { teamId: team.id, error })
+            }
+        }
+    }
+
+    private async fetchTeams(keys: string[]): Promise<Record<string, Team | null>> {
+        const teamIds: number[] = []
+        const tokens: string[] = []
+        for (const key of keys) {
+            if (key.startsWith(ID_KEY_PREFIX)) {
+                const rawId = key.slice(ID_KEY_PREFIX.length)
+                if (/^\d{1,10}$/.test(rawId)) {
+                    const parsed = parseInt(rawId)
+                    if (isValidTeamId(parsed)) {
+                        teamIds.push(parsed)
+                    }
+                }
+            } else if (key.startsWith(TOKEN_KEY_PREFIX)) {
+                tokens.push(key.slice(TOKEN_KEY_PREFIX.length))
+            }
+        }
+
+        const result = await this.postgres.query<RawTeam>(
+            PostgresUse.COMMON_READ,
+            `SELECT
+                t.id,
+                t.project_id,
+                t.uuid,
+                t.organization_id,
+                t.name,
+                t.anonymize_ips,
+                t.api_token,
+                t.secret_api_token,
+                t.session_recording_opt_in,
+                t.person_processing_opt_out,
+                t.heatmaps_opt_in,
+                t.ingested_event,
+                t.person_display_name_properties,
+                t.cookieless_server_hash_mode,
+                t.timezone,
+                t.logs_settings,
+                t.extra_settings,
+                extract('epoch' from t.drop_events_older_than) as drop_events_older_than_seconds,
+                COALESCE(cfg.minimal_flag_called_events, false) AS minimal_flag_called_events,
+                COALESCE(ocfg.flag_evaluations_mode, 0) AS flag_evaluations_mode,
+                -- The keys are the only part of available_product_features a caller reads. Picking
+                -- them out here returns a text[], which the pg driver reads with its plain array
+                -- parser. Selecting the jsonb[] column makes the driver JSON-parse every feature
+                -- object of every row, and an organization holds about a hundred of them.
+                ARRAY(
+                    SELECT feature->>'key'
+                    FROM unnest(o.available_product_features) AS feature
+                    WHERE feature->>'key' IS NOT NULL
+                ) AS available_product_feature_keys
+            FROM posthog_team t
+            JOIN posthog_organization o ON o.id = t.organization_id
+            LEFT JOIN feature_flags_teamfeatureflagsconfig cfg ON cfg.team_id = t.id
+            LEFT JOIN feature_flags_organizationfeatureflagsconfig ocfg ON ocfg.organization_id = t.organization_id
+            WHERE t.id = ANY($1) OR t.api_token = ANY($2)
+            `,
+            [teamIds, tokens],
+            'fetch-teams-with-features'
+        )
+
+        // Initialize result record with nulls for all requested keys
+        const resultRecord: Record<string, Team | null> = {}
+        for (const key of keys) {
+            resultRecord[key] = null
+        }
+
+        // Fill in actual teams where they exist
+        result.rows.forEach((row) => {
+            const { available_product_feature_keys, ...teamPartial } = row
+            const team: Team = {
+                ...teamPartial,
+                // NOTE: The postgres lib loads the bigint as a string, so we need to cast it to a ProjectId
+                project_id: Number(teamPartial.project_id) as ProjectId,
+                // NOTE: extract('epoch' from interval) returns a numeric which can be parsed as string by postgres driver
+                drop_events_older_than_seconds:
+                    teamPartial.drop_events_older_than_seconds !== null
+                        ? Number(teamPartial.drop_events_older_than_seconds)
+                        : null,
+                available_features: availableFeatures(available_product_feature_keys),
+            }
+            resultRecord[idKey(row.id)] = team
+            resultRecord[tokenKey(row.api_token)] = team
+        })
+
+        return resultRecord
+    }
+}
+
+/**
+ * Lifecycle owner for `TeamManager`. `start()` constructs a fresh
+ * `TeamManager` and hands it back along with a no-op stop callback. The
+ * resulting `TeamManager` has no `start`/`stop` of its own — its lifetime
+ * is fully controlled through this Manager.
+ */
+export class TeamManagerComponent {
+    constructor(
+        private postgres: PostgresRouter,
+        private options?: TeamManagerOptions
+    ) {}
+
+    start(): Promise<{ value: TeamManager; stop: () => Promise<void> }> {
+        return Promise.resolve({
+            value: new TeamManager(this.postgres, this.options),
+            stop: () => Promise.resolve(),
+        })
+    }
+}

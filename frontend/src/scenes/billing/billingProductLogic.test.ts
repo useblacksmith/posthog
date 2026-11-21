@@ -1,0 +1,634 @@
+/* oxlint-disable react-hooks/rules-of-hooks -- useMocks is a test helper, not a React hook */
+import { waitFor } from '@testing-library/react'
+import { router } from 'kea-router'
+import { expectLogic } from 'kea-test-utils'
+import posthog from 'posthog-js'
+
+import { dayjs } from 'lib/dayjs'
+// Imported from the source module rather than the `@posthog/lemon-ui` barrel so the spy below
+// replaces `.error` on the same `lemonToast` singleton the logic calls at runtime (see the same
+// note in paymentEntryLogic.test.ts).
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { billingLogic } from 'lib/logic/billing/billingLogic'
+import { billingProductLogic } from 'scenes/billing/billingProductLogic'
+import { paymentEntryLogic } from 'scenes/billing/paymentEntryLogic'
+import { organizationLogic } from 'scenes/organizationLogic'
+
+import { billingJson } from '~/mocks/fixtures/_billing'
+import { defaultPlatformAddons } from '~/mocks/fixtures/_billing_platform_addons'
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+import { BillingPlan, BillingProductV2AddonType, BillingProductV2Type, BillingType, SurveyEventName } from '~/types'
+
+import { BillingGaugeItemKind, BillingGaugeItemType } from './types'
+
+const productByType = (type: string): BillingProductV2Type =>
+    billingJson.products.find((p) => p.type === type) as BillingProductV2Type
+
+describe('billingProductLogic', () => {
+    const mounted: ReturnType<typeof billingProductLogic.build>[] = []
+
+    const seedBilling = async (
+        customLimits: BillingType['custom_limits_usd'],
+        nextPeriodLimits?: BillingType['next_period_custom_limits_usd']
+    ): Promise<void> => {
+        useMocks({
+            get: {
+                '/api/billing': () => [
+                    200,
+                    {
+                        ...billingJson,
+                        custom_limits_usd: customLimits,
+                        next_period_custom_limits_usd: nextPeriodLimits,
+                    },
+                ],
+            },
+        })
+        billingLogic.mount()
+        await expectLogic(billingLogic, () => billingLogic.actions.loadBilling()).toFinishAllListeners()
+    }
+
+    beforeEach(() => {
+        initKeaTests()
+    })
+
+    afterEach(() => {
+        mounted.forEach((logic) => logic.unmount())
+        mounted.length = 0
+    })
+
+    const mountProduct = (type: string): ReturnType<typeof billingProductLogic.build> => {
+        const logic = billingProductLogic({ product: productByType(type) })
+        logic.mount()
+        mounted.push(logic)
+        return logic
+    }
+
+    describe('product deep-link scrolling', () => {
+        it('does not retrigger a stale product scroll when another product logic mounts later', () => {
+            billingLogic.mount()
+            billingLogic.actions.setScrollToProductKey('product_analytics' as any)
+
+            const scrollIntoView = jest.fn()
+            const productAnalyticsLogic = billingProductLogic({
+                product: productByType('product_analytics'),
+                productRef: { current: { scrollIntoView } as unknown as HTMLDivElement },
+            })
+
+            jest.useFakeTimers()
+            try {
+                productAnalyticsLogic.mount()
+                mounted.push(productAnalyticsLogic)
+                jest.runOnlyPendingTimers()
+
+                expect(scrollIntoView).toHaveBeenCalledTimes(1)
+                expect(productAnalyticsLogic.values.scrollToProductKey).toBe(null)
+
+                const sessionReplayLogic = mountProduct('session_replay')
+                expect(sessionReplayLogic.values.scrollToProductKey).toBe(null)
+                jest.runOnlyPendingTimers()
+
+                expect(scrollIntoView).toHaveBeenCalledTimes(1)
+            } finally {
+                jest.useRealTimers()
+            }
+        })
+    })
+
+    describe('custom billing limit resolution', () => {
+        // $0 is a real, meaningful limit (drop all usage) — it must not be conflated with
+        // "no limit set" (unbounded spend). This guards the `=== 0` handling in the
+        // customLimitUsd / hasCustomLimitSet selectors.
+        it.each([
+            ['no custom limit set', {}, null, false],
+            ['a positive dollar limit', { product_analytics: 500 }, 500, true],
+            ['a $0 limit', { product_analytics: 0 }, 0, true],
+            ['a limit set under the usage key', { events: 200 }, 200, true],
+        ] as const)('resolves %s', async (_name, customLimits, expectedLimit, expectedHasSet) => {
+            await seedBilling(customLimits)
+            const logic = mountProduct('product_analytics')
+
+            expect(logic.values.customLimitUsd).toBe(expectedLimit)
+            expect(logic.values.hasCustomLimitSet).toBe(expectedHasSet)
+        })
+
+        // Billing refuses limits for a product flagged `no_billing_limit`. A stale limit in the
+        // response must still not reach the limit control or draw a limit marker on either gauge.
+        it.each([
+            ['keeps every limit of a product that allows one', false, 500, 400, true],
+            ['drops every limit of a product without billing limits', true, null, null, false],
+        ] as const)('%s', async (_name, noBillingLimit, expectedLimit, expectedNextPeriodLimit, expectLimitShown) => {
+            await seedBilling({ product_analytics: 500 }, { product_analytics: 400 })
+            const product: BillingProductV2Type = {
+                ...productByType('product_analytics'),
+                no_billing_limit: noBillingLimit,
+            }
+            const logic = billingProductLogic({ product })
+            logic.mount()
+            mounted.push(logic)
+
+            const hasLimitMarker = (items: BillingGaugeItemType[]): boolean =>
+                items.some((item) => item.type === BillingGaugeItemKind.BillingLimit)
+            expect(logic.values).toMatchObject({
+                customLimitUsd: expectedLimit,
+                hasCustomLimitSet: expectLimitShown,
+                billingLimitNextPeriod: expectedNextPeriodLimit,
+            })
+            expect(logic.values.billingLimitAsUsage > 0).toBe(expectLimitShown)
+            expect(hasLimitMarker(logic.values.billingGaugeItems)).toBe(expectLimitShown)
+            expect(hasLimitMarker(logic.values.combinedMonetaryGaugeItems)).toBe(expectLimitShown)
+        })
+    })
+
+    describe('product variants', () => {
+        // No Logs fixture exists, so reuse replay's shape: a variant product with a usage-based add-on.
+        const replay = productByType('session_replay')
+        const addonFixture = replay.addons[0]
+        const noCurrentPlan = addonFixture.plans.map((plan) => ({ ...plan, current_plan: false }))
+
+        it.each([
+            ['lists a subscribed add-on', { subscribed: true, plans: noCurrentPlan }, true],
+            ['lists an add-on on a current plan', { subscribed: false, plans: addonFixture.plans }, true],
+            ['skips an add-on the customer does not hold', { subscribed: false, plans: noCurrentPlan }, false],
+        ])('%s', (_name, addonState, listed) => {
+            const logs: BillingProductV2Type = {
+                ...replay,
+                type: 'logs',
+                addons: [{ ...addonFixture, type: 'logs_retention_custom', ...addonState }],
+            }
+            const logic = billingProductLogic({ product: logs })
+            logic.mount()
+            mounted.push(logic)
+
+            expect(logic.values.productVariants?.map(({ key, displayName }) => ({ key, displayName }))).toEqual([
+                { key: 'logs', displayName: 'Logs ingestion (14-day retention)' },
+                ...(listed ? [{ key: 'logs_retention_custom', displayName: 'Custom retention' }] : []),
+            ])
+        })
+    })
+
+    describe('companions', () => {
+        const replay = productByType('session_replay')
+        const logs: BillingProductV2Type = {
+            ...replay,
+            type: 'logs',
+            name: 'Logs',
+            current_amount_usd: '100.00',
+            projected_amount_usd_with_limit: '200.00',
+        }
+        const companion = (type: string, companionOf: string, held: boolean): BillingProductV2Type => ({
+            ...replay,
+            type,
+            companion_of: companionOf,
+            inclusion_only: true,
+            no_billing_limit: true,
+            addons: [],
+            usage_limit: null,
+            subscribed: held,
+            plans: replay.plans.map((plan) => ({ ...plan, current_plan: false })),
+            current_amount_usd: '10.00',
+            projected_amount_usd: '20.00',
+        })
+
+        const seedProducts = async (products: BillingProductV2Type[], discountPercent?: number): Promise<void> => {
+            useMocks({
+                get: {
+                    '/api/billing': () => [200, { ...billingJson, products, discount_percent: discountPercent }],
+                },
+            })
+            billingLogic.mount()
+            await expectLogic(billingLogic, () => billingLogic.actions.loadBilling()).toFinishAllListeners()
+        }
+
+        const mountLogs = (product: BillingProductV2Type = logs): ReturnType<typeof billingProductLogic.build> => {
+            const logic = billingProductLogic({ product })
+            logic.mount()
+            mounted.push(logic)
+            return logic
+        }
+
+        it('lists only the held companions of this parent', async () => {
+            await seedProducts([
+                logs,
+                companion('logs_retention_custom', 'logs', true),
+                companion('logs_not_held', 'logs', false),
+                companion('replay_companion', 'session_replay', true),
+            ])
+
+            expect(mountLogs().values.heldCompanions.map((p) => p.type)).toEqual(['logs_retention_custom'])
+        })
+
+        it('lists nothing when the parent holds no companion', async () => {
+            await seedProducts([logs, companion('logs_not_held', 'logs', false)])
+
+            expect(mountLogs().values.heldCompanions).toEqual([])
+        })
+
+        it('totals the header amounts and the held companions after the discount', async () => {
+            await seedProducts([logs, companion('logs_retention_custom', 'logs', true)], 10)
+            const logic = mountLogs()
+
+            expect(logic.values.combinedMonetaryData).toMatchObject({ currentTotal: 90, projectedTotal: 180 })
+            expect(logic.values.totalsIncludingCompanions).toEqual({ currentTotal: 99, projectedTotal: 198 })
+        })
+
+        it('rounds a half-cent header amount the way the card displays it', async () => {
+            const halfCentLogs = { ...logs, current_amount_usd: '2.01', projected_amount_usd_with_limit: '2.01' }
+            await seedProducts(
+                [
+                    halfCentLogs,
+                    {
+                        ...companion('logs_retention_custom', 'logs', true),
+                        current_amount_usd: '1.00',
+                        projected_amount_usd: '1.00',
+                    },
+                ],
+                50
+            )
+            const logic = mountLogs(halfCentLogs)
+
+            // The header shows $1.01 for $1.005, so the total must be $1.01 + $0.50.
+            expect(logic.values.totalsIncludingCompanions).toEqual({ currentTotal: 1.51, projectedTotal: 1.51 })
+        })
+
+        it('leaves a held companion that can have its own billing limit out of the amounts and the total', async () => {
+            await seedProducts([
+                logs,
+                companion('logs_retention_custom', 'logs', true),
+                { ...companion('logs_limited_extra', 'logs', true), no_billing_limit: undefined },
+            ])
+            const logic = mountLogs()
+
+            expect(logic.values.heldCompanions.map((p) => p.type)).toEqual([
+                'logs_retention_custom',
+                'logs_limited_extra',
+            ])
+            expect(logic.values.noLimitCompanionAmounts.map(({ companion }) => companion.type)).toEqual([
+                'logs_retention_custom',
+            ])
+            expect(logic.values.totalsIncludingCompanions).toEqual({ currentTotal: 110, projectedTotal: 220 })
+        })
+    })
+
+    describe('unsubscribe survey state', () => {
+        it.each([
+            {
+                name: 'cancelling a paid plan',
+                subscriptionLevel: 'paid' as const,
+                productType: 'product_analytics',
+                expected: ['free-20230117'],
+            },
+            {
+                name: 'unsubscribing from product analytics alone',
+                subscriptionLevel: 'custom' as const,
+                productType: 'product_analytics',
+                expected: ['free-20230117', 'scale-addon-20250429'],
+            },
+            {
+                name: 'removing the platform package',
+                subscriptionLevel: 'paid' as const,
+                productType: BillingPlan.Scale,
+                expected: ['paid-20240111'],
+            },
+            {
+                name: 'unsubscribing from another product',
+                subscriptionLevel: 'custom' as const,
+                productType: 'session_replay',
+                expected: null,
+            },
+        ])(
+            'compares events retention against the plans left after $name',
+            async ({ subscriptionLevel, productType, expected }) => {
+                const subscribedScale: BillingProductV2AddonType = {
+                    ...scaleAddon,
+                    subscribed: true,
+                    plans: scaleAddon.plans.map((plan) => ({ ...plan, current_plan: true })),
+                }
+                useMocks({
+                    get: {
+                        '/api/billing': () => [
+                            200,
+                            {
+                                ...billingJson,
+                                subscription_level: subscriptionLevel,
+                                products: billingJson.products.map((product) =>
+                                    product.type === 'platform_and_support'
+                                        ? { ...product, addons: [subscribedScale] }
+                                        : product
+                                ),
+                            },
+                        ],
+                    },
+                })
+                billingLogic.mount()
+                await expectLogic(billingLogic, () => billingLogic.actions.loadBilling()).toFinishAllListeners()
+                const logic = billingProductLogic({
+                    product: productType === BillingPlan.Scale ? subscribedScale : productByType(productType),
+                })
+                logic.mount()
+                mounted.push(logic)
+
+                expect(
+                    logic.values.eventsRetentionPlansAfterUnsubscribe?.map((plan) => plan?.plan_key ?? null) ?? null
+                ).toEqual(expected)
+            }
+        )
+
+        it('keeps survey responses isolated per product type', async () => {
+            await seedBilling({})
+            const analytics = mountProduct('product_analytics')
+            const replay = mountProduct('session_replay')
+
+            analytics.actions.setSurveyResponse('$survey_response', 'analytics feedback')
+            analytics.actions.toggleSurveyReason('Too expensive')
+            replay.actions.setSurveyResponse('$survey_response', 'replay feedback')
+
+            expect(analytics.values.surveyResponse.$survey_response).toBe('analytics feedback')
+            expect(analytics.values.surveyResponse.$survey_response_2).toEqual(['Too expensive'])
+            expect(replay.values.surveyResponse.$survey_response).toBe('replay feedback')
+            expect(replay.values.surveyResponse.$survey_response_2).toEqual([])
+        })
+
+        // Guards the unsubscribe submit path the deleted Playwright spec covered: confirming
+        // deactivation must POST the product to /api/billing/deactivate, submit the collected
+        // survey on success (deactivateProductSuccess -> reportSurveySent), and clear surveyID so
+        // the modal closes. Fake timers step over the loader's real 2s reload breakpoint.
+        it('deactivates the product, submits the survey, and clears the modal on confirm', async () => {
+            let deactivateBody: any = null
+            useMocks({
+                get: { '/api/billing': () => [200, billingJson] },
+                post: {
+                    '/api/billing/deactivate': async ({ request }) => {
+                        deactivateBody = await request.json()
+                        return [200, billingJson]
+                    },
+                },
+            })
+            billingLogic.mount()
+            await expectLogic(billingLogic, () => billingLogic.actions.loadBilling()).toFinishAllListeners()
+
+            const captureSpy = jest.spyOn(posthog, 'capture').mockReturnValue(undefined as any)
+            const logic = mountProduct('product_analytics')
+            logic.actions.setSurveyID('billing-unsubscribe-survey')
+            logic.actions.toggleSurveyReason('Too expensive')
+            logic.actions.setSurveyResponse('$survey_response', 'Product analytics')
+
+            jest.useFakeTimers()
+            try {
+                const expectation = expectLogic(logic, () => {
+                    logic.actions.deactivateProduct('product_analytics')
+                }).toDispatchActions([
+                    'deactivateProduct',
+                    'loadBilling',
+                    'deactivateProductSuccess',
+                    'reportSurveySent',
+                    'setSurveyID',
+                ])
+                // Run past the post-report breakpoint(400) so the scroll runs. The scene element
+                // is absent in jsdom, so this also guards that indexing it stays safe: without the
+                // optional-chain guard, scrollIntoView on the missing element throws a TypeError.
+                await jest.advanceTimersByTimeAsync(2500)
+                await expectation
+
+                expect(deactivateBody).toEqual({ products: 'product_analytics' })
+                expect(captureSpy).toHaveBeenCalledWith(SurveyEventName.SENT, {
+                    $survey_id: 'billing-unsubscribe-survey',
+                    $survey_response: 'Product analytics',
+                    $survey_response_2: ['Too expensive'],
+                })
+                expect(logic.values.surveyID).toBe('')
+            } finally {
+                jest.useRealTimers()
+                captureSpy.mockRestore()
+            }
+        })
+    })
+})
+
+// Scale is a flat-rate platform add-on ($750/mo) — the exact shape that used to charge immediately.
+const scaleAddon = defaultPlatformAddons.find((addon) => addon.type === BillingPlan.Scale) as BillingProductV2AddonType
+
+describe('billingProductLogic — confirm purchase modal', () => {
+    let logic: ReturnType<typeof billingProductLogic.build>
+    let toastErrorSpy: jest.SpyInstance
+
+    const seedBilling = async (billing: Partial<BillingType>): Promise<void> => {
+        useMocks({ get: { '/api/billing': () => [200, billing] } })
+        billingLogic.mount()
+        await expectLogic(billingLogic, () => billingLogic.actions.loadBilling()).toFinishAllListeners()
+    }
+
+    beforeEach(async () => {
+        initKeaTests()
+        toastErrorSpy = jest.spyOn(lemonToast, 'error').mockImplementation(() => ({ id: 'x' }) as any)
+        // A card-on-file paying customer is the only one who reaches the flat-rate "Add" button.
+        await seedBilling({ customer_id: 'cus_test', subscription_level: 'paid' })
+    })
+
+    afterEach(() => {
+        logic?.unmount()
+        toastErrorSpy.mockRestore()
+    })
+
+    it('opens and closes the modal via show/hide actions', async () => {
+        logic = billingProductLogic({ product: scaleAddon })
+        logic.mount()
+
+        await expectLogic(logic, () => logic.actions.showConfirmPurchaseModal()).toMatchValues({
+            confirmPurchaseModalOpen: true,
+        })
+        await expectLogic(logic, () => logic.actions.hideConfirmPurchaseModal()).toMatchValues({
+            confirmPurchaseModalOpen: false,
+        })
+    })
+
+    it('confirming the purchase activates the add-on with its upgrade plan', async () => {
+        // Respond with an error so activation stops before any real-charge side effects, while still
+        // proving the request fired with the right add-on + plan.
+        const activate = jest.fn(() => [200, { success: false, error: 'stop before charge' }] as [number, unknown])
+        let body: unknown
+        useMocks({
+            post: {
+                '/api/billing/activate': async ({ request }) => {
+                    body = await request.json()
+                    return activate()
+                },
+            },
+        })
+        logic = billingProductLogic({ product: scaleAddon })
+        logic.mount()
+
+        await expectLogic(logic, () => logic.actions.confirmProductPurchase())
+            .toDispatchActions([
+                'confirmProductPurchase',
+                (a) =>
+                    a.type === logic.actionTypes.handleProductUpgrade &&
+                    a.payload.products === `${scaleAddon.type}:${scaleAddon.plans[0].plan_key}`,
+            ])
+            .toFinishAllListeners()
+
+        expect(activate).toHaveBeenCalled()
+        expect(body).toEqual({
+            organization_id: organizationLogic.values.currentOrganization!.id,
+            products: `${scaleAddon.type}:${scaleAddon.plans[0].plan_key}`,
+        })
+    })
+
+    it('refreshes the paid organization and keeps the page params after an add-on purchase', async () => {
+        const organization = organizationLogic.values.currentOrganization!
+        const billingBefore = billingLogic.values.billing
+        const billingReads: (string | null)[] = []
+        useMocks({
+            get: {
+                '/api/billing': ({ request }) => {
+                    billingReads.push(new URL(request.url).searchParams.get('organization_id'))
+                    return [200, { customer_id: 'cus_test', subscription_level: 'paid', has_active_subscription: true }]
+                },
+            },
+            post: { '/api/billing/activate': () => [200, { success: true }] },
+        })
+        router.actions.push('/project/1/replay', { foo: 'bar' })
+        logic = billingProductLogic({ product: scaleAddon })
+        logic.mount()
+        const push = jest.spyOn(router.actions, 'push')
+        try {
+            await expectLogic(logic, () => logic.actions.handleProductUpgrade('scale:scale', '')).toFinishAllListeners()
+            expect(billingReads).toEqual([organization.id])
+            expect(billingLogic.values.billing).not.toBe(billingBefore)
+            expect(billingLogic.values.billing?.has_active_subscription).toBe(true)
+            expect(push).toHaveBeenCalledWith('/project/1/replay', {
+                foo: 'bar',
+                upgraded: 'true',
+                products: 'scale:scale',
+            })
+            expect(toastErrorSpy).not.toHaveBeenCalled()
+        } finally {
+            push.mockRestore()
+        }
+    })
+
+    it('keeps the add-on loading until its activation settles', async () => {
+        let resolveActivation!: (response: [number, unknown]) => void
+        const activate = jest.fn(
+            () =>
+                new Promise<[number, unknown]>((resolve) => {
+                    resolveActivation = resolve
+                })
+        )
+        useMocks({ post: { '/api/billing/activate': activate } })
+        logic = billingProductLogic({ product: scaleAddon })
+        logic.mount()
+        logic.actions.initiateProductUpgrade(scaleAddon, scaleAddon.plans[0], '')
+        await waitFor(() => expect(activate).toHaveBeenCalledTimes(1))
+        expect(logic.values.billingProductLoading).toBe(scaleAddon.type)
+        resolveActivation([200, { success: false, error: 'Stopped before charging' }])
+        await expectLogic(logic).toFinishAllListeners()
+        expect(logic.values.billingProductLoading).toBe(null)
+    })
+
+    it('keeps another selected organization after the original product activation succeeds', async () => {
+        const original = organizationLogic.values.currentOrganization!
+        const selected = { ...original, id: '00000000-0000-4000-8000-000000000002', name: 'Selected organization' }
+        let resolveActivation!: (response: [number, { success: boolean }]) => void
+        const response = new Promise<[number, { success: boolean }]>((resolve) => {
+            resolveActivation = resolve
+        })
+        const activate = jest.fn(() => response)
+        useMocks({ post: { '/api/billing/activate': activate } })
+        logic = billingProductLogic({ product: scaleAddon })
+        logic.mount()
+        const push = jest.spyOn(router.actions, 'push')
+        try {
+            logic.actions.handleProductUpgrade('scale:scale', '/project/1/replay')
+            await waitFor(() => expect(activate).toHaveBeenCalledTimes(1))
+            organizationLogic.actions.loadCurrentOrganizationSuccess(selected)
+            resolveActivation([200, { success: true }])
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(organizationLogic.values.currentOrganization?.id).toBe(selected.id)
+            expect(push).not.toHaveBeenCalled()
+            expect(paymentEntryLogic.values.completedPaymentOrganization).toEqual({
+                id: original.id,
+                name: original.name,
+            })
+            expect(toastErrorSpy).not.toHaveBeenCalled()
+        } finally {
+            push.mockRestore()
+        }
+    })
+
+    it('auto-closes the modal once activation finishes', async () => {
+        useMocks({
+            post: { '/api/billing/activate': () => [200, { success: false, error: 'x' }] as [number, unknown] },
+        })
+        logic = billingProductLogic({ product: scaleAddon })
+        logic.mount()
+        logic.actions.showConfirmPurchaseModal()
+        expect(logic.values.confirmPurchaseModalOpen).toBe(true)
+
+        await expectLogic(logic, () => logic.actions.confirmProductPurchase())
+            .toFinishAllListeners()
+            .toMatchValues({ confirmPurchaseModalOpen: false })
+    })
+
+    describe('credit-aware amount selectors', () => {
+        // Halfway through a billing period, so the $750 Scale plan prorates to ~$375.
+        const seedBillingMidPeriod = async (discountAmountUsd?: string): Promise<void> => {
+            await seedBilling({
+                customer_id: 'cus_test',
+                subscription_level: 'paid',
+                products: [],
+                discount_amount_usd: discountAmountUsd,
+                // Dayjs values serialize to ISO strings in the mocked JSON response, which
+                // billingLogic's parseBillingResponse turns back into Dayjs — same as the real API.
+                billing_period: {
+                    current_period_start: dayjs().subtract(12, 'hour'),
+                    current_period_end: dayjs().add(12, 'hour'),
+                    interval: 'month',
+                },
+            })
+        }
+
+        it('applies the credit balance against the amount due', async () => {
+            await seedBillingMidPeriod('100')
+            logic = billingProductLogic({ product: scaleAddon })
+            logic.mount()
+
+            expect(logic.values.amountDueBeforeCredits).toBeCloseTo(375, 1)
+            expect(logic.values.appliedCreditBalance).toBe(100)
+            expect(logic.values.amountDueToday).toBeCloseTo(275, 1)
+        })
+
+        it('clamps the amount due at zero when the credit balance exceeds the charge', async () => {
+            await seedBillingMidPeriod('1000')
+            logic = billingProductLogic({ product: scaleAddon })
+            logic.mount()
+
+            // Only the amount due is applied — never more (no negative totals).
+            expect(logic.values.appliedCreditBalance).toBeCloseTo(375, 1)
+            expect(logic.values.appliedCreditBalance).toBe(logic.values.amountDueBeforeCredits)
+            expect(logic.values.amountDueToday).toBe(0)
+        })
+
+        it('applies no credit when the customer has no balance', async () => {
+            await seedBillingMidPeriod(undefined)
+            logic = billingProductLogic({ product: scaleAddon })
+            logic.mount()
+
+            expect(logic.values.appliedCreditBalance).toBe(0)
+            expect(logic.values.amountDueToday).toBe(logic.values.amountDueBeforeCredits)
+        })
+    })
+
+    it('does nothing when the product has no upgrade plan', async () => {
+        const activate = jest.fn(() => [200, { success: true }] as [number, unknown])
+        useMocks({ post: { '/api/billing/activate': activate } })
+        const productWithoutPlans = { ...scaleAddon, type: BillingPlan.Boost, plans: [] } as BillingProductV2AddonType
+        logic = billingProductLogic({ product: productWithoutPlans })
+        logic.mount()
+
+        await expectLogic(logic, () => logic.actions.confirmProductPurchase()).toFinishAllListeners()
+
+        expect(activate).not.toHaveBeenCalled()
+    })
+})

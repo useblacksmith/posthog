@@ -1,0 +1,16 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "id": {
+            "description": "The ID of the experiment to get comprehensive results for",
+            "type": "number"
+        },
+        "refresh": {
+            "default": false,
+            "description": "Asks for a blocking calculation. A cached result younger than 24 hours is still returned, so this does not force a recomputation. Defaults to false.",
+            "type": "boolean"
+        }
+    },
+    "required": ["id"],
+    "type": "object"
+}

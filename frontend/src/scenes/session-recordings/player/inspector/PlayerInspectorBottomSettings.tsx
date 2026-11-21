@@ -1,0 +1,138 @@
+import './PlayerInspectorList.scss'
+
+import { useActions, useValues } from 'kea'
+
+import { BaseIcon, IconCheck } from '@posthog/icons'
+
+import { SettingsBar, SettingsMenu, SettingsToggle } from 'lib/components/PanelSettings/PanelSettings'
+import { userPreferencesLogic } from 'lib/logic/userPreferencesLogic'
+import { miniFiltersLogic } from 'scenes/session-recordings/player/inspector/miniFiltersLogic'
+
+import { sessionRecordingPlayerLogic } from '../sessionRecordingPlayerLogic'
+import { playerInspectorLogic } from './playerInspectorLogic'
+
+function HideProperties(): JSX.Element {
+    const { logicProps } = useValues(sessionRecordingPlayerLogic)
+    const inspectorLogic = playerInspectorLogic(logicProps)
+
+    const { hasEventsToDisplay } = useValues(inspectorLogic)
+    const { hasEventsFiltersSelected } = useValues(miniFiltersLogic)
+
+    const { hideNullValues } = useValues(userPreferencesLogic)
+    const { setHideNullValues } = useActions(userPreferencesLogic)
+
+    const { hidePostHogPropertiesInTable } = useValues(userPreferencesLogic)
+    const { setHidePostHogPropertiesInTable } = useActions(userPreferencesLogic)
+
+    return (
+        <SettingsMenu
+            data-attr="inspector-hide-properties-menu"
+            items={[
+                {
+                    label: <>{hidePostHogPropertiesInTable ? <IconCheck /> : <BaseIcon />} Hide PostHog properties</>,
+                    onClick: () => setHidePostHogPropertiesInTable(!hidePostHogPropertiesInTable),
+                    'data-attr': 'inspector-hide-posthog-properties',
+                    active: hidePostHogPropertiesInTable,
+                    disabledReason:
+                        hasEventsToDisplay && hasEventsFiltersSelected ? undefined : 'There are no events in the list',
+                },
+                {
+                    label: <>{hideNullValues ? <IconCheck /> : <BaseIcon />} Hide null values</>,
+                    onClick: () => setHideNullValues(!hideNullValues),
+                    'data-attr': 'inspector-hide-null-values',
+                    active: hideNullValues,
+                    disabledReason:
+                        hasEventsToDisplay && hasEventsFiltersSelected ? undefined : 'There are no events in the list',
+                },
+            ]}
+            label="Hide properties"
+            highlightWhenActive={false}
+        />
+    )
+}
+
+function SyncScrolling(): JSX.Element {
+    const { logicProps } = useValues(sessionRecordingPlayerLogic)
+    const inspectorLogic = playerInspectorLogic(logicProps)
+
+    const { syncScrollPaused } = useValues(inspectorLogic)
+    const { setSyncScrollPaused } = useActions(inspectorLogic)
+
+    return (
+        <SettingsToggle
+            data-attr="inspector-sync-scrolling"
+            title={
+                syncScrollPaused
+                    ? 'Scroll the activity list in sync with playback'
+                    : 'Do not auto-scroll the activity list in sync with playback'
+            }
+            label="Sync scrolling"
+            onClick={() => {
+                setSyncScrollPaused(!syncScrollPaused)
+            }}
+            active={!syncScrollPaused}
+        />
+    )
+}
+
+function ShowOnlyMatching(): JSX.Element {
+    const { logicProps } = useValues(sessionRecordingPlayerLogic)
+    const inspectorLogic = playerInspectorLogic(logicProps)
+
+    const { allItemsByItemType, allowMatchingEventsFilter } = useValues(inspectorLogic)
+
+    const { showOnlyMatching, miniFiltersForType } = useValues(miniFiltersLogic)
+    const { setShowOnlyMatching } = useActions(miniFiltersLogic)
+
+    const hasEventsFiltersSelected = miniFiltersForType('events').some((x) => x.enabled)
+    const hasEventsToDisplay = allItemsByItemType['events']?.length > 0
+
+    return (
+        <SettingsToggle
+            data-attr="inspector-show-only-matching"
+            title={
+                showOnlyMatching
+                    ? 'Show all events for this recording'
+                    : 'Show only events that match the current filters'
+            }
+            label="Show only matching events"
+            active={hasEventsToDisplay && showOnlyMatching && allowMatchingEventsFilter}
+            onClick={() => {
+                setShowOnlyMatching(!showOnlyMatching)
+            }}
+            disabledReason={
+                hasEventsToDisplay && hasEventsFiltersSelected
+                    ? allowMatchingEventsFilter
+                        ? undefined
+                        : 'There are no event filters to match against'
+                    : 'There are no events in the list'
+            }
+        />
+    )
+}
+
+function ShowLineTooltips(): JSX.Element {
+    const { showLineTooltips } = useValues(miniFiltersLogic)
+    const { setShowLineTooltips } = useActions(miniFiltersLogic)
+
+    return (
+        <SettingsToggle
+            data-attr="inspector-line-tooltips"
+            title={showLineTooltips ? 'Hide hover tooltips on inspector lines' : 'Show the full line content on hover'}
+            label="Show line tooltips"
+            onClick={() => setShowLineTooltips(!showLineTooltips)}
+            active={showLineTooltips}
+        />
+    )
+}
+
+export function PlayerInspectorBottomSettings(): JSX.Element {
+    return (
+        <SettingsBar border="top">
+            <SyncScrolling />
+            <ShowOnlyMatching />
+            <ShowLineTooltips />
+            <HideProperties />
+        </SettingsBar>
+    )
+}

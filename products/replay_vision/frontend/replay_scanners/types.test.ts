@@ -1,0 +1,106 @@
+import {
+    type FailureKind,
+    failureRetryGuidance,
+    modelLabel,
+    modelName,
+    modelOptions,
+    modelTierNaming,
+    observationRetryOffer,
+} from './types'
+
+describe('scanner type helpers', () => {
+    describe('failureRetryGuidance', () => {
+        // The retry button is always rendered; this is what decides whether we push it. Getting a kind into the wrong
+        // bucket either discourages the retry that fixes it, or promises one that can only fail the same way.
+        const cases: [FailureKind, boolean, boolean][] = [
+            // kind, worthwhile, carries a hint
+            ['provider_transient', true, false],
+            ['infra_transient', true, false],
+            ['rasterization_failed', true, false],
+            ['orphaned', true, false],
+            ['internal_error', true, false],
+            ['pii_detected', true, false],
+            ['provider_rejected', false, true],
+            ['validation_failed', false, true],
+        ]
+
+        it.each(cases)('classifies %s', (kind, worthwhile, hasHint) => {
+            const guidance = failureRetryGuidance(kind)
+            expect(guidance.worthwhile).toBe(worthwhile)
+            expect(guidance.hint !== null).toBe(hasHint)
+        })
+
+        it('offers the retry for a kind it cannot parse', () => {
+            // A reason the backend added and this build doesn't know yet parses to null. Withholding the retry on no
+            // evidence would strand the user, so the unknown case has to stay encouraging.
+            expect(failureRetryGuidance(null)).toEqual({ worthwhile: true, hint: null })
+        })
+    })
+
+    describe('observationRetryOffer', () => {
+        it.each<[string, Parameters<typeof observationRetryOffer>[0], string, boolean, boolean]>([
+            // label, status, error_reason, show, worthwhile
+            ['any failed observation', 'failed', 'internal_error:boom', true, true],
+            ['a failed observation with an unknown kind', 'failed', 'future_kind:msg', true, true],
+            ['a discouraged failure kind, softly', 'failed', 'provider_rejected:declined', true, false],
+            // no_snapshots can be a timing artifact (snapshots that finished ingesting after the scan), and the
+            // backend retry endpoint accepts ineligible rows; withholding the button would strand the session.
+            [
+                'an ineligible observation with no snapshots',
+                'ineligible',
+                'no_snapshots:nothing to render',
+                true,
+                false,
+            ],
+            // no_ai_consent offers a retry too: consent can be turned on after the scan, and without the
+            // button the unique (scanner, session) row would lock the session out permanently.
+            ['an ineligible observation without AI consent', 'ineligible', 'no_ai_consent:consent off', true, false],
+            ['a deterministic ineligibility gate', 'ineligible', 'too_short:12s long', false, false],
+            ['an unknown ineligible kind', 'ineligible', 'future_gate:msg', false, false],
+            ['a succeeded observation', 'succeeded', '', false, false],
+            ['a running observation', 'running', '', false, false],
+        ])('handles %s', (_label, status, errorReason, show, worthwhile) => {
+            const offer = observationRetryOffer(status, errorReason)
+            expect(offer.show).toBe(show)
+            expect(offer.worthwhile).toBe(worthwhile)
+        })
+
+        it('carries a hint for the ineligible kinds it offers, so the button can say why retrying might work', () => {
+            expect(observationRetryOffer('ineligible', 'no_snapshots:nothing to render').hint).not.toBeNull()
+        })
+    })
+
+    describe('model naming', () => {
+        it('falls back to the raw id for retired models frozen in old observation snapshots', () => {
+            expect(modelLabel('gemini-1.5-retired')).toBe('gemini-1.5-retired')
+        })
+
+        // A model leaving the lineup must not turn every past observation's label into a raw slug.
+        it.each(['gemini-3.7-flash', 'gemini-3.6-flash'])('still names retired model %s', (model) => {
+            expect(modelLabel(model)).toContain('Flash')
+            expect(modelName(model)).toContain('Flash')
+        })
+
+        it.each([
+            ['control', 'Model', 'model'],
+            [undefined, 'Model', 'model'],
+            ['model-tier', 'Model tier', 'tier'],
+            ['effort', 'Effort', 'effort'],
+        ])('maps the tier naming arm %s', (variant, fieldLabel, naming) => {
+            expect(modelTierNaming(variant)).toEqual({ fieldLabel, naming })
+        })
+
+        it.each([
+            ['tier', ['Lite', 'Normal', 'Advanced']],
+            ['effort', ['Quick', 'Normal', 'Max']],
+        ] as const)('names the %s options from cheapest to most capable', (naming, names) => {
+            expect(modelOptions(naming).map((opt) => opt.label.split(' · ')[0])).toEqual(names)
+        })
+
+        // A tier can later map to a different model, so the test arms never show a Gemini name or id.
+        it.each(['gemini-3.7-flash', 'gemini-1.5-retired'])('shows no Gemini name for %s in a test arm', (model) => {
+            expect(modelName(model, 'tier')).toBe('Legacy')
+            expect(modelLabel(model, 'effort')).toBe('Legacy')
+        })
+    })
+})

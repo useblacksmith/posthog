@@ -1,0 +1,205 @@
+import '@testing-library/jest-dom'
+
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { BindLogic, Provider } from 'kea'
+
+import { VisualizationNode, NodeKind, HeatmapSortOrder } from '~/queries/schema/schema-general'
+import { initKeaTests } from '~/test/init'
+import { ChartDisplayType } from '~/types'
+
+import { dataNodeLogic } from '../../../DataNode/dataNodeLogic'
+import { DataVisualizationLogicProps, dataVisualizationLogic } from '../../dataVisualizationLogic'
+import { TwoDimensionalHeatmap } from './TwoDimensionalHeatmap'
+
+// Prevent loadData from completing (success or failure) so Kea's loader never
+// dispatches loadDataFailure and clears the response set via setResponse.
+jest.mock('~/queries/query', () => ({
+    ...jest.requireActual('~/queries/query'),
+    performQuery: jest.fn().mockImplementation(() => new Promise(() => {})),
+}))
+
+const dataNodeCollectionId = 'new-test-SQL-heatmap'
+let logicCounter = 0
+
+const makeQuery = (nullLabel = '(header null)', nullValue = ''): VisualizationNode => ({
+    kind: NodeKind.DataVisualizationNode,
+    source: {
+        kind: NodeKind.HogQLQuery,
+        query: 'select 1',
+    },
+    display: ChartDisplayType.TwoDimensionalHeatmap,
+    chartSettings: {
+        heatmap: {
+            xAxisColumn: 'region',
+            yAxisColumn: 'segment',
+            valueColumn: 'count',
+            nullLabel,
+            nullValue,
+        },
+    },
+})
+
+const response = {
+    columns: ['region', 'segment', 'count'],
+    types: [
+        ['region', 'String'],
+        ['segment', 'String'],
+        ['count', 'Int64'],
+    ] as [string, string][],
+    results: [
+        [null, 'Enterprise', 10],
+        ['US', null, 20],
+        ['US', 'Enterprise', null],
+    ],
+}
+
+const setup = (
+    nullLabel = '(header null)',
+    nullValue = '',
+    responseOverride: typeof response = response,
+    onInspect?: (record: Record<string, unknown>) => void
+): ReturnType<typeof dataVisualizationLogic.build> => {
+    logicCounter += 1
+    const testKey = `test-two-dimensional-heatmap-${logicCounter}`
+    const query = makeQuery(nullLabel, nullValue)
+    const props: DataVisualizationLogicProps = {
+        key: testKey,
+        query,
+        dataNodeCollectionId,
+    }
+
+    const logic = dataVisualizationLogic(props)
+    logic.mount()
+    dataNodeLogic({ key: testKey, query: query.source, dataNodeCollectionId }).actions.setResponse(responseOverride)
+
+    render(
+        <Provider>
+            <BindLogic logic={dataVisualizationLogic} props={props}>
+                <TwoDimensionalHeatmap onInspect={onInspect} />
+            </BindLogic>
+        </Provider>
+    )
+
+    return logic
+}
+
+describe('TwoDimensionalHeatmap', () => {
+    it.each([
+        [undefined, ['Stage 2', 'Stage 10', 'Stage 1'], ['20', '10', '30']],
+        [HeatmapSortOrder.Asc, ['Stage 1', 'Stage 2', 'Stage 10'], ['30', '20', '10']],
+        [HeatmapSortOrder.Desc, ['Stage 10', 'Stage 2', 'Stage 1'], ['10', '20', '30']],
+    ])('orders columns by %s without moving values to another label', async (xAxisSortOrder, headers, cells) => {
+        const logic = setup('(header null)', '', {
+            ...response,
+            results: [
+                ['Stage 2', 'Enterprise', 20],
+                ['Stage 10', 'Enterprise', 10],
+                ['Stage 1', 'Enterprise', 30],
+            ],
+        })
+        await screen.findByText('Stage 10')
+
+        act(() => {
+            logic.actions.updateChartSettings({ heatmap: { ...logic.values.chartSettings.heatmap, xAxisSortOrder } })
+        })
+
+        expect(
+            Array.from(screen.getByRole('table').querySelectorAll('thead th'))
+                .slice(1)
+                .map((header) => header.textContent)
+        ).toEqual(headers)
+        expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(cells)
+    })
+
+    it('keeps null and literal labels separately inspectable even when display labels collide', async () => {
+        const onInspect = jest.fn()
+        const values = [null, 'null', 'null (2)', '']
+        setup(
+            'null',
+            '',
+            {
+                ...response,
+                results: values.map((value, index) => [value, 'Enterprise', index + 10]),
+            },
+            onInspect
+        )
+
+        for (const [index, value] of values.entries()) {
+            fireEvent.click((await screen.findByText(String(index + 10))).closest('button')!)
+            expect(onInspect).toHaveBeenLastCalledWith({ region: value, segment: 'Enterprise', count: index + 10 })
+        }
+        expect(screen.queryByText(/duplicate/)).not.toBeInTheDocument()
+    })
+    afterEach(() => {
+        cleanup()
+        // Guard against any pollution leaking into other tests if a regression reintroduces it
+        delete (Object.prototype as any).disableClientSideRouting
+    })
+
+    beforeEach(() => {
+        initKeaTests()
+    })
+
+    it('does not pollute Object.prototype when row labels contain __proto__', async () => {
+        // Attacker-controlled query results: a Y-axis label of `__proto__` and an X-axis label that
+        // is a sensitive global key. With a plain-object accumulator, cellValues['__proto__'][key] = 1
+        // writes straight to Object.prototype, which the Link component then reads to bypass URL sanitization.
+        const maliciousResponse = {
+            columns: ['region', 'segment', 'count'],
+            types: [
+                ['region', 'String'],
+                ['segment', 'String'],
+                ['count', 'Int64'],
+            ] as [string, string][],
+            results: [['disableClientSideRouting', '__proto__', 1]],
+        }
+
+        setup('(header null)', '', maliciousResponse)
+
+        expect(await screen.findByText('disableClientSideRouting')).toBeInTheDocument()
+        expect(({} as any).disableClientSideRouting).toBeUndefined()
+        expect('disableClientSideRouting' in Object.prototype).toBe(false)
+    })
+
+    it('uses the null label in headers and the null value in cell contents', async () => {
+        setup('(header null)', '(cell null)')
+
+        expect(await screen.findAllByText('(header null)')).toHaveLength(2)
+        expect(screen.getAllByText('(cell null)')).toHaveLength(2)
+        expect(screen.queryByText(/^null$/)).not.toBeInTheDocument()
+    })
+
+    it('updates cell contents when the null value setting changes', async () => {
+        const logic = setup('(header null)')
+
+        await screen.findAllByText('(header null)')
+        expect(screen.queryByText('(cell null)')).not.toBeInTheDocument()
+
+        await act(async () => {
+            logic.actions.updateChartSettings({
+                heatmap: {
+                    ...logic.values.chartSettings.heatmap,
+                    nullValue: '(cell null)',
+                },
+            })
+        })
+
+        expect(await screen.findAllByText('(cell null)')).toHaveLength(2)
+        expect(await screen.findAllByText('(header null)')).toHaveLength(2)
+    })
+
+    it('does not render a dense grid when sparse results produce too many cells', async () => {
+        const sparseResponse = {
+            ...response,
+            results: Array.from({ length: 101 }, (_, index) => [`Region ${index}`, `Segment ${index}`, index]),
+        }
+
+        setup('(header null)', '', sparseResponse)
+
+        expect(await screen.findByText('Too many cells to display')).toBeInTheDocument()
+        expect(
+            screen.getByText('Use columns with fewer unique values or reduce the query result size.')
+        ).toBeInTheDocument()
+        expect(screen.queryByRole('table')).not.toBeInTheDocument()
+    })
+})

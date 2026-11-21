@@ -1,0 +1,454 @@
+"""Pydantic content schemas + registry for `ReviewReportArtefact` rows.
+
+Mirrors Signals' `artefact_schemas` leaf: one model per artefact type, parsed at the boundary via
+`parse_artefact_content` and passed around typed; the row's type is derived from the content
+model's class so type and content can never diverge.
+
+ReviewHog owns its own registry and helpers — Signals' `artefact_type_for` / `parse_artefact_content`
+close over Signals' module-global registry and cannot take ours — but reuses the content models
+that fit unchanged (`Commit`, `CodeReference`, `TaskRunArtefact`, `NoteArtefact`) and the shared
+`ArtefactContentValidationError` from the Signals leaf.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any, Literal, cast
+
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+from products.review_hog.backend.facade.contracts import (
+    FindingOutcome,
+    FindingOutcomeMethod,
+    FindingReactionSentiment,
+    ReviewIssueCategory,
+)
+from products.review_hog.backend.reviewer.models.github_meta import PRComment, PRFile, PRMetadata
+from products.review_hog.backend.reviewer.models.issues_review import (
+    DropDisposition,
+    IssuePriority,
+    IssuesReview,
+    LineRange,
+    ReportedPriority,
+)
+from products.review_hog.backend.reviewer.models.perspective_selection import PerspectiveSelection
+from products.review_hog.backend.reviewer.models.split_pr_into_chunks import Chunk
+from products.review_hog.backend.reviewer.review_design import REVIEW_DESIGN_PIPELINE
+from products.signals.backend.facade.report_artefacts import (
+    ArtefactContentValidationError,
+    CodeReference,
+    Commit,
+    NoteArtefact,
+    TaskRunArtefact,
+)
+
+
+class ReviewIssueFinding(BaseModel):
+    """Content schema for an `issue_finding` artefact: one durable review finding.
+
+    `issue_key` is turn-local (`run_index`-prefixed so a later turn's reused id can't collide);
+    `run_index` lets publishing scope to one turn instead of replaying the whole history.
+    """
+
+    issue_key: str = Field(description="Identity within a turn (run_index + file + anchor + perspective + id).")
+    run_index: int = Field(
+        description="The review turn (1-based) that produced this finding; scopes publishing to one turn."
+    )
+    validation_context: str | None = Field(
+        default=None,
+        description="The reviewed head, mode, and model configurations for verdict reuse and Flash outcome attribution.",
+    )
+    title: str = Field(description="Issue title.")
+    file: str = Field(description="Repository-relative path to the file containing the issue.")
+    lines: list[LineRange] = Field(default_factory=list, description="Affected line ranges.")
+    body: str = Field(description="Description of the problem.")
+    # Empty for single-agent findings: their body ends with the fix direction instead.
+    suggestion: str = Field(description="Specific fix or improvement.")
+    suggestion_code: str | None = Field(
+        default=None, description="Replacement code for the finding's line range, posted as a GitHub suggestion."
+    )
+    priority: IssuePriority = Field(description="Priority level of the finding.")
+    reported_priority: ReportedPriority | None = Field(
+        default=None,
+        description="The single-agent reviewer's own P0-P3 priority, which tells P0 and P1 apart. Null for the pipeline.",
+    )
+    source_perspective: str | None = Field(default=None, description="Which review perspective produced this finding.")
+    is_directly_related_to_changes: bool = Field(
+        default=False, description="Whether the finding is caused by the PR's changes, not just the same file."
+    )
+
+    @field_validator("issue_key", "title", "file", "body")
+    @classmethod
+    def fields_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty or whitespace-only")
+        return v
+
+
+class DroppedFindingArtefact(BaseModel):
+    """Content for a `dropped_finding` artefact: a single-agent finding the turn found but did not keep.
+
+    Analysis data only. Publishing, the status comment, outcome classification, `load_prior_findings`,
+    and the reviews API read `issue_finding` rows, so a dropped finding can neither post nor keep a
+    later turn from raising the same problem. A retried turn replaces its rows by `finding.run_index`.
+    """
+
+    head_sha: str = Field(description="PR head commit the turn reviewed.")
+    finding: ReviewIssueFinding = Field(description="The full finding, as it would have persisted had it been kept.")
+    pass_number: int = Field(description="The session's reserved pass: 2000 for the main session, 2001+ for a lens.")
+    chunk_id: int = Field(description="The lens part the session reviewed (1 for the main session).")
+    disposition: DropDisposition = Field(description="Why the turn dropped the finding.")
+    duplicate_of: str | None = Field(
+        default=None,
+        description="For a dedup drop, what it repeats: an issue key, or `comment:<id>` for a PR comment.",
+    )
+    rank: int | None = Field(
+        default=None, description="For a finding the cap cut, its 1-based position in the turn's ranked findings."
+    )
+    dedup_fallback: bool = Field(
+        default=False,
+        description="The dedup LLM call failed, so the positional pre-filter alone decided this drop.",
+    )
+    cap: int = Field(description="The turn's finding cap, which must-fix findings can exceed.")
+    lens_part_count: int = Field(description="How many parts the lens sessions split the PR into.")
+
+
+class ValidationVerdict(BaseModel):
+    """Content schema for a `validation_verdict` artefact: the validator's ruling on a finding.
+
+    Keyed to its finding by `issue_key`; the latest verdict per key wins.
+    """
+
+    issue_key: str = Field(description="The `ReviewIssueFinding.issue_key` this verdict rules on.")
+    is_valid: bool = Field(description="Whether the finding should be implemented (true) or dismissed (false).")
+    category: ReviewIssueCategory | None = Field(default=None, description="Category of the finding.")
+    argumentation: str = Field(description="Why the finding is valid or should be dismissed.")
+    adjusted_priority: IssuePriority | None = Field(
+        default=None,
+        description="Validator's priority override for the finding; null keeps the reviewer's priority.",
+    )
+
+    @field_validator("issue_key", "argumentation")
+    @classmethod
+    def fields_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty or whitespace-only")
+        return v
+
+
+class FindingOutcomeArtefact(BaseModel):
+    """Content for a `finding_outcome` artefact: the classified fate of one published finding.
+
+    Written by the outcome-telemetry batch after the PR merged, one row per published finding,
+    *before* the finding's event is emitted. Presence means the outcome is decided and is never
+    re-decided: an interrupted sweep re-emits from these rows, and the report only leaves the sweep
+    once `ReviewReport.outcomes_emitted_at` (the emission completion marker) is stamped.
+    """
+
+    issue_key: str = Field(description="The `ReviewIssueFinding.issue_key` this outcome rules on.")
+    run_index: int = Field(description="The review turn whose published head was compared against the merge.")
+    outcome: FindingOutcome = Field(description="The finding's classified fate.")
+    method: FindingOutcomeMethod = Field(description="Which signal decided the outcome.")
+    reaction_sentiment: FindingReactionSentiment | None = Field(
+        default=None,
+        description="The tone of the reactions people and other agents left on the finding's comment, or None without one.",
+    )
+    reply_excerpt: str | None = Field(
+        default=None, description="The start of the first reply to the finding's comment that ReviewHog did not write."
+    )
+    comment_outdated: bool | None = Field(
+        default=None,
+        description="Whether GitHub marked the finding's comment outdated at merge, or None when no comment matched.",
+    )
+    reviewed_head: str = Field(description="The head the finding was published at (the compare base).")
+    final_head: str = Field(description="The PR branch tip at merge (the compare head).")
+    judge_reasoning: str | None = Field(
+        default=None,
+        description="The judge's stated reason for its ruling, kept so a classification can be explained later.",
+    )
+    judge_model: str | None = Field(
+        default=None, description="Model that judged whether the change addressed the finding, when the judge ran."
+    )
+
+    @field_validator("issue_key", "reviewed_head", "final_head")
+    @classmethod
+    def fields_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty or whitespace-only")
+        return v
+
+
+class ThreadVerdictArtefact(BaseModel):
+    """Content schema for a `thread_verdict` artefact: the resolution stage's ruling on one review thread.
+
+    Latest row per `thread_id` wins. `latest_comment_id` is the per-thread idempotency watermark
+    (CONTEXT.md — "Per-thread watermark"): the newest thread comment known when the verdict landed —
+    updated to the stage's own posted reply once it lands, so the reply doesn't re-open triage. Any
+    newer comment re-opens the thread for a fresh assessment. `reply_posted` / `resolved` record
+    which GitHub side effects were actually delivered, so a crashed run redoes only the writes.
+    """
+
+    thread_id: str = Field(description="The review thread's GraphQL node id (PRRT_…).")
+    outcome: Literal["fixed", "wont_fix", "already_fixed", "obsolete", "escalate"] = Field(
+        description="Terminal outcome of the thread (see CONTEXT.md — 'Thread outcome')."
+    )
+    path: str = Field(default="", description="File the thread is anchored to.")
+    author_login: str = Field(default="", description="Login of the thread's opening commenter.")
+    author_is_bot: bool = Field(
+        default=False, description="Whether the opener is a bot — gates the resolve side effect (etiquette)."
+    )
+    reasoning: str = Field(description="The turn's internal worth/safe assessment, with evidence.")
+    reply: str = Field(description="The reply text posted (or to post) on the thread.")
+    commit_sha: str | None = Field(default=None, description="The fix commit's SHA when outcome is fixed.")
+    commit_verified: bool | None = Field(
+        default=None,
+        description="Server-side check that commit_sha is on the PR head branch; None = not checked yet. "
+        "False withholds the public commit link and the auto-resolve — the model's echo is unproven.",
+    )
+    commit_restricted: bool | None = Field(
+        default=None,
+        description="Server-side hard-floor backstop: the fix commit touches restricted paths "
+        "(.github/, CODEOWNERS, dependency manifests). True withholds the link and the auto-resolve "
+        "and flags the reply for human review; None = not checked (pre-backstop rows).",
+    )
+    verification: str | None = Field(default=None, description="What was run to verify a fix, and the honest result.")
+    latest_comment_id: int | None = Field(
+        default=None, description="Newest thread comment databaseId known at verdict time (the watermark)."
+    )
+    reply_posted: bool = Field(default=False, description="Whether the reply side effect was delivered.")
+    reply_url: str | None = Field(default=None, description="Permalink of the posted reply, when delivered.")
+    resolved: bool = Field(default=False, description="Whether the stage resolved the thread (bot threads only).")
+
+    @field_validator("thread_id", "reasoning", "reply")
+    @classmethod
+    def fields_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty or whitespace-only")
+        return v
+
+
+class ResolutionRunArtefact(BaseModel):
+    """Content for a `resolution_run` artefact: one resolution run's opening work-list.
+
+    Appended by the run's prepare step the moment the work-list is classified, so progress surfaces
+    (the reviews API's resolving row, the PR status comment) can count the run's `thread_verdict`
+    artefacts against it. The newest row marks the report's latest resolution run; the run's closing
+    `note` artefact (author `review_hog_resolution`) marks it finished — a run artefact with no
+    later closing note is either still running (recent artefact activity) or died partway (stale).
+    """
+
+    total: int = Field(description="Threads queued for a resolution turn this run (post pre-filter and run cap).")
+    thread_ids: list[str] = Field(
+        default_factory=list,
+        description="The queued threads' node ids, so progress counts only this run's verdicts "
+        "(redelivered prior-run verdicts also append rows during the run).",
+    )
+    redeliver: int = Field(default=0, description="Threads only needing their GitHub writes redelivered (no LLM turn).")
+    skipped: int = Field(default=0, description="Threads skipped as already judged and delivered.")
+    overflow: int = Field(default=0, description="Threads beyond the run cap, left for the next run.")
+
+
+class ChunkSetArtefact(BaseModel):
+    """Content for a `chunk_set` artefact: the PR's chunking computed for ONE review turn.
+
+    Per-turn working state, not a cross-turn-stable finding — so it embeds the live `Chunk`
+    pipeline model directly (re-derived whenever the head moves) rather than redefining a frozen
+    shape. `head_sha` scopes it to its turn, so a resumed run reuses only the current head's
+    chunking and a new head re-chunks.
+    """
+
+    head_sha: str = Field(description="PR head commit this chunking was computed for (the turn key).")
+    chunks: list[Chunk] = Field(description="The reviewable chunks for this turn.")
+
+
+class PerspectiveSelectionArtefact(BaseModel):
+    """Content for a `perspective_selection` artefact: the selector's per-chunk perspective picks.
+
+    Per-turn working state like `chunk_set`: `head_sha` scopes it so a resumed run reuses the
+    selection instead of re-paying the one-shot, and a new head re-selects. `selection` is the
+    NORMALIZED plan (the exact (perspective, chunk) pairs the fan-out runs), and `roster` is the
+    run's full enabled menu — together they let the progress estimate and the skipped-perspective
+    UI compute what ran and what was skipped without re-deriving run-time state.
+    """
+
+    head_sha: str = Field(description="PR head commit this selection was computed for (the turn key).")
+    roster: list[str] = Field(
+        default_factory=list, description="Every enabled perspective the selector chose from, in pass order."
+    )
+    selection: PerspectiveSelection = Field(description="Per-chunk perspective picks with reasons (normalized).")
+
+
+class PerspectiveResultArtefact(BaseModel):
+    """Content for a `perspective_result` artefact: one (perspective, chunk) review for one turn.
+
+    The complete reviewer arm keys the resume because different efforts can review the same commit.
+    Rows without an arm are not reused: their model alone cannot establish the reasoning budget.
+    """
+
+    head_sha: str = Field(description="PR head commit this review was computed for.")
+    pass_number: int = Field(description="The review perspective (1=Logic, 2=Contracts, 3=Performance).")
+    chunk_id: int = Field(description="The chunk this perspective reviewed.")
+    review: IssuesReview = Field(description="The issues this perspective found in this chunk.")
+    review_model: str | None = Field(default=None, description="The reviewer model that produced this result.")
+    review_config: str | None = Field(
+        default=None, description="Serialized reviewer configuration that produced this result."
+    )
+
+
+class PRSnapshotArtefact(BaseModel):
+    """Content for a `pr_snapshot` artefact: the turn's fetched PR inputs, stored by reference.
+
+    Persisted once at fetch so the Temporal stage activities reload the PR metadata / comments /
+    files from the DB by `(report_id, head_sha)` instead of crossing the workflow boundary with the
+    big `pr_files` payload (subject to Temporal's ~2 MiB cap). Per-turn working state — head_sha
+    scopes it to its turn, latest-wins on a re-fetch.
+    """
+
+    head_sha: str = Field(description="PR head commit these inputs were fetched for (the turn key).")
+    pr_metadata: PRMetadata = Field(description="The PR's metadata (title/body/branches/labels/…).")
+    pr_comments: list[PRComment] = Field(default_factory=list, description="The PR's reviewable inline comments.")
+    pr_files: list[PRFile] = Field(default_factory=list, description="The PR's reviewable files with code context.")
+    review_design: str = Field(
+        default=REVIEW_DESIGN_PIPELINE,
+        description="The design the turn runs on (pipeline or single_agent), chosen at fetch.",
+    )
+    merge_base_sha: str | None = Field(
+        default=None,
+        description="The commit GitHub computes the PR diff against. None when GitHub did not return it.",
+    )
+    skipped_paths: list[str] = Field(
+        default_factory=list, description="The changed files the review left out (lock, generated, test files)."
+    )
+    devex_lens_files: list[str] = Field(
+        default_factory=list,
+        description="The changed files the devex team owns, the scope of the devex lens session. Empty on a turn without it.",
+    )
+
+
+class TurnMarkerArtefact(BaseModel):
+    """Content for a `turn_marker` artefact: the ReviewHog version and input fingerprint of one turn.
+
+    Written once when the turn starts, so stored turns can be split by version like the analytics
+    events. `fingerprint_inputs` is the hashed payload: two turns with different fingerprints can be
+    compared key by key to see which prompt, skill, or model pin changed.
+    """
+
+    head_sha: str = Field(description="PR head commit this turn reviews (the turn key).")
+    run_index: int = Field(description="The review turn (1-based) this marker belongs to.")
+    review_mode: str = Field(description="What the turn ran on (full or flash).")
+    reviewhog_version: str = Field(description="The version id of the turn's review mode, e.g. reviewhog-flash-1-0.")
+    reviewhog_fingerprint: str = Field(description="Short hash of the turn's mode, model pins, prompts, and skills.")
+    fingerprint_inputs: dict[str, Any] = Field(
+        default_factory=dict, description="The payload the fingerprint hashes (prompt and skill texts as hashes)."
+    )
+    # The fields below are None on markers written before they existed.
+    publishes: bool | None = Field(default=None, description="Whether the turn posts its result to the PR.")
+    base_branch: str | None = Field(default=None, description="The base branch the reviewed diff was taken against.")
+    base_sha: str | None = Field(default=None, description="The merge base the reviewed diff was taken against.")
+    skipped_paths: list[str] | None = Field(
+        default=None, description="The changed files the turn left out of the review."
+    )
+    review_design: str | None = Field(
+        default=None, description="The design the turn ran on (pipeline or single_agent)."
+    )
+    clean_full_coverage: bool | None = Field(
+        default=None,
+        description=(
+            "Set when a Standard automatic turn finished: true when it kept no valid finding, read every file, "
+            "and reviewed the PR without capping the lens parts. None on every other turn."
+        ),
+    )
+
+
+RUN_OUTCOME_NOTE_AUTHOR = "review_hog_run_outcome"
+
+
+class RunOutcomeNote(NoteArtefact):
+    """Content for a `note` artefact that records a review turn or resolution run that ended without a result.
+
+    A completed turn leaves a `turn_marker` and a stamped report, and a resolution run leaves its
+    closing note. A failed turn, a dropped Standard request, and a skipped resolution run leave
+    nothing else, so a status reader cannot tell them from a request that is still waiting. It stays
+    a `note` so that no new artefact type (and no migration) is needed: readers that parse it as a
+    plain `NoteArtefact` ignore the extra fields.
+    """
+
+    author: str | None = Field(default=RUN_OUTCOME_NOTE_AUTHOR, description="Always `review_hog_run_outcome`.")
+    stage: Literal["review", "resolution"] = Field(description="Which run ended: a review turn or a resolution run.")
+    outcome: Literal["skipped", "failed"] = Field(description="How the run ended.")
+    reason: str = Field(description="Short reason code, e.g. flash_after_full, review_failed, pr_not_open.")
+    run_index: int | None = Field(default=None, description="The review turn (1-based) for a review run.")
+    review_mode: str | None = Field(default=None, description="The review mode (full or flash) for a review run.")
+    head_sha: str | None = Field(default=None, description="The PR head the run targeted, when known.")
+
+
+# Reused leaf models back the work-log entry types; ReviewHog adds findings + verdicts. The
+# working-state types (chunk_set / perspective_result) are per-turn pipeline scaffolding the
+# DB-driven resume reads back — head_sha-scoped, latest-wins within a turn.
+ReviewLogArtefactContent = TaskRunArtefact | Commit | CodeReference | NoteArtefact
+ReviewWorkingStateContent = (
+    ChunkSetArtefact | PerspectiveSelectionArtefact | PerspectiveResultArtefact | PRSnapshotArtefact
+)
+ReviewArtefactContent = (
+    ReviewIssueFinding
+    | DroppedFindingArtefact
+    | ValidationVerdict
+    | FindingOutcomeArtefact
+    | ThreadVerdictArtefact
+    | ResolutionRunArtefact
+    | TurnMarkerArtefact
+    | ReviewLogArtefactContent
+    | ReviewWorkingStateContent
+)
+
+# Keys must match `ReviewReportArtefact.ArtefactType` values exactly (asserted by a test).
+ARTEFACT_CONTENT_SCHEMAS: Mapping[str, type[BaseModel]] = {
+    "issue_finding": ReviewIssueFinding,
+    "dropped_finding": DroppedFindingArtefact,
+    "validation_verdict": ValidationVerdict,
+    "finding_outcome": FindingOutcomeArtefact,
+    "thread_verdict": ThreadVerdictArtefact,
+    "resolution_run": ResolutionRunArtefact,
+    "task_run": TaskRunArtefact,
+    "commit": Commit,
+    "code_reference": CodeReference,
+    "note": NoteArtefact,
+    "chunk_set": ChunkSetArtefact,
+    "perspective_selection": PerspectiveSelectionArtefact,
+    "perspective_result": PerspectiveResultArtefact,
+    "pr_snapshot": PRSnapshotArtefact,
+    "turn_marker": TurnMarkerArtefact,
+}
+_ARTEFACT_TYPE_BY_MODEL: Mapping[type[BaseModel], str] = {
+    **{model: t for t, model in ARTEFACT_CONTENT_SCHEMAS.items()},
+    # A note subtype: it persists as `note`, and `note` rows still parse as the plain NoteArtefact.
+    RunOutcomeNote: "note",
+}
+
+
+def artefact_type_for(content: BaseModel) -> str:
+    """The artefact type a content model persists as (exact class match).
+
+    Deriving the row's type from the model class makes a type/content mismatch unrepresentable.
+    """
+    artefact_type = _ARTEFACT_TYPE_BY_MODEL.get(type(content))
+    if artefact_type is None:
+        raise ArtefactContentValidationError(f"{type(content).__name__} is not a review artefact content model")
+    return artefact_type
+
+
+def parse_artefact_content(artefact_type: str, content: str | dict | list) -> ReviewArtefactContent:
+    """Parse a raw payload (JSON text or deserialized JSON) into `artefact_type`'s content model.
+
+    The read/write boundary: raises `ArtefactContentValidationError` on an unknown type, malformed
+    JSON, or schema mismatch.
+    """
+    schema = ARTEFACT_CONTENT_SCHEMAS.get(artefact_type)
+    if schema is None:
+        raise ArtefactContentValidationError(f"Unknown review artefact type {artefact_type!r}")
+    try:
+        if isinstance(content, str):
+            return cast(ReviewArtefactContent, schema.model_validate_json(content))
+        return cast(ReviewArtefactContent, schema.model_validate(content))
+    except ValidationError as e:
+        raise ArtefactContentValidationError(str(e)) from e

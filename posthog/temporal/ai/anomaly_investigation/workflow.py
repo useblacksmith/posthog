@@ -1,0 +1,995 @@
+"""Temporal workflow that kicks off the anomaly investigation agent and persists
+its findings as a Notebook linked to the investigated check.
+
+Triggered from posthog/temporal/alerts/workflows.py for a firing check the budget allows, and
+for a platform evaluation of an insight alert from the alerts platform's insight source.
+"""
+
+from __future__ import annotations
+
+import json
+import asyncio
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Optional
+from uuid import UUID
+
+from django.db import transaction
+
+import structlog
+from asgiref.sync import sync_to_async
+from temporalio import activity, workflow
+from temporalio.common import RetryPolicy
+
+from posthog.models import Team, User
+from posthog.tasks.alerts.charts import png_to_b64, render_series_chart
+from posthog.tasks.alerts.investigation_wording import InvestigationBreaches, notebook_url, verdict_breaches
+from posthog.tasks.alerts.metric_definition import describe_metric_definition
+from posthog.tasks.alerts.utils import (
+    _should_suppress_notification,
+    dispatch_alert_notification,
+    prepare_alert_insight_chart_url,
+    record_alert_delivery,
+)
+from posthog.temporal.ai.anomaly_investigation.evaluated import EvaluatedCheck
+from posthog.temporal.ai.anomaly_investigation.event_provenance import alerted_series_event, describe_event_provenance
+from posthog.temporal.ai.anomaly_investigation.notebook import NotebookRenderContext, build_investigation_markdown
+from posthog.temporal.ai.anomaly_investigation.prompts import build_anomaly_context
+from posthog.temporal.ai.anomaly_investigation.report import InvestigationReport
+from posthog.temporal.ai.anomaly_investigation.runner import run_investigation
+from posthog.temporal.ai.anomaly_investigation.tools import AlertedSeries, _run_detector_simulation
+from posthog.temporal.common.base import PostHogWorkflow
+from posthog.temporal.common.heartbeat import Heartbeater
+from posthog.utils import absolute_uri
+
+from products.alerts.backend.facade import investigations as alerts
+from products.alerts.backend.facade.api import first_subscriber_id
+from products.alerts.backend.facade.contracts import InvestigationRelease
+from products.alerts.backend.investigation_episode import EpisodeInvestigations, episode_investigations
+from products.alerts.backend.models.alert import AlertCheck, AlertConfiguration, InvestigationStatus
+from products.alerts.backend.models.investigation import InsightAlertInvestigation
+from products.alerts_platform.backend.facade import api as platform
+from products.alerts_platform.backend.facade.contracts import AlertDeliveryRequest, HeldDeliveryAddress, SourceKind
+from products.alerts_platform.backend.facade.temporal import start_deliveries
+from products.notebooks.backend.facade import api as notebooks
+from products.notebooks.backend.facade.content import build_markdown_notebook_content
+from products.notebooks.backend.facade.contracts import NotebookData
+from products.product_analytics.backend.facade.api import insights_including_soft_deleted_for_team
+from products.signals.backend.facade import api as signals
+from products.signals.backend.facade.source_configs import (
+    AlertFilterOutcome,
+    evaluate_alert_filter,
+    get_analytics_alert_name_patterns,
+    get_analytics_alert_scope,
+)
+
+if TYPE_CHECKING:
+    from products.product_analytics.backend.facade.models import Insight
+
+logger = structlog.get_logger(__name__)
+
+# (source_product, source_type) identifiers for the emitted signal. The signals taxonomy, payload
+# contract, and inbox support for this pair are added in a separate PR; this module only emits.
+SIGNAL_SOURCE_PRODUCT = "analytics"
+SIGNAL_SOURCE_TYPE = "anomaly_investigation"
+_ALERT_SCOPE_OFF = "off"
+
+
+# Sized to cover a realistic worst-case sequential agent run: up to MAX_TOOL_CALLS + 2 LLM turns
+# (tool loop, finalize, and one corrective finalize retry), each capped at the runner's per-request
+# timeout (thinking turns run long). 20 min got tight once that per-request timeout rose to 180s,
+# so a slow thinking-heavy run could blow the deadline and be killed mid-flight — skipping the
+# runner's fallback path and re-running the whole agent; the finalize retry pushed the 12-request
+# worst case to 36 min, past the previous 30. 40 min keeps a realistic run inside a single activity
+# attempt; the pathological tail falls to the retry.
+ANOMALY_INVESTIGATION_ACTIVITY_START_TO_CLOSE = 40 * 60  # 40 minutes
+ANOMALY_INVESTIGATION_ACTIVITY_HEARTBEAT_TIMEOUT = 5 * 60  # 5 minutes
+ANOMALY_INVESTIGATION_ACTIVITY_MAX_ATTEMPTS = 2
+
+# Runs started before the agent released a platform evaluation's held delivery, and replay must not start one.
+_PATCH_PLATFORM_RELEASE = "anomaly-investigation-platform-release-2026-11"
+
+# Marker on the check's delivery receipts: the follow-up for a changed verdict is sent once.
+_VERDICT_CHANGE_FOLLOWUP_KEY = "investigation_verdict_change"
+
+# Cap for the embedded signal description. Kept well under the signals facade's ~8000-token limit
+# (a conservative margin even for token-dense text) so a long agent report can't get the signal
+# rejected and silently dropped.
+_MAX_DESCRIPTION_CHARS = 3000
+
+
+@dataclass(frozen=False)
+class AnomalyInvestigationWorkflowInputs:
+    team_id: int
+    alert_id: UUID
+    # The insight stack's check. A platform evaluation has none and names its investigation instead.
+    alert_check_id: Optional[UUID] = None
+    user_id: Optional[int] = None
+    trace_id: Optional[str] = None
+    investigation_id: Optional[UUID] = None
+
+
+@workflow.defn(name="anomaly-investigation")
+class AnomalyInvestigationWorkflow(PostHogWorkflow):
+    """The agent runs in one activity. A platform evaluation's verdict releases a held delivery,
+    which only a workflow can start, so the workflow starts it after the activity."""
+
+    @staticmethod
+    def parse_inputs(inputs: list[str]) -> AnomalyInvestigationWorkflowInputs:
+        loaded = json.loads(inputs[0])
+        return AnomalyInvestigationWorkflowInputs(**loaded)
+
+    @workflow.run
+    async def run(self, inputs: AnomalyInvestigationWorkflowInputs) -> None:
+        deliveries = await workflow.execute_activity(
+            investigate_anomaly_activity,
+            inputs,
+            start_to_close_timeout=timedelta(seconds=ANOMALY_INVESTIGATION_ACTIVITY_START_TO_CLOSE),
+            heartbeat_timeout=timedelta(seconds=ANOMALY_INVESTIGATION_ACTIVITY_HEARTBEAT_TIMEOUT),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=2),
+                maximum_interval=timedelta(minutes=1),
+                maximum_attempts=ANOMALY_INVESTIGATION_ACTIVITY_MAX_ATTEMPTS,
+            ),
+        )
+        if workflow.patched(_PATCH_PLATFORM_RELEASE) and deliveries:
+            await start_deliveries(deliveries)
+            # Without the mark, the safety net starts the delivery again after its grace, and the
+            # delivery's id dedups it. The mark only saves that second start.
+            await workflow.execute_activity(
+                record_investigation_deliveries_started_activity,
+                deliveries,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+
+
+@activity.defn
+async def record_investigation_deliveries_started_activity(deliveries: list[AlertDeliveryRequest]) -> None:
+    now = datetime.now(UTC)
+    for delivery in deliveries:
+        await sync_to_async(platform.record_hold_delivery_started, thread_sensitive=False)(
+            HeldDeliveryAddress(
+                team_id=delivery.team_id,
+                configuration_id=delivery.configuration_id,
+                evaluation_key=delivery.evaluation_key,
+            ),
+            now=now,
+        )
+
+
+@activity.defn
+async def investigate_anomaly_activity(inputs: AnomalyInvestigationWorkflowInputs) -> list[AlertDeliveryRequest]:
+    """Runs the agent and records its verdict. Returns the platform deliveries the verdict releases,
+    which the workflow starts. An insight stack check delivers from here and returns none."""
+    team, alert = await asyncio.gather(
+        Team.objects.aget(id=inputs.team_id),
+        sync_to_async(_investigated_alert, thread_sensitive=False)(inputs.team_id, inputs.alert_id),
+    )
+    if alert is None:
+        raise AlertConfiguration.DoesNotExist(f"No insight alert {inputs.alert_id}")
+    subject, evaluated = await _load_subject(inputs)
+    if isinstance(subject, InsightAlertInvestigation) and subject.status == InvestigationStatus.DONE:
+        # A retry after the verdict was recorded repeats only its release, not the agent.
+        return list((await _finish_platform_investigation(alert, subject)).deliveries)
+
+    user = await _investigation_user(inputs, alert)
+
+    if user is None:
+        await _mark_failed(subject, "No user available to run the investigation agent.")
+        return []
+
+    await _mark_running(subject)
+
+    insight = await sync_to_async(_evaluated_insight, thread_sensitive=False)(alert, evaluated)
+    metric_description = insight.name or f"Insight {insight.short_id}"
+    detector_type = _evaluated_detector_type(alert, evaluated)
+    alerted = _evaluated_series(alert, evaluated)
+
+    # Measured up front rather than left to a tool call: without it the agent has only the
+    # event's name to go on, and an opaque name invites it to invent the machinery behind it.
+    event = alerted_series_event(insight.query, series_index=alerted.series_index)
+    event_provenance = ""
+    if event:
+        event_provenance = await sync_to_async(describe_event_provenance, thread_sensitive=False)(
+            team=team, event=event
+        )
+
+    anomaly_context_text = build_anomaly_context(
+        alert_name=alert.name or "Unnamed alert",
+        metric_description=metric_description,
+        detector_type=detector_type,
+        triggered_dates=evaluated.triggered_dates,
+        triggered_metadata=evaluated.triggered_metadata,
+        calculated_value=evaluated.calculated_value,
+        interval=evaluated.interval,
+        # The alerted series, not series 0 — matching how the check and the chart pick it.
+        metric_definition=describe_metric_definition(
+            insight.query, series_index=alerted.series_index, alert_config=alert.config
+        ),
+        event_provenance=event_provenance,
+    )
+
+    # Render a chart of the metric with the detector's anomaly points marked and
+    # attach it to the HumanMessage so the multimodal model can reason visually
+    # before spending any tool-call budget.
+    anomaly_context = await sync_to_async(_build_multimodal_context, thread_sensitive=False)(
+        alert=alert,
+        context_text=anomaly_context_text,
+        triggered_dates=evaluated.triggered_dates,
+        triggered_points=evaluated.triggered_points,
+        alerted=alerted,
+        detector_type=detector_type,
+    )
+
+    try:
+        async with Heartbeater():
+            result = await run_investigation(
+                team=team,
+                user=user,
+                anomaly_context=anomaly_context,
+                alert=alert,
+                alerted=alerted,
+                heartbeat=activity.heartbeat,
+            )
+    except Exception as err:
+        logger.exception("anomaly_investigation.agent_failed", alert_id=str(alert.id))
+        await _mark_failed(subject, f"Agent run failed: {err}")
+        raise
+
+    notebook_markdown = build_investigation_markdown(
+        NotebookRenderContext(
+            alert=alert,
+            evaluated=evaluated,
+            insight=insight,
+            report=result.report,
+        )
+    )
+
+    notebook = await sync_to_async(notebooks.create_notebook, thread_sensitive=False)(
+        team.id,
+        title=f"Investigation — {alert.name or 'anomaly alert'}",
+        content=build_markdown_notebook_content(notebook_markdown),
+        text_content=notebook_markdown,
+        created_by_id=user.id,
+        last_modified_by_id=user.id,
+        creation_source=notebooks.NotebookCreationSource.TEMPORAL_AGENT,
+    )
+
+    summary = result.report.summary.strip()
+    deliveries: list[AlertDeliveryRequest] = []
+    if isinstance(subject, InsightAlertInvestigation):
+        release = await sync_to_async(alerts.finish_investigation, thread_sensitive=False)(
+            subject.team_id,
+            alert.id,
+            subject.id,
+            verdict=result.report.verdict,
+            summary=summary or None,
+            notebook_id=notebook.id,
+        )
+        deliveries = list(release.deliveries)
+        previous_verdict = release.previous_verdict
+        episode_source_id = _episode_source_id(subject)
+    else:
+        episode = await _deliver_alert_check_outcome(
+            alert=alert,
+            alert_check=subject,
+            user=user,
+            verdict=result.report.verdict,
+            summary=summary,
+            notebook=notebook,
+        )
+        previous_verdict = episode.previous_verdict
+        episode_source_id = episode.first_check_id
+
+    # Surface the completed investigation to the Signals inbox, gated on the verdict so
+    # false-positive fires don't become inbox noise (the verdict stays auditable on the
+    # investigated record and in the notebook). Best-effort: the investigation itself has already
+    # succeeded and been persisted, so a failure to emit must not fail the activity
+    # (and trigger a re-run of the whole agent).
+    if not should_emit_episode_signal(result.report.verdict, previous_verdict, alert.investigation_inconclusive_action):
+        logger.info(
+            "anomaly_investigation.signal_skipped",
+            alert_id=str(alert.id),
+            **_subject_ids(subject),
+            verdict=result.report.verdict,
+        )
+        return deliveries
+
+    try:
+        # Inside the try, so a failed read of the scope or the filter drops the signal instead of failing the activity.
+        if await sync_to_async(get_analytics_alert_scope, thread_sensitive=False)(team_id=team.id) == _ALERT_SCOPE_OFF:
+            logger.info(
+                "anomaly_investigation.signal_skipped",
+                alert_id=str(alert.id),
+                **_subject_ids(subject),
+                verdict=result.report.verdict,
+                reason="alert_scope_off",
+            )
+            return deliveries
+        filter_outcome = await sync_to_async(_alert_filter_outcome, thread_sensitive=False)(alert, insight)
+        if filter_outcome != AlertFilterOutcome.PASSED:
+            logger.info(
+                "anomaly_investigation.signal_skipped",
+                alert_id=str(alert.id),
+                **_subject_ids(subject),
+                verdict=result.report.verdict,
+                reason="filter_invalid" if filter_outcome == AlertFilterOutcome.INVALID else "filtered",
+            )
+            return deliveries
+        await _emit_investigation_signal(
+            team=team,
+            alert=alert,
+            subject=subject,
+            evaluated=evaluated,
+            source_id=episode_source_id,
+            previous_verdict=previous_verdict,
+            insight=insight,
+            detector_type=detector_type,
+            report=result.report,
+            notebook_short_id=notebook.short_id,
+        )
+    except Exception:
+        logger.exception(
+            "anomaly_investigation.signal_emission_failed",
+            alert_id=str(alert.id),
+            **_subject_ids(subject),
+        )
+    return deliveries
+
+
+async def _deliver_alert_check_outcome(
+    *,
+    alert: AlertConfiguration,
+    alert_check: AlertCheck,
+    user: User,
+    verdict: str,
+    summary: str,
+    notebook: NotebookData,
+) -> EpisodeInvestigations:
+    """Records the verdict on the insight stack's check and delivers or suppresses its notification.
+    Returns the check's episode as it stood before this verdict."""
+    # Rendered before the check is marked DONE: once the status is terminal the safety net's
+    # short grace applies (INVESTIGATION_NOTIFY_GRACE_MINUTES), and a slow render sitting
+    # between the DONE update and the dispatch would let the sweep force-send its fallback
+    # notification mid-render. While the status is RUNNING the sweep waits much longer.
+    insight_chart_url = await sync_to_async(prepare_alert_insight_chart_url, thread_sensitive=False)(
+        alert=alert,
+        alert_check=alert_check,
+        user=user,
+        verdict=verdict,
+    )
+
+    # Read the episode before this check's own verdict lands, so `previous_verdict` is the
+    # last verdict of an earlier check in the same firing episode.
+    episode = await sync_to_async(episode_investigations, thread_sensitive=False)(alert, alert_check)
+
+    await sync_to_async(AlertCheck.objects.filter(id=alert_check.id).update, thread_sensitive=False)(
+        investigation_notebook_id=notebook.id,
+        investigation_status=InvestigationStatus.DONE,
+        investigation_verdict=verdict,
+        investigation_summary=summary or None,
+        investigation_error=None,
+    )
+
+    # Always invoke the dispatcher — it reads the check's own delivery state
+    # (`notification_sent_at` / `notification_suppressed_by_agent`) as its
+    # idempotency guard, so non-gated checks (already dispatched by the main
+    # task) short-circuit safely. Calling unconditionally closes the race where
+    # a user toggles `investigation_gates_notifications` from True → False
+    # after the check was held back but before the workflow completes — in
+    # that case the current flag would say "don't dispatch" even though the
+    # notification was never sent.
+    await sync_to_async(_deliver_investigation_outcome, thread_sensitive=False)(
+        alert=alert,
+        alert_check=alert_check,
+        verdict=verdict,
+        previous_verdict=episode.previous_verdict,
+        summary=summary,
+        notebook_short_id=notebook.short_id,
+        insight_chart_url=insight_chart_url,
+    )
+    return episode
+
+
+async def _finish_platform_investigation(
+    alert: AlertConfiguration, investigation: InsightAlertInvestigation
+) -> InvestigationRelease:
+    return await sync_to_async(alerts.finish_investigation, thread_sensitive=False)(
+        investigation.team_id,
+        alert.id,
+        investigation.id,
+        verdict=investigation.verdict,
+        summary=investigation.summary,
+        notebook_id=investigation.notebook_id,
+    )
+
+
+def _investigated_alert(team_id: int, alert_id: UUID) -> AlertConfiguration | None:
+    """The alert's insight row, or, for an alert with no insight row, one built from the platform's
+    view of it. None when both are gone."""
+    alert = (
+        AlertConfiguration.objects.select_related("insight", "team", "threshold", "created_by")
+        .filter(team_id=team_id, id=alert_id)
+        .first()
+    )
+    if alert is not None:
+        return alert
+    view = platform.get_configuration(
+        team_id=team_id, source_kinds=[SourceKind.INSIGHT.value], configuration_id=alert_id
+    )
+    if view is None or view.legacy_configuration_id is not None:
+        return None
+    return AlertConfiguration.from_platform_view(view, team_id=team_id)
+
+
+async def _load_subject(
+    inputs: AnomalyInvestigationWorkflowInputs,
+) -> tuple[AlertCheck | InsightAlertInvestigation, EvaluatedCheck]:
+    """The record the investigation writes to, and what its check measured."""
+    if inputs.investigation_id is not None:
+        investigation = await sync_to_async(_load_investigation, thread_sensitive=False)(
+            inputs.team_id, inputs.investigation_id
+        )
+        return investigation, EvaluatedCheck.of_investigation(investigation)
+    if inputs.alert_check_id is not None:
+        alert_check = await AlertCheck.objects.aget(id=inputs.alert_check_id)
+        return alert_check, EvaluatedCheck.of_alert_check(alert_check)
+    raise ValueError("An investigation needs an alert check or an investigation id")
+
+
+def _load_investigation(team_id: int, investigation_id: UUID) -> InsightAlertInvestigation:
+    return InsightAlertInvestigation.objects.for_team(team_id).get(id=investigation_id)
+
+
+async def _investigation_user(inputs: AnomalyInvestigationWorkflowInputs, alert: AlertConfiguration) -> User | None:
+    if inputs.user_id is not None:
+        try:
+            return await User.objects.aget(id=inputs.user_id)
+        except User.DoesNotExist:
+            pass
+    return await _pick_investigation_user(alert)
+
+
+def _episode_source_id(investigation: InsightAlertInvestigation) -> str:
+    """One identity for every investigation of one firing, as the insight stack keys a signal on
+    its episode's first check. The firing that was open at takeover has no start, and is one episode."""
+    started = investigation.episode_started_at.isoformat() if investigation.episode_started_at else "takeover"
+    return f"{investigation.configuration_id}:{started}"
+
+
+def _subject_ids(subject: AlertCheck | InsightAlertInvestigation) -> dict[str, str]:
+    """The keys that name the investigated record, on a signal and in logs."""
+    if isinstance(subject, InsightAlertInvestigation):
+        return {"investigation_id": str(subject.id), "evaluation_key": subject.evaluation_key}
+    return {"alert_check_id": str(subject.id)}
+
+
+def _alert_filter_outcome(alert: AlertConfiguration, insight: Insight) -> AlertFilterOutcome:
+    return evaluate_alert_filter(
+        get_analytics_alert_name_patterns(team_id=alert.team_id),
+        alert_name=alert.name,
+        insight_name=insight.name or insight.derived_name,
+    )
+
+
+def should_emit_investigation_signal(verdict: str | None, inconclusive_action: str | None) -> bool:
+    """Whether a completed investigation should surface in the Signals inbox.
+
+    True positives always emit; false positives never do. Inconclusive follows the
+    alert's `investigation_inconclusive_action` policy, mirroring the notification
+    gate, so one per-alert knob controls both surfaces.
+    """
+    if verdict == "true_positive":
+        return True
+    if verdict == "inconclusive":
+        return (inconclusive_action or "notify") == "notify"
+    return False
+
+
+def should_emit_episode_signal(
+    verdict: str | None, previous_verdict: str | None, inconclusive_action: str | None
+) -> bool:
+    """Whether this investigation should reach the Signals inbox.
+
+    A re-investigation only emits when its verdict differs from the last one on the same
+    episode. That bounds an incident to one emission per verdict it reaches, so a long
+    incident cannot file a report for every check of it.
+    """
+    if verdict == previous_verdict:
+        return False
+    return should_emit_investigation_signal(verdict, inconclusive_action)
+
+
+def _build_investigation_signal_extra(
+    *,
+    alert: AlertConfiguration,
+    subject: AlertCheck | InsightAlertInvestigation,
+    evaluated: EvaluatedCheck,
+    insight: Insight,
+    detector_type: str,
+    report: InvestigationReport,
+    notebook_short_id: str | None,
+) -> dict:
+    """The `extra` payload for an anomaly-investigation signal — a plain dict validated against
+    `AnomalyInvestigationSignalExtra` inside `emit_signal`."""
+    url = notebook_url(notebook_short_id) if notebook_short_id else absolute_uri("/alerts")
+    extra: dict = {
+        "alert_id": str(alert.id),
+        "alert_name": alert.name or "Unnamed alert",
+        **_subject_ids(subject),
+        "insight_id": str(insight.id),
+        "detector_type": detector_type,
+        "verdict": report.verdict,
+        "url": url,
+    }
+    # Optional fields — omit when absent so the schema's None defaults apply.
+    if insight.name:
+        extra["insight_name"] = insight.name
+    insight_short_id = getattr(insight, "short_id", None)
+    if insight_short_id:
+        extra["insight_short_id"] = insight_short_id
+    if evaluated.triggered_dates:
+        extra["triggered_dates"] = list(evaluated.triggered_dates)
+    if notebook_short_id:
+        extra["notebook_short_id"] = notebook_short_id
+    return extra
+
+
+async def _emit_investigation_signal(
+    *,
+    team: Team,
+    alert: AlertConfiguration,
+    subject: AlertCheck | InsightAlertInvestigation,
+    evaluated: EvaluatedCheck,
+    source_id: str,
+    previous_verdict: str | None,
+    insight: Insight,
+    detector_type: str,
+    report: InvestigationReport,
+    notebook_short_id: str | None,
+) -> None:
+    """Emit an `alerts/anomaly_investigation` signal carrying the agent's verdict and findings.
+
+    The source id names the episode, not this check, so every investigation of one incident
+    carries the same identity. Grouping matches a signal on its description and on
+    semantically near signals, not on the source id, so one report per episode is a strong
+    default and not a guarantee: a re-emit can still open a report of its own.
+    """
+    await signals.emit_signal(
+        team=team,
+        source_product=SIGNAL_SOURCE_PRODUCT,
+        source_type=SIGNAL_SOURCE_TYPE,
+        source_id=source_id,
+        description=_build_signal_description(
+            alert_name=alert.name or "Unnamed alert",
+            insight_name=insight.name or None,
+            insight_id=str(insight.id),
+            insight_short_id=getattr(insight, "short_id", None),
+            report=report,
+            previous_verdict=previous_verdict,
+        ),
+        weight=1,
+        extra=_build_investigation_signal_extra(
+            alert=alert,
+            subject=subject,
+            evaluated=evaluated,
+            insight=insight,
+            detector_type=detector_type,
+            report=report,
+            notebook_short_id=notebook_short_id,
+        ),
+    )
+
+
+def _build_signal_description(
+    *,
+    alert_name: str,
+    insight_name: str | None,
+    insight_id: str,
+    insight_short_id: str | None,
+    report: InvestigationReport,
+    previous_verdict: str | None = None,
+) -> str:
+    """Human-readable description embedded for grouping. Leads with the verdict, names the insight
+    (with its id, handy for lookups), then the agent's summary, hypotheses, and recommendations.
+
+    A re-investigation of the same episode leads with the verdict change instead, because that
+    change is why the agent ran again."""
+    verdict_label = report.verdict.replace("_", " ")
+    metric = f" on {insight_name}" if insight_name else ""
+    insight_ref = f"{insight_short_id} / id {insight_id}" if insight_short_id else f"id {insight_id}"
+    headline = f"Anomaly investigation for alert '{alert_name}'{metric} (verdict: {verdict_label})."
+    if previous_verdict and previous_verdict != report.verdict:
+        headline = (
+            f"Verdict changed from {previous_verdict.replace('_', ' ')} to {verdict_label} "
+            f"for alert '{alert_name}'{metric}, which is still firing."
+        )
+    lines: list[str] = [
+        headline,
+        f"Insight: {insight_ref}.",
+        report.summary,
+    ]
+    if report.metric_meaning.strip():
+        # Grouping and triage both hinge on what the metric counts, which its name often misstates.
+        lines.append(f"What the metric measures: {report.metric_meaning.strip()}")
+    if report.hypotheses:
+        lines.append("Hypotheses:")
+        lines.extend(f"- {h.title}: {h.rationale}" for h in report.hypotheses)
+    if report.recommendations:
+        lines.append("Recommendations:")
+        lines.extend(f"- {rec}" for rec in report.recommendations)
+    description = "\n".join(line for line in lines if line)
+    # Bound the agent-generated text so it can't blow the facade's description token limit — past it
+    # emit_signal raises and the best-effort caller would silently drop the signal. The full write-up
+    # lives in the linked notebook, so truncating the embedded description is safe.
+    if len(description) > _MAX_DESCRIPTION_CHARS:
+        description = description[: _MAX_DESCRIPTION_CHARS - 1].rstrip() + "…"
+    return description
+
+
+def _deliver_investigation_outcome(
+    *,
+    alert,
+    alert_check,
+    verdict: str | None,
+    previous_verdict: str | None,
+    summary: str,
+    notebook_short_id: str | None,
+    insight_chart_url: str | None = None,
+) -> None:
+    """Decide what the user gets now that we have the verdict.
+
+    For a check whose notification was held back (every investigated check of a gated alert):
+
+    - true_positive → notify (enriched body with verdict + summary + notebook link)
+    - false_positive → suppress, mark the check so the UI can surface why
+    - inconclusive → fall back to the alert's configured policy
+    - unknown / null verdict → notify (safest default)
+
+    A check that was not held back (the alert did not gate when the check fired) already
+    notified. It gets a follow-up only when the verdict changed,
+    because the change is the news; an unchanged verdict would repeat what the user already
+    read. A change to a false positive is a correction of a message the user already has,
+    so it is sent rather than suppressed.
+
+    Idempotent: if another codepath (retry, safety-net task) already dispatched,
+    the first delivery is a no-op, and the follow-up is written once per check.
+    """
+    suppress = _should_suppress_notification(verdict, alert.investigation_inconclusive_action)
+
+    with transaction.atomic():
+        # Re-fetch under a row lock so concurrent dispatchers can't double-notify.
+        check = AlertCheck.objects.select_for_update().get(id=alert_check.id)
+        if check.notification_sent_at is not None or check.notification_suppressed_by_agent:
+            _dispatch_verdict_change_followup(
+                alert=alert,
+                check=check,
+                verdict=verdict,
+                previous_verdict=previous_verdict,
+                summary=summary,
+                notebook_short_id=notebook_short_id,
+            )
+            return
+
+        if suppress:
+            check.notification_suppressed_by_agent = True
+            check.save(update_fields=["notification_suppressed_by_agent"])
+            logger.info(
+                "anomaly_investigation.notification_suppressed",
+                alert_id=str(alert.id),
+                alert_check_id=str(alert_check.id),
+                verdict=verdict,
+            )
+            return
+
+        descriptions = _build_breach_descriptions(
+            alert_check=check,
+            verdict=verdict,
+            previous_verdict=previous_verdict,
+            summary=summary,
+            notebook_short_id=notebook_short_id,
+        )
+        # Event properties beyond the breach text, for HogFunction destinations. The notebook
+        # URL backs the Slack "View Investigation" button (falls back to "View Alert" when
+        # absent), and the chart URL renders as an image block of the alerted insight (the
+        # block falls back to a divider when absent).
+        extra_properties: dict[str, str] = {}
+        if notebook_short_id:
+            extra_properties["investigation_notebook_url"] = notebook_url(notebook_short_id)
+        if insight_chart_url:
+            extra_properties["insight_chart_url"] = insight_chart_url
+        try:
+            # render_chart=False: the chart was already rendered above, before this
+            # transaction took its row lock.
+            deliveries = dispatch_alert_notification(
+                alert,
+                check,
+                descriptions.lines,
+                extra_properties=extra_properties or None,
+                render_chart=False,
+                investigation_summary=descriptions.summary,
+            )
+            record_alert_delivery(alert, check, deliveries, stamp_on_empty=True)
+        except Exception:
+            logger.exception(
+                "anomaly_investigation.gated_notification_failed",
+                alert_id=str(alert.id),
+                alert_check_id=str(alert_check.id),
+            )
+            # Don't swallow — let the safety-net task retry on the next tick.
+            raise
+
+
+def _dispatch_verdict_change_followup(
+    *,
+    alert,
+    check,
+    verdict: str | None,
+    previous_verdict: str | None,
+    summary: str,
+    notebook_short_id: str | None,
+) -> None:
+    """Send one follow-up for a check whose notification already went out and whose verdict
+    changed since the previous investigation of the same episode.
+
+    A false positive does not hold this back the way it holds back a first notification.
+    The user was already told the anomaly was real, so the correction is the whole point of
+    the message. An inconclusive verdict still follows the alert's configured policy: a user
+    who asked not to hear about unsure verdicts did not ask to hear about them here.
+
+    Caller holds the row lock. The marker on `targets_notified` is the idempotency guard, so
+    an activity retry past a successful send cannot notify twice. It is written only once a
+    destination accepts the send, so a failed enqueue leaves the follow-up retryable.
+
+    Never raises into the activity: a correction that cannot be sent is not worth a second
+    agent run.
+    """
+    if not alerts.verdict_change_is_news(verdict, previous_verdict, alert.investigation_inconclusive_action):
+        return
+    receipts = check.targets_notified or {}
+    if receipts.get(_VERDICT_CHANGE_FOLLOWUP_KEY):
+        return
+
+    descriptions = _build_breach_descriptions(
+        alert_check=check,
+        verdict=verdict,
+        previous_verdict=previous_verdict,
+        summary=summary,
+        notebook_short_id=notebook_short_id,
+    )
+    extra_properties = {"investigation_notebook_url": notebook_url(notebook_short_id)} if notebook_short_id else None
+    try:
+        # The savepoint keeps a database failure inside the dispatch from poisoning the
+        # caller's transaction once the handler below swallows it.
+        with transaction.atomic():
+            # A key of its own: the check id already carries a delivery record per recipient
+            # from the notification sent at fire time, and the email sender drops a second
+            # send under the same campaign. Stable across retries, so at-most-once per
+            # recipient still holds.
+            deliveries = dispatch_alert_notification(
+                alert,
+                check,
+                descriptions.lines,
+                extra_properties=extra_properties,
+                idempotency_key=f"{check.id}:investigation-verdict-change",
+                investigation_summary=descriptions.summary,
+                # The caller holds a row lock, and this check was already notified, so
+                # prepare_alert_insight_chart_url would return None anyway.
+                render_chart=False,
+            )
+    except Exception:
+        # Best-effort, like the signal emit: the verdict is persisted and the user already
+        # has the fire notification, so raising would rerun the whole agent for one
+        # correction message. The safety net cannot recover this check either — it only
+        # picks up checks that were never notified.
+        logger.exception(
+            "anomaly_investigation.verdict_change_followup_failed",
+            alert_id=str(alert.id),
+            alert_check_id=str(check.id),
+        )
+        return
+    if not deliveries:
+        # A failed enqueue and an alert with no destinations look the same from here, so
+        # leave the marker unset. A later attempt can then send again, and an alert with no
+        # destination has nothing to re-send. Marking it would lose the follow-up for good:
+        # no sweep picks up a check whose notification already went out.
+        logger.warning(
+            "anomaly_investigation.verdict_change_followup_not_delivered",
+            alert_id=str(alert.id),
+            alert_check_id=str(check.id),
+            verdict=verdict,
+            previous_verdict=previous_verdict,
+        )
+        return
+    check.targets_notified = {**receipts, _VERDICT_CHANGE_FOLLOWUP_KEY: True}
+    check.save(update_fields=["targets_notified"])
+    logger.info(
+        "anomaly_investigation.verdict_change_followup_sent",
+        alert_id=str(alert.id),
+        alert_check_id=str(check.id),
+        verdict=verdict,
+        previous_verdict=previous_verdict,
+    )
+
+
+def _build_breach_descriptions(
+    *,
+    alert_check,
+    verdict: str | None,
+    previous_verdict: str | None,
+    summary: str,
+    notebook_short_id: str | None,
+) -> InvestigationBreaches:
+    return verdict_breaches(
+        triggered_dates=alert_check.triggered_dates or [],
+        value=alert_check.calculated_value,
+        verdict=verdict,
+        previous_verdict=previous_verdict,
+        summary=summary,
+        notebook_short_id=notebook_short_id,
+    )
+
+
+async def _mark_running(subject: AlertCheck | InsightAlertInvestigation) -> None:
+    if isinstance(subject, InsightAlertInvestigation):
+        await sync_to_async(alerts.mark_investigation_running, thread_sensitive=False)(subject.team_id, subject.id)
+        return
+    await sync_to_async(AlertCheck.objects.filter(id=subject.id).update, thread_sensitive=False)(
+        investigation_status=InvestigationStatus.RUNNING,
+    )
+
+
+async def _mark_failed(subject: AlertCheck | InsightAlertInvestigation, reason: str) -> None:
+    if isinstance(subject, InsightAlertInvestigation):
+        await sync_to_async(alerts.mark_investigation_failed, thread_sensitive=False)(
+            subject.team_id, subject.id, reason
+        )
+        return
+    await sync_to_async(AlertCheck.objects.filter(id=subject.id).update, thread_sensitive=False)(
+        investigation_status=InvestigationStatus.FAILED,
+        investigation_error={"message": reason},
+    )
+
+
+def _evaluated_series(alert, evaluated) -> AlertedSeries:
+    """The series the check judged, which the alert can have been repointed away from since.
+
+    A breakdown check saves the fired value's position as ``series_index``, so its query series
+    is the alert's own.
+    """
+    metadata = evaluated.triggered_metadata or {}
+    configured = (alert.config or {}).get("series_index", 0)
+    saved = metadata.get("series_index")
+    saved_index = saved if isinstance(saved, int) and not isinstance(saved, bool) else None
+    label = metadata.get("breakdown_label")
+    if isinstance(label, str):
+        return AlertedSeries(series_index=configured, breakdown_label=label, breakdown_index=saved_index)
+    return AlertedSeries(
+        series_index=saved_index if saved_index is not None else configured, breakdown_index=saved_index
+    )
+
+
+def _evaluated_detector_type(alert, evaluated) -> str:
+    """The detector that produced the check, which the alert can have been moved off since."""
+    metadata = evaluated.triggered_metadata or {}
+    saved = metadata.get("detector_type")
+    if isinstance(saved, str) and saved:
+        return saved
+    # Checks saved before the type was recorded: only AI checks carried a verdict.
+    if isinstance(metadata.get("verdict_is_anomaly"), bool):
+        return "llm"
+    return (alert.detector_config or {}).get("type") or "threshold"
+
+
+def _evaluated_insight(alert, evaluated):
+    """The insight the check judged, which the alert can have been repointed away from since."""
+    saved = (evaluated.triggered_metadata or {}).get("insight_id")
+    if not isinstance(saved, int) or isinstance(saved, bool) or saved == alert.insight_id:
+        return alert.insight
+    # The judged insight can be soft-deleted by now; its definition is still what the check was about.
+    found = insights_including_soft_deleted_for_team(team_id=alert.team_id, insight_ids=[saved])
+    return found[0] if found else alert.insight
+
+
+def _build_multimodal_context(
+    *,
+    alert,
+    context_text: str,
+    triggered_dates: list[str],
+    triggered_points: list[int] | None = None,
+    alerted: AlertedSeries | None = None,
+    detector_type: str | None = None,
+):
+    """Return a LangChain HumanMessage content value — either a plain string or a
+    list of content blocks with the text and a rendered chart PNG.
+
+    ``detector_type`` is the detector that produced the check under investigation, and
+    ``triggered_points`` the indices it flagged, paired with ``triggered_dates``.
+    Best-effort: if the detector can't simulate or the chart fails to render, we
+    fall back to text-only so the investigation still runs.
+    """
+    if alert.insight is None:
+        return context_text
+    # The alert's detector can change while an investigation waits to start. A saved AI
+    # verdict is charted from its own markers, with no scores from whatever detector the
+    # alert carries now, and even after the alert moved to a plain threshold.
+    judged_by_model = detector_type == "llm"
+    if alert.detector_config is None and not judged_by_model:
+        return context_text
+
+    sim = _run_detector_simulation(
+        alert=alert, team=alert.team, date_from=None, alerted=alerted, score=not judged_by_model
+    )
+    if isinstance(sim, str) or not sim:
+        logger.info("anomaly_investigation.chart_skipped", alert_id=str(alert.id), reason=str(sim)[:120])
+        return context_text
+
+    dates = sim.get("dates") or []
+    values = sim.get("data") or []
+    if not dates or not values:
+        return context_text
+
+    triggered_indices = _restore_triggered_indices(dates, triggered_points or [], triggered_dates)
+
+    png = render_series_chart(
+        dates=dates,
+        values=values,
+        triggered_indices=triggered_indices,
+        scores=None if judged_by_model else sim.get("scores") or None,
+        title=_chart_title(alert, alerted),
+    )
+    if not png:
+        return context_text
+
+    return [
+        {"type": "text", "text": context_text},
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": png_to_b64(png),
+            },
+        },
+    ]
+
+
+def _chart_title(alert, alerted: AlertedSeries | None) -> str:
+    title = alert.insight.name or alert.name or "Metric"
+    if alerted is not None and alerted.breakdown_label is not None:
+        title = f"{title} ({alerted.breakdown_label})"
+    return title[:80]
+
+
+def _restore_triggered_indices(dates: list[str], saved_points: list[int], saved_dates: list[str]) -> list[int]:
+    """Where the check's flagged points sit in the series as fetched now.
+
+    The series can have gained or lost points at either end since the check ran, so the
+    saved indices are matched to their dates as one block and shifted together. A SQL
+    series can repeat a date label, so matching on dates alone would mark every row that
+    shares one; the block match keeps one row per flagged point. A check with no saved
+    indices, or whose block no longer lines up, falls back to the dates.
+    """
+    pairs = list(zip(saved_points, saved_dates))
+    if pairs and len(saved_points) == len(saved_dates):
+        for offset in sorted(range(-len(dates), len(dates) + 1), key=abs):
+            if all(0 <= index + offset < len(dates) and dates[index + offset] == date for index, date in pairs):
+                return sorted(index + offset for index, _ in pairs)
+    wanted = set(saved_dates)
+    return [index for index, date in enumerate(dates) if date in wanted]
+
+
+async def _pick_investigation_user(alert) -> User | None:
+    """Fall back to the alert creator, then any subscribed user, then None."""
+
+    def _resolve() -> User | None:
+        if alert.created_by_id:
+            try:
+                return User.objects.get(id=alert.created_by_id)
+            except User.DoesNotExist:
+                pass
+        subscriber_id = first_subscriber_id(team_id=alert.team_id, alert_id=alert.id)
+        return User.objects.filter(id=subscriber_id).first() if subscriber_id is not None else None
+
+    return await sync_to_async(_resolve, thread_sensitive=False)()

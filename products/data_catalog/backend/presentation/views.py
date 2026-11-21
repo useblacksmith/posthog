@@ -1,0 +1,725 @@
+"""DRF views for data_catalog.
+
+Thin: validate via the serializer, call the facade, serialize the result. Domain invariants
+(name uniqueness, upsert, rename, validation, drift, approval) live in the logic layer behind the facade.
+"""
+
+from functools import reduce
+from operator import or_
+from typing import Any, cast
+
+from django.contrib.postgres.search import SearchQuery, SearchRank
+from django.db.models import Q, QuerySet
+from django.db.models.expressions import CombinedExpression
+
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
+from rest_framework import mixins, status, viewsets
+from rest_framework.decorators import action as drf_action
+from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.filters import SearchFilter
+from rest_framework.pagination import LimitOffsetPagination
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.settings import api_settings
+from rest_framework.throttling import BaseThrottle
+from rest_framework.views import APIView
+
+from posthog.api.mixins import ValidatedRequest, validated_request
+from posthog.api.pagination import PrecountedLimitOffsetPagination
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.api.utils import action
+from posthog.event_usage import get_request_analytics_properties
+from posthog.helpers.full_text_search import build_search_vector
+from posthog.models import Team, User
+from posthog.rate_limit import (
+    ClickHouseBurstRateThrottle,
+    ClickHouseSustainedRateThrottle,
+    HogQLQueryThrottle,
+    MetricSearchBurstRateThrottle,
+    MetricSearchSustainedRateThrottle,
+    MetricWriteBurstRateThrottle,
+    MetricWriteSustainedRateThrottle,
+)
+
+from ..facade import api
+from ..facade.enums import HOGQL_DEFINITION_KIND, INSIGHT_DEFINITION_KINDS, NODE_DEFINITION_KINDS
+from ..facade.models import Metric, RelationshipProposal, TableCertification
+from .serializers import (
+    CertificationCreateSerializer,
+    CertificationSerializer,
+    MetricApproveRequestSerializer,
+    MetricAvailabilitySerializer,
+    MetricBulkApproveResponseSerializer,
+    MetricBulkChangeOwnerRequestSerializer,
+    MetricBulkChangeOwnerResponseSerializer,
+    MetricBulkDeleteResponseSerializer,
+    MetricBulkNamesRequestSerializer,
+    MetricCreateSerializer,
+    MetricNameConflictSerializer,
+    MetricRunQuerySerializer,
+    MetricRunRequestSerializer,
+    MetricRunResponseSerializer,
+    MetricSerializer,
+    MetricUsageSerializer,
+    PendingReviewCountsSerializer,
+    RelationshipProposalSerializer,
+    RelationshipRejectSerializer,
+    UsageSnapshotSerializer,
+    UsageSnapshotSummarySerializer,
+)
+
+# Kinds that execute a ClickHouse query through the trends/funnels pipeline (node kinds run as a
+# wrapped single-series trends query).
+_STRUCTURED_QUERY_KINDS = {*INSIGHT_DEFINITION_KINDS, *NODE_DEFINITION_KINDS}
+
+
+def _resolve_bulk_metrics(
+    queryset: QuerySet[Metric], names: list[str]
+) -> tuple[list[Metric], list[api.MetricBulkSkip]]:
+    """Resolve names against a team-scoped queryset, deduped, in request order.
+
+    Shared by both bulk metric actions, so a name that resolves for one resolves for the other.
+    """
+    requested = list(dict.fromkeys(names))
+    by_name = {metric.name: metric for metric in queryset.filter(name__in=requested)}
+    return (
+        [by_name[name] for name in requested if name in by_name],
+        [api.MetricBulkSkip(name=name, reason=api.BULK_SKIP_NOT_FOUND) for name in requested if name not in by_name],
+    )
+
+
+def _require_usage_enabled(request: Request, team: Team) -> None:
+    # A 404 rather than a 403, so the endpoints stay invisible until the flag is on for the team.
+    if not api.is_usage_enabled(cast(User, request.user), team):
+        raise NotFound()
+
+
+_NO_USAGE_SCAN = "No usage scan has finished for this project yet."
+_USAGE_404 = OpenApiResponse(description="Usage is not enabled for this project, or no scan has finished.")
+
+
+class CatalogSearchFilter(SearchFilter):
+    def get_search_vector(self, request: Request, view: APIView) -> CombinedExpression:
+        return build_search_vector(dict.fromkeys(self.get_search_fields(view, request) or [], "A"), config="english")
+
+    def filter_queryset(self, request: Request, queryset: QuerySet, view: APIView) -> QuerySet:
+        terms = self.get_search_terms(request)
+        if not terms:
+            return queryset
+        vector = self.get_search_vector(request, view)
+        query = reduce(or_, [SearchQuery(term, config="english") for term in terms[:60]])
+        return (
+            queryset.alias(_search_vector=vector, _search_rank=SearchRank(vector, query))
+            .filter(_search_vector=query)
+            .order_by("-_search_rank", "pk")
+        )
+
+
+class MetricSearchFilter(CatalogSearchFilter):
+    search_description = (
+        "Find metrics for a measure instead of reading the whole catalog. Send the user's words, the likely "
+        "metric name, and the spelled-out form of an acronym, separated by commas, such as "
+        "'mrr, monthly recurring revenue'. Results come best match first, 20 by default, and match_reason "
+        "says why each one matched. Words match by stem in the name, display name, description, and "
+        "definition. Synonyms do not match unless the metric's text contains them."
+    )
+
+
+class MetricListPagination(PrecountedLimitOffsetPagination):
+    """Pages the ranked search from a count the search returns, so the view loads only the rows on the page."""
+
+    def get_schema_operation_parameters(self, view: APIView) -> list[dict[str, Any]]:
+        return LimitOffsetPagination.get_schema_operation_parameters(self, view)
+
+
+class MetricViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
+    """CRUD for catalog metrics, addressed by their ``name`` (e.g. /metrics/mrr/)."""
+
+    scope_object = "data_catalog"
+    lookup_field = "name"
+    filter_backends = [MetricSearchFilter]
+    search_fields = ["name", "display_name", "description"]
+    serializer_class = MetricSerializer
+    pagination_class = MetricListPagination
+    queryset = Metric.objects.unscoped()
+
+    def _list_filters(self) -> api.MetricListFilters:
+        params = self.request.query_params
+        return api.MetricListFilters(
+            status=params.get("status") or None, definition_kind=params.get("definition_kind") or None
+        )
+
+    def safely_get_queryset(self, queryset: QuerySet[Metric]) -> QuerySet[Metric]:
+        metrics = api.metrics_visible_to_user(
+            self.team, cast(User, self.request.user), self.user_access_control, self._list_filters()
+        )
+        return metrics.select_related("created_by", "owner")
+
+    def dangerously_get_required_scopes(self, request: Request, view: APIView) -> list[str] | None:
+        if getattr(view, "action", None) not in ("create", "update", "partial_update"):
+            return None
+        if isinstance(request.data, dict) and request.data.get("source_insight_short_id"):
+            return ["data_catalog:write", "insight:read"]
+        return None
+
+    def get_throttles(self) -> list[BaseThrottle]:
+        # Running a metric executes a query, so it must carry the same query throttles as /query/;
+        # markdown and definition-less metrics never reach ClickHouse and keep the API defaults.
+        if getattr(self, "action", None) == "run":
+            kind = (
+                Metric.objects.for_team(self.team_id)
+                .filter(name=self.kwargs.get("name"), deleted=False)
+                .values_list("definition__kind", flat=True)
+                .first()
+            )
+            if kind == HOGQL_DEFINITION_KIND:
+                return [HogQLQueryThrottle()]
+            if kind in _STRUCTURED_QUERY_KINDS:
+                return [ClickHouseBurstRateThrottle(), ClickHouseSustainedRateThrottle()]
+        # A search can embed its query, and a write can embed the metric, which spends model provider budget.
+        action = getattr(self, "action", None)
+        if action == "list" and self.request.query_params.get(api_settings.SEARCH_PARAM):
+            return [*super().get_throttles(), MetricSearchBurstRateThrottle(), MetricSearchSustainedRateThrottle()]
+        if action in ("create", "update", "partial_update"):
+            return [*super().get_throttles(), MetricWriteBurstRateThrottle(), MetricWriteSustainedRateThrottle()]
+        return super().get_throttles()
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("status", OpenApiTypes.STR, description="Only metrics with this review status."),
+            OpenApiParameter(
+                "definition_kind", OpenApiTypes.STR, description="Only metrics with this query node kind."
+            ),
+        ]
+    )
+    def list(self, request: Request, *args, **kwargs) -> Response:
+        search = request.query_params.get(api_settings.SEARCH_PARAM, "").strip()
+        if search:
+            return self._ranked_search_list(request, search)
+        # Precompute drift for the whole page in one bulk query, so is_drifted doesn't fan out
+        # into a per-metric insight lookup (an N+1 over the catalog list).
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        metrics = page if page is not None else list(queryset)
+        context = {**self.get_serializer_context(), "drift_map": api.compute_drift(metrics)}
+        serializer = self.get_serializer(metrics, many=True, context=context)
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
+
+    def _ranked_search_list(self, request: Request, search: str) -> Response:
+        paginator = cast(MetricListPagination, self.paginator)
+        if paginator.limit_query_param not in request.query_params:
+            paginator.default_limit = api.SEARCH_DEFAULT_LIMIT
+        limit = paginator.get_limit(request) or api.SEARCH_DEFAULT_LIMIT
+        result = api.search_catalog(
+            team=self.team,
+            user=cast(User, request.user),
+            user_access_control=self.user_access_control,
+            search=search,
+            filters=self._list_filters(),
+            limit=limit,
+            offset=paginator.get_offset(request),
+            analytics_props=get_request_analytics_properties(request),
+        )
+        # The search already cut the page, so the paginator takes the total from it and slices nothing.
+        paginator.set_count(result.total)
+        metrics = paginator.paginate_queryset([hit.metric for hit in result.hits], request, view=self) or []
+        context = {
+            **self.get_serializer_context(),
+            "drift_map": api.compute_drift(metrics),
+            "match_reasons": {hit.metric.id: hit.match_reason for hit in result.hits},
+        }
+        serializer = self.get_serializer(metrics, many=True, context=context)
+        return paginator.get_paginated_response(serializer.data)
+
+    @extend_schema(
+        description="Create a metric. When a live metric already holds the name, returns 409 unless overwrite "
+        "is true, in which case the existing metric is refined with the fields sent.",
+        request=MetricCreateSerializer,
+        responses={
+            201: MetricSerializer,
+            409: OpenApiResponse(
+                response=MetricNameConflictSerializer,
+                description="A live metric already holds this name (code 'metric_name_taken'). "
+                "extra.existing_metric holds its name and status, unless the metric is hidden from the caller. "
+                "Send overwrite true to replace a visible metric.",
+            ),
+        },
+    )
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        serializer = MetricCreateSerializer(data=request.data, context=self.get_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        user = cast(User, request.user)
+        # Pass only the fields the client actually sent, so an upsert that refines an existing metric
+        # leaves omitted fields (a stored definition, provenance, ...) untouched rather than resetting them.
+        optional = {
+            key: data[key]
+            for key in (
+                "display_name",
+                "unit",
+                "owner",
+                "definition",
+                "source_insight_short_id",
+                "created_source",
+                "ai_model",
+                "reasoning",
+            )
+            if key in data
+        }
+        metric = api.upsert_metric(
+            team=self.team,
+            user=user,
+            name=data["name"],
+            description=data["description"],
+            overwrite=data["overwrite"],
+            user_access_control=self.user_access_control,
+            request=request,
+            **optional,
+        )
+        return Response(self.get_serializer(metric).data, status=status.HTTP_201_CREATED)
+
+    def update(self, request: Request, *args, **kwargs) -> Response:
+        partial = kwargs.pop("partial", False)
+        metric = self.get_object()
+        serializer = self.get_serializer(metric, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        fields = dict(serializer.validated_data)
+        metric = api.update_metric(metric, team=self.team, user=cast(User, request.user), request=request, **fields)
+        return Response(self.get_serializer(metric).data)
+
+    def perform_destroy(self, instance: Metric) -> None:
+        api.soft_delete_metric(instance, cast(User, self.request.user), request=self.request)
+
+    @action(
+        detail=True,
+        methods=["POST"],
+        required_scopes=["data_catalog_approval:write", "data_catalog:read"],
+        request=MetricApproveRequestSerializer,
+        responses={200: MetricSerializer},
+    )
+    @validated_request(request_serializer=MetricApproveRequestSerializer)
+    def approve(self, request: ValidatedRequest, **kwargs) -> Response:
+        """Bless a metric as canonical. Returns 409 while the metric is drifted from its insight."""
+        metric = api.approve_metric(
+            self.get_object(),
+            cast(User, request.user),
+            request=request,
+            expected_updated_at=request.validated_data.get("expected_updated_at"),
+        )
+        return Response(self.get_serializer(metric).data)
+
+    # DRF routes detail=False actions before the {name} detail route, so these paths can't be
+    # shadowed by a metric literally named bulk_approve.
+    @action(
+        detail=False,
+        methods=["POST"],
+        required_scopes=["data_catalog_approval:write", "data_catalog:read"],
+        request=MetricBulkNamesRequestSerializer,
+        responses={200: MetricBulkApproveResponseSerializer},
+    )
+    @validated_request(request_serializer=MetricBulkNamesRequestSerializer)
+    def bulk_approve(self, request: ValidatedRequest, **kwargs) -> Response:
+        """Approve many metrics as canonical. Unknown, already-approved, and drifted metrics are skipped."""
+        metrics, unresolved = _resolve_bulk_metrics(self.get_queryset(), request.validated_data["names"])
+        approved, skipped = api.bulk_approve_metrics(metrics, cast(User, request.user), request=request)
+        # Approval is gated on a drift check over the same locked rows, so every metric in
+        # `approved` is in lockstep with its insight; recomputing would be a second bulk query.
+        context = {**self.get_serializer_context(), "drift_map": {metric.id: False for metric in approved}}
+        payload = MetricBulkApproveResponseSerializer(
+            {"approved": approved, "skipped": [*unresolved, *skipped]}, context=context
+        )
+        return Response(payload.data)
+
+    @action(
+        detail=False,
+        methods=["POST"],
+        required_scopes=["data_catalog:write"],
+        request=MetricBulkNamesRequestSerializer,
+        responses={200: MetricBulkDeleteResponseSerializer},
+    )
+    @validated_request(request_serializer=MetricBulkNamesRequestSerializer)
+    def bulk_delete(self, request: ValidatedRequest, **kwargs) -> Response:
+        """Delete many metrics, freeing their names for reuse. Unknown metrics are skipped."""
+        metrics, unresolved = _resolve_bulk_metrics(self.get_queryset(), request.validated_data["names"])
+        deleted, skipped = api.bulk_soft_delete_metrics(metrics, cast(User, request.user), request=request)
+        payload = MetricBulkDeleteResponseSerializer(
+            {"deleted": [metric.name for metric in deleted], "skipped": [*unresolved, *skipped]}
+        )
+        return Response(payload.data)
+
+    @action(
+        detail=False,
+        methods=["POST"],
+        url_path="bulk/change_owner",
+        required_scopes=["data_catalog:write"],
+        request=MetricBulkChangeOwnerRequestSerializer,
+        responses={200: MetricBulkChangeOwnerResponseSerializer},
+    )
+    @validated_request(request_serializer=MetricBulkChangeOwnerRequestSerializer, include_serializer_context=True)
+    def bulk_change_owner(self, request: ValidatedRequest, **kwargs) -> Response:
+        """Give many metrics one owner, keeping their approvals. Unknown metrics are skipped."""
+        metrics, unresolved = _resolve_bulk_metrics(self.get_queryset(), request.validated_data["names"])
+        owner = request.validated_data["owner"]
+        names_by_id = {metric.id: metric.name for metric in metrics}
+        change = api.bulk_change_metric_owner(
+            team_id=self.team.id,
+            names_by_id=names_by_id,
+            owner_id=owner.id if owner else None,
+            user_id=cast(User, request.user).id,
+            analytics_props=get_request_analytics_properties(request),
+        )
+        position = {metric_id: index for index, metric_id in enumerate(change.updated_ids)}
+        updated = sorted(
+            self.get_queryset().filter(id__in=change.updated_ids).select_related("owner", "created_by", "approved_by"),
+            key=lambda metric: position[metric.id],
+        )
+        skipped = [
+            api.MetricBulkSkip(name=names_by_id[metric_id], reason=api.BULK_SKIP_NOT_FOUND)
+            for metric_id in change.skipped_ids
+        ]
+        context = {**self.get_serializer_context(), "drift_map": api.compute_drift(updated)}
+        payload = MetricBulkChangeOwnerResponseSerializer(
+            {"updated": updated, "skipped": [*unresolved, *skipped]}, context=context
+        )
+        return Response(payload.data)
+
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path="refresh_from_insight",
+        required_scopes=["data_catalog:write", "insight:read"],
+        request=None,
+        responses={200: MetricSerializer},
+    )
+    def refresh_from_insight(self, request: Request, **kwargs) -> Response:
+        """Re-snapshot the linked insight's current query into the definition."""
+        metric = api.refresh_metric_from_insight(self.get_object(), cast(User, request.user), request=request)
+        return Response(self.get_serializer(metric).data)
+
+    @action(
+        detail=True,
+        methods=["GET"],
+        required_scopes=["data_catalog:read"],
+        responses={200: MetricUsageSerializer, 404: _USAGE_404},
+    )
+    def usage(self, request: Request, **kwargs) -> Response:
+        """How the metric was used in the latest usage scan: direct runs and agent re-derivations."""
+        _require_usage_enabled(request, self.team)
+        reader = api.usage_reader(self.team, cast(User, request.user), self.user_access_control)
+        usage = api.metric_usage(self.team_id, self.get_object().id, reader)
+        if usage is None:
+            raise NotFound(_NO_USAGE_SCAN)
+        return Response(MetricUsageSerializer(usage).data)
+
+    # @extend_schema must sit OUTSIDE @action: DRF's @action resets func.kwargs, wiping any schema
+    # annotation applied earlier — including @validated_request's — from the generated OpenAPI.
+    @extend_schema(
+        request=MetricRunRequestSerializer,
+        parameters=[MetricRunQuerySerializer],
+        responses={
+            200: OpenApiResponse(response=MetricRunResponseSerializer, description="The normalized run envelope."),
+            400: OpenApiResponse(
+                description="The metric has no runnable definition, an override is invalid for its kind, or the query failed."
+            ),
+            429: OpenApiResponse(description="Query rate limit or concurrency limit exceeded."),
+            500: OpenApiResponse(description="Unexpected error while executing the query."),
+        },
+    )
+    @drf_action(
+        detail=True,
+        methods=["POST"],
+        required_scopes=["data_catalog:read", "query:read"],
+    )
+    @validated_request(
+        request_serializer=MetricRunRequestSerializer,
+        query_serializer=MetricRunQuerySerializer,
+    )
+    def run(self, request: ValidatedRequest, **kwargs) -> Response:
+        """Execute the metric's definition and return the normalized result envelope."""
+        # required_scopes gates tokens on query:read, but session users carry no scopes and
+        # AccessControlPermission only checks the data_catalog resource. Enforce query RBAC
+        # explicitly so a member with query access denied can't read data through a metric run.
+        if not self.user_access_control.check_access_level_for_resource("query", "viewer"):
+            raise PermissionDenied("You need query access to run a metric.")
+        overrides = request.validated_data
+        envelope = api.run_metric(
+            team=self.team,
+            metric=self.get_object(),
+            user=cast(User, request.user),
+            refresh=request.validated_query_data.get("refresh"),
+            date_from=overrides.get("date_from"),
+            date_to=overrides.get("date_to"),
+            interval=overrides.get("interval"),
+            offset=overrides.get("offset"),
+            query_id=overrides.get("query_id"),
+            request=request,
+        )
+        return Response(envelope)
+
+
+class CertificationSearchFilter(CatalogSearchFilter):
+    def get_schema_operation_parameters(self, view: APIView) -> list[dict[str, object]]:
+        return [
+            *super().get_schema_operation_parameters(view),
+            {
+                "name": "status",
+                "required": False,
+                "in": "query",
+                "description": "Only certifications with this review status.",
+                "schema": {"type": "string"},
+            },
+        ]
+
+
+class CertificationViewSet(
+    TeamAndOrgViewSetMixin,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Trust marks on warehouse tables and views. Reads exclude soft-deleted targets."""
+
+    scope_object = "data_catalog"
+    filter_backends = [CertificationSearchFilter]
+    search_fields = ["table__name", "saved_query__name", "notes"]
+    serializer_class = CertificationSerializer
+    queryset = TableCertification.objects.unscoped()
+
+    def safely_get_queryset(self, queryset: QuerySet[TableCertification]) -> QuerySet[TableCertification]:
+        certifications = api.certifications_for_team(self.team)
+        if status_filter := self.request.query_params.get("status"):
+            certifications = certifications.filter(status=status_filter)
+        return certifications
+
+    def dangerously_get_required_scopes(self, request: Request, view: APIView) -> list[str] | None:
+        action = getattr(view, "action", None)
+        if action == "destroy":
+            return ["data_catalog_approval:write", "data_catalog:read"]
+        if action == "create" and isinstance(request.data, dict):
+            scopes = ["data_catalog:write"]
+            if request.data.get("table_id") or request.data.get("table_name"):
+                scopes.append("warehouse_table:read")
+            if request.data.get("saved_query_id") or request.data.get("view_name"):
+                scopes.append("warehouse_view:read")
+            return scopes if len(scopes) > 1 else None
+        return None
+
+    @extend_schema(request=CertificationCreateSerializer, responses={201: CertificationSerializer})
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        serializer = CertificationCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        cert = api.propose_certification(
+            team=self.team, user=cast(User, request.user), request=request, **serializer.validated_data
+        )
+        return Response(CertificationSerializer(cert).data, status=status.HTTP_201_CREATED)
+
+    def perform_destroy(self, instance: TableCertification) -> None:
+        api.revoke_certification(instance, cast(User, self.request.user), request=self.request)
+
+    @action(
+        detail=True,
+        methods=["POST"],
+        required_scopes=["data_catalog_approval:write", "data_catalog:read"],
+        request=None,
+        responses={200: CertificationSerializer},
+    )
+    def certify(self, request: Request, **kwargs) -> Response:
+        """Mark the target as certified (prefer this source)."""
+        cert = api.certify(self.get_object(), cast(User, request.user), request=request)
+        return Response(CertificationSerializer(cert).data)
+
+    @action(
+        detail=True,
+        methods=["POST"],
+        required_scopes=["data_catalog_approval:write", "data_catalog:read"],
+        request=None,
+        responses={200: CertificationSerializer},
+    )
+    def deprecate(self, request: Request, **kwargs) -> Response:
+        """Mark the target as deprecated (avoid this source)."""
+        cert = api.deprecate(self.get_object(), cast(User, request.user), request=request)
+        return Response(CertificationSerializer(cert).data)
+
+
+class RelationshipProposalViewSet(
+    TeamAndOrgViewSetMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.CreateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Reviewed join facts. Accepting one promotes it to a real DataWarehouseJoin; rejections persist."""
+
+    scope_object = "data_catalog"
+    filter_backends = [CatalogSearchFilter]
+    search_fields = ["source_table_name", "joining_table_name", "reasoning"]
+    serializer_class = RelationshipProposalSerializer
+    queryset = RelationshipProposal.objects.unscoped()
+
+    def safely_get_queryset(self, queryset: QuerySet[RelationshipProposal]) -> QuerySet[RelationshipProposal]:
+        proposals = api.relationships_for_team(self.team)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            proposals = proposals.filter(status=status_filter)
+        table_name = self.request.query_params.get("table_name")
+        if table_name:
+            proposals = proposals.filter(Q(source_table_name=table_name) | Q(joining_table_name=table_name))
+        return proposals
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("status", OpenApiTypes.STR, description="Filter by proposed/accepted/rejected."),
+            OpenApiParameter(
+                "table_name", OpenApiTypes.STR, description="Only relationships involving this table on either side."
+            ),
+        ]
+    )
+    def list(self, request: Request, *args, **kwargs) -> Response:
+        return super().list(request, *args, **kwargs)
+
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        proposal = api.propose_relationship(
+            team=self.team,
+            user=cast(User, request.user),
+            source_table_name=data["source_table_name"],
+            source_table_key=data["source_table_key"],
+            joining_table_name=data["joining_table_name"],
+            joining_table_key=data["joining_table_key"],
+            field_name=data["field_name"],
+            configuration=data.get("configuration"),
+            confidence=data.get("confidence"),
+            reasoning=data.get("reasoning", ""),
+            evidence=data.get("evidence"),
+            request=request,
+        )
+        return Response(self.get_serializer(proposal).data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=["POST"],
+        required_scopes=["data_catalog_approval:write", "data_catalog:read", "query:read", "warehouse_view:write"],
+        throttle_classes=[HogQLQueryThrottle],
+        request=None,
+        responses={200: RelationshipProposalSerializer},
+    )
+    def accept(self, request: Request, **kwargs) -> Response:
+        """Promote the proposal to a real warehouse join after re-validating and probing it."""
+        # required_scopes gates tokens, but session users carry no scopes and AccessControlPermission
+        # only checks the data_catalog resource. Enforce the resources this action actually touches
+        # explicitly: query (the ClickHouse acceptance probe) and warehouse_view (the join it creates).
+        if not self.user_access_control.check_access_level_for_resource("query", "viewer"):
+            raise PermissionDenied("You need query access to accept a relationship proposal.")
+        if not self.user_access_control.check_access_level_for_resource("warehouse_view", "editor"):
+            raise PermissionDenied("You need warehouse view edit access to accept a relationship proposal.")
+        proposal = api.accept_proposal(self.get_object(), cast(User, request.user), request=request)
+        return Response(self.get_serializer(proposal).data)
+
+    @extend_schema(request=RelationshipRejectSerializer, responses={200: RelationshipProposalSerializer})
+    @action(detail=True, methods=["POST"], required_scopes=["data_catalog_approval:write", "data_catalog:read"])
+    def reject(self, request: Request, **kwargs) -> Response:
+        """Reject the proposal. Persists forever so the pair is never re-proposed."""
+        body = RelationshipRejectSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        proposal = api.reject_proposal(
+            self.get_object(),
+            cast(User, request.user),
+            body.validated_data.get("rejection_reason", ""),
+            request=request,
+        )
+        return Response(self.get_serializer(proposal).data)
+
+
+class UsageSnapshotViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
+    """Usage scans of the catalog, newest first. The list omits payloads; latest includes them."""
+
+    scope_object = "data_catalog"
+    # A plain ViewSet maps no actions to scopes by default, so API-key reads would 403 without these.
+    scope_object_read_actions = ["list", "latest"]
+    scope_object_write_actions = ["recompute"]
+
+    def initial(self, request: Request, *args, **kwargs) -> None:
+        super().initial(request, *args, **kwargs)
+        _require_usage_enabled(request, self.team)
+
+    @extend_schema(responses={200: UsageSnapshotSummarySerializer(many=True), 404: _USAGE_404})
+    def list(self, request: Request, **kwargs) -> Response:
+        """Up to a year of usage scans for the project, newest first, without payloads."""
+        return Response(UsageSnapshotSummarySerializer(api.usage_snapshot_history(self.team_id), many=True).data)
+
+    @action(detail=False, methods=["GET"], responses={200: UsageSnapshotSerializer, 404: _USAGE_404})
+    def latest(self, request: Request, **kwargs) -> Response:
+        """The newest finished usage scan, with its payload."""
+        reader = api.usage_reader(self.team, cast(User, request.user), self.user_access_control)
+        snapshot = api.latest_usage_snapshot(self.team_id, reader)
+        if snapshot is None:
+            raise NotFound(_NO_USAGE_SCAN)
+        return Response(UsageSnapshotSerializer(snapshot).data)
+
+    @action(
+        detail=False,
+        methods=["POST"],
+        request=None,
+        responses={
+            202: UsageSnapshotSummarySerializer,
+            403: OpenApiResponse(
+                description="The user has no query access, or the organization has not approved AI data processing."
+            ),
+            404: _USAGE_404,
+            409: OpenApiResponse(description="A usage scan is already running for this project."),
+            429: OpenApiResponse(description="A usage scan started less than an hour ago."),
+        },
+        required_scopes=["data_catalog:write", "query:read"],
+    )
+    def recompute(self, request: Request, **kwargs) -> Response:
+        """Start a usage scan now. The new snapshot computes until the scan finishes."""
+        # The scan reads the project's query logs and agent SQL. Session users carry no scopes, and
+        # AccessControlPermission checks only the data_catalog resource, so check query RBAC here.
+        if not self.user_access_control.check_access_level_for_resource("query", "viewer"):
+            raise PermissionDenied("You need query access to run a usage scan.")
+        try:
+            snapshot = api.start_usage_scan(self.team)
+        except api.AIConsentMissing:
+            raise PermissionDenied("Your organization has not approved AI data processing, so a usage scan can't run.")
+        except api.ScanAlreadyRunning:
+            return Response(
+                {"detail": "A usage scan is already running for this project."}, status=status.HTTP_409_CONFLICT
+            )
+        except api.ScanCooldown:
+            return Response(
+                {"detail": "A usage scan started less than an hour ago. Try again later."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        return Response(UsageSnapshotSummarySerializer(snapshot).data, status=status.HTTP_202_ACCEPTED)
+
+
+class CatalogViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
+    scope_object = "data_catalog"
+
+    @action(
+        detail=False,
+        methods=["GET"],
+        required_scopes=["data_catalog:read"],
+        responses={200: PendingReviewCountsSerializer},
+    )
+    def pending_review(self, request: Request, **kwargs) -> Response:
+        """How many items wait in each review queue, as its list shows them to you, up to ten minutes behind an access change."""
+        counts = api.pending_review_counts(self.team, cast(User, request.user), self.user_access_control)
+        return Response(PendingReviewCountsSerializer(counts).data)
+
+    @action(
+        detail=False,
+        methods=["GET"],
+        required_scopes=["data_catalog:read"],
+        responses={200: MetricAvailabilitySerializer},
+    )
+    def metric_availability(self, request: Request, **kwargs) -> Response:
+        """Whether the project has any live metric. Skips the list's per-table access checks, which build the whole HogQL schema."""
+        return Response(MetricAvailabilitySerializer({"has_metrics": api.metrics_for_team(self.team).exists()}).data)

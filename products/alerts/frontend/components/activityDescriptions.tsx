@@ -1,0 +1,217 @@
+import {
+    ActivityLogItem,
+    ActivityLogUserName,
+    HumanizedChange,
+    activityLogSummary,
+    defaultDescriber,
+} from 'lib/components/ActivityLog/humanizeActivity'
+import { Link } from 'lib/lemon-ui/Link'
+import { urls } from 'scenes/urls'
+
+const formattedName = (name?: string | null): string | JSX.Element => {
+    const displayName = name
+
+    return <strong>{displayName}</strong>
+}
+
+const getContextDescription = (context: any): JSX.Element | null => {
+    if (!context) {
+        return null
+    }
+
+    if (context.insight_id && context.insight_short_id) {
+        return (
+            <>
+                {' '}
+                for insight{' '}
+                <Link to={urls.insightView(context.insight_short_id)}>
+                    {context.insight_name || context.insight_short_id}
+                </Link>
+            </>
+        )
+    }
+
+    return null
+}
+
+function describeOwnershipChange(logItem: ActivityLogItem): HumanizedChange {
+    const isTransfer = logItem.activity === 'transferred_ownership'
+    const owner = logItem.detail.changes?.find((change) => change.field === 'created_by')?.after
+    const ownerEmail =
+        owner && typeof owner === 'object' && !Array.isArray(owner) && typeof owner.email === 'string'
+            ? owner.email
+            : 'another member'
+    const action = isTransfer ? 'transferred ownership of the alert' : 'took ownership of the alert'
+    const target = (
+        <>
+            {formattedName(logItem.detail.name)}
+            {getContextDescription(logItem.detail.context)}
+            {isTransfer && (
+                <>
+                    {' '}
+                    to <strong>{ownerEmail}</strong>
+                </>
+            )}
+        </>
+    )
+    return {
+        summary: activityLogSummary(logItem, action, target),
+        description: (
+            <>
+                <ActivityLogUserName logItem={logItem} /> {action} {target}
+            </>
+        ),
+    }
+}
+
+export function alertConfigurationActivityDescriber(
+    logItem: ActivityLogItem,
+    asNotification?: boolean
+): HumanizedChange {
+    if (logItem.scope != 'AlertConfiguration') {
+        console.error('alert configuration describer received a non-alert-configuration activity')
+        return { description: null }
+    }
+
+    if (logItem.activity == 'created') {
+        const contextDesc = getContextDescription(logItem?.detail?.context)
+
+        if (logItem.detail?.type === 'alert_subscription_change') {
+            return {
+                summary: activityLogSummary(
+                    logItem,
+                    <>
+                        Added subscriber {logItem.detail.context?.subscriber_name} (
+                        {logItem.detail.context?.subscriber_email})
+                    </>,
+                    <>
+                        {formattedName(logItem.detail.context?.alert_name)}
+                        {contextDesc}
+                    </>
+                ),
+                description: (
+                    <>
+                        <ActivityLogUserName logItem={logItem} /> added{' '}
+                        <strong>
+                            {logItem?.detail?.context?.subscriber_name} ({logItem?.detail?.context?.subscriber_email})
+                        </strong>{' '}
+                        as a subscriber for alert {formattedName(logItem?.detail?.context?.alert_name)}
+                        {contextDesc}
+                    </>
+                ),
+            }
+        }
+
+        return {
+            summary: activityLogSummary(
+                logItem,
+                'Created the alert',
+                <>
+                    {formattedName(logItem.detail.name)}
+                    {contextDesc}
+                </>
+            ),
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> created the alert {formattedName(logItem?.detail.name)}
+                    {contextDesc}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'deleted') {
+        const contextDesc = getContextDescription(logItem?.detail?.context)
+
+        if (logItem.detail?.type === 'alert_subscription_change') {
+            return {
+                summary: activityLogSummary(
+                    logItem,
+                    <>
+                        Removed subscriber {logItem.detail.context?.subscriber_name} (
+                        {logItem.detail.context?.subscriber_email})
+                    </>,
+                    <>
+                        {formattedName(logItem.detail.context?.alert_name)}
+                        {contextDesc}
+                    </>
+                ),
+                description: (
+                    <>
+                        <ActivityLogUserName logItem={logItem} /> removed{' '}
+                        <strong>
+                            {logItem?.detail?.context?.subscriber_name} ({logItem?.detail?.context?.subscriber_email})
+                        </strong>{' '}
+                        as a subscriber from alert {formattedName(logItem?.detail?.context?.alert_name)}
+                        {contextDesc}
+                    </>
+                ),
+            }
+        }
+
+        const displayName = logItem.detail.name || 'Alert Configuration'
+        return {
+            summary: activityLogSummary(
+                logItem,
+                'Deleted the alert',
+                <>
+                    {displayName}
+                    {contextDesc}
+                </>
+            ),
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> deleted the alert: {displayName}
+                    {contextDesc}
+                </>
+            ),
+        }
+    }
+
+    if (['took_ownership', 'transferred_ownership'].includes(logItem.activity)) {
+        return describeOwnershipChange(logItem)
+    }
+
+    if (logItem.activity == 'updated') {
+        const contextDesc = getContextDescription(logItem?.detail?.context)
+
+        if (logItem.detail?.type === 'threshold_change') {
+            return {
+                summary: activityLogSummary(
+                    logItem,
+                    'Updated the threshold',
+                    <>
+                        {formattedName(logItem.detail.context?.alert_name)}
+                        {contextDesc}
+                    </>
+                ),
+                description: (
+                    <>
+                        <ActivityLogUserName logItem={logItem} /> updated the <strong>threshold</strong> for alert{' '}
+                        {formattedName(logItem?.detail?.context?.alert_name)}
+                        {contextDesc}
+                    </>
+                ),
+            }
+        }
+
+        return {
+            summary: activityLogSummary(
+                logItem,
+                'Updated the alert',
+                <>
+                    {formattedName(logItem.detail.name)}
+                    {contextDesc}
+                </>
+            ),
+            description: (
+                <>
+                    <ActivityLogUserName logItem={logItem} /> updated the alert {formattedName(logItem?.detail.name)}
+                    {contextDesc}
+                </>
+            ),
+        }
+    }
+
+    return defaultDescriber(logItem, asNotification, formattedName(logItem?.detail.name))
+}

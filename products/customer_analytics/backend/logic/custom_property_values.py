@@ -1,0 +1,649 @@
+"""
+Business logic for per-account custom property values.
+
+ORM queries, type validation/coercion, the soft-delete + insert transaction, append-only history.
+Called by facade/api.py. Do not call from outside this module.
+"""
+
+import math
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
+from uuid import UUID
+
+from django.core.exceptions import ValidationError
+from django.core.validators import URLValidator
+from django.db import IntegrityError, connections, router, transaction
+from django.db.models import QuerySet
+from django.utils import timezone
+
+from posthog.dataclasses import frozen
+from posthog.exceptions_capture import capture_exception
+from posthog.models.scoping.manager import resolve_effective_team_id
+from posthog.models.user import User
+
+from products.customer_analytics.backend.events import emit_account_custom_property_changed
+from products.customer_analytics.backend.models import (
+    CANONICAL_LAST_SLACK_MESSAGE_AT,
+    Account,
+    CustomPropertyDefinition,
+    CustomPropertyValue,
+    DataType,
+    DisplayType,
+    TargetType,
+)
+from products.customer_analytics.backend.models.custom_property_value import ACTIVE_VALUE_CONSTRAINT_NAME
+
+CoercedValue = float | bool | str | datetime
+_LINK_VALIDATOR = URLValidator(schemes=["http", "https"])
+
+
+class InvalidCustomPropertyValue(ValueError):
+    """Raised when a value can't be coerced to its definition's data type.
+
+    ``field`` carries the definition id when set from a batch write, so the caller can
+    point at which property failed.
+    """
+
+    field: str | None = None
+
+
+class CustomPropertyValueHistoryTooLong(Exception):
+    """Raised when a property's history in the requested window has more values than one response holds."""
+
+    def __init__(self, limit: int):
+        super().__init__(f"More than {limit} values.")
+        self.limit = limit
+
+
+class CustomPropertyDefinitionNotFound(Exception):
+    """Raised when the target custom property definition does not exist for the team.
+
+    ``identifier`` is the id or name that failed to resolve, so callers can surface which
+    property was at fault.
+    """
+
+    def __init__(self, identifier: Any) -> None:
+        super().__init__(f"Custom property definition '{identifier}' not found.")
+        self.identifier = identifier
+
+
+class CustomPropertyValueConflict(Exception):
+    """Raised when a concurrent write already set an active value for this (account, definition).
+
+    Only the active-value uniqueness race maps to this — retrying succeeds, since the retry
+    soft-deletes the now-existing active row before inserting. Any other integrity error is a real
+    fault and is left to surface.
+    """
+
+
+@contextmanager
+def _guard_value(*, team_id: int, account_id: str | UUID, definition_id: str | UUID) -> Iterator[str]:
+    using = router.db_for_write(CustomPropertyValue)
+    canonical_team_id = resolve_effective_team_id(team_id)
+    key = f"account-custom-property:{canonical_team_id}:{UUID(str(account_id))}:{UUID(str(definition_id))}"
+    with transaction.atomic(using=using):
+        with connections[using].cursor() as cursor:
+            # Row locks cannot protect a value that is absent or has been replaced.
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", [key])
+        yield using
+
+
+def _parse_definition_id(identifier: str) -> UUID:
+    try:
+        return UUID(identifier)
+    except ValueError as exc:
+        raise CustomPropertyDefinitionNotFound(identifier) from exc
+
+
+def set_custom_property_value(
+    *,
+    team_id: int,
+    account_id: str | UUID,
+    definition_id: str | UUID,
+    value: Any,
+    created_by_id: int | None = None,
+    actor: User | None = None,
+    workflow_id: str | None = None,
+) -> CustomPropertyValue:
+    """Set an account's value for a custom property, preserving history.
+
+    Coerces `value` to the definition's data type, then atomically soft-deletes the current active
+    row (if any) and inserts the new one — keeping at most one active row per (team, account,
+    definition) while leaving superseded rows for later analysis.
+
+    Raises `CustomPropertyDefinitionNotFound` (unknown definition), `Account.DoesNotExist`
+    (account not in team), `InvalidCustomPropertyValue` (value doesn't match the data type), or
+    `CustomPropertyValueConflict` (a concurrent write won the active-value race — retry).
+    """
+    try:
+        definition = CustomPropertyDefinition.objects.for_team(team_id).get(id=definition_id)
+    except CustomPropertyDefinition.DoesNotExist as exc:
+        raise CustomPropertyDefinitionNotFound(definition_id) from exc
+    _assert_account_in_team(team_id=team_id, account_id=account_id)
+    return _set_value(
+        team_id=team_id,
+        account_id=account_id,
+        definition=definition,
+        value=value,
+        created_by_id=created_by_id,
+        actor=actor,
+        workflow_id=workflow_id,
+    )
+
+
+def set_account_custom_properties_by_id(
+    *,
+    team_id: int,
+    account_id: str | UUID,
+    properties: dict[str, Any],
+    created_by_id: int | None = None,
+    actor: User | None = None,
+    workflow_id: str | None = None,
+) -> list[CustomPropertyValue]:
+    """Set or clear several account custom property values by definition id.
+
+    Resolves each id to its team-scoped definition. A null value soft-deletes the active row.
+    Other values apply the same coerce + soft-delete + insert as `set_custom_property_value`.
+    Caller is responsible for wrapping the batch in a transaction when all-or-nothing semantics are required.
+
+    Raises `CustomPropertyDefinitionNotFound` (unknown id, carrying the id),
+    `InvalidCustomPropertyValue` (value doesn't match the data type, carrying the id in `field`),
+    `Account.DoesNotExist`, or `CustomPropertyValueConflict`.
+    """
+    _assert_account_in_team(team_id=team_id, account_id=account_id)
+    rows: list[CustomPropertyValue] = []
+    # Outer batch transactions retain these locks until commit, so use a consistent order.
+    for definition_id in sorted(properties, key=_parse_definition_id):
+        value = properties[definition_id]
+        try:
+            definition = CustomPropertyDefinition.objects.for_team(team_id).get(id=definition_id)
+        except (CustomPropertyDefinition.DoesNotExist, ValidationError) as exc:
+            raise CustomPropertyDefinitionNotFound(definition_id) from exc
+        if value is None:
+            _clear_value(
+                team_id=team_id,
+                account_id=account_id,
+                definition=definition,
+                actor=actor,
+                workflow_id=workflow_id,
+            )
+            continue
+        try:
+            row = _set_value(
+                team_id=team_id,
+                account_id=account_id,
+                definition=definition,
+                value=value,
+                created_by_id=created_by_id,
+                actor=actor,
+                workflow_id=workflow_id,
+            )
+        except InvalidCustomPropertyValue as exc:
+            exc.field = str(definition_id)
+            raise
+        rows.append(row)
+    return rows
+
+
+MIN_INTERVAL_BETWEEN_LAST_SLACK_MESSAGE_WRITES = timedelta(hours=1)
+_LAST_SLACK_MESSAGE_WRITE_ATTEMPTS = 3
+
+
+def record_last_slack_message_at(*, team_id: int, account_id: str | UUID, timestamp: datetime) -> bool:
+    """Record when a customer last messaged in the Slack channel bound to `account_id`.
+
+    Creates the canonical definition on first write for the team — no user owns it, so
+    `created_by` stays null and no activity-log entry is written. Skips the write when the stored
+    value is newer than `timestamp` (Slack events can arrive out of order) or less than
+    `MIN_INTERVAL_BETWEEN_LAST_SLACK_MESSAGE_WRITES` behind it. Returns whether it wrote.
+
+    Raises `InvalidCustomPropertyValue` when the team already has a property under the canonical
+    name with a non-datetime type.
+    """
+    definition, _ = CustomPropertyDefinition.objects.for_team(team_id).get_or_create(
+        team_id=team_id,
+        name=CANONICAL_LAST_SLACK_MESSAGE_AT,
+        defaults={"display_type": DisplayType.DATETIME},
+    )
+    for _attempt in range(_LAST_SLACK_MESSAGE_WRITE_ATTEMPTS):
+        try:
+            with _guard_value(team_id=team_id, account_id=account_id, definition_id=definition.id) as using:
+                current = (
+                    CustomPropertyValue.objects.for_team(team_id)
+                    .using(using)
+                    .filter(account_id=account_id, definition_id=definition.id, is_deleted=False)
+                    .values_list("value_datetime", flat=True)
+                    .first()
+                )
+                if current is not None and timestamp - current < MIN_INTERVAL_BETWEEN_LAST_SLACK_MESSAGE_WRITES:
+                    return False
+                _set_value(
+                    team_id=team_id,
+                    account_id=account_id,
+                    definition=definition,
+                    value=timestamp,
+                    created_by_id=None,
+                )
+        except CustomPropertyValueConflict:
+            continue
+        return True
+    return False
+
+
+def set_synced_custom_property_value(
+    *, team_id: int, account_id: str | UUID, definition: CustomPropertyDefinition, value: Any
+) -> bool:
+    """Set or clear a warehouse value for an account already resolved inside this team."""
+    if value is None:
+        return _clear_value(team_id=team_id, account_id=account_id, definition=definition)
+    _, coerced = _coerce_to_column(definition, value)
+    with _guard_value(team_id=team_id, account_id=account_id, definition_id=definition.id) as using:
+        current = (
+            CustomPropertyValue.objects.for_team(team_id)
+            .using(using)
+            .filter(account_id=account_id, definition_id=definition.id, is_deleted=False)
+            .first()
+        )
+        if current is not None:
+            current.definition = definition
+            if value_of(current) == coerced:
+                return False
+        _set_value(
+            team_id=team_id,
+            account_id=account_id,
+            definition=definition,
+            value=value,
+            created_by_id=None,
+        )
+    return True
+
+
+def _set_value(
+    *,
+    team_id: int,
+    account_id: str | UUID,
+    definition: CustomPropertyDefinition,
+    value: Any,
+    created_by_id: int | None,
+    actor: User | None = None,
+    workflow_id: str | None = None,
+) -> CustomPropertyValue:
+    """Coerce `value` and atomically supersede the account's active row for `definition`."""
+    column, coerced = _coerce_to_column(definition, value)
+    try:
+        with _guard_value(team_id=team_id, account_id=account_id, definition_id=definition.id) as using:
+            active_rows = (
+                CustomPropertyValue.objects.for_team(team_id)
+                .using(using)
+                .filter(account_id=account_id, definition_id=definition.id, is_deleted=False)
+            )
+            previous_row = active_rows.first()
+            active_rows.update(is_deleted=True)
+            row = (
+                CustomPropertyValue.objects.for_team(team_id)
+                .using(using)
+                .create(
+                    team_id=team_id,
+                    account_id=account_id,
+                    definition_id=definition.id,
+                    created_by_id=created_by_id,
+                    **{column: coerced},
+                )
+            )
+            _schedule_value_changed_event(
+                team_id=team_id,
+                account_id=account_id,
+                definition=definition,
+                previous_row=previous_row,
+                current_value=coerced,
+                actor=actor,
+                workflow_id=workflow_id,
+                using=using,
+            )
+    except IntegrityError as exc:
+        if _is_active_value_conflict(exc):
+            raise CustomPropertyValueConflict(
+                f"An active value for custom property '{definition.name}' was set concurrently."
+            ) from exc
+        raise
+    row.definition = definition
+    return row
+
+
+def _clear_value(
+    *,
+    team_id: int,
+    account_id: str | UUID,
+    definition: CustomPropertyDefinition,
+    actor: User | None = None,
+    workflow_id: str | None = None,
+) -> bool:
+    with _guard_value(team_id=team_id, account_id=account_id, definition_id=definition.id) as using:
+        active_rows = (
+            CustomPropertyValue.objects.for_team(team_id)
+            .using(using)
+            .filter(account_id=account_id, definition_id=definition.id, is_deleted=False)
+        )
+        previous_row = active_rows.first()
+        if previous_row is None:
+            return False
+        cleared_rows = active_rows.filter(id=previous_row.id).update(is_deleted=True)
+        if cleared_rows == 0:
+            raise CustomPropertyValueConflict(
+                f"An active value for custom property '{definition.name}' was changed concurrently."
+            )
+        _schedule_value_changed_event(
+            team_id=team_id,
+            account_id=account_id,
+            definition=definition,
+            previous_row=previous_row,
+            current_value=None,
+            actor=actor,
+            workflow_id=workflow_id,
+            using=using,
+        )
+    return True
+
+
+def _schedule_value_changed_event(
+    *,
+    team_id: int,
+    account_id: str | UUID,
+    definition: CustomPropertyDefinition,
+    previous_row: CustomPropertyValue | None,
+    current_value: CoercedValue | None,
+    actor: User | None,
+    workflow_id: str | None,
+    using: str,
+) -> None:
+    """Emit $account_custom_property_changed post-commit when the stored value actually changes.
+
+    A first set emits with a null previous_value. Rewriting the same value stays silent: the view
+    sync rewrites every value each run, and a workflow re-setting the same value must not
+    retrigger itself.
+    """
+    previous_value: CoercedValue | None = None
+    if previous_row is not None:
+        previous_row.definition = definition
+        previous_value = value_of(previous_row)
+    if previous_value == current_value:
+        return
+    account = Account.objects.for_team(team_id).using(using).select_related("team").get(id=account_id)
+
+    def emit() -> None:
+        try:
+            emit_account_custom_property_changed(
+                account=account,
+                definition=definition,
+                previous_value=previous_value,
+                current_value=current_value,
+                actor=actor,
+                workflow_id=workflow_id,
+            )
+        except Exception as e:
+            capture_exception(e)
+
+    transaction.on_commit(emit, using=using)
+
+
+def _is_active_value_conflict(exc: IntegrityError) -> bool:
+    return ACTIVE_VALUE_CONSTRAINT_NAME in str(exc)
+
+
+def list_active_custom_property_values(*, team_id: int, account_id: str | UUID) -> list[CustomPropertyValue]:
+    """The account's current (non-deleted) values, newest first."""
+    return list(
+        CustomPropertyValue.objects.for_team(team_id)
+        .filter(account_id=account_id, is_deleted=False)
+        .select_related("definition", "created_by")
+        .order_by("-created_at")
+    )
+
+
+@frozen
+class CustomPropertyValueHistoryRow:
+    row: CustomPropertyValue
+    replaced_at: datetime | None
+    is_current: bool
+
+
+HISTORY_ENTRY_LIMIT = 1000
+
+
+def list_custom_property_value_history(
+    *, team_id: int, account_id: str | UUID, definition_id: str | UUID, since: datetime | None = None
+) -> list[CustomPropertyValueHistoryRow]:
+    """Every value the account has held for an account definition, oldest first. With `since`, only
+    the values held from then on, starting with the one in place at `since`. Raises
+    `CustomPropertyValueHistoryTooLong` when more than `HISTORY_ENTRY_LIMIT` values remain, rather than
+    return a history with a silent gap.
+
+    Setting the same value again stores a new row, so a run of equal values collapses into its
+    first row. A clear stores no time, so a cleared value reads as held until the next value is
+    set, and a value cleared last has no `replaced_at`.
+    """
+    try:
+        definition = CustomPropertyDefinition.objects.for_team(team_id).get(
+            id=definition_id, target_type=TargetType.ACCOUNT
+        )
+    except (CustomPropertyDefinition.DoesNotExist, ValidationError, ValueError) as exc:
+        raise CustomPropertyDefinitionNotFound(definition_id) from exc
+    values = CustomPropertyValue.objects.for_team(team_id).filter(account_id=account_id, definition=definition)
+    if since is None:
+        entries = _list_value_run_starts(values, definition, HISTORY_ENTRY_LIMIT + 1)
+        _raise_when_too_long(entries)
+    else:
+        held_at_since = _list_value_run_starts(values.filter(created_at__lt=since), definition, 1)
+        entries = _list_value_run_starts(values.filter(created_at__gte=since), definition, HISTORY_ENTRY_LIMIT + 1)
+        _raise_when_too_long(entries)
+        if held_at_since and entries and _stored_key(entries[0]) == _stored_key(held_at_since[0]):
+            entries[0] = held_at_since[0]
+        elif held_at_since and not (entries and entries[0].created_at <= since):
+            entries = held_at_since + entries
+    has_current = values.filter(is_deleted=False).exists()
+    return [
+        CustomPropertyValueHistoryRow(
+            row=row,
+            replaced_at=entries[index + 1].created_at if index + 1 < len(entries) else None,
+            is_current=has_current and index == len(entries) - 1,
+        )
+        for index, row in enumerate(entries)
+    ]
+
+
+def _list_value_run_starts(
+    values: QuerySet[CustomPropertyValue], definition: CustomPropertyDefinition, limit: int
+) -> list[CustomPropertyValue]:
+    """The first row of each of the `limit` latest runs of equal values, oldest first. Rows stream
+    newest first and only run starts are kept, so repeated writes of one value cost no memory."""
+    starts: list[CustomPropertyValue] = []
+    for row in values.order_by("-created_at", "-id").iterator(chunk_size=50):
+        row.definition = definition
+        if starts and _stored_key(row) == _stored_key(starts[-1]):
+            starts[-1] = row
+            continue
+        if len(starts) == limit:
+            break
+        starts.append(row)
+    starts.reverse()
+    return starts
+
+
+def _raise_when_too_long(entries: list[CustomPropertyValue]) -> None:
+    if len(entries) > HISTORY_ENTRY_LIMIT:
+        raise CustomPropertyValueHistoryTooLong(HISTORY_ENTRY_LIMIT)
+
+
+def _stored_key(row: CustomPropertyValue) -> tuple:
+    """Includes the column, so a `true` stored before a type change never equals a later `1`."""
+    return (row.value_str, row.value_bool, row.value_num, row.value_datetime)
+
+
+VALUE_SUGGESTIONS_LIMIT = 50
+
+
+def list_custom_property_value_suggestions(*, team_id: int, definition_id: str | UUID, search: str | None) -> list[str]:
+    """Suggested filter values for a custom property: a select's option labels, a boolean's
+    true/false, otherwise distinct active values across the team's accounts. Empty when the
+    definition doesn't exist — suggestions are best-effort, not an error surface."""
+    try:
+        definition = CustomPropertyDefinition.objects.for_team(team_id).get(id=definition_id)
+    except (CustomPropertyDefinition.DoesNotExist, ValidationError, ValueError):
+        return []
+
+    needle = (search or "").strip().lower()
+
+    if definition.display_type == DisplayType.SELECT:
+        labels = [str(option.get("label") or "") for option in definition.options or []]
+        return [label for label in labels if label and needle in label.lower()][:VALUE_SUGGESTIONS_LIMIT]
+    if definition.data_type == DataType.BOOLEAN:
+        return [value for value in ("true", "false") if needle in value]
+    if definition.data_type == DataType.DATETIME:
+        # Date filters render a date picker, not text suggestions.
+        return []
+
+    queryset = CustomPropertyValue.objects.for_team(team_id).filter(definition_id=definition.id, is_deleted=False)
+
+    if definition.data_type == DataType.NUMERIC:
+        numeric_values = (
+            queryset.exclude(value_num__isnull=True)
+            .values_list("value_num", flat=True)
+            .distinct()
+            .order_by("value_num")
+        )
+        # The needle matches the *formatted* numeric string, which the database can't compute —
+        # filter in Python and stop once the limit fills, instead of slicing the queryset first.
+        suggestions: list[str] = []
+        for value in numeric_values.iterator():
+            formatted = _format_numeric_suggestion(value)
+            if formatted is None or needle not in formatted:
+                continue
+            suggestions.append(formatted)
+            if len(suggestions) == VALUE_SUGGESTIONS_LIMIT:
+                break
+        return suggestions
+
+    if needle:
+        queryset = queryset.filter(value_str__icontains=needle)
+    string_values = (
+        queryset.exclude(value_str__isnull=True)
+        .values_list("value_str", flat=True)
+        .distinct()
+        .order_by("value_str")[:VALUE_SUGGESTIONS_LIMIT]
+    )
+    return [value for value in string_values if value is not None]
+
+
+def _format_numeric_suggestion(value: float | None) -> str | None:
+    # Integral floats render without a trailing ".0", matching how the filter column displays
+    # them. Non-finite values can't pass write-path coercion; skip a stray row rather than crash.
+    # None only occurs in the type, not at runtime — the caller excludes null rows.
+    if value is None or not math.isfinite(value):
+        return None
+    return str(int(value)) if value == int(value) else str(value)
+
+
+def _assert_account_in_team(*, team_id: int, account_id: str | UUID) -> None:
+    if not Account.objects.for_team(team_id).filter(id=account_id).exists():
+        raise Account.DoesNotExist(f"Account {account_id} not found for team {team_id}")
+
+
+def _expects(definition: CustomPropertyDefinition, what: str) -> str:
+    return f"Custom property '{definition.name}' expects {what}"
+
+
+def _coerce_numeric(definition: CustomPropertyDefinition, value: Any) -> float:
+    # bool is a subclass of int — reject it so True doesn't silently become 1.0.
+    if isinstance(value, bool):
+        raise InvalidCustomPropertyValue(_expects(definition, "a numeric value"))
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise InvalidCustomPropertyValue(_expects(definition, "a numeric value"))
+    # Reject NaN/inf: float() accepts "nan"/"inf", but a non-finite value silently corrupts
+    # AVG/SUM aggregates over this column downstream.
+    if not math.isfinite(result):
+        raise InvalidCustomPropertyValue(_expects(definition, "a finite numeric value"))
+    return result
+
+
+def _coerce_boolean(definition: CustomPropertyDefinition, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and (normalized := value.strip().lower()) in ("true", "false"):
+        return normalized == "true"
+    raise InvalidCustomPropertyValue(_expects(definition, "a boolean value"))
+
+
+def _coerce_datetime(definition: CustomPropertyDefinition, value: Any) -> datetime:
+    # datetime must be checked before date — datetime is a subclass of date.
+    if isinstance(value, datetime):
+        return timezone.make_aware(value, UTC) if timezone.is_naive(value) else value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=UTC)
+    if isinstance(value, str):
+        try:
+            # fromisoformat accepts both date-only ("2026-01-01", a DisplayType.DATE input) and a
+            # trailing "Z", which parse_datetime does not.
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            raise InvalidCustomPropertyValue(_expects(definition, "an ISO-8601 datetime"))
+        return timezone.make_aware(parsed, UTC) if timezone.is_naive(parsed) else parsed
+    raise InvalidCustomPropertyValue(_expects(definition, "an ISO-8601 datetime"))
+
+
+def _coerce_string(definition: CustomPropertyDefinition, value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return str(value)
+    raise InvalidCustomPropertyValue(_expects(definition, "a text value"))
+
+
+def _coerce_link(definition: CustomPropertyDefinition, value: Any) -> str:
+    link = _coerce_string(definition, value)
+    try:
+        _LINK_VALIDATOR(link)
+    except ValidationError:
+        raise InvalidCustomPropertyValue(_expects(definition, "an HTTP or HTTPS URL"))
+    return link
+
+
+def _coerce_select(definition: CustomPropertyDefinition, value: Any) -> str:
+    labels = [option["label"] for option in definition.options or []]
+    if isinstance(value, str) and value in labels:
+        return value
+    raise InvalidCustomPropertyValue(_expects(definition, f"one of its options: {', '.join(labels)}"))
+
+
+# Each data type maps to its CustomPropertyValue column and the coercer that validates a raw value
+# into it (defined here, after the coercers it references).
+_HANDLER_BY_DATA_TYPE: dict[DataType, tuple[str, Callable[[CustomPropertyDefinition, Any], CoercedValue]]] = {
+    DataType.STRING: ("value_str", _coerce_string),
+    DataType.NUMERIC: ("value_num", _coerce_numeric),
+    DataType.BOOLEAN: ("value_bool", _coerce_boolean),
+    DataType.DATETIME: ("value_datetime", _coerce_datetime),
+}
+
+
+def _coerce_to_column(definition: CustomPropertyDefinition, value: Any) -> tuple[str, CoercedValue]:
+    if definition.display_type == DisplayType.SELECT:
+        return "value_str", _coerce_select(definition, value)
+    if definition.display_type == DisplayType.LINK:
+        return "value_str", _coerce_link(definition, value)
+    column, coerce = _HANDLER_BY_DATA_TYPE[definition.data_type]
+    return column, coerce(definition, value)
+
+
+def stored_value_of(row: CustomPropertyValue) -> CoercedValue | None:
+    """The value in whichever column `row` filled. A past row keeps the column of the data type its
+    definition had when the row was written, which can differ from the definition's type today."""
+    return next((v for v in (row.value_str, row.value_bool, row.value_num, row.value_datetime) if v is not None), None)
+
+
+def value_of(row: CustomPropertyValue) -> CoercedValue | None:
+    """The value stored on `row`, read from the column matching its definition's data type."""
+    column, _ = _HANDLER_BY_DATA_TYPE[row.definition.data_type]
+    return getattr(row, column)

@@ -1,0 +1,98 @@
+{
+  "name": "@posthog/shared",
+  "version": "1.0.0",
+  "description": "Shared utilities for PostHog",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./analytics-events": {
+      "types": "./dist/analytics-events.d.ts",
+      "import": "./dist/analytics-events.js"
+    },
+    "./announcements": {
+      "types": "./dist/announcements.d.ts",
+      "import": "./dist/announcements.js"
+    },
+    "./hoggies": {
+      "types": "./dist/hoggies.d.ts",
+      "import": "./dist/hoggies.js"
+    },
+    "./schemas": {
+      "types": "./dist/schemas.d.ts",
+      "import": "./dist/schemas.js"
+    },
+    "./domain-types": {
+      "types": "./dist/domain-types.d.ts",
+      "import": "./dist/domain-types.js"
+    },
+    "./model-catalog": {
+      "types": "./dist/model-catalog.d.ts",
+      "import": "./dist/model-catalog.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    },
+    "./task-context": {
+      "types": "./dist/task-context.d.ts",
+      "import": "./dist/task-context.js"
+    },
+    "./deeplink": {
+      "types": "./dist/deeplink.d.ts",
+      "import": "./dist/deeplink.js"
+    },
+    "./dismissalReasons": {
+      "types": "./dist/dismissalReasons.d.ts",
+      "import": "./dist/dismissalReasons.js"
+    },
+    "./constants": {
+      "types": "./dist/constants.d.ts",
+      "import": "./dist/constants.js"
+    },
+    "./mcp-sandbox-proxy": {
+      "types": "./dist/mcp-sandbox-proxy.d.ts",
+      "import": "./dist/mcp-sandbox-proxy.js"
+    },
+    "./screenshot-area": {
+      "types": "./dist/screenshot-area.d.ts",
+      "import": "./dist/screenshot-area.js"
+    },
+    "./rich-output-prompt": {
+      "types": "./dist/rich-output-prompt.d.ts",
+      "import": "./dist/rich-output-prompt.js"
+    },
+    "./posthog-property-headers": {
+      "types": "./dist/posthog-property-headers.d.ts",
+      "import": "./dist/posthog-property-headers.js"
+    },
+    "./product-engineer-prompt": {
+      "types": "./dist/product-engineer-prompt.d.ts",
+      "import": "./dist/product-engineer-prompt.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "clean": "node ../../scripts/rimraf.mjs dist .turbo"
+  },
+  "dependencies": {
+    "@posthog/agent-contracts": "link:../../../../packages/agent/packages/agent-contracts",
+    "@posthog/brand": "catalog:",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/sdk": "0.19.0",
+    "tsup": "^9.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.8"
+  },
+  "files": [
+    "dist/**/*",
+    "src/**/*"
+  ]
+}

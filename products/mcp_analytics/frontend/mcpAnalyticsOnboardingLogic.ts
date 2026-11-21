@@ -1,0 +1,328 @@
+import { MakeLogicType, actions, afterMount, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+
+import api from 'lib/api'
+import { productSetupStatusLogic } from 'lib/components/ProductEmptyState/productSetupStatusLogic'
+import type { ProductSetupStatus } from 'lib/components/ProductEmptyState/types'
+import { dayjs } from 'lib/dayjs'
+import posthog from 'lib/posthog-typed'
+import { addProductIntent } from 'lib/utils/product-intents'
+import { teamLogic } from 'scenes/teamLogic'
+import { userLogic } from 'scenes/userLogic'
+
+import { HogQLQueryResponse, NodeKind, ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+
+import { asNumber } from './queryResultParsers'
+
+// These intents fire on view, not on a user action, so during impersonation they'd register
+// staff navigation as the team's intent — and the read-only middleware rejects the write (403),
+// toasting on every mount. Skip firing while impersonating.
+function isImpersonatedSession(): boolean {
+    return userLogic.findMounted()?.values.user?.is_impersonated ?? false
+}
+
+export type MCPOnboardingState = 'not-instrumented' | 'connected-no-calls' | 'onboarded'
+
+/** Maps MCP's three-state model onto the app-wide product setup vocabulary. */
+export function emptyStateStatusForOnboardingState(onboardingState: MCPOnboardingState | null): ProductSetupStatus {
+    if (onboardingState === null) {
+        return 'loading'
+    }
+    if (onboardingState === 'onboarded') {
+        return 'has-data'
+    }
+    if (onboardingState === 'connected-no-calls') {
+        return 'waiting-for-data'
+    }
+    return 'needs-setup'
+}
+
+/**
+ * Which question the dashboard answers, by volume. `activity` is for "what are
+ * agents doing with my server?" — a live feed, verbatim intents, and an
+ * instrumentation checklist; windowed metrics would be noise at this volume.
+ * `metrics` is the standard dashboard for "is it healthy?". Volume-gated rather
+ * than time-gated so a low-traffic server never regresses to an empty dashboard.
+ */
+export type MCPDashboardStage = 'activity' | 'metrics'
+
+/** Metrics and trends unlock on lifetime volume… */
+export const METRICS_UNLOCK_LIFETIME_CALLS = 300
+/** …or on sustained density, whichever comes first. */
+export const METRICS_UNLOCK_7D_CALLS = 250
+
+export interface MCPOnboardingSignals {
+    /** A client has completed the MCP handshake — proves the SDK wrap is live. */
+    hasInitialize: boolean
+    /** A tool has actually been called — the server is in use. */
+    hasToolCall: boolean
+    /** Lifetime `$mcp_tool_call` count — drives the activity/metrics stage gate. */
+    toolCallsTotal: number
+    /** `$mcp_tool_call` count over the last 7 days — the density half of the gate. */
+    toolCalls7d: number
+    /** Timestamp of the first tool call, for "since June 30" copy. Null before the first call. */
+    firstCallAt: string | null
+}
+
+function dashboardStageForSignals(signals: MCPOnboardingSignals | null): MCPDashboardStage | null {
+    if (!signals || !signals.hasToolCall) {
+        return null
+    }
+    return signals.toolCallsTotal >= METRICS_UNLOCK_LIFETIME_CALLS || signals.toolCalls7d >= METRICS_UNLOCK_7D_CALLS
+        ? 'metrics'
+        : 'activity'
+}
+
+export type FirstDataWatch = 'unknown' | 'watching' | 'arrived' | 'settled'
+
+/** Where the viewer saw the first call land: the setup mode reveal, or the scene the gate swaps in. */
+export type FirstDataSurface = 'setup_mode' | 'dashboard'
+
+/** A `null` answer (stale response after a project switch) changes nothing. */
+export function nextFirstDataWatch(current: FirstDataWatch, signals: MCPOnboardingSignals | null): FirstDataWatch {
+    if (!signals) {
+        return current
+    }
+    if (current === 'unknown') {
+        return signals.hasToolCall ? 'settled' : 'watching'
+    }
+    if (current === 'watching' && signals.hasToolCall) {
+        // A backfill that lands on the metrics stage is not a "your first call arrived" moment.
+        return dashboardStageForSignals(signals) === 'activity' ? 'arrived' : 'settled'
+    }
+    return current
+}
+
+// Signal funnel over all history. `$mcp_initialize` fires when an agent connects
+// (before any tool call), so it distinguishes "instrumented but no traffic yet"
+// from "not instrumented at all". Counts (not booleans) so the same query drives
+// the activity/metrics stage gate. Deliberately no `properties.*` access: event-name +
+// timestamp filters hit the events sort key, so this stays cheap even on projects
+// with millions of MCP events — property-derived stats live in mcpEarlyDataLogic,
+// whose queries are time-bounded.
+const ONBOARDING_SIGNAL_QUERY = `
+SELECT
+    countIf(event = '$mcp_initialize') > 0 AS has_initialize,
+    countIf(event = '$mcp_tool_call') AS tool_calls_total,
+    countIf(event = '$mcp_tool_call' AND timestamp >= now() - INTERVAL 7 DAY) AS tool_calls_7d,
+    minIf(timestamp, event = '$mcp_tool_call') AS first_call_at
+FROM events
+WHERE event IN ('$mcp_initialize', '$mcp_tool_call')
+`
+
+// While the user is onboarding we re-check on a timer so the page advances on its own
+// as the first events land. The disposables plugin pauses this on hidden tabs and tears
+// it down on unmount.
+const POLL_INTERVAL_MS = 20000
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface mcpAnalyticsOnboardingLogicValues {
+    setupStatus: ProductSetupStatus // productSetupStatusLogic
+    dashboardStage: MCPDashboardStage | null
+    firstDataWatch: FirstDataWatch
+    isOnboarded: boolean
+    onboardingState: MCPOnboardingState | null
+    signals: MCPOnboardingSignals | null
+    signalsLoading: boolean
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface mcpAnalyticsOnboardingLogicActions {
+    setDetectedStatus: (status: ProductSetupStatus) => {
+        status: ProductSetupStatus
+    } // productSetupStatusLogic
+    acknowledgeFirstData: (surface: FirstDataSurface) => {
+        surface: FirstDataSurface
+    }
+    loadSignals: (_: void) => void
+    loadSignalsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadSignalsSuccess: (
+        signals: MCPOnboardingSignals | null,
+        payload?: void
+    ) => {
+        signals: MCPOnboardingSignals | null
+        payload?: void
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface mcpAnalyticsOnboardingLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        onboardingState: (signals: MCPOnboardingSignals | null) => MCPOnboardingState | null
+        isOnboarded: (onboardingState: MCPOnboardingState | null) => boolean
+        dashboardStage: (signals: MCPOnboardingSignals | null) => MCPDashboardStage | null
+    }
+}
+
+export type mcpAnalyticsOnboardingLogicType = MakeLogicType<
+    mcpAnalyticsOnboardingLogicValues,
+    mcpAnalyticsOnboardingLogicActions,
+    Record<string, any>,
+    mcpAnalyticsOnboardingLogicMeta
+>
+
+export const mcpAnalyticsOnboardingLogic = kea<mcpAnalyticsOnboardingLogicType>([
+    path(['products', 'mcp_analytics', 'frontend', 'mcpAnalyticsOnboardingLogic']),
+    connect(() => ({
+        actions: [productSetupStatusLogic({ productKey: ProductKey.MCP_ANALYTICS }), ['setDetectedStatus']],
+        values: [productSetupStatusLogic({ productKey: ProductKey.MCP_ANALYTICS }), ['status as setupStatus']],
+    })),
+    actions({
+        acknowledgeFirstData: (surface: FirstDataSurface) => ({ surface }),
+    }),
+    loaders({
+        signals: {
+            __default: null as MCPOnboardingSignals | null,
+            loadSignals: async (_: void, breakpoint): Promise<MCPOnboardingSignals | null> => {
+                const projectUuid = teamLogic.values.currentTeam?.uuid
+                // Force a fresh calculation instead of reading a cached result. The first
+                // events on a new project land a beat after capture returns 200, so a poll
+                // during that gap caches `[0,0]` — and with the default cache TTL the page
+                // would then keep serving that stale "not onboarded" answer for up to a
+                // minute after the data is actually queryable, dulling the "you're connected!"
+                // moment. Forcing keeps the flip near-instant. Polling stops once the first
+                // tool call lands (see loadSignalsSuccess), so this is bounded to onboarding plus
+                // one query per mount, and the query itself is cheap (event-name counts on the sort key).
+                const response = (await api
+                    .query(
+                        {
+                            kind: NodeKind.HogQLQuery,
+                            query: ONBOARDING_SIGNAL_QUERY,
+                        },
+                        { refresh: 'force_blocking' }
+                    )
+                    .catch((error: unknown) => {
+                        breakpoint()
+                        if (projectUuid !== teamLogic.values.currentTeam?.uuid) {
+                            return null
+                        }
+                        throw error
+                    })) as HogQLQueryResponse | null
+                breakpoint()
+                if (projectUuid !== teamLogic.values.currentTeam?.uuid) {
+                    return null
+                }
+                const row = (response?.results?.[0] as unknown[] | undefined) ?? []
+                const toolCallsTotal = asNumber(row[1])
+                return {
+                    hasInitialize: asNumber(row[0]) > 0,
+                    hasToolCall: toolCallsTotal > 0,
+                    toolCallsTotal,
+                    toolCalls7d: asNumber(row[2]),
+                    // minIf() returns the epoch sentinel when nothing matched — only trust it
+                    // once we know at least one call exists.
+                    firstCallAt: toolCallsTotal > 0 && typeof row[3] === 'string' ? row[3] : null,
+                }
+            },
+        },
+    }),
+    reducers({
+        firstDataWatch: [
+            'unknown' as FirstDataWatch,
+            {
+                loadSignalsSuccess: (state, { signals }) => nextFirstDataWatch(state, signals),
+                acknowledgeFirstData: (state) => (state === 'arrived' ? 'settled' : state),
+            },
+        ],
+    }),
+    selectors({
+        onboardingState: [
+            (s) => [s.signals],
+            (signals: MCPOnboardingSignals | null): MCPOnboardingState | null => {
+                if (!signals) {
+                    return null
+                }
+                if (signals.hasToolCall) {
+                    return 'onboarded'
+                }
+                if (signals.hasInitialize) {
+                    return 'connected-no-calls'
+                }
+                return 'not-instrumented'
+            },
+        ],
+        isOnboarded: [
+            (s) => [s.onboardingState],
+            (onboardingState: MCPOnboardingState | null): boolean => onboardingState === 'onboarded',
+        ],
+        dashboardStage: [
+            (s) => [s.signals],
+            (signals: MCPOnboardingSignals | null): MCPDashboardStage | null => dashboardStageForSignals(signals),
+        ],
+    }),
+    listeners(({ actions, values, cache, selectors }) => ({
+        loadSignalsFailure: () => {
+            // A failing signal query must not strand the empty-state gate on its
+            // spinner. If nothing (preload included) has answered yet, publish
+            // `unknown` so the gate fails open to the real scene - the poll keeps
+            // retrying and a later success replaces this. A failure never downgrades
+            // an existing answer.
+            if (values.setupStatus === 'loading') {
+                actions.setDetectedStatus('unknown')
+            }
+        },
+        loadSignalsSuccess: ({ signals }) => {
+            if (!signals) {
+                return
+            }
+            // Feed the app-wide setup-status layer (drives the scene empty-state gate).
+            actions.setDetectedStatus(emptyStateStatusForOnboardingState(values.onboardingState))
+
+            // Mark the diagnostic middle of the funnel: the SDK is connected but no
+            // tool calls have landed yet. Separates an install problem (never
+            // instrumented) from a traffic problem (wired up, but the server isn't
+            // being called). Registered once per mount so the poll doesn't repeat it.
+            if (
+                values.onboardingState === 'connected-no-calls' &&
+                !cache.registeredConnected &&
+                !isImpersonatedSession()
+            ) {
+                cache.registeredConnected = true
+                void addProductIntent({
+                    product_type: ProductKey.MCP_ANALYTICS,
+                    intent_context: ProductIntentContext.MCP_ANALYTICS_CONNECTED,
+                })
+            }
+            // The poll exists to catch the first call landing. The activity stage refreshes its own
+            // feed (mcpEarlyDataLogic), so a full-history scan every 20s past this point buys nothing.
+            if (values.isOnboarded) {
+                cache.disposables.dispose('poll')
+            }
+        },
+        acknowledgeFirstData: ({ surface }, _breakpoint, _action, previousState) => {
+            // Compare with the state before the reducer settled it, so a repeated acknowledge captures nothing.
+            if (selectors.firstDataWatch(previousState) !== 'arrived' || isImpersonatedSession()) {
+                return
+            }
+            const { toolCallsTotal, firstCallAt } = values.signals ?? {}
+            posthog.captureRaw('mcp analytics first data seen live', {
+                tool_calls_total: toolCallsTotal,
+                seconds_since_first_call: firstCallAt ? Math.max(0, dayjs().diff(dayjs(firstCallAt), 'second')) : null,
+                surface,
+            })
+        },
+    })),
+    afterMount(({ actions, cache, values }) => {
+        actions.loadSignals()
+        // Register product intent so activation lands in the standard cross-customer
+        // funnel (`has_activated_mcp_analytics` flips once tool calls arrive too).
+        if (!isImpersonatedSession()) {
+            void addProductIntent({
+                product_type: ProductKey.MCP_ANALYTICS,
+                intent_context: ProductIntentContext.MCP_ANALYTICS_VIEWED,
+            })
+        }
+        cache.disposables.add(() => {
+            // Skips while a request is in flight, so a request slower than the interval is not
+            // cancelled by the next one. Setup mode polls the same loader on its own timer.
+            const id = window.setInterval(() => !values.signalsLoading && actions.loadSignals(), POLL_INTERVAL_MS)
+            return () => clearInterval(id)
+        }, 'poll')
+    }),
+])

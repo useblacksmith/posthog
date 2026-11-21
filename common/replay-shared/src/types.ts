@@ -1,0 +1,43 @@
+import { eventWithTime } from 'posthog-js/rrweb-types'
+
+export interface RecordingSegment {
+    kind: 'window' | 'buffer' | 'gap'
+    startTimestamp: number
+    endTimestamp: number
+    durationMs: number
+    windowId?: number
+    isActive: boolean
+    isLoading?: boolean
+}
+
+export type EncodedRecordingSnapshot = {
+    windowId: number
+    data: eventWithTime[]
+}
+
+export const SnapshotSourceType = {
+    blob_v2: 'blob_v2',
+    file: 'file',
+} as const
+
+export type SnapshotSourceType = (typeof SnapshotSourceType)[keyof typeof SnapshotSourceType]
+
+export interface SessionRecordingSnapshotSource {
+    source: SnapshotSourceType
+    start_timestamp?: string
+    end_timestamp?: string
+    blob_key?: string
+    /** Fetch this block here directly, with the listing's block token, instead of through the snapshots endpoint. */
+    url?: string
+}
+
+export interface SessionRecordingSnapshotSourceResponse {
+    sources?: Pick<SessionRecordingSnapshotSource, 'source' | 'blob_key'>[]
+    snapshots?: RecordingSnapshot[]
+    processed?: boolean
+    sourceLoaded?: boolean
+}
+
+export type RecordingSnapshot = eventWithTime & {
+    windowId: number
+}

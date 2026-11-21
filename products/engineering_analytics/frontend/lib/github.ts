@@ -1,0 +1,32 @@
+export function githubPrUrl(repoOwner: string, repoName: string, number: number): string {
+    return `https://github.com/${repoOwner}/${repoName}/pull/${number}`
+}
+
+/** GitHub has no stable by-name workflow URL, so link the Actions list filtered to the workflow. */
+export function githubWorkflowUrl(repoOwner: string, repoName: string, workflowName: string): string {
+    return `https://github.com/${repoOwner}/${repoName}/actions?query=${encodeURIComponent(`workflow:"${workflowName}"`)}`
+}
+
+export function githubRunUrl(repoOwner: string, repoName: string, runId: number): string {
+    return `https://github.com/${repoOwner}/${repoName}/actions/runs/${runId}`
+}
+
+/** With a step number, the page opens at the first line of that step. */
+export function githubJobUrl(
+    repoOwner: string,
+    repoName: string,
+    runId: number,
+    jobId: number,
+    stepNumber?: number | null
+): string {
+    return `${githubRunUrl(repoOwner, repoName, runId)}/job/${jobId}${stepNumber == null ? '' : `#step:${stepNumber}:1`}`
+}
+
+export function githubCommitUrl(repoOwner: string, repoName: string, sha: string): string {
+    return `https://github.com/${repoOwner}/${repoName}/commit/${sha}`
+}
+
+/** `repository` is 'owner/name'. HEAD resolves the default branch, whatever it is named. */
+export function githubFileUrl(repository: string, file: string): string {
+    return `https://github.com/${repository}/blob/HEAD/${file}`
+}

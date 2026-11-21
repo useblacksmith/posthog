@@ -1,0 +1,63 @@
+import type { SurveysTabs } from 'scenes/surveys/surveysLogic'
+import { urls } from 'scenes/urls'
+
+import { ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
+
+import { ActivityScope, FileSystemIconColor, ProductManifest } from '../../frontend/src/types'
+
+export const manifest: ProductManifest = {
+    name: 'Surveys',
+    activityDescribers: {
+        [ActivityScope.SURVEY]: () =>
+            import('scenes/surveys/surveyActivityDescriber').then((module) => module.surveyActivityDescriber),
+    },
+    urls: {
+        surveys: (tab?: `${SurveysTabs}`): string => `/surveys${tab ? `?tab=${tab}` : ''}`,
+        /** @param id A UUID or 'new'. ':id' for routing. */
+        survey: (id: string): string => `/surveys/${id}`,
+        surveyFormBuilder: (id: string = 'new'): string => `/surveys/form/${id}`,
+        surveyWizard: (id: string = 'new', template?: string): string =>
+            `/surveys/guided/${id}${template ? `?template=${encodeURIComponent(template)}` : ''}`,
+    },
+    fileSystemTypes: {
+        survey: {
+            name: 'Survey',
+            iconType: 'survey',
+            href: (ref: string) => urls.survey(ref),
+            listHref: () => urls.surveys(),
+            listSearchParam: 'search',
+            iconColor: ['var(--color-product-surveys-light)', 'var(--color-product-surveys-dark)'],
+            filterKey: 'survey',
+        },
+    },
+    treeItemsNew: [
+        {
+            path: `Survey`,
+            type: 'survey',
+            href: urls.surveyWizard('new'),
+            iconType: 'survey',
+            iconColor: [
+                'var(--color-product-surveys-light)',
+                'var(--color-product-surveys-dark)',
+            ] as FileSystemIconColor,
+        },
+    ],
+    treeItemsProducts: [
+        {
+            path: 'Surveys',
+            intents: [ProductKey.SURVEYS],
+            category: ProductItemCategory.PRODUCT_ENGINEERING,
+            type: 'survey',
+            href: urls.surveys(),
+            searchKeywords: ['feedback', 'nps', 'csat', 'polls'],
+            searchTabs: [{ name: 'Notifications', href: urls.surveys('notifications') }],
+            iconType: 'survey',
+            iconColor: [
+                'var(--color-product-surveys-light)',
+                'var(--color-product-surveys-dark)',
+            ] as FileSystemIconColor,
+            sceneKey: 'Surveys',
+            sceneKeys: ['Survey', 'Surveys'],
+        },
+    ],
+}

@@ -1,0 +1,229 @@
+from datetime import timedelta
+
+from posthog.test.base import BaseTest
+from unittest import mock
+
+from parameterized import parameterized
+from temporalio.service import RPCError, RPCStatusCode
+
+from products.data_modeling.backend.facade.contracts import SchedulingUnavailableError, UnsupportedFrequencyTargetError
+from products.data_modeling.backend.logic.cohort_scheduling import is_tier_schedule_id
+from products.data_modeling.backend.logic.node_frequency import get_declared_target, set_declared_target
+from products.data_modeling.backend.models import DAG, Node
+from products.data_modeling.backend.models.datawarehouse_saved_query import (
+    DataWarehouseSavedQuery,
+    NoSchedulableDagError,
+)
+from products.data_modeling.backend.models.node import NodeType
+
+MODEL = "products.data_modeling.backend.models.datawarehouse_saved_query"
+GET_V2_DAG_IDS = "products.data_modeling.backend.schedule.get_v2_scheduled_dag_ids"
+RECONCILE = "products.data_modeling.backend.logic.schedule_reconcile"
+NODE_MAT = "products.data_modeling.backend.logic.node_materialization"
+H12 = timedelta(hours=12)
+
+
+def _no_schedules():
+    """A Temporal client whose schedule listing is empty — a DAG nothing has ever scheduled."""
+
+    async def list_schedules(*_args, **_kwargs):
+        async def gen():
+            return
+            yield  # pragma: no cover - makes gen an async generator
+
+        return gen()
+
+    temporal = mock.Mock()
+    temporal.list_schedules = list_schedules
+    return temporal
+
+
+class TestScheduleMaterializationV2Guard(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.dag = DAG.objects.create(team=self.team, name="Default")
+        self.sq = DataWarehouseSavedQuery.objects.create(
+            name="view",
+            team=self.team,
+            query={"query": "SELECT 1", "kind": "HogQLQuery"},
+        )
+        Node.objects.create(team=self.team, dag=self.dag, saved_query=self.sq, type=NodeType.VIEW)
+
+    def test_frequency_only_call_on_v2_neither_reports_nor_starts_a_run(self):
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value={str(self.dag.id)}),
+            mock.patch(f"{NODE_MAT}.sync_connect") as sync_connect,
+            mock.patch(f"{MODEL}.capture_exception") as capture,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.sq.schedule_materialization(frequency_target=H12)
+        # reporting on the healthy path would bury the one signal that matters
+        capture.assert_not_called()
+        # a frequency-only call carries no enable intent, so it must not start a one-off run
+        sync_connect.assert_not_called()
+
+    def test_saved_query_whose_node_vanished_is_refused_instead_of_scheduled(self):
+        nodeless = DataWarehouseSavedQuery.objects.create(
+            name="sync_failed",
+            team=self.team,
+            query={"query": "SELECT 1", "kind": "HogQLQuery"},
+            is_materialized=True,
+        )
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value={str(self.dag.id)}),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            nodeless.schedule_materialization(frequency_target=H12)
+        nodeless.refresh_from_db()
+        assert nodeless.is_materialized is False
+
+    def test_reports_and_disables_when_there_is_no_node_to_bootstrap(self):
+        # a DAG with no v2 schedule is bootstrapped through its node, so the one way left to
+        # reach the end of schedule_materialization with nothing scheduled is a query that has
+        # no node at all. Nothing can run it, so materialization is turned back off.
+        nodeless = DataWarehouseSavedQuery.objects.create(
+            name="sync_failed",
+            team=self.team,
+            query={"query": "SELECT 1", "kind": "HogQLQuery"},
+            is_materialized=True,
+        )
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value=set()),
+            mock.patch(f"{MODEL}.capture_exception") as capture,
+        ):
+            nodeless.schedule_materialization()
+
+        nodeless.refresh_from_db()
+        assert nodeless.is_materialized is False
+        assert isinstance(capture.call_args.args[0], NoSchedulableDagError)
+        assert capture.call_args.args[1]["team_id"] == self.team.pk
+
+    def test_virgin_dag_is_born_on_tiers(self):
+        # a brand-new team's DAG has no schedule at all, so the v2 lookup says "not on v2" and
+        # nothing would ever materialize the query — the bootstrap is what gives it a schedule
+        node = Node.objects.get(saved_query=self.sq)
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value=set()),
+            mock.patch(f"{RECONCILE}.async_connect", new=mock.AsyncMock(return_value=_no_schedules())),
+            mock.patch(f"{RECONCILE}.a_create_schedule", new=mock.AsyncMock()) as create,
+            mock.patch(f"{NODE_MAT}.sync_connect"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.sq.schedule_materialization(frequency_target=H12)
+
+        create.assert_called_once()
+        assert is_tier_schedule_id(create.call_args.kwargs["id"])
+        node.refresh_from_db()
+        assert get_declared_target(node) == H12
+
+    def test_failed_bootstrap_retracts_the_materialized_claim(self):
+        # the reconcile runs after the caller's transaction commits, so a failure has no caller
+        # left to raise into: leaving is_materialized set would report a schedule that was
+        # never created
+        self.sq.is_materialized = True
+        self.sq.save(update_fields=["is_materialized"])
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value=set()),
+            mock.patch(f"{RECONCILE}.async_connect", new=mock.AsyncMock(return_value=_no_schedules())),
+            mock.patch(
+                f"{RECONCILE}.a_create_schedule", new=mock.AsyncMock(side_effect=Exception("temporal unavailable"))
+            ),
+            mock.patch(f"{RECONCILE}.capture_exception"),
+            mock.patch(f"{NODE_MAT}.sync_connect"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.sq.schedule_materialization(frequency_target=H12)
+
+        self.sq.refresh_from_db()
+        assert self.sq.is_materialized is False
+
+    def test_rejected_frequency_leaves_a_virgin_dag_unbootstrapped(self):
+        # the bootstrap is all side effects, and on_commit fires immediately for the callers that
+        # are not inside an atomic block — so seeding or scheduling before the frequency is
+        # validated converts the DAG to v2 on a request that then 400s
+        node = Node.objects.get(saved_query=self.sq)
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value=set()),
+            mock.patch(f"{RECONCILE}.async_connect", new=mock.AsyncMock(return_value=_no_schedules())),
+            mock.patch(f"{RECONCILE}.a_create_schedule", new=mock.AsyncMock()) as create,
+            self.captureOnCommitCallbacks(execute=True),
+            self.assertRaises(UnsupportedFrequencyTargetError),
+        ):
+            self.sq.schedule_materialization(frequency_target=timedelta(minutes=45))
+
+        create.assert_not_called()
+        node.refresh_from_db()
+        assert get_declared_target(node) is None
+
+    def test_writes_target_through_to_the_node(self):
+        node = Node.objects.get(saved_query=self.sq)
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value={str(self.dag.id)}),
+            mock.patch(f"{RECONCILE}.maybe_reconcile_dag") as reconcile,
+        ):
+            self.sq.schedule_materialization(frequency_target=H12)
+        node.refresh_from_db()
+        assert get_declared_target(node) == H12
+        reconcile.assert_called_once()
+
+    def test_tiered_call_without_a_target_keeps_the_existing_one(self):
+        # a caller with no frequency opinion (e.g. re-enabling materialization) must not
+        node = Node.objects.get(saved_query=self.sq)
+        set_declared_target(node, timedelta(hours=6))
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value={str(self.dag.id)}),
+            mock.patch(f"{RECONCILE}.maybe_reconcile_dag"),
+        ):
+            self.sq.schedule_materialization()
+        node.refresh_from_db()
+        assert get_declared_target(node) == timedelta(hours=6)
+
+    def test_revert_materialization_on_tiered_clears_target(self):
+        # without this a reverted matview stays in its cadence tier and keeps materializing
+        node = Node.objects.get(saved_query=self.sq)
+        set_declared_target(node, timedelta(hours=12))
+        with (
+            mock.patch(f"{RECONCILE}.maybe_reconcile_dag"),
+        ):
+            self.sq.revert_materialization()
+        node.refresh_from_db()
+        assert get_declared_target(node) is None
+
+    def test_surfaces_invalid_frequency_without_disabling(self):
+        # an invalid frequency is a request problem: it must reach the caller as a validation
+        # error, not silently flip is_materialized like infrastructure failures do
+        self.sq.is_materialized = True
+        self.sq.save(update_fields=["is_materialized"])
+        with (
+            mock.patch(GET_V2_DAG_IDS, return_value={str(self.dag.id)}),
+            self.assertRaises(UnsupportedFrequencyTargetError),
+        ):
+            self.sq.schedule_materialization(frequency_target=timedelta(minutes=45))
+        self.sq.refresh_from_db()
+        assert self.sq.is_materialized is True
+
+    def test_disables_materialization_when_v2_lookup_fails(self):
+        self.sq.is_materialized = True
+        self.sq.save(update_fields=["is_materialized"])
+        with mock.patch(GET_V2_DAG_IDS, side_effect=Exception("temporal unavailable")):
+            self.sq.schedule_materialization()
+        self.sq.refresh_from_db()
+        assert self.sq.is_materialized is False
+
+    @parameterized.expand(
+        [
+            ("tls_handshake", RuntimeError("Failed client connect: Server connection error: invalid peer certificate")),
+            ("rpc_unavailable", RPCError("connection reset", RPCStatusCode.UNAVAILABLE, b"")),
+        ]
+    )
+    def test_temporal_outage_raises_and_keeps_materialization(self, _name: str, error: Exception):
+        self.sq.is_materialized = True
+        self.sq.save(update_fields=["is_materialized"])
+        node = Node.objects.get(saved_query=self.sq)
+        set_declared_target(node, H12)
+        with mock.patch(GET_V2_DAG_IDS, side_effect=error), self.assertRaises(SchedulingUnavailableError):
+            self.sq.schedule_materialization()
+        self.sq.refresh_from_db()
+        node.refresh_from_db()
+        assert self.sq.is_materialized is True
+        assert get_declared_target(node) == H12

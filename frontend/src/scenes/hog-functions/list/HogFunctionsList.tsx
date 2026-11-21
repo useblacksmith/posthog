@@ -1,0 +1,408 @@
+import { BindLogic, useActions, useValues } from 'kea'
+import { combineUrl, router } from 'kea-router'
+import { useCallback, useMemo } from 'react'
+
+import { IconBell } from '@posthog/icons'
+import {
+    LemonBadge,
+    LemonButton,
+    LemonCheckbox,
+    LemonInput,
+    LemonSelect,
+    LemonSelectOptions,
+    LemonTable,
+    LemonTableColumn,
+    LemonTag,
+    Link,
+    Tooltip,
+} from '@posthog/lemon-ui'
+
+import { AppMetricsSparkline } from 'lib/components/AppMetrics/AppMetricsSparkline'
+import { MemberSelect } from 'lib/components/MemberSelect'
+import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+import { LemonMenuOverlay } from 'lib/lemon-ui/LemonMenu/LemonMenu'
+import { createdByColumn, updatedAtColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
+import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
+import { urls } from 'scenes/urls'
+
+import { HogFunctionConfigurationContextId, HogFunctionType } from '~/types'
+
+import { HogFunctionIcon } from '../configuration/HogFunctionIcon'
+import { humanizeHogFunctionType } from '../hog-function-utils'
+import { HogFunctionStatusIndicator } from '../misc/HogFunctionStatusIndicator'
+import { eventToHogFunctionContextId } from '../sub-templates/sub-templates'
+import { HogFunctionOrderModal } from './HogFunctionOrderModal'
+import { hogFunctionRequestModalLogic } from './hogFunctionRequestModalLogic'
+import { HogFunctionListLogicProps, hogFunctionsListLogic } from './hogFunctionsListLogic'
+
+const INTERNAL_DESTINATION_CONTEXT: Partial<
+    Record<HogFunctionConfigurationContextId, { label: string; url?: string }>
+> = {
+    'activity-log': {
+        label: 'Activity log',
+        url: urls.settings('environment-activity-logs', 'activity-log-notifications'),
+    },
+    'discussion-mention': {
+        label: 'Discussions',
+        url: urls.settings('environment-discussions', 'discussion-mention-integrations'),
+    },
+    'error-tracking': {
+        label: 'Error tracking',
+        url: urls.errorTrackingConfiguration() + '#selectedSetting=error-tracking-alerting',
+    },
+    'insight-alerts': { label: 'Insight alerts' },
+    'experiment-alerts': { label: 'Experiment alerts' },
+    'logs-alerting': { label: 'Logs alerts' },
+    'health-alerts': {
+        label: 'Health alerts',
+        url: urls.healthAlerts(),
+    },
+    'batch-export-alerts': { label: 'Batch export alerts' },
+    'billing-alerts': { label: 'Billing alerts' },
+    'replay-vision-alerts': { label: 'Replay vision alerts' },
+    'replay-vision-requests': { label: 'Replay vision requests' },
+    'signals-reports': { label: 'Inbox reports' },
+}
+
+function NotificationContextTag({ hogFunction }: { hogFunction: HogFunctionType }): JSX.Element | null {
+    const eventId = hogFunction.filters?.events?.[0]?.id
+    const contextId = eventToHogFunctionContextId(eventId)
+    const context = INTERNAL_DESTINATION_CONTEXT[contextId]
+    if (!context) {
+        return null
+    }
+
+    const tooltipTitle = context.url
+        ? `Notification managed in ${context.label} settings. Click to go there.`
+        : `Notification managed in ${context.label} settings.`
+
+    return (
+        <Tooltip title={tooltipTitle}>
+            <LemonTag
+                size="small"
+                type="muted"
+                icon={<IconBell />}
+                onClick={
+                    context.url
+                        ? (e) => {
+                              e.preventDefault()
+                              e.stopPropagation()
+                              router.actions.push(context.url!)
+                          }
+                        : undefined
+                }
+                className={
+                    context.url ? 'cursor-pointer hover:bg-fill-button-tertiary-hover transition-colors' : undefined
+                }
+            >
+                {context.label}
+            </LemonTag>
+        </Tooltip>
+    )
+}
+
+// `returnTo` only applies to the canonical hog-function path; the legacy plugin scene doesn't read it.
+export const urlForHogFunction = (hogFunction: HogFunctionType, returnTo?: string): string => {
+    if (hogFunction.id.startsWith('plugin-')) {
+        return urls.legacyPlugin(hogFunction.id.replace('plugin-', ''))
+    }
+    const path = urls.hogFunction(hogFunction.id)
+    return returnTo ? combineUrl(path, { returnTo }).url : path
+}
+
+export function HogFunctionList({
+    extraControls,
+    hideFeedback = false,
+    emptyText,
+    onDeleteHogFunction,
+    onEditHogFunction,
+    returnTo,
+    truncateDescriptions = false,
+    manualFunctionsLoading = false,
+    ...props
+}: HogFunctionListLogicProps & {
+    extraControls?: JSX.Element
+    hideFeedback?: boolean
+    emptyText?: string
+    onDeleteHogFunction?: (hogFunction: HogFunctionType) => void
+    onEditHogFunction?: (hogFunction: HogFunctionType) => void
+    /** Path the row's breadcrumbs return to. An alert row reads it as the owning alert's path, so pass the owner's URL rather than a list URL. */
+    returnTo?: string
+    /** Clamp long descriptions to two lines with a "Show more" toggle. */
+    truncateDescriptions?: boolean
+    /** Whether `manualFunctions` are still being fetched, so the table shows a skeleton and not an empty state. */
+    manualFunctionsLoading?: boolean
+}): JSX.Element {
+    const { loading, filteredHogFunctions, filters, sortedHogFunctions, hiddenHogFunctions, notificationSources } =
+        useValues(hogFunctionsListLogic(props))
+    const { loadHogFunctions, setFilters, resetFilters, toggleEnabled, deleteHogFunction, setReorderModalOpen } =
+        useActions(hogFunctionsListLogic(props))
+
+    const { openFeedbackDialog } = useActions(hogFunctionRequestModalLogic)
+
+    const humanizedType = humanizeHogFunctionType(props.type)
+    // One source leaves nothing to narrow down, so the filter only shows for a list that mixes sources.
+    const showNotificationSourceFilter = notificationSources.length > 1 || !!filters.notificationSource
+    const notificationSourceOptions: LemonSelectOptions<HogFunctionConfigurationContextId | null> = [
+        { label: 'All sources', value: null },
+        ...notificationSources
+            .map((contextId) => ({
+                // An internal event with no entry above falls back to the 'standard' context id,
+                // which is an internal token rather than something to show a person.
+                label: INTERNAL_DESTINATION_CONTEXT[contextId]?.label ?? 'Other',
+                value: contextId,
+            }))
+            .sort((a, b) => a.label.localeCompare(b.label)),
+    ]
+
+    useOnMountEffect(loadHogFunctions)
+
+    const isManualFunction = useCallback(
+        (hogFunction: HogFunctionType): boolean => {
+            return props.manualFunctions?.find((f) => f.id === hogFunction.id) !== undefined
+        },
+        [props.manualFunctions]
+    )
+
+    const columns = useMemo(() => {
+        const columns: LemonTableColumn<HogFunctionType, any>[] = [
+            {
+                title: '',
+                width: 0,
+                render: function RenderIcon(_, hogFunction) {
+                    return <HogFunctionIcon src={hogFunction.icon_url} size="small" />
+                },
+            },
+            {
+                title: 'Name',
+                sticky: true,
+                sorter: (a, b) =>
+                    (a.name ?? '').localeCompare(b.name ?? '', undefined, { sensitivity: 'base', numeric: true }),
+                key: 'name',
+                dataIndex: 'name',
+                render: (_, hogFunction) => {
+                    return (
+                        <LemonTableLink
+                            to={urlForHogFunction(hogFunction, returnTo)}
+                            onClick={onEditHogFunction ? () => onEditHogFunction(hogFunction) : undefined}
+                            title={
+                                <>
+                                    <Tooltip title="Click to update configuration, view metrics, and more">
+                                        <span>{hogFunction.name}</span>
+                                    </Tooltip>
+                                    {hogFunction.type === 'internal_destination' && (
+                                        <NotificationContextTag hogFunction={hogFunction} />
+                                    )}
+                                    {hogFunction.draft_updated_at && (
+                                        <Tooltip title="Staged changes are waiting to be published. Open it to review them.">
+                                            <LemonTag size="small" type="warning" className="ml-1">
+                                                Unpublished changes
+                                            </LemonTag>
+                                        </Tooltip>
+                                    )}
+                                </>
+                            }
+                            description={hogFunction.description}
+                            truncateDescription={truncateDescriptions}
+                        />
+                    )
+                },
+            },
+            createdByColumn() as LemonTableColumn<HogFunctionType, any>,
+
+            updatedAtColumn() as LemonTableColumn<HogFunctionType, any>,
+            {
+                title: 'Last 7 days',
+                width: 0,
+                render: (_, hogFunction) => {
+                    if (isManualFunction(hogFunction) || hogFunction.type === 'site_app') {
+                        return <>N/A</>
+                    }
+
+                    return (
+                        <Link to={urlForHogFunction(hogFunction) + '?tab=metrics'}>
+                            <AppMetricsSparkline
+                                logicKey={hogFunction.id}
+                                forceParams={{
+                                    appSource: 'hog_function',
+                                    appSourceId: hogFunction.id,
+                                    // Log transformations report drops and budget skips under
+                                    // metric_kind 'other' — without it their sparkline reads as idle.
+                                    metricKind:
+                                        hogFunction.type === 'transformation_log'
+                                            ? ['success', 'failure', 'other']
+                                            : ['success', 'failure'],
+                                    breakdownBy: 'metric_kind',
+                                    interval: 'day',
+                                    dateFrom: '-7d',
+                                }}
+                            />
+                        </Link>
+                    )
+                },
+            },
+            {
+                title: 'Status',
+                key: 'enabled',
+                sorter: (a) => (a.enabled ? 1 : -1),
+                width: 0,
+                render: function RenderStatus(_, hogFunction) {
+                    return <HogFunctionStatusIndicator hogFunction={hogFunction} />
+                },
+            },
+            {
+                width: 0,
+                render: function Render(_, hogFunction) {
+                    return (
+                        <More
+                            overlay={
+                                <LemonMenuOverlay
+                                    items={
+                                        isManualFunction(hogFunction)
+                                            ? [
+                                                  // TRICKY: Hack for now to just link out to the full view
+                                                  {
+                                                      label: 'View & configure',
+                                                      to: urlForHogFunction(hogFunction, returnTo),
+                                                  },
+                                              ]
+                                            : [
+                                                  {
+                                                      label: hogFunction.enabled ? 'Pause' : 'Unpause',
+                                                      onClick: () => toggleEnabled(hogFunction, !hogFunction.enabled),
+                                                  },
+                                                  {
+                                                      label: 'Delete',
+                                                      status: 'danger' as const, // for typechecker happiness
+                                                      onClick: () => {
+                                                          onDeleteHogFunction?.(hogFunction)
+                                                          deleteHogFunction(hogFunction)
+                                                      },
+                                                  },
+                                              ]
+                                    }
+                                />
+                            }
+                        />
+                    )
+                },
+            },
+        ]
+
+        if (props.type === 'transformation' || props.type === 'transformation_log') {
+            // insert it in the second column
+            columns.splice(1, 0, {
+                title: 'Prio',
+                key: 'execution_order',
+                sorter: (a) => (a.execution_order ? 1 : -1),
+                width: 0,
+                render: function Render(_, hogFunction) {
+                    return (
+                        <LemonButton
+                            size="small"
+                            tooltip="Transformations are executed in a specific order. Click to reorder them."
+                            onClick={() => setReorderModalOpen(true)}
+                        >
+                            <LemonBadge.Number count={hogFunction.execution_order ?? 0} status="muted" />
+                        </LemonButton>
+                    )
+                },
+            })
+        }
+
+        return columns
+    }, [
+        props.type,
+        humanizedType,
+        toggleEnabled,
+        deleteHogFunction,
+        isManualFunction,
+        onDeleteHogFunction,
+        onEditHogFunction,
+        returnTo,
+        truncateDescriptions,
+    ]) // oxlint-disable-line react-hooks/exhaustive-deps
+
+    return (
+        <div className="flex flex-col gap-4">
+            <div className="flex flex-wrap gap-2 items-center">
+                <LemonInput
+                    type="search"
+                    placeholder="Search..."
+                    value={filters.search ?? ''}
+                    onChange={(e) => setFilters({ search: e })}
+                />
+                {!hideFeedback ? (
+                    <Link className="text-sm font-semibold" subtle onClick={() => openFeedbackDialog(props.type)}>
+                        Can't find what you're looking for?
+                    </Link>
+                ) : null}
+                <div className="flex-1" />
+                <div className="flex flex-col xl:flex-row items-center gap-0.5 xl:gap-2 shrink-0">
+                    <span className="text-xs xl:text-sm">Created by:</span>
+                    <MemberSelect
+                        value={filters.createdBy || null}
+                        onChange={(user) => setFilters({ createdBy: user?.uuid || null })}
+                    />
+                </div>
+                {showNotificationSourceFilter && (
+                    <LemonSelect
+                        size="small"
+                        value={filters.notificationSource ?? null}
+                        onChange={(value) => setFilters({ notificationSource: value ?? undefined })}
+                        options={notificationSourceOptions}
+                        data-attr="hog-function-notification-source-filter"
+                    />
+                )}
+                <LemonCheckbox
+                    label="Show paused"
+                    bordered
+                    size="small"
+                    checked={filters.showPaused}
+                    onChange={(e) => setFilters({ showPaused: e ?? undefined })}
+                />
+                {extraControls}
+            </div>
+
+            <BindLogic logic={hogFunctionsListLogic} props={props}>
+                <LemonTable
+                    dataSource={filteredHogFunctions}
+                    size="small"
+                    loading={loading || manualFunctionsLoading}
+                    columns={columns}
+                    // The sparkline loads once per row, so a row must keep its function across a sort or a search.
+                    rowKey="id"
+                    pagination={{ pageSize: 30 }}
+                    emptyState={
+                        // The API applies the search itself, so an empty result with a search is a filter miss.
+                        sortedHogFunctions.length === 0 && !filters.search?.trim() ? (
+                            (emptyText ?? `No ${humanizedType}s found`)
+                        ) : (
+                            <>
+                                No {humanizedType}s matching filters.{' '}
+                                <Link onClick={() => resetFilters()}>Clear filters</Link>{' '}
+                            </>
+                        )
+                    }
+                    footer={
+                        hiddenHogFunctions.length > 0 && (
+                            <div className="p-3 text-secondary">
+                                {hiddenHogFunctions.length} hidden.{' '}
+                                <Link
+                                    onClick={() => {
+                                        resetFilters()
+                                        setFilters({ showPaused: true })
+                                    }}
+                                >
+                                    Show all
+                                </Link>
+                            </div>
+                        )
+                    }
+                />
+                <HogFunctionOrderModal />
+            </BindLogic>
+        </div>
+    )
+}

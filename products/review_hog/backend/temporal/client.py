@@ -1,0 +1,410 @@
+"""Triggers for the review and resolution workflows.
+
+Four entry points across two workflows. Each workflow pairs a **blocking** CLI trigger
+(`execute_*`, via `execute_workflow`) with a **non-blocking** production trigger (`start_*`, via
+`start_workflow`); the blocking form returns the `ReviewReport` id, the non-blocking form returns
+the workflow id and fires and forget (the run happens in the worker).
+
+`ReviewPRQueueWorkflow` serializes requests and runs each turn in `ReviewPRWorkflow`:
+- `execute_review_pr_workflow` — used by the `run_review` management command so the CLI eval loop
+  stays intact: run, see the outcome, read the report (stage progress streams in the worker log via
+  `workflow.logger`).
+- `start_review_pr_workflow` — used by production triggers; signals preserve new heads and Full
+  requests that arrive during an active review. Fetch creates the report id when a turn starts.
+
+`ResolvePRWorkflow` — triaging and settling a PR's unresolved review threads:
+- `execute_resolution_workflow` — the CLI entry (`run_resolution`), mirroring
+  `execute_review_pr_workflow`. Returns the `ReviewReport` id if any.
+- `start_resolution_workflow` — used by the production triggers (the `resolve` endpoint and the UI
+  resolve-only run). A published review chains into resolution as a child-workflow start inside
+  `ReviewPRWorkflow`, not through these entry points.
+
+The review target is either a PR (`pr_url`) or a pushed branch with no PR yet
+(`repository` + `head_branch`) — exactly one, validated in `_build_inputs`. Resolution always
+targets a PR (`pr_url`), validated in `_build_resolution_inputs`.
+"""
+
+import asyncio
+import logging
+from collections.abc import Callable
+from datetime import timedelta
+from enum import StrEnum
+from typing import Any, cast
+
+from django.conf import settings
+
+from asgiref.sync import async_to_sync
+from temporalio.client import WorkflowExecutionStatus, WorkflowQueryRejectedError
+from temporalio.common import QueryRejectCondition, RetryPolicy, WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.service import RPCError, RPCStatusCode
+
+from posthog.dataclasses import frozen
+from posthog.models.team.team import Team
+from posthog.temporal.common.client import sync_connect
+
+from products.review_hog.backend.reviewer.constants import REVIEW_MODE_FULL
+from products.review_hog.backend.reviewer.tools.github_meta import PRParser
+from products.review_hog.backend.temporal.types import (
+    TRIGGER_MANUAL,
+    ResolvePRWorkflowInputs,
+    ReviewPRQueueInputs,
+    ReviewPRWorkflowInputs,
+    resolve_pr_workflow_id,
+    review_branch_workflow_id,
+    review_pr_workflow_id,
+)
+from products.signals.backend.facade.taxonomy import ReportPriority
+
+logger = logging.getLogger(__name__)
+
+# Resolution retries resume from the persisted thread watermarks.
+_RESOLUTION_RETRY = RetryPolicy(maximum_attempts=2)
+
+
+class WorkflowProbe(StrEnum):
+    RUNNING = "running"
+    NOT_RUNNING = "not_running"
+    UNKNOWN = "unknown"
+
+
+def probe_workflow(workflow_id: str, rpc_timeout: timedelta | None = None) -> WorkflowProbe:
+    """Whether `workflow_id` has a live execution, with probe errors kept apart as UNKNOWN.
+
+    A status reader must not report a PR as idle when Temporal did not answer. A missed
+    `rpc_timeout` deadline reads as UNKNOWN too.
+    """
+    try:
+        client = sync_connect()
+        description = async_to_sync(client.get_workflow_handle(workflow_id).describe)(rpc_timeout=rpc_timeout)
+    except RPCError as e:
+        if e.status == RPCStatusCode.NOT_FOUND:
+            return WorkflowProbe.NOT_RUNNING
+        logger.warning("Workflow describe failed for %s: %s", workflow_id, e)
+        return WorkflowProbe.UNKNOWN
+    except Exception:
+        logger.exception("Workflow describe failed for %s", workflow_id)
+        return WorkflowProbe.UNKNOWN
+    if description.status == WorkflowExecutionStatus.RUNNING:
+        return WorkflowProbe.RUNNING
+    return WorkflowProbe.NOT_RUNNING
+
+
+@frozen
+class QueuedReviewHeads:
+    """The heads the PR's review queue still has to review. None is a request for the live head."""
+
+    # The request whose turn runs now, or waits for a resolution run to end before it starts.
+    active: tuple[str | None, ...] = ()
+    pending: tuple[str | None, ...] = ()
+
+
+def queued_review_heads(workflow_id: str, rpc_timeout: timedelta | None = None) -> QueuedReviewHeads:
+    """The heads the PR's review queue still has to review. Empty when no queue runs.
+
+    Raises when Temporal does not answer, so a caller cannot read an outage as "nothing queued".
+    """
+    try:
+        client = sync_connect()
+        handle = client.get_workflow_handle(workflow_id)
+        # async_to_sync erases query's overloads, so mypy binds the wrong one.
+        query = cast(Callable[..., Any], async_to_sync(handle.query))
+        heads: dict[str, list[str | None]] = query(
+            "requested_heads", reject_condition=QueryRejectCondition.NOT_OPEN, rpc_timeout=rpc_timeout
+        )
+    except WorkflowQueryRejectedError:
+        return QueuedReviewHeads()
+    except RPCError as e:
+        if e.status == RPCStatusCode.NOT_FOUND:
+            return QueuedReviewHeads()
+        raise
+    return QueuedReviewHeads(active=tuple(heads["active"]), pending=tuple(heads["pending"]))
+
+
+def workflow_running(workflow_id: str) -> bool:
+    """Whether `workflow_id` has a live execution — the busy-guard's probe (CONTEXT.md — "Busy-guard").
+
+    Temporal's same-id joining dedups review-vs-review and resolve-vs-resolve on its own, but the
+    review and resolution workflows carry different ids, so the cross-stage "is this PR's cycle
+    busy?" check is this explicit describe. Fail-open on probe errors other than not-found: a
+    trigger must not 500 over a flaky describe, and a real Temporal outage still surfaces on the
+    start call itself.
+    """
+    return probe_workflow(workflow_id) == WorkflowProbe.RUNNING
+
+
+def _build_inputs(
+    *,
+    team_id: int,
+    user_id: int,
+    publish: bool,
+    acting_user_id: int | None,
+    trigger_source: str,
+    signal_report_id: str | None,
+    pr_url: str | None,
+    repository: str | None,
+    head_branch: str | None,
+    resolve_comments: bool | None = None,
+    signal_priority: ReportPriority | None = None,
+    review_mode: str = REVIEW_MODE_FULL,
+    requested_head_sha: str | None = None,
+    trigger_action: str | None = None,
+    marks_ready: bool = False,
+    installation_id: str | None = None,
+    github_repo_id: int | None = None,
+) -> tuple[ReviewPRWorkflowInputs, str]:
+    """Validate the review target, the team, and build the workflow inputs + deterministic id.
+
+    `owner` / `repo` / `pr_number` are parsed here so the workflow stays free of the GitHub-URL
+    dependency and every trigger shares the deterministic per-target workflow id. Exactly one target
+    shape is required: a PR (`pr_url`) or a branch (`repository` + `head_branch`).
+    """
+    if (pr_url is None) == (head_branch is None):
+        raise ValueError("Exactly one review target is required: pr_url, or repository + head_branch")
+    Team.objects.get(id=team_id)  # fail fast if the team doesn't exist
+
+    if pr_url is not None:
+        pr_info = PRParser().parse_github_pr_url(pr_url)
+        owner, repo, pr_number = str(pr_info["owner"]), str(pr_info["repo"]), int(pr_info["pr_number"])
+        workflow_id = review_pr_workflow_id(team_id=team_id, owner=owner, repo=repo, pr_number=pr_number)
+    else:
+        owner, _, repo = (repository or "").partition("/")
+        if not owner or not repo or "/" in repo:
+            raise ValueError(f"Branch targets need a repository in 'owner/repo' form, got {repository!r}")
+        pr_number = None
+        workflow_id = review_branch_workflow_id(team_id=team_id, owner=owner, repo=repo, head_branch=head_branch or "")
+
+    inputs = ReviewPRWorkflowInputs(
+        team_id=team_id,
+        user_id=user_id,
+        pr_url=pr_url,
+        owner=owner,
+        repo=repo,
+        pr_number=pr_number,
+        publish=publish,
+        acting_user_id=acting_user_id,
+        trigger_source=trigger_source,
+        signal_report_id=signal_report_id,
+        signal_priority=signal_priority.value if signal_priority is not None else None,
+        head_branch=head_branch,
+        resolve_comments=resolve_comments,
+        review_mode=review_mode,
+        requested_head_sha=requested_head_sha,
+        trigger_action=trigger_action,
+        marks_ready=marks_ready,
+        installation_id=installation_id,
+        github_repo_id=github_repo_id,
+    )
+    return inputs, workflow_id
+
+
+def execute_review_pr_workflow(
+    *,
+    pr_url: str | None = None,
+    team_id: int,
+    user_id: int,
+    publish: bool = False,
+    acting_user_id: int | None = None,
+    trigger_source: str = TRIGGER_MANUAL,
+    signal_report_id: str | None = None,
+    repository: str | None = None,
+    head_branch: str | None = None,
+    resolve_comments: bool | None = None,
+    review_mode: str = REVIEW_MODE_FULL,
+) -> str:
+    """Start or signal the review queue, wait for it to finish, and return the `ReviewReport` id.
+
+    `team_id` / `user_id` are explicit identity (the team the review persists under; the user the
+    sandbox tasks run as). `publish` defaults off so a CLI run never posts unless asked.
+    `acting_user_id` pins whose enabled perspectives drive the review (the eval passes the run user
+    so it doesn't depend on the PR author being a PostHog user).
+    """
+    inputs, workflow_id = _build_inputs(
+        team_id=team_id,
+        user_id=user_id,
+        publish=publish,
+        acting_user_id=acting_user_id,
+        trigger_source=trigger_source,
+        signal_report_id=signal_report_id,
+        pr_url=pr_url,
+        repository=repository,
+        head_branch=head_branch,
+        resolve_comments=resolve_comments,
+        review_mode=review_mode,
+    )
+
+    # `sync_connect` is @async_to_sync, so call it from sync code (outside any running loop); the
+    # blocking workflow execution then runs inside `asyncio.run`.
+    client = sync_connect()
+    logger.info(f"Running ReviewPRWorkflow {workflow_id} on {settings.VIDEO_EXPORT_TASK_QUEUE} (publish={publish})")
+    return asyncio.run(
+        client.execute_workflow(
+            "review-pr-queue",
+            ReviewPRQueueInputs(requests=[inputs]),
+            id=workflow_id,
+            task_queue=settings.VIDEO_EXPORT_TASK_QUEUE,
+            # A new turn may start once the prior one finishes (the living-report re-review);
+            # re-triggering while a run is in flight joins that run rather than erroring.
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+            start_signal="request_review",
+            start_signal_args=[inputs],
+        )
+    )
+
+
+def start_review_pr_workflow(
+    *,
+    pr_url: str | None = None,
+    team_id: int,
+    user_id: int,
+    publish: bool,
+    acting_user_id: int | None = None,
+    trigger_source: str = TRIGGER_MANUAL,
+    signal_report_id: str | None = None,
+    signal_priority: ReportPriority | None = None,
+    repository: str | None = None,
+    head_branch: str | None = None,
+    resolve_comments: bool | None = None,
+    review_mode: str = REVIEW_MODE_FULL,
+    requested_head_sha: str | None = None,
+    trigger_action: str | None = None,
+    marks_ready: bool = False,
+    installation_id: str | None = None,
+    github_repo_id: int | None = None,
+) -> str:
+    """Start or signal the review queue without blocking and return the workflow id.
+
+    For the production triggers: the caller returns immediately while the review runs in the worker.
+    `publish` is required (the caller decides explicitly). Safe to call from a synchronous DRF action
+    or a `post_save` receiver — `sync_connect()` is `@async_to_sync` and the start is wrapped
+    likewise. `acting_user_id` defaults None so the workflow resolves the PR author itself (the label
+    trigger has not fetched the PR, so it cannot know the author); the inbox trigger sets it.
+
+    A signal records requests that arrive during a review. Automatic pushes coalesce to the latest
+    head; explicit Full requests wait for an active Flash review without being discarded.
+    """
+    inputs, workflow_id = _build_inputs(
+        team_id=team_id,
+        user_id=user_id,
+        publish=publish,
+        acting_user_id=acting_user_id,
+        trigger_source=trigger_source,
+        signal_report_id=signal_report_id,
+        signal_priority=signal_priority,
+        pr_url=pr_url,
+        repository=repository,
+        head_branch=head_branch,
+        resolve_comments=resolve_comments,
+        review_mode=review_mode,
+        requested_head_sha=requested_head_sha,
+        trigger_action=trigger_action,
+        marks_ready=marks_ready,
+        installation_id=installation_id,
+        github_repo_id=github_repo_id,
+    )
+
+    client = sync_connect()
+    logger.info(
+        f"Starting ReviewPRWorkflow {workflow_id} on {settings.VIDEO_EXPORT_TASK_QUEUE} "
+        f"(publish={publish}, review_mode={review_mode})"
+    )
+    # async_to_sync erases start_workflow's overloads, so mypy binds the wrong one.
+    start_workflow = cast(Callable[..., Any], async_to_sync(client.start_workflow))
+    start_workflow(
+        "review-pr-queue",
+        ReviewPRQueueInputs(requests=[inputs]),
+        id=workflow_id,
+        task_queue=settings.VIDEO_EXPORT_TASK_QUEUE,
+        id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        start_signal="request_review",
+        start_signal_args=[inputs],
+    )
+    return workflow_id
+
+
+def _build_resolution_inputs(
+    *,
+    pr_url: str,
+    team_id: int,
+    user_id: int,
+    acting_user_id: int | None,
+    trigger_source: str,
+) -> tuple[ResolvePRWorkflowInputs, str]:
+    """Parse the PR target, check the team, and build the resolution inputs + deterministic id."""
+    Team.objects.get(id=team_id)  # fail fast if the team doesn't exist
+    pr_info = PRParser().parse_github_pr_url(pr_url)
+    owner, repo, pr_number = str(pr_info["owner"]), str(pr_info["repo"]), int(pr_info["pr_number"])
+    inputs = ResolvePRWorkflowInputs(
+        team_id=team_id,
+        user_id=user_id,
+        owner=owner,
+        repo=repo,
+        pr_number=pr_number,
+        pr_url=pr_url,
+        acting_user_id=acting_user_id,
+        trigger_source=trigger_source,
+    )
+    workflow_id = resolve_pr_workflow_id(team_id=team_id, owner=owner, repo=repo, pr_number=pr_number)
+    return inputs, workflow_id
+
+
+def execute_resolution_workflow(
+    *,
+    pr_url: str,
+    team_id: int,
+    user_id: int,
+    acting_user_id: int | None = None,
+    trigger_source: str = TRIGGER_MANUAL,
+) -> str | None:
+    """Start `ResolvePRWorkflow`, block until it completes, and return the `ReviewReport` id (if any).
+
+    The CLI entry (`run_resolution`), mirroring `execute_review_pr_workflow`. Unlike a review there
+    is no publish flag — the resolution stage's whole job is writing back (replies, resolves, and
+    commits to the PR branch), so triggering it IS the consent.
+    """
+    inputs, workflow_id = _build_resolution_inputs(
+        pr_url=pr_url, team_id=team_id, user_id=user_id, acting_user_id=acting_user_id, trigger_source=trigger_source
+    )
+    client = sync_connect()
+    logger.info(f"Running ResolvePRWorkflow {workflow_id} on {settings.VIDEO_EXPORT_TASK_QUEUE}")
+    return asyncio.run(
+        client.execute_workflow(
+            "resolve-pr",
+            inputs,
+            id=workflow_id,
+            task_queue=settings.VIDEO_EXPORT_TASK_QUEUE,
+            # One resolution run per PR at a time: a re-trigger while one is in flight joins it; a
+            # new run may start once the prior finished (per-thread watermarks make it incremental).
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+            retry_policy=_RESOLUTION_RETRY,
+        )
+    )
+
+
+def start_resolution_workflow(
+    *,
+    pr_url: str,
+    team_id: int,
+    user_id: int,
+    acting_user_id: int | None = None,
+    trigger_source: str = TRIGGER_MANUAL,
+) -> str:
+    """Start `ResolvePRWorkflow` without blocking and return the workflow id (the production triggers)."""
+    inputs, workflow_id = _build_resolution_inputs(
+        pr_url=pr_url, team_id=team_id, user_id=user_id, acting_user_id=acting_user_id, trigger_source=trigger_source
+    )
+    client = sync_connect()
+    logger.info(f"Starting ResolvePRWorkflow {workflow_id} on {settings.VIDEO_EXPORT_TASK_QUEUE}")
+    start_workflow = cast(Callable[..., Any], async_to_sync(client.start_workflow))
+    start_workflow(
+        "resolve-pr",
+        inputs,
+        id=workflow_id,
+        task_queue=settings.VIDEO_EXPORT_TASK_QUEUE,
+        id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        retry_policy=_RESOLUTION_RETRY,
+    )
+    return workflow_id

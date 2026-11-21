@@ -1,0 +1,2241 @@
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * MCP service uses these Zod schemas for generated tool handlers.
+ * To regenerate: hogli build:openapi
+ *
+ * PostHog API - MCP 9 enabled ops
+ * OpenAPI spec version: 1.0.0
+ */
+import * as zod from 'zod'
+
+export const BatchExportsListParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const batchExportsListQueryLimitMax = 1000
+
+export const BatchExportsListQueryParams = () => zod.object({
+    limit: zod.number().max(batchExportsListQueryLimitMax).optional().describe('Number of results to return per page.'),
+    offset: zod.number().optional().describe('The initial index from which to return the results.'),
+})
+
+export const BatchExportsCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const batchExportsCreateBodyDestinationOneOneConfigUseVariantTypeDefault = true
+export const batchExportsCreateBodyDestinationOneOneConfigUseAutomaticSchemaEvolutionDefault = true
+export const batchExportsCreateBodyDestinationOneTwoConfigPrefixDefault = ``
+export const batchExportsCreateBodyDestinationOneTwoConfigFileFormatDefault = `JSONLines`
+export const batchExportsCreateBodyDestinationOneThreeConfigTableIdDefault = `events`
+export const batchExportsCreateBodyDestinationOneThreeConfigUseJsonTypeDefault = false
+export const batchExportsCreateBodyDestinationOneFourConfigSchemaDefault = `public`
+export const batchExportsCreateBodyDestinationOneFourConfigTableNameDefault = `events`
+export const batchExportsCreateBodyDestinationOneFourConfigHasSelfSignedCertDefault = false
+export const batchExportsCreateBodyDestinationOneFiveConfigFileFormatDefault = `JSONLines`
+export const batchExportsCreateBodyDestinationOneSixConfigFileFormatDefault = `JSONLines`
+export const batchExportsCreateBodyDestinationOneSixConfigUseVirtualStyleAddressingDefault = false
+export const batchExportsCreateBodyDestinationOneSevenConfigTableNameDefault = `events`
+export const batchExportsCreateBodyDestinationOneEightConfigSchemaDefault = `public`
+export const batchExportsCreateBodyDestinationOneEightConfigTableNameDefault = `events`
+export const batchExportsCreateBodyDestinationOneEightConfigPortDefault = 5439
+export const batchExportsCreateBodyDestinationOneEightConfigPropertiesDataTypeDefault = `varchar`
+export const batchExportsCreateBodyDestinationOneEightConfigModeDefault = `INSERT`
+export const batchExportsCreateBodyOffsetDayMin = 0
+export const batchExportsCreateBodyOffsetDayMax = 6
+
+export const batchExportsCreateBodyOffsetHourMin = 0
+export const batchExportsCreateBodyOffsetHourMax = 23
+
+export const BatchExportsCreateBody = () => zod
+    .object({
+        name: zod.string().describe('Human-readable name for the batch export.'),
+        model: zod
+            .enum(['events', 'persons', 'sessions', 'hogql'])
+            .describe('\* `events` - Events\n\* `persons` - Persons\n\* `sessions` - Sessions\n\* `hogql` - Hogql')
+            .optional()
+            .describe(
+                'Which data model to export: events, persons, sessions, or hogql. The hogql model exports the results of hogql_query.\n\n\* `events` - Events\n\* `persons` - Persons\n\* `sessions` - Sessions\n\* `hogql` - Hogql'
+            ),
+        destination: zod
+            .union([
+                zod
+                    .object({
+                        type: zod.enum(['Databricks']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of a databricks-kind Integration. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                http_path: zod.string().describe('Databricks SQL warehouse HTTP path.'),
+                                catalog: zod.string().describe('Unity Catalog name.'),
+                                schema: zod.string().describe('Schema (database) name inside the catalog.'),
+                                table_name: zod.string().describe('Destination table name.'),
+                                use_variant_type: zod
+                                    .boolean()
+                                    .default(batchExportsCreateBodyDestinationOneOneConfigUseVariantTypeDefault)
+                                    .describe('Whether to use the Databricks VARIANT type for JSON-like columns.'),
+                                use_automatic_schema_evolution: zod
+                                    .boolean()
+                                    .default(
+                                        batchExportsCreateBodyDestinationOneOneConfigUseAutomaticSchemaEvolutionDefault
+                                    )
+                                    .describe(
+                                        'Whether to let Databricks evolve the destination table schema automatically.'
+                                    ),
+                            })
+                            .describe(
+                                'Typed configuration for a Databricks batch-export destination.\n\nCredentials live in the linked Integration, not in this config. Mirrors\n`DatabricksBatchExportInputs` in `products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a Databricks batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['AzureBlob']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of an azure-blob-kind Integration. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                container_name: zod.string().describe('Azure Blob Storage container name.'),
+                                prefix: zod
+                                    .string()
+                                    .default(batchExportsCreateBodyDestinationOneTwoConfigPrefixDefault)
+                                    .describe('Object key prefix applied to every exported file.'),
+                                compression: zod
+                                    .union([
+                                        zod
+                                            .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                            .describe(
+                                                '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                            ),
+                                        zod.null(),
+                                    ])
+                                    .optional()
+                                    .describe(
+                                        'Optional compression codec applied to exported files. Valid codecs depend on file_format.\n\n\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                    ),
+                                file_format: zod
+                                    .enum(['Parquet', 'JSONLines'])
+                                    .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                                    .default(batchExportsCreateBodyDestinationOneTwoConfigFileFormatDefault)
+                                    .describe(
+                                        'File format used for exported objects.\n\n\* `JSONLines` - JSONLines\n\* `Parquet` - Parquet'
+                                    ),
+                                max_file_size_mb: zod
+                                    .number()
+                                    .nullish()
+                                    .describe(
+                                        'If set, rolls to a new file once the current file exceeds this size in MB.'
+                                    ),
+                                legacy_parquet_extension: zod
+                                    .boolean()
+                                    .optional()
+                                    .describe(
+                                        "Whether Parquet files keep the compression codec in their extension, for example '.parquet.zst' rather than '.parquet'. Parquet records its codec inside the file, so new exports leave it out. An export that already wrote Parquet files before this setting existed keeps it, so that pipelines matching on the old names do not break. Has no effect on JSON Lines, which always carries the codec in its extension."
+                                    ),
+                            })
+                            .describe(
+                                'Typed configuration for an Azure Blob Storage batch-export destination.\n\nCredentials live in the linked Integration, not in this config. Mirrors\n`AzureBlobBatchExportInputs` in `products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating an Azure Blob Storage batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['BigQuery']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of a google-cloud-service-account-kind Integration. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                dataset_id: zod.string().describe('BigQuery dataset ID to write to.'),
+                                table_id: zod
+                                    .string()
+                                    .default(batchExportsCreateBodyDestinationOneThreeConfigTableIdDefault)
+                                    .describe('BigQuery table ID inside the dataset.'),
+                                use_json_type: zod
+                                    .boolean()
+                                    .default(batchExportsCreateBodyDestinationOneThreeConfigUseJsonTypeDefault)
+                                    .describe(
+                                        "Whether to export 'properties', 'set', and 'set_once' fields as the BigQuery JSON type rather than STRING. Cannot be changed after the export is created."
+                                    ),
+                            })
+                            .describe(
+                                'Typed configuration for a BigQuery batch-export destination.\n\nCredentials live in the linked Integration, not in this config. Mirrors the\nnon-credential fields of `BigQueryBatchExportInputs` in\n`products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a BigQuery batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['Postgres']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of a postgresql-kind Integration providing connection credentials. Required when creating a batch export. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                database: zod.string().describe('PostgreSQL database name to connect to.'),
+                                schema: zod
+                                    .string()
+                                    .default(batchExportsCreateBodyDestinationOneFourConfigSchemaDefault)
+                                    .describe('PostgreSQL schema name containing the destination table.'),
+                                table_name: zod
+                                    .string()
+                                    .default(batchExportsCreateBodyDestinationOneFourConfigTableNameDefault)
+                                    .describe('PostgreSQL table name to write exported rows into.'),
+                                has_self_signed_cert: zod
+                                    .boolean()
+                                    .default(batchExportsCreateBodyDestinationOneFourConfigHasSelfSignedCertDefault)
+                                    .describe(
+                                        'Legacy SSL option for direct credential configuration. Ignored when using a PostgreSQL integration.'
+                                    ),
+                            })
+                            .describe(
+                                'Typed configuration for a PostgreSQL batch-export destination.\n\nConnection credentials live in the linked Integration, never here. Mirrors the\nnon-credential fields of `PostgresBatchExportInputs` in `products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a PostgreSQL batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['AwsS3']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of an aws-s3-kind Integration providing AWS credentials. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                bucket_name: zod.string().describe('Name of the destination bucket.'),
+                                region: zod.string().describe("Region the bucket is in (e.g. 'us-east-1')."),
+                                prefix: zod.string().describe('Object key prefix applied to every exported file.'),
+                                compression: zod
+                                    .union([
+                                        zod
+                                            .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                            .describe(
+                                                '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                            ),
+                                        zod.null(),
+                                    ])
+                                    .optional()
+                                    .describe(
+                                        'Optional compression codec applied to exported files. Valid codecs depend on file_format.\n\n\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                    ),
+                                file_format: zod
+                                    .enum(['Parquet', 'JSONLines'])
+                                    .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                                    .default(batchExportsCreateBodyDestinationOneFiveConfigFileFormatDefault)
+                                    .describe(
+                                        'File format used for exported objects.\n\n\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines'
+                                    ),
+                                max_file_size_mb: zod
+                                    .number()
+                                    .nullish()
+                                    .describe(
+                                        'If set, rolls to a new file once the current file exceeds this size in MB.'
+                                    ),
+                                legacy_parquet_extension: zod
+                                    .boolean()
+                                    .optional()
+                                    .describe(
+                                        "Whether Parquet files keep the compression codec in their extension, for example '.parquet.zst' rather than '.parquet'. Parquet records its codec inside the file, so new exports leave it out. An export that already wrote Parquet files before this setting existed keeps it, so that pipelines matching on the old names do not break. Has no effect on JSON Lines, which always carries the codec in its extension."
+                                    ),
+                                encryption: zod
+                                    .string()
+                                    .nullish()
+                                    .describe(
+                                        "Optional S3 server-side encryption algorithm (e.g. 'AES256' or 'aws:kms')."
+                                    ),
+                                kms_key_id: zod
+                                    .string()
+                                    .nullish()
+                                    .describe("KMS key ID to use when encryption is 'aws:kms'."),
+                            })
+                            .describe(
+                                'Typed configuration for an AWS S3 batch-export destination.\n\nAWS credentials live in the linked aws-s3 Integration. Mirrors the non-credential fields of\n`AwsS3BatchExportInputs` in `products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating an AWS S3 batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['S3Compatible']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of an s3-compatible-kind Integration providing credentials and the provider endpoint URL. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                bucket_name: zod.string().describe('Name of the destination bucket.'),
+                                region: zod.string().describe("Region the bucket is in (e.g. 'us-east-1')."),
+                                prefix: zod.string().describe('Object key prefix applied to every exported file.'),
+                                compression: zod
+                                    .union([
+                                        zod
+                                            .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                            .describe(
+                                                '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                            ),
+                                        zod.null(),
+                                    ])
+                                    .optional()
+                                    .describe(
+                                        'Optional compression codec applied to exported files. Valid codecs depend on file_format.\n\n\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                    ),
+                                file_format: zod
+                                    .enum(['Parquet', 'JSONLines'])
+                                    .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                                    .default(batchExportsCreateBodyDestinationOneSixConfigFileFormatDefault)
+                                    .describe(
+                                        'File format used for exported objects.\n\n\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines'
+                                    ),
+                                max_file_size_mb: zod
+                                    .number()
+                                    .nullish()
+                                    .describe(
+                                        'If set, rolls to a new file once the current file exceeds this size in MB.'
+                                    ),
+                                legacy_parquet_extension: zod
+                                    .boolean()
+                                    .optional()
+                                    .describe(
+                                        "Whether Parquet files keep the compression codec in their extension, for example '.parquet.zst' rather than '.parquet'. Parquet records its codec inside the file, so new exports leave it out. An export that already wrote Parquet files before this setting existed keeps it, so that pipelines matching on the old names do not break. Has no effect on JSON Lines, which always carries the codec in its extension."
+                                    ),
+                                use_virtual_style_addressing: zod
+                                    .boolean()
+                                    .default(
+                                        batchExportsCreateBodyDestinationOneSixConfigUseVirtualStyleAddressingDefault
+                                    )
+                                    .describe('Use virtual-hosted-style addressing rather than path-style.'),
+                            })
+                            .describe(
+                                'Typed configuration for an S3-compatible batch-export destination (Cloudflare R2,\nDigitalOcean Spaces, etc.).\n\nCredentials and the provider `endpoint_url` live in the linked s3-compatible Integration.\nMirrors the non-credential fields of `S3CompatibleBatchExportInputs` in\n`products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating an S3-compatible batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['Snowflake']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of a snowflake-kind Integration providing the account, user and credentials. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                database: zod.string().describe('Snowflake database to write to.'),
+                                warehouse: zod.string().describe('Snowflake compute warehouse to use.'),
+                                schema: zod
+                                    .string()
+                                    .describe('Schema inside the database containing the destination table.'),
+                                table_name: zod
+                                    .string()
+                                    .default(batchExportsCreateBodyDestinationOneSevenConfigTableNameDefault)
+                                    .describe('Destination table name.'),
+                                role: zod
+                                    .string()
+                                    .nullish()
+                                    .describe('Optional Snowflake role to assume for the session.'),
+                            })
+                            .describe(
+                                'Typed configuration for a Snowflake batch-export destination.\n\nAccount, user, authentication type and credentials live in the linked Integration, never here.\nMirrors the non-credential fields of `SnowflakeBatchExportInputs` in\n`products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a Snowflake batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['Redshift']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of an aws-redshift-kind Integration providing connection credentials. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                database: zod.string().describe('Redshift database name to connect to.'),
+                                host: zod
+                                    .string()
+                                    .optional()
+                                    .describe(
+                                        'Redshift cluster or Serverless workgroup endpoint. Required when using an AWS Redshift integration; plain Redshift integrations store the host themselves.'
+                                    ),
+                                schema: zod
+                                    .string()
+                                    .default(batchExportsCreateBodyDestinationOneEightConfigSchemaDefault)
+                                    .describe('Redshift schema name containing the destination table.'),
+                                table_name: zod
+                                    .string()
+                                    .default(batchExportsCreateBodyDestinationOneEightConfigTableNameDefault)
+                                    .describe('Redshift table name to write exported rows into.'),
+                                port: zod
+                                    .number()
+                                    .default(batchExportsCreateBodyDestinationOneEightConfigPortDefault)
+                                    .describe('Port the Redshift server listens on.'),
+                                properties_data_type: zod
+                                    .enum(['varchar', 'super'])
+                                    .describe('\* `varchar` - varchar\n\* `super` - super')
+                                    .default(batchExportsCreateBodyDestinationOneEightConfigPropertiesDataTypeDefault)
+                                    .describe(
+                                        'Data type used for JSON-like columns such as event properties.\n\n\* `varchar` - varchar\n\* `super` - super'
+                                    ),
+                                mode: zod
+                                    .enum(['INSERT', 'COPY'])
+                                    .describe('\* `INSERT` - INSERT\n\* `COPY` - COPY')
+                                    .default(batchExportsCreateBodyDestinationOneEightConfigModeDefault)
+                                    .describe(
+                                        'How rows reach Redshift: batched INSERT statements, or COPY from files staged in S3.\n\n\* `INSERT` - INSERT\n\* `COPY` - COPY'
+                                    ),
+                                copy_inputs: zod
+                                    .object({
+                                        s3_bucket: zod
+                                            .string()
+                                            .describe('S3 bucket where files are staged before the Redshift COPY.'),
+                                        region_name: zod.string().describe('AWS region of the staging S3 bucket.'),
+                                        s3_key_prefix: zod
+                                            .string()
+                                            .describe('Key prefix for staged files in the S3 bucket.'),
+                                        authorization: zod
+                                            .union([
+                                                zod.number().describe('ID of an aws-s3-kind Integration.'),
+                                                zod
+                                                    .string()
+                                                    .describe('ARN of an IAM role attached to the Redshift cluster.'),
+                                            ])
+                                            .describe(
+                                                'Authorization for Redshift to read staged files during COPY: an IAM role ARN or an AWS S3 integration ID.'
+                                            ),
+                                        bucket_credentials: zod
+                                            .number()
+                                            .describe('AWS S3 integration ID used to stage files in the S3 bucket.'),
+                                    })
+                                    .describe(
+                                        'S3 staging configuration for a Redshift batch export running in COPY mode.'
+                                    )
+                                    .optional()
+                                    .describe("S3 staging configuration, required when mode is 'COPY'."),
+                            })
+                            .describe(
+                                'Typed configuration for a Redshift batch-export destination.\n\nConnection credentials live in the linked Integration, never here. Mirrors the non-credential fields of `RedshiftBatchExportInputs` in\n`products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a Redshift batch-export destination.'),
+            ])
+            .describe('Destination configuration. Required integration_id is enforced per destination type.'),
+        interval: zod
+            .enum(['hour', 'day', 'week', 'every 5 minutes', 'every 15 minutes'])
+            .describe(
+                '\* `hour` - hour\n\* `day` - day\n\* `week` - week\n\* `every 5 minutes` - every 5 minutes\n\* `every 15 minutes` - every 15 minutes'
+            )
+            .describe(
+                'How often the batch export should run.\n\n\* `hour` - hour\n\* `day` - day\n\* `week` - week\n\* `every 5 minutes` - every 5 minutes\n\* `every 15 minutes` - every 15 minutes'
+            ),
+        paused: zod.boolean().optional().describe('Whether the batch export is paused.'),
+        hogql_query: zod
+            .string()
+            .nullish()
+            .describe(
+                "HogQL SELECT query. With model 'hogql', its results are the data exported by every run. The query may reference the {data_interval_start} and {data_interval_end} placeholders, replaced with each run's data interval bounds, for example: WHERE timestamp >= {data_interval_start} AND timestamp < {data_interval_end}. Without them every run exports all rows the query returns. Required when model is 'hogql'."
+            ),
+        hogql_modifiers: zod
+            .union([
+                zod.object({
+                    bounceRateDurationSeconds: zod.union([zod.number(), zod.null()]).optional(),
+                    bounceRatePageViewMode: zod
+                        .union([
+                            zod.enum(['count_pageviews', 'uniq_urls', 'uniq_page_screen_autocaptures']),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    convertToProjectTimezone: zod.union([zod.boolean(), zod.null()]).optional(),
+                    cookielessTrafficIsRegular: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Do not treat a missing user agent as automation on cookieless events. Positive bot signals and custom project rules still apply. Resolved server-side; not intended to be set by clients.'
+                        ),
+                    customBotDefinitions: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    category: zod
+                                        .union([zod.string(), zod.null()])
+                                        .optional()
+                                        .describe('Reported by `$virt_traffic_category`. Defaults to `custom`.'),
+                                    combiner: zod
+                                        .enum(['AND', 'OR'])
+                                        .describe('Whether every condition must match (AND) or any one of them (OR).'),
+                                    id: zod.string(),
+                                    items: zod.array(
+                                        zod.object({
+                                            id: zod.string(),
+                                            key: zod
+                                                .enum([
+                                                    '$raw_user_agent',
+                                                    '$ip',
+                                                    '$lib',
+                                                    '$host',
+                                                    '$pathname',
+                                                    '$current_url',
+                                                    '$browser',
+                                                    '$os',
+                                                    '$browser_language',
+                                                    '$screen_width',
+                                                    '$screen_height',
+                                                    '$geoip_country_code',
+                                                    '$referrer',
+                                                    '$referring_domain',
+                                                ])
+                                                .describe('The event property this condition reads.'),
+                                            matcher: zod.enum(['contains', 'regex', 'exact', 'cidr']),
+                                            pattern: zod
+                                                .string()
+                                                .describe('Matched against the property named by `key`.'),
+                                        })
+                                    ),
+                                    name: zod
+                                        .string()
+                                        .describe(
+                                            'Reported by `$virt_bot_name` and `$virt_bot_operator` when the rule matches.'
+                                        ),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    customChannelTypeRules: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    channel_type: zod.string(),
+                                    combiner: zod.enum(['AND', 'OR']),
+                                    id: zod.string(),
+                                    items: zod.array(
+                                        zod.object({
+                                            id: zod.string(),
+                                            key: zod.enum([
+                                                'utm_source',
+                                                'utm_medium',
+                                                'utm_campaign',
+                                                'referring_domain',
+                                                'url',
+                                                'pathname',
+                                                'hostname',
+                                            ]),
+                                            op: zod.enum([
+                                                'exact',
+                                                'is_not',
+                                                'is_set',
+                                                'is_not_set',
+                                                'icontains',
+                                                'not_icontains',
+                                                'regex',
+                                                'not_regex',
+                                            ]),
+                                            value: zod
+                                                .union([zod.string(), zod.array(zod.string()), zod.null()])
+                                                .optional(),
+                                        })
+                                    ),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    dataWarehouseEventsModifiers: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    distinct_id_field: zod.string(),
+                                    id_field: zod.string(),
+                                    table_name: zod.string(),
+                                    timestamp_field: zod.string(),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    debug: zod.union([zod.boolean(), zod.null()]).optional(),
+                    forceClickhouseDataSkippingIndexes: zod
+                        .union([zod.array(zod.string()), zod.null()])
+                        .optional()
+                        .describe('If these are provided, the query will fail if these skip indexes are not used'),
+                    formatCsvAllowDoubleQuotes: zod.union([zod.boolean(), zod.null()]).optional(),
+                    inCohortVia: zod
+                        .union([zod.enum(['auto', 'leftjoin', 'subquery', 'leftjoin_conjoined']), zod.null()])
+                        .optional(),
+                    inlineCohortCalculation: zod.union([zod.enum(['off', 'auto', 'always']), zod.null()]).optional(),
+                    materializationMode: zod
+                        .union([
+                            zod.enum(['auto', 'legacy_null_as_string', 'legacy_null_as_null', 'disabled']),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    materializeRepeatedCTEs: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Reuse eligible bounded event aggregates within one query execution. When unset, the server may enable it via the cloud feature flag.'
+                        ),
+                    materializedColumnsOptimizationMode: zod
+                        .union([zod.enum(['disabled', 'optimized']), zod.null()])
+                        .optional(),
+                    mergeFederatedAggregateJoins: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Merge sibling aggregating LEFT JOINs over federated Postgres tables into one UNION ALL join, so their scans overlap'
+                        ),
+                    negatedPersonFiltersNotIn: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Replace negated person-property filters in the WHERE of an `events` query (such as `email not_icontains`) with `person_id NOT IN (SELECT id FROM persons WHERE <the filters fail>)`, so the query no longer joins every person. Applies only when every filtered person property has a materialized column, nothing else in the query reads that persons join, and the join would be a LEFT JOIN.'
+                        ),
+                    optimizeJoinedFilters: zod.union([zod.boolean(), zod.null()]).optional(),
+                    optimizeProjections: zod.union([zod.boolean(), zod.null()]).optional(),
+                    parserMode: zod
+                        .union([
+                            zod.enum([
+                                'cpp_only',
+                                'cpp_with_rust_shadow',
+                                'cpp_with_rust_py_shadow',
+                                'rust_with_cpp_shadow',
+                                'rust_only',
+                                'rust_py_only',
+                                'rust_py_with_cpp_shadow',
+                            ]),
+                            zod.null(),
+                        ])
+                        .optional()
+                        .describe(
+                            'HogQL parser backend; absent → `rust_py_with_cpp_shadow` (rust-py is primary, cpp runs as a sampled shadow). `\*_shadow` modes return the primary result and sample-compare against the other parser, reporting divergences without failing the request. The `rust_py_\*` modes drive the same hand-rolled Rust parser as `rust_\*` but build `posthog.hogql.ast` dataclass instances directly via PyO3, skipping the JSON round-trip.'
+                        ),
+                    personIdPushdown: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Push an `id IN (SELECT person_id FROM <left table> WHERE …)` predicate into the joined persons subquery, so the latest-version lookup only reads persons that the outer query's left-table filters can reach. Applies only to a persons join from the query's own FROM table. Unset, it applies to a persons join from `posthog.flag_evaluations` or from the union of events and flag_evaluations, and to no other join."
+                        ),
+                    personsArgMaxVersion: zod.union([zod.enum(['auto', 'v1', 'v2']), zod.null()]).optional(),
+                    personsJoinMode: zod.union([zod.enum(['inner', 'left']), zod.null()]).optional(),
+                    personsOnEventsMode: zod
+                        .union([
+                            zod.enum([
+                                'disabled',
+                                'person_id_no_override_properties_on_events',
+                                'person_id_override_properties_on_events',
+                                'person_id_override_properties_joined',
+                            ]),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    propertyGroupsMode: zod
+                        .union([zod.enum(['enabled', 'disabled', 'optimized']), zod.null()])
+                        .optional(),
+                    pushDownPredicates: zod.union([zod.boolean(), zod.null()]).optional(),
+                    s3TableUseInvalidColumns: zod.union([zod.boolean(), zod.null()]).optional(),
+                    sessionIdPushdown: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Push a `session_id_v7 IN (SELECT … FROM events WHERE …)` predicate into the raw_sessions subquery to limit aggregation to sessions that participate in the outer events filter.'
+                        ),
+                    sessionPropertyPreAggregation: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Pre-filter raw_sessions aggregation by `session_id_v7 IN (cheap pre-aggregation that only materializes the columns referenced by the outer-WHERE session predicate)`. Useful when the breakdown\/SELECT pulls in many session columns (e.g. `$channel_type`) but the filter only references one (e.g. `$entry_current_url`).'
+                        ),
+                    sessionTableVersion: zod.union([zod.enum(['auto', 'v1', 'v2', 'v3']), zod.null()]).optional(),
+                    sessionTimestampBufferMinutes: zod
+                        .union([zod.number(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Padding, in minutes, on each side of the event time range when it filters the sessions table by session start. Defaults to 3 days. It can only narrow the range: values above the default are ignored. Lower it only for a query that keeps just the sessions that start inside its own time range.'
+                        ),
+                    sessionsV2JoinMode: zod.union([zod.enum(['string', 'uuid']), zod.null()]).optional(),
+                    timings: zod.union([zod.boolean(), zod.null()]).optional(),
+                    typeAwareCastSimplification: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Remove provably redundant casts and nullability wrappers (e.g. `toString(String)`, `assumeNotNull(non_nullable)`, dead `ifNull` fallbacks) using inferred expression types'
+                        ),
+                    useMaterializedViews: zod.union([zod.boolean(), zod.null()]).optional(),
+                    useNewEventsSchema: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Read events from the native JSON events table (`true`) or the legacy events table (`false`). When unset, a staff person's tab switch or `ph_new_events_schema` cookie applies, then the project. A project reads the native table once PostHog has moved it there. Before that, it can opt in early by storing `true` here in its project settings. A stored `false` is ignored."
+                        ),
+                    usePreaggregatedIntermediateResults: zod.union([zod.boolean(), zod.null()]).optional(),
+                    usePreaggregatedTableTransforms: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Try to automatically convert HogQL queries to use preaggregated tables at the AST level \*'
+                        ),
+                    useWebAnalyticsPreAggregatedTables: zod.union([zod.boolean(), zod.null()]).optional(),
+                    webAnalyticsFirstPageviewFilters: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Serve filters on the stored session-entry attribution properties (`$channel_type`, `$entry_utm_\*`, `$entry_referring_domain`) by recomputing the value from the session's first pageview. Resolved server-side; not intended to be set by clients."
+                        ),
+                }),
+                zod.null(),
+            ])
+            .optional()
+            .describe(
+                "HogQL modifiers to use when the query runs, as an object keyed by modifier name, for example {\"convertToProjectTimezone\": true}. Only supported when 'model' is 'hogql'. Each modifier set here overrides the project modifier with the same name, and the project modifiers apply to all others. If neither sets convertToProjectTimezone, it defaults to false, so timestamps are exported in UTC. Set it to true to export timestamps in the project timezone instead. Unknown modifier names are rejected. On update, the object replaces the modifiers stored on the export, so include every modifier to keep, or send null to remove them all."
+            ),
+        primary_key: zod
+            .array(zod.string())
+            .nullish()
+            .describe(
+                "The column or columns in the provided HogQL query that make up the primary key for a HogQL-backed batch export. Required if incremental mode is 'MERGE'"
+            ),
+        version_key: zod
+            .array(zod.string())
+            .nullish()
+            .describe(
+                'The column or columns in the provided HogQL query that make up the version key for a HogQL-backed batch export.'
+            ),
+        incremental_mode: zod
+            .enum(['APPEND', 'MERGE'])
+            .describe('\* `APPEND` - Append\n\* `MERGE` - Merge')
+            .optional()
+            .describe('How this batch export handles incremental updates.\n\n\* `APPEND` - Append\n\* `MERGE` - Merge'),
+        timezone: zod
+            .string()
+            .nullish()
+            .describe(
+                "IANA timezone name (e.g. 'America\/New_York', 'Europe\/London', 'UTC') controlling daily and weekly interval boundaries."
+            ),
+        offset_day: zod
+            .number()
+            .min(batchExportsCreateBodyOffsetDayMin)
+            .max(batchExportsCreateBodyOffsetDayMax)
+            .nullish()
+            .describe('Day-of-week offset for weekly intervals (0=Sunday, 6=Saturday).'),
+        offset_hour: zod
+            .number()
+            .min(batchExportsCreateBodyOffsetHourMin)
+            .max(batchExportsCreateBodyOffsetHourMax)
+            .nullish()
+            .describe('Hour-of-day offset (0-23) for daily and weekly intervals.'),
+    })
+    .describe(
+        'Request body for create\/partial_update on BatchExportViewSet.\n\nMirrors the writeable fields of `BatchExportSerializer` but uses a polymorphic\n`destination` schema so integration_id is marked required on the types that need\nit. Responses continue to use `BatchExportSerializer`.'
+    )
+
+export const BatchExportsRetrieveParams = () => zod.object({
+    id: zod.string().describe('A UUID string identifying this batch export.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const BatchExportsPartialUpdateParams = () => zod.object({
+    id: zod.string().describe('A UUID string identifying this batch export.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const batchExportsPartialUpdateBodyDestinationOneOneConfigUseVariantTypeDefault = true
+export const batchExportsPartialUpdateBodyDestinationOneOneConfigUseAutomaticSchemaEvolutionDefault = true
+export const batchExportsPartialUpdateBodyDestinationOneTwoConfigPrefixDefault = ``
+export const batchExportsPartialUpdateBodyDestinationOneTwoConfigFileFormatDefault = `JSONLines`
+export const batchExportsPartialUpdateBodyDestinationOneThreeConfigTableIdDefault = `events`
+export const batchExportsPartialUpdateBodyDestinationOneThreeConfigUseJsonTypeDefault = false
+export const batchExportsPartialUpdateBodyDestinationOneFourConfigSchemaDefault = `public`
+export const batchExportsPartialUpdateBodyDestinationOneFourConfigTableNameDefault = `events`
+export const batchExportsPartialUpdateBodyDestinationOneFourConfigHasSelfSignedCertDefault = false
+export const batchExportsPartialUpdateBodyDestinationOneFiveConfigFileFormatDefault = `JSONLines`
+export const batchExportsPartialUpdateBodyDestinationOneSixConfigFileFormatDefault = `JSONLines`
+export const batchExportsPartialUpdateBodyDestinationOneSixConfigUseVirtualStyleAddressingDefault = false
+export const batchExportsPartialUpdateBodyDestinationOneSevenConfigTableNameDefault = `events`
+export const batchExportsPartialUpdateBodyDestinationOneEightConfigSchemaDefault = `public`
+export const batchExportsPartialUpdateBodyDestinationOneEightConfigTableNameDefault = `events`
+export const batchExportsPartialUpdateBodyDestinationOneEightConfigPortDefault = 5439
+export const batchExportsPartialUpdateBodyDestinationOneEightConfigPropertiesDataTypeDefault = `varchar`
+export const batchExportsPartialUpdateBodyDestinationOneEightConfigModeDefault = `INSERT`
+export const batchExportsPartialUpdateBodyOffsetDayMin = 0
+export const batchExportsPartialUpdateBodyOffsetDayMax = 6
+
+export const batchExportsPartialUpdateBodyOffsetHourMin = 0
+export const batchExportsPartialUpdateBodyOffsetHourMax = 23
+
+export const BatchExportsPartialUpdateBody = () => zod
+    .object({
+        name: zod.string().optional().describe('Human-readable name for the batch export.'),
+        model: zod
+            .enum(['events', 'persons', 'sessions', 'hogql'])
+            .describe('\* `events` - Events\n\* `persons` - Persons\n\* `sessions` - Sessions\n\* `hogql` - Hogql')
+            .optional()
+            .describe(
+                'Which data model to export: events, persons, sessions, or hogql. The hogql model exports the results of hogql_query.\n\n\* `events` - Events\n\* `persons` - Persons\n\* `sessions` - Sessions\n\* `hogql` - Hogql'
+            ),
+        destination: zod
+            .union([
+                zod
+                    .object({
+                        type: zod.enum(['Databricks']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of a databricks-kind Integration. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                http_path: zod.string().describe('Databricks SQL warehouse HTTP path.'),
+                                catalog: zod.string().describe('Unity Catalog name.'),
+                                schema: zod.string().describe('Schema (database) name inside the catalog.'),
+                                table_name: zod.string().describe('Destination table name.'),
+                                use_variant_type: zod
+                                    .boolean()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneOneConfigUseVariantTypeDefault)
+                                    .describe('Whether to use the Databricks VARIANT type for JSON-like columns.'),
+                                use_automatic_schema_evolution: zod
+                                    .boolean()
+                                    .default(
+                                        batchExportsPartialUpdateBodyDestinationOneOneConfigUseAutomaticSchemaEvolutionDefault
+                                    )
+                                    .describe(
+                                        'Whether to let Databricks evolve the destination table schema automatically.'
+                                    ),
+                            })
+                            .describe(
+                                'Typed configuration for a Databricks batch-export destination.\n\nCredentials live in the linked Integration, not in this config. Mirrors\n`DatabricksBatchExportInputs` in `products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a Databricks batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['AzureBlob']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of an azure-blob-kind Integration. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                container_name: zod.string().describe('Azure Blob Storage container name.'),
+                                prefix: zod
+                                    .string()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneTwoConfigPrefixDefault)
+                                    .describe('Object key prefix applied to every exported file.'),
+                                compression: zod
+                                    .union([
+                                        zod
+                                            .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                            .describe(
+                                                '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                            ),
+                                        zod.null(),
+                                    ])
+                                    .optional()
+                                    .describe(
+                                        'Optional compression codec applied to exported files. Valid codecs depend on file_format.\n\n\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                    ),
+                                file_format: zod
+                                    .enum(['Parquet', 'JSONLines'])
+                                    .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                                    .default(batchExportsPartialUpdateBodyDestinationOneTwoConfigFileFormatDefault)
+                                    .describe(
+                                        'File format used for exported objects.\n\n\* `JSONLines` - JSONLines\n\* `Parquet` - Parquet'
+                                    ),
+                                max_file_size_mb: zod
+                                    .number()
+                                    .nullish()
+                                    .describe(
+                                        'If set, rolls to a new file once the current file exceeds this size in MB.'
+                                    ),
+                                legacy_parquet_extension: zod
+                                    .boolean()
+                                    .optional()
+                                    .describe(
+                                        "Whether Parquet files keep the compression codec in their extension, for example '.parquet.zst' rather than '.parquet'. Parquet records its codec inside the file, so new exports leave it out. An export that already wrote Parquet files before this setting existed keeps it, so that pipelines matching on the old names do not break. Has no effect on JSON Lines, which always carries the codec in its extension."
+                                    ),
+                            })
+                            .describe(
+                                'Typed configuration for an Azure Blob Storage batch-export destination.\n\nCredentials live in the linked Integration, not in this config. Mirrors\n`AzureBlobBatchExportInputs` in `products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating an Azure Blob Storage batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['BigQuery']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of a google-cloud-service-account-kind Integration. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                dataset_id: zod.string().describe('BigQuery dataset ID to write to.'),
+                                table_id: zod
+                                    .string()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneThreeConfigTableIdDefault)
+                                    .describe('BigQuery table ID inside the dataset.'),
+                                use_json_type: zod
+                                    .boolean()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneThreeConfigUseJsonTypeDefault)
+                                    .describe(
+                                        "Whether to export 'properties', 'set', and 'set_once' fields as the BigQuery JSON type rather than STRING. Cannot be changed after the export is created."
+                                    ),
+                            })
+                            .describe(
+                                'Typed configuration for a BigQuery batch-export destination.\n\nCredentials live in the linked Integration, not in this config. Mirrors the\nnon-credential fields of `BigQueryBatchExportInputs` in\n`products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a BigQuery batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['Postgres']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of a postgresql-kind Integration providing connection credentials. Required when creating a batch export. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                database: zod.string().describe('PostgreSQL database name to connect to.'),
+                                schema: zod
+                                    .string()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneFourConfigSchemaDefault)
+                                    .describe('PostgreSQL schema name containing the destination table.'),
+                                table_name: zod
+                                    .string()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneFourConfigTableNameDefault)
+                                    .describe('PostgreSQL table name to write exported rows into.'),
+                                has_self_signed_cert: zod
+                                    .boolean()
+                                    .default(
+                                        batchExportsPartialUpdateBodyDestinationOneFourConfigHasSelfSignedCertDefault
+                                    )
+                                    .describe(
+                                        'Legacy SSL option for direct credential configuration. Ignored when using a PostgreSQL integration.'
+                                    ),
+                            })
+                            .describe(
+                                'Typed configuration for a PostgreSQL batch-export destination.\n\nConnection credentials live in the linked Integration, never here. Mirrors the\nnon-credential fields of `PostgresBatchExportInputs` in `products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a PostgreSQL batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['AwsS3']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of an aws-s3-kind Integration providing AWS credentials. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                bucket_name: zod.string().describe('Name of the destination bucket.'),
+                                region: zod.string().describe("Region the bucket is in (e.g. 'us-east-1')."),
+                                prefix: zod.string().describe('Object key prefix applied to every exported file.'),
+                                compression: zod
+                                    .union([
+                                        zod
+                                            .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                            .describe(
+                                                '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                            ),
+                                        zod.null(),
+                                    ])
+                                    .optional()
+                                    .describe(
+                                        'Optional compression codec applied to exported files. Valid codecs depend on file_format.\n\n\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                    ),
+                                file_format: zod
+                                    .enum(['Parquet', 'JSONLines'])
+                                    .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                                    .default(batchExportsPartialUpdateBodyDestinationOneFiveConfigFileFormatDefault)
+                                    .describe(
+                                        'File format used for exported objects.\n\n\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines'
+                                    ),
+                                max_file_size_mb: zod
+                                    .number()
+                                    .nullish()
+                                    .describe(
+                                        'If set, rolls to a new file once the current file exceeds this size in MB.'
+                                    ),
+                                legacy_parquet_extension: zod
+                                    .boolean()
+                                    .optional()
+                                    .describe(
+                                        "Whether Parquet files keep the compression codec in their extension, for example '.parquet.zst' rather than '.parquet'. Parquet records its codec inside the file, so new exports leave it out. An export that already wrote Parquet files before this setting existed keeps it, so that pipelines matching on the old names do not break. Has no effect on JSON Lines, which always carries the codec in its extension."
+                                    ),
+                                encryption: zod
+                                    .string()
+                                    .nullish()
+                                    .describe(
+                                        "Optional S3 server-side encryption algorithm (e.g. 'AES256' or 'aws:kms')."
+                                    ),
+                                kms_key_id: zod
+                                    .string()
+                                    .nullish()
+                                    .describe("KMS key ID to use when encryption is 'aws:kms'."),
+                            })
+                            .describe(
+                                'Typed configuration for an AWS S3 batch-export destination.\n\nAWS credentials live in the linked aws-s3 Integration. Mirrors the non-credential fields of\n`AwsS3BatchExportInputs` in `products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating an AWS S3 batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['S3Compatible']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of an s3-compatible-kind Integration providing credentials and the provider endpoint URL. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                bucket_name: zod.string().describe('Name of the destination bucket.'),
+                                region: zod.string().describe("Region the bucket is in (e.g. 'us-east-1')."),
+                                prefix: zod.string().describe('Object key prefix applied to every exported file.'),
+                                compression: zod
+                                    .union([
+                                        zod
+                                            .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                            .describe(
+                                                '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                            ),
+                                        zod.null(),
+                                    ])
+                                    .optional()
+                                    .describe(
+                                        'Optional compression codec applied to exported files. Valid codecs depend on file_format.\n\n\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                    ),
+                                file_format: zod
+                                    .enum(['Parquet', 'JSONLines'])
+                                    .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                                    .default(batchExportsPartialUpdateBodyDestinationOneSixConfigFileFormatDefault)
+                                    .describe(
+                                        'File format used for exported objects.\n\n\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines'
+                                    ),
+                                max_file_size_mb: zod
+                                    .number()
+                                    .nullish()
+                                    .describe(
+                                        'If set, rolls to a new file once the current file exceeds this size in MB.'
+                                    ),
+                                legacy_parquet_extension: zod
+                                    .boolean()
+                                    .optional()
+                                    .describe(
+                                        "Whether Parquet files keep the compression codec in their extension, for example '.parquet.zst' rather than '.parquet'. Parquet records its codec inside the file, so new exports leave it out. An export that already wrote Parquet files before this setting existed keeps it, so that pipelines matching on the old names do not break. Has no effect on JSON Lines, which always carries the codec in its extension."
+                                    ),
+                                use_virtual_style_addressing: zod
+                                    .boolean()
+                                    .default(
+                                        batchExportsPartialUpdateBodyDestinationOneSixConfigUseVirtualStyleAddressingDefault
+                                    )
+                                    .describe('Use virtual-hosted-style addressing rather than path-style.'),
+                            })
+                            .describe(
+                                'Typed configuration for an S3-compatible batch-export destination (Cloudflare R2,\nDigitalOcean Spaces, etc.).\n\nCredentials and the provider `endpoint_url` live in the linked s3-compatible Integration.\nMirrors the non-credential fields of `S3CompatibleBatchExportInputs` in\n`products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating an S3-compatible batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['Snowflake']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of a snowflake-kind Integration providing the account, user and credentials. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                database: zod.string().describe('Snowflake database to write to.'),
+                                warehouse: zod.string().describe('Snowflake compute warehouse to use.'),
+                                schema: zod
+                                    .string()
+                                    .describe('Schema inside the database containing the destination table.'),
+                                table_name: zod
+                                    .string()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneSevenConfigTableNameDefault)
+                                    .describe('Destination table name.'),
+                                role: zod
+                                    .string()
+                                    .nullish()
+                                    .describe('Optional Snowflake role to assume for the session.'),
+                            })
+                            .describe(
+                                'Typed configuration for a Snowflake batch-export destination.\n\nAccount, user, authentication type and credentials live in the linked Integration, never here.\nMirrors the non-credential fields of `SnowflakeBatchExportInputs` in\n`products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a Snowflake batch-export destination.'),
+                zod
+                    .object({
+                        type: zod.enum(['Redshift']),
+                        integration_id: zod
+                            .number()
+                            .describe(
+                                'ID of an aws-redshift-kind Integration providing connection credentials. Use the integrations-list MCP tool to find one.'
+                            ),
+                        config: zod
+                            .object({
+                                database: zod.string().describe('Redshift database name to connect to.'),
+                                host: zod
+                                    .string()
+                                    .optional()
+                                    .describe(
+                                        'Redshift cluster or Serverless workgroup endpoint. Required when using an AWS Redshift integration; plain Redshift integrations store the host themselves.'
+                                    ),
+                                schema: zod
+                                    .string()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneEightConfigSchemaDefault)
+                                    .describe('Redshift schema name containing the destination table.'),
+                                table_name: zod
+                                    .string()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneEightConfigTableNameDefault)
+                                    .describe('Redshift table name to write exported rows into.'),
+                                port: zod
+                                    .number()
+                                    .default(batchExportsPartialUpdateBodyDestinationOneEightConfigPortDefault)
+                                    .describe('Port the Redshift server listens on.'),
+                                properties_data_type: zod
+                                    .enum(['varchar', 'super'])
+                                    .describe('\* `varchar` - varchar\n\* `super` - super')
+                                    .default(
+                                        batchExportsPartialUpdateBodyDestinationOneEightConfigPropertiesDataTypeDefault
+                                    )
+                                    .describe(
+                                        'Data type used for JSON-like columns such as event properties.\n\n\* `varchar` - varchar\n\* `super` - super'
+                                    ),
+                                mode: zod
+                                    .enum(['INSERT', 'COPY'])
+                                    .describe('\* `INSERT` - INSERT\n\* `COPY` - COPY')
+                                    .default(batchExportsPartialUpdateBodyDestinationOneEightConfigModeDefault)
+                                    .describe(
+                                        'How rows reach Redshift: batched INSERT statements, or COPY from files staged in S3.\n\n\* `INSERT` - INSERT\n\* `COPY` - COPY'
+                                    ),
+                                copy_inputs: zod
+                                    .object({
+                                        s3_bucket: zod
+                                            .string()
+                                            .describe('S3 bucket where files are staged before the Redshift COPY.'),
+                                        region_name: zod.string().describe('AWS region of the staging S3 bucket.'),
+                                        s3_key_prefix: zod
+                                            .string()
+                                            .describe('Key prefix for staged files in the S3 bucket.'),
+                                        authorization: zod
+                                            .union([
+                                                zod.number().describe('ID of an aws-s3-kind Integration.'),
+                                                zod
+                                                    .string()
+                                                    .describe('ARN of an IAM role attached to the Redshift cluster.'),
+                                            ])
+                                            .describe(
+                                                'Authorization for Redshift to read staged files during COPY: an IAM role ARN or an AWS S3 integration ID.'
+                                            ),
+                                        bucket_credentials: zod
+                                            .number()
+                                            .describe('AWS S3 integration ID used to stage files in the S3 bucket.'),
+                                    })
+                                    .describe(
+                                        'S3 staging configuration for a Redshift batch export running in COPY mode.'
+                                    )
+                                    .optional()
+                                    .describe("S3 staging configuration, required when mode is 'COPY'."),
+                            })
+                            .describe(
+                                'Typed configuration for a Redshift batch-export destination.\n\nConnection credentials live in the linked Integration, never here. Mirrors the non-credential fields of `RedshiftBatchExportInputs` in\n`products\/batch_exports\/backend\/service.py`.'
+                            ),
+                    })
+                    .describe('Request shape for creating or updating a Redshift batch-export destination.'),
+            ])
+            .optional()
+            .describe('Destination configuration. Required integration_id is enforced per destination type.'),
+        interval: zod
+            .enum(['hour', 'day', 'week', 'every 5 minutes', 'every 15 minutes'])
+            .describe(
+                '\* `hour` - hour\n\* `day` - day\n\* `week` - week\n\* `every 5 minutes` - every 5 minutes\n\* `every 15 minutes` - every 15 minutes'
+            )
+            .optional()
+            .describe(
+                'How often the batch export should run.\n\n\* `hour` - hour\n\* `day` - day\n\* `week` - week\n\* `every 5 minutes` - every 5 minutes\n\* `every 15 minutes` - every 15 minutes'
+            ),
+        paused: zod.boolean().optional().describe('Whether the batch export is paused.'),
+        hogql_query: zod
+            .string()
+            .nullish()
+            .describe(
+                "HogQL SELECT query. With model 'hogql', its results are the data exported by every run. The query may reference the {data_interval_start} and {data_interval_end} placeholders, replaced with each run's data interval bounds, for example: WHERE timestamp >= {data_interval_start} AND timestamp < {data_interval_end}. Without them every run exports all rows the query returns. Required when model is 'hogql'."
+            ),
+        hogql_modifiers: zod
+            .union([
+                zod.object({
+                    bounceRateDurationSeconds: zod.union([zod.number(), zod.null()]).optional(),
+                    bounceRatePageViewMode: zod
+                        .union([
+                            zod.enum(['count_pageviews', 'uniq_urls', 'uniq_page_screen_autocaptures']),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    convertToProjectTimezone: zod.union([zod.boolean(), zod.null()]).optional(),
+                    cookielessTrafficIsRegular: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Do not treat a missing user agent as automation on cookieless events. Positive bot signals and custom project rules still apply. Resolved server-side; not intended to be set by clients.'
+                        ),
+                    customBotDefinitions: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    category: zod
+                                        .union([zod.string(), zod.null()])
+                                        .optional()
+                                        .describe('Reported by `$virt_traffic_category`. Defaults to `custom`.'),
+                                    combiner: zod
+                                        .enum(['AND', 'OR'])
+                                        .describe('Whether every condition must match (AND) or any one of them (OR).'),
+                                    id: zod.string(),
+                                    items: zod.array(
+                                        zod.object({
+                                            id: zod.string(),
+                                            key: zod
+                                                .enum([
+                                                    '$raw_user_agent',
+                                                    '$ip',
+                                                    '$lib',
+                                                    '$host',
+                                                    '$pathname',
+                                                    '$current_url',
+                                                    '$browser',
+                                                    '$os',
+                                                    '$browser_language',
+                                                    '$screen_width',
+                                                    '$screen_height',
+                                                    '$geoip_country_code',
+                                                    '$referrer',
+                                                    '$referring_domain',
+                                                ])
+                                                .describe('The event property this condition reads.'),
+                                            matcher: zod.enum(['contains', 'regex', 'exact', 'cidr']),
+                                            pattern: zod
+                                                .string()
+                                                .describe('Matched against the property named by `key`.'),
+                                        })
+                                    ),
+                                    name: zod
+                                        .string()
+                                        .describe(
+                                            'Reported by `$virt_bot_name` and `$virt_bot_operator` when the rule matches.'
+                                        ),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    customChannelTypeRules: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    channel_type: zod.string(),
+                                    combiner: zod.enum(['AND', 'OR']),
+                                    id: zod.string(),
+                                    items: zod.array(
+                                        zod.object({
+                                            id: zod.string(),
+                                            key: zod.enum([
+                                                'utm_source',
+                                                'utm_medium',
+                                                'utm_campaign',
+                                                'referring_domain',
+                                                'url',
+                                                'pathname',
+                                                'hostname',
+                                            ]),
+                                            op: zod.enum([
+                                                'exact',
+                                                'is_not',
+                                                'is_set',
+                                                'is_not_set',
+                                                'icontains',
+                                                'not_icontains',
+                                                'regex',
+                                                'not_regex',
+                                            ]),
+                                            value: zod
+                                                .union([zod.string(), zod.array(zod.string()), zod.null()])
+                                                .optional(),
+                                        })
+                                    ),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    dataWarehouseEventsModifiers: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    distinct_id_field: zod.string(),
+                                    id_field: zod.string(),
+                                    table_name: zod.string(),
+                                    timestamp_field: zod.string(),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    debug: zod.union([zod.boolean(), zod.null()]).optional(),
+                    forceClickhouseDataSkippingIndexes: zod
+                        .union([zod.array(zod.string()), zod.null()])
+                        .optional()
+                        .describe('If these are provided, the query will fail if these skip indexes are not used'),
+                    formatCsvAllowDoubleQuotes: zod.union([zod.boolean(), zod.null()]).optional(),
+                    inCohortVia: zod
+                        .union([zod.enum(['auto', 'leftjoin', 'subquery', 'leftjoin_conjoined']), zod.null()])
+                        .optional(),
+                    inlineCohortCalculation: zod.union([zod.enum(['off', 'auto', 'always']), zod.null()]).optional(),
+                    materializationMode: zod
+                        .union([
+                            zod.enum(['auto', 'legacy_null_as_string', 'legacy_null_as_null', 'disabled']),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    materializeRepeatedCTEs: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Reuse eligible bounded event aggregates within one query execution. When unset, the server may enable it via the cloud feature flag.'
+                        ),
+                    materializedColumnsOptimizationMode: zod
+                        .union([zod.enum(['disabled', 'optimized']), zod.null()])
+                        .optional(),
+                    mergeFederatedAggregateJoins: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Merge sibling aggregating LEFT JOINs over federated Postgres tables into one UNION ALL join, so their scans overlap'
+                        ),
+                    negatedPersonFiltersNotIn: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Replace negated person-property filters in the WHERE of an `events` query (such as `email not_icontains`) with `person_id NOT IN (SELECT id FROM persons WHERE <the filters fail>)`, so the query no longer joins every person. Applies only when every filtered person property has a materialized column, nothing else in the query reads that persons join, and the join would be a LEFT JOIN.'
+                        ),
+                    optimizeJoinedFilters: zod.union([zod.boolean(), zod.null()]).optional(),
+                    optimizeProjections: zod.union([zod.boolean(), zod.null()]).optional(),
+                    parserMode: zod
+                        .union([
+                            zod.enum([
+                                'cpp_only',
+                                'cpp_with_rust_shadow',
+                                'cpp_with_rust_py_shadow',
+                                'rust_with_cpp_shadow',
+                                'rust_only',
+                                'rust_py_only',
+                                'rust_py_with_cpp_shadow',
+                            ]),
+                            zod.null(),
+                        ])
+                        .optional()
+                        .describe(
+                            'HogQL parser backend; absent → `rust_py_with_cpp_shadow` (rust-py is primary, cpp runs as a sampled shadow). `\*_shadow` modes return the primary result and sample-compare against the other parser, reporting divergences without failing the request. The `rust_py_\*` modes drive the same hand-rolled Rust parser as `rust_\*` but build `posthog.hogql.ast` dataclass instances directly via PyO3, skipping the JSON round-trip.'
+                        ),
+                    personIdPushdown: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Push an `id IN (SELECT person_id FROM <left table> WHERE …)` predicate into the joined persons subquery, so the latest-version lookup only reads persons that the outer query's left-table filters can reach. Applies only to a persons join from the query's own FROM table. Unset, it applies to a persons join from `posthog.flag_evaluations` or from the union of events and flag_evaluations, and to no other join."
+                        ),
+                    personsArgMaxVersion: zod.union([zod.enum(['auto', 'v1', 'v2']), zod.null()]).optional(),
+                    personsJoinMode: zod.union([zod.enum(['inner', 'left']), zod.null()]).optional(),
+                    personsOnEventsMode: zod
+                        .union([
+                            zod.enum([
+                                'disabled',
+                                'person_id_no_override_properties_on_events',
+                                'person_id_override_properties_on_events',
+                                'person_id_override_properties_joined',
+                            ]),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    propertyGroupsMode: zod
+                        .union([zod.enum(['enabled', 'disabled', 'optimized']), zod.null()])
+                        .optional(),
+                    pushDownPredicates: zod.union([zod.boolean(), zod.null()]).optional(),
+                    s3TableUseInvalidColumns: zod.union([zod.boolean(), zod.null()]).optional(),
+                    sessionIdPushdown: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Push a `session_id_v7 IN (SELECT … FROM events WHERE …)` predicate into the raw_sessions subquery to limit aggregation to sessions that participate in the outer events filter.'
+                        ),
+                    sessionPropertyPreAggregation: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Pre-filter raw_sessions aggregation by `session_id_v7 IN (cheap pre-aggregation that only materializes the columns referenced by the outer-WHERE session predicate)`. Useful when the breakdown\/SELECT pulls in many session columns (e.g. `$channel_type`) but the filter only references one (e.g. `$entry_current_url`).'
+                        ),
+                    sessionTableVersion: zod.union([zod.enum(['auto', 'v1', 'v2', 'v3']), zod.null()]).optional(),
+                    sessionTimestampBufferMinutes: zod
+                        .union([zod.number(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Padding, in minutes, on each side of the event time range when it filters the sessions table by session start. Defaults to 3 days. It can only narrow the range: values above the default are ignored. Lower it only for a query that keeps just the sessions that start inside its own time range.'
+                        ),
+                    sessionsV2JoinMode: zod.union([zod.enum(['string', 'uuid']), zod.null()]).optional(),
+                    timings: zod.union([zod.boolean(), zod.null()]).optional(),
+                    typeAwareCastSimplification: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Remove provably redundant casts and nullability wrappers (e.g. `toString(String)`, `assumeNotNull(non_nullable)`, dead `ifNull` fallbacks) using inferred expression types'
+                        ),
+                    useMaterializedViews: zod.union([zod.boolean(), zod.null()]).optional(),
+                    useNewEventsSchema: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Read events from the native JSON events table (`true`) or the legacy events table (`false`). When unset, a staff person's tab switch or `ph_new_events_schema` cookie applies, then the project. A project reads the native table once PostHog has moved it there. Before that, it can opt in early by storing `true` here in its project settings. A stored `false` is ignored."
+                        ),
+                    usePreaggregatedIntermediateResults: zod.union([zod.boolean(), zod.null()]).optional(),
+                    usePreaggregatedTableTransforms: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Try to automatically convert HogQL queries to use preaggregated tables at the AST level \*'
+                        ),
+                    useWebAnalyticsPreAggregatedTables: zod.union([zod.boolean(), zod.null()]).optional(),
+                    webAnalyticsFirstPageviewFilters: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Serve filters on the stored session-entry attribution properties (`$channel_type`, `$entry_utm_\*`, `$entry_referring_domain`) by recomputing the value from the session's first pageview. Resolved server-side; not intended to be set by clients."
+                        ),
+                }),
+                zod.null(),
+            ])
+            .optional()
+            .describe(
+                "HogQL modifiers to use when the query runs, as an object keyed by modifier name, for example {\"convertToProjectTimezone\": true}. Only supported when 'model' is 'hogql'. Each modifier set here overrides the project modifier with the same name, and the project modifiers apply to all others. If neither sets convertToProjectTimezone, it defaults to false, so timestamps are exported in UTC. Set it to true to export timestamps in the project timezone instead. Unknown modifier names are rejected. On update, the object replaces the modifiers stored on the export, so include every modifier to keep, or send null to remove them all."
+            ),
+        primary_key: zod
+            .array(zod.string())
+            .nullish()
+            .describe(
+                "The column or columns in the provided HogQL query that make up the primary key for a HogQL-backed batch export. Required if incremental mode is 'MERGE'"
+            ),
+        version_key: zod
+            .array(zod.string())
+            .nullish()
+            .describe(
+                'The column or columns in the provided HogQL query that make up the version key for a HogQL-backed batch export.'
+            ),
+        incremental_mode: zod
+            .enum(['APPEND', 'MERGE'])
+            .describe('\* `APPEND` - Append\n\* `MERGE` - Merge')
+            .optional()
+            .describe('How this batch export handles incremental updates.\n\n\* `APPEND` - Append\n\* `MERGE` - Merge'),
+        timezone: zod
+            .string()
+            .nullish()
+            .describe(
+                "IANA timezone name (e.g. 'America\/New_York', 'Europe\/London', 'UTC') controlling daily and weekly interval boundaries."
+            ),
+        offset_day: zod
+            .number()
+            .min(batchExportsPartialUpdateBodyOffsetDayMin)
+            .max(batchExportsPartialUpdateBodyOffsetDayMax)
+            .nullish()
+            .describe('Day-of-week offset for weekly intervals (0=Sunday, 6=Saturday).'),
+        offset_hour: zod
+            .number()
+            .min(batchExportsPartialUpdateBodyOffsetHourMin)
+            .max(batchExportsPartialUpdateBodyOffsetHourMax)
+            .nullish()
+            .describe('Hour-of-day offset (0-23) for daily and weekly intervals.'),
+    })
+    .describe(
+        'Request body for create\/partial_update on BatchExportViewSet.\n\nMirrors the writeable fields of `BatchExportSerializer` but uses a polymorphic\n`destination` schema so integration_id is marked required on the types that need\nit. Responses continue to use `BatchExportSerializer`.'
+    )
+
+export const BatchExportsDestroyParams = () => zod.object({
+    id: zod.string().describe('A UUID string identifying this batch export.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Create and start a batch export on demand run to download a file.
+ */
+export const FileDownloadBatchExportsCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const fileDownloadBatchExportsCreateBodyOneFileFormatDefault = `Parquet`
+export const fileDownloadBatchExportsCreateBodyOneFileMaxSizeMbDefault = 1024
+export const fileDownloadBatchExportsCreateBodyOneFileMaxSizeMbMin = 0
+
+export const fileDownloadBatchExportsCreateBodyTwoFileFormatDefault = `Parquet`
+export const fileDownloadBatchExportsCreateBodyTwoFileMaxSizeMbDefault = 1024
+export const fileDownloadBatchExportsCreateBodyTwoFileMaxSizeMbMin = 0
+
+export const fileDownloadBatchExportsCreateBodyThreeFileFormatDefault = `Parquet`
+export const fileDownloadBatchExportsCreateBodyThreeFileMaxSizeMbDefault = 1024
+export const fileDownloadBatchExportsCreateBodyThreeFileMaxSizeMbMin = 0
+
+export const fileDownloadBatchExportsCreateBodyFourFileFormatDefault = `Parquet`
+export const fileDownloadBatchExportsCreateBodyFourFileMaxSizeMbDefault = 1024
+export const fileDownloadBatchExportsCreateBodyFourFileMaxSizeMbMin = 0
+
+export const FileDownloadBatchExportsCreateBody = () => zod.union([
+    zod
+        .object({
+            file: zod
+                .object({
+                    format: zod
+                        .enum(['Parquet', 'JSONLines'])
+                        .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                        .default(fileDownloadBatchExportsCreateBodyOneFileFormatDefault)
+                        .describe('File format\n\n\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines'),
+                    compression: zod
+                        .union([
+                            zod
+                                .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                .describe(
+                                    '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                ),
+                            zod.null(),
+                        ])
+                        .optional()
+                        .describe(
+                            'Compress the file with a supported compression format\n\n\* `zstd` - zstd\n\* `gzip` - gzip\n\* `brotli` - brotli\n\* `lz4` - lz4\n\* `snappy` - snappy'
+                        ),
+                    max_size_mb: zod
+                        .number()
+                        .min(fileDownloadBatchExportsCreateBodyOneFileMaxSizeMbMin)
+                        .nullish()
+                        .default(fileDownloadBatchExportsCreateBodyOneFileMaxSizeMbDefault)
+                        .describe(
+                            'Split the download into files of about this size in MiB. A file can go a little over. Set it to null or 0 to write a single file of any size.'
+                        ),
+                })
+                .describe('Typed configuration for a FileDownload batch-export destination.'),
+            model: zod.enum(['events']),
+            include: zod.array(zod.string()).optional(),
+            exclude: zod.array(zod.string()).optional(),
+            data_interval_start: zod.iso.datetime({ offset: true }),
+            data_interval_end: zod.iso.datetime({ offset: true }),
+        })
+        .describe('Typed configuration for the events model.'),
+    zod
+        .object({
+            file: zod
+                .object({
+                    format: zod
+                        .enum(['Parquet', 'JSONLines'])
+                        .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                        .default(fileDownloadBatchExportsCreateBodyTwoFileFormatDefault)
+                        .describe('File format\n\n\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines'),
+                    compression: zod
+                        .union([
+                            zod
+                                .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                .describe(
+                                    '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                ),
+                            zod.null(),
+                        ])
+                        .optional()
+                        .describe(
+                            'Compress the file with a supported compression format\n\n\* `zstd` - zstd\n\* `gzip` - gzip\n\* `brotli` - brotli\n\* `lz4` - lz4\n\* `snappy` - snappy'
+                        ),
+                    max_size_mb: zod
+                        .number()
+                        .min(fileDownloadBatchExportsCreateBodyTwoFileMaxSizeMbMin)
+                        .nullish()
+                        .default(fileDownloadBatchExportsCreateBodyTwoFileMaxSizeMbDefault)
+                        .describe(
+                            'Split the download into files of about this size in MiB. A file can go a little over. Set it to null or 0 to write a single file of any size.'
+                        ),
+                })
+                .describe('Typed configuration for a FileDownload batch-export destination.'),
+            model: zod.enum(['persons']),
+            data_interval_start: zod.iso.datetime({ offset: true }),
+            data_interval_end: zod.iso.datetime({ offset: true }),
+        })
+        .describe('Typed configuration for the persons model.'),
+    zod
+        .object({
+            file: zod
+                .object({
+                    format: zod
+                        .enum(['Parquet', 'JSONLines'])
+                        .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                        .default(fileDownloadBatchExportsCreateBodyThreeFileFormatDefault)
+                        .describe('File format\n\n\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines'),
+                    compression: zod
+                        .union([
+                            zod
+                                .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                .describe(
+                                    '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                ),
+                            zod.null(),
+                        ])
+                        .optional()
+                        .describe(
+                            'Compress the file with a supported compression format\n\n\* `zstd` - zstd\n\* `gzip` - gzip\n\* `brotli` - brotli\n\* `lz4` - lz4\n\* `snappy` - snappy'
+                        ),
+                    max_size_mb: zod
+                        .number()
+                        .min(fileDownloadBatchExportsCreateBodyThreeFileMaxSizeMbMin)
+                        .nullish()
+                        .default(fileDownloadBatchExportsCreateBodyThreeFileMaxSizeMbDefault)
+                        .describe(
+                            'Split the download into files of about this size in MiB. A file can go a little over. Set it to null or 0 to write a single file of any size.'
+                        ),
+                })
+                .describe('Typed configuration for a FileDownload batch-export destination.'),
+            model: zod.enum(['sessions']),
+            data_interval_start: zod.iso.datetime({ offset: true }),
+            data_interval_end: zod.iso.datetime({ offset: true }),
+        })
+        .describe('Typed configuration for the sessions model.'),
+    zod
+        .object({
+            file: zod
+                .object({
+                    format: zod
+                        .enum(['Parquet', 'JSONLines'])
+                        .describe('\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines')
+                        .default(fileDownloadBatchExportsCreateBodyFourFileFormatDefault)
+                        .describe('File format\n\n\* `Parquet` - Parquet\n\* `JSONLines` - JSONLines'),
+                    compression: zod
+                        .union([
+                            zod
+                                .enum(['brotli', 'gzip', 'lz4', 'snappy', 'zstd'])
+                                .describe(
+                                    '\* `brotli` - brotli\n\* `gzip` - gzip\n\* `lz4` - lz4\n\* `snappy` - snappy\n\* `zstd` - zstd'
+                                ),
+                            zod.null(),
+                        ])
+                        .optional()
+                        .describe(
+                            'Compress the file with a supported compression format\n\n\* `zstd` - zstd\n\* `gzip` - gzip\n\* `brotli` - brotli\n\* `lz4` - lz4\n\* `snappy` - snappy'
+                        ),
+                    max_size_mb: zod
+                        .number()
+                        .min(fileDownloadBatchExportsCreateBodyFourFileMaxSizeMbMin)
+                        .nullish()
+                        .default(fileDownloadBatchExportsCreateBodyFourFileMaxSizeMbDefault)
+                        .describe(
+                            'Split the download into files of about this size in MiB. A file can go a little over. Set it to null or 0 to write a single file of any size.'
+                        ),
+                })
+                .describe('Typed configuration for a FileDownload batch-export destination.'),
+            model: zod.enum(['hogql']),
+            hogql_query: zod
+                .string()
+                .describe(
+                    'HogQL SELECT query whose results are exported. This model is in closed beta and is enabled per team; when it is not enabled, the request fails with a permission error that names HogQL batch exports. Contact PostHog support to request access. The query may reference the {data_interval_start} and {data_interval_end} placeholders. Provide a value for each placeholder the query references; missing referenced bounds are rejected, not inferred. When both bounds are supplied, they must span at most seven days. Neither supplied bound may be in the future. Without placeholders, the query runs unchanged, even if bounds are supplied. Every column in the SELECT clause must be a field or have an alias. It is recommended to limit the query with a WHERE clause, for example bounding timestamp on the events table, both to avoid exporting more rows than expected and because user queries run under stricter resource limits than the other models.'
+                ),
+            hogql_modifiers: zod
+                .object({
+                    bounceRateDurationSeconds: zod.union([zod.number(), zod.null()]).optional(),
+                    bounceRatePageViewMode: zod
+                        .union([
+                            zod.enum(['count_pageviews', 'uniq_urls', 'uniq_page_screen_autocaptures']),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    convertToProjectTimezone: zod.union([zod.boolean(), zod.null()]).optional(),
+                    cookielessTrafficIsRegular: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Do not treat a missing user agent as automation on cookieless events. Positive bot signals and custom project rules still apply. Resolved server-side; not intended to be set by clients.'
+                        ),
+                    customBotDefinitions: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    category: zod
+                                        .union([zod.string(), zod.null()])
+                                        .optional()
+                                        .describe('Reported by `$virt_traffic_category`. Defaults to `custom`.'),
+                                    combiner: zod
+                                        .enum(['AND', 'OR'])
+                                        .describe('Whether every condition must match (AND) or any one of them (OR).'),
+                                    id: zod.string(),
+                                    items: zod.array(
+                                        zod.object({
+                                            id: zod.string(),
+                                            key: zod
+                                                .enum([
+                                                    '$raw_user_agent',
+                                                    '$ip',
+                                                    '$lib',
+                                                    '$host',
+                                                    '$pathname',
+                                                    '$current_url',
+                                                    '$browser',
+                                                    '$os',
+                                                    '$browser_language',
+                                                    '$screen_width',
+                                                    '$screen_height',
+                                                    '$geoip_country_code',
+                                                    '$referrer',
+                                                    '$referring_domain',
+                                                ])
+                                                .describe('The event property this condition reads.'),
+                                            matcher: zod.enum(['contains', 'regex', 'exact', 'cidr']),
+                                            pattern: zod
+                                                .string()
+                                                .describe('Matched against the property named by `key`.'),
+                                        })
+                                    ),
+                                    name: zod
+                                        .string()
+                                        .describe(
+                                            'Reported by `$virt_bot_name` and `$virt_bot_operator` when the rule matches.'
+                                        ),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    customChannelTypeRules: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    channel_type: zod.string(),
+                                    combiner: zod.enum(['AND', 'OR']),
+                                    id: zod.string(),
+                                    items: zod.array(
+                                        zod.object({
+                                            id: zod.string(),
+                                            key: zod.enum([
+                                                'utm_source',
+                                                'utm_medium',
+                                                'utm_campaign',
+                                                'referring_domain',
+                                                'url',
+                                                'pathname',
+                                                'hostname',
+                                            ]),
+                                            op: zod.enum([
+                                                'exact',
+                                                'is_not',
+                                                'is_set',
+                                                'is_not_set',
+                                                'icontains',
+                                                'not_icontains',
+                                                'regex',
+                                                'not_regex',
+                                            ]),
+                                            value: zod
+                                                .union([zod.string(), zod.array(zod.string()), zod.null()])
+                                                .optional(),
+                                        })
+                                    ),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    dataWarehouseEventsModifiers: zod
+                        .union([
+                            zod.array(
+                                zod.object({
+                                    distinct_id_field: zod.string(),
+                                    id_field: zod.string(),
+                                    table_name: zod.string(),
+                                    timestamp_field: zod.string(),
+                                })
+                            ),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    debug: zod.union([zod.boolean(), zod.null()]).optional(),
+                    forceClickhouseDataSkippingIndexes: zod
+                        .union([zod.array(zod.string()), zod.null()])
+                        .optional()
+                        .describe('If these are provided, the query will fail if these skip indexes are not used'),
+                    formatCsvAllowDoubleQuotes: zod.union([zod.boolean(), zod.null()]).optional(),
+                    inCohortVia: zod
+                        .union([zod.enum(['auto', 'leftjoin', 'subquery', 'leftjoin_conjoined']), zod.null()])
+                        .optional(),
+                    inlineCohortCalculation: zod.union([zod.enum(['off', 'auto', 'always']), zod.null()]).optional(),
+                    materializationMode: zod
+                        .union([
+                            zod.enum(['auto', 'legacy_null_as_string', 'legacy_null_as_null', 'disabled']),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    materializeRepeatedCTEs: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Reuse eligible bounded event aggregates within one query execution. When unset, the server may enable it via the cloud feature flag.'
+                        ),
+                    materializedColumnsOptimizationMode: zod
+                        .union([zod.enum(['disabled', 'optimized']), zod.null()])
+                        .optional(),
+                    mergeFederatedAggregateJoins: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Merge sibling aggregating LEFT JOINs over federated Postgres tables into one UNION ALL join, so their scans overlap'
+                        ),
+                    negatedPersonFiltersNotIn: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Replace negated person-property filters in the WHERE of an `events` query (such as `email not_icontains`) with `person_id NOT IN (SELECT id FROM persons WHERE <the filters fail>)`, so the query no longer joins every person. Applies only when every filtered person property has a materialized column, nothing else in the query reads that persons join, and the join would be a LEFT JOIN.'
+                        ),
+                    optimizeJoinedFilters: zod.union([zod.boolean(), zod.null()]).optional(),
+                    optimizeProjections: zod.union([zod.boolean(), zod.null()]).optional(),
+                    parserMode: zod
+                        .union([
+                            zod.enum([
+                                'cpp_only',
+                                'cpp_with_rust_shadow',
+                                'cpp_with_rust_py_shadow',
+                                'rust_with_cpp_shadow',
+                                'rust_only',
+                                'rust_py_only',
+                                'rust_py_with_cpp_shadow',
+                            ]),
+                            zod.null(),
+                        ])
+                        .optional()
+                        .describe(
+                            'HogQL parser backend; absent → `rust_py_with_cpp_shadow` (rust-py is primary, cpp runs as a sampled shadow). `\*_shadow` modes return the primary result and sample-compare against the other parser, reporting divergences without failing the request. The `rust_py_\*` modes drive the same hand-rolled Rust parser as `rust_\*` but build `posthog.hogql.ast` dataclass instances directly via PyO3, skipping the JSON round-trip.'
+                        ),
+                    personIdPushdown: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Push an `id IN (SELECT person_id FROM <left table> WHERE …)` predicate into the joined persons subquery, so the latest-version lookup only reads persons that the outer query's left-table filters can reach. Applies only to a persons join from the query's own FROM table. Unset, it applies to a persons join from `posthog.flag_evaluations` or from the union of events and flag_evaluations, and to no other join."
+                        ),
+                    personsArgMaxVersion: zod.union([zod.enum(['auto', 'v1', 'v2']), zod.null()]).optional(),
+                    personsJoinMode: zod.union([zod.enum(['inner', 'left']), zod.null()]).optional(),
+                    personsOnEventsMode: zod
+                        .union([
+                            zod.enum([
+                                'disabled',
+                                'person_id_no_override_properties_on_events',
+                                'person_id_override_properties_on_events',
+                                'person_id_override_properties_joined',
+                            ]),
+                            zod.null(),
+                        ])
+                        .optional(),
+                    propertyGroupsMode: zod
+                        .union([zod.enum(['enabled', 'disabled', 'optimized']), zod.null()])
+                        .optional(),
+                    pushDownPredicates: zod.union([zod.boolean(), zod.null()]).optional(),
+                    s3TableUseInvalidColumns: zod.union([zod.boolean(), zod.null()]).optional(),
+                    sessionIdPushdown: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Push a `session_id_v7 IN (SELECT … FROM events WHERE …)` predicate into the raw_sessions subquery to limit aggregation to sessions that participate in the outer events filter.'
+                        ),
+                    sessionPropertyPreAggregation: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Pre-filter raw_sessions aggregation by `session_id_v7 IN (cheap pre-aggregation that only materializes the columns referenced by the outer-WHERE session predicate)`. Useful when the breakdown\/SELECT pulls in many session columns (e.g. `$channel_type`) but the filter only references one (e.g. `$entry_current_url`).'
+                        ),
+                    sessionTableVersion: zod.union([zod.enum(['auto', 'v1', 'v2', 'v3']), zod.null()]).optional(),
+                    sessionTimestampBufferMinutes: zod
+                        .union([zod.number(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Padding, in minutes, on each side of the event time range when it filters the sessions table by session start. Defaults to 3 days. It can only narrow the range: values above the default are ignored. Lower it only for a query that keeps just the sessions that start inside its own time range.'
+                        ),
+                    sessionsV2JoinMode: zod.union([zod.enum(['string', 'uuid']), zod.null()]).optional(),
+                    timings: zod.union([zod.boolean(), zod.null()]).optional(),
+                    typeAwareCastSimplification: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Remove provably redundant casts and nullability wrappers (e.g. `toString(String)`, `assumeNotNull(non_nullable)`, dead `ifNull` fallbacks) using inferred expression types'
+                        ),
+                    useMaterializedViews: zod.union([zod.boolean(), zod.null()]).optional(),
+                    useNewEventsSchema: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Read events from the native JSON events table (`true`) or the legacy events table (`false`). When unset, a staff person's tab switch or `ph_new_events_schema` cookie applies, then the project. A project reads the native table once PostHog has moved it there. Before that, it can opt in early by storing `true` here in its project settings. A stored `false` is ignored."
+                        ),
+                    usePreaggregatedIntermediateResults: zod.union([zod.boolean(), zod.null()]).optional(),
+                    usePreaggregatedTableTransforms: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            'Try to automatically convert HogQL queries to use preaggregated tables at the AST level \*'
+                        ),
+                    useWebAnalyticsPreAggregatedTables: zod.union([zod.boolean(), zod.null()]).optional(),
+                    webAnalyticsFirstPageviewFilters: zod
+                        .union([zod.boolean(), zod.null()])
+                        .optional()
+                        .describe(
+                            "Serve filters on the stored session-entry attribution properties (`$channel_type`, `$entry_utm_\*`, `$entry_referring_domain`) by recomputing the value from the session's first pageview. Resolved server-side; not intended to be set by clients."
+                        ),
+                })
+                .optional()
+                .describe(
+                    "HogQL modifiers to use when the query runs, as an object keyed by modifier name, for example {\"convertToProjectTimezone\": true}. Only supported when 'model' is 'hogql'. Each modifier set here overrides the project modifier with the same name, and the project modifiers apply to all others. If neither sets convertToProjectTimezone, it defaults to false, so timestamps are exported in UTC. Set it to true to export timestamps in the project timezone instead. Unknown modifier names are rejected. On update, the object replaces the modifiers stored on the export, so include every modifier to keep, or send null to remove them all."
+                ),
+            data_interval_start: zod.iso
+                .datetime({ offset: true })
+                .optional()
+                .describe(
+                    'Start of the export interval. Required for the events, persons, and sessions models. For HogQL, required only when the query references {data_interval_start}. A supplied start must not be in the future. When both bounds are supplied, the interval must span at most seven days.'
+                ),
+            data_interval_end: zod.iso
+                .datetime({ offset: true })
+                .optional()
+                .describe(
+                    'End of the export interval. Required for the events, persons, and sessions models. For HogQL, required only when the query references {data_interval_end}. A supplied end must not be in the future or precede a supplied start. Bounds replace HogQL placeholders; they do not add filters to the query.'
+                ),
+        })
+        .describe('Typed configuration for the hogql model.'),
+])
+
+/**
+ * Get a batch export on demand run.
+ *
+ * If the underlying batch export run has completed, we return keys to the
+ * generated file downloads so that users may download them by making a request
+ * to /download.
+ */
+export const FileDownloadBatchExportsRetrieveParams = () => zod.object({
+    id: zod.string().describe('A UUID string identifying this batch export run.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Cancel an ongoing file-download batch export.
+ */
+export const FileDownloadBatchExportsCancelCreateParams = () => zod.object({
+    id: zod.string().describe('A UUID string identifying this batch export run.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Count the rows a HogQL batch export would produce if started now.
+ */
+export const FileDownloadBatchExportsCountRowsCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const FileDownloadBatchExportsCountRowsCreateBody = () => zod
+    .object({
+        model: zod
+            .enum(['hogql'])
+            .describe('\* `hogql` - hogql')
+            .describe("Model to count rows for. Only 'hogql' is supported.\n\n\* `hogql` - hogql"),
+        hogql_query: zod
+            .string()
+            .describe(
+                'HogQL SELECT query whose results are exported. This model is in closed beta and is enabled per team; when it is not enabled, the request fails with a permission error that names HogQL batch exports. Contact PostHog support to request access. The query may reference the {data_interval_start} and {data_interval_end} placeholders. Provide a value for each placeholder the query references; missing referenced bounds are rejected, not inferred. When both bounds are supplied, they must span at most seven days. Neither supplied bound may be in the future. Without placeholders, the query runs unchanged, even if bounds are supplied. Every column in the SELECT clause must be a field or have an alias. It is recommended to limit the query with a WHERE clause, for example bounding timestamp on the events table, both to avoid exporting more rows than expected and because user queries run under stricter resource limits than the other models.'
+            ),
+        hogql_modifiers: zod
+            .object({
+                bounceRateDurationSeconds: zod.union([zod.number(), zod.null()]).optional(),
+                bounceRatePageViewMode: zod
+                    .union([zod.enum(['count_pageviews', 'uniq_urls', 'uniq_page_screen_autocaptures']), zod.null()])
+                    .optional(),
+                convertToProjectTimezone: zod.union([zod.boolean(), zod.null()]).optional(),
+                cookielessTrafficIsRegular: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Do not treat a missing user agent as automation on cookieless events. Positive bot signals and custom project rules still apply. Resolved server-side; not intended to be set by clients.'
+                    ),
+                customBotDefinitions: zod
+                    .union([
+                        zod.array(
+                            zod.object({
+                                category: zod
+                                    .union([zod.string(), zod.null()])
+                                    .optional()
+                                    .describe('Reported by `$virt_traffic_category`. Defaults to `custom`.'),
+                                combiner: zod
+                                    .enum(['AND', 'OR'])
+                                    .describe('Whether every condition must match (AND) or any one of them (OR).'),
+                                id: zod.string(),
+                                items: zod.array(
+                                    zod.object({
+                                        id: zod.string(),
+                                        key: zod
+                                            .enum([
+                                                '$raw_user_agent',
+                                                '$ip',
+                                                '$lib',
+                                                '$host',
+                                                '$pathname',
+                                                '$current_url',
+                                                '$browser',
+                                                '$os',
+                                                '$browser_language',
+                                                '$screen_width',
+                                                '$screen_height',
+                                                '$geoip_country_code',
+                                                '$referrer',
+                                                '$referring_domain',
+                                            ])
+                                            .describe('The event property this condition reads.'),
+                                        matcher: zod.enum(['contains', 'regex', 'exact', 'cidr']),
+                                        pattern: zod.string().describe('Matched against the property named by `key`.'),
+                                    })
+                                ),
+                                name: zod
+                                    .string()
+                                    .describe(
+                                        'Reported by `$virt_bot_name` and `$virt_bot_operator` when the rule matches.'
+                                    ),
+                            })
+                        ),
+                        zod.null(),
+                    ])
+                    .optional(),
+                customChannelTypeRules: zod
+                    .union([
+                        zod.array(
+                            zod.object({
+                                channel_type: zod.string(),
+                                combiner: zod.enum(['AND', 'OR']),
+                                id: zod.string(),
+                                items: zod.array(
+                                    zod.object({
+                                        id: zod.string(),
+                                        key: zod.enum([
+                                            'utm_source',
+                                            'utm_medium',
+                                            'utm_campaign',
+                                            'referring_domain',
+                                            'url',
+                                            'pathname',
+                                            'hostname',
+                                        ]),
+                                        op: zod.enum([
+                                            'exact',
+                                            'is_not',
+                                            'is_set',
+                                            'is_not_set',
+                                            'icontains',
+                                            'not_icontains',
+                                            'regex',
+                                            'not_regex',
+                                        ]),
+                                        value: zod
+                                            .union([zod.string(), zod.array(zod.string()), zod.null()])
+                                            .optional(),
+                                    })
+                                ),
+                            })
+                        ),
+                        zod.null(),
+                    ])
+                    .optional(),
+                dataWarehouseEventsModifiers: zod
+                    .union([
+                        zod.array(
+                            zod.object({
+                                distinct_id_field: zod.string(),
+                                id_field: zod.string(),
+                                table_name: zod.string(),
+                                timestamp_field: zod.string(),
+                            })
+                        ),
+                        zod.null(),
+                    ])
+                    .optional(),
+                debug: zod.union([zod.boolean(), zod.null()]).optional(),
+                forceClickhouseDataSkippingIndexes: zod
+                    .union([zod.array(zod.string()), zod.null()])
+                    .optional()
+                    .describe('If these are provided, the query will fail if these skip indexes are not used'),
+                formatCsvAllowDoubleQuotes: zod.union([zod.boolean(), zod.null()]).optional(),
+                inCohortVia: zod
+                    .union([zod.enum(['auto', 'leftjoin', 'subquery', 'leftjoin_conjoined']), zod.null()])
+                    .optional(),
+                inlineCohortCalculation: zod.union([zod.enum(['off', 'auto', 'always']), zod.null()]).optional(),
+                materializationMode: zod
+                    .union([zod.enum(['auto', 'legacy_null_as_string', 'legacy_null_as_null', 'disabled']), zod.null()])
+                    .optional(),
+                materializeRepeatedCTEs: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Reuse eligible bounded event aggregates within one query execution. When unset, the server may enable it via the cloud feature flag.'
+                    ),
+                materializedColumnsOptimizationMode: zod
+                    .union([zod.enum(['disabled', 'optimized']), zod.null()])
+                    .optional(),
+                mergeFederatedAggregateJoins: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Merge sibling aggregating LEFT JOINs over federated Postgres tables into one UNION ALL join, so their scans overlap'
+                    ),
+                negatedPersonFiltersNotIn: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Replace negated person-property filters in the WHERE of an `events` query (such as `email not_icontains`) with `person_id NOT IN (SELECT id FROM persons WHERE <the filters fail>)`, so the query no longer joins every person. Applies only when every filtered person property has a materialized column, nothing else in the query reads that persons join, and the join would be a LEFT JOIN.'
+                    ),
+                optimizeJoinedFilters: zod.union([zod.boolean(), zod.null()]).optional(),
+                optimizeProjections: zod.union([zod.boolean(), zod.null()]).optional(),
+                parserMode: zod
+                    .union([
+                        zod.enum([
+                            'cpp_only',
+                            'cpp_with_rust_shadow',
+                            'cpp_with_rust_py_shadow',
+                            'rust_with_cpp_shadow',
+                            'rust_only',
+                            'rust_py_only',
+                            'rust_py_with_cpp_shadow',
+                        ]),
+                        zod.null(),
+                    ])
+                    .optional()
+                    .describe(
+                        'HogQL parser backend; absent → `rust_py_with_cpp_shadow` (rust-py is primary, cpp runs as a sampled shadow). `\*_shadow` modes return the primary result and sample-compare against the other parser, reporting divergences without failing the request. The `rust_py_\*` modes drive the same hand-rolled Rust parser as `rust_\*` but build `posthog.hogql.ast` dataclass instances directly via PyO3, skipping the JSON round-trip.'
+                    ),
+                personIdPushdown: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        "Push an `id IN (SELECT person_id FROM <left table> WHERE …)` predicate into the joined persons subquery, so the latest-version lookup only reads persons that the outer query's left-table filters can reach. Applies only to a persons join from the query's own FROM table. Unset, it applies to a persons join from `posthog.flag_evaluations` or from the union of events and flag_evaluations, and to no other join."
+                    ),
+                personsArgMaxVersion: zod.union([zod.enum(['auto', 'v1', 'v2']), zod.null()]).optional(),
+                personsJoinMode: zod.union([zod.enum(['inner', 'left']), zod.null()]).optional(),
+                personsOnEventsMode: zod
+                    .union([
+                        zod.enum([
+                            'disabled',
+                            'person_id_no_override_properties_on_events',
+                            'person_id_override_properties_on_events',
+                            'person_id_override_properties_joined',
+                        ]),
+                        zod.null(),
+                    ])
+                    .optional(),
+                propertyGroupsMode: zod.union([zod.enum(['enabled', 'disabled', 'optimized']), zod.null()]).optional(),
+                pushDownPredicates: zod.union([zod.boolean(), zod.null()]).optional(),
+                s3TableUseInvalidColumns: zod.union([zod.boolean(), zod.null()]).optional(),
+                sessionIdPushdown: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Push a `session_id_v7 IN (SELECT … FROM events WHERE …)` predicate into the raw_sessions subquery to limit aggregation to sessions that participate in the outer events filter.'
+                    ),
+                sessionPropertyPreAggregation: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Pre-filter raw_sessions aggregation by `session_id_v7 IN (cheap pre-aggregation that only materializes the columns referenced by the outer-WHERE session predicate)`. Useful when the breakdown\/SELECT pulls in many session columns (e.g. `$channel_type`) but the filter only references one (e.g. `$entry_current_url`).'
+                    ),
+                sessionTableVersion: zod.union([zod.enum(['auto', 'v1', 'v2', 'v3']), zod.null()]).optional(),
+                sessionTimestampBufferMinutes: zod
+                    .union([zod.number(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Padding, in minutes, on each side of the event time range when it filters the sessions table by session start. Defaults to 3 days. It can only narrow the range: values above the default are ignored. Lower it only for a query that keeps just the sessions that start inside its own time range.'
+                    ),
+                sessionsV2JoinMode: zod.union([zod.enum(['string', 'uuid']), zod.null()]).optional(),
+                timings: zod.union([zod.boolean(), zod.null()]).optional(),
+                typeAwareCastSimplification: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Remove provably redundant casts and nullability wrappers (e.g. `toString(String)`, `assumeNotNull(non_nullable)`, dead `ifNull` fallbacks) using inferred expression types'
+                    ),
+                useMaterializedViews: zod.union([zod.boolean(), zod.null()]).optional(),
+                useNewEventsSchema: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        "Read events from the native JSON events table (`true`) or the legacy events table (`false`). When unset, a staff person's tab switch or `ph_new_events_schema` cookie applies, then the project. A project reads the native table once PostHog has moved it there. Before that, it can opt in early by storing `true` here in its project settings. A stored `false` is ignored."
+                    ),
+                usePreaggregatedIntermediateResults: zod.union([zod.boolean(), zod.null()]).optional(),
+                usePreaggregatedTableTransforms: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        'Try to automatically convert HogQL queries to use preaggregated tables at the AST level \*'
+                    ),
+                useWebAnalyticsPreAggregatedTables: zod.union([zod.boolean(), zod.null()]).optional(),
+                webAnalyticsFirstPageviewFilters: zod
+                    .union([zod.boolean(), zod.null()])
+                    .optional()
+                    .describe(
+                        "Serve filters on the stored session-entry attribution properties (`$channel_type`, `$entry_utm_\*`, `$entry_referring_domain`) by recomputing the value from the session's first pageview. Resolved server-side; not intended to be set by clients."
+                    ),
+            })
+            .optional()
+            .describe(
+                "HogQL modifiers to use when the query runs, as an object keyed by modifier name, for example {\"convertToProjectTimezone\": true}. Only supported when 'model' is 'hogql'. Each modifier set here overrides the project modifier with the same name, and the project modifiers apply to all others. If neither sets convertToProjectTimezone, it defaults to false, so timestamps are exported in UTC. Set it to true to export timestamps in the project timezone instead. Unknown modifier names are rejected. On update, the object replaces the modifiers stored on the export, so include every modifier to keep, or send null to remove them all."
+            ),
+        data_interval_start: zod.iso
+            .datetime({ offset: true })
+            .optional()
+            .describe(
+                'Start of the export interval. Required for the events, persons, and sessions models. For HogQL, required only when the query references {data_interval_start}. A supplied start must not be in the future. When both bounds are supplied, the interval must span at most seven days.'
+            ),
+        data_interval_end: zod.iso
+            .datetime({ offset: true })
+            .optional()
+            .describe(
+                'End of the export interval. Required for the events, persons, and sessions models. For HogQL, required only when the query references {data_interval_end}. A supplied end must not be in the future or precede a supplied start. Bounds replace HogQL placeholders; they do not add filters to the query.'
+            ),
+    })
+    .describe('Request shape for counting the rows a file download batch export would produce.')

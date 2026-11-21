@@ -1,0 +1,175 @@
+import { getUiCapability, RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps/server'
+import { z } from 'zod'
+
+import {
+    classifyAuthFailure,
+    isStepUpChallengeError,
+    mapErrorToAuthResponse,
+    validateBearerToken,
+} from '@/lib/auth-errors'
+import { getPostHogClient } from '@/lib/posthog'
+import { validateCredentialForPath } from '@/lib/project-secret-key'
+import {
+    type ClientInfo,
+    parseRequestProperties,
+    type RequestProperties,
+    type Transport,
+} from '@/lib/request-properties'
+import { getRegionFromRequest } from '@/lib/routing'
+import { META_CLIENT_CAPABILITIES, parseRequestProtocolMeta } from '@/lib/stateless-protocol'
+import { extractBearerToken, sanitizeHeaderValue } from '@/lib/utils'
+
+import { trackAuthFailure } from './analytics'
+import { resolveClientIp } from './client-ip'
+import { getEdgeClientIpSigningKeys } from './constants'
+import { authFailuresTotal, clientIpResolutionsTotal } from './metrics'
+import type { HonoCtx } from './types'
+
+const InitializeParamsSchema = z.object({
+    clientInfo: z
+        .object({
+            name: z.string().optional(),
+            version: z.string().optional(),
+        })
+        .optional(),
+    protocolVersion: z.string().optional(),
+    capabilities: z.unknown().optional(),
+})
+
+const JsonRpcMessageSchema = z.object({
+    method: z.string(),
+    params: z.unknown().optional(),
+})
+
+function parseUiCapabilities(capabilities: unknown): Pick<ClientInfo, 'uiSupported'> {
+    const parsed = z
+        .object({ extensions: z.record(z.string(), z.record(z.string(), z.unknown())).optional() })
+        .safeParse(capabilities)
+    const uiCapability = getUiCapability(parsed.success ? parsed.data : undefined)
+    if (uiCapability === undefined) {
+        return { uiSupported: undefined }
+    }
+    const ui = z.object({ mimeTypes: z.array(z.string()).optional() }).safeParse(uiCapability)
+    return { uiSupported: ui.success && ui.data.mimeTypes?.includes(RESOURCE_MIME_TYPE) === true }
+}
+
+function parseClientInfo(bodyText: string): ClientInfo {
+    try {
+        const parsed = JSON.parse(bodyText)
+        const messages = Array.isArray(parsed) ? parsed : [parsed]
+        // 2026-07-28 stateless clients never send `initialize` — their identity
+        // rides in each request's `_meta`. Prefer an initialize payload when
+        // present (legacy dialect), else fall back to the first `_meta` match.
+        let metaFallback: ClientInfo | undefined
+        for (const msg of messages) {
+            const rpc = JsonRpcMessageSchema.safeParse(msg)
+            if (!rpc.success) {
+                continue
+            }
+            if (rpc.data.method === 'initialize') {
+                const params = InitializeParamsSchema.safeParse(rpc.data.params)
+                if (!params.success) {
+                    continue
+                }
+                return {
+                    clientName: sanitizeHeaderValue(params.data.clientInfo?.name),
+                    clientVersion: sanitizeHeaderValue(params.data.clientInfo?.version),
+                    protocolVersion: sanitizeHeaderValue(params.data.protocolVersion),
+                    elicitationUrlSupported: z
+                        .object({ elicitation: z.object({ url: z.object({}) }) })
+                        .safeParse(params.data.capabilities).success,
+                    ...parseUiCapabilities(params.data.capabilities),
+                }
+            }
+            if (!metaFallback) {
+                const meta = parseRequestProtocolMeta(rpc.data.params)
+                if (meta.protocolVersion || meta.clientName) {
+                    const params = z
+                        .object({ _meta: z.record(z.string(), z.unknown()).optional() })
+                        .safeParse(rpc.data.params)
+                    metaFallback = {
+                        clientName: sanitizeHeaderValue(meta.clientName),
+                        clientVersion: sanitizeHeaderValue(meta.clientVersion),
+                        protocolVersion: sanitizeHeaderValue(meta.protocolVersion),
+                        ...parseUiCapabilities(
+                            params.success ? params.data._meta?.[META_CLIENT_CAPABILITIES] : undefined
+                        ),
+                    }
+                }
+            }
+        }
+        return metaFallback ?? {}
+    } catch {}
+    return {}
+}
+
+function authenticate(c: HonoCtx): Response | null {
+    const token = extractBearerToken(c.req.raw)
+    const error =
+        validateCredentialForPath(token, c.req.raw) ??
+        validateBearerToken(token, c.req.raw, getRegionFromRequest(c.req.raw))
+    if (error) {
+        const reason = !token ? 'missing_token' : 'invalid_token'
+        authFailuresTotal.inc({ reason })
+    }
+    return error
+}
+
+async function preserveBody(c: HonoCtx): Promise<string> {
+    const raw = c.req.raw
+    const bodyText = await raw.text()
+    const fresh = new Request(raw.url, { method: raw.method, headers: raw.headers, body: bodyText })
+    Object.defineProperty(c.req, 'raw', { value: fresh, writable: true, configurable: true })
+    return bodyText
+}
+
+export async function authenticateAndParse(
+    c: HonoCtx,
+    transport: Transport
+): Promise<{ props: RequestProperties } | { error: Response }> {
+    const error = authenticate(c)
+    if (error) {
+        return { error }
+    }
+
+    const bodyText = await preserveBody(c)
+    const props = parseRequestProperties(c.req.raw, parseClientInfo(bodyText), transport)
+    props.mcpSessionId = sanitizeHeaderValue(c.req.header('mcp-session-id') || undefined)
+    props.mcpConversationId = sanitizeHeaderValue(c.req.header('mcp-conversation-id') || undefined)
+    props.region = props.region || getRegionFromRequest(c.req.raw) || undefined
+    const clientIp = await resolveClientIp(c.req.raw.headers, getEdgeClientIpSigningKeys())
+    clientIpResolutionsTotal.inc({ source: clientIp.source, edge_outcome: clientIp.edgeOutcome })
+    props.clientIp = clientIp.ip
+    if (new URL(c.req.url).searchParams.get('_deprecated') === 'sse') {
+        props.viaSseRedirect = true
+    }
+
+    return { props }
+}
+
+export function handleCatchError(error: unknown, props: RequestProperties): Response {
+    if (!isStepUpChallengeError(error)) {
+        console.error('[handleCatchError]', error)
+    }
+    const authResponse = mapErrorToAuthResponse(error)
+    if (authResponse) {
+        const reason = authResponse.status === 403 ? 'insufficient_scope' : 'invalid_token'
+        authFailuresTotal.inc({ reason })
+        trackAuthFailure(props, classifyAuthFailure(error))
+        return authResponse
+    }
+    try {
+        if (error instanceof Error) {
+            getPostHogClient().captureException(error, {
+                distinctId: props.userHash,
+                properties: {
+                    team: 'posthog_ai',
+                    source: 'mcp_hono_request',
+                    mcp_transport: props.transport,
+                    suppress_analytics: props.suppressAnalytics === true,
+                },
+            })
+        }
+    } catch {}
+    return new Response('Internal server error', { status: 500 })
+}

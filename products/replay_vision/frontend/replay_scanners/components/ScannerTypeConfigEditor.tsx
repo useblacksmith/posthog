@@ -1,0 +1,314 @@
+import { useActions, useValues } from 'kea'
+import { useCallback } from 'react'
+
+import { IconAI } from '@posthog/icons'
+import { LemonButton, LemonInput, LemonSegmentedButton, LemonSwitch, LemonTextArea } from '@posthog/lemon-ui'
+
+import { LemonField } from 'lib/lemon-ui/LemonField'
+import { LemonInputSelect } from 'lib/lemon-ui/LemonInputSelect/LemonInputSelect'
+import { useMaxTool } from 'scenes/max/useMaxTool'
+
+import { iconForType } from '~/layout/panel-layout/ProjectTree/defaultTree'
+
+import { useAttachedContext } from 'products/posthog_ai/frontend/api/logics'
+
+import { replayScannerLogic } from '../replayScannerLogic'
+import { ClassifierScannerConfig, SummarizerScannerConfig, scannerTypeLabel } from '../types'
+import { ExperimentScannerConfigFields } from './ExperimentScannerConfigFields'
+
+/** Whether this form should offer no AI help at all.
+ *
+ * The goal step is the AI path, so someone who turned it down to build by hand gets one path or the
+ * other rather than a half-AI middle. Only while creating: editing a saved scanner is not that
+ * choice, and someone who did draft with AI keeps the entry points so they can rework the draft. */
+function useManualWithoutAi(scannerId: string): boolean {
+    const { isNew, goalDraft } = useValues(replayScannerLogic({ id: scannerId }))
+    return isNew && !goalDraft
+}
+
+export const SUMMARIZER_LENGTH_OPTIONS: { value: SummarizerScannerConfig['length']; label: string }[] = [
+    { value: 'short', label: 'Short (1-2 sentences)' },
+    { value: 'medium', label: 'Medium (4-6 sentences)' },
+    { value: 'long', label: 'Long (3-5 paragraphs)' },
+]
+
+/** Prompt field with a Max entry point that drafts the prompt and fills it back into the form. */
+function ScannerPromptField({
+    scannerId,
+    placeholder,
+    label = 'Prompt and additional context',
+    caption,
+}: {
+    scannerId: string
+    placeholder: string
+    label?: string
+    caption?: string
+}): JSX.Element {
+    const logic = replayScannerLogic({ id: scannerId })
+    const { scanner, isNew, goalDraft } = useValues(logic)
+    const { setScannerValue } = useActions(logic)
+    // The AI already wrote this prompt one step ago, so offering to write it reads as a no-op.
+    const promptWasDrafted = isNew && !!goalDraft
+    const manualWithoutAi = useManualWithoutAi(scannerId)
+
+    const onDraftedPrompt = useCallback(
+        (toolOutput: { prompt?: string; error?: string }) => {
+            if (!toolOutput?.error && toolOutput?.prompt) {
+                setScannerValue(['scanner_config', 'prompt'], toolOutput.prompt)
+            }
+        },
+        [setScannerValue]
+    )
+
+    const { openMax } = useMaxTool({
+        identifier: 'draft_replay_vision_scanner_prompt',
+        active: !!scanner,
+        context: {
+            scanner_type: scanner?.scanner_type,
+            current_prompt: scanner?.scanner_config?.prompt || '',
+        },
+        contextDescription: scanner
+            ? { text: `${scannerTypeLabel(scanner.scanner_type)} scanner`, icon: iconForType('session_replay') }
+            : undefined,
+        initialMaxPrompt: promptWasDrafted
+            ? 'Help me rewrite the prompt for this scanner'
+            : 'Help me write the prompt for this scanner',
+        callback: onDraftedPrompt,
+    })
+
+    useAttachedContext(
+        scanner
+            ? [
+                  { type: 'replay_vision_scanner', key: scannerId, label: scannerTypeLabel(scanner?.scanner_type) },
+                  {
+                      type: 'replay_vision_scanner_prompt',
+                      value: JSON.stringify(scanner?.scanner_config?.prompt || ''),
+                      label: 'Current prompt',
+                  },
+              ]
+            : null,
+        { active: !!scanner }
+    )
+
+    return (
+        <div className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="text-sm font-medium">{label}</label>
+                {openMax && !manualWithoutAi && (
+                    <LemonButton
+                        size="xsmall"
+                        type="secondary"
+                        icon={<IconAI />}
+                        onClick={() => openMax()}
+                        data-attr="replay-vision-write-prompt-with-ai"
+                    >
+                        {promptWasDrafted ? 'Rewrite with PostHog AI' : 'Write with PostHog AI'}
+                    </LemonButton>
+                )}
+            </div>
+            <LemonField name="scanner_config.prompt">
+                <LemonTextArea placeholder={placeholder} minRows={6} />
+            </LemonField>
+            {caption && <div className="text-xs text-muted">{caption}</div>}
+        </div>
+    )
+}
+
+function ClassifierTagsField({ scannerId }: { scannerId: string }): JSX.Element {
+    const logic = replayScannerLogic({ id: scannerId })
+    const { scanner } = useValues(logic)
+    const { clearClassifierTags } = useActions(logic)
+
+    const config = scanner?.scanner_config as ClassifierScannerConfig | undefined
+    const hasTags = (config?.tags ?? []).length > 0
+
+    return (
+        <div className="space-y-2">
+            <LemonField
+                name="scanner_config.tags"
+                label={
+                    <span className="flex w-full flex-wrap items-center justify-between gap-2">
+                        Categories
+                        <LemonButton
+                            size="xsmall"
+                            type="secondary"
+                            disabledReason={hasTags ? undefined : 'No categories to clear'}
+                            onClick={() => clearClassifierTags()}
+                            data-attr="replay-vision-clear-categories"
+                        >
+                            Clear all
+                        </LemonButton>
+                    </span>
+                }
+            >
+                {({ value, onChange }) => (
+                    <LemonInputSelect
+                        mode="multiple"
+                        allowCustomValues
+                        placeholder="Type a category and press enter..."
+                        value={(value as string[]) ?? []}
+                        onChange={onChange}
+                        options={((value as string[]) ?? []).map((t) => ({ key: t, label: t }))}
+                    />
+                )}
+            </LemonField>
+            <div className="text-xs text-muted">The classifier sorts each session it scans into these categories.</div>
+        </div>
+    )
+}
+
+export function ScannerTypeConfigEditor({ scannerId }: { scannerId: string }): JSX.Element {
+    const { scanner } = useValues(replayScannerLogic({ id: scannerId }))
+
+    if (!scanner) {
+        return <div className="text-muted">Loading…</div>
+    }
+
+    if (scanner.scanner_type === 'summarizer') {
+        return (
+            <div className="space-y-4">
+                <ScannerPromptField
+                    scannerId={scannerId}
+                    label="Additional context"
+                    caption="The agent already knows how to summarize. Use this field to add product context or steer summaries, for example what the ideal user flow looks like."
+                    placeholder="Describe your product and what users usually come to do. Call out anything the summaries should focus on, like where users get stuck."
+                />
+                <LemonField name="scanner_config.length" label="Summary length">
+                    <LemonSegmentedButton className="max-w-full overflow-x-auto" options={SUMMARIZER_LENGTH_OPTIONS} />
+                </LemonField>
+            </div>
+        )
+    }
+
+    if (scanner.scanner_type === 'experiment') {
+        return (
+            <div className="space-y-4">
+                <ExperimentScannerConfigFields scannerId={scannerId} />
+                <ScannerPromptField
+                    scannerId={scannerId}
+                    label="What to focus on"
+                    caption="Each session gets a summary. Say what the summaries should cover, for example the step the experiment changes and where people get stuck."
+                    placeholder="Summarize what people do after they reach the checkout. Call out hesitation, errors, and where they leave."
+                />
+                <LemonField name="scanner_config.length" label="Summary length">
+                    <LemonSegmentedButton className="max-w-full overflow-x-auto" options={SUMMARIZER_LENGTH_OPTIONS} />
+                </LemonField>
+            </div>
+        )
+    }
+
+    if (scanner.scanner_type === 'monitor') {
+        return (
+            <div className="space-y-4">
+                <ScannerPromptField
+                    scannerId={scannerId}
+                    placeholder="Did the user encounter a payment failure? Answer yes or no with a one-sentence reason."
+                    caption="Your prompt is the condition to check each session for. Include anything the agent should know about your product or this flow."
+                />
+                <LemonField name="scanner_config.allow_inconclusive">
+                    {({ value, onChange }) => (
+                        <div className="flex items-center gap-2">
+                            <LemonSwitch checked={!!value} onChange={onChange} />
+                            <div>
+                                <div className="text-sm font-medium">Allow inconclusive verdicts</div>
+                                <div className="text-xs text-muted">
+                                    Lets the model answer inconclusive when the recording doesn't contain enough
+                                    evidence to decide. Otherwise it must commit to yes or no.
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </LemonField>
+            </div>
+        )
+    }
+
+    if (scanner.scanner_type === 'classifier') {
+        return (
+            <div className="space-y-4">
+                <ScannerPromptField
+                    scannerId={scannerId}
+                    placeholder="Categorize this session by what the user came to do: first-time setup, regular work, exploring features, or troubleshooting a problem. If they did several, pick the one they spent the most time on."
+                    caption="Your prompt tells the agent how to decide which of your categories fit each session. Include anything the agent should know about your product or this flow."
+                />
+                <ClassifierTagsField scannerId={scannerId} />
+                <LemonField name="scanner_config.multi_label">
+                    {({ value, onChange }) => (
+                        <div className="flex items-center gap-2">
+                            <LemonSwitch checked={!!value} onChange={onChange} />
+                            <div>
+                                <div className="text-sm font-medium">Allow multiple categories per session</div>
+                                <div className="text-xs text-muted">
+                                    Otherwise the model picks exactly one of your categories.
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </LemonField>
+                <LemonField name="scanner_config.allow_freeform_tags">
+                    {({ value, onChange }) => (
+                        <div className="flex items-center gap-2">
+                            <LemonSwitch checked={!!value} onChange={onChange} />
+                            <div>
+                                <div className="text-sm font-medium">Allow freeform categories</div>
+                                <div className="text-xs text-muted">
+                                    Lets the model use categories outside the ones you defined.
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </LemonField>
+            </div>
+        )
+    }
+
+    if (scanner.scanner_type === 'scorer') {
+        return (
+            <div className="space-y-4">
+                <ScannerPromptField
+                    scannerId={scannerId}
+                    placeholder="Rate how frustrated the user appeared during this session. Smooth progress scores low. Rage clicks, repeated retries, and giving up mid-task score high."
+                    caption="Your prompt is what the agent scores each session on, using the scale below. Include anything the agent should know about your product or this flow."
+                />
+                <LemonField name="scanner_config.scale">
+                    {({ value, onChange, error }) => {
+                        const scale = (value as { min: number; max: number; label?: string }) ?? { min: 0, max: 10 }
+                        return (
+                            <div className="space-y-3">
+                                <div className="space-y-1">
+                                    <label className="block text-sm font-medium">Scale</label>
+                                    <div className="flex items-center gap-3 max-w-md">
+                                        <LemonInput
+                                            type="number"
+                                            value={Number.isFinite(scale.min) ? scale.min : undefined}
+                                            onChange={(v) => onChange({ ...scale, min: v ?? Number.NaN })}
+                                            prefix={<span className="text-muted text-xs">min</span>}
+                                        />
+                                        <span className="text-muted">to</span>
+                                        <LemonInput
+                                            type="number"
+                                            value={Number.isFinite(scale.max) ? scale.max : undefined}
+                                            onChange={(v) => onChange({ ...scale, max: v ?? Number.NaN })}
+                                            prefix={<span className="text-muted text-xs">max</span>}
+                                        />
+                                    </div>
+                                    {error && <div className="text-xs text-danger">{error}</div>}
+                                </div>
+                                <div className="space-y-1">
+                                    <label className="block text-sm font-medium">Score label (optional)</label>
+                                    <LemonInput
+                                        value={scale.label ?? ''}
+                                        onChange={(v) => onChange({ ...scale, label: v || undefined })}
+                                        placeholder="frustration"
+                                    />
+                                </div>
+                            </div>
+                        )
+                    }}
+                </LemonField>
+            </div>
+        )
+    }
+
+    return <div className="text-muted text-sm">Unsupported scanner type.</div>
+}

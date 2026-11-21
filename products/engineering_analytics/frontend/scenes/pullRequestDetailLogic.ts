@@ -1,0 +1,752 @@
+import { MakeLogicType, actions, afterMount, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { router } from 'kea-router'
+
+import { ApiConfig } from 'lib/api'
+
+import { Breadcrumb } from '~/types'
+
+import {
+    engineeringAnalyticsCiFailureLogs,
+    engineeringAnalyticsPrCost,
+    engineeringAnalyticsPrLifecycle,
+    engineeringAnalyticsPrRuns,
+    engineeringAnalyticsPullRequestFriction,
+    engineeringAnalyticsPullRequestTimelines,
+    engineeringAnalyticsWorkflowJobs,
+} from '../generated/api'
+import type {
+    CIEngineEnumApi,
+    CIFailureLogsApi,
+    PRCostSummaryApi,
+    PRLifecycleApi,
+    PRTimelineApi,
+    PullRequestFrictionDetailApi,
+    PullRequestTimelinesApi,
+    WorkflowJobApi,
+    WorkflowRunDetailApi,
+} from '../generated/api.schemas'
+import { failedShardsLabel, groupJobs } from '../lib/jobGroups'
+import { jobCacheKey } from '../lib/jobs'
+import { WorkflowRun, isDecisiveFailure, isPassingConclusion } from '../lib/lifecycle'
+import { repoBreadcrumbs } from '../lib/repoBreadcrumbs'
+
+const projectId = (): string => String(ApiConfig.getCurrentProjectId())
+
+export interface PullRequestDetailLogicProps {
+    repoOwner: string
+    repoName: string
+    number: number
+    sourceId: string | null
+}
+
+/** Failures first, then running, then passes, which is the order a reviewer triages in. */
+export function sortRunsForTriage(runs: WorkflowRun[]): WorkflowRun[] {
+    const rank = (run: WorkflowRun): number =>
+        run.conclusion === null ? 1 : isPassingConclusion(run.conclusion) ? 2 : 0
+    return [...runs].sort((a, b) => rank(a) - rank(b) || a.workflow.localeCompare(b.workflow))
+}
+
+// A broken push must not fan the eager "what failed" job fetches out into dozens of requests.
+const MAX_FAILING_JOB_FETCHES = 6
+
+/** Counts the latest run per workflow on the newest push. */
+export interface LatestPushStats {
+    headSha: string
+    total: number
+    green: number
+    running: number
+    failingWorkflows: string[]
+}
+
+export function computeLatestPushStats(group: PrCommitRuns | undefined): LatestPushStats | null {
+    if (!group) {
+        return null
+    }
+    const latestByWorkflow = new Map<string, WorkflowRun>()
+    for (const run of group.runs) {
+        const seen = latestByWorkflow.get(run.workflow)
+        if (!seen || (run.startedAt ?? '') > (seen.startedAt ?? '')) {
+            latestByWorkflow.set(run.workflow, run)
+        }
+    }
+    const latest = Array.from(latestByWorkflow.values())
+    return {
+        headSha: group.headSha,
+        total: latest.length,
+        green: latest.filter((run) => run.conclusion != null && isPassingConclusion(run.conclusion)).length,
+        running: latest.filter((run) => run.conclusion == null).length,
+        failingWorkflows: latest
+            .filter((run) => run.conclusion != null && !isPassingConclusion(run.conclusion))
+            .map((run) => run.workflow)
+            .sort(),
+    }
+}
+
+/** Each workflow's latest run on the PR, across pushes. */
+export function latestRunPerWorkflow(runs: PrRunRow[]): Map<string, PrRunRow> {
+    const latest = new Map<string, PrRunRow>()
+    for (const run of runs) {
+        const seen = latest.get(run.workflow)
+        if (!seen || (run.startedAt ?? '') > (seen.startedAt ?? '')) {
+            latest.set(run.workflow, run)
+        }
+    }
+    return latest
+}
+
+export interface PrCommitRuns {
+    headSha: string
+    headBranch: string
+    runs: WorkflowRun[]
+    latestStart: string | null
+}
+
+export interface PrRunRow extends WorkflowRun {
+    headSha: string
+    headBranch: string
+}
+
+export interface PrWorkflowRow {
+    workflowName: string
+    runCount: number
+    p50Seconds: number | null
+    estimatedCostUsd: number | null
+}
+
+/** Nearest-rank percentile. */
+function percentile(values: number[], q: number): number | null {
+    if (values.length === 0) {
+        return null
+    }
+    const sorted = [...values].sort((a, b) => a - b)
+    return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1))]
+}
+
+function toWorkflowRun(run: WorkflowRunDetailApi): WorkflowRun {
+    return {
+        workflow: run.workflow_name,
+        workflowId: run.workflow_id ?? null,
+        event: run.event ?? null,
+        conclusion: run.conclusion,
+        startedAt: run.run_started_at,
+        finishedAt: run.status === 'completed' ? run.updated_at : null,
+        updatedAt: run.updated_at,
+        durationSeconds: run.duration_seconds,
+        runId: run.id,
+        ciEngine: run.ci_engine,
+        runAttempt: run.run_attempt,
+    }
+}
+
+export { jobCacheKey }
+
+/** Newest push first. */
+export function groupRunsByCommit(prRuns: WorkflowRunDetailApi[]): PrCommitRuns[] {
+    const byCommit = new Map<string, WorkflowRunDetailApi[]>()
+    for (const run of prRuns) {
+        const group = byCommit.get(run.head_sha) ?? []
+        group.push(run)
+        byCommit.set(run.head_sha, group)
+    }
+    const groups = [...byCommit.entries()].map(([headSha, runs]) => ({
+        headSha,
+        headBranch: runs[0]?.head_branch ?? '',
+        runs: runs.map(toWorkflowRun),
+        latestStart: runs.reduce<string | null>((max, run) => {
+            const started = run.run_started_at
+            return started && started > (max ?? '') ? started : max
+        }, null),
+    }))
+    groups.sort((a, b) => (b.latestStart ?? '').localeCompare(a.latestStart ?? ''))
+    return groups
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface pullRequestDetailLogicValues {
+    authoredRuns: WorkflowRunDetailApi[]
+    breadcrumbs: Breadcrumb[]
+    commitGroups: PrCommitRuns[]
+    expandedRunKeys: string[]
+    failingJobLabelByWorkflow: Record<string, string>
+    failureLogs: CIFailureLogsApi | 'unavailable' | null
+    failureLogsLoading: boolean
+    filteredCommitGroups: PrCommitRuns[]
+    filteredPrWorkflowRows: PrWorkflowRow[]
+    filteredRuns: PrRunRow[]
+    friction: PullRequestFrictionDetailApi | null
+    frictionFailed: boolean
+    frictionLoading: boolean
+    latestPushStats: LatestPushStats | null
+    lifecycle: PRLifecycleApi | null
+    lifecycleLoading: boolean
+    loadFailed: boolean
+    prCost: PRCostSummaryApi | null
+    prCostFailed: boolean
+    prCostLoading: boolean
+    prRuns: WorkflowRunDetailApi[]
+    prRunsFailed: boolean
+    prRunsLoading: boolean
+    prWorkflowRows: PrWorkflowRow[]
+    pushes: number
+    repoName: string
+    repoOwner: string
+    rerunCycles: number
+    runCostByKey: Record<
+        string,
+        {
+            cost: number | null
+            minutes: number | null
+        }
+    >
+    runJobs: Record<string, WorkflowJobApi[]>
+    runJobsLoading: boolean
+    runs: WorkflowRun[]
+    sourceId: string | null
+    timeline: PRTimelineApi | null
+    timelines: PullRequestTimelinesApi | null
+    timelinesFailed: boolean
+    timelinesLoading: boolean
+    workflowFilter: string
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface pullRequestDetailLogicActions {
+    loadFailureLogs: () => any
+    loadFailureLogsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadFailureLogsSuccess: (
+        failureLogs: CIFailureLogsApi | 'unavailable',
+        payload?: any
+    ) => {
+        failureLogs: CIFailureLogsApi | 'unavailable'
+        payload?: any
+    }
+    loadFriction: () => any
+    loadFrictionFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadFrictionSuccess: (
+        friction: PullRequestFrictionDetailApi,
+        payload?: any
+    ) => {
+        friction: PullRequestFrictionDetailApi
+        payload?: any
+    }
+    loadJobs: ({
+        ciEngine,
+        runId,
+        runAttempt,
+    }: {
+        ciEngine?: CIEngineEnumApi | null
+        runAttempt: number | null
+        runId: number
+    }) => {
+        ciEngine?: CIEngineEnumApi | null
+        runId: number
+        runAttempt: number | null
+    }
+    loadJobsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadJobsSuccess: (
+        runJobs: Record<string, WorkflowJobApi[]>,
+        payload?: {
+            ciEngine?: CIEngineEnumApi | null
+            runId: number
+            runAttempt: number | null
+        }
+    ) => {
+        runJobs: Record<string, WorkflowJobApi[]>
+        payload?: {
+            ciEngine?: CIEngineEnumApi | null
+            runId: number
+            runAttempt: number | null
+        }
+    }
+    loadLifecycle: () => any
+    loadLifecycleFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadLifecycleSuccess: (
+        lifecycle: PRLifecycleApi | null,
+        payload?: any
+    ) => {
+        lifecycle: PRLifecycleApi | null
+        payload?: any
+    }
+    loadPrCost: () => any
+    loadPrCostFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadPrCostSuccess: (
+        prCost: PRCostSummaryApi | null,
+        payload?: any
+    ) => {
+        prCost: PRCostSummaryApi | null
+        payload?: any
+    }
+    loadPrRuns: () => any
+    loadPrRunsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadPrRunsSuccess: (
+        prRuns: WorkflowRunDetailApi[],
+        payload?: any
+    ) => {
+        prRuns: WorkflowRunDetailApi[]
+        payload?: any
+    }
+    loadTimelines: () => any
+    loadTimelinesFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadTimelinesSuccess: (
+        timelines: PullRequestTimelinesApi,
+        payload?: any
+    ) => {
+        timelines: PullRequestTimelinesApi
+        payload?: any
+    }
+    setRunExpanded: (
+        rowKey: string,
+        expanded: boolean,
+        runId: number | null,
+        runAttempt: number | null,
+        ciEngine?: CIEngineEnumApi | null
+    ) => {
+        ciEngine: CIEngineEnumApi | null | undefined
+        expanded: boolean
+        rowKey: string
+        runAttempt: number | null
+        runId: number | null
+    }
+    setWorkflowFilter: (filter: string) => {
+        filter: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface pullRequestDetailLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        sourceId: (arg: string | null) => string | null
+        repoOwner: (arg: string) => string
+        repoName: (arg: string) => string
+        runs: (prRuns: WorkflowRunDetailApi[]) => WorkflowRun[]
+        commitGroups: (prRuns: WorkflowRunDetailApi[]) => PrCommitRuns[]
+        filteredCommitGroups: (commitGroups: PrCommitRuns[], workflowFilter: string) => PrCommitRuns[]
+        filteredRuns: (filteredCommitGroups: PrCommitRuns[]) => PrRunRow[]
+        prWorkflowRows: (commitGroups: PrCommitRuns[], prCost: PRCostSummaryApi | null) => PrWorkflowRow[]
+        runCostByKey: (prCost: PRCostSummaryApi | null) => Record<
+            string,
+            {
+                cost: number | null
+                minutes: number | null
+            }
+        >
+        filteredPrWorkflowRows: (prWorkflowRows: PrWorkflowRow[], workflowFilter: string) => PrWorkflowRow[]
+        latestPushStats: (commitGroups: PrCommitRuns[]) => LatestPushStats | null
+        failingJobLabelByWorkflow: (
+            filteredRuns: PrRunRow[],
+            runJobs: Record<string, WorkflowJobApi[]>
+        ) => Record<string, string>
+        authoredRuns: (prRuns: WorkflowRunDetailApi[]) => WorkflowRunDetailApi[]
+        pushes: (authoredRuns: WorkflowRunDetailApi[]) => number
+        rerunCycles: (authoredRuns: WorkflowRunDetailApi[]) => number
+        timeline: (timelines: PullRequestTimelinesApi | null) => PRTimelineApi | null
+        breadcrumbs: (
+            repoOwner: string,
+            repoName: string,
+            sourceId: string | null,
+            searchParams: Record<string, any>
+        ) => Breadcrumb[]
+    }
+}
+
+export type pullRequestDetailLogicType = MakeLogicType<
+    pullRequestDetailLogicValues,
+    pullRequestDetailLogicActions,
+    PullRequestDetailLogicProps,
+    pullRequestDetailLogicMeta
+>
+
+export const pullRequestDetailLogic = kea<pullRequestDetailLogicType>([
+    path(['products', 'engineering_analytics', 'frontend', 'scenes', 'pullRequestDetailLogic']),
+    props({} as PullRequestDetailLogicProps),
+    // sourceId is part of the identity: the same PR number can resolve to a different source.
+    key((props) => `${props.repoOwner}/${props.repoName}#${props.number}@${props.sourceId ?? ''}`),
+
+    actions({
+        // Re-runs share a run_id, so row expansion uses a per-row key. Jobs are fetched per run and attempt.
+        setRunExpanded: (
+            rowKey: string,
+            expanded: boolean,
+            runId: number | null,
+            runAttempt: number | null,
+            ciEngine?: CIEngineEnumApi | null
+        ) => ({
+            ciEngine,
+            rowKey,
+            expanded,
+            runId,
+            runAttempt,
+        }),
+        setWorkflowFilter: (filter: string) => ({ filter }),
+    }),
+
+    loaders(({ props, values }) => ({
+        lifecycle: [
+            null as PRLifecycleApi | null,
+            {
+                loadLifecycle: async (): Promise<PRLifecycleApi | null> =>
+                    await engineeringAnalyticsPrLifecycle(projectId(), {
+                        pr_number: props.number,
+                        repo: `${props.repoOwner}/${props.repoName}`,
+                        source_id: props.sourceId ?? undefined,
+                    }),
+            },
+        ],
+        prRuns: [
+            [] as WorkflowRunDetailApi[],
+            {
+                loadPrRuns: async (): Promise<WorkflowRunDetailApi[]> =>
+                    await engineeringAnalyticsPrRuns(projectId(), {
+                        pr_number: props.number,
+                        repo: `${props.repoOwner}/${props.repoName}`,
+                        source_id: props.sourceId ?? undefined,
+                    }),
+            },
+        ],
+        timelines: [
+            null as PullRequestTimelinesApi | null,
+            {
+                loadTimelines: async (): Promise<PullRequestTimelinesApi> =>
+                    await engineeringAnalyticsPullRequestTimelines(projectId(), {
+                        pr_number: props.number,
+                        repo: `${props.repoOwner}/${props.repoName}`,
+                        source_id: props.sourceId ?? undefined,
+                    }),
+            },
+        ],
+        prCost: [
+            null as PRCostSummaryApi | null,
+            {
+                loadPrCost: async (): Promise<PRCostSummaryApi | null> =>
+                    await engineeringAnalyticsPrCost(projectId(), {
+                        pr_number: props.number,
+                        repo: `${props.repoOwner}/${props.repoName}`,
+                        source_id: props.sourceId ?? undefined,
+                    }),
+            },
+        ],
+        friction: [
+            null as PullRequestFrictionDetailApi | null,
+            {
+                loadFriction: async (): Promise<PullRequestFrictionDetailApi> =>
+                    await engineeringAnalyticsPullRequestFriction(projectId(), {
+                        pr_number: props.number,
+                        repo: `${props.repoOwner}/${props.repoName}`,
+                        source_id: props.sourceId ?? undefined,
+                    }),
+            },
+        ],
+        // Fetched only once a decisive failure is known. 'unavailable' means the fetch itself failed.
+        failureLogs: [
+            null as CIFailureLogsApi | 'unavailable' | null,
+            {
+                loadFailureLogs: async (): Promise<CIFailureLogsApi | 'unavailable'> => {
+                    try {
+                        return await engineeringAnalyticsCiFailureLogs(projectId(), {
+                            pr_number: props.number,
+                            repo: `${props.repoOwner}/${props.repoName}`,
+                            source_id: props.sourceId ?? undefined,
+                        })
+                    } catch {
+                        return 'unavailable'
+                    }
+                },
+            },
+        ],
+        runJobs: [
+            {} as Record<string, WorkflowJobApi[]>,
+            {
+                // values.runJobs is read after the await, so two near-simultaneous first expands do not
+                // overwrite each other.
+                loadJobs: async ({
+                    ciEngine,
+                    runId,
+                    runAttempt,
+                }: {
+                    ciEngine?: CIEngineEnumApi | null
+                    runId: number
+                    runAttempt: number | null
+                }): Promise<Record<string, WorkflowJobApi[]>> => {
+                    const jobs = await engineeringAnalyticsWorkflowJobs(projectId(), {
+                        run_id: runId,
+                        ci_engine: ciEngine ?? undefined,
+                        run_attempt: runAttempt ?? undefined,
+                        source_id: props.sourceId ?? undefined,
+                        repo: `${props.repoOwner}/${props.repoName}`,
+                    })
+                    return { ...values.runJobs, [jobCacheKey(runId, runAttempt, ciEngine)]: jobs }
+                },
+            },
+        ],
+    })),
+
+    reducers({
+        loadFailed: [
+            false,
+            {
+                loadLifecycle: () => false,
+                loadLifecycleSuccess: () => false,
+                loadLifecycleFailure: () => true,
+            },
+        ],
+        // Separate from loadFailed so a runs-load failure errors the CI-runs section, not the header.
+        prRunsFailed: [
+            false,
+            {
+                loadPrRuns: () => false,
+                loadPrRunsSuccess: () => false,
+                loadPrRunsFailure: () => true,
+            },
+        ],
+        prCostFailed: [
+            false,
+            {
+                loadPrCost: () => false,
+                loadPrCostSuccess: () => false,
+                loadPrCostFailure: () => true,
+            },
+        ],
+        timelinesFailed: [false, { loadTimelines: () => false, loadTimelinesFailure: () => true }],
+        frictionFailed: [false, { loadFriction: () => false, loadFrictionFailure: () => true }],
+        expandedRunKeys: [
+            [] as string[],
+            {
+                setRunExpanded: (state, { rowKey, expanded }) =>
+                    expanded ? Array.from(new Set([...state, rowKey])) : state.filter((key) => key !== rowKey),
+            },
+        ],
+        workflowFilter: ['', { setWorkflowFilter: (_, { filter }) => filter }],
+    }),
+
+    listeners(({ actions, values }) => ({
+        setRunExpanded: ({ expanded, runId, runAttempt, ciEngine }) => {
+            if (expanded && runId != null && !(jobCacheKey(runId, runAttempt, ciEngine) in values.runJobs)) {
+                actions.loadJobs({ runId, runAttempt, ciEngine })
+            }
+        },
+        // Only a merged pull request has friction, so an open one skips the read.
+        loadLifecycleSuccess: ({ lifecycle }) => {
+            if (lifecycle?.pull_request?.state === 'merged') {
+                actions.loadFriction()
+            }
+        },
+        // Failure logs exist only once something failed, so skip the Logs query otherwise.
+        loadPrRunsSuccess: () => {
+            if (values.prRuns.some((run) => isDecisiveFailure(run.conclusion))) {
+                actions.loadFailureLogs()
+            }
+            // The table names what failed, so fetch the jobs of each failing workflow's latest run now.
+            Array.from(latestRunPerWorkflow(values.filteredRuns).values())
+                .filter((run) => run.conclusion != null && !isPassingConclusion(run.conclusion))
+                .slice(0, MAX_FAILING_JOB_FETCHES)
+                .forEach((run) => {
+                    if (
+                        run.runId != null &&
+                        !(jobCacheKey(run.runId, run.runAttempt, run.ciEngine) in values.runJobs)
+                    ) {
+                        actions.loadJobs({ runId: run.runId, runAttempt: run.runAttempt, ciEngine: run.ciEngine })
+                    }
+                })
+        },
+    })),
+
+    selectors({
+        sourceId: [
+            () => [(_, p: PullRequestDetailLogicProps) => p.sourceId],
+            (sourceId: string | null): string | null => sourceId,
+        ],
+        repoOwner: [
+            () => [(_, p: PullRequestDetailLogicProps) => p.repoOwner],
+            (repoOwner: string): string => repoOwner,
+        ],
+        repoName: [() => [(_, p: PullRequestDetailLogicProps) => p.repoName], (repoName: string): string => repoName],
+        runs: [(s) => [s.prRuns], (prRuns: WorkflowRunDetailApi[]): WorkflowRun[] => prRuns.map(toWorkflowRun)],
+        commitGroups: [
+            (s) => [s.prRuns],
+            (prRuns: WorkflowRunDetailApi[]): PrCommitRuns[] => groupRunsByCommit(prRuns),
+        ],
+        filteredCommitGroups: [
+            (s) => [s.commitGroups, s.workflowFilter],
+            (commitGroups: PrCommitRuns[], workflowFilter: string): PrCommitRuns[] => {
+                const query = workflowFilter.trim().toLowerCase()
+                if (!query) {
+                    return commitGroups
+                }
+                return commitGroups
+                    .map((group) => ({
+                        ...group,
+                        runs: group.runs.filter((run) => run.workflow.toLowerCase().includes(query)),
+                    }))
+                    .filter((group) => group.runs.length > 0)
+            },
+        ],
+        filteredRuns: [
+            (s) => [s.filteredCommitGroups],
+            (groups: PrCommitRuns[]): PrRunRow[] =>
+                groups.flatMap((group) =>
+                    group.runs.map((run) => ({ ...run, headSha: group.headSha, headBranch: group.headBranch }))
+                ),
+        ],
+        prWorkflowRows: [
+            (s) => [s.commitGroups, s.prCost],
+            (commitGroups: PrCommitRuns[], prCost: PRCostSummaryApi | null): PrWorkflowRow[] => {
+                const costByWorkflow = new Map((prCost?.by_workflow ?? []).map((cost) => [cost.workflow_name, cost]))
+                const workflowNames: string[] = []
+                const seen = new Set<string>()
+                for (const group of commitGroups) {
+                    for (const run of group.runs) {
+                        if (!seen.has(run.workflow)) {
+                            seen.add(run.workflow)
+                            workflowNames.push(run.workflow)
+                        }
+                    }
+                }
+                return workflowNames.map((workflowName): PrWorkflowRow => {
+                    const all = commitGroups.flatMap((group) =>
+                        group.runs.filter((run) => run.workflow === workflowName)
+                    )
+                    const durations = all
+                        .filter((run) => run.conclusion !== null)
+                        .map((run) => run.durationSeconds)
+                        .filter((d): d is number => d != null)
+                    return {
+                        workflowName,
+                        runCount: all.length,
+                        p50Seconds: percentile(durations, 0.5),
+                        estimatedCostUsd: costByWorkflow.get(workflowName)?.estimated_cost_usd ?? null,
+                    }
+                })
+            },
+        ],
+        // Keyed by jobCacheKey. Empty when the job source isn't synced.
+        runCostByKey: [
+            (s) => [s.prCost],
+            (prCost: PRCostSummaryApi | null): Record<string, { minutes: number | null; cost: number | null }> => {
+                const map: Record<string, { minutes: number | null; cost: number | null }> = {}
+                for (const rc of prCost?.by_run ?? []) {
+                    map[jobCacheKey(rc.run_id, rc.run_attempt, rc.ci_engine)] = {
+                        minutes: rc.billable_minutes,
+                        cost: rc.estimated_cost_usd,
+                    }
+                }
+                return map
+            },
+        ],
+        filteredPrWorkflowRows: [
+            (s) => [s.prWorkflowRows, s.workflowFilter],
+            (rows: PrWorkflowRow[], workflowFilter: string): PrWorkflowRow[] => {
+                const query = workflowFilter.trim().toLowerCase()
+                return query ? rows.filter((row) => row.workflowName.toLowerCase().includes(query)) : rows
+            },
+        ],
+        latestPushStats: [
+            (s) => [s.commitGroups],
+            (commitGroups: PrCommitRuns[]): LatestPushStats | null => computeLatestPushStats(commitGroups[0]),
+        ],
+        // A workflow with no entry has jobs that are not loaded yet.
+        failingJobLabelByWorkflow: [
+            (s) => [s.filteredRuns, s.runJobs],
+            (filteredRuns: PrRunRow[], runJobs: Record<string, WorkflowJobApi[]>): Record<string, string> => {
+                const labels: Record<string, string> = {}
+                for (const [workflow, run] of latestRunPerWorkflow(filteredRuns)) {
+                    if (run.conclusion == null || isPassingConclusion(run.conclusion) || run.runId == null) {
+                        continue
+                    }
+                    const jobs = runJobs[jobCacheKey(run.runId, run.runAttempt, run.ciEngine)]
+                    if (!jobs) {
+                        continue
+                    }
+                    const failing = groupJobs(jobs).filter((group) => group.failed.length > 0)
+                    if (failing.length) {
+                        labels[workflow] = failing
+                            .map((group) =>
+                                group.jobs.length > 1 ? `${group.base} (${failedShardsLabel(group)})` : group.base
+                            )
+                            .join(' · ')
+                    }
+                }
+                return labels
+            },
+        ],
+        // Drops merge-queue gate attempts, whose head SHAs the author never pushed. Mirrors the
+        // backend's push-activity query (`pull_request_list.py`), so push counts agree between the PR list and this page.
+        authoredRuns: [
+            (s) => [s.prRuns],
+            (prRuns: WorkflowRunDetailApi[]): WorkflowRunDetailApi[] => prRuns.filter((run) => !run.is_merge_queue),
+        ],
+        pushes: [
+            (s) => [s.authoredRuns],
+            (authoredRuns: WorkflowRunDetailApi[]): number => new Set(authoredRuns.map((run) => run.head_sha)).size,
+        ],
+        rerunCycles: [
+            (s) => [s.authoredRuns],
+            (authoredRuns: WorkflowRunDetailApi[]): number =>
+                authoredRuns.filter((run) => (run.run_attempt ?? 1) > 1).length,
+        ],
+        timeline: [
+            (s) => [s.timelines],
+            (timelines: PullRequestTimelinesApi | null): PRTimelineApi | null =>
+                timelines?.items.find((item) => item.segments.length > 0) ?? null,
+        ],
+        breadcrumbs: [
+            (s, p) => [p.repoOwner, p.repoName, s.sourceId, router.selectors.searchParams],
+            (
+                repoOwner: string,
+                repoName: string,
+                sourceId: string | null,
+                searchParams: Record<string, string | undefined>
+            ): Breadcrumb[] => repoBreadcrumbs(`${repoOwner}/${repoName}`, searchParams, sourceId),
+        ],
+    }),
+
+    afterMount(({ actions }) => {
+        actions.loadLifecycle()
+        actions.loadPrRuns()
+        actions.loadTimelines()
+        actions.loadPrCost()
+    }),
+])

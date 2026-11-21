@@ -1,0 +1,685 @@
+import math
+import time
+import uuid
+import random
+import dataclasses
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from enum import StrEnum
+from functools import wraps
+from time import sleep
+from typing import TYPE_CHECKING, Optional
+
+import structlog
+from celery import current_task
+from prometheus_client import Counter
+
+from posthog import redis, settings
+from posthog.clickhouse.backoff import ExponentialBackoff
+from posthog.clickhouse.query_tagging import (
+    Product,
+    add_fallback_query_tags,
+    get_query_tag_value,
+    get_query_tags,
+    is_api_key_access_method,
+    tag_queries,
+)
+from posthog.constants import AvailableFeature
+from posthog.dataclasses import frozen
+from posthog.schema_enums import ProductKey
+from posthog.settings import TEST
+from posthog.utils import generate_short_id
+
+if TYPE_CHECKING:
+    from posthog.models.team import Team
+
+# Default concurrency limits
+DEFAULT_APP_ORG_CONCURRENT_QUERIES = 20
+DEFAULT_APP_DASHBOARD_CONCURRENT_QUERIES = 6
+DEFAULT_APP_TELEMETRY_CONCURRENT_QUERIES = 12
+
+
+class QueryLane(StrEnum):
+    """Which per-organization app limits a query takes its slots from."""
+
+    ANALYTICS = "analytics"
+    TELEMETRY = "telemetry"
+
+
+CONCURRENT_QUERY_LIMIT_EXCEEDED_COUNTER = Counter(
+    "posthog_clickhouse_query_concurrency_limit_exceeded",
+    "Number of times a team tried to exceed concurrency limit.",
+    ["task_name", "team_id", "limit", "limit_name", "result", "product"],
+)
+
+# The `product` label is derived from query tags that originate in a client-supplied productKey.
+# Restricting it to known product values keeps the Prometheus series count bounded — an arbitrary
+# tag can never mint a new series.
+_KNOWN_PRODUCT_LABELS: frozenset[str] = frozenset(p.value for p in Product) | frozenset(p.value for p in ProductKey)
+
+logger = structlog.get_logger(__name__)
+
+CONCURRENT_QUERY_QUEUE_WAIT_COUNTER = Counter(
+    "posthog_clickhouse_query_concurrency_queue_wait",
+    "Queries that found a limiter full and queued for a slot, by how the wait ended.",
+    ["limit_name", "result"],
+)
+
+CONCURRENT_TASKS_LIMIT_EXCEEDED_COUNTER = Counter(
+    "posthog_celery_task_concurrency_limit_exceeded",
+    "Number of times a Celery task exceeded the concurrency limit",
+    ["task_name", "limit", "limit_name"],
+)
+
+# Lua script for atomic check, remove expired if limit hit, and increment with TTL
+lua_script = """
+local key = KEYS[1]
+local current_time = tonumber(ARGV[1])
+local task_id = ARGV[2]
+local max_concurrent_tasks = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+local expiration_time = current_time + ttl
+
+-- Check the number of current running tasks
+local running_tasks_count = redis.call('ZCARD', key)
+if running_tasks_count >= max_concurrent_tasks then
+    -- Remove expired tasks if limit is hit
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', current_time)
+    running_tasks_count = redis.call('ZCARD', key)
+    if running_tasks_count >= max_concurrent_tasks then
+        return 0
+    end
+end
+
+-- Add the new task with its expiration time
+redis.call('ZADD', key, expiration_time, task_id)
+return 1
+"""
+
+
+def _is_in_temporal() -> bool:
+    try:
+        from temporalio import activity, workflow
+
+        return workflow.in_workflow() or activity.in_activity()
+    except ImportError:
+        return False
+
+
+@frozen
+class ConcurrencySlot:
+    """An acquired concurrency slot: the Redis sorted-set key and the member to remove on release."""
+
+    running_tasks_key: str
+    task_id: str
+
+
+@dataclasses.dataclass(frozen=False)
+class QueueWait:
+    """Lets a caller wait for a slot on a full limiter instead of failing at once.
+
+    One instance is shared by every limiter a query takes, so the query waits at most `timeout` seconds in total.
+    """
+
+    timeout: float = 10.0
+    # Waiters per team beyond this multiple of the limit fail at once, since few of them would get a slot in time.
+    waiters_per_slot: int = 2
+    waited: float = 0.0
+
+
+# Mutable by design: tests inject fake clocks by assigning get_time and sleep after construction
+@dataclasses.dataclass(frozen=False)
+class RateLimit:
+    """
+    Ensures that only max_concurrency of tasks_name are executed at a given time.
+    Tasks have ttl as a safeguard against not being removed.
+    """
+
+    max_concurrency: int
+    limit_name: str
+    get_task_name: Callable
+    get_task_id: Callable
+    get_task_key: Optional[Callable] = None
+    applicable: Optional[Callable] = None  # allows to put a constraint on when rate limiting is used
+    ttl: int = 60
+    bypass_all: bool = False
+    redis_client = redis.get_client()
+    retry: Optional[float] = None
+    retry_timeout: float = 10.0  # seconds
+    apply_clickhouse_kill_switch: bool = True
+    allow_team_bypass: bool = True
+    get_time: Callable[[], float] = lambda: time.time()
+    sleep: Callable[[float], None] = lambda d: sleep(d)
+    retry_jitter: bool = False
+
+    @contextmanager
+    def run(self, *args, queue_wait: Optional[QueueWait] = None, **kwargs):
+        applicable = not self.applicable or self.applicable(*args, **kwargs)
+
+        slot = self.use(*args, queue_wait=queue_wait, **kwargs) if applicable else None
+
+        try:
+            yield
+        finally:
+            if slot is not None:
+                self.release(slot)
+
+    def use(self, *args, queue_wait: Optional[QueueWait] = None, **kwargs) -> Optional[ConcurrencySlot]:
+        """
+        Acquire the resource before execution or throw exception.
+        Returns None when the limiter let the caller through without taking a slot (bypass).
+        With `queue_wait`, a full limiter makes the caller wait for a slot before it throws.
+        """
+        wait_deadline = self.get_time() + self.retry_timeout
+        task_name = self.get_task_name(*args, **kwargs)
+        running_tasks_key = self.get_task_key(*args, **kwargs) if self.get_task_key else task_name
+        task_id = self.get_task_id(*args, **kwargs)
+        team_id: Optional[int] = kwargs.get("team_id", None)
+        # Attribute blocks to the originating product surface (web_analytics, product_analytics, …)
+        # so we can track which product a saturated org's rejections come from. The limiter runs
+        # before sync_execute's add_fallback_query_tags, so ad-hoc queries that only tag scene/kind
+        # (no explicit productKey) would otherwise label as "unknown" — apply the same fallback here.
+        # StrEnum → its value.
+        tags = get_query_tags()
+        if tags.product is None:
+            add_fallback_query_tags(tags)
+        product_value = str(tags.product) if tags.product else None
+        product_label = product_value if product_value in _KNOWN_PRODUCT_LABELS else "unknown"
+
+        max_concurrency: int = self.max_concurrency
+
+        in_beta = kwargs.get("is_api") and (team_id in settings.API_QUERIES_PER_TEAM)
+        if in_beta:
+            max_concurrency = settings.API_QUERIES_PER_TEAM[team_id]  # type: ignore
+        elif limit_value := kwargs.get("limit", None):
+            max_concurrency = int(limit_value)
+
+        if self.apply_clickhouse_kill_switch and not TEST:
+            from posthog.clickhouse.client.execute import KillSwitchLevel, get_kill_switch_level
+
+            kill_switch_level = get_kill_switch_level()
+            if kill_switch_level == KillSwitchLevel.LIGHT:
+                max_concurrency = max(1, max_concurrency // 2)
+            elif kill_switch_level == KillSwitchLevel.FULL:
+                max_concurrency = max(1, max_concurrency // 4)
+
+        # p80 is below 1.714ms, therefore max retry is 1.714s
+        backoff = ExponentialBackoff(delay=self.retry or 0.15, max_delay=1.714, exp=1.5)
+        count = 1
+        wait_total = 0.0
+        # Atomically check, remove expired if limit hit, and add the new task
+        while (
+            self.redis_client.eval(
+                lua_script, 1, running_tasks_key, int(self.get_time()), task_id, max_concurrency, self.ttl
+            )
+            == 0
+        ):
+            from posthog.rate_limit import team_is_allowed_to_bypass_throttle
+
+            bypass = self.allow_team_bypass and team_is_allowed_to_bypass_throttle(team_id)
+
+            # team in beta cannot skip limits
+            if bypass or (not in_beta and self.bypass_all):
+                tag_queries(rate_limit_bypass=1)
+                result = "allow" if bypass else "block"
+                CONCURRENT_QUERY_LIMIT_EXCEEDED_COUNTER.labels(
+                    task_name=task_name,
+                    team_id=str(team_id),
+                    limit=max_concurrency,
+                    limit_name=self.limit_name,
+                    result=result,
+                    product=product_label,
+                ).inc()
+                return None
+
+            if self.retry and self.get_time() < wait_deadline:
+                CONCURRENT_QUERY_LIMIT_EXCEEDED_COUNTER.labels(
+                    task_name=task_name,
+                    team_id=str(team_id),
+                    limit=max_concurrency,
+                    limit_name=self.limit_name,
+                    result="retry",
+                    product=product_label,
+                ).inc()
+                wait_sec = backoff(count)
+                if self.retry_jitter:
+                    # Spread retries so released slots do not sit idle between synchronized polls.
+                    wait_sec = random.uniform(wait_sec / 2, wait_sec)
+                wait_sec = min(wait_sec, max(0.0, wait_deadline - self.get_time()))
+                self.sleep(wait_sec)
+                wait_total += wait_sec
+                tag_queries(rate_limit_wait_ms=int(1000 * wait_total))
+                count += 1
+                continue
+
+            if queue_wait is not None and self._wait_in_queue(
+                queue_wait,
+                running_tasks_key=running_tasks_key,
+                task_id=task_id,
+                team_id=team_id,
+                max_concurrency=max_concurrency,
+            ):
+                return ConcurrencySlot(running_tasks_key=running_tasks_key, task_id=task_id)
+
+            CONCURRENT_QUERY_LIMIT_EXCEEDED_COUNTER.labels(
+                task_name=task_name,
+                team_id=str(team_id),
+                limit=max_concurrency,
+                limit_name=self.limit_name,
+                result="block",
+                product=product_label,
+            ).inc()
+
+            raise ConcurrencyLimitExceeded(
+                f"Exceeded maximum concurrency limit: {max_concurrency} for key: {task_name} and task: {task_id}"
+            )
+
+        return ConcurrencySlot(running_tasks_key=running_tasks_key, task_id=task_id)
+
+    def _wait_in_queue(
+        self,
+        queue_wait: QueueWait,
+        *,
+        running_tasks_key: str,
+        task_id: str,
+        team_id: Optional[int],
+        max_concurrency: int,
+    ) -> bool:
+        """Poll for a slot until the shared wait budget runs out. Returns whether the slot was taken."""
+        remaining = queue_wait.timeout - queue_wait.waited
+        if remaining <= 0:
+            return False
+
+        # Waiters are held in a sorted set like the slots, so a worker that dies while waiting drops out on expiry.
+        waiters_key = f"{running_tasks_key}:waiters:{team_id}"
+        max_waiters = queue_wait.waiters_per_slot * max_concurrency
+        start = self.get_time()
+        if (
+            self.redis_client.eval(
+                lua_script, 1, waiters_key, int(start), task_id, max_waiters, math.ceil(remaining) + 1
+            )
+            == 0
+        ):
+            CONCURRENT_QUERY_QUEUE_WAIT_COUNTER.labels(limit_name=self.limit_name, result="waiter_cap_rejected").inc()
+            return False
+
+        CONCURRENT_QUERY_QUEUE_WAIT_COUNTER.labels(limit_name=self.limit_name, result="waited").inc()
+        deadline = start + remaining
+        backoff = ExponentialBackoff(delay=0.1, max_delay=1.714, exp=1.5)
+        count = 1
+        admitted = False
+        try:
+            while (now := self.get_time()) < deadline:
+                wait_sec = backoff(count)
+                self.sleep(min(random.uniform(wait_sec / 2, wait_sec), deadline - now))
+                count += 1
+                if (
+                    self.redis_client.eval(
+                        lua_script, 1, running_tasks_key, int(self.get_time()), task_id, max_concurrency, self.ttl
+                    )
+                    == 1
+                ):
+                    admitted = True
+                    break
+        finally:
+            try:
+                self.redis_client.zrem(waiters_key, task_id)
+            except Exception:
+                # The waiter entry expires on its own; failing here would leak a slot already taken.
+                logger.warning("concurrency_queue_waiter_cleanup_failed", exc_info=True)
+            queue_wait.waited += self.get_time() - start
+            tag_queries(queue_wait_ms=int(1000 * queue_wait.waited))
+
+        CONCURRENT_QUERY_QUEUE_WAIT_COUNTER.labels(
+            limit_name=self.limit_name, result="waited_then_admitted" if admitted else "waited_then_rejected"
+        ).inc()
+        return admitted
+
+    def release(self, slot: ConcurrencySlot) -> None:
+        """
+        Release the resource, when the execution finishes.
+        """
+        self.redis_client.zrem(slot.running_tasks_key, slot.task_id)
+
+    def wrap(self, task_func):
+        @wraps(task_func)
+        def wrapper(*args, **kwargs):
+            with self.run(*args, **kwargs):
+                return task_func(*args, **kwargs)
+
+        return wrapper
+
+
+__API_CONCURRENT_QUERY_PER_TEAM: Optional[RateLimit] = None
+__APP_CONCURRENT_QUERY_PER_ORG: Optional[RateLimit] = None
+__APP_CONCURRENT_DASHBOARD_QUERIES_PER_ORG: Optional[RateLimit] = None
+__APP_CONCURRENT_TELEMETRY_QUERIES_PER_ORG: Optional[RateLimit] = None
+__MATERIALIZED_ENDPOINTS_CONCURRENT_QUERY_PER_TEAM: Optional[RateLimit] = None
+__EVENTS_LIST_CONCURRENT_QUERY_PER_TEAM: Optional[RateLimit] = None
+__LOGS_API_CONCURRENT_QUERY_PER_TEAM: Optional[RateLimit] = None
+__LLM_ANALYTICS_CONCURRENT_QUERIES: Optional[RateLimit] = None
+
+
+def get_api_team_rate_limiter():
+    global __API_CONCURRENT_QUERY_PER_TEAM
+
+    def __applicable(
+        *args,
+        team_id: Optional[int] = None,
+        is_api: Optional[bool] = None,
+        **kwargs,
+    ) -> bool:
+        return bool(not TEST and is_api and team_id)
+
+    if __API_CONCURRENT_QUERY_PER_TEAM is None:
+        __API_CONCURRENT_QUERY_PER_TEAM = RateLimit(
+            max_concurrency=3,
+            applicable=__applicable,
+            limit_name="api_per_team",
+            get_task_name=lambda *args, **kwargs: f"api:query:per-team:{kwargs.get('team_id')}",
+            get_task_id=lambda *args, **kwargs: (
+                current_task.request.id if current_task else (kwargs.get("task_id") or generate_short_id())
+            ),
+            ttl=600,
+            # p20 duration for a query is 133ms, p25 is 164ms, p50 is 458ms, there's a 20% chance that after 134ms
+            # the slot is free.
+            retry=0.134,
+            retry_jitter=True,
+            # The default timeout for an API query on ClickHouse is 10s. p99 duration is 19s,
+            # 15 seconds should be enough for some other query to finish. If the query cannot get a slot in this period,
+            # the user should contact us about increasing the quota.
+            retry_timeout=15.0,
+        )
+    return __API_CONCURRENT_QUERY_PER_TEAM
+
+
+def get_app_org_rate_limiter():
+    """
+    Limits the number of concurrent queries (running outside celery) per organization.
+    """
+    global __APP_CONCURRENT_QUERY_PER_ORG
+    if __APP_CONCURRENT_QUERY_PER_ORG is None:
+        __APP_CONCURRENT_QUERY_PER_ORG = RateLimit(
+            max_concurrency=DEFAULT_APP_ORG_CONCURRENT_QUERIES,
+            applicable=lambda *args, **kwargs: (
+                not TEST
+                and kwargs.get("org_id")
+                and not kwargs.get("is_api")
+                # if running in celery, we don't want rate limit to apply
+                # as celery tasks have their own limits on the queues + using @limit_concurrency
+                and not current_task
+                # if running in temporal workflow, don't apply rate limit
+                # as temporal activities have their own concurrency controls
+                and not _is_in_temporal()
+            ),
+            limit_name="app_per_org",
+            get_task_name=lambda *args, **kwargs: f"app:query:per-org:{kwargs.get('org_id')}",
+            get_task_id=lambda *args, **kwargs: kwargs.get("task_id") or generate_short_id(),
+            ttl=600,
+        )
+    return __APP_CONCURRENT_QUERY_PER_ORG
+
+
+def get_app_dashboard_queries_rate_limiter():
+    """
+    Limits the number of concurrent queries (running outside celery/temporal) per organization.
+    """
+    global __APP_CONCURRENT_DASHBOARD_QUERIES_PER_ORG
+    if __APP_CONCURRENT_DASHBOARD_QUERIES_PER_ORG is None:
+        __APP_CONCURRENT_DASHBOARD_QUERIES_PER_ORG = RateLimit(
+            max_concurrency=DEFAULT_APP_DASHBOARD_CONCURRENT_QUERIES,
+            applicable=(
+                lambda *args, **kwargs: (
+                    not TEST
+                    and not kwargs.get("is_api")
+                    and kwargs.get("dashboard_id") is not None
+                    # if running in celery, we don't want rate limit to apply
+                    # as celery tasks have their own limits on the queues + using @limit_concurrency
+                    and not current_task
+                    # if running in temporal workflow, don't apply rate limit
+                    # as temporal activities have their own concurrency controls
+                    and not _is_in_temporal()
+                )
+            ),
+            limit_name="app_dashboard_queries_per_org",
+            get_task_name=lambda *args, **kwargs: f"app:dashboard_query:per-org:{kwargs.get('org_id')}",
+            get_task_id=lambda *args, **kwargs: kwargs.get("task_id") or generate_short_id(),
+            ttl=600,
+        )
+    return __APP_CONCURRENT_DASHBOARD_QUERIES_PER_ORG
+
+
+def get_app_telemetry_queries_rate_limiter():
+    """
+    Limits concurrent telemetry (metrics) app queries per organization, apart from the analytics limits.
+
+    A live board refreshes its tiles every few seconds, so a full lane waits briefly for a slot
+    instead of rejecting the tile.
+    """
+    global __APP_CONCURRENT_TELEMETRY_QUERIES_PER_ORG
+    if __APP_CONCURRENT_TELEMETRY_QUERIES_PER_ORG is None:
+        __APP_CONCURRENT_TELEMETRY_QUERIES_PER_ORG = RateLimit(
+            max_concurrency=DEFAULT_APP_TELEMETRY_CONCURRENT_QUERIES,
+            applicable=lambda *args, **kwargs: (
+                not TEST
+                and kwargs.get("org_id")
+                and not kwargs.get("is_api")
+                # celery and temporal have their own concurrency controls, as for the analytics limits
+                and not current_task
+                and not _is_in_temporal()
+            ),
+            limit_name="app_telemetry_queries_per_org",
+            get_task_name=lambda *args, **kwargs: f"app:telemetry_query:per-org:{kwargs.get('org_id')}",
+            get_task_id=lambda *args, **kwargs: kwargs.get("task_id") or generate_short_id(),
+            ttl=600,
+            retry=0.1,
+            retry_jitter=True,
+            retry_timeout=10.0,
+        )
+    return __APP_CONCURRENT_TELEMETRY_QUERIES_PER_ORG
+
+
+def get_materialized_endpoints_rate_limiter():
+    """
+    Limits the number of concurrent materialized endpoint queries per team.
+
+    Materialized endpoint queries read from pre-computed S3 tables,
+    so they can handle higher concurrency than inline queries.
+    """
+    global __MATERIALIZED_ENDPOINTS_CONCURRENT_QUERY_PER_TEAM
+
+    def __applicable(
+        *args,
+        team_id: Optional[int] = None,
+        is_materialized_endpoint: Optional[bool] = None,
+        **kwargs,
+    ) -> bool:
+        return bool(not TEST and team_id and is_materialized_endpoint)
+
+    if __MATERIALIZED_ENDPOINTS_CONCURRENT_QUERY_PER_TEAM is None:
+        __MATERIALIZED_ENDPOINTS_CONCURRENT_QUERY_PER_TEAM = RateLimit(
+            max_concurrency=10,
+            applicable=__applicable,
+            limit_name="materialized_endpoints_per_team",
+            get_task_name=lambda *args, **kwargs: f"materialized_endpoints:query:per-team:{kwargs.get('team_id')}",
+            get_task_id=lambda *args, **kwargs: (
+                current_task.request.id if current_task else (kwargs.get("task_id") or generate_short_id())
+            ),
+            ttl=600,
+            retry=0.134,
+            retry_timeout=30.0,
+        )
+    return __MATERIALIZED_ENDPOINTS_CONCURRENT_QUERY_PER_TEAM
+
+
+def get_logs_api_team_rate_limiter() -> RateLimit:
+    """
+    Limits the number of concurrent logs API requests per team made with a personal API key.
+    Every logs query shares one ClickHouse user on the logs cluster, and that user has a server-side
+    concurrency cap. A script that sends a burst of requests can fill the cap and cause refused
+    queries for logs alerting and for other teams' log searches.
+    """
+    global __LOGS_API_CONCURRENT_QUERY_PER_TEAM
+
+    if __LOGS_API_CONCURRENT_QUERY_PER_TEAM is None:
+        __LOGS_API_CONCURRENT_QUERY_PER_TEAM = RateLimit(
+            max_concurrency=3,
+            limit_name="logs_api_per_team",
+            get_task_name=lambda *args, **kwargs: f"logs_api:query:per-team:{kwargs.get('team_id')}",
+            get_task_id=lambda *args, **kwargs: kwargs.get("task_id") or generate_short_id(),
+            # A slot is held for a whole request. The longest request is patterns_diff, which runs six sequential
+            # queries (three per window) of up to 60 seconds each, the default max_execution_time. The ttl must
+            # outlast that, or the slot expires while the request still queries ClickHouse. patterns_diff derives a
+            # request-wide deadline from this ttl, so a longer per-query limit cannot outlast it. A worker that dies
+            # without releasing its slot keeps it for the full ttl, so the ttl stays close to that bound.
+            ttl=450,
+            retry=0.134,
+            # A waiting request holds a web worker, so a burst gets a quick 429 instead of a long queue.
+            retry_timeout=2.0,
+        )
+    return __LOGS_API_CONCURRENT_QUERY_PER_TEAM
+
+
+def get_events_list_rate_limiter():
+    """
+    Limits the number of concurrent events_list queries per team.
+    events_list queries scan large amounts of event data and run on OFFLINE workload.
+    """
+    global __EVENTS_LIST_CONCURRENT_QUERY_PER_TEAM
+
+    def __applicable(
+        *args,
+        team_id: Optional[int] = None,
+        **kwargs,
+    ) -> bool:
+        return bool(not TEST and team_id)
+
+    if __EVENTS_LIST_CONCURRENT_QUERY_PER_TEAM is None:
+        __EVENTS_LIST_CONCURRENT_QUERY_PER_TEAM = RateLimit(
+            max_concurrency=2,
+            applicable=__applicable,
+            limit_name="events_list_per_team",
+            get_task_name=lambda *args, **kwargs: f"events_list:query:per-team:{kwargs.get('team_id')}",
+            get_task_id=lambda *args, **kwargs: (
+                current_task.request.id if current_task else (kwargs.get("task_id") or generate_short_id())
+            ),
+            ttl=600,
+            retry=0.134,
+            retry_timeout=30.0,
+        )
+    return __EVENTS_LIST_CONCURRENT_QUERY_PER_TEAM
+
+
+def get_llm_analytics_rate_limiter():
+    """
+    Limits concurrent background AI observability queries (ClickHouseUser.LLM_ANALYTICS).
+
+    Slots are global rather than per team or per org because the resource being protected is the
+    ClickHouse user's server-side concurrency cap, which every team's queries draw from.
+    """
+    global __LLM_ANALYTICS_CONCURRENT_QUERIES
+    if __LLM_ANALYTICS_CONCURRENT_QUERIES is None:
+        __LLM_ANALYTICS_CONCURRENT_QUERIES = RateLimit(
+            max_concurrency=settings.CLICKHOUSE_LLM_ANALYTICS_MAX_CONCURRENT_QUERIES,
+            applicable=lambda *args, **kwargs: not TEST,
+            limit_name="llm_analytics_background",
+            get_task_name=lambda *args, **kwargs: "llm_analytics:query:background",
+            get_task_id=lambda *args, **kwargs: kwargs.get("task_id") or generate_short_id(),
+            # Exceeds the 600s QUERY_ASYNC ClickHouse timeout so a worker dying mid-query cannot
+            # release its slot while the query it stands for is still running on the cluster.
+            ttl=900,
+            retry=0.25,
+            # Must stay well under the tightest AIO activity heartbeat timeout of 30s, otherwise
+            # waiting for a slot looks like a dead worker.
+            retry_timeout=10.0,
+        )
+    return __LLM_ANALYTICS_CONCURRENT_QUERIES
+
+
+class ConcurrencyLimitExceeded(Exception):
+    pass
+
+
+def limit_concurrency(
+    max_concurrent_tasks: int, key: Optional[Callable] = None, ttl: int = 60 * 15, limit_name: str = ""
+) -> Callable:
+    def decorator(task_func):
+        @wraps(task_func)
+        def wrapper(*args, **kwargs):
+            task_name = current_task.name
+            redis_client = redis.get_client()
+            running_tasks_key = f"celery_running_tasks:{task_name}"
+            if key:
+                dynamic_key = key(*args, **kwargs)
+                running_tasks_key = f"{running_tasks_key}:{dynamic_key}"
+            else:
+                dynamic_key = None
+            task_id = f"{task_name}:{current_task.request.id}"
+            current_time = int(time.time())
+
+            # Atomically check, remove expired if limit hit, and add the new task
+            if (
+                redis_client.eval(lua_script, 1, running_tasks_key, current_time, task_id, max_concurrent_tasks, ttl)
+                == 0
+            ):
+                CONCURRENT_TASKS_LIMIT_EXCEEDED_COUNTER.labels(
+                    task_name=task_name, limit=max_concurrent_tasks, limit_name=limit_name
+                ).inc()
+
+                raise ConcurrencyLimitExceeded(
+                    f"Exceeded maximum concurrent tasks limit: {max_concurrent_tasks} for key: {dynamic_key}"
+                )
+
+            try:
+                # Execute the task
+                return task_func(*args, **kwargs)
+            finally:
+                # Remove the task ID from the sorted set when the task finishes
+                redis_client.zrem(running_tasks_key, task_id)
+
+        return wrapper
+
+    return decorator
+
+
+def get_org_app_concurrency_limit(org_id: uuid.UUID) -> Optional[int]:
+    """
+    Get organization concurrency limit for app queries from
+    feature entitlements. Using Redis for quicker lookups.
+    Returns None if no org-specific limit is found.
+    """
+    cache_key = f"org_app_concurrency_limit:{org_id}"
+    cached_limit = redis.get_client().get(cache_key)
+    if cached_limit:
+        return int(cached_limit)
+
+    try:
+        from posthog.models.organization import Organization
+
+        org = Organization.objects.get(id=org_id)
+        feature = org.get_available_feature(AvailableFeature.ORGANIZATION_APP_QUERY_CONCURRENCY_LIMIT)
+        if feature and isinstance(feature.get("limit"), int):
+            limit = feature["limit"]
+            # Cache for 1 hour
+            redis.get_client().setex(cache_key, 3600, limit)
+            return limit
+    except Exception:
+        # Fall back to default if anything goes wrong
+        pass
+
+    return None
+
+
+@contextmanager
+def app_org_concurrency_slot(
+    team: "Team", *, task_id: str | None = None, queue_wait: QueueWait | None = None
+) -> Iterator[None]:
+    with get_app_org_rate_limiter().run(
+        queue_wait=queue_wait,
+        org_id=team.organization_id,
+        team_id=team.pk,
+        task_id=task_id,
+        is_api=is_api_key_access_method(get_query_tag_value("access_method")),
+        limit=get_org_app_concurrency_limit(team.organization_id),
+    ):
+        yield

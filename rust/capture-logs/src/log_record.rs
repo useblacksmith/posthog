@@ -1,0 +1,748 @@
+use std::collections::HashMap;
+
+use anyhow::Result;
+use base64::{prelude::BASE64_STANDARD, Engine};
+use chrono::serde::ts_microseconds;
+use chrono::DateTime;
+use chrono::TimeDelta;
+use chrono::Utc;
+use clickhouse::Row;
+use opentelemetry_proto::tonic::{
+    common::v1::{
+        any_value::{self, Value},
+        AnyValue, InstrumentationScope,
+    },
+    logs::v1::LogRecord,
+    resource::v1::Resource,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value as JsonValue};
+use tracing::debug;
+use uuid::Uuid;
+
+#[derive(Row, Debug, Serialize, Deserialize)]
+pub struct KafkaLogRow {
+    pub uuid: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub trace_flags: u32,
+    #[serde(with = "ts_microseconds")]
+    pub timestamp: DateTime<Utc>,
+    #[serde(with = "ts_microseconds")]
+    pub observed_timestamp: DateTime<Utc>,
+    pub body: String,
+    pub severity_text: String,
+    pub severity_number: i32,
+    pub service_name: String,
+    pub resource_attributes: HashMap<String, String>,
+    pub instrumentation_scope: String,
+    pub event_name: String,
+    pub attributes: HashMap<String, String>,
+    pub bytes_uncompressed: Option<i64>,
+    // Per-row retention in days. capture-logs always writes None — the Node consumer stamps
+    // this from team retention rules. Null lets ClickHouse fall back to the batch header.
+    pub retention_days: Option<i32>,
+    // Masked body and the rule set that produced it. capture-logs always writes None — the Node
+    // consumer stamps both. The fields exist here so the schema carries them; a value the writer
+    // schema has no slot for is silently dropped at encode.
+    pub pattern: Option<String>,
+    pub pattern_version: Option<i32>,
+}
+
+/// Sum byte lengths of the row's string and map content. Fixed-width fields
+/// (timestamps, trace_flags, severity_number) are excluded — only variable-length
+/// payload is counted. Distinct from the Kafka header `bytes_uncompressed`, which
+/// is the raw HTTP body size for the whole batch.
+pub fn compute_kafka_log_row_bytes(row: &KafkaLogRow) -> i64 {
+    let mut total: usize = 0;
+    total = total.saturating_add(row.body.len());
+
+    // by default exclude instrumentation_scope and event_name as they are
+    // low cardinality and highly compressible, but add them if they are large
+    // to prevent abuse
+    if row.instrumentation_scope.len() > 50 {
+        total = total.saturating_add(row.instrumentation_scope.len());
+    }
+    if row.event_name.len() > 50 {
+        total = total.saturating_add(row.event_name.len());
+    }
+
+    for (k, v) in &row.resource_attributes {
+        total = total.saturating_add(k.len()).saturating_add(v.len());
+    }
+    for (k, v) in &row.attributes {
+        total = total.saturating_add(k.len()).saturating_add(v.len());
+    }
+    i64::try_from(total).unwrap_or(i64::MAX)
+}
+
+/// Sum of per-row `bytes_uncompressed` across a batch; rows without the field count as zero.
+/// Feeds the `bytes_uncompressed_records` Kafka header — the records-based counterpart to the
+/// payload-sized `bytes_uncompressed` header — so the two can be compared before billing
+/// switches to the records-based value.
+pub fn sum_kafka_log_row_bytes(rows: &[KafkaLogRow]) -> u64 {
+    rows.iter().map(KafkaLogRow::byte_count).sum()
+}
+
+/// Earliest row `timestamp` in a batch, as epoch microseconds. Feeds the `min_timestamp` Kafka
+/// header. The Node consumer compares it with the team's shortest retention to decide, without
+/// decoding the batch, whether any row can already be past retention.
+pub fn min_kafka_log_row_timestamp_micros(rows: &[KafkaLogRow]) -> Option<i64> {
+    rows.iter()
+        .map(|row| row.timestamp.timestamp_micros())
+        .min()
+}
+
+impl KafkaLogRow {
+    /// Set `bytes_uncompressed` from the row's variable-length content. Consuming
+    /// builder; the `mut self` is encapsulated and never escapes.
+    pub(crate) fn byte_count(&self) -> u64 {
+        self.bytes_uncompressed.unwrap_or(0).max(0) as u64
+    }
+
+    pub(crate) fn with_computed_bytes(mut self) -> Self {
+        self.bytes_uncompressed = Some(compute_kafka_log_row_bytes(&self));
+        self
+    }
+
+    pub fn new(
+        record: LogRecord,
+        resource: Option<Resource>,
+        scope: Option<InstrumentationScope>,
+        max_past: TimeDelta,
+    ) -> Result<(Self, bool)> {
+        // Extract body - convert any AnyValue type to JSON string
+        let body = match record.body {
+            Some(body) => match body.value {
+                Some(any_value::Value::StringValue(s)) => s,
+                Some(_) => any_value_to_json(body).to_string(),
+                None => "".to_string(),
+            },
+            None => "".to_string(),
+        };
+
+        // severity_number takes priority over the severity text and the body
+        let (severity_text, severity_number) = if record.severity_number > 0 {
+            (
+                convert_severity_number_to_text(record.severity_number),
+                record.severity_number,
+            )
+        } else {
+            let severity_text = match try_extract_severity(&body) {
+                Some(parsed_severity) => parsed_severity.to_string(),
+                None => normalize_severity_text(record.severity_text),
+            };
+            let severity_number = convert_severity_text_to_number(&severity_text);
+            (severity_text, severity_number)
+        };
+
+        let resource_attributes = extract_resource_attributes(resource);
+
+        let mut attributes: HashMap<String, String> = record
+            .attributes
+            .into_iter()
+            .map(|kv| {
+                (
+                    kv.key,
+                    any_value_to_string(kv.value.unwrap_or(AnyValue {
+                        value: Some(Value::StringValue("".to_string())),
+                    })),
+                )
+            })
+            .collect();
+
+        let instrumentation_scope = match scope {
+            Some(s) => format!("{}@{}", s.name, s.version),
+            None => "".to_string(),
+        };
+
+        let event_name = record.event_name;
+        let service_name = extract_string_from_map(&resource_attributes, "service.name");
+
+        // Trace/span IDs
+        let trace_id = extract_trace_id(&record.trace_id);
+        let span_id = extract_span_id(&record.span_id);
+
+        // Trace flags
+        let trace_flags = record.flags;
+
+        let raw_timestamp = match record.time_unix_nano {
+            0 => Utc::now(),
+            _ => DateTime::<Utc>::from_timestamp_nanos(record.time_unix_nano.try_into()?),
+        };
+
+        let (timestamp, was_overridden) =
+            apply_timestamp_override_with_past_limit(raw_timestamp, &mut attributes, max_past);
+
+        let observed_timestamp = Utc::now();
+
+        let log_row = Self {
+            uuid: Uuid::now_v7().to_string(),
+            trace_id: BASE64_STANDARD.encode(trace_id),
+            span_id: BASE64_STANDARD.encode(span_id),
+            trace_flags,
+            timestamp,
+            observed_timestamp,
+            body,
+            severity_text,
+            severity_number,
+            resource_attributes,
+            instrumentation_scope,
+            event_name,
+            service_name,
+            attributes,
+            bytes_uncompressed: None,
+            retention_days: None,
+            pattern: None,
+            pattern_version: None,
+        }
+        .with_computed_bytes();
+        debug!("log: {:?}", log_row);
+
+        Ok((log_row, was_overridden))
+    }
+}
+
+const DEFAULT_MAX_PAST_HOURS: i64 = 24;
+
+pub fn default_max_past() -> TimeDelta {
+    TimeDelta::hours(DEFAULT_MAX_PAST_HOURS)
+}
+
+/// Never widens with the past bound. A timestamp ahead of the ingest time is always a client
+/// clock error, so widening both together would let one client write past every other query range.
+const MAX_FUTURE_HOURS: i64 = 24;
+
+/// Returns the final timestamp, and the original when it was overridden.
+pub fn override_timestamp(timestamp: DateTime<Utc>) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
+    override_timestamp_with_past_limit(timestamp, default_max_past())
+}
+
+pub fn override_timestamp_with_past_limit(
+    timestamp: DateTime<Utc>,
+    max_past: TimeDelta,
+) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
+    let now = Utc::now();
+
+    // `Sub` panics when the result leaves chrono's year range, which a large ceiling reaches.
+    let earliest = now
+        .checked_sub_signed(max_past)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+
+    if timestamp < earliest || timestamp > now + TimeDelta::hours(MAX_FUTURE_HOURS) {
+        (now, Some(timestamp))
+    } else {
+        (timestamp, None)
+    }
+}
+
+pub const ORIGINAL_TIMESTAMP_ATTRIBUTE: &str = "posthog.original_timestamp";
+
+/// `override_timestamp` plus the `ORIGINAL_TIMESTAMP_ATTRIBUTE` the consumer reads back; every intake
+/// goes through here so the attribute name and format stay one contract.
+pub(crate) fn apply_timestamp_override(
+    raw: DateTime<Utc>,
+    attributes: &mut HashMap<String, String>,
+) -> (DateTime<Utc>, bool) {
+    apply_timestamp_override_with_past_limit(raw, attributes, default_max_past())
+}
+
+pub(crate) fn apply_timestamp_override_with_past_limit(
+    raw: DateTime<Utc>,
+    attributes: &mut HashMap<String, String>,
+    max_past: TimeDelta,
+) -> (DateTime<Utc>, bool) {
+    let (timestamp, original) = override_timestamp_with_past_limit(raw, max_past);
+    if let Some(original) = original {
+        attributes.insert(
+            ORIGINAL_TIMESTAMP_ATTRIBUTE.to_string(),
+            original.to_rfc3339(),
+        );
+    }
+    (timestamp, original.is_some())
+}
+
+pub(crate) fn datetime_from_millis(millis: Option<i64>) -> DateTime<Utc> {
+    millis
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or_else(Utc::now)
+}
+
+// extract a JSON value as a string. If it's a string, strip the surrounding "quotes"
+fn extract_string_from_map(attributes: &HashMap<String, String>, key: &str) -> String {
+    if let Some(value) = attributes.get(key) {
+        if let Ok(JsonValue::String(value)) = serde_json::from_str::<JsonValue>(value) {
+            value.to_string()
+        } else {
+            value.to_string()
+        }
+    } else {
+        "".to_string()
+    }
+}
+
+pub fn extract_trace_id(input: &[u8]) -> [u8; 16] {
+    if input.len() == 16 {
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(input);
+        bytes
+    } else {
+        [0; 16]
+    }
+}
+
+pub fn extract_span_id(input: &[u8]) -> [u8; 8] {
+    if input.len() == 8 {
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(input);
+        bytes
+    } else {
+        [0; 8]
+    }
+}
+
+fn severity_for_lowercase(lowered: &str) -> Option<&'static str> {
+    Some(match lowered {
+        "critical" | "fatal" | "crit" | "alert" | "emerg" => "fatal",
+        "error" | "err" | "eror" => "error",
+        "warn" | "warning" => "warn",
+        "info" | "information" | "informational" => "info",
+        "debug" | "dbug" => "debug",
+        "trace" => "trace",
+        _ => return None,
+    })
+}
+
+pub(crate) fn normalize_severity_text(severity_text: String) -> String {
+    // don't allow arbitrary values in severity text. normalize unknown to info
+    severity_for_lowercase(&severity_text.to_lowercase())
+        .unwrap_or("info")
+        .to_string()
+}
+
+pub(crate) fn convert_severity_text_to_number(severity_text: &str) -> i32 {
+    match severity_text {
+        "trace" => 1,
+        "debug" => 5,
+        "info" => 9,
+        "warn" => 13,
+        "error" => 17,
+        "fatal" => 21,
+        _ => 0,
+    }
+}
+
+fn convert_severity_number_to_text(severity_number: i32) -> String {
+    match severity_number {
+        1 => "trace".to_string(),
+        2 => "trace".to_string(),
+        3 => "trace".to_string(),
+        4 => "trace".to_string(),
+        5 => "debug".to_string(),
+        6 => "debug".to_string(),
+        7 => "debug".to_string(),
+        8 => "debug".to_string(),
+        9 => "info".to_string(),
+        10 => "info".to_string(),
+        11 => "info".to_string(),
+        12 => "info".to_string(),
+        13 => "warn".to_string(),
+        14 => "warn".to_string(),
+        15 => "warn".to_string(),
+        16 => "warn".to_string(),
+        17 => "error".to_string(),
+        18 => "error".to_string(),
+        19 => "error".to_string(),
+        20 => "error".to_string(),
+        21 => "fatal".to_string(),
+        22 => "fatal".to_string(),
+        23 => "fatal".to_string(),
+        24 => "fatal".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+pub fn extract_resource_attributes(resource: Option<Resource>) -> HashMap<String, String> {
+    let Some(resource) = resource else {
+        return HashMap::new();
+    };
+
+    resource
+        .attributes
+        .into_iter()
+        .map(|kv| {
+            (
+                kv.key,
+                any_value_to_string(kv.value.unwrap_or(AnyValue {
+                    value: Some(Value::StringValue("".to_string())),
+                })),
+            )
+        })
+        .collect()
+}
+
+// TODO - pull this from PG
+const SEVERITY_KEYS: &[&str] = &[
+    "level",
+    "severity",
+    "log.level",
+    "config.log_level",
+    "levelname",
+];
+
+pub(crate) fn try_extract_severity(body: &str) -> Option<&'static str> {
+    if !body.trim_start().starts_with('{') {
+        return None;
+    }
+    let Ok(val) = serde_json::from_str::<JsonValue>(body) else {
+        return None;
+    };
+
+    for key in SEVERITY_KEYS {
+        if let Some(found) = val.get(key).and_then(|severity| severity.as_str()) {
+            if let Some(text) = severity_alias(found) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// Canonical severity for a level word, or `None` when the word is not a known level. Unlike
+/// `normalize_severity_text`, an unknown word is not folded to `info`, so callers can keep looking.
+pub(crate) fn severity_alias(word: &str) -> Option<&'static str> {
+    severity_for_lowercase(&word.trim().to_lowercase())
+}
+
+pub fn any_value_to_json(value: AnyValue) -> JsonValue {
+    match value.value {
+        Some(value_enum) => match value_enum {
+            any_value::Value::StringValue(s) => json!(s),
+            any_value::Value::BoolValue(b) => json!(b),
+            any_value::Value::IntValue(i) => json!(i),
+            any_value::Value::DoubleValue(d) => json!(d),
+            any_value::Value::ArrayValue(arr) => {
+                json!(arr
+                    .values
+                    .into_iter()
+                    .map(any_value_to_json)
+                    .collect::<Vec<_>>())
+            }
+            any_value::Value::KvlistValue(kvlist) => {
+                let mut map = HashMap::new();
+                for kv in kvlist.values.into_iter() {
+                    if let Some(v) = kv.value {
+                        map.insert(kv.key.clone(), any_value_to_json(v));
+                    }
+                }
+                json!(map)
+            }
+            any_value::Value::BytesValue(b) => {
+                json!(BASE64_STANDARD.encode(b))
+            }
+        },
+        None => JsonValue::Null,
+    }
+}
+
+pub fn any_value_to_string(value: AnyValue) -> String {
+    any_value_to_json(value).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apache_avro::{Codec, Reader, Schema, Writer};
+
+    use crate::avro_schema::AVRO_SCHEMA;
+
+    fn sample_row() -> KafkaLogRow {
+        let mut resource_attributes = HashMap::new();
+        resource_attributes.insert("host.name".to_string(), "localhost".to_string());
+        let mut attributes = HashMap::new();
+        attributes.insert("k".to_string(), "v".to_string());
+        KafkaLogRow {
+            uuid: "uuid-1234".to_string(),
+            trace_id: "tid".to_string(),
+            span_id: "sid".to_string(),
+            trace_flags: 0,
+            timestamp: Utc::now(),
+            observed_timestamp: Utc::now(),
+            body: "hello".to_string(),
+            severity_text: "info".to_string(),
+            severity_number: 9,
+            service_name: "svc".to_string(),
+            resource_attributes,
+            instrumentation_scope: "scope@1".to_string(),
+            event_name: "evt".to_string(),
+            attributes,
+            bytes_uncompressed: None,
+            retention_days: None,
+            pattern: None,
+            pattern_version: None,
+        }
+    }
+
+    #[test]
+    fn test_compute_kafka_log_row_bytes_sums_string_and_map_lengths() {
+        let row = sample_row();
+        // string fields: body(5)
+        // maps: resource_attributes "host.name"(9)+"localhost"(9)=18; attributes "k"(1)+"v"(1)=2
+        // total = 5 + 18 + 2 = 25
+        assert_eq!(compute_kafka_log_row_bytes(&row), 25);
+    }
+
+    fn sample_row_bytes() -> u64 {
+        sample_row()
+            .with_computed_bytes()
+            .bytes_uncompressed
+            .unwrap() as u64
+    }
+
+    #[test]
+    fn test_sum_kafka_log_row_bytes_empty_slice_is_zero() {
+        assert_eq!(sum_kafka_log_row_bytes(&[]), 0);
+    }
+
+    #[test]
+    fn test_sum_kafka_log_row_bytes_treats_missing_field_as_zero() {
+        let with_bytes = sample_row().with_computed_bytes();
+        let without_bytes = sample_row(); // bytes_uncompressed: None
+        assert_eq!(
+            sum_kafka_log_row_bytes(&[with_bytes, without_bytes]),
+            sample_row_bytes()
+        );
+    }
+
+    #[test]
+    fn test_sum_kafka_log_row_bytes_sums_all_rows() {
+        let rows = [
+            sample_row().with_computed_bytes(),
+            sample_row().with_computed_bytes(),
+        ];
+        assert_eq!(sum_kafka_log_row_bytes(&rows), sample_row_bytes() * 2);
+    }
+
+    #[test]
+    fn test_min_kafka_log_row_timestamp_is_the_oldest_row_wherever_it_sits() {
+        let now = Utc::now();
+        let oldest = now - TimeDelta::days(400);
+        let rows: Vec<KafkaLogRow> = [now, oldest, now - TimeDelta::hours(1)]
+            .into_iter()
+            .map(|timestamp| KafkaLogRow {
+                timestamp,
+                ..sample_row()
+            })
+            .collect();
+
+        assert_eq!(
+            min_kafka_log_row_timestamp_micros(&rows),
+            Some(oldest.timestamp_micros())
+        );
+        assert_eq!(min_kafka_log_row_timestamp_micros(&[]), None);
+    }
+
+    #[test]
+    fn test_compute_kafka_log_row_bytes_excludes_fixed_width_fields() {
+        // Two rows differing only in fixed-width numeric/timestamp fields should compute
+        // identical bytes_uncompressed.
+        let mut a = sample_row();
+        a.trace_flags = 0;
+        a.severity_number = 1;
+        let mut b = sample_row();
+        b.trace_flags = u32::MAX;
+        b.severity_number = i32::MIN;
+        b.timestamp = a.timestamp + TimeDelta::days(1);
+        assert_eq!(
+            compute_kafka_log_row_bytes(&a),
+            compute_kafka_log_row_bytes(&b),
+        );
+    }
+
+    #[test]
+    fn test_bytes_uncompressed_serialises_into_avro_payload() {
+        // We don't deserialise back into KafkaLogRow because apache_avro's `from_value`
+        // can't resolve `["null", T]` unions into non-Option struct fields (the existing
+        // pattern used for body/attributes/etc.). Instead, decode to the raw Avro Value
+        // and assert the new field is present with the expected long.
+        use apache_avro::types::Value;
+
+        let mut row = sample_row();
+        row.bytes_uncompressed = Some(compute_kafka_log_row_bytes(&row));
+        let expected = row.bytes_uncompressed.unwrap();
+
+        let schema = Schema::parse_str(AVRO_SCHEMA).expect("schema parses");
+        let mut writer = Writer::with_codec(&schema, Vec::new(), Codec::Null);
+        writer.append_ser(&row).expect("append_ser ok");
+        let payload = writer.into_inner().expect("flush ok");
+
+        let reader = Reader::new(payload.as_slice()).expect("reader ok");
+        let mut found_long: Option<i64> = None;
+        for value in reader {
+            let value = value.expect("decode ok");
+            if let Value::Record(fields) = value {
+                for (name, field_value) in fields {
+                    if name == "bytes_uncompressed" {
+                        if let Value::Union(_, inner) = field_value {
+                            if let Value::Long(v) = *inner {
+                                found_long = Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(found_long, Some(expected));
+    }
+
+    #[test]
+    fn test_retention_days_serialises_into_avro_payload() {
+        use apache_avro::types::Value;
+
+        let mut row = sample_row();
+        row.retention_days = Some(30);
+
+        let schema = Schema::parse_str(AVRO_SCHEMA).expect("schema parses");
+        let mut writer = Writer::with_codec(&schema, Vec::new(), Codec::Null);
+        writer.append_ser(&row).expect("append_ser ok");
+        let payload = writer.into_inner().expect("flush ok");
+
+        let reader = Reader::new(payload.as_slice()).expect("reader ok");
+        let mut found_int: Option<i32> = None;
+        for value in reader {
+            let value = value.expect("decode ok");
+            if let Value::Record(fields) = value {
+                for (name, field_value) in fields {
+                    if name == "retention_days" {
+                        if let Value::Union(_, inner) = field_value {
+                            if let Value::Int(v) = *inner {
+                                found_int = Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(found_int, Some(30));
+    }
+
+    #[test]
+    fn test_new_populates_bytes_uncompressed() {
+        let log_record = LogRecord::default();
+        let (row, _) = KafkaLogRow::new(log_record, None, None, default_max_past()).expect("ok");
+        assert!(row.bytes_uncompressed.is_some());
+        assert_eq!(
+            row.bytes_uncompressed.unwrap(),
+            compute_kafka_log_row_bytes(&row),
+        );
+    }
+
+    #[test]
+    fn new_resolves_severity_from_number_text_and_body() {
+        for (severity_text, severity_number, body, expected) in [
+            ("", 17, r#"{"levelname":"WARNING"}"#, ("error", 17)),
+            ("ERROR", 0, r#"{"levelname":"WARNING"}"#, ("warn", 13)),
+            ("ERROR", 0, "plain text", ("error", 17)),
+        ] {
+            let log_record = LogRecord {
+                severity_text: severity_text.to_string(),
+                severity_number,
+                body: Some(AnyValue {
+                    value: Some(Value::StringValue(body.to_string())),
+                }),
+                ..Default::default()
+            };
+            let (row, _) =
+                KafkaLogRow::new(log_record, None, None, default_max_past()).expect("ok");
+            assert_eq!(
+                (row.severity_text.as_str(), row.severity_number),
+                expected,
+                "{severity_text} {severity_number} {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn override_timestamp_keeps_a_timestamp_inside_the_window() {
+        let wide_past = TimeDelta::days(500);
+
+        for (case, offset, max_past) in [
+            ("an hour ago", TimeDelta::hours(-1), default_max_past()),
+            (
+                "just inside the default bound",
+                TimeDelta::hours(-22),
+                default_max_past(),
+            ),
+            (
+                "400 days ago, inside a widened bound",
+                TimeDelta::days(-400),
+                wide_past,
+            ),
+        ] {
+            let now = Utc::now();
+            let timestamp = now + offset;
+
+            let (final_ts, original) = override_timestamp_with_past_limit(timestamp, max_past);
+
+            assert_eq!(final_ts, timestamp, "{case}");
+            assert!(original.is_none(), "{case}");
+        }
+    }
+
+    #[test]
+    fn override_timestamp_replaces_a_timestamp_outside_the_window() {
+        let wide_past = TimeDelta::days(500);
+
+        for (case, offset, max_past) in [
+            (
+                "just past the default bound",
+                TimeDelta::hours(-24) - TimeDelta::seconds(1),
+                default_max_past(),
+            ),
+            ("two days ago", TimeDelta::hours(-48), default_max_past()),
+            (
+                "400 days ago, past a narrower widened bound",
+                TimeDelta::days(-400),
+                TimeDelta::days(300),
+            ),
+            (
+                "a day ahead, widened past bound",
+                TimeDelta::hours(25),
+                wide_past,
+            ),
+        ] {
+            let now = Utc::now();
+            let timestamp = now + offset;
+
+            let (final_ts, original) = override_timestamp_with_past_limit(timestamp, max_past);
+
+            assert!(
+                (final_ts - now).num_seconds().abs() < 2,
+                "{case}: expected the ingest time, got {final_ts}"
+            );
+            assert_eq!(original.unwrap(), timestamp, "{case}");
+        }
+    }
+
+    #[test]
+    fn override_timestamp_keeps_a_timestamp_under_an_oversized_past_bound() {
+        let timestamp = Utc::now() - TimeDelta::days(400);
+
+        // A bound this wide makes `now - max_past` leave chrono's range.
+        let (final_ts, original) =
+            override_timestamp_with_past_limit(timestamp, TimeDelta::days(200_000_000));
+
+        assert_eq!(final_ts, timestamp);
+        assert!(original.is_none());
+    }
+
+    #[test]
+    fn override_timestamp_applies_a_24_hour_past_bound() {
+        // Asserts the original only: the replacement is the ingest time, which races the clock.
+        let inside = Utc::now() - TimeDelta::hours(23);
+        let outside = Utc::now() - TimeDelta::hours(25);
+
+        assert!(override_timestamp(inside).1.is_none());
+        assert_eq!(override_timestamp(outside).1, Some(outside));
+    }
+}

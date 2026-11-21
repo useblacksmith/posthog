@@ -1,0 +1,775 @@
+import re
+import json
+import time
+import urllib.parse
+from collections.abc import Callable
+from enum import Enum, auto
+from functools import wraps
+from ipaddress import ip_address
+from typing import Any, Optional, Union, cast
+from urllib.parse import urlparse
+from uuid import UUID
+
+from django.core.exceptions import RequestDataTooBig
+from django.db.models import QuerySet
+from django.http import HttpRequest
+
+import structlog
+from drf_spectacular.utils import empty
+from prometheus_client import Counter
+from requests.adapters import HTTPAdapter
+from rest_framework import request, serializers, status
+from rest_framework.decorators import action as drf_action
+from rest_framework.exceptions import ValidationError
+from rest_framework.fields import Field
+from statshog.defaults.django import statsd
+from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, PoolManager
+
+from posthog.schema import QueryTiming
+
+from posthog.api.documentation import extend_schema
+from posthog.constants import LIMIT, OFFSET
+from posthog.dataclasses import frozen
+from posthog.exceptions import (
+    RequestParsingError,
+    UnspecifiedCompressionFallbackParsingError,
+    generate_exception_response,
+)
+from posthog.helpers.impersonation import is_impersonated
+from posthog.hogql_queries.legacy_compatibility.clean_properties import clean_property
+from posthog.models import User
+from posthog.models.activity_logging.activity_log import Detail, changes_between, log_activity
+from posthog.security.url_validation import has_ambiguous_authority
+from posthog.utils import load_data_from_request
+from posthog.utils_cors import cors_response
+
+logger = structlog.get_logger(__name__)
+
+
+class ErrorResponseSerializer(serializers.Serializer):
+    error = serializers.CharField(help_text="Error message")
+
+
+class PaginationMode(Enum):
+    next = auto()
+    previous = auto()
+
+
+class ServiceRequest:
+    """Minimal request-like object for DRF serializers used from a service layer.
+
+    Provides the subset of the DRF Request interface that serializers actually
+    use (request.user and friends), without DRF's authentication machinery.
+
+    ``is_system=True`` explicitly declares a system write with no acting user —
+    the approval gate skips only requests that declare this, never inferring it
+    from a merely absent user.
+
+    ``method`` must match the write's semantics: serializers branch on it (e.g.
+    create-only validation runs on "POST"), so an update shim must say "PATCH".
+    """
+
+    def __init__(self, user: Any, *, is_system: bool = False, method: str = "POST"):
+        self.user = user
+        self.is_system = is_system
+        self.method = method
+        self.successful_authenticator = None
+        self.path = "/"
+        self.data: dict = {}
+        self.FILES: dict = {}
+        self.GET: dict = {}
+        self.META: dict = {}
+        self.headers: dict = {}
+        self.session: dict = {}
+
+
+# This overrides a change in DRF 3.15 that alters our behavior. If the user passes an empty argument,
+# the new version keeps it as null vs coalescing it to the default.
+# Don't add this to new classes
+class ClassicBehaviorBooleanFieldSerializer(serializers.BooleanField):
+    def __init__(self, **kwargs):
+        Field.__init__(self, allow_null=True, required=False, **kwargs)
+
+
+def format_paginated_url(request: request.Request, offset: int, page_size: int, mode=PaginationMode.next):
+    result = request.get_full_path()
+    if not result:
+        return None
+
+    new_offset = offset - page_size if mode == PaginationMode.previous else offset + page_size
+
+    if new_offset < 0:
+        return None
+
+    if "offset" in result:
+        result = result[1:]
+        result = result.replace(f"offset={offset}", f"offset={new_offset}")
+    else:
+        result = request.build_absolute_uri("{}{}offset={}".format(result, "&" if "?" in result else "?", new_offset))
+    return result
+
+
+def is_csp_report(request) -> bool:
+    return (
+        request.path == "/report"
+        or request.path == "/report/"
+        or request.headers.get("Content-Type") in {"application/reports+json", "application/csp-report"}
+    )
+
+
+def get_token(data, request) -> Optional[str]:
+    token = None
+
+    if request.method == "GET" or is_csp_report(
+        request
+    ):  # CSPs are actually POST, but the token must be available at the report-uri/to URL
+        if request.GET.get("token"):
+            token = request.GET.get("token")  # token passed as query param
+        elif request.GET.get("api_key"):
+            token = request.GET.get("api_key")  # api_key passed as query param
+
+    if not token:
+        if request.POST.get("api_key"):
+            token = request.POST["api_key"]
+        elif request.POST.get("token"):
+            token = request.POST["token"]
+        elif data:
+            if isinstance(data, list):
+                data = data[0]  # Mixpanel Swift SDK
+            if isinstance(data, dict):
+                if data.get("$token"):
+                    token = data["$token"]  # JS identify call
+                elif data.get("token"):
+                    token = data["token"]  # JS reloadFeatures call
+                elif data.get("api_key"):
+                    token = data["api_key"]  # server-side libraries like posthog-python and posthog-ruby
+                elif data.get("properties") and data["properties"].get("token"):
+                    token = data["properties"]["token"]  # JS capture call
+    return token
+
+
+def get_project_id(data, request) -> Optional[int]:
+    if request.GET.get("project_id"):
+        return int(request.GET["project_id"])
+    if request.POST.get("project_id"):
+        return int(request.POST["project_id"])
+    if isinstance(data, list):
+        data = data[0]  # Mixpanel Swift SDK
+    if data.get("project_id"):
+        return int(data["project_id"])
+    return None
+
+
+def get_data(request):
+    data = None
+
+    try:
+        data = load_data_from_request(request)
+    except (RequestParsingError, UnspecifiedCompressionFallbackParsingError) as error:
+        statsd.incr("capture_endpoint_invalid_payload")
+        logger.exception(f"Invalid payload", error=error)
+        return (
+            None,
+            cors_response(
+                request,
+                generate_exception_response(
+                    "capture",
+                    f"Malformed request data: {error}",
+                    code="invalid_payload",
+                ),
+            ),
+        )
+
+    except RequestDataTooBig:
+        return (
+            None,
+            cors_response(
+                request,
+                generate_exception_response(
+                    endpoint="capture",
+                    detail="Request too large.",
+                    type="client_error",
+                    code="request_too_large",
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                ),
+            ),
+        )
+
+    if not data:
+        return (
+            None,
+            cors_response(
+                request,
+                generate_exception_response(
+                    "capture",
+                    "No data found. Make sure to use a POST request when sending the payload in the body of the request.",
+                    code="no_data",
+                ),
+            ),
+        )
+
+    return data, None
+
+
+def check_definition_ids_inclusion_field_sql(
+    raw_included_definition_ids: Optional[str], is_property: bool, named_key: str
+):
+    # Create conditional field based on whether id exists in included_properties
+    if is_property:
+        included_definitions_sql = f"(id = ANY (%({named_key})s::uuid[]))"
+    else:
+        included_definitions_sql = f"(id = ANY (%({named_key})s::uuid[]))"
+
+    if not raw_included_definition_ids:
+        return included_definitions_sql, []
+
+    return included_definitions_sql, list(set(json.loads(raw_included_definition_ids)))
+
+
+SURROGATE_REGEX = re.compile("([\ud800-\udfff])")
+
+SURROGATES_SUBSTITUTED_COUNTER = Counter(
+    "surrogates_substituted_total",
+    "Stray UTF16 surrogates detected and removed from user input.",
+)
+
+
+# keep in sync with nodejs/src/common/utils/db/utils.ts::safeClickhouseString
+def safe_clickhouse_string(s: str, with_counter=True) -> str:
+    matches = SURROGATE_REGEX.findall(s or "")
+    for match in matches:
+        if with_counter:
+            SURROGATES_SUBSTITUTED_COUNTER.inc()
+        s = s.replace(match, match.encode("unicode_escape").decode("utf8"))
+    return s
+
+
+def get_pk_or_uuid(queryset: QuerySet, key: Union[int, str]) -> QuerySet:
+    try:
+        # Test if value is a UUID
+        UUID(str(key))
+        return queryset.filter(uuid=key)
+    except ValueError:
+        return queryset.filter(pk=key)
+
+
+def parse_actor_property_filters(raw_properties: Optional[str]) -> list[dict]:
+    """Read the `properties` query parameter of a person or cohort actors endpoint.
+
+    Filters that `ActorsQuery` requires an `operator` on get `exact` when the caller omits it.
+    """
+    if not raw_properties:
+        return []
+    properties = json.loads(raw_properties)
+    if not isinstance(properties, list):
+        return []
+    # An empty filter, bare `{}` or explicit `{"type": "empty"}`, must keep no operator;
+    # `clean_property` only excludes `hogql` from its default, not `empty`.
+    return [clean_property(prop) if prop and prop.get("type") != "empty" else prop for prop in properties]
+
+
+INSIGHT_KINDS = {
+    "TrendsQuery",
+    "FunnelsQuery",
+    "RetentionQuery",
+    "PathsQuery",
+    "PathsV2Query",
+    "StickinessQuery",
+    "LifecycleQuery",
+}
+
+# Queries that should be granted an extended ClickHouse timeout via LimitContext.QUERY_ASYNC.
+# Superset of INSIGHT_KINDS — includes expensive non-insight queries like TracesQuery
+# whose two-phase GROUP BY over the events table can exceed the default 60s limit.
+# Experiment queries are also here: they run synchronously in the web request but can be
+# expensive enough to need the longer timeout.
+ASYNC_QUERY_KINDS = INSIGHT_KINDS | {
+    "TracesQuery",
+    "ExperimentQuery",
+    "ExperimentExposureQuery",
+    # Server-owned HogQL sections keep the extended timeout their standalone HogQLQuery tiles had.
+    "MCPDashboardQuery",
+}
+_EXTRA_ASYNC_KINDS = ASYNC_QUERY_KINDS - INSIGHT_KINDS
+
+INSIGHT_ACTORS_KINDS = {
+    "InsightActorsQuery",
+    "FunnelsActorsQuery",
+    "StickinessActorsQuery",
+    "PathsV2ActorsQuery",
+}
+
+
+def is_insight_query(query: dict) -> bool:
+    kind = query.get("kind")
+    source = query.get("source")
+
+    if kind in INSIGHT_KINDS:
+        return True
+    if kind == "HogQLQuery":
+        return True
+    if kind == "DataTableNode":
+        if source and (source.get("kind") or getattr(source, "kind", None)) in INSIGHT_KINDS:
+            return True
+    if kind == "BIVisualizationNode":
+        return isinstance(source, dict) and is_insight_query(source)
+    if kind == "DataVisualizationNode":
+        if source and (source.get("kind") or getattr(source, "kind", None)) in INSIGHT_KINDS:
+            return True
+    if kind == "InsightVizNode":
+        if source and (source.get("kind") or getattr(source, "kind", None)) in INSIGHT_KINDS:
+            return True
+
+    return False
+
+
+def is_async_query(query: dict) -> bool:
+    """Check if a query should be granted the extended ClickHouse timeout (LimitContext.QUERY_ASYNC).
+
+    Name is historical: originally these queries all ran via the async/Celery path, but membership
+    now just signals "expensive, needs the longer timeout" regardless of whether execution is sync
+    or async. Superset of is_insight_query — also covers expensive non-insight queries like traces
+    and experiments.
+    """
+    if is_insight_query(query):
+        return True
+
+    kind = query.get("kind")
+    source = query.get("source")
+
+    if kind in _EXTRA_ASYNC_KINDS:
+        return True
+    if kind in ("DataTableNode", "DataVisualizationNode", "BIVisualizationNode", "InsightVizNode"):
+        source_kind = source.get("kind") if source and isinstance(source, dict) else getattr(source, "kind", None)
+        if source_kind in _EXTRA_ASYNC_KINDS:
+            return True
+
+    return False
+
+
+def is_insight_actors_query(query: dict) -> bool:
+    kind = query.get("kind")
+    source = query.get("source")
+
+    if kind in INSIGHT_ACTORS_KINDS:
+        return True
+    if kind == "ActorsQuery":
+        if source and (source.get("kind") or getattr(source, "kind", None)) in INSIGHT_ACTORS_KINDS:
+            return True
+    return False
+
+
+def is_insight_actors_options_query(query: dict) -> bool:
+    kind = query.get("kind")
+    if kind == "InsightActorsQueryOptions":
+        return True
+    return False
+
+
+MAX_LISTED_IDS = 200
+
+
+def parse_id_list[T](
+    raw: str | None, *, name: str, parse: Callable[[str], T], max_ids: int = MAX_LISTED_IDS
+) -> list[T] | None:
+    """Parse a comma-separated id filter from a query param. None when the param is absent."""
+    if raw is None:
+        return None
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if len(parts) > max_ids:
+        raise ValidationError({name: f"Pass at most {max_ids} IDs."})
+    try:
+        return [parse(part) for part in parts]
+    except (TypeError, ValueError):
+        raise ValidationError({name: "Pass IDs separated by commas."})
+
+
+def parse_bool(value: Union[str, list[str]]) -> bool:
+    if value == "true":
+        return True
+    return False
+
+
+def raise_if_connected_to_private_ip(conn):
+    """Raise if the HTTPConnection / HTTPSConnection we are given points to a private IP."""
+    if not getattr(conn, "sock", None):  # Force the connection open to check the remote IP
+        conn.connect()
+    addr = ip_address(conn.sock.getpeername()[0])
+    if addr.is_private:
+        raise ValueError("Internal IP")
+
+
+class PublicIPOnlyHTTPConnectionPool(HTTPConnectionPool):
+    def _validate_conn(self, conn):
+        raise_if_connected_to_private_ip(conn)
+        validate_conn = getattr(super(), "_validate_conn", None)
+        if validate_conn is not None:
+            validate_conn(conn)
+
+
+class PublicIPOnlyHTTPSConnectionPool(HTTPSConnectionPool):
+    def _validate_conn(self, conn):
+        raise_if_connected_to_private_ip(conn)
+        validate_conn = getattr(super(), "_validate_conn", None)
+        if validate_conn is not None:
+            validate_conn(conn)
+
+
+class PublicIPOnlyHttpAdapter(HTTPAdapter):
+    """Transport adapter that enforces that we only connect to public IPs
+
+    Due to the lack of a hook after DNS resolution, we override the connection pool classes
+    to check the remote IP after we connect to it, but before we send the request.
+
+    Intended as a second line of defense after the URL has been validated.
+    """
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": PublicIPOnlyHTTPConnectionPool,
+            "https": PublicIPOnlyHTTPSConnectionPool,
+        }
+
+
+def canonicalize_encoded_url(url: str) -> str:
+    """Decode a URL that arrived fully percent-encoded, so it has an authority to validate.
+
+    Some browsers encode a whole redirect target, turning ``https://permitted.example`` into
+    ``https%3A%2F%2Fpermitted.example`` — a string that parses to no host at all.
+
+    Only a string with no host is decoded, and only once. Decoding a URL that already has an
+    authority is what lets ``https://permitted.example%2F@evil.example/`` be approved as
+    ``permitted.example`` while a browser resolves ``evil.example``, so that case is left alone.
+    Callers must redirect to what this returns, not to what they passed in, because approving the
+    decoded form and emitting the raw one would reintroduce the same split.
+
+    Callers run their own ``urlparse`` after this and turn its ``ValueError`` into a 400, so a URL
+    that cannot be parsed at all is handed back untouched rather than raised on here.
+    """
+    try:
+        if urlparse(url).hostname:
+            return url
+        decoded = urllib.parse.unquote(url)
+        return decoded if urlparse(decoded).hostname else url
+    except ValueError:
+        return url
+
+
+def unparsed_hostname_in_allowed_url_list(allowed_url_list: Optional[list[str]], hostname: Optional[str]) -> bool:
+    if not hostname:
+        return hostname_in_allowed_url_list(allowed_url_list, hostname)
+    candidate = canonicalize_encoded_url(hostname)
+    if has_ambiguous_authority(candidate):
+        return False
+    return hostname_in_allowed_url_list(allowed_url_list, urlparse(candidate).hostname)
+
+
+def strip_url_userinfo(url: str) -> str:
+    """
+    Rebuild ``url`` so its authority holds only the host and port.
+
+    Redirect targets are approved on the strength of their host, so echoing the
+    caller's authority back keeps a ``user@`` prefix that the approval never looked at.
+    """
+    parsed = urlparse(url)
+    if "@" not in parsed.netloc:
+        return url
+    # urlparse derives the host the same way, by taking everything after the last "@".
+    return urllib.parse.urlunparse(parsed._replace(netloc=parsed.netloc.rpartition("@")[2]))
+
+
+def _strip_www(host: str) -> str:
+    """Treat www.domain.com and domain.com as equivalent."""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _matches_wildcard_host(pattern: str, hostname: str) -> bool:
+    """Match a host pattern whose `*` spans any run of characters, dots included.
+
+    Scanning the literals greedily from left to right decides this grammar exactly, in a
+    single pass, so the cost stays linear in the hostname length however many wildcards
+    the pattern carries.
+    """
+    parts = pattern.split("*")
+    if len(parts) == 1:
+        return pattern == hostname
+
+    prefix, suffix = parts[0], parts[-1]
+    if len(hostname) < len(prefix) + len(suffix):
+        return False
+    if not hostname.startswith(prefix) or not hostname.endswith(suffix):
+        return False
+
+    start, end = len(prefix), len(hostname) - len(suffix)
+    for part in parts[1:-1]:
+        if not part:
+            continue
+        found = hostname.find(part, start, end)
+        if found == -1:
+            return False
+        start = found + len(part)
+
+    return True
+
+
+def hostname_in_allowed_url_list(allowed_url_list: Optional[list[str]], hostname: Optional[str]) -> bool:
+    if not hostname:
+        return False
+
+    permitted_domains = []
+    if allowed_url_list:
+        for url in allowed_url_list:
+            try:
+                host = parse_domain(url)
+            except ValueError:
+                # Entries stored before write-time validation can still be unparseable, and
+                # one of them must not take down every allowlist check the team makes.
+                continue
+            if host:
+                permitted_domains.append(host)
+
+    for permitted_domain in permitted_domains:
+        if "*" in permitted_domain:
+            if _matches_wildcard_host(permitted_domain, hostname):
+                return True
+        elif _strip_www(permitted_domain) == _strip_www(hostname):
+            return True
+
+    return False
+
+
+def parse_domain(url: Any) -> Optional[str]:
+    return urlparse(url).hostname
+
+
+MAX_WILDCARDS_PER_AUTHORIZED_URL = 5
+
+
+def validate_authorized_url_wildcards(urls: list[str]) -> None:
+    """Keep stored allowlist entries to the shape real deployments use.
+
+    Genuine entries carry one wildcard, occasionally two. Entries far beyond that only ever
+    make matching more expensive, so they are rejected at write time.
+    """
+    for url in urls:
+        if not isinstance(url, str):
+            # widget_domains arrives on a raw JSONField, so entries are not string-coerced for us.
+            raise ValidationError("Each URL must be a string.")
+        try:
+            host = parse_domain(url)
+        except ValueError:
+            # urlparse raises on an unterminated IPv6 bracket, and every later allowlist
+            # check re-parses the stored entry, so accepting one here turns each of those
+            # checks into a 500 for the whole team.
+            raise ValidationError("One of these URLs can't be parsed. Check for a typo, like an unclosed bracket.")
+        if host and host.count("*") > MAX_WILDCARDS_PER_AUTHORIZED_URL:
+            raise ValidationError(
+                f"Each URL can include up to {MAX_WILDCARDS_PER_AUTHORIZED_URL} wildcards. "
+                "Remove the extra ones from this entry."
+            )
+
+
+def on_permitted_recording_domain(permitted_domains: list[str], request: HttpRequest) -> bool:
+    origin = parse_domain(request.headers.get("Origin"))
+    referer = parse_domain(request.headers.get("Referer"))
+
+    user_agent = request.headers.get("user-agent")
+
+    is_authorized_web_client: bool = hostname_in_allowed_url_list(
+        permitted_domains, origin
+    ) or hostname_in_allowed_url_list(permitted_domains, referer)
+    # TODO this is a short term fix for beta testers
+    # TODO we will match on the app identifier in the origin instead and allow users to auth those
+    is_authorized_mobile_client: bool = user_agent is not None and any(
+        keyword in user_agent
+        for keyword in ["posthog-android", "posthog-ios", "posthog-react-native", "posthog-flutter", "posthog-kmp"]
+    )
+
+    return is_authorized_web_client or is_authorized_mobile_client
+
+
+# By default, DRF spectacular uses the serializer of the view as the response format for actions. However, most actions don't return a version of the model, but something custom. This function removes the response from all actions in the documentation.
+def action(methods=None, detail=None, url_path=None, url_name=None, responses=None, request=empty, **kwargs):
+    """
+    Mark a ViewSet method as a routable action.
+
+    `@action`-decorated functions will be endowed with a `mapping` property,
+    a `MethodMapper` that can be used to add additional method-based behaviors
+    on the routed action.
+
+    :param methods: A list of HTTP method names this action responds to.
+                    Defaults to GET only.
+    :param detail: Required. Determines whether this action applies to
+                   instance/detail requests or collection/list requests.
+    :param url_path: Define the URL segment for this action. Defaults to the
+                     name of the method decorated.
+    :param url_name: Define the internal (`reverse`) URL name for this action.
+                     Defaults to the name of the method decorated with underscores
+                     replaced with dashes.
+    :param responses: Serializer or pydantic model of the response for documentation
+    :param request: Serializer/schema of the request body for documentation. Defaults to inferring
+                    from the viewset's ``serializer_class``; pass ``None`` for actions with no body.
+    :param kwargs: Additional properties to set on the view.  This can be used
+                   to override viewset-level *_classes settings, equivalent to
+                   how the `@renderer_classes` etc. decorators work for function-
+                   based API views.
+    """
+
+    def decorator(func):
+        @extend_schema(request=request, responses=responses)
+        @drf_action(
+            methods=methods,
+            detail=detail,
+            url_path=url_path,
+            url_name=url_name,
+            **kwargs,
+        )
+        @wraps(func)
+        def wrapped_function(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        return wrapped_function
+
+    return decorator
+
+
+# context manager for gathering a sequence of server timings
+# can be used to then return the timings in the HTTP response headers
+# so that browsers and other tools can show them
+class ServerTimingsGathered:
+    def __init__(self):
+        # Instance level dictionary to store timings
+        self.timings_dict = {}
+
+    def __call__(self, name):
+        self.name = name
+        return self
+
+    def __enter__(self):
+        # timings are assumed to be in milliseconds when reported
+        # but are gathered by time.perf_counter which is fractional seconds 🫠
+        # so each value is multiplied by 1000 at collection
+        self.start_time = time.perf_counter() * 1000
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        end_time = time.perf_counter() * 1000
+        elapsed_time = end_time - self.start_time
+        self.timings_dict[self.name] = elapsed_time
+
+    def get_all_timings(self):
+        return self.timings_dict
+
+    def generate_timings(self, hogql_timings: list[QueryTiming] | None = None) -> dict[str, float]:
+        timings_dict = self.get_all_timings()
+        hogql_timings_dict = {}
+        for timing in hogql_timings or []:
+            new_key = f"hogql_{timing.k.lstrip('./').replace('/', '_')}"
+            # HogQL query timings are in seconds, convert to milliseconds
+            hogql_timings_dict[new_key] = timing.t * 1000
+        all_timings = {**timings_dict, **hogql_timings_dict}
+        return all_timings
+
+    def to_header_string(self, hogql_timings: list[QueryTiming] | None = None) -> str:
+        slowest_hogql_timings = sorted(hogql_timings or [], key=lambda timing: timing.t, reverse=True)[:20]
+        timings = self.generate_timings(slowest_hogql_timings).items()
+        result: list[str] = []
+        current_length = 0
+
+        for key, duration in timings:
+            timing_str = f"{key};dur={round(duration, ndigits=2)}"
+            # +2 for ", " separator, except for first item
+            new_length = current_length + len(timing_str) + (2 if result else 0)
+
+            if new_length > 10000:
+                """
+                The server timings can grow to arbitrary length - in the case that caused us problems over 33,000 characters
+                AWS ALBs have limits on size for both each individual header and for all headers on a request
+                If we exceed that limit then the ALB returns a 502 with no other explanation
+                leading to confusion and distraction
+                So, we limit here to 10k characters to avoid that issue
+                The timings header is a debug signal we don't rely on for functionality
+                so not receiving all timings is not the worse thing in the world
+                """
+                logger.info(
+                    "server_timing_header_truncated",
+                    timing_count=len(timings),
+                    included_timing_count=len(result),
+                    header_length=current_length,
+                )
+                break
+
+            result.append(timing_str)
+            current_length = new_length
+
+        return ", ".join(result)
+
+
+ACTIVITY_TYPES = {
+    "partial_update": "updated",
+    "update": "updated",
+    "delete": "deleted",
+    "create": "created",
+    "default": "changed",
+}
+
+
+def log_activity_from_viewset(
+    viewset, instance, activity=None, name=None, previous=None, detail_type=None, short_id=None
+) -> None:
+    try:
+        model_class = instance.__class__.__name__
+        name = name or model_class
+        activity = activity or ACTIVITY_TYPES.get(viewset.action, ACTIVITY_TYPES["default"])
+
+        detail_kwargs = {"name": name}
+        if previous is not None:
+            changes = changes_between(model_class, previous=previous, current=instance)
+            detail_kwargs["changes"] = changes
+        if detail_type is not None:
+            detail_kwargs["type"] = detail_type
+        if short_id is not None:
+            detail_kwargs["short_id"] = short_id
+
+        log_activity(
+            organization_id=viewset.organization.id,
+            team_id=viewset.team.id,
+            user=cast(User, viewset.request.user),
+            was_impersonated=is_impersonated(viewset.request),
+            item_id=str(instance.id),
+            scope=model_class,
+            activity=activity,
+            detail=Detail(**detail_kwargs),
+        )
+    except:
+        pass
+
+
+@frozen
+class Paging:
+    """A page of results asked for by `limit` and `offset`. Either is 0 when the client sends neither."""
+
+    limit: int
+    offset: int
+
+
+def _paging_param(raw: str | None, name: str) -> int:
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise ValidationError(f"'{name}' must be an integer") from error
+
+
+def paging_params(request: request.Request) -> Paging:
+    """Read the `limit` and `offset` query params, defaulting either to 0 when absent or empty."""
+    return Paging(
+        limit=_paging_param(request.GET.get(LIMIT), LIMIT),
+        offset=_paging_param(request.GET.get(OFFSET), OFFSET),
+    )

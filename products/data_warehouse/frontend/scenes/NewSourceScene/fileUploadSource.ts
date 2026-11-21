@@ -1,0 +1,50 @@
+import { urls } from 'scenes/urls'
+
+import type { ExternalDataSourceType } from '~/types'
+
+import { SourceConfigResponseApi } from 'products/warehouse_sources/frontend/generated/api.schemas'
+
+// File upload is a client-only catalog entry. The backend FileUpload source isn't listed in the
+// catalog, because PostHog creates it after the uploaded file becomes a table. This synthetic config
+// reuses the shared source-config shape and the wizard's connector-selection plumbing. It drives the
+// wizard's second step and the tile icon; the three tiles below (one per format) all point back at
+// it, since users look for "CSV", not "File upload".
+export const FILE_UPLOAD_SOURCE_NAME: ExternalDataSourceType = 'FileUpload'
+
+export type FileUploadFormat = 'csv' | 'json' | 'parquet'
+
+export const FILE_UPLOAD_SOURCE_CONFIG: SourceConfigResponseApi = {
+    name: FILE_UPLOAD_SOURCE_NAME,
+    label: 'File upload',
+    caption: 'Upload a CSV, JSON, or Parquet file to query it in the PostHog data warehouse.',
+    iconPath: '/static/services/file-upload.svg',
+    // The upload form is bespoke (`FileUploadSourceForm`), so no generic connection fields.
+    fields: [],
+    // No vendor API sits behind an upload, so the version fields the response type requires stay empty.
+    supportsColumnSelection: false,
+    versions: [],
+    defaultVersion: '',
+    deprecatedVersions: [],
+}
+
+export const FILE_UPLOAD_FORMATS: { format: FileUploadFormat; label: string; keywords: string[] }[] = [
+    { format: 'csv', label: 'CSV file', keywords: ['csv', 'spreadsheet', 'excel export', 'comma separated', 'upload'] },
+    { format: 'json', label: 'JSON file', keywords: ['json', 'ndjson', 'jsonl', 'upload'] },
+    { format: 'parquet', label: 'Parquet file', keywords: ['parquet', 'pqt', 'columnar', 'upload'] },
+]
+
+/**
+ * Identifier for one format's catalog tile, e.g. `FileUpload-csv`.
+ *
+ * The catalog tile and the analytics events both key off this, so a pick and the table it produced
+ * join on one value. There is no external data source row to join against instead — an upload
+ * becomes a table, not a synced source — so this string is the only link between the two halves.
+ */
+export function fileUploadSourceType(format: FileUploadFormat): string {
+    return `${FILE_UPLOAD_SOURCE_NAME}-${format}`
+}
+
+export function fileUploadSourceUrl(format: FileUploadFormat): string {
+    const url = urls.dataWarehouseSourceNew(FILE_UPLOAD_SOURCE_NAME)
+    return `${url}${url.includes('?') ? '&' : '?'}format=${format}`
+}

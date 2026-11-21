@@ -1,0 +1,1417 @@
+import json
+import uuid
+import tracemalloc
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
+
+import pytest
+import time_machine
+from unittest.mock import MagicMock, patch
+
+from asgiref.sync import async_to_sync
+
+from posthog.schema import DateRange, LLMTrace, LLMTraceEvent, SessionQuery, TraceQuery
+
+from posthog.hogql import ast
+from posthog.hogql.database.database import Database
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.api.capture import CaptureInternalError
+from posthog.constants import AvailableFeature
+from posthog.hogql_queries.ai.session_query_runner import SessionQueryRunner
+from posthog.hogql_queries.ai.trace_query_runner import TraceQueryRunner
+from posthog.models import Organization, Team, User
+from posthog.models.ai_events.test_util import bulk_create_ai_events
+from posthog.models.event.util import bulk_create_events
+from posthog.temporal.ai_observability.judge_attachments import JudgeAttachments
+from posthog.temporal.ai_observability.run_session_evaluation import fetch_session_for_evaluation
+from posthog.temporal.ai_observability.trace_summarization.fetch_and_format import _fetch_and_format_trace
+
+from products.access_control.backend.facade.contracts import PropertyAccessLevel
+from products.access_control.backend.models.access_control import AccessControl
+from products.access_control.backend.models.property_access_control import PropertyAccessControl
+from products.access_control.backend.property_access_control import restriction_cache_scope
+from products.ai_observability.backend.facade.evaluation_runtime import (
+    JUDGE_TRACE_MAX_CHARS,
+    build_trace_hog_globals,
+    execute_hog_eval_bytecode,
+)
+from products.ai_observability.backend.llm.attachments import AttachmentPart
+from products.ai_observability.backend.models.evaluation_config import EvaluationConfig
+from products.ai_observability.backend.models.evaluations import Evaluation
+from products.ai_observability.backend.models.provider_keys import LLMProviderKey
+from products.cdp.backend.validation import compile_hog
+from products.event_definitions.backend.models import PropertyDefinition
+
+from .eval_reports.report_agent.tools import _execute_hogql, get_trace_detail
+from .evaluation_llm_judge import BooleanEvalResult
+from .evaluation_types import EvaluationActivityResult
+from .evaluation_workflow_activities import backfill_verdict_timestamp
+from .run_trace_evaluation import (
+    MAX_TRACE_EVAL_EVENTS,
+    TRACE_EVENTS_LOOKBACK,
+    EmitTraceEvaluationEventInputs,
+    ExecuteTraceEvaluationInputs,
+    RunTraceEvaluationInputs,
+    RunTraceEvaluationWorkflow,
+    TraceFetchOutcome,
+    TraceHogTestSample,
+    _build_trace_skip_result,
+    _sample_recent_traces,
+    build_trace_system_prompt,
+    emit_trace_evaluation_event_activity,
+    execute_trace_hog_eval_activity,
+    execute_trace_llm_judge_activity,
+    fetch_trace_for_evaluation,
+    format_trace_for_judge,
+    run_hog_eval_over_recent_traces,
+)
+
+FROZEN_NOW = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+
+def create_trace_event(event: str = "$ai_generation", **properties: Any) -> LLMTraceEvent:
+    return LLMTraceEvent(
+        id=str(uuid.uuid4()),
+        event=event,
+        createdAt=FROZEN_NOW.isoformat(),
+        properties=properties,
+    )
+
+
+def create_trace(events: list[LLMTraceEvent], **overrides: Any) -> LLMTrace:
+    defaults: dict[str, Any] = {
+        "id": "trace-123",
+        "createdAt": FROZEN_NOW.isoformat(),
+        "distinctId": "test-user",
+        "events": events,
+    }
+    return LLMTrace(**{**defaults, **overrides})
+
+
+@pytest.fixture
+def setup_data():
+    organization = Organization.objects.create(name="Test Org")
+    team = Team.objects.create(organization=organization, name="Test Team")
+    evaluation = Evaluation.objects.create(
+        team=team,
+        name="Trace Evaluation",
+        evaluation_type="llm_judge",
+        evaluation_config={"prompt": "Did the agent resolve the user's request?"},
+        output_type="boolean",
+        output_config={},
+        target="trace",
+        enabled=True,
+    )
+    return {"organization": organization, "team": team, "evaluation": evaluation}
+
+
+@pytest.fixture
+def active_key_config(setup_data):
+    """Give the team a healthy active provider key so a null-config judge resolves via DefaultModelSpec."""
+    team = setup_data["team"]
+    key = LLMProviderKey.objects.create(
+        team=team,
+        provider="openai",
+        name="openai key",
+        state=LLMProviderKey.State.OK,
+        encrypted_config={"api_key": "sk-test"},
+    )
+    EvaluationConfig.objects.create(team=team, active_provider_key=key)
+
+
+def evaluation_dict(setup_data: dict, **overrides: Any) -> dict[str, Any]:
+    defaults = {
+        "id": str(setup_data["evaluation"].id),
+        "name": "Trace Evaluation",
+        "evaluation_type": "llm_judge",
+        "evaluation_config": {"prompt": "Did the agent resolve the user's request?"},
+        "output_type": "boolean",
+        "output_config": {},
+        "team_id": setup_data["team"].id,
+    }
+    return {**defaults, **overrides}
+
+
+# These assert the integration with the shared text_repr formatter — that the judge receives the
+# trace's events and content — not the formatter's exact tree art, which text_repr tests itself.
+class TestFormatTraceForJudge:
+    def test_renders_trace_hierarchy_with_event_content(self):
+        trace = create_trace(
+            [
+                create_trace_event(
+                    "$ai_span",
+                    **{"$ai_span_name": "retrieval", "$ai_input_state": "query", "$ai_output_state": "3 docs"},
+                ),
+                create_trace_event(
+                    "$ai_generation",
+                    **{
+                        "$ai_model": "gpt-4o",
+                        "$ai_latency": 1.5,
+                        "$ai_input": [{"role": "user", "content": "What is 2+2?"}],
+                        "$ai_output_choices": [{"role": "assistant", "content": "4"}],
+                    },
+                ),
+            ],
+            traceName="math-agent",
+        )
+
+        transcript = format_trace_for_judge(trace)
+
+        assert "MATH-AGENT" in transcript
+        assert "TRACE HIERARCHY" in transcript
+        assert "[GEN]" in transcript
+        assert "[SPAN]" in transcript
+        assert "gpt-4o" in transcript
+        assert "What is 2+2?" in transcript
+
+    def test_numbers_images_only_for_a_judge_with_images(self):
+        image = {"type": "image_url", "image_url": {"url": f"phaiblob://v1/sha256/{'a' * 64}?mime=image%2Fpng&size=1"}}
+        otel_blob = {"type": "blob", "modality": "image", "mime_type": "image/png", "content": "aGk="}
+        trace = create_trace(
+            [
+                create_trace_event(
+                    "$ai_generation",
+                    **{
+                        "$ai_input": [
+                            {"role": "user", "content": [image, {"type": "text", "text": "Describe the chart."}]},
+                            {
+                                "role": "user",
+                                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [image]}],
+                            },
+                            {"role": "user", "parts": [otel_blob]},
+                            {
+                                "type": "function_call_output",
+                                "call_id": "c1",
+                                "output": [
+                                    {
+                                        "type": "input_image",
+                                        "image_url": f"phaiblob://v1/sha256/{'c' * 64}?mime=image%2Fpng&size=1",
+                                    }
+                                ],
+                            },
+                        ],
+                        "$ai_output": "A rising line.",
+                    },
+                )
+            ]
+        )
+
+        plain = format_trace_for_judge(trace)
+        marked = format_trace_for_judge(trace, JudgeAttachments(team_id=1).marker)
+
+        assert "[image 1]" not in plain
+        # The message and the tool result repeat one image, and the OTel part adds a second.
+        assert marked.count("[image 1]") == 2
+        assert "[image 2]" in marked
+        assert "[image 3]" in marked
+
+    def test_includes_tool_catalog(self):
+        tools = [{"type": "function", "function": {"name": "search_docs", "description": "Search the docs"}}]
+        trace = create_trace(
+            [
+                create_trace_event("$ai_generation", **{"$ai_input": "hi", "$ai_output": "hello"}),
+                create_trace_event("$ai_generation", **{"$ai_tools": tools, "$ai_input": "x", "$ai_output": "y"}),
+            ]
+        )
+
+        transcript = format_trace_for_judge(trace)
+
+        assert "search_docs" in transcript
+
+    @pytest.mark.parametrize("output_property", ["$ai_output", "$ai_output_choices"])
+    @pytest.mark.parametrize(
+        "content_length,output_length,should_truncate,should_truncate_output",
+        [(50_000, 4_000, False, False), (200_000, 4_000, True, False), (200_000, 200_000, True, True)],
+    )
+    def test_truncates_long_event_io_only_when_the_trace_exceeds_budget(
+        self,
+        output_property: str,
+        content_length: int,
+        output_length: int,
+        should_truncate: bool,
+        should_truncate_output: bool,
+    ) -> None:
+        content = "start " + "x" * (content_length // 2) + " critical evidence " + "y" * (content_length // 2) + " end"
+        output = "a" * (output_length // 2) + "\n- Required output evidence.\n" + "b" * (output_length // 2)
+        output_value = (
+            output
+            if output_property == "$ai_output"
+            else [{"role": "assistant", "content": [{"type": "text", "text": output}]}]
+        )
+        trace = create_trace(
+            [
+                create_trace_event(
+                    "$ai_generation",
+                    **{"$ai_input": [{"role": "user", "content": content}], output_property: output_value},
+                )
+            ]
+        )
+
+        transcript = format_trace_for_judge(trace)
+
+        assert ("chars truncated" in transcript) == should_truncate
+        assert ("critical evidence" in transcript) == (not should_truncate)
+        assert ("- Required output evidence." in transcript) == (not should_truncate_output)
+        if not should_truncate_output:
+            assert all(line in transcript for line in output.splitlines())
+        assert "start " in transcript
+        assert " end" in transcript
+        assert len(transcript) <= JUDGE_TRACE_MAX_CHARS
+
+    def test_bounds_output_to_max_chars(self):
+        # 200 large generations would blow well past the cap without sampling.
+        events = [
+            create_trace_event("$ai_generation", **{"$ai_input": f"question {i} " + ("x" * 2_000)}) for i in range(200)
+        ]
+
+        transcript = format_trace_for_judge(create_trace(events))
+
+        assert len(transcript) <= JUDGE_TRACE_MAX_CHARS
+        assert "SAMPLED VIEW" in transcript
+
+    @pytest.mark.parametrize("message_property", ["$ai_input", "$ai_output_choices"])
+    @pytest.mark.parametrize("event_count,message_count", [(50, 1), (1, 50)])
+    @pytest.mark.parametrize("message_format", ["content", "parts"])
+    def test_oversized_messages_do_not_allocate_the_full_transcript(
+        self, message_property: str, event_count: int, message_count: int, message_format: str
+    ) -> None:
+        content = "start " + "x" * 500_000 + " end"
+        message_content = (
+            {"content": content}
+            if message_format == "content"
+            else {
+                "parts": [
+                    {"type": "text", "content": content[:250_000]},
+                    {"type": "text", "content": content[250_000:]},
+                ]
+            }
+        )
+        messages = [{"role": "user", **message_content} for _ in range(message_count)]
+        trace = create_trace(
+            [create_trace_event("$ai_generation", **{message_property: messages}) for _ in range(event_count)]
+        )
+
+        tracemalloc.start()
+        try:
+            transcript = format_trace_for_judge(trace)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert "chars truncated" in transcript
+        assert len(transcript) <= JUDGE_TRACE_MAX_CHARS
+        assert peak_bytes < 10_000_000
+
+    def test_marks_errored_events(self):
+        trace = create_trace(
+            [create_trace_event("$ai_generation", **{"$ai_is_error": True, "$ai_error": "rate limited"})]
+        )
+
+        transcript = format_trace_for_judge(trace)
+
+        assert "rate limited" in transcript
+
+
+class TestBuildTraceHogGlobals:
+    def test_builds_events_with_per_event_input_output(self):
+        events = [
+            create_trace_event("$ai_span", **{"$ai_input_state": "", "$ai_output_state": ""}),
+            create_trace_event("$ai_generation", **{"$ai_input": "first question", "$ai_output": "first answer"}),
+            create_trace_event("$ai_generation", **{"$ai_input": "second question", "$ai_output": "final answer"}),
+        ]
+        trace = create_trace(events, totalCost=0.03, totalLatency=2.5)
+
+        globals_dict = build_trace_hog_globals(trace, "trace-123")
+
+        assert "input" not in globals_dict
+        assert "output" not in globals_dict
+        assert globals_dict["trace"] == {"id": "trace-123", "event_count": 3}
+        assert globals_dict["target"] == {
+            "type": "trace",
+            "id": "trace-123",
+            "total_cost_usd": 0.03,
+            "total_latency_seconds": 2.5,
+        }
+        assert len(globals_dict["events"]) == 3
+        assert globals_dict["events"][1]["event"] == "$ai_generation"
+        assert globals_dict["events"][1]["input"] == "first question"
+        assert globals_dict["events"][2]["output"] == "final answer"
+        assert "input_text" not in globals_dict["events"][1]
+        assert "output_text" not in globals_dict["events"][2]
+        assert globals_dict["evaluation_events"][1]["input_text"] == "first question"
+        assert globals_dict["evaluation_events"][2]["output_text"] == "final answer"
+
+    def test_saved_events_source_only_builds_compatibility_events(self):
+        bytecode = compile_hog("return length(events) == 1 and events.1.output == 'answer'", "destination")
+        trace = create_trace(
+            [create_trace_event("$ai_generation", **{"$ai_input": "question", "$ai_output": "answer"})]
+        )
+
+        globals_dict = build_trace_hog_globals(trace, "trace-123", bytecode=bytecode)
+        result = execute_hog_eval_bytecode(bytecode, globals_dict, allows_na=False)
+
+        assert set(globals_dict) == {"events", "trace"}
+        assert set(globals_dict["events"][0]) == {"uuid", "event", "timestamp", "input", "output", "properties"}
+        assert result == {"verdict": True, "reasoning": "", "error": None}
+
+    def test_strips_heavy_keys_from_event_properties(self):
+        events = [
+            create_trace_event(
+                "$ai_generation",
+                **{"$ai_input": "question", "$ai_output": "answer", "$ai_model": "gpt-4o", "$ai_tools": ["tool"]},
+            )
+        ]
+        trace = create_trace(events)
+
+        globals_dict = build_trace_hog_globals(trace, "trace-123")
+
+        event_props = globals_dict["events"][0]["properties"]
+        assert event_props == {"$ai_model": "gpt-4o"}
+
+
+class TestBuildTraceSkipResult:
+    def test_skip_result_without_na(self):
+        result = _build_trace_skip_result(allows_na=False, skip_reason="trace_too_large")
+
+        assert result["verdict"] is False
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "trace_too_large"
+        assert "applicable" not in result
+
+    def test_skip_result_with_na(self):
+        result = _build_trace_skip_result(allows_na=True, skip_reason="trace_not_found")
+
+        assert result["verdict"] is None
+        assert result["applicable"] is False
+        assert result["skip_reason"] == "trace_not_found"
+
+
+class TestBackgroundEvaluationPropertyAccess:
+    @pytest.mark.django_db
+    @pytest.mark.parametrize("target", ["trace", "session"])
+    @pytest.mark.parametrize(
+        "property_type,member_only,access_level",
+        [
+            (PropertyDefinition.Type.EVENT, False, PropertyAccessLevel.NONE),
+            (PropertyDefinition.Type.EVENT, True, PropertyAccessLevel.NONE),
+            (PropertyDefinition.Type.EVENT, False, PropertyAccessLevel.READ),
+            (PropertyDefinition.Type.PERSON, False, PropertyAccessLevel.NONE),
+            (PropertyDefinition.Type.GROUP, False, PropertyAccessLevel.NONE),
+        ],
+    )
+    @time_machine.travel(FROZEN_NOW, tick=False)
+    def test_online_evaluations_read_properties_independently_of_user_permissions(
+        self,
+        setup_data: dict[str, object],
+        target: str,
+        property_type: int,
+        member_only: bool,
+        access_level: PropertyAccessLevel,
+    ) -> None:
+        organization = cast(Organization, setup_data["organization"])
+        team = cast(Team, setup_data["team"])
+        organization.available_product_features = [
+            {"name": feature, "key": feature}
+            for feature in (
+                AvailableFeature.PROPERTY_ACCESS_CONTROL,
+                AvailableFeature.ACCESS_CONTROL,
+                AvailableFeature.ROLE_BASED_ACCESS,
+            )
+        ]
+        organization.save()
+        user = User.objects.create_and_join(organization, "restricted-evaluator@example.com", "test-password")
+        member = user.organization_memberships.get(organization=organization)
+        AccessControl.objects.create(team=team, resource="llm_analytics", access_level="none")
+        properties = {
+            "$ai_input": [{"role": "user", "content": "What is 2 plus 2?"}],
+            "$ai_output": "The answer is four.",
+            "$ai_output_choices": [{"role": "assistant", "content": "The answer is four."}],
+            "evaluation_context": "arithmetic",
+        }
+        for name in properties:
+            definition = PropertyDefinition.objects.create(
+                team=team,
+                name=name,
+                type=property_type,
+                group_type_index=0 if property_type == PropertyDefinition.Type.GROUP else None,
+            )
+            PropertyAccessControl.objects.create(
+                team=team,
+                property_definition=definition,
+                organization_member=member if member_only else None,
+                access_level=access_level.value,
+            )
+        unit_id = str(uuid.uuid4())
+        bulk_create_ai_events(
+            [
+                {
+                    "event": "$ai_generation",
+                    "team": team,
+                    "distinct_id": "test-person",
+                    "timestamp": FROZEN_NOW - timedelta(minutes=1),
+                    "properties": {"$ai_trace_id": unit_id, "$ai_session_id": unit_id, **properties},
+                }
+            ]
+        )
+        fetch = fetch_trace_for_evaluation if target == "trace" else fetch_session_for_evaluation
+        outcome = fetch(team.id, unit_id, FROZEN_NOW)
+
+        assert outcome.skip_reason is None
+        assert outcome.event_count == 1
+        if isinstance(outcome, TraceFetchOutcome):
+            assert outcome.trace is not None
+            trace = outcome.trace
+        else:
+            assert outcome.traces is not None
+            trace = outcome.traces[0]
+        assert len(trace.events) == 1
+        for name, value in properties.items():
+            assert trace.events[0].properties[name] == value
+
+        date_range = DateRange(date_from=(FROZEN_NOW - timedelta(hours=1)).isoformat(), date_to=FROZEN_NOW.isoformat())
+        report_detail = json.loads(
+            get_trace_detail.invoke(
+                {"state": {"team_id": team.id, "trace_id_allowlist": [unit_id]}, "trace_id": unit_id}
+            )
+        )
+        summary = _fetch_and_format_trace(
+            unit_id, team.id, (FROZEN_NOW - timedelta(hours=1)).isoformat(), FROZEN_NOW.isoformat()
+        )
+        assert report_detail["event_count"] == 1
+        assert summary is not None and summary.text_repr is not None
+        for text in ("What is 2 plus 2?", "The answer is four."):
+            assert text in report_detail["text"]
+            if (
+                property_type == PropertyDefinition.Type.EVENT
+                and access_level == PropertyAccessLevel.NONE
+                and not member_only
+            ):
+                assert text not in summary.text_repr
+            else:
+                assert text in summary.text_repr
+
+        runner = (
+            TraceQueryRunner(team=team, user=user, query=TraceQuery(traceId=unit_id, dateRange=date_range))
+            if target == "trace"
+            else SessionQueryRunner(team=team, user=user, query=SessionQuery(sessionId=unit_id, dateRange=date_range))
+        )
+        system_runner = type(runner)(team=team, query=runner.query, bypass_property_access_control=True)
+        default_runner = type(runner)(team=team, query=runner.query)
+        assert system_runner.get_cache_key() != default_runner.get_cache_key()
+        user_trace = runner.calculate().results[0]
+        for name, value in properties.items():
+            if property_type == PropertyDefinition.Type.EVENT and access_level == PropertyAccessLevel.NONE:
+                assert name not in user_trace.events[0].properties
+            else:
+                assert user_trace.events[0].properties[name] == value
+
+        bytecode = compile_hog("print(evaluation_events[1].properties.evaluation_context); return true", "destination")
+        result = execute_hog_eval_bytecode(bytecode, build_trace_hog_globals(trace, unit_id, bytecode=bytecode), False)
+        assert result["reasoning"] == "arithmetic"
+        bulk_create_events(
+            [
+                {
+                    "event": "$ai_evaluation",
+                    "team": team,
+                    "distinct_id": "test-person",
+                    "timestamp": FROZEN_NOW,
+                    "properties": {
+                        "$ai_trace_id": unit_id,
+                        "$ai_evaluation_reasoning": result["reasoning"],
+                        "$ai_evaluation_result": result["verdict"],
+                    },
+                }
+            ]
+        )
+        query = "SELECT properties.$ai_evaluation_reasoning, properties.$ai_evaluation_result, properties FROM events WHERE event = '$ai_evaluation' AND properties.$ai_trace_id = {trace_id}"
+        response = execute_hogql_query(
+            query, team=team, user=user, placeholders={"trace_id": ast.Constant(value=unit_id)}
+        )
+        assert response.results[0][0] == "arithmetic"
+
+        if property_type == PropertyDefinition.Type.EVENT and access_level == PropertyAccessLevel.NONE:
+            for name in ("$ai_evaluation_reasoning", "$ai_evaluation_result"):
+                definition = PropertyDefinition.objects.create(team=team, name=name, type=PropertyDefinition.Type.EVENT)
+                PropertyAccessControl.objects.create(
+                    team=team,
+                    property_definition=definition,
+                    organization_member=member if member_only else None,
+                    access_level=PropertyAccessLevel.NONE.value,
+                )
+
+        response = execute_hogql_query(
+            query, team=team, user=user, placeholders={"trace_id": ast.Constant(value=unit_id)}
+        )
+        reasoning, verdict, blob = response.results[0]
+        assert _execute_hogql(team.id, query, {"trace_id": ast.Constant(value=unit_id)})[0][0] == "arithmetic"
+        if property_type == PropertyDefinition.Type.EVENT and access_level == PropertyAccessLevel.NONE:
+            assert reasoning is None
+            assert verdict is None
+            assert "$ai_evaluation_reasoning" not in json.loads(blob)
+            assert "$ai_evaluation_result" not in json.loads(blob)
+        else:
+            assert reasoning == "arithmetic"
+
+        # A newly granted reader sees the existing result without rerunning the evaluation.
+        PropertyAccessControl.objects.filter(team=team).update(access_level=PropertyAccessLevel.READ.value)
+        with restriction_cache_scope():
+            response = execute_hogql_query(
+                query, team=team, user=user, placeholders={"trace_id": ast.Constant(value=unit_id)}
+            )
+        assert response.results[0][0] == "arithmetic"
+
+
+class TestFetchTraceForEvaluation:
+    @pytest.mark.django_db(transaction=True)
+    def test_skips_when_no_events_found(self, setup_data):
+        team = setup_data["team"]
+
+        with patch("posthog.temporal.ai_observability.run_trace_evaluation._count_trace_events", return_value=0):
+            outcome = fetch_trace_for_evaluation(team.id, "trace-123", FROZEN_NOW)
+
+        assert outcome.skip_reason == "trace_not_found"
+        assert outcome.trace is None
+
+    @pytest.mark.django_db(transaction=True)
+    def test_skips_oversized_traces_without_fetching(self, setup_data):
+        team = setup_data["team"]
+
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation._count_trace_events",
+            return_value=MAX_TRACE_EVAL_EVENTS + 1,
+        ):
+            with patch("posthog.temporal.ai_observability.run_trace_evaluation.TraceQueryRunner") as mock_runner:
+                outcome = fetch_trace_for_evaluation(team.id, "trace-123", FROZEN_NOW)
+
+        assert outcome.skip_reason == "trace_too_large"
+        assert outcome.event_count == MAX_TRACE_EVAL_EVENTS + 1
+        mock_runner.assert_not_called()
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize("window_end", [None, FROZEN_NOW + timedelta(minutes=30)])
+    def test_upper_bound_is_the_given_window_end_or_now(self, setup_data, window_end):
+        team = setup_data["team"]
+        trace = create_trace([create_trace_event("$ai_generation", **{"$ai_input": "q", "$ai_output": "a"})])
+
+        with (
+            time_machine.travel(FROZEN_NOW, tick=False),
+            patch("posthog.temporal.ai_observability.run_trace_evaluation._count_trace_events", return_value=1),
+            patch("posthog.temporal.ai_observability.run_trace_evaluation.TraceQueryRunner") as mock_runner,
+        ):
+            mock_runner.return_value.calculate.return_value = MagicMock(results=[trace])
+            fetch_trace_for_evaluation(team.id, "trace-123", FROZEN_NOW, window_end)
+
+        date_range = mock_runner.call_args.kwargs["query"].dateRange
+        assert date_range.date_to == (window_end or FROZEN_NOW).isoformat()
+        # The runner ignores dateRange on the ai_events path unless it is asked to honor it, and
+        # only a backfilled run asks: a live run grades the whole trace, as it always has.
+        assert mock_runner.call_args.kwargs["bound_events_to_date_range"] is (window_end is not None)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_returns_trace_when_found(self, setup_data):
+        team = setup_data["team"]
+        trace = create_trace([create_trace_event("$ai_generation", **{"$ai_input": "q", "$ai_output": "a"})])
+
+        with patch("posthog.temporal.ai_observability.run_trace_evaluation._count_trace_events", return_value=1):
+            with patch("posthog.temporal.ai_observability.run_trace_evaluation.TraceQueryRunner") as mock_runner:
+                mock_runner.return_value.calculate.return_value = MagicMock(results=[trace])
+                outcome = fetch_trace_for_evaluation(team.id, "trace-123", FROZEN_NOW)
+
+        assert outcome.skip_reason is None
+        assert outcome.trace is trace
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize("window_end", [None, FROZEN_NOW + timedelta(minutes=30)])
+    @pytest.mark.parametrize("trace_state", [{}, {"inputState": "what is the weather?"}])
+    def test_an_event_less_trace_is_returned_when_the_read_saw_everything(self, setup_data, window_end, trace_state):
+        team = setup_data["team"]
+        root_only_trace = create_trace([], **trace_state)
+
+        # The count preflight sees the `$ai_trace` root row, which never reaches `events`, so the
+        # runner can return a trace with no events. Whether that is enough to grade depends on the
+        # evaluation, so the fetch hands it back and lets each activity decide.
+        with (
+            time_machine.travel(FROZEN_NOW, tick=False),
+            # The preflight count, then the renderable-event count.
+            patch("posthog.temporal.ai_observability.run_trace_evaluation._count_trace_events", side_effect=[1, 0]),
+            patch("posthog.temporal.ai_observability.run_trace_evaluation.TraceQueryRunner") as mock_runner,
+        ):
+            mock_runner.return_value.calculate.return_value = MagicMock(results=[root_only_trace])
+            outcome = fetch_trace_for_evaluation(team.id, "trace-123", FROZEN_NOW, window_end)
+
+        assert outcome.skip_reason is None
+        assert outcome.trace is root_only_trace
+
+    @pytest.mark.django_db(transaction=True)
+    def test_a_partial_read_is_skipped_rather_than_graded(self, setup_data):
+        team = setup_data["team"]
+        root_only_trace = create_trace([], inputState="what is the weather?")
+
+        # The count finds events the fetch did not return, so the read missed part of the trace.
+        # Grading the remainder would hide those events from every evaluation.
+        with (
+            time_machine.travel(FROZEN_NOW, tick=False),
+            # The preflight count, then the renderable-event count.
+            patch("posthog.temporal.ai_observability.run_trace_evaluation._count_trace_events", side_effect=[1, 3]),
+            patch("posthog.temporal.ai_observability.run_trace_evaluation.TraceQueryRunner") as mock_runner,
+        ):
+            mock_runner.return_value.calculate.return_value = MagicMock(results=[root_only_trace])
+            outcome = fetch_trace_for_evaluation(team.id, "trace-123", FROZEN_NOW)
+
+        assert outcome.skip_reason == "trace_not_found"
+        assert outcome.trace is None
+
+    @pytest.mark.django_db(transaction=True)
+    # Rows only in `events` send the count and the trace read down the events fallback.
+    @pytest.mark.parametrize("insert_events", [bulk_create_ai_events, bulk_create_events])
+    def test_reads_the_trace_without_building_the_full_catalog(self, setup_data, insert_events):
+        team = setup_data["team"]
+        organization = setup_data["organization"]
+        organization.available_product_features = [
+            {"name": AvailableFeature.PROPERTY_ACCESS_CONTROL, "key": AvailableFeature.PROPERTY_ACCESS_CONTROL}
+        ]
+        organization.save()
+        definition = PropertyDefinition.objects.create(
+            team=team, name="evaluation_context", type=PropertyDefinition.Type.EVENT
+        )
+        PropertyAccessControl.objects.create(
+            team=team, property_definition=definition, access_level=PropertyAccessLevel.NONE.value
+        )
+        trace_id = f"trace-{uuid.uuid4()}"
+        timestamp = FROZEN_NOW - timedelta(minutes=1)
+        insert_events(
+            [
+                {
+                    "event": "$ai_trace",
+                    "team": team,
+                    "distinct_id": "user",
+                    "timestamp": timestamp,
+                    "properties": {"$ai_trace_id": trace_id},
+                },
+                {
+                    "event": "$ai_generation",
+                    "team": team,
+                    "distinct_id": "user",
+                    "timestamp": timestamp,
+                    "properties": {
+                        "$ai_trace_id": trace_id,
+                        "$ai_input": [{"role": "user", "content": "What is the weather?"}],
+                        "$ai_output_choices": [{"role": "assistant", "content": "Sunny all day."}],
+                        "evaluation_context": "weather",
+                    },
+                },
+            ]
+        )
+
+        with (
+            time_machine.travel(FROZEN_NOW, tick=False),
+            patch.object(Database, "create_for", side_effect=AssertionError("eval read built the full HogQL catalog")),
+        ):
+            outcome = fetch_trace_for_evaluation(team.id, trace_id, FROZEN_NOW)
+
+        assert outcome.skip_reason is None
+        assert outcome.trace is not None
+        assert [event.event for event in outcome.trace.events] == ["$ai_generation"]
+        assert outcome.trace.events[0].properties["evaluation_context"] == "weather"
+
+
+class TestRunHogEvalOverRecentTraces:
+    @patch("posthog.temporal.ai_observability.run_trace_evaluation.query_ai_events")
+    def test_samples_the_first_matching_generation_timestamp(self, mock_query):
+        mock_query.return_value = MagicMock(results=[["trace-123", "2024-01-01T10:00:00Z", FROZEN_NOW]])
+
+        samples = _sample_recent_traces(
+            MagicMock(spec=Team),
+            condition_filter=None,
+            sample_count=1,
+            date_from=FROZEN_NOW - timedelta(days=7),
+            date_to=FROZEN_NOW,
+        )
+
+        trigger_timestamp_select = mock_query.call_args.kwargs["query"].select[1]
+        assert trigger_timestamp_select.alias == "trigger_timestamp"
+        assert trigger_timestamp_select.expr.name == "min"
+        assert samples == [
+            TraceHogTestSample(
+                trace_id="trace-123",
+                trigger_timestamp=datetime(2024, 1, 1, 10, 0, tzinfo=UTC),
+            )
+        ]
+
+    @patch("posthog.hogql_queries.ai.ai_table_resolver.execute_hogql_query")
+    def test_rewrites_promoted_ai_property_conditions(self, mock_execute_query):
+        mock_execute_query.return_value = MagicMock(results=[["trace-123", FROZEN_NOW, FROZEN_NOW]])
+        condition_filter = ast.CompareOperation(
+            op=ast.CompareOperationOp.Eq,
+            left=ast.Field(chain=["properties", "$ai_input"]),
+            right=ast.Constant(value="hello"),
+        )
+
+        _sample_recent_traces(
+            MagicMock(spec=Team),
+            condition_filter=condition_filter,
+            sample_count=1,
+            date_from=FROZEN_NOW - timedelta(days=7),
+            date_to=FROZEN_NOW,
+        )
+
+        where_clause = mock_execute_query.call_args.kwargs["placeholders"]["where_clause"]
+        rewritten_condition = where_clause.exprs[-1]
+        assert rewritten_condition.left.chain == ["input"]
+
+    @time_machine.travel(FROZEN_NOW, tick=False)
+    @pytest.mark.parametrize("output_type", ["boolean", "numeric", "categorical"])
+    def test_uses_the_sampled_trigger_and_configured_aggregation_window(self, output_type: str):
+        team = MagicMock(spec=Team)
+        user = MagicMock()
+        trigger_timestamp = FROZEN_NOW - timedelta(hours=2)
+        trace = create_trace(
+            [
+                create_trace_event("$ai_generation", **{"$ai_input": "first", "$ai_output": "one"}),
+                create_trace_event("$ai_generation", **{"$ai_input": "second", "$ai_output": "two"}),
+            ]
+        )
+        bytecode = compile_hog(
+            "return length(evaluation_events) / 4"
+            if output_type == "numeric"
+            else "return ['resolved']"
+            if output_type == "categorical"
+            else "return target.type == 'trace' and length(evaluation_events) == 2",
+            "destination",
+        )
+
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation._sample_recent_traces",
+            return_value=[TraceHogTestSample(trace_id="trace-123", trigger_timestamp=trigger_timestamp)],
+        ) as mock_sample:
+            with (
+                patch(
+                    "posthog.temporal.ai_observability.run_trace_evaluation.query_ai_events",
+                    side_effect=[MagicMock(results=[[2]]), MagicMock(results=[[0]])],
+                ) as mock_query,
+                patch("posthog.temporal.ai_observability.run_trace_evaluation.TraceQueryRunner") as mock_runner,
+            ):
+                mock_runner.return_value.calculate.return_value = MagicMock(results=[trace])
+                results = run_hog_eval_over_recent_traces(
+                    team=team,
+                    user=user,
+                    bytecode=bytecode,
+                    condition_filter=None,
+                    sample_count=1,
+                    allows_na=False,
+                    output_type=output_type,
+                    output_config={"min": 0, "max": 1}
+                    if output_type == "numeric"
+                    else {"options": [{"key": "resolved", "label": "Resolved"}]}
+                    if output_type == "categorical"
+                    else {},
+                    window_seconds=120,
+                )
+
+        mock_sample.assert_called_once_with(
+            team,
+            None,
+            1,
+            FROZEN_NOW - timedelta(seconds=120, days=7),
+            FROZEN_NOW - timedelta(seconds=120),
+            user=user,
+        )
+        for query_call in mock_query.call_args_list:
+            assert query_call.kwargs["user"] is user
+        runner_kwargs = mock_runner.call_args.kwargs
+        assert runner_kwargs["user"] is user
+        assert runner_kwargs["query"].traceId == "trace-123"
+        assert runner_kwargs["query"].dateRange.date_from == (trigger_timestamp - TRACE_EVENTS_LOOKBACK).isoformat()
+        assert runner_kwargs["query"].dateRange.date_to == (trigger_timestamp + timedelta(seconds=120)).isoformat()
+        if output_type == "numeric":
+            assert results[0].score == 0.5
+            assert results[0].verdict is None
+        elif output_type == "categorical":
+            assert results[0].categories == ["resolved"]
+            assert results[0].verdict is None
+        else:
+            assert results[0].verdict is True
+        assert results[0].input_preview == "first"
+        assert results[0].output_preview == "two"
+
+
+class TestExecuteTraceLLMJudgeActivity:
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize(
+        "trace,expected_fragments",
+        [
+            (
+                create_trace(
+                    [
+                        create_trace_event("$ai_generation", **{"$ai_input": "What is 2+2?", "$ai_output": "4"}),
+                        create_trace_event("$ai_generation", **{"$ai_input": "And times 3?", "$ai_output": "12"}),
+                    ]
+                ),
+                ["TRACE HIERARCHY", "What is 2+2?", "And times 3?"],
+            ),
+            (
+                create_trace([], inputState=[{"role": "user", "content": ""}, {"role": "user", "content": "2+2?"}]),
+                ["2+2?"],
+            ),
+            (
+                create_trace(
+                    [],
+                    outputState=[
+                        {"role": "assistant", "parts": [{"type": "tool_call", "name": "get_weather", "arguments": {}}]}
+                    ],
+                ),
+                ["get_weather()"],
+            ),
+            (create_trace([], outputState={"score": 0}), ['"score": 0']),
+            pytest.param(
+                create_trace(
+                    [],
+                    outputState=[
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": "\n"},
+                                {
+                                    "type": "function",
+                                    "function": {"name": "get_weather", "arguments": {"city": "Paris"}},
+                                },
+                            ],
+                        }
+                    ],
+                ),
+                ['get_weather(city="Paris")'],
+                id="root_tool_call_with_whitespace",
+            ),
+        ],
+    )
+    def test_judges_full_trace_transcript(
+        self,
+        setup_data: dict[str, Any],
+        active_key_config: None,
+        trace: LLMTrace,
+        expected_fragments: list[str],
+    ) -> None:
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation.fetch_trace_for_evaluation",
+            return_value=TraceFetchOutcome(trace=trace, skip_reason=None, event_count=2),
+        ):
+            with patch("posthog.temporal.ai_observability.evaluation_llm_judge.Client") as mock_client_class:
+                mock_client = MagicMock()
+                mock_client_class.return_value = mock_client
+                mock_response = MagicMock()
+                mock_response.parsed = BooleanEvalResult(verdict=True, reasoning="Resolved both questions")
+                mock_response.usage = MagicMock(input_tokens=10, output_tokens=5, total_tokens=15)
+                mock_client.complete.return_value = mock_response
+
+                result = execute_trace_llm_judge_activity(
+                    ExecuteTraceEvaluationInputs(
+                        evaluation=evaluation_dict(setup_data),
+                        team_id=setup_data["team"].id,
+                        trace_id="trace-123",
+                        window_start=FROZEN_NOW.isoformat(),
+                    )
+                )
+
+                request = mock_client.complete.call_args[0][0]
+                content = request.messages[0]["content"]
+                assert "AI trace" in request.system
+                assert content.count("[GEN]") == len(trace.events)
+                for fragment in expected_fragments:
+                    assert fragment in content
+
+        assert result["verdict"] is True
+        assert result["reasoning"] == "Resolved both questions"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_sends_the_trace_images_to_a_judge_with_images(
+        self, setup_data: dict[str, Any], active_key_config: None
+    ) -> None:
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+        trace = create_trace([], inputState=[{"role": "user", "content": [image, {"type": "text", "text": "Chart?"}]}])
+        with (
+            patch(
+                "posthog.temporal.ai_observability.run_trace_evaluation.fetch_trace_for_evaluation",
+                return_value=TraceFetchOutcome(trace=trace, skip_reason=None, event_count=1),
+            ),
+            patch("posthog.temporal.ai_observability.evaluation_llm_judge.Client") as mock_client_class,
+        ):
+            mock_client = mock_client_class.return_value
+            mock_client.complete.return_value.parsed = BooleanEvalResult(verdict=True, reasoning="ok")
+            mock_client.complete.return_value.usage = MagicMock(input_tokens=1, output_tokens=1, total_tokens=2)
+
+            execute_trace_llm_judge_activity(
+                ExecuteTraceEvaluationInputs(
+                    evaluation=evaluation_dict(setup_data),
+                    team_id=setup_data["team"].id,
+                    trace_id="trace-123",
+                    window_start=FROZEN_NOW.isoformat(),
+                )
+            )
+
+        content = mock_client.complete.call_args[0][0].messages[0]["content"]
+        assert AttachmentPart(mime_type="image/png", data=b"hi") in content
+        assert "[image 1]" in content[-1]["text"]
+
+    @pytest.mark.parametrize(
+        "trace_state",
+        [
+            {},
+            {"inputState": ""},
+            {"inputState": "   ", "outputState": "\n"},
+            {"inputState": [{"role": "user", "content": ""}]},
+            {"outputState": [{"role": "assistant", "content": " \n "}]},
+            {"inputState": [{"role": "user", "content": []}]},
+            {"inputState": [{"role": "user", "parts": []}]},
+            {"outputState": [{"role": "assistant", "parts": [{"type": "text", "content": " \n "}]}]},
+        ],
+    )
+    @pytest.mark.parametrize("output_type", ["boolean", "numeric", "categorical"])
+    def test_skips_without_llm_call_when_the_trace_has_no_transcript(
+        self, trace_state: dict[str, Any], output_type: str
+    ) -> None:
+        # With no events and no trace-level state the formatter emits the trace name alone, and the
+        # judge would confidently report that there is nothing to grade. Whitespace state renders as
+        # a heading above nothing, which reads the same way.
+        root_only_trace = create_trace([], **trace_state)
+
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation.fetch_trace_for_evaluation",
+            return_value=TraceFetchOutcome(trace=root_only_trace, skip_reason=None, event_count=1),
+        ):
+            with patch("posthog.temporal.ai_observability.evaluation_llm_judge.Client") as mock_client_class:
+                result = execute_trace_llm_judge_activity(
+                    ExecuteTraceEvaluationInputs(
+                        evaluation={
+                            "evaluation_type": "llm_judge",
+                            "evaluation_config": {"prompt": "Is the response correct?"},
+                            "output_type": output_type,
+                            "output_config": {},
+                            "team_id": 1,
+                        },
+                        team_id=1,
+                        trace_id="trace-123",
+                        window_start=FROZEN_NOW.isoformat(),
+                    )
+                )
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "trace_not_found"
+        assert result["result_type"] == output_type
+        mock_client_class.assert_not_called()
+
+    @pytest.mark.parametrize("skip_reason", ["trace_not_found", "trace_too_large"])
+    def test_skips_without_llm_call(self, skip_reason: str) -> None:
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation.fetch_trace_for_evaluation",
+            return_value=TraceFetchOutcome(trace=None, skip_reason=skip_reason, event_count=0),
+        ):
+            with patch("posthog.temporal.ai_observability.evaluation_llm_judge.Client") as mock_client_class:
+                result = execute_trace_llm_judge_activity(
+                    ExecuteTraceEvaluationInputs(
+                        evaluation={
+                            "evaluation_type": "llm_judge",
+                            "evaluation_config": {"prompt": "Is the response correct?"},
+                            "output_type": "boolean",
+                            "output_config": {},
+                        },
+                        team_id=1,
+                        trace_id="trace-123",
+                        window_start=FROZEN_NOW.isoformat(),
+                    )
+                )
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == skip_reason
+        assert result["reasoning"]
+        mock_client_class.assert_not_called()
+
+
+class TestExecuteTraceHogEvalActivity:
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    async def test_runs_hog_against_trace_globals(self, setup_data):
+        bytecode = compile_hog("return length(events) = 2 and events[2].output = 'final answer'", "destination")
+        evaluation = evaluation_dict(
+            setup_data,
+            evaluation_type="hog",
+            evaluation_config={"source": "...", "bytecode": bytecode},
+        )
+        trace = create_trace(
+            [
+                create_trace_event("$ai_generation", **{"$ai_input": "q1", "$ai_output": "intermediate"}),
+                create_trace_event("$ai_generation", **{"$ai_input": "q2", "$ai_output": "final answer"}),
+            ]
+        )
+
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation.fetch_trace_for_evaluation",
+            return_value=TraceFetchOutcome(trace=trace, skip_reason=None, event_count=2),
+        ):
+            result = await execute_trace_hog_eval_activity(
+                ExecuteTraceEvaluationInputs(
+                    evaluation=evaluation,
+                    team_id=setup_data["team"].id,
+                    trace_id="trace-123",
+                    window_start=FROZEN_NOW.isoformat(),
+                )
+            )
+
+        assert result["verdict"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    async def test_grades_a_root_only_trace_on_trace_level_metadata(self, setup_data):
+        # Hog needs no transcript: cost and latency come off the root event. A trace the judge
+        # cannot read must still reach a latency evaluation.
+        bytecode = compile_hog("return target.total_latency_seconds < 10", "destination")
+        evaluation = evaluation_dict(
+            setup_data,
+            evaluation_type="hog",
+            evaluation_config={"source": "...", "bytecode": bytecode},
+        )
+        root_only_trace = create_trace([], totalLatency=1.5)
+
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation.fetch_trace_for_evaluation",
+            return_value=TraceFetchOutcome(trace=root_only_trace, skip_reason=None, event_count=1),
+        ):
+            result = await execute_trace_hog_eval_activity(
+                ExecuteTraceEvaluationInputs(
+                    evaluation=evaluation,
+                    team_id=setup_data["team"].id,
+                    trace_id="trace-123",
+                    window_start=FROZEN_NOW.isoformat(),
+                )
+            )
+
+        assert result["verdict"] is True
+        assert not result.get("skipped")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("skip_reason", ["trace_too_large", "trace_not_found"])
+    async def test_skips_without_running_hog(self, skip_reason: str) -> None:
+        bytecode = compile_hog("return true", "destination")
+        evaluation = {
+            "evaluation_type": "hog",
+            "evaluation_config": {"source": "return true", "bytecode": bytecode},
+        }
+
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation.fetch_trace_for_evaluation",
+            return_value=TraceFetchOutcome(trace=None, skip_reason=skip_reason, event_count=10_000),
+        ):
+            result = await execute_trace_hog_eval_activity(
+                ExecuteTraceEvaluationInputs(
+                    evaluation=evaluation,
+                    team_id=1,
+                    trace_id="trace-123",
+                    window_start=FROZEN_NOW.isoformat(),
+                )
+            )
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == skip_reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    async def test_user_hog_error_is_terminal(self, setup_data):
+        # A non-boolean return is a user Hog error; it must be terminal so the workflow disables
+        # the broken eval instead of re-running it against every matching trace.
+        bytecode = compile_hog("return 42", "destination")
+        evaluation = evaluation_dict(
+            setup_data,
+            evaluation_type="hog",
+            evaluation_config={"source": "return 42", "bytecode": bytecode},
+        )
+        trace = create_trace([create_trace_event("$ai_generation", **{"$ai_input": "q", "$ai_output": "a"})])
+
+        with patch(
+            "posthog.temporal.ai_observability.run_trace_evaluation.fetch_trace_for_evaluation",
+            return_value=TraceFetchOutcome(trace=trace, skip_reason=None, event_count=1),
+        ):
+            result = await execute_trace_hog_eval_activity(
+                ExecuteTraceEvaluationInputs(
+                    evaluation=evaluation,
+                    team_id=setup_data["team"].id,
+                    trace_id="trace-123",
+                    window_start=FROZEN_NOW.isoformat(),
+                )
+            )
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "hog_error"
+        assert result["terminal_user_error"] is True
+        assert result["status_reason"]
+
+
+class TestEmitTraceEvaluationEventActivity:
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    async def test_emits_event_targeting_trace(self, setup_data):
+        team = setup_data["team"]
+        result: EvaluationActivityResult = {
+            "result_type": "boolean",
+            "verdict": True,
+            "reasoning": "Looks good",
+            "allows_na": False,
+            "model": "gpt-5-mini",
+            "provider": "openai",
+            "input_tokens": 42,
+            "output_tokens": 18,
+        }
+
+        with patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value=team.api_token):
+            with patch("posthog.temporal.ai_observability.team_capture.capture_ai_internal") as mock_capture:
+                mock_capture.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
+
+                await emit_trace_evaluation_event_activity(
+                    EmitTraceEvaluationEventInputs(
+                        evaluation=evaluation_dict(setup_data),
+                        team_id=team.id,
+                        trace_id="trace-123",
+                        distinct_id="test-user",
+                        session_id="session-1",
+                        result=result,
+                        start_time=datetime(2024, 1, 1, 12, 0, 0),
+                    )
+                )
+
+                mock_capture.assert_called_once()
+                call_kwargs = mock_capture.call_args[1]
+                assert call_kwargs["event_name"] == "$ai_evaluation"
+                assert call_kwargs["distinct_id"] == "test-user"
+                props = call_kwargs["properties"]
+                assert props["$ai_target_id"] == "trace-123"
+                assert props["$ai_target_type"] == "trace_id"
+                assert props["$ai_trace_id"] == "trace-123"
+                assert props["$session_id"] == "session-1"
+                assert props["$ai_evaluation_result"] is True
+                assert props["$ai_model"] == "gpt-5-mini"
+                assert "$ai_target_event_id" not in props
+                assert "$ai_target_event_type" not in props
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize(
+        "expected_trigger,backfill_id,event_timestamp",
+        [
+            pytest.param("live", None, None, id="live"),
+            pytest.param("backfill", "bf-1", "2026-08-01T12:00:00+00:00", id="backfill"),
+        ],
+    )
+    async def test_stamps_trigger_and_timestamp(
+        self,
+        setup_data,
+        expected_trigger: str,
+        backfill_id: str | None,
+        event_timestamp: str | None,
+    ):
+        team = setup_data["team"]
+        result: EvaluationActivityResult = {
+            "result_type": "boolean",
+            "verdict": True,
+            "reasoning": "Looks good",
+            "allows_na": False,
+        }
+
+        with (
+            time_machine.travel(FROZEN_NOW, tick=False),
+            patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value=team.api_token),
+            patch("posthog.temporal.ai_observability.team_capture.capture_ai_internal") as mock_capture,
+        ):
+            mock_capture.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
+
+            await emit_trace_evaluation_event_activity(
+                EmitTraceEvaluationEventInputs(
+                    evaluation=evaluation_dict(setup_data),
+                    team_id=team.id,
+                    trace_id="trace-123",
+                    distinct_id="test-user",
+                    session_id=None,
+                    result=result,
+                    start_time=datetime(2024, 1, 1, 12, 0, 0),
+                    backfill_id=backfill_id,
+                    event_timestamp=event_timestamp,
+                )
+            )
+
+        call_kwargs = mock_capture.call_args[1]
+        props = call_kwargs["properties"]
+        assert props["$ai_evaluation_trigger"] == expected_trigger
+        if backfill_id:
+            assert props["$ai_evaluation_backfill_id"] == backfill_id
+        else:
+            assert "$ai_evaluation_backfill_id" not in props
+        if event_timestamp:
+            # Offset inside the unit's second, so verdicts that would share an ingestion dedup
+            # key no longer do.
+            assert call_kwargs["timestamp"] == backfill_verdict_timestamp(
+                datetime.fromisoformat(event_timestamp),
+                str(evaluation_dict(setup_data)["id"]),
+                cast(str, backfill_id),
+                "trace-123",
+            )
+        else:
+            # A live verdict is stamped when it is emitted.
+            assert call_kwargs["timestamp"] == FROZEN_NOW
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize(
+        "status_code,should_raise",
+        [
+            pytest.param(402, False, id="billing_limit_is_swallowed"),
+            pytest.param(500, True, id="server_error_still_raises"),
+        ],
+    )
+    async def test_emits_event_billing_limit(self, setup_data, status_code: int, should_raise: bool):
+        team = setup_data["team"]
+        result: EvaluationActivityResult = {
+            "result_type": "boolean",
+            "verdict": True,
+            "reasoning": "Looks good",
+            "allows_na": False,
+            "model": "gpt-5-mini",
+            "provider": "openai",
+        }
+        capture_result = MagicMock(
+            raise_for_status=MagicMock(side_effect=CaptureInternalError("boom", status_code=status_code))
+        )
+        inputs = EmitTraceEvaluationEventInputs(
+            evaluation=evaluation_dict(setup_data),
+            team_id=team.id,
+            trace_id="trace-123",
+            distinct_id="test-user",
+            session_id="session-1",
+            result=result,
+            start_time=datetime(2024, 1, 1, 12, 0, 0),
+        )
+
+        with patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value=team.api_token):
+            with patch(
+                "posthog.temporal.ai_observability.team_capture.capture_ai_internal", return_value=capture_result
+            ):
+                if should_raise:
+                    with pytest.raises(CaptureInternalError):
+                        await emit_trace_evaluation_event_activity(inputs)
+                else:
+                    await emit_trace_evaluation_event_activity(inputs)
+
+
+class TestEmitSessionEvaluationEvent:
+    @pytest.mark.parametrize(
+        "target,ai_session_id,expected_target_type,expected_target_id",
+        [
+            ("trace", None, "trace_id", "trace-123"),
+            ("session", "session-abc", "session_id", "session-abc"),
+        ],
+    )
+    def test_target_linkage_per_target(
+        self,
+        target: str,
+        ai_session_id: str | None,
+        expected_target_type: str,
+        expected_target_id: str,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _capture(**kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            return response
+
+        with (
+            patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value="phc_test"),
+            patch("posthog.temporal.ai_observability.team_capture.capture_ai_internal", side_effect=_capture),
+        ):
+            async_to_sync(emit_trace_evaluation_event_activity)(
+                EmitTraceEvaluationEventInputs(
+                    evaluation={"id": "eval-1", "name": "n", "output_type": "boolean"},
+                    team_id=1,
+                    trace_id="trace-123",
+                    distinct_id="user-1",
+                    session_id="ph-session-1",
+                    result={"verdict": True, "reasoning": "", "result_type": "boolean"},
+                    start_time=FROZEN_NOW,
+                    target=target,
+                    ai_session_id=ai_session_id,
+                )
+            )
+
+        props = captured["properties"]
+        assert props["$ai_target_type"] == expected_target_type
+        assert props["$ai_target_id"] == expected_target_id
+        # $session_id is the product-analytics session and is unrelated to $ai_session_id.
+        assert props["$session_id"] == "ph-session-1"
+        if ai_session_id is None:
+            assert "$ai_session_id" not in props
+        else:
+            assert props["$ai_session_id"] == ai_session_id
+
+    def test_session_verdict_carries_no_trace_id(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def _capture(**kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            return response
+
+        with (
+            patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value="phc_test"),
+            patch("posthog.temporal.ai_observability.team_capture.capture_ai_internal", side_effect=_capture),
+        ):
+            async_to_sync(emit_trace_evaluation_event_activity)(
+                EmitTraceEvaluationEventInputs(
+                    evaluation={"id": "eval-1", "name": "n", "output_type": "boolean"},
+                    team_id=1,
+                    trace_id="trace-123",
+                    distinct_id="user-1",
+                    session_id=None,
+                    result={"verdict": True, "reasoning": "", "result_type": "boolean"},
+                    start_time=FROZEN_NOW,
+                    target="session",
+                    ai_session_id="session-abc",
+                )
+            )
+
+        props = captured["properties"]
+        assert "$ai_trace_id" not in props
+        assert props["$ai_session_id"] == "session-abc"
+
+
+class TestRunTraceEvaluationWorkflowInputs:
+    def test_parse_inputs(self):
+        payload = {
+            "evaluation_id": "eval-123",
+            "team_id": 1,
+            "trace_id": "trace-456",
+            "distinct_id": "user-1",
+            "session_id": None,
+            "window_seconds": 60,
+        }
+
+        parsed = RunTraceEvaluationWorkflow.parse_inputs([json.dumps(payload)])
+
+        assert parsed.evaluation_id == "eval-123"
+        assert parsed.trace_id == "trace-456"
+        assert parsed.window_seconds == 60
+
+    def test_defaults(self):
+        inputs = RunTraceEvaluationInputs(
+            evaluation_id="eval-123", team_id=1, trace_id="trace-456", distinct_id="user-1"
+        )
+
+        assert inputs.session_id is None
+        assert inputs.window_seconds == 30 * 60
+
+
+class TestBuildTraceSystemPrompt:
+    def test_frames_trace_as_unit_under_evaluation(self):
+        prompt = build_trace_system_prompt("Did the agent resolve the request?", allows_na=False)
+
+        assert "AI trace" in prompt
+        assert "Did the agent resolve the request?" in prompt
+        assert "boolean verdict" in prompt

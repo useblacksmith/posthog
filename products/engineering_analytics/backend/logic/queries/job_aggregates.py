@@ -1,0 +1,153 @@
+"""Curated query: per-job aggregates for one workflow over a window, one row per de-sharded job name."""
+
+from datetime import datetime
+
+from posthog.hogql import ast
+
+from products.engineering_analytics.backend.facade.contracts import WorkflowHealthRunScope, WorkflowJobAggregate
+from products.engineering_analytics.backend.logic.queries._curated import CuratedGitHubSource, opt_float
+from products.engineering_analytics.backend.logic.queries._workflow_filters import (
+    DURATION_PERCENTILE_CONDITION,
+    branch_filter_clause,
+    cost_run_scope_filter_clause,
+    date_to_filter_clause,
+    failure_rate_expr,
+    run_scope_filter_clause,
+    run_windowed_job_created_floor_constant,
+)
+
+_LIMIT = 200
+
+# A skipped job is stamped started_at = created_at, so it never queued. `conclusion` is Nullable and
+# NULL != 'skipped' is NULL, which quantileIf drops; the ifNull keeps still-running jobs in the sample.
+_QUEUED_JOB_CONDITION = "ifNull(conclusion, '') != 'skipped'"
+
+# Mirrors jobGroups.stripShardSuffix and collapseTemplates on the frontend and
+# master_failures.strip_shard_suffix in Python. Keep the three in sync.
+_JOB_NAME_TEMPLATE = (
+    "replaceRegexpOne(replaceRegexpAll(__NAME__, '\\\\$\\\\{\\\\{[^}]*\\\\}\\\\}', '…'),"
+    " '\\\\s*\\\\((\\\\d+)/(\\\\d+)\\\\)(\\\\))?$', '\\\\3')"
+)
+
+
+def _job_name_expr(column: str) -> str:
+    return _JOB_NAME_TEMPLATE.replace("__NAME__", column)
+
+
+_AGGREGATE_SELECT = f"""
+    SELECT
+        {_job_name_expr("job_name")} AS job_group,
+        count() AS job_count,
+        uniq(job_name) AS shard_count,
+        uniq(tuple(ci_engine, run_id)) AS runs_in,
+        quantileIf(0.5)(queue_seconds, {_QUEUED_JOB_CONDITION}) AS queue_p50_seconds,
+        quantileIf(0.5)(duration_seconds, {DURATION_PERCENTILE_CONDITION}) AS p50_seconds,
+        quantileIf(0.95)(duration_seconds, {DURATION_PERCENTILE_CONDITION}) AS p95_seconds,
+        -- Jobs without a verdict (skipped, cancelled, neutral) stay in job_count but not in the rate.
+        {failure_rate_expr()} AS failure_rate,
+        countIf(run_attempt > 1) AS retry_job_count,
+        sum(ifNull(billable_seconds, 0)) AS billable_seconds,
+        sumIf(estimated_cost_usd, estimated_cost_usd IS NOT NULL) AS cost_sum,
+        countIf(estimated_cost_usd IS NOT NULL) AS costed_jobs
+    FROM __COST_SOURCE__ AS c
+    -- NOT is_rerun_copy: "Re-run failed jobs" re-lists every already-passed job under the new attempt
+    -- with the earlier attempt's timestamps. Counting those would double every duration sample and
+    -- report retry pressure for jobs nobody retried. A copy carries no cost, so the filter leaves the cost as is.
+    WHERE NOT is_rerun_copy
+        AND workflow_name = {{workflow_name}} AND created_at >= {{date_from}} __DATE_TO__ __BRANCH__
+        __COST_RUN_SCOPE__
+    GROUP BY job_group
+    ORDER BY job_count DESC
+    LIMIT {_LIMIT}
+"""
+
+_RUN_COUNT_SELECT = """
+    SELECT count() AS total_runs
+    FROM __RUNS_SOURCE__ AS r
+    WHERE workflow_name = {workflow_name} AND run_started_at >= {date_from}
+        __RUNS_DATE_TO__ __RUNS_BRANCH__ __RUNS_RUN_SCOPE__
+"""
+
+
+def query_job_aggregates(
+    *,
+    curated: CuratedGitHubSource,
+    workflow_name: str,
+    date_from: datetime,
+    date_to: datetime | None,
+    branch: str | None,
+    run_scope: WorkflowHealthRunScope = WorkflowHealthRunScope.ALL,
+) -> list[WorkflowJobAggregate]:
+    # A re-run copy is recognisable only while its original attempt is in the scan, so the scan takes
+    # the wide created_at floor. A tight floor would drop the original and count the copy as an execution.
+    cost_source = curated.job_cost_source(created_floor=True, since=date_from)
+    if cost_source is None:
+        return []
+
+    branch = branch.strip() if branch else None
+    placeholders: dict[str, ast.Expr] = {
+        "workflow_name": ast.Constant(value=workflow_name),
+        "date_from": ast.Constant(value=date_from),
+        "job_created_floor": run_windowed_job_created_floor_constant(date_from),
+    }
+    date_to_clause = date_to_filter_clause(date_to, placeholders, column="created_at")
+    runs_date_to_clause = date_to_filter_clause(date_to, placeholders, column="run_started_at")
+    branch_clause = branch_filter_clause(branch, placeholders, column="head_branch")
+
+    def fill(template: str) -> str:
+        return (
+            template.replace("__COST_SOURCE__", cost_source)
+            .replace("__COST_RUN_SCOPE__", cost_run_scope_filter_clause(run_scope))
+            .replace("__RUNS_RUN_SCOPE__", run_scope_filter_clause(run_scope))
+            .replace("__RUNS_SOURCE__", curated.run_source(since=date_from))
+            .replace("__DATE_TO__", date_to_clause)
+            .replace("__RUNS_DATE_TO__", runs_date_to_clause)
+            .replace("__BRANCH__", branch_clause)
+            .replace("__RUNS_BRANCH__", branch_clause)
+        )
+
+    response = curated.run(
+        fill(_AGGREGATE_SELECT), query_type="engineering_analytics.job_aggregates", placeholders=placeholders
+    )
+    if not response.results:
+        return []
+
+    run_count_response = curated.run(
+        fill(_RUN_COUNT_SELECT), query_type="engineering_analytics.job_aggregates_runs", placeholders=placeholders
+    )
+    total_runs = run_count_response.results[0][0] if run_count_response.results else 0
+
+    items: list[WorkflowJobAggregate] = []
+    for (
+        job_name,
+        job_count,
+        shard_count,
+        runs_in,
+        queue_p50_seconds,
+        p50_seconds,
+        p95_seconds,
+        failure_rate,
+        retry_job_count,
+        billable_seconds,
+        cost_sum,
+        costed_jobs,
+    ) in response.results:
+        items.append(
+            WorkflowJobAggregate(
+                job_name=job_name,
+                job_count=job_count,
+                shard_count=shard_count,
+                runs_in=runs_in,
+                run_share=(runs_in / total_runs) if total_runs else None,
+                queue_p50_seconds=opt_float(queue_p50_seconds),
+                p50_seconds=opt_float(p50_seconds),
+                p95_seconds=opt_float(p95_seconds),
+                failure_rate=opt_float(failure_rate),
+                retry_job_count=retry_job_count,
+                # With no costed job (every instance github-hosted, non-Linux, or still queued) the cost is
+                # unknown, because $0 would misreport an unfinished or non-billable job.
+                billable_minutes=float(billable_seconds or 0.0) / 60 if costed_jobs else None,
+                estimated_cost_usd=float(cost_sum or 0.0) if costed_jobs else None,
+            )
+        )
+    return items

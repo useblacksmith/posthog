@@ -1,0 +1,19 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "fingerprint": {
+            "description": "Ignored. The server derives the metric's calculation key from the experiment's current settings. Accepted so that existing clients keep working.",
+            "type": "string"
+        },
+        "id": {
+            "description": "A unique integer value identifying this experiment.",
+            "type": "number"
+        },
+        "metric_uuid": {
+            "description": "UUID of the metric to fetch timeseries for. Available on each metric in the experiment's metrics array.",
+            "type": "string"
+        }
+    },
+    "required": ["id", "metric_uuid"],
+    "type": "object"
+}

@@ -1,0 +1,1042 @@
+from collections.abc import Callable, Iterable
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from typing import Any
+from uuid import UUID
+
+from django.conf import settings
+from django.db import IntegrityError, transaction
+from django.db.models.functions import Now
+from django.utils import timezone as django_timezone
+
+import structlog
+
+from posthog.clickhouse.client.execute import kill_switch_overrides
+from posthog.dataclasses import frozen
+from posthog.exceptions import ClickHouseEstimatedQueryExecutionTimeTooLong, ClickHouseQueryTimeOut
+from posthog.models.team.team import Team
+
+from products.cohorts.backend.backfill.flag_calls_table import FlagCallsTableUnresolved
+from products.cohorts.backend.backfill.pinning import (
+    PersonPinningCapExceeded,
+    leaf_unpinnable_reason,
+    pin_behavioral_run,
+    pin_person_conditions_for_cohorts,
+)
+from products.cohorts.backend.backfill.readiness import ensure_filters_shape_hash
+from products.cohorts.backend.backfill.sizing import (
+    BehavioralScanEstimate,
+    PersonSeedEstimate,
+    PersonSeedEstimateScanCapExceeded,
+    estimate_behavioral_scan_events,
+    estimate_person_seed_topic_bytes,
+)
+from products.cohorts.backend.models.backfill import (
+    ACTIVE_COHORT_BACKFILL_RUN_STATUSES,
+    CohortBackfillKind,
+    CohortBackfillRefusal,
+    CohortBackfillRun,
+    CohortBackfillRunCohort,
+    CohortBackfillRunStatus,
+    CohortBackfillScope,
+    CohortBackfillTrigger,
+)
+from products.cohorts.backend.models.cohort import Cohort, CohortType
+from products.cohorts.backend.models.leaf_shape import walk_filter_leaves
+from products.cohorts.backend.parity.eligibility import structural_exclusion
+from products.cohorts.backend.realtime_teams import is_processing_team
+
+logger = structlog.get_logger(__name__)
+
+
+def check_run_preconditions() -> tuple[dict[str, Any], list[str]]:
+    preconditions = {
+        "merge_gate_attested": settings.BEHAVIORAL_BACKFILL_MERGE_GATE_ATTESTED,
+        "durability_attested": settings.BEHAVIORAL_BACKFILL_DURABILITY_ATTESTED,
+        "catalog_consume_floor": "not_implemented_b8",
+    }
+    missing = [
+        name
+        for name, met in (
+            ("merge gate", preconditions["merge_gate_attested"]),
+            ("processor durability", preconditions["durability_attested"]),
+        )
+        if not met
+    ]
+    return preconditions, missing
+
+
+def check_person_run_preconditions() -> tuple[dict[str, Any], list[str]]:
+    """Person-run gates: the behavioral ones plus person-record TTL and seed sizing.
+
+    Neither is scope-dependent. Every person seed lands in the same ``cf_person_records`` store,
+    whose retention Django cannot see (the seeder reads ``COHORT_PERSON_RECORD_TTL_DAYS``), so an
+    operator has to attest it for any kind of person run. And both person creators size their seed
+    emission against ``BEHAVIORAL_BACKFILL_PERSON_TOPIC_BYTES_BUDGET``, so sizing is attested for
+    any kind of person run too. An unset budget is itself a missing precondition: `over_budget` is a
+    strict comparison against it, so with the default of 0 every sized run would refuse anyway,
+    after paying for the sizing scan.
+    """
+    preconditions, missing = check_run_preconditions()
+    preconditions["person_ttl_attested"] = settings.BEHAVIORAL_BACKFILL_PERSON_TTL_ATTESTED
+    if not preconditions["person_ttl_attested"]:
+        missing.append("person record TTL")
+    preconditions["person_sizing_attested"] = settings.BEHAVIORAL_BACKFILL_PERSON_SIZING_ATTESTED
+    if not preconditions["person_sizing_attested"]:
+        missing.append("person seed sizing")
+    preconditions["person_topic_bytes_budget"] = settings.BEHAVIORAL_BACKFILL_PERSON_TOPIC_BYTES_BUDGET
+    if settings.BEHAVIORAL_BACKFILL_PERSON_TOPIC_BYTES_BUDGET <= 0:
+        missing.append("person seed topic-bytes budget")
+    return preconditions, missing
+
+
+def _has_pinnable_person_filters(cohort: Cohort) -> bool:
+    properties = (cohort.filters or {}).get("properties")
+    return any(
+        leaf.get("type") == "person" and leaf.get("conditionHash") is not None
+        for leaf in walk_filter_leaves(properties)
+    )
+
+
+def _contains_person_metadata_leaf(cohort: Cohort) -> bool:
+    properties = (cohort.filters or {}).get("properties")
+    return any(leaf.get("type") == "person_metadata" for leaf in walk_filter_leaves(properties))
+
+
+def _catalog_refusal_reason(cohort: Cohort) -> str | None:
+    """The refusal for a cohort the frozen catalog will not compose, or ``None``.
+
+    The catalog excludes a cohort whole for one dropped leaf, so both run kinds screen every leaf.
+    The tree is screened too: the seeder fails a whole team run over one cohort with a negated root,
+    which has no dropped leaf.
+    """
+    for leaf in walk_filter_leaves((cohort.filters or {}).get("properties")):
+        reason = leaf_unpinnable_reason(leaf)
+        if reason is not None:
+            return f"has a filter the realtime catalog drops ({reason})"
+    exclusion = structural_exclusion(cohort.filters)
+    if exclusion is not None:
+        return f"has a shape the realtime catalog will not compose ({exclusion})"
+    return None
+
+
+NO_BEHAVIORAL_FILTER = "has no behavioral filter"
+NO_PERSON_FILTER = "has no person filter with a condition hash"
+REALTIME_OFF = "realtime is off"
+# Reasons that say only that this run kind does not apply to the cohort. Every save of a cohort
+# carrying the other kind's leaves produces one, and a cohort nobody turned realtime on for is not
+# refused, so none of them is a refusal an operator can act on.
+INAPPLICABLE_BACKFILL_REASONS = frozenset({NO_BEHAVIORAL_FILTER, NO_PERSON_FILTER, REALTIME_OFF})
+
+
+def person_backfill_ineligibility_reason(cohort: Cohort) -> str | None:
+    """The single person-run eligibility predicate, shared by the creators, the management command,
+    and the dispatch receiver so none of them can judge a cohort backfillable that another refuses."""
+    if cohort.cohort_type != CohortType.REALTIME:
+        return "not realtime"
+    if not cohort.realtime_enabled:
+        return REALTIME_OFF
+    if cohort.is_static:
+        return "static"
+    if cohort.deleted:
+        return "deleted"
+    if _contains_person_metadata_leaf(cohort):
+        return "contains person_metadata filters"
+    if not _has_pinnable_person_filters(cohort):
+        return NO_PERSON_FILTER
+    return _catalog_refusal_reason(cohort)
+
+
+def behavioral_backfill_ineligibility_reason(cohort: Cohort) -> str | None:
+    """The single behavioral-run eligibility predicate, shared by the creators, the management
+    command, and the dispatch receiver so none of them can judge a cohort backfillable that another
+    refuses.
+
+    A cohort with any leaf the frozen catalog would drop is refused whole rather than narrowed to
+    its seedable leaves, because the processor excludes such a cohort from composition entirely and
+    a readiness stamp on it would claim a membership the flags reader can never see. The exclusion
+    is per cohort, not per leaf, so a refused `person_metadata` leaf beside a seedable behavioral
+    one takes the whole cohort out — every leaf is screened, not only the behavioral ones.
+    """
+    if cohort.cohort_type != CohortType.REALTIME:
+        return "not realtime"
+    if not cohort.realtime_enabled:
+        return REALTIME_OFF
+    if cohort.is_static:
+        return "static"
+    if cohort.deleted:
+        return "deleted"
+    properties = (cohort.filters or {}).get("properties")
+    if not any(leaf.get("type") == "behavioral" for leaf in walk_filter_leaves(properties)):
+        return NO_BEHAVIORAL_FILTER
+    # The flags service reads membership only for a cohort whose `condition_type` flags a behavioral
+    # leaf. A stamp on an unclassified cohort makes it read as ready while flags match nobody.
+    if cohort.condition_type is None:
+        return "has a null condition_type"
+    return _catalog_refusal_reason(cohort)
+
+
+def judge_team_cohorts(
+    team_id: int,
+    cohort_ids: list[int] | None,
+    ineligibility_reason: Callable[[Cohort], str | None],
+) -> list[tuple[Cohort, str | None]]:
+    """Every cohort of the team, or of ``cohort_ids``, paired with its refusal or ``None``.
+
+    Deliberately wider than the run creators, which narrow the SQL-expressible half of eligibility
+    away before they lock: a dry run exists to name *why* each cohort was refused, and it takes no
+    locks. Both sides decide with the same predicate.
+    """
+    queryset = Cohort.objects.filter(team_id=team_id)
+    if cohort_ids is not None:
+        queryset = queryset.filter(id__in=cohort_ids)
+    return [(cohort, ineligibility_reason(cohort)) for cohort in queryset.order_by("id")]
+
+
+def _run_status(preconditions_missing: list[str]) -> tuple[str, str]:
+    if preconditions_missing:
+        reason = f"Missing operator attestations: {', '.join(preconditions_missing)}"
+        return CohortBackfillRunStatus.BLOCKED, reason
+    return CohortBackfillRunStatus.AWAITING_BOUNDARY, ""
+
+
+def _active_participation_cohort_ids(team_id: int, cohort_ids: Iterable[int], *, kind: CohortBackfillKind) -> set[int]:
+    return set(
+        CohortBackfillRunCohort.objects.for_team(team_id)
+        .filter(
+            cohort_id__in=cohort_ids,
+            superseded_at__isnull=True,
+            run__backfill_kind=kind,
+            run__status__in=ACTIVE_COHORT_BACKFILL_RUN_STATUSES,
+        )
+        .values_list("cohort_id", flat=True)
+    )
+
+
+def _has_active_cohort_run(team_id: int, cohort_id: int, *, kind: CohortBackfillKind) -> bool:
+    """Mirror of the ``cohort_bfr_active_cohort_kind_uq`` predicate. The participation check above
+    misses a run whose participation the seeder already superseded (``record_participation_partial``)
+    while the run itself stays active and so still holds the per-cohort uniqueness slot."""
+    return (
+        CohortBackfillRun.objects.for_team(team_id)
+        .filter(cohort_id=cohort_id, backfill_kind=kind, status__in=ACTIVE_COHORT_BACKFILL_RUN_STATUSES)
+        .exists()
+    )
+
+
+def _has_active_team_run(team_id: int, *, kind: CohortBackfillKind) -> bool:
+    """Mirror of the ``cohort_bfr_active_team_kind_uq`` predicate, for the same divergent state as
+    ``_has_active_cohort_run``: a team run whose participations are all superseded is invisible to
+    the participation check but still violates the constraint."""
+    return (
+        CohortBackfillRun.objects.for_team(team_id)
+        .filter(scope=CohortBackfillScope.TEAM, backfill_kind=kind, status__in=ACTIVE_COHORT_BACKFILL_RUN_STATUSES)
+        .exists()
+    )
+
+
+def _active_person_seed_topic_bytes(team_id: int) -> int:
+    """Sum of the sizing estimates recorded on the team's active person runs.
+
+    The budget has to bound the team's in-flight person seed bytes as a whole, not each run alone:
+    the seeder's person scan is team-wide per run, and the per-cohort uniqueness constraint lets one
+    run per cohort stack, so runs that each fit the budget can still add up to many multiples of it.
+    """
+    return sum(
+        preconditions.get("person_seed_estimated_topic_bytes", 0)
+        for preconditions in CohortBackfillRun.objects.for_team(team_id)
+        .filter(
+            backfill_kind=CohortBackfillKind.PERSON_PROPERTY,
+            status__in=ACTIVE_COHORT_BACKFILL_RUN_STATUSES,
+        )
+        .values_list("preconditions", flat=True)
+    )
+
+
+class BackfillRefusalReason(StrEnum):
+    """Why a creator declined to make a run.
+
+    The creators have always refused by returning ``None``, which collapsed a budget refusal and an
+    occupied run slot into the same signal — the two need entirely different operator responses
+    (raise the budget vs. go unwedge a stuck run), so the metric has to tell them apart.
+    """
+
+    TEAM_NOT_REALTIME = "team_not_realtime"
+    COHORT_MISSING = "cohort_missing"
+    COHORT_INELIGIBLE = "cohort_ineligible"
+    PARTICIPATION_ACTIVE = "participation_active"
+    RUN_SLOT_OCCUPIED = "run_slot_occupied"
+    SLOT_RACE = "slot_race"
+    INVALID_HORIZON = "invalid_horizon"
+    PINNING_CAP_EXCEEDED = "pinning_cap_exceeded"
+    OVER_BUDGET = "over_budget"
+    SIZING_SCAN_CAP_EXCEEDED = "sizing_scan_cap_exceeded"
+    DEFINITION_CHANGED = "definition_changed"
+    FLAG_CALLS_TABLE_UNRESOLVED = "flag_calls_table_unresolved"
+    SCAN_OVER_LIMIT = "scan_over_limit"
+
+
+@frozen
+class BackfillRunAttempt:
+    """A creator's outcome: the run, or the reason there isn't one. Exactly one is set."""
+
+    run: CohortBackfillRun | None
+    reason: BackfillRefusalReason | None
+
+    @classmethod
+    def created(cls, run: CohortBackfillRun) -> "BackfillRunAttempt":
+        return cls(run=run, reason=None)
+
+    @classmethod
+    def refused(cls, reason: BackfillRefusalReason) -> "BackfillRunAttempt":
+        return cls(run=None, reason=reason)
+
+
+def _pin_or_refuse_behavioral_cohort(cohort: Cohort) -> dict[str, Any] | BackfillRefusalReason:
+    ineligibility = behavioral_backfill_ineligibility_reason(cohort)
+    if ineligibility is not None:
+        logger.info(
+            "cohort_behavioral_backfill_ineligible",
+            team_id=cohort.team_id,
+            cohort_id=cohort.id,
+            reason=ineligibility,
+        )
+        return BackfillRefusalReason.COHORT_INELIGIBLE
+    if _active_participation_cohort_ids(cohort.team_id, [cohort.id], kind=CohortBackfillKind.BEHAVIORAL):
+        return BackfillRefusalReason.PARTICIPATION_ACTIVE
+    if _has_active_cohort_run(cohort.team_id, cohort.id, kind=CohortBackfillKind.BEHAVIORAL):
+        return BackfillRefusalReason.RUN_SLOT_OCCUPIED
+    try:
+        return pin_behavioral_run([cohort], cohort.team)
+    except FlagCallsTableUnresolved as error:
+        logger.warning(
+            "cohort_behavioral_backfill_flag_calls_table_unresolved",
+            team_id=cohort.team_id,
+            cohort_id=cohort.id,
+            error=str(error),
+        )
+        return BackfillRefusalReason.FLAG_CALLS_TABLE_UNRESOLVED
+
+
+def _scan_over_limit_message(estimate: BehavioralScanEstimate) -> str:
+    return (
+        f"The run would scan {estimate.peak_day_events} events on its busiest day ({estimate.peak_day}), "
+        f"above the limit of {estimate.max_events_per_day}."
+    )
+
+
+class BehavioralScanOverLimit(ValueError):
+    def __init__(self, estimate: BehavioralScanEstimate, event_name_count: int) -> None:
+        super().__init__(_scan_over_limit_message(estimate))
+        self.estimate = estimate
+        self.event_name_count = event_name_count
+
+
+def _clear_refusals(team_id: int, cohort_ids: Iterable[int]) -> None:
+    """If the new run later fails, the cohort API reports `needs_attention` without `too_large_to_build`."""
+    CohortBackfillRefusal.objects.for_team(team_id).filter(cohort_id__in=cohort_ids).delete()
+
+
+def create_backfill_run_for_cohort(team_id: int, cohort_id: int, trigger_kind: str) -> CohortBackfillRun | None:
+    """The run, or ``None``, for callers that assert on the run and never on why one was refused."""
+    return attempt_backfill_run_for_cohort(team_id, cohort_id, trigger_kind).run
+
+
+def attempt_backfill_run_for_cohort(team_id: int, cohort_id: int, trigger_kind: str) -> BackfillRunAttempt:
+    """Create one cohort's behavioral run, reporting the refusal reason rather than raising.
+
+    Every conflict check is re-run under a row lock, so a cohort edited again, deleted, or made
+    static in the meantime refuses instead of creating a second run for the same slot. The reason
+    comes back on the attempt so the signal path can label its metric with it.
+    """
+    if not is_processing_team(team_id, fresh=True):
+        return BackfillRunAttempt.refused(BackfillRefusalReason.TEAM_NOT_REALTIME)
+
+    # Unlocked pre-pass for the scan estimate: it is a ClickHouse round trip, so it must not run while
+    # the create path below holds the cohort row FOR UPDATE. The locked pass re-derives eligibility and
+    # the pin, and refuses if the pinned event names moved in between.
+    cohort = Cohort.objects.select_related("team").filter(id=cohort_id, team_id=team_id).first()
+    if cohort is None:
+        return BackfillRunAttempt.refused(BackfillRefusalReason.COHORT_MISSING)
+    pinned = _pin_or_refuse_behavioral_cohort(cohort)
+    if isinstance(pinned, BackfillRefusalReason):
+        return BackfillRunAttempt.refused(pinned)
+
+    max_events_per_day = settings.BEHAVIORAL_BACKFILL_MAX_SCAN_EVENTS_PER_DAY
+    estimate: BehavioralScanEstimate | None = None
+    refusal_message: str | None = None
+    if max_events_per_day:
+        try:
+            estimate = estimate_behavioral_scan_events(
+                team_id,
+                pinned["event_names"],
+                flag_calls_table=pinned["flag_calls_table"],
+                max_events_per_day=max_events_per_day,
+            )
+        except (ClickHouseQueryTimeOut, ClickHouseEstimatedQueryExecutionTimeTooLong) as error:
+            # The kill switch lowers the time cap below the estimate's own, so a timeout under it says nothing
+            # about the cohort, and a stored refusal would outlive the incident.
+            if kill_switch_overrides(team_id):
+                raise
+            # Refused like an over-limit count. The task's retries land seconds apart and repeat the same
+            # capped scan, then leave the cohort with no run and no stored reason.
+            refusal_message = f"The scan estimate hit its time cap: {error}"
+        else:
+            if estimate.over_limit:
+                refusal_message = _scan_over_limit_message(estimate)
+
+    try:
+        with transaction.atomic():
+            cohort = (
+                Cohort.objects.select_for_update(of=("self",))
+                .select_related("team")
+                .filter(id=cohort_id, team_id=team_id)
+                .first()
+            )
+            if cohort is None:
+                return BackfillRunAttempt.refused(BackfillRefusalReason.COHORT_MISSING)
+            locked_pinned = _pin_or_refuse_behavioral_cohort(cohort)
+            if isinstance(locked_pinned, BackfillRefusalReason):
+                return BackfillRunAttempt.refused(locked_pinned)
+            # The estimate read only the pre-pass event names and flag calls table. A racing edit that changed
+            # the names dispatched its own debounced task, which owns the re-estimated run.
+            if locked_pinned["event_names"] != pinned["event_names"]:
+                logger.warning(
+                    "cohort_behavioral_backfill_definition_changed_during_sizing",
+                    team_id=team_id,
+                    cohort_id=cohort_id,
+                )
+                return BackfillRunAttempt.refused(BackfillRefusalReason.DEFINITION_CHANGED)
+            # A flag evaluations mode change dispatches no task, so the trigger task's retry sizes the new table.
+            if locked_pinned["flag_calls_table"] != pinned["flag_calls_table"]:
+                raise ValueError("The cohort's flag calls table changed during sizing; retry the run")
+
+            filters_shape_hash = ensure_filters_shape_hash(cohort)
+            behavioral_filters_shape_hash = cohort.behavioral_filters_shape_hash or ""
+            # Stored under the lock and after the slot checks, so a run created during the estimate
+            # refuses this attempt instead of being outlived by its refusal.
+            if refusal_message is not None:
+                CohortBackfillRefusal.objects.for_team(team_id).update_or_create(
+                    cohort=cohort,
+                    defaults={
+                        "team_id": team_id,
+                        "shape_hash": behavioral_filters_shape_hash,
+                        "message": refusal_message,
+                        "refused_at": django_timezone.now(),
+                    },
+                )
+                return BackfillRunAttempt.refused(BackfillRefusalReason.SCAN_OVER_LIMIT)
+            preconditions, missing = check_run_preconditions()
+            status, blocked_reason = _run_status(missing)
+            run = CohortBackfillRun.objects.for_team(team_id).create(
+                team_id=team_id,
+                cohort=cohort,
+                backfill_kind=CohortBackfillKind.BEHAVIORAL,
+                trigger_kind=trigger_kind,
+                scope=CohortBackfillScope.COHORT,
+                status=status,
+                timezone=cohort.team.timezone,
+                pinned=locked_pinned,
+                preconditions={**preconditions, **(estimate.as_preconditions() if estimate else {})},
+                blocked_reason=blocked_reason,
+            )
+            CohortBackfillRunCohort.objects.for_team(team_id).create(
+                run=run,
+                team_id=team_id,
+                cohort=cohort,
+                filters_shape_hash=filters_shape_hash,
+                behavioral_filters_shape_hash=behavioral_filters_shape_hash,
+                pinned_filters=cohort.filters,
+            )
+            _clear_refusals(team_id, [cohort_id])
+            return BackfillRunAttempt.created(run)
+    except IntegrityError:
+        # A writer this transaction could not see won the unique-constraint race after the conflict
+        # checks passed. Refusing is this creator's contract, so report the race rather than raise.
+        logger.warning(
+            "cohort_backfill_run_conflict_race",
+            team_id=team_id,
+            cohort_id=cohort_id,
+            backfill_kind=CohortBackfillKind.BEHAVIORAL,
+        )
+        return BackfillRunAttempt.refused(BackfillRefusalReason.SLOT_RACE)
+
+
+def _validate_boundary_at(trigger_kind: str, boundary_at: datetime | None) -> datetime | None:
+    if boundary_at is None:
+        return None
+    if trigger_kind != CohortBackfillTrigger.DISASTER_RECOVERY:
+        raise ValueError("boundary_at is only valid for disaster recovery runs")
+    if django_timezone.is_naive(boundary_at):
+        raise ValueError("boundary_at must include a UTC offset")
+    try:
+        return boundary_at.astimezone(UTC)
+    except OverflowError as error:
+        raise ValueError("boundary_at falls outside the supported UTC range") from error
+
+
+def _eligible_team_cohorts(
+    team_id: int,
+    requested_ids: set[int] | None,
+    ineligibility_reason: Callable[[Cohort], str | None],
+    kind_name: str,
+    *,
+    lock: bool,
+) -> list[Cohort]:
+    # Narrow on the SQL-expressible half of eligibility before locking: `select_for_update` locks
+    # every row the query returns, so an unnarrowed team scan would hold `FOR UPDATE` on static,
+    # deleted, non-realtime and switched-off cohorts that were never candidates, blocking edits to them.
+    queryset = Cohort.objects.select_related("team").filter(
+        team_id=team_id,
+        cohort_type=CohortType.REALTIME,
+        realtime_enabled_at__isnull=False,
+        is_static=False,
+        deleted=False,
+    )
+    if lock:
+        queryset = queryset.select_for_update(of=("self",))
+    if requested_ids is not None:
+        queryset = queryset.filter(id__in=requested_ids)
+    cohorts = [cohort for cohort in queryset.order_by("id") if ineligibility_reason(cohort) is None]
+    if requested_ids is not None and {cohort.id for cohort in cohorts} != requested_ids:
+        invalid_ids = sorted(requested_ids - {cohort.id for cohort in cohorts})
+        raise ValueError(f"Cohorts are not eligible realtime {kind_name} cohorts: {invalid_ids}")
+    if not cohorts:
+        raise ValueError(f"Team {team_id} has no eligible realtime {kind_name} cohorts")
+    return cohorts
+
+
+def create_team_backfill_run(
+    team_id: int,
+    trigger_kind: str,
+    cohort_ids: Iterable[int] | None = None,
+    created_by_id: int | None = None,
+    boundary_at: datetime | None = None,
+    *,
+    max_events_per_day: int | None = None,
+) -> CohortBackfillRun:
+    """Pass ``max_events_per_day=0`` to skip the scan estimate, which is how staff accept a run's volume."""
+    if not is_processing_team(team_id, fresh=True):
+        raise ValueError(f"Team {team_id} is not processed by the realtime cohort pipeline")
+
+    boundary_at = _validate_boundary_at(trigger_kind, boundary_at)
+    if max_events_per_day is None:
+        max_events_per_day = settings.BEHAVIORAL_BACKFILL_MAX_SCAN_EVENTS_PER_DAY
+
+    requested_ids = set(cohort_ids) if cohort_ids is not None else None
+    team = Team.objects.get(id=team_id)
+    # Estimated unlocked for the same reason as in `attempt_backfill_run_for_cohort`.
+    cohorts = _eligible_team_cohorts(
+        team_id, requested_ids, behavioral_backfill_ineligibility_reason, "behavioral", lock=False
+    )
+    pinned = pin_behavioral_run(cohorts, team)
+    preconditions, missing = check_run_preconditions()
+    if max_events_per_day:
+        estimate = estimate_behavioral_scan_events(
+            team_id,
+            pinned["event_names"],
+            flag_calls_table=pinned["flag_calls_table"],
+            max_events_per_day=max_events_per_day,
+        )
+        if estimate.over_limit:
+            raise BehavioralScanOverLimit(estimate, len(pinned["event_names"]))
+        preconditions = {**preconditions, **estimate.as_preconditions()}
+
+    with transaction.atomic():
+        cohorts = _eligible_team_cohorts(
+            team_id, requested_ids, behavioral_backfill_ineligibility_reason, "behavioral", lock=True
+        )
+        conflicting_ids = _active_participation_cohort_ids(
+            team_id, [cohort.id for cohort in cohorts], kind=CohortBackfillKind.BEHAVIORAL
+        )
+        if conflicting_ids:
+            raise ValueError(f"Cohorts already have active backfill runs: {sorted(conflicting_ids)}")
+        if _has_active_team_run(team_id, kind=CohortBackfillKind.BEHAVIORAL):
+            raise ValueError(f"Team {team_id} already has an active team backfill run (behavioral)")
+        locked_pinned = pin_behavioral_run(cohorts, team)
+        # Compares what the estimate read, as in `attempt_backfill_run_for_cohort`.
+        if (locked_pinned["event_names"], locked_pinned["flag_calls_table"]) != (
+            pinned["event_names"],
+            pinned["flag_calls_table"],
+        ):
+            raise ValueError(
+                "Cohort behavioral definitions or their flag calls table changed during sizing; retry the run"
+            )
+
+        hashes: dict[int, str] = {}
+        behavioral_hashes: dict[int, str] = {}
+        for cohort in cohorts:
+            hashes[cohort.id] = ensure_filters_shape_hash(cohort)
+            behavioral_hashes[cohort.id] = cohort.behavioral_filters_shape_hash or ""
+        status, blocked_reason = _run_status(missing)
+        run = CohortBackfillRun.objects.for_team(team_id).create(
+            team_id=team_id,
+            created_by_id=created_by_id,
+            backfill_kind=CohortBackfillKind.BEHAVIORAL,
+            trigger_kind=trigger_kind,
+            scope=CohortBackfillScope.TEAM,
+            status=status,
+            boundary_at=boundary_at,
+            timezone=team.timezone,
+            pinned=locked_pinned,
+            preconditions=preconditions,
+            blocked_reason=blocked_reason,
+        )
+        CohortBackfillRunCohort.objects.for_team(team_id).bulk_create(
+            [
+                CohortBackfillRunCohort(
+                    run=run,
+                    team_id=team_id,
+                    cohort=cohort,
+                    filters_shape_hash=hashes[cohort.id],
+                    behavioral_filters_shape_hash=behavioral_hashes[cohort.id],
+                    pinned_filters=cohort.filters,
+                )
+                for cohort in cohorts
+            ]
+        )
+        _clear_refusals(team_id, [cohort.id for cohort in cohorts])
+        return run
+
+
+def create_person_backfill_run_for_cohort(
+    team_id: int,
+    cohort_id: int,
+    trigger_kind: str,
+    *,
+    person_horizon_days: int | None = None,
+) -> CohortBackfillRun | None:
+    """The run, or ``None``, for callers that assert on the run and never on why one was refused."""
+    return attempt_person_backfill_run_for_cohort(
+        team_id, cohort_id, trigger_kind, person_horizon_days=person_horizon_days
+    ).run
+
+
+def attempt_person_backfill_run_for_cohort(
+    team_id: int,
+    cohort_id: int,
+    trigger_kind: str,
+    *,
+    person_horizon_days: int | None = None,
+) -> BackfillRunAttempt:
+    """Create one cohort's person-property run, on the signal path's contract.
+
+    Unlike ``create_person_team_backfill_run`` this refuses quietly where the team creator raises:
+    it is the target of ``cohort_person_shape_changed_backfill``, where a refusal must warn and
+    return rather than fail the Celery task. That is also why the horizon defaults from settings
+    here but is required on the operator-driven team creator. The one exception is a transient
+    sizing failure (a ClickHouse timeout or transport error), which propagates so the task's retry
+    machinery re-runs it; the scan's own deterministic read cap still refuses quietly, since
+    retrying it would only repeat the capped scan.
+
+    The reason for a refusal comes back on the attempt, so the signal path can label its metric
+    with it.
+    """
+    if not is_processing_team(team_id, fresh=True):
+        return BackfillRunAttempt.refused(BackfillRefusalReason.TEAM_NOT_REALTIME)
+
+    horizon_days = (
+        person_horizon_days
+        if person_horizon_days is not None
+        else settings.BEHAVIORAL_BACKFILL_PERSON_DEFAULT_HORIZON_DAYS
+    )
+    if horizon_days < 1:
+        logger.warning(
+            "cohort_person_backfill_invalid_horizon",
+            team_id=team_id,
+            cohort_id=cohort_id,
+            person_horizon_days=horizon_days,
+        )
+        return BackfillRunAttempt.refused(BackfillRefusalReason.INVALID_HORIZON)
+
+    # Unlocked pre-pass for the sizing gate: the estimate is a ClickHouse round trip, so it must not
+    # run while the create path below holds the cohort row FOR UPDATE. The locked pass re-derives
+    # eligibility and the pin, and refuses if the definition moved in between.
+    cohort = Cohort.objects.filter(id=cohort_id, team_id=team_id).first()
+    if cohort is None:
+        return BackfillRunAttempt.refused(BackfillRefusalReason.COHORT_MISSING)
+    if person_backfill_ineligibility_reason(cohort) is not None:
+        return BackfillRunAttempt.refused(BackfillRefusalReason.COHORT_INELIGIBLE)
+    if _active_participation_cohort_ids(team_id, [cohort_id], kind=CohortBackfillKind.PERSON_PROPERTY):
+        return BackfillRunAttempt.refused(BackfillRefusalReason.PARTICIPATION_ACTIVE)
+    if _has_active_cohort_run(team_id, cohort_id, kind=CohortBackfillKind.PERSON_PROPERTY):
+        return BackfillRunAttempt.refused(BackfillRefusalReason.RUN_SLOT_OCCUPIED)
+    try:
+        pinned = pin_person_conditions_for_cohorts(
+            [cohort],
+            max_conditions=settings.BEHAVIORAL_BACKFILL_PERSON_MAX_PINNED_CONDITIONS,
+        )
+    except PersonPinningCapExceeded:
+        logger.warning(
+            "cohort_person_backfill_pinning_cap_exceeded",
+            team_id=team_id,
+            cohort_id=cohort_id,
+            max_conditions=settings.BEHAVIORAL_BACKFILL_PERSON_MAX_PINNED_CONDITIONS,
+        )
+        return BackfillRunAttempt.refused(BackfillRefusalReason.PINNING_CAP_EXCEEDED)
+
+    person_scan_since = django_timezone.now() - timedelta(days=horizon_days)
+    # With a precondition missing the run below records as `blocked`, which the seeder never claims,
+    # so paying for the sizing scan would buy nothing.
+    preconditions, missing = check_person_run_preconditions()
+    estimate: PersonSeedEstimate | None = None
+    if not missing:
+        # A budget already consumed by in-flight runs refuses before the estimate on purpose: the
+        # estimate is the team-wide sizing scan, and dispatch is debounced per cohort, so N edited
+        # cohorts would otherwise each pay a scan only to be refused here one by one. Expensive
+        # scans record large estimates, so the teams whose scans cost the most stop scanning first.
+        active_topic_bytes = _active_person_seed_topic_bytes(team_id)
+        if active_topic_bytes >= settings.BEHAVIORAL_BACKFILL_PERSON_TOPIC_BYTES_BUDGET:
+            logger.warning(
+                "cohort_person_backfill_over_budget",
+                team_id=team_id,
+                cohort_id=cohort_id,
+                active_topic_bytes=active_topic_bytes,
+                budget_bytes=settings.BEHAVIORAL_BACKFILL_PERSON_TOPIC_BYTES_BUDGET,
+            )
+            return BackfillRunAttempt.refused(BackfillRefusalReason.OVER_BUDGET)
+        try:
+            estimate = estimate_person_seed_topic_bytes(team_id, person_scan_since, len(pinned["conditions"]))
+        except PersonSeedEstimateScanCapExceeded as error:
+            logger.warning(
+                "cohort_person_backfill_sizing_failed",
+                team_id=team_id,
+                cohort_id=cohort_id,
+                error=str(error),
+            )
+            return BackfillRunAttempt.refused(BackfillRefusalReason.SIZING_SCAN_CAP_EXCEEDED)
+        if estimate.estimated_topic_bytes + active_topic_bytes > estimate.budget_bytes:
+            logger.warning(
+                "cohort_person_backfill_over_budget",
+                team_id=team_id,
+                cohort_id=cohort_id,
+                estimated_topic_bytes=estimate.estimated_topic_bytes,
+                active_topic_bytes=active_topic_bytes,
+                budget_bytes=estimate.budget_bytes,
+            )
+            return BackfillRunAttempt.refused(BackfillRefusalReason.OVER_BUDGET)
+
+    try:
+        with transaction.atomic():
+            # The locked re-checks reuse the unlocked reasons on purpose: which pass caught the
+            # refusal is a debugging detail for the log line, not a dimension worth doubling the
+            # metric's cardinality for.
+            cohort = (
+                Cohort.objects.select_for_update(of=("self",))
+                .select_related("team")
+                .filter(id=cohort_id, team_id=team_id)
+                .first()
+            )
+            if cohort is None:
+                return BackfillRunAttempt.refused(BackfillRefusalReason.COHORT_MISSING)
+            if person_backfill_ineligibility_reason(cohort) is not None:
+                return BackfillRunAttempt.refused(BackfillRefusalReason.COHORT_INELIGIBLE)
+            if _active_participation_cohort_ids(team_id, [cohort_id], kind=CohortBackfillKind.PERSON_PROPERTY):
+                return BackfillRunAttempt.refused(BackfillRefusalReason.PARTICIPATION_ACTIVE)
+            if _has_active_cohort_run(team_id, cohort_id, kind=CohortBackfillKind.PERSON_PROPERTY):
+                return BackfillRunAttempt.refused(BackfillRefusalReason.RUN_SLOT_OCCUPIED)
+
+            try:
+                locked_pinned = pin_person_conditions_for_cohorts(
+                    [cohort],
+                    max_conditions=settings.BEHAVIORAL_BACKFILL_PERSON_MAX_PINNED_CONDITIONS,
+                )
+            except PersonPinningCapExceeded:
+                logger.warning(
+                    "cohort_person_backfill_pinning_cap_exceeded",
+                    team_id=team_id,
+                    cohort_id=cohort_id,
+                    max_conditions=settings.BEHAVIORAL_BACKFILL_PERSON_MAX_PINNED_CONDITIONS,
+                )
+                return BackfillRunAttempt.refused(BackfillRefusalReason.PINNING_CAP_EXCEEDED)
+            if locked_pinned != pinned:
+                # A racing edit changed the definition after sizing; its own save dispatched a fresh
+                # debounced task, so that task owns the re-sized run.
+                logger.warning(
+                    "cohort_person_backfill_definition_changed_during_sizing",
+                    team_id=team_id,
+                    cohort_id=cohort_id,
+                )
+                return BackfillRunAttempt.refused(BackfillRefusalReason.DEFINITION_CHANGED)
+
+            filters_shape_hash = ensure_filters_shape_hash(cohort)
+            person_filters_shape_hash = cohort.person_filters_shape_hash or ""
+            status, blocked_reason = _run_status(missing)
+            run = CohortBackfillRun.objects.for_team(team_id).create(
+                team_id=team_id,
+                cohort=cohort,
+                backfill_kind=CohortBackfillKind.PERSON_PROPERTY,
+                trigger_kind=trigger_kind,
+                scope=CohortBackfillScope.COHORT,
+                status=status,
+                timezone=cohort.team.timezone,
+                person_scan_since=person_scan_since,
+                pinned={**pinned, "person_horizon_days": horizon_days},
+                preconditions={**preconditions, **(estimate.as_preconditions() if estimate else {})},
+                blocked_reason=blocked_reason,
+            )
+            CohortBackfillRunCohort.objects.for_team(team_id).create(
+                run=run,
+                team_id=team_id,
+                cohort=cohort,
+                filters_shape_hash=filters_shape_hash,
+                person_filters_shape_hash=person_filters_shape_hash,
+                pinned_filters=cohort.filters,
+            )
+            return BackfillRunAttempt.created(run)
+    except IntegrityError:
+        # A writer this transaction could not see won the unique-constraint race after the conflict
+        # checks passed. Refusing is this creator's contract, so report the race rather than raise.
+        logger.warning(
+            "cohort_backfill_run_conflict_race",
+            team_id=team_id,
+            cohort_id=cohort_id,
+            backfill_kind=CohortBackfillKind.PERSON_PROPERTY,
+        )
+        return BackfillRunAttempt.refused(BackfillRefusalReason.SLOT_RACE)
+
+
+def create_person_team_backfill_run(
+    team_id: int,
+    trigger_kind: str,
+    person_horizon_days: int,
+    cohort_ids: Iterable[int] | None = None,
+    created_by_id: int | None = None,
+    boundary_at: datetime | None = None,
+) -> CohortBackfillRun:
+    if not is_processing_team(team_id, fresh=True):
+        raise ValueError(f"Team {team_id} is not processed by the realtime cohort pipeline")
+    if person_horizon_days < 1:
+        raise ValueError("person_horizon_days must be at least 1")
+
+    boundary_at = _validate_boundary_at(trigger_kind, boundary_at)
+    preconditions, missing = check_person_run_preconditions()
+    if missing:
+        raise ValueError(f"Missing operator attestations: {', '.join(missing)}")
+
+    requested_ids = set(cohort_ids) if cohort_ids is not None else None
+    cohorts = _eligible_team_cohorts(
+        team_id, requested_ids, person_backfill_ineligibility_reason, "person-property", lock=False
+    )
+    pinned = pin_person_conditions_for_cohorts(
+        cohorts,
+        max_conditions=settings.BEHAVIORAL_BACKFILL_PERSON_MAX_PINNED_CONDITIONS,
+    )
+    person_scan_since = (boundary_at or django_timezone.now()) - timedelta(days=person_horizon_days)
+    estimate = estimate_person_seed_topic_bytes(
+        team_id,
+        person_scan_since,
+        len(pinned["conditions"]),
+    )
+    if estimate.over_budget:
+        raise ValueError(
+            f"Estimated person seed topic bytes {estimate.estimated_topic_bytes} exceed budget {estimate.budget_bytes}"
+        )
+
+    with transaction.atomic():
+        team = Team.objects.get(id=team_id)
+        cohorts = _eligible_team_cohorts(
+            team_id, requested_ids, person_backfill_ineligibility_reason, "person-property", lock=True
+        )
+        locked_pinned = pin_person_conditions_for_cohorts(
+            cohorts,
+            max_conditions=settings.BEHAVIORAL_BACKFILL_PERSON_MAX_PINNED_CONDITIONS,
+        )
+        if locked_pinned != pinned:
+            raise ValueError("Cohort person-property definitions changed during sizing; retry the run")
+
+        conflicting_ids = _active_participation_cohort_ids(
+            team_id,
+            [cohort.id for cohort in cohorts],
+            kind=CohortBackfillKind.PERSON_PROPERTY,
+        )
+        if conflicting_ids:
+            raise ValueError(f"Cohorts already have active person-property backfill runs: {sorted(conflicting_ids)}")
+        if _has_active_team_run(team_id, kind=CohortBackfillKind.PERSON_PROPERTY):
+            raise ValueError(f"Team {team_id} already has an active team backfill run (person_property)")
+
+        hashes: dict[int, str] = {}
+        person_hashes: dict[int, str] = {}
+        for cohort in cohorts:
+            hashes[cohort.id] = ensure_filters_shape_hash(cohort)
+            person_hashes[cohort.id] = cohort.person_filters_shape_hash or ""
+
+        run = CohortBackfillRun.objects.for_team(team_id).create(
+            team_id=team_id,
+            created_by_id=created_by_id,
+            backfill_kind=CohortBackfillKind.PERSON_PROPERTY,
+            trigger_kind=trigger_kind,
+            scope=CohortBackfillScope.TEAM,
+            status=CohortBackfillRunStatus.AWAITING_BOUNDARY,
+            boundary_at=boundary_at,
+            person_scan_since=person_scan_since,
+            timezone=team.timezone,
+            pinned={**pinned, "person_horizon_days": person_horizon_days},
+            preconditions={**preconditions, **estimate.as_preconditions()},
+        )
+        CohortBackfillRunCohort.objects.for_team(team_id).bulk_create(
+            [
+                CohortBackfillRunCohort(
+                    run=run,
+                    team_id=team_id,
+                    cohort=cohort,
+                    filters_shape_hash=hashes[cohort.id],
+                    person_filters_shape_hash=person_hashes[cohort.id],
+                    pinned_filters=cohort.filters,
+                )
+                for cohort in cohorts
+            ]
+        )
+        return run
+
+
+def supersede_active_runs(team_id: int, cohort_ids: Iterable[int], *, kind: CohortBackfillKind) -> int:
+    """Returns the number of participations newly superseded, not everything written: superseding a
+    run whose participation the seeder already terminalized returns 0."""
+    cohort_id_set = set(cohort_ids)
+    if not cohort_id_set:
+        return 0
+
+    error = "Cohort definition changed during backfill"
+    with transaction.atomic():
+        # Resolve the targets first, then write run rows before participation rows. The finalizer
+        # locks in that order (run FOR UPDATE, then participations via the readiness stamp), so
+        # the opposite order here would deadlock the two on a cohort-scoped run.
+        targets = list(
+            CohortBackfillRunCohort.objects.for_team(team_id)
+            .filter(
+                cohort_id__in=cohort_id_set,
+                superseded_at__isnull=True,
+                run__backfill_kind=kind,
+                run__status__in=ACTIVE_COHORT_BACKFILL_RUN_STATUSES,
+            )
+            .values_list("id", "run_id", "run__scope")
+        )
+        # Cohort-scoped runs are also targeted through the run's own cohort column: a seeder partial
+        # outcome (`record_participation_partial`) supersedes the participation while the run stays
+        # active, and an active run holds the per-cohort uniqueness slot whether or not its
+        # participation is already terminal.
+        cohort_run_ids = set(
+            CohortBackfillRun.objects.for_team(team_id)
+            .filter(
+                cohort_id__in=cohort_id_set,
+                backfill_kind=kind,
+                status__in=ACTIVE_COHORT_BACKFILL_RUN_STATUSES,
+            )
+            .values_list("id", flat=True)
+        )
+        cohort_run_ids.update(run_id for _, run_id, scope in targets if scope == CohortBackfillScope.COHORT)
+        if not targets and not cohort_run_ids:
+            return 0
+
+        if cohort_run_ids:
+            CohortBackfillRun.objects.for_team(team_id).filter(id__in=cohort_run_ids).update(
+                status=CohortBackfillRunStatus.SUPERSEDED,
+                finished_at=Now(),
+                error=error,
+            )
+        return (
+            CohortBackfillRunCohort.objects.for_team(team_id)
+            .filter(id__in=[participation_id for participation_id, _, _ in targets], superseded_at__isnull=True)
+            .update(superseded_at=Now(), error=error)
+        )
+
+
+@frozen
+class CancelOutcome:
+    cancelled_run_ids: tuple[UUID, ...] = ()
+    superseded_participations: int = 0
+    # (run_id, "stamped" | "finalizable" | "not_active")
+    refused: tuple[tuple[UUID, str], ...] = ()
+
+
+def cancel_runs(targets: Iterable[tuple[UUID, int]], *, reason: str, allow_finalizable: bool = False) -> CancelOutcome:
+    """Terminalize ``(run_id, team_id)`` pairs to ``cancelled`` on an operator's behalf.
+
+    This is the manual counterpart to ``supersede_active_runs``: an automatic writer reacting to a
+    cohort edit wants that one, which records *why* the backfill stopped mattering. ``cancelled``
+    means a person decided the run would never finish, so it stays out of signals, tasks, and request
+    paths. Its purpose is releasing the partial uniqueness slot an active run holds, which is what
+    lets the cohort or team be backfilled again.
+
+    Callers pass the team alongside each run rather than a bare id, so every query here is team
+    scoped and the sweep never reads run rows across teams by id.
+
+    Writes nothing beyond the run and its unresolved participations. No chunk write, because a chunk
+    under a live lease is fenced on ``claim_epoch`` and an unfenced update from here would race the
+    worker's own; the seeder's claim, plan, and CAS queries all require an active run status, so
+    canceling is already enough to stop it. No cache invalidation either, because no readiness stamp
+    is written and there is nothing stale to drop.
+    """
+    cancelled: list[UUID] = []
+    refused: list[tuple[UUID, str]] = []
+    participations = 0
+    for run_id, team_id in targets:
+        # One transaction per run. A sweep of fifty must not hold every run's lock at once: the
+        # cohort save path takes the same locks through `supersede_active_runs`, and a long
+        # multi-run transaction here would block saves for its whole duration.
+        with transaction.atomic():
+            # Same lock target as the finalizer's `_finalize_one_run`, so cancel and finalize
+            # serialize on the run row instead of racing. Deliberately not `skip_locked`: an
+            # operator needs a definite outcome per run, and the wait is bounded by one finalizer
+            # transaction.
+            run = (
+                CohortBackfillRun.objects.for_team(team_id)
+                .select_for_update(of=("self",))
+                .filter(id=run_id, status__in=ACTIVE_COHORT_BACKFILL_RUN_STATUSES)
+                .first()
+            )
+            if run is None:
+                refused.append((run_id, "not_active"))
+                continue
+
+            open_participations = CohortBackfillRunCohort.objects.for_team(team_id).filter(
+                run_id=run_id, superseded_at__isnull=True
+            )
+            # Re-read under the lock rather than trusting the inventory the operator looked at: the
+            # seeder may have observed the run since, and canceling one the finalizer would
+            # legitimately complete throws away a finished backfill. A run whose participations are
+            # all superseded is not that: the finalizer would only terminalize it, so refusing it
+            # would strand it holding its uniqueness slot with nothing able to release it.
+            if (
+                not allow_finalizable
+                and run.status == CohortBackfillRunStatus.RECONCILING
+                and run.reconcile_observed_at is not None
+                and open_participations.exists()
+            ):
+                refused.append((run_id, "finalizable"))
+                continue
+
+            if (
+                CohortBackfillRunCohort.objects.for_team(team_id)
+                .filter(run_id=run_id, stamped_at__isnull=False)
+                .exists()
+            ):
+                # A stamp is one way and the flags service already reads it as proof that
+                # `cohort_membership` is populated. Canceling behind one would leave the cohort
+                # marked ready with a run row claiming the backfill was abandoned.
+                refused.append((run_id, "stamped"))
+                continue
+
+            # Run row before participation rows, matching the ordering documented in
+            # `supersede_active_runs`; the reverse deadlocks against the finalizer.
+            CohortBackfillRun.objects.for_team(team_id).filter(id=run_id).update(
+                status=CohortBackfillRunStatus.CANCELLED, finished_at=Now(), error=reason
+            )
+            participations += open_participations.filter(stamped_at__isnull=True).update(
+                superseded_at=Now(), error=reason
+            )
+            cancelled.append(run_id)
+            logger.info(
+                "cohort_backfill_run_cancelled",
+                run_id=str(run_id),
+                team_id=team_id,
+                previous_status=run.status,
+                reason=reason,
+            )
+
+    return CancelOutcome(
+        cancelled_run_ids=tuple(cancelled),
+        superseded_participations=participations,
+        refused=tuple(refused),
+    )

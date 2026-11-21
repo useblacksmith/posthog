@@ -1,0 +1,848 @@
+import { deepEqual as equal } from 'fast-equals'
+import { DeepPartialMap, ValidationErrorType } from 'kea-forms'
+
+import {
+    isEmptyProperty,
+    isPersonMetadataPropertyFilter,
+    isPersonPropertyFilter,
+    propertyFilterTypeToPropertyDefinitionType,
+} from 'lib/components/PropertyFilters/utils'
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { ENTITY_MATCH_TYPE, PROPERTY_MATCH_TYPE } from 'lib/constants'
+import { isStringDateRegex } from 'lib/utils/dateFilters'
+import { calculateDays } from 'lib/utils/durations'
+import { isNumeric } from 'lib/utils/guards'
+import { areObjectValuesEmpty } from 'lib/utils/objects'
+import { isOperatorDate, isOperatorSemver } from 'lib/utils/operators'
+import { isStrictSemverValue, isValidSemverValue } from 'lib/utils/semver'
+import {
+    BEHAVIORAL_TYPE_TO_LABEL,
+    CRITERIA_VALIDATIONS,
+    FIELD_VALUES,
+    getRowShape,
+} from 'scenes/cohorts/CohortFilters/constants'
+import {
+    BehavioralFilterKey,
+    BehavioralFilterType,
+    CohortClientErrors,
+    FieldOptionsType,
+    FieldWithFieldKey,
+    FilterType,
+} from 'scenes/cohorts/CohortFilters/types'
+
+import { propertyDefinitionsModel } from '~/models/propertyDefinitionsModel'
+import { getCoreFilterDefinition } from '~/taxonomy/helpers'
+import {
+    ActionType,
+    AnyCohortCriteriaType,
+    AnyCohortGroupType,
+    AnyPropertyFilter,
+    BehavioralCohortType,
+    BehavioralEventType,
+    BehavioralLifecycleType,
+    CohortCriteriaGroupFilter,
+    CohortCriteriaType,
+    CohortType,
+    FilterLogicalOperator,
+    PropertyDefinition,
+    PropertyDefinitionState,
+    PropertyDefinitionType,
+    PropertyFilterType,
+    PropertyFilterValue,
+    PropertyOperator,
+    PreflightStatus,
+    PropertyType,
+    TimeUnitType,
+} from '~/types'
+
+import { MessageAudience, cohortAudienceProperties } from 'products/workflows/frontend/MessageAudience/messageAudience'
+import { urlForNewWorkflowWithTrigger } from 'products/workflows/frontend/Workflows/workflowTriggerPrefill'
+
+/**
+ * Single source of truth for whether a HaveProperty/NotHaveProperty criterion targets a
+ * top-level persons-table column (PersonMetadata) or the JSON properties blob (Person).
+ *
+ * `event_type` is the transient taxonomic-group hint set when the user picks a property: it
+ * wins when present, so a freshly-picked property derives the right key immediately. Once
+ * that hint has been dropped (e.g. a cohort loaded from the API), the durable `type` carries
+ * the answer. We only fall back to a PersonMetadata `type` when `event_type` is absent — so
+ * switching away from a PersonMetadata property to a plain person property (which arrives
+ * with `event_type === PersonProperties`) correctly downgrades to Person rather than
+ * persisting a `person_metadata` criterion the server would reject.
+ */
+export function behavioralKeyForPersonProperty(criteria: {
+    type?: BehavioralFilterKey | null
+    event_type?: TaxonomicFilterGroupType | null
+}): BehavioralFilterKey.Person | BehavioralFilterKey.PersonMetadata {
+    return criteria.event_type === TaxonomicFilterGroupType.PersonMetadata ||
+        (criteria.type === BehavioralFilterKey.PersonMetadata && !criteria.event_type)
+        ? BehavioralFilterKey.PersonMetadata
+        : BehavioralFilterKey.Person
+}
+
+/** True for either flavor of person-property criterion (JSON-blob lookup or persons-table column). */
+export function isPersonPropertyFilterKey(type: BehavioralFilterKey | undefined): boolean {
+    return type === BehavioralFilterKey.Person || type === BehavioralFilterKey.PersonMetadata
+}
+
+export function cleanBehavioralTypeCriteria(criteria: AnyCohortCriteriaType): AnyCohortCriteriaType {
+    let type = undefined
+    if (
+        [
+            BehavioralEventType.PerformEvent,
+            BehavioralEventType.PerformMultipleEvents,
+            BehavioralEventType.PerformSequenceEvents,
+            BehavioralEventType.NotPerformSequenceEvents,
+            BehavioralLifecycleType.PerformEventFirstTime,
+            BehavioralLifecycleType.PerformEventRegularly,
+            BehavioralLifecycleType.StopPerformEvent,
+            BehavioralLifecycleType.StartPerformEventAgain,
+        ].includes(criteria.value as BehavioralEventType | BehavioralLifecycleType)
+    ) {
+        type = BehavioralFilterKey.Behavioral
+    }
+    if (
+        [BehavioralCohortType.InCohort, BehavioralCohortType.NotInCohort].includes(
+            criteria.value as BehavioralCohortType
+        )
+    ) {
+        type = BehavioralFilterKey.Cohort
+    }
+    if (
+        [BehavioralEventType.HaveProperty, BehavioralEventType.NotHaveProperty].includes(
+            criteria.value as BehavioralEventType
+        )
+    ) {
+        type = behavioralKeyForPersonProperty(criteria)
+    }
+    return {
+        ...criteria,
+        ...(type ? { type } : {}),
+    }
+}
+
+export function isCohortCriteriaGroup(
+    criteria:
+        | CohortCriteriaGroupFilter
+        | AnyCohortCriteriaType[]
+        | AnyCohortCriteriaType
+        | AnyCohortGroupType[]
+        | AnyCohortGroupType
+        | undefined
+): criteria is CohortCriteriaGroupFilter {
+    if (criteria) {
+        return (
+            (criteria as CohortCriteriaGroupFilter).type !== undefined &&
+            (criteria as CohortCriteriaGroupFilter).values !== undefined
+        )
+    }
+    return false
+}
+
+export function isValidCohortGroup(criteria: AnyCohortGroupType): boolean {
+    return !(
+        (criteria.matchType === PROPERTY_MATCH_TYPE && !criteria.properties?.length) ||
+        (criteria.matchType === ENTITY_MATCH_TYPE && !(criteria.action_id || criteria.event_id))
+    )
+}
+
+// Mirrors the COHORT_CSV_UPLOAD_MAX_BYTES default, for when preflight has not loaded.
+const DEFAULT_COHORT_CSV_MAX_BYTES = 20 * 1024 * 1024
+
+export function cohortCsvMaxBytes(preflight: PreflightStatus | null | undefined): number {
+    return preflight?.cohort_csv_upload_max_bytes ?? DEFAULT_COHORT_CSV_MAX_BYTES
+}
+
+export function formatCohortCsvLimit(maxBytes: number): string {
+    return `${Math.round((maxBytes / (1024 * 1024)) * 10) / 10} MB`
+}
+
+export function cohortCsvTooLargeMessage(maxBytes: number): string {
+    return `CSV file is larger than the limit of ${formatCohortCsvLimit(maxBytes)}. Split the file into smaller parts and upload them one at a time.`
+}
+
+export function createCohortFormData(
+    cohort: CohortType,
+    { preserveStaticFilters = false }: { preserveStaticFilters?: boolean } = {}
+): FormData {
+    const rawCohort = {
+        ...(cohort.name ? { name: cohort.name } : {}),
+        description: cohort.description ?? '',
+        ...(cohort.csv ? { csv: cohort.csv } : {}),
+        ...(cohort.is_static ? { is_static: cohort.is_static } : {}),
+        ...(cohort.id === 'new' && cohort.realtime_enabled && hasEventCriteria(cohort)
+            ? { realtime_enabled: true }
+            : {}),
+        ...(typeof cohort._create_in_folder === 'string' ? { _create_in_folder: cohort._create_in_folder } : {}),
+        filters: JSON.stringify(
+            cohort.is_static && !preserveStaticFilters
+                ? {
+                      properties: {},
+                  }
+                : /* Overwrite value with value_property for cases where value is not a behavior enum (i.e., cohort and person filters) */
+                  {
+                      properties: {
+                          ...applyAllCriteriaGroup(
+                              applyAllNestedCriteria(cohort, (criteriaList) =>
+                                  criteriaList.map(
+                                      (c) =>
+                                          ({
+                                              ...c,
+                                              ...('value_property' in c ? { value: c.value_property } : {}),
+                                              value_property: undefined,
+                                              sort_key: undefined,
+                                          }) as AnyCohortCriteriaType
+                                  )
+                              ),
+                              (groupList) =>
+                                  groupList.map((g) => ({
+                                      ...g,
+                                      id: undefined,
+                                      sort_key: undefined,
+                                  }))
+                          ).filters.properties,
+                          id: undefined,
+                      },
+                      filterTestAccounts: cohort.filters.filterTestAccounts,
+                  }
+        ),
+    }
+
+    // Must use FormData to encode file binary in request
+    const cohortFormData = new FormData()
+    for (const [itemKey, value] of Object.entries(rawCohort)) {
+        cohortFormData.append(itemKey, value as string | Blob)
+    }
+
+    if (cohort._create_static_person_ids != null) {
+        cohort._create_static_person_ids.forEach((personId) => {
+            cohortFormData.append('_create_static_person_ids', personId)
+        })
+    }
+    return cohortFormData
+}
+
+/** Whether a group (or bare criterion) contributes at least one positive (non-negated) matching criterion. */
+function hasPositiveCriterion(group: CohortCriteriaGroupFilter | AnyCohortCriteriaType): boolean {
+    if (!isCohortCriteriaGroup(group)) {
+        return !group.negation
+    }
+    return (group.values as AnyCohortCriteriaType[]).filter((g) => !isCohortCriteriaGroup(g)).some((c) => !c.negation)
+}
+
+const SEMVER_RANGE_OPERATORS: ReadonlySet<PropertyOperator> = new Set([
+    PropertyOperator.SemverTilde,
+    PropertyOperator.SemverCaret,
+    PropertyOperator.SemverWildcard,
+])
+
+export function validateGroup(
+    group: CohortCriteriaGroupFilter | AnyCohortCriteriaType,
+    // The outer ("Match all/any criteria") operator and the other groups in the cohort. When the
+    // outer operator is AND, every group is intersected, so a negation in one group is bounded by a
+    // positive matching criterion in any sibling group — the whole cohort has to be considered, not
+    // just this group in isolation.
+    outerOperator?: FilterLogicalOperator,
+    siblingGroups: (CohortCriteriaGroupFilter | AnyCohortCriteriaType)[] = []
+): DeepPartialMap<CohortCriteriaGroupFilter, ValidationErrorType> {
+    if (!isCohortCriteriaGroup(group)) {
+        return {}
+    }
+
+    // Validate at highest level first (groups and then criteria)
+    const criteria = (group.values as AnyCohortCriteriaType[])
+        .filter((g) => !isCohortCriteriaGroup(g))
+        .map((c, index) => ({ ...c, index }))
+    const negatedCriteria = criteria.filter((c) => !!c.negation)
+    const negatedCriteriaIndices = new Set(negatedCriteria.map((c) => c.index))
+
+    // A negation is bounded by a positive matching criterion either within this AND group, or — when
+    // the cohort matches ALL criteria (outer AND) — within any sibling group.
+    const boundedWithinGroup = group.type === FilterLogicalOperator.And && negatedCriteria.length < criteria.length
+    const boundedBySibling =
+        group.type === FilterLogicalOperator.And &&
+        outerOperator === FilterLogicalOperator.And &&
+        siblingGroups.some((sibling) => hasPositiveCriterion(sibling))
+
+    if (negatedCriteria.length > 0 && !boundedWithinGroup && !boundedBySibling) {
+        const errorMsg = `${negatedCriteria
+            .map((c) => {
+                const behavioralFilterType = criteriaToBehavioralFilterType(c)
+                // Fall back to the raw filter type when the label map has no entry: this surfaces which
+                // BehavioralFilterType is missing from BEHAVIORAL_TYPE_TO_LABEL (e.g. a new enum value that
+                // landed before the map was updated) rather than crashing on an undefined `.label`.
+                return `'${BEHAVIORAL_TYPE_TO_LABEL[behavioralFilterType]?.label ?? behavioralFilterType}'`
+            })
+            .join(', ')} ${negatedCriteria.length > 1 ? 'are' : 'is a'} negative cohort criteria. ${
+            CohortClientErrors.NegationCriteriaMissingOther
+        }`
+        return {
+            id: errorMsg,
+            values: criteria.map((c) => ({
+                value: negatedCriteriaIndices.has(c.index) ? errorMsg : undefined,
+            })) as DeepPartialMap<CohortCriteriaType, ValidationErrorType>[],
+        }
+    }
+
+    // Negation where matching criteria cancel each other out
+    const negatedFailingCriteriaIndices = new Set()
+    negatedCriteria.forEach((negatedC) => {
+        const baseCriteria = { ...negatedC }
+        criteria.forEach((c) => {
+            if (
+                baseCriteria.index !== c.index &&
+                equal(cleanCriteria(baseCriteria), Object.assign({}, cleanCriteria(c), { negation: !c.negation }))
+            ) {
+                negatedFailingCriteriaIndices.add(c.index)
+                negatedFailingCriteriaIndices.add(baseCriteria.index)
+            }
+        })
+    })
+
+    if (
+        group.type === FilterLogicalOperator.And &&
+        negatedCriteria.length > 0 &&
+        negatedFailingCriteriaIndices.size > 0
+    ) {
+        return {
+            id: CohortClientErrors.NegationCriteriaCancel,
+            values: criteria.map((c) => ({
+                value: negatedFailingCriteriaIndices.has(c.index)
+                    ? CohortClientErrors.NegationCriteriaCancel
+                    : undefined,
+            })) as DeepPartialMap<CohortCriteriaType, ValidationErrorType>[],
+        }
+    }
+
+    // Validate BETWEEN and NOT_BETWEEN operators
+    const betweenCriteria = criteria.filter(
+        (c) => c.operator === PropertyOperator.Between || c.operator === PropertyOperator.NotBetween
+    )
+    if (betweenCriteria.length > 0) {
+        const betweenErrors: DeepPartialMap<CohortCriteriaType, ValidationErrorType>[] = criteria.map((c) => {
+            if (c.operator !== PropertyOperator.Between && c.operator !== PropertyOperator.NotBetween) {
+                return {}
+            }
+
+            const value = 'value_property' in c ? c.value_property : null
+            if (!Array.isArray(value) || value.length !== 2) {
+                return {
+                    id: CohortClientErrors.EmptyBetweenValues,
+                    value_property: CohortClientErrors.EmptyBetweenValues,
+                }
+            }
+
+            const [min, max] = value
+            if (min === null || max === null || Number.isNaN(Number(min)) || Number.isNaN(Number(max))) {
+                return {
+                    id: CohortClientErrors.EmptyBetweenValues,
+                    value_property: CohortClientErrors.EmptyBetweenValues,
+                }
+            }
+
+            if (Number(min) > Number(max)) {
+                return {
+                    id: CohortClientErrors.BetweenMinGreaterThanMax,
+                    value_property: CohortClientErrors.BetweenMinGreaterThanMax,
+                }
+            }
+
+            return {}
+        }) as DeepPartialMap<CohortCriteriaType, ValidationErrorType>[]
+
+        if (betweenErrors.some((e) => e.value_property)) {
+            return {
+                values: betweenErrors,
+            }
+        }
+    }
+
+    const semverErrors: DeepPartialMap<CohortCriteriaType, ValidationErrorType>[] = criteria.map((c) => {
+        if (!c.operator || !isOperatorSemver(c.operator)) {
+            return {}
+        }
+        const rawValue = 'value_property' in c ? c.value_property : null
+        // Older cohorts can store one value as a one-item list; the API unwraps it on save.
+        const value = Array.isArray(rawValue) && rawValue.length === 1 ? rawValue[0] : rawValue
+        const isValid =
+            typeof value === 'string' &&
+            (SEMVER_RANGE_OPERATORS.has(c.operator)
+                ? isValidSemverValue(value, { allowWildcard: c.operator === PropertyOperator.SemverWildcard })
+                : isStrictSemverValue(value))
+        return isValid
+            ? {}
+            : { id: CohortClientErrors.InvalidSemverValue, value_property: CohortClientErrors.InvalidSemverValue }
+    }) as DeepPartialMap<CohortCriteriaType, ValidationErrorType>[]
+    if (semverErrors.some((e) => e.value_property)) {
+        return {
+            values: semverErrors,
+        }
+    }
+
+    // Complete event regularly time comparison
+    const regularEventCriteria = criteria.filter((c) => c.value === BehavioralLifecycleType.PerformEventRegularly)
+    if (
+        regularEventCriteria.length > 0 &&
+        regularEventCriteria.every((c) => isNumeric(c.min_periods) && isNumeric(c.total_periods))
+    ) {
+        return {
+            values: criteria.map((c) =>
+                c.value === BehavioralLifecycleType.PerformEventRegularly
+                    ? (c.min_periods ?? 0) > (c.total_periods ?? 0)
+                        ? {
+                              id: CohortClientErrors.PeriodTimeMismatch,
+                              min_periods: CohortClientErrors.PeriodTimeMismatch,
+                              total_periods: CohortClientErrors.PeriodTimeMismatch,
+                          }
+                        : {}
+                    : {}
+            ) as DeepPartialMap<CohortCriteriaType, ValidationErrorType>[],
+        }
+    }
+
+    // Sequential times comparison
+    const sequentialTimeCriteria = criteria.filter((c) =>
+        [
+            BehavioralLifecycleType.StartPerformEventAgain,
+            BehavioralLifecycleType.StopPerformEvent,
+            BehavioralEventType.PerformSequenceEvents,
+        ].includes(c.value as BehavioralLifecycleType | BehavioralEventType)
+    )
+    if (
+        sequentialTimeCriteria.length > 0 &&
+        sequentialTimeCriteria.every(
+            (c) =>
+                isNumeric(c.seq_time_value) &&
+                isNumeric(c.time_value) &&
+                c.time_interval !== undefined &&
+                c.seq_time_interval !== undefined
+        )
+    ) {
+        return {
+            values: criteria.map((c) =>
+                [
+                    BehavioralLifecycleType.StartPerformEventAgain,
+                    BehavioralLifecycleType.StopPerformEvent,
+                    BehavioralEventType.PerformSequenceEvents,
+                ].includes(c.value as BehavioralLifecycleType | BehavioralEventType)
+                    ? calculateDays(Number(c.seq_time_value ?? 0), c.seq_time_interval ?? TimeUnitType.Day) >
+                      calculateDays(Number(c.time_value ?? 0), c.time_interval ?? TimeUnitType.Day)
+                        ? {
+                              id: CohortClientErrors.SequentialTimeMismatch,
+                              seq_time_value: CohortClientErrors.SequentialTimeMismatch,
+                              time_value: CohortClientErrors.SequentialTimeMismatch,
+                          }
+                        : {}
+                    : {}
+            ) as DeepPartialMap<CohortCriteriaType, ValidationErrorType>[],
+        }
+    }
+
+    // Generic criteria values cannot be empty
+    return {
+        values: criteria.map((c) => {
+            const behavioralFilterType = criteriaToBehavioralFilterType(c)
+            const row = getRowShape(behavioralFilterType)
+            let requiredFields = (row?.fields ?? []).filter((f) => !!f.fieldKey) as FieldWithFieldKey[]
+
+            // Edge case where property value is not required if operator is "is set" or "is not set"
+            if (
+                [BehavioralEventType.HaveProperty, BehavioralEventType.NotHaveProperty].includes(
+                    behavioralFilterType as BehavioralEventType
+                ) &&
+                'operator' in c &&
+                c['operator'] &&
+                [PropertyOperator.IsSet, PropertyOperator.IsNotSet].includes(c['operator'])
+            ) {
+                requiredFields = requiredFields.filter((f) => f.fieldKey !== 'value_property')
+            }
+
+            // Handle EventFilters separately, since these are optional
+            requiredFields = requiredFields.filter((f) => f.fieldKey !== 'event_filters')
+
+            // explicit_datetime_to is the optional upper bound of a date range
+            requiredFields = requiredFields.filter((f) => f.fieldKey !== 'explicit_datetime_to')
+            const eventFilterError =
+                c?.event_filters &&
+                c.event_filters.length > 0 &&
+                c.event_filters.some((prop) => prop?.type !== PropertyFilterType.HogQL && isEmptyProperty(prop))
+                    ? CohortClientErrors.EmptyEventFilters
+                    : undefined
+
+            const cRecord = c as Record<string, unknown>
+            const criteriaErrors = Object.fromEntries(
+                requiredFields.map(({ fieldKey, type }) => {
+                    const fieldValue = cRecord[fieldKey]
+                    const hasValue = Array.isArray(fieldValue)
+                        ? fieldValue.length > 0
+                        : fieldValue !== undefined && fieldValue !== null && fieldValue !== ''
+
+                    if (!hasValue) {
+                        return [
+                            fieldKey,
+                            CRITERIA_VALIDATIONS?.[type](fieldValue as string | number | null | undefined),
+                        ]
+                    }
+
+                    // Add numeric validation for person property values
+                    if (
+                        fieldKey === 'value_property' &&
+                        'key' in c &&
+                        'type' in c &&
+                        isPersonPropertyFilterKey(c.type)
+                    ) {
+                        const propertyKey = c.key as string
+                        const propertyDefinitionType = propertyFilterTypeToPropertyDefinitionType(
+                            c.type === BehavioralFilterKey.PersonMetadata
+                                ? PropertyFilterType.PersonMetadata
+                                : PropertyFilterType.Person
+                        )
+
+                        const mountedModel = propertyDefinitionsModel.findMounted()
+                        if (
+                            mountedModel &&
+                            mountedModel.values.describeProperty &&
+                            mountedModel.values.describeProperty(propertyKey, propertyDefinitionType) ===
+                                PropertyType.Numeric
+                        ) {
+                            const values = Array.isArray(fieldValue) ? fieldValue : [fieldValue]
+                            const invalidValues = values.filter((val) => {
+                                const strVal = String(val).trim()
+                                // Empty values are considered valid (handled by required field validation)
+                                if (strVal === '') {
+                                    return false
+                                }
+                                // Strict numeric validation: allow optional sign, digits with optional single decimal point
+                                return !/^[+-]?(\d+\.?|\d*\.\d+)$/.test(strVal)
+                            })
+
+                            if (invalidValues.length > 0) {
+                                return [fieldKey, CohortClientErrors.InvalidNumericPersonPropertyValue]
+                            }
+                        }
+                    }
+
+                    return [fieldKey, undefined]
+                })
+            )
+
+            const allErrors = { ...criteriaErrors, event_filters: eventFilterError }
+            const consolidatedErrors = Object.values(allErrors)
+                .filter((e) => !!e)
+                .join(' ')
+
+            return {
+                ...(areObjectValuesEmpty(allErrors) ? {} : { id: consolidatedErrors }),
+                ...allErrors,
+            }
+        }),
+    }
+}
+
+export function criteriaToBehavioralFilterType(criteria: AnyCohortCriteriaType): BehavioralFilterType {
+    if (criteria.negation) {
+        if (criteria.value === BehavioralEventType.PerformSequenceEvents) {
+            return BehavioralEventType.NotPerformSequenceEvents
+        }
+        if (criteria.value === BehavioralEventType.PerformEvent) {
+            return BehavioralEventType.NotPerformedEvent
+        }
+        if (isPersonPropertyFilterKey(criteria.type)) {
+            return BehavioralEventType.NotHaveProperty
+        }
+        if (criteria.type === BehavioralFilterKey.Cohort) {
+            return BehavioralCohortType.NotInCohort
+        }
+    }
+    return criteria.value ?? BehavioralEventType.PerformEvent
+}
+
+export function determineFilterType(
+    type: BehavioralFilterKey,
+    value: BehavioralFilterType,
+    negation: boolean = false
+): AnyCohortCriteriaType {
+    if (
+        value === BehavioralEventType.NotPerformSequenceEvents ||
+        (value === BehavioralEventType.PerformSequenceEvents && negation)
+    ) {
+        return {
+            type: BehavioralFilterKey.Behavioral,
+            value: BehavioralEventType.PerformSequenceEvents,
+            negation: true,
+        }
+    }
+    if (value === BehavioralEventType.NotPerformedEvent || (value === BehavioralEventType.PerformEvent && negation)) {
+        return {
+            type: BehavioralFilterKey.Behavioral,
+            value: BehavioralEventType.PerformEvent,
+            negation: true,
+        }
+    }
+    if (value === BehavioralCohortType.NotInCohort || (value === BehavioralCohortType.InCohort && negation)) {
+        return {
+            type: BehavioralFilterKey.Cohort,
+            value: BehavioralCohortType.InCohort,
+            negation: true,
+        }
+    }
+    if (value === BehavioralEventType.NotHaveProperty || (value === BehavioralEventType.HaveProperty && negation)) {
+        return {
+            // Preserve PersonMetadata vs Person — the original type drives whether the
+            // filter targets the persons-table column or the JSON properties blob.
+            // Without this, a negated PersonMetadata criterion silently degrades to
+            // a JSON-blob lookup on every cleanCriteria pass.
+            type: behavioralKeyForPersonProperty({ type }),
+            value: BehavioralEventType.HaveProperty,
+            negation: true,
+        }
+    }
+
+    return {
+        type,
+        value,
+        negation: false,
+    }
+}
+
+export function resolveCohortFieldValue(
+    criteria: AnyCohortCriteriaType,
+    fieldKey: string
+): string | number | boolean | null | undefined | AnyPropertyFilter[] | PropertyFilterValue {
+    // Resolve correct behavioral filter type
+    if (fieldKey === 'value') {
+        return criteriaToBehavioralFilterType(criteria)
+    }
+    return (
+        (
+            criteria as Record<
+                string,
+                string | number | boolean | null | undefined | AnyPropertyFilter[] | PropertyFilterValue
+            >
+        )[fieldKey] ?? null
+    )
+}
+
+export function applyAllCriteriaGroup(
+    oldCohort: CohortType,
+    fn: (
+        groupList: (AnyCohortCriteriaType | CohortCriteriaGroupFilter)[]
+    ) => (AnyCohortCriteriaType | CohortCriteriaGroupFilter)[]
+): CohortType {
+    return {
+        ...oldCohort,
+        filters: {
+            properties: {
+                ...oldCohort.filters.properties,
+                values: fn(oldCohort.filters.properties.values) as AnyCohortCriteriaType[],
+            },
+        },
+    }
+}
+
+export function applyAllNestedCriteria(
+    oldCohort: CohortType,
+    fn: (criteriaList: AnyCohortCriteriaType[]) => (AnyCohortCriteriaType | CohortCriteriaGroupFilter)[],
+    groupIndex?: number
+): CohortType {
+    return {
+        ...oldCohort,
+        filters: {
+            properties: {
+                ...oldCohort.filters.properties,
+                values: (oldCohort.filters.properties.values?.map((group, groupI) =>
+                    (groupIndex === undefined || groupI === groupIndex) && isCohortCriteriaGroup(group)
+                        ? {
+                              ...group,
+                              values: fn(group.values as AnyCohortCriteriaType[]),
+                          }
+                        : group
+                ) ?? []) as CohortCriteriaGroupFilter[] | AnyCohortCriteriaType[],
+            },
+        },
+    }
+}
+
+// Helper function to safely access properties from criteria
+function getCriteriaValue(criteria: AnyCohortCriteriaType, key: string): any {
+    return (criteria as Record<string, any>)[key]
+}
+
+// Populate empty values with default values on changing type, pruning any extra variables
+export function cleanCriteria(criteria: AnyCohortCriteriaType, shouldPurge: boolean = false): AnyCohortCriteriaType {
+    const populatedCriteria: Record<string, any> = {}
+    const { fields, ...apiProps } = getRowShape(criteriaToBehavioralFilterType(criteria)) ?? { fields: [] }
+    Object.entries(apiProps).forEach(([key, defaultValue]) => {
+        const nextValue = getCriteriaValue(criteria, key) ?? defaultValue
+        if (shouldPurge) {
+            populatedCriteria[key] = defaultValue
+        } else if (nextValue !== undefined && nextValue !== null) {
+            populatedCriteria[key] = nextValue
+        } else {
+            populatedCriteria[key] = undefined
+        }
+    })
+    fields.forEach(({ fieldKey, defaultValue }) => {
+        const nextValue = fieldKey ? (getCriteriaValue(criteria, fieldKey) ?? defaultValue) : null
+        if (fieldKey && shouldPurge) {
+            populatedCriteria[fieldKey] = defaultValue
+        } else if (fieldKey && nextValue !== undefined && nextValue !== null) {
+            populatedCriteria[fieldKey] = nextValue
+        } else if (fieldKey) {
+            populatedCriteria[fieldKey] = undefined
+        }
+    })
+    if ((criteria as CohortCriteriaType).sort_key != null) {
+        populatedCriteria.sort_key = (criteria as CohortCriteriaType).sort_key
+    }
+    return {
+        ...populatedCriteria,
+        ...determineFilterType(populatedCriteria['type'], populatedCriteria['value'], populatedCriteria['negation']),
+    }
+}
+
+export function criteriaToHumanSentence(
+    criteria: AnyCohortCriteriaType,
+    cohortsById: Partial<Record<string | number, CohortType>>,
+    actionsById: Partial<Record<string | number, ActionType>>
+): React.ReactNode {
+    const words: React.ReactNode[] = []
+    const data = getRowShape(criteriaToBehavioralFilterType(criteria))
+
+    if (!data) {
+        return <></>
+    }
+
+    data.fields.forEach(({ type, fieldKey, defaultValue, hide }) => {
+        // TODO: This needs to be much nicer for all cohort criteria options
+        if (!hide) {
+            if (type === FilterType.Text) {
+                words.push(defaultValue)
+            } else if (fieldKey) {
+                const value = getCriteriaValue(criteria, fieldKey)
+                if (type === FilterType.CohortValues) {
+                    words.push(<pre>{cohortsById?.[value]?.name ?? `Cohort ${value}`}</pre>)
+                } else if (type === FilterType.EventsAndActions && typeof value === 'number') {
+                    words.push(<pre>{actionsById?.[value]?.name ?? `Action ${value}`}</pre>)
+                } else if (type === FilterType.EventFilters && (criteria.event_filters?.length || 0) > 0) {
+                    words.push(<pre>with filters</pre>)
+                } else if (
+                    fieldKey === 'key' &&
+                    (criteria as AnyCohortCriteriaType).type === BehavioralFilterKey.PersonMetadata
+                ) {
+                    // PersonMetadata keys (e.g. created_at) are stored raw; resolve the taxonomy
+                    // label ("First seen") so the human sentence doesn't surface the column name.
+                    const label = getCoreFilterDefinition(
+                        value as string,
+                        TaxonomicFilterGroupType.PersonMetadata
+                    )?.label
+                    words.push(<pre>{label ?? value}</pre>)
+                } else {
+                    words.push(<pre>{value}</pre>)
+                }
+            }
+        }
+    })
+    return <>{words}</>
+}
+
+export function createCohortDataNodeLogicKey(cohortId: number | 'new'): string {
+    return `cohort_${cohortId}_persons`
+}
+
+export function urlForCohortWorkflow(cohort: CohortType): string {
+    return urlForNewWorkflowWithTrigger(
+        {
+            type: 'batch',
+            filters: { properties: cohortAudienceProperties({ id: cohort.id as number, name: cohort.name }) },
+        },
+        'cohort'
+    )
+}
+
+export const COHORT_MATCHING_DAYS = {
+    '1': 'day',
+    '7': 'week',
+    '14': '2 weeks',
+    '30': 'month',
+}
+
+function hasBehavioralCriteria(group: CohortCriteriaGroupFilter | AnyCohortCriteriaType): boolean {
+    if ('values' in group && Array.isArray(group.values)) {
+        return (group.values as (CohortCriteriaGroupFilter | AnyCohortCriteriaType)[]).some(hasBehavioralCriteria)
+    }
+    return group.type === BehavioralFilterKey.Behavioral
+}
+
+/** Whether a dynamic cohort matches on events. Only such a cohort is offered realtime when it is created. */
+export function hasEventCriteria(cohort: CohortType): boolean {
+    return !cohort.is_static && !!cohort.filters?.properties && hasBehavioralCriteria(cohort.filters.properties)
+}
+
+/** Why a broadcast can't send to this cohort, mirroring the batch audience check on the server. */
+export function cohortBroadcastDisabledReason(cohort: CohortType): string | null {
+    if (typeof cohort.id !== 'number') {
+        return 'Save the cohort first'
+    }
+    if (cohort.deleted) {
+        return 'Restore the cohort first'
+    }
+    if (hasEventCriteria(cohort)) {
+        return "Broadcasts can't send to cohorts with event conditions. Use a static or property-based cohort."
+    }
+    return null
+}
+
+export function cohortBroadcastAudience(cohort: Pick<CohortType, 'id' | 'name'>): MessageAudience {
+    if (typeof cohort.id !== 'number') {
+        return { properties: [], source: 'cohort' }
+    }
+    return {
+        properties: cohortAudienceProperties({ id: cohort.id, name: cohort.name }),
+        source: 'cohort',
+        sourceRecord: `cohort:${cohort.id}`,
+        draftSource: { source: 'cohort', source_id: String(cohort.id) },
+    }
+}
+
+export function personOperatorOptionsType(propertyType?: PropertyType | null): FieldOptionsType {
+    return propertyType === PropertyType.DateTime
+        ? FieldOptionsType.SingleFieldDateOperators
+        : FieldOptionsType.CohortMathOperators
+}
+
+export function isPersonOperatorShown(operator: PropertyOperator, propertyType?: PropertyType | null): boolean {
+    return operator in FIELD_VALUES[personOperatorOptionsType(propertyType)].values
+}
+
+export type PropertyDefinitionLookup = (
+    key: string,
+    type: PropertyDefinitionType
+) => PropertyDefinition | PropertyDefinitionState | null
+
+/**
+ * True when the cohort editor cannot show a recent filter's operator and value.
+ * While a property type is still loading, only operators that both type menus offer count as shown.
+ */
+export function isRecentPersonFilterUnsupported(
+    filter: AnyPropertyFilter,
+    lookupDefinition: PropertyDefinitionLookup
+): boolean {
+    if (!(isPersonPropertyFilter(filter) || isPersonMetadataPropertyFilter(filter)) || !filter.operator) {
+        return true
+    }
+    const { operator, value } = filter
+    // The cohort date editor takes an absolute date only, so a relative value such as -30d shows as an invalid date.
+    if (isOperatorDate(operator) && typeof value === 'string' && isStringDateRegex.test(value)) {
+        return true
+    }
+    const isOperatorShownFor = (propertyType?: PropertyType): boolean => isPersonOperatorShown(operator, propertyType)
+    const definition = lookupDefinition(filter.key, propertyFilterTypeToPropertyDefinitionType(filter.type))
+    if (typeof definition === 'object' && definition !== null) {
+        return !isOperatorShownFor(definition.property_type)
+    }
+    if (definition === PropertyDefinitionState.Missing || definition === PropertyDefinitionState.Error) {
+        return !isOperatorShownFor()
+    }
+    return !(isOperatorShownFor(PropertyType.DateTime) && isOperatorShownFor())
+}

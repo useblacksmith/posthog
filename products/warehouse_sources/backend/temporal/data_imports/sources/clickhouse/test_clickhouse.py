@@ -1,0 +1,1746 @@
+import os
+import uuid
+import array
+import socket
+import threading
+from collections.abc import AsyncIterable, Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
+
+import pytest
+from posthog.test.base import BaseTest
+from unittest.mock import MagicMock, call, patch
+
+from django.conf import settings
+
+import pyarrow as pa
+import clickhouse_connect
+from clickhouse_connect.driver.exceptions import ClickHouseError, OperationalError, ProgrammingError, StreamFailureError
+from clickhouse_connect.driver.httpclient import HttpClient
+from parameterized import parameterized
+from sshtunnel import BaseSSHTunnelForwarderError
+
+from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import clickhouse as ch_module
+from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse.clickhouse import (
+    _MAX_CONNECT_ATTEMPTS,
+    YIELD_TARGET_ROWS,
+    ClickHouseColumn,
+    ClickHouseConnectionError,
+    _build_query,
+    _get_client,
+    _get_incremental_row_count,
+    _get_partition_settings,
+    _has_duplicate_primary_keys,
+    _parse_mv_target,
+    _project_columns,
+    _quote_identifier,
+    _reads_in_incremental_order,
+    filter_clickhouse_incremental_fields,
+    get_primary_keys_for_schemas,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse.source import (
+    _CLOUDFLARE_TUNNEL_DOWN,
+    _EGRESS_DENIED_PRIVATE_HOST,
+    _PROXY_AUTH_REQUIRED,
+    _REDIRECTED,
+    _TEMPORARILY_UNAVAILABLE,
+    GENERIC_CONNECTION_ERROR,
+    ClickHouseSource,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.predicates import (
+    ColumnTypeCategory,
+    ValidatedRowFilter,
+)
+from products.warehouse_sources.backend.types import (
+    ExternalDataSchemaSyncType,
+    ExternalDataSourceType,
+    IncrementalFieldType,
+)
+
+
+class TestQuoteIdentifier:
+    @pytest.mark.parametrize(
+        "name,expected",
+        [
+            ("users", "`users`"),
+            ("user_id", "`user_id`"),
+            ("CamelCase", "`CamelCase`"),
+            ("with space", "`with space`"),
+            ("with`backtick", "`with``backtick`"),
+            ("123starts_with_digit", "`123starts_with_digit`"),
+        ],
+    )
+    def test_quotes_and_escapes(self, name, expected):
+        assert _quote_identifier(name) == expected
+
+    def test_rejects_null_byte(self):
+        with pytest.raises(ValueError, match="null byte"):
+            _quote_identifier("bad\x00name")
+
+
+class TestFilterClickHouseIncrementalFields:
+    @pytest.mark.parametrize(
+        "type_name,expected_type",
+        [
+            ("Int8", IncrementalFieldType.Integer),
+            ("Int16", IncrementalFieldType.Integer),
+            ("Int32", IncrementalFieldType.Integer),
+            ("Int64", IncrementalFieldType.Integer),
+            ("Int128", IncrementalFieldType.Integer),
+            ("Int256", IncrementalFieldType.Integer),
+            ("UInt8", IncrementalFieldType.Integer),
+            ("UInt16", IncrementalFieldType.Integer),
+            ("UInt32", IncrementalFieldType.Integer),
+            ("UInt64", IncrementalFieldType.Integer),
+            ("Date", IncrementalFieldType.Date),
+            ("Date32", IncrementalFieldType.Date),
+            ("DateTime", IncrementalFieldType.Timestamp),
+            ("DateTime('UTC')", IncrementalFieldType.Timestamp),
+            ("DateTime64(3)", IncrementalFieldType.Timestamp),
+            ("DateTime64(6, 'UTC')", IncrementalFieldType.Timestamp),
+            ("Nullable(Int64)", IncrementalFieldType.Integer),
+            ("Nullable(DateTime)", IncrementalFieldType.Timestamp),
+            ("LowCardinality(Int32)", IncrementalFieldType.Integer),
+        ],
+    )
+    def test_supported_types(self, type_name, expected_type):
+        result = filter_clickhouse_incremental_fields([("col", type_name, False)])
+        assert result == [("col", expected_type, False)]
+
+
+class TestBuildQuery:
+    @staticmethod
+    def _cols(*specs: tuple[str, str]) -> list[ClickHouseColumn]:
+        return [ClickHouseColumn(name=n, data_type=t, nullable=False) for n, t in specs]
+
+    @staticmethod
+    def _filter(column: str, operator: str, value: object, category: ColumnTypeCategory) -> ValidatedRowFilter:
+        return ValidatedRowFilter(column=column, operator=operator, value=value, category=category)
+
+    def test_incremental_casts_date_last_value_through_todate32(self):
+        # A `Date` cursor can come back from storage as a raw day-count integer
+        # (ClickHouse's own on-disk representation), which `greater(Date, UInt16)`
+        # rejects when bound directly. toDate32 accepts both an integer day-count
+        # and a date string, so the comparison always type-checks.
+        query, _ = _build_query(
+            database="default",
+            table_name="events",
+            columns=self._cols(("id", "Int64"), ("day", "Date")),
+            should_use_incremental_field=True,
+            incremental_field="day",
+            incremental_field_type=IncrementalFieldType.Date,
+        )
+        assert "WHERE `day` > toDate32(%(last_value)s)" in query
+
+    def test_incremental_quotes_field_with_special_chars(self):
+        query, _ = _build_query(
+            database="my-db",
+            table_name="weird table",
+            columns=self._cols(("event time", "DateTime")),
+            should_use_incremental_field=True,
+            incremental_field="event time",
+        )
+        assert "`my-db`.`weird table`" in query
+        assert "`event time`" in query
+
+    def test_incremental_raises_without_field(self):
+        with pytest.raises(ValueError, match="incremental_field can't be None"):
+            _build_query(
+                database="default",
+                table_name="events",
+                columns=self._cols(("id", "Int64")),
+                should_use_incremental_field=True,
+                incremental_field=None,
+            )
+
+    def test_wraps_arrow_unsupported_types_in_to_string(self):
+        query, _ = _build_query(
+            database="default",
+            table_name="events",
+            columns=[
+                ClickHouseColumn(name="id", data_type="Int64", nullable=False),
+                ClickHouseColumn(name="user_id", data_type="UUID", nullable=False),
+                ClickHouseColumn(name="ip", data_type="Nullable(IPv4)", nullable=True),
+                ClickHouseColumn(name="tags", data_type="Array(String)", nullable=False),
+                ClickHouseColumn(name="status", data_type="LowCardinality(Enum8('a' = 1))", nullable=False),
+                ClickHouseColumn(name="payload", data_type="JSON(a UInt32)", nullable=False),
+                ClickHouseColumn(name="value", data_type="Dynamic(max_types=8)", nullable=False),
+            ],
+            should_use_incremental_field=False,
+            incremental_field=None,
+        )
+        assert "`id`" in query
+        assert "toString(`user_id`) AS `user_id`" in query
+        assert "toString(`ip`) AS `ip`" in query
+        assert "toString(`tags`) AS `tags`" in query
+        assert "toString(`status`) AS `status`" in query
+        assert "toString(`payload`) AS `payload`" in query
+        assert "toString(`value`) AS `value`" in query
+
+    @pytest.mark.parametrize(
+        "should_use_incremental_field,page_conditions,expected_tail",
+        [
+            pytest.param(True, (), " ORDER BY `created_at` ASC", id="incremental_single_query"),
+            pytest.param(
+                True, ("(`created_at`) > (%(page_lower_0)s)",), " ORDER BY `created_at` ASC", id="incremental_paged"
+            ),
+            pytest.param(False, (), None, id="full_refresh"),
+        ],
+    )
+    def test_orders_only_an_incremental_query_and_ends_with_the_order(
+        self, should_use_incremental_field: bool, page_conditions: tuple[str, ...], expected_tail: str | None
+    ) -> None:
+        query, _ = _build_query(
+            database="default",
+            table_name="events",
+            columns=self._cols(("id", "Int64"), ("created_at", "DateTime64(6)")),
+            should_use_incremental_field=should_use_incremental_field,
+            incremental_field="created_at" if should_use_incremental_field else None,
+            incremental_field_type=IncrementalFieldType.DateTime if should_use_incremental_field else None,
+            page_conditions=page_conditions,
+        )
+        if expected_tail is None:
+            assert "ORDER BY" not in query
+        else:
+            assert query.endswith(expected_tail)
+
+    @pytest.mark.parametrize(
+        "data_type,should_use_incremental_field,incremental_field,expected",
+        [
+            ("DateTime64(6)", True, "created_at", True),
+            ("Date", True, "created_at", True),
+            ("Nullable(Int64)", True, "created_at", True),
+            ("LowCardinality(Nullable(UInt32))", True, "created_at", True),
+            # The SELECT list casts these with toString(), and the alias can make the order textual.
+            ("Int128", True, "created_at", False),
+            ("UInt256", True, "created_at", False),
+            ("Nullable(Int256)", True, "created_at", False),
+            ("DateTime64(6)", False, "created_at", False),
+            ("DateTime64(6)", True, "missing", False),
+        ],
+    )
+    def test_reads_in_incremental_order(
+        self, data_type: str, should_use_incremental_field: bool, incremental_field: str, expected: bool
+    ) -> None:
+        columns = self._cols(("id", "Int64"), ("created_at", data_type))
+        assert _reads_in_incremental_order(columns, should_use_incremental_field, incremental_field) is expected
+
+
+class TestProjectColumns:
+    @staticmethod
+    def _cols(*names: str) -> list[ClickHouseColumn]:
+        return [ClickHouseColumn(name=n, data_type="String", nullable=False) for n in names]
+
+    @staticmethod
+    def _names(cols: list[ClickHouseColumn]) -> list[str]:
+        return [c.name for c in cols]
+
+    def test_always_includes_primary_keys_and_incremental(self):
+        cols = self._cols("id", "name", "created_at", "extra")
+        result = _project_columns(cols, ["name"], ["id"], "created_at")
+        assert set(self._names(result)) == {"name", "id", "created_at"}
+
+
+class TestParseMvTarget:
+    def test_unqualified_target(self):
+        q = "CREATE MATERIALIZED VIEW default.mv TO target AS SELECT 1"
+        assert _parse_mv_target(q) == ("", "target")
+
+    def test_empty(self):
+        assert _parse_mv_target(None) is None
+        assert _parse_mv_target("") is None
+
+
+class TestGetClickhouseRowCount:
+    def _mock_client(self, query_side_effect):
+        client = MagicMock()
+        client.query.side_effect = query_side_effect
+        return client
+
+    def _result(self, rows):
+        r = MagicMock()
+        r.result_rows = rows
+        return r
+
+    def _run(self, responses):
+        """responses: list of (expected_substring_in_query_or_None, result_rows)."""
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import clickhouse as ch_module
+
+        calls = list(responses)
+
+        def side_effect(query, **_kwargs):
+            _, rows = calls.pop(0)
+            if isinstance(rows, Exception):
+                raise rows
+            return self._result(rows)
+
+        client = MagicMock()
+        client.query.side_effect = side_effect
+
+        with patch.object(ch_module, "_get_client", return_value=client):
+            return ch_module.get_clickhouse_row_count(
+                host="h",
+                port=1,
+                database="default",
+                user="u",
+                password="p",
+                secure=True,
+                verify=True,
+                names=None,
+            )
+
+    def test_distributed_falls_back_to_count(self):
+        counts = self._run(
+            [
+                (None, [("dist_events", None, "Distributed", "u1", "CREATE ...")]),
+                (None, [(42_000,)]),
+            ]
+        )
+        assert counts == {"dist_events": 42_000}
+
+    def test_mv_with_to_target_resolves_target(self):
+        counts = self._run(
+            [
+                (
+                    None,
+                    [
+                        (
+                            "events_mv",
+                            None,
+                            "MaterializedView",
+                            "u1",
+                            "CREATE MATERIALIZED VIEW default.events_mv TO default.events_target AS SELECT * FROM src",
+                        )
+                    ],
+                ),
+                (None, [("default", "events_target", 999)]),
+            ]
+        )
+        assert counts == {"events_mv": 999}
+
+    def test_mv_without_to_uses_inner_id(self):
+        counts = self._run(
+            [
+                (
+                    None,
+                    [
+                        (
+                            "mv",
+                            None,
+                            "MaterializedView",
+                            "abc-uuid",
+                            "CREATE MATERIALIZED VIEW default.mv (a UInt64) ENGINE = MergeTree ORDER BY a AS SELECT a FROM src",
+                        )
+                    ],
+                ),
+                (None, [(".inner_id.abc-uuid", 55)]),
+            ]
+        )
+        assert counts == {"mv": 55}
+
+    def test_skips_rows_narrower_than_the_select(self):
+        counts = self._run([(None, [("short_row",), ("events", 7, "MergeTree", "u1", "CREATE ...")])])
+        assert counts == {"events": 7}
+
+
+class TestGetPrimaryKeysForSchemas:
+    def _run(self, client, table_names):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import clickhouse as ch_module
+
+        with patch.object(ch_module, "_get_client", return_value=client):
+            return get_primary_keys_for_schemas(
+                host="h",
+                port=1,
+                database="default",
+                user="u",
+                password="p",
+                secure=True,
+                verify=True,
+                table_names=table_names,
+            )
+
+    def test_empty_input(self):
+        client = MagicMock()
+        assert self._run(client, []) == {}
+        client.query.assert_not_called()
+
+    def test_continues_past_per_table_error(self):
+        client = MagicMock()
+
+        calls = {"n": 0}
+
+        def side_effect(query, parameters=None, **_kwargs):
+            calls["n"] += 1
+            if parameters["table"] == "broken":
+                raise ClickHouseError("boom")
+            r = MagicMock()
+            r.result_rows = [("id",)]
+            return r
+
+        client.query.side_effect = side_effect
+        result = self._run(client, ["good", "broken", "other"])
+        assert result["good"] == ["id"]
+        assert result["broken"] is None
+        assert result["other"] == ["id"]
+
+
+class TestClickHouseColumnToArrowField:
+    @pytest.mark.parametrize(
+        "data_type,expected_arrow_type",
+        [
+            ("Int8", pa.int8()),
+            ("Int16", pa.int16()),
+            ("Int32", pa.int32()),
+            ("Int64", pa.int64()),
+            ("UInt8", pa.uint8()),
+            ("UInt16", pa.uint16()),
+            ("UInt32", pa.uint32()),
+            ("UInt64", pa.uint64()),
+            ("Float32", pa.float32()),
+            ("Float64", pa.float64()),
+            ("Bool", pa.bool_()),
+            ("String", pa.string()),
+            ("UUID", pa.string()),
+            ("Date", pa.date32()),
+            ("Date32", pa.date32()),
+            ("IPv4", pa.string()),
+            ("IPv6", pa.string()),
+            ("Int128", pa.string()),
+            ("Int256", pa.string()),
+            ("UInt128", pa.string()),
+            ("UInt256", pa.string()),
+            ("FixedString(16)", pa.string()),
+            ("Enum8('a' = 1, 'b' = 2)", pa.string()),
+            ("Enum16('long_label' = 1)", pa.string()),
+            ("Array(Int64)", pa.string()),
+            ("Map(String, Int64)", pa.string()),
+            ("Tuple(Int64, String)", pa.string()),
+            ("JSON", pa.string()),
+        ],
+    )
+    def test_simple_type_mappings(self, data_type, expected_arrow_type):
+        col = ClickHouseColumn("test_col", data_type, nullable=True)
+        field = col.to_arrow_field()
+        assert field.type == expected_arrow_type
+        assert field.name == "test_col"
+        assert field.nullable is True
+
+    @pytest.mark.parametrize(
+        "data_type,expected_unit",
+        [
+            ("DateTime64(0)", "s"),
+            ("DateTime64(3)", "ms"),
+            ("DateTime64(6)", "us"),
+            ("DateTime64(9)", "ns"),
+        ],
+    )
+    def test_datetime64_precision(self, data_type, expected_unit):
+        col = ClickHouseColumn("ts", data_type, nullable=False)
+        field = col.to_arrow_field()
+        assert field.type == pa.timestamp(expected_unit)
+
+    @pytest.mark.parametrize(
+        "data_type,expected_precision,expected_scale",
+        [
+            ("Decimal(10, 2)", 10, 2),
+            ("Decimal(18)", 18, 0),
+            # DecimalN(S): N fixes precision (9/18/38/76), lone arg is scale.
+            ("Decimal32(4)", 9, 4),
+            ("Decimal64(8)", 18, 8),
+            ("Decimal128(20)", 38, 20),
+            ("Decimal256(40)", 76, 40),
+        ],
+    )
+    def test_decimal_types(self, data_type, expected_precision, expected_scale):
+        col = ClickHouseColumn("amt", data_type, nullable=False)
+        field = col.to_arrow_field()
+        assert isinstance(field.type, (pa.Decimal128Type, pa.Decimal256Type))
+        assert field.type.precision == expected_precision
+        assert field.type.scale == expected_scale
+
+
+class TestClickHouseSourceRetryableErrors:
+    @pytest.fixture
+    def source(self):
+        return ClickHouseSource()
+
+    def test_permanent_errors_are_not_classified_as_retryable(self, source):
+        # A 404 is a deterministic failure (already asserted non-retryable above) — it must not
+        # also be misclassified as a benign retryable error, or `_handle_import_error` would log
+        # it at `warning` and mask the real cause.
+        error_msg = "HTTP driver received HTTP status 404 (for url https://example.ngrok-free.dev:443)"
+        retryable = source.get_retryable_errors()
+        assert not any(pattern in error_msg for pattern in retryable)
+
+    @pytest.mark.parametrize(
+        ("_name", "error_msg"),
+        [
+            (
+                # A bare HTTP 500 (no X-ClickHouse-Exception-Code header) means a proxy/load
+                # balancer in front of ClickHouse failed, not ClickHouse itself — the same
+                # transient shape as the already-retryable 502/503/504.
+                "bare_500",
+                "HTTP driver received HTTP status 500, server response: An unexpected error occurred: EOF (for url https://host:8443)",
+            ),
+            (
+                # Cloudflare's own "Argo Tunnel error" diagnostic (HTTP 530, error code 1033):
+                # the Cloudflare Tunnel in front of the host lost its connection to the origin.
+                # cloudflared reconnects on its own, so this gets the same transient treatment.
+                "cloudflare_tunnel_down",
+                "HTTP driver received HTTP status 530, server response: error code: 1033 (for url https://host:8443)",
+            ),
+        ],
+    )
+    def test_bare_gateway_status_is_classified_as_retryable(self, source, _name, error_msg):
+        # Without the matching entry, a transient gateway blip would be reported as tracked
+        # exception noise on every occurrence instead of silently retried.
+        retryable = source.get_retryable_errors()
+        assert any(pattern in error_msg for pattern in retryable)
+
+    def test_arrow_stream_flatbuffer_error_is_classified_as_retryable(self, source):
+        # pyarrow raises `OSError("Invalid flatbuffers message.")` from its own IPC framing when
+        # the connection carrying `query_arrow_stream` drops before the first message's header can
+        # be verified — the same mid-transfer connection drop as "bytes for message body, got",
+        # just caught earlier in the read. Without this it would be reported as tracked exception
+        # noise on every occurrence instead of silently retried.
+        error_msg = "Invalid flatbuffers message."
+        retryable = source.get_retryable_errors()
+        assert any(pattern in error_msg for pattern in retryable)
+
+
+class TestGetClientTransientRetry:
+    """`_get_client` retries a transient connection drop during connect in-process."""
+
+    def _connect(self):
+        return _get_client(
+            host="h", port=8443, database="default", user="default", password=None, secure=True, verify=True
+        )
+
+    def test_gives_up_after_max_attempts(self):
+        ssl_eof = ClickHouseError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+        with (
+            patch.object(ch_module.time, "sleep"),
+            patch.object(ch_module, "get_client", side_effect=ssl_eof) as mock_get_client,
+        ):
+            with pytest.raises(ClickHouseConnectionError):
+                self._connect()
+        assert mock_get_client.call_count == _MAX_CONNECT_ATTEMPTS
+
+    def test_rate_limit_backs_off_exponentially(self):
+        # A 429 backs off exponentially (base 2) to give the rate limit room to
+        # clear, unlike a connect drop which just re-dials on a short linear wait.
+        client = MagicMock()
+        rate_limited = OperationalError("HTTP driver received HTTP status 429 (for url https://host:8443)")
+        with (
+            patch.object(ch_module.time, "sleep") as mock_sleep,
+            patch.object(ch_module, "get_client", side_effect=[rate_limited, rate_limited, client]) as mock_get_client,
+        ):
+            assert self._connect() is client
+        assert mock_get_client.call_count == 3
+        mock_sleep.assert_has_calls([call(2), call(4)])
+
+    def test_does_not_retry_deterministic_failure(self):
+        cert_error = ClickHouseError("certificate verify failed")
+        with (
+            patch.object(ch_module.time, "sleep") as mock_sleep,
+            patch.object(ch_module, "get_client", side_effect=cert_error) as mock_get_client,
+        ):
+            with pytest.raises(ClickHouseConnectionError):
+                self._connect()
+        assert mock_get_client.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @parameterized.expand(
+        [
+            # clickhouse-connect's construction-time probe unpacks the reply into two values;
+            # a non-ClickHouse 2xx body raises a bare ValueError.
+            ("value_error", ValueError("too many values to unpack (expected 2)")),
+            # The same probe can also run out of response bytes mid-parse (e.g. the body is
+            # some other service's JSON, not the ClickHouse native wire format), which raises
+            # a bare `StreamFailureError` instead of a `ClickHouseError`.
+            ("stream_failure_error", StreamFailureError('{"ok": true, "path": "/?wait_end_of_query=1"}')),
+        ]
+    )
+    def test_wraps_non_clickhouse_response_probe_error(self, _name, probe_error):
+        # Either error is wrapped as a connection error (deterministic, no retry) instead of
+        # leaking the cryptic probe exception.
+        with (
+            patch.object(ch_module.time, "sleep") as mock_sleep,
+            patch.object(ch_module, "get_client", side_effect=probe_error) as mock_get_client,
+        ):
+            with pytest.raises(ClickHouseConnectionError, match="did not return a valid ClickHouse response"):
+                self._connect()
+        assert mock_get_client.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @parameterized.expand(
+        [
+            ("single_integer_line", b"200\n"),
+            ("empty_body", b""),
+            ("html_page", b"<html><body>It works</body></html>\n"),
+            ("too_many_columns", b"a\tb\tc\n"),
+        ]
+    )
+    def test_wraps_non_clickhouse_probe_body(self, _name, body):
+        response = MagicMock(data=body, headers={})
+        with (
+            patch.object(ch_module.time, "sleep") as mock_sleep,
+            patch.object(HttpClient, "_raw_request", return_value=response),
+        ):
+            with pytest.raises(ClickHouseConnectionError, match="did not return a valid ClickHouse response"):
+                self._connect()
+        mock_sleep.assert_not_called()
+
+
+class TestGetClientSessionSettings:
+    """`_get_client` applies tuning settings after connect, tolerating a
+    readonly source profile that rejects them instead of failing the sync."""
+
+    def _connect(self, settings):
+        return _get_client(
+            host="h",
+            port=8443,
+            database="default",
+            user="default",
+            password=None,
+            secure=True,
+            verify=True,
+            settings=settings,
+        )
+
+    def test_readonly_setting_does_not_fail_connection(self):
+        client = MagicMock()
+
+        def set_setting(key, _value):
+            if key == "max_block_size":
+                raise ProgrammingError("Setting max_block_size is unknown or readonly")
+
+        client.set_client_setting.side_effect = set_setting
+        with patch.object(ch_module, "get_client", return_value=client):
+            result = self._connect({"max_block_size": 20000, "optimize_read_in_order": 1})
+
+        assert result is client
+        # The rejected setting is skipped; the accepted one is still applied.
+        client.set_client_setting.assert_any_call("optimize_read_in_order", 1)
+
+
+class TestTranslateError:
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "Code: 516. DB::Exception: Authentication failed for user 'default'",
+            "Code: 192. DB::Exception: There is no user `analytics` in user directories. (UNKNOWN_USER)",
+        ],
+    )
+    def test_rejected_login_maps_to_invalid_credentials(self, msg):
+        translated = ClickHouseSource._translate_error(msg)
+        assert translated is not None
+        assert "rejected the username or password" in translated
+
+    @pytest.mark.parametrize("code", ["301", "302", "307", "308"])
+    def test_redirect_responses_name_the_redirect(self, code):
+        # Proxy-bypassing connections don't follow redirects, so the 3xx reaches the user.
+        msg = f"HTTP driver received HTTP status {code} (for url https://host:8443)"
+        assert ClickHouseSource._translate_error(msg) == _REDIRECTED
+
+    @pytest.mark.parametrize("code", ["500", "502", "503", "504"])
+    def test_gateway_responses_are_temporarily_unavailable(self, code):
+        # A bare status with no ClickHouse exception code means a proxy/LB in front of
+        # ClickHouse is briefly down, not that the connection details are wrong.
+        msg = f"HTTP driver received HTTP status {code} (for url https://host:8443)"
+        assert ClickHouseSource._translate_error(msg) == _TEMPORARILY_UNAVAILABLE
+
+    def test_cloudflare_tunnel_error_names_the_tunnel(self):
+        # Cloudflare's own "error code: 1033" (Argo Tunnel error), not a ClickHouse one — the
+        # generic gateway copy above would send the customer to check the wrong thing.
+        msg = "HTTP driver received HTTP status 530, server response: error code: 1033 (for url https://host:8443)"
+        assert ClickHouseSource._translate_error(msg) == _CLOUDFLARE_TUNNEL_DOWN
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            # Host resolved to a private-range address.
+            "HTTP driver received HTTP status 407, server response: Egress proxying is denied to host "
+            "'172.20.136.220:8000': no valid IP found among resolved addresses - 172.20.136.220 denied by "
+            "rule 'Deny: Private Range'. . (for url http://example.com:8123)",
+            # Different host and deny rule — the match must not depend on either.
+            "HTTP driver received HTTP status 407, server response: Egress proxying is denied to host "
+            "'169.254.169.254:80': no valid IP found among resolved addresses - 169.254.169.254 denied by "
+            "rule 'Deny: Not Global Unicast'. . (for url http://other.example.com:8443)",
+        ],
+    )
+    def test_egress_denied_host_maps_to_private_host_error(self, msg):
+        assert ClickHouseSource._translate_error(msg) == _EGRESS_DENIED_PRIVATE_HOST
+
+    def test_bare_proxy_auth_required_names_the_other_service(self):
+        # No "server response" body at all, unlike the egress-proxy-deny 407 above — some other
+        # service on that host/port demanded proxy credentials, not our own egress proxy.
+        msg = "HTTP driver received HTTP status 407 (for url http://wh.6dt3hlb5.requestrepo.com:18123)"
+        assert ClickHouseSource._translate_error(msg) == _PROXY_AUTH_REQUIRED
+
+
+class TestClickHouseSourceNonRetryableErrors:
+    @pytest.fixture
+    def source(self):
+        return ClickHouseSource()
+
+    @pytest.mark.parametrize(
+        ("observed_error", "expected_message"),
+        [
+            # Host resolved to a private-range address.
+            (
+                "DatabaseError: HTTP driver received HTTP status 407, server response: Egress proxying is denied "
+                "to host '172.20.136.220:8000': no valid IP found among resolved addresses - 172.20.136.220 "
+                "denied by rule 'Deny: Private Range'. . (for url http://example.com:18123)",
+                _EGRESS_DENIED_PRIVATE_HOST,
+            ),
+            # Different host and deny rule — the match must not rely on either volatile detail.
+            (
+                "DatabaseError: HTTP driver received HTTP status 407, server response: Egress proxying is denied "
+                "to host '169.254.169.254:80': no valid IP found among resolved addresses - 169.254.169.254 "
+                "denied by rule 'Deny: Not Global Unicast'. . (for url http://other.example.com:8443)",
+                _EGRESS_DENIED_PRIVATE_HOST,
+            ),
+            # A bare 407 with no body at all is a different host/service answering, not our
+            # egress proxy's SSRF refusal — it must map to the distinct _PROXY_AUTH_REQUIRED
+            # message instead of being swallowed by the egress-denied entry above.
+            (
+                "DatabaseError: HTTP driver received HTTP status 407 (for url http://wh.6dt3hlb5.requestrepo.com:18123)",
+                _PROXY_AUTH_REQUIRED,
+            ),
+        ],
+    )
+    def test_407_responses_are_non_retryable(self, source, observed_error, expected_message):
+        # Our egress proxy re-resolves the configured host on every connection, independently of
+        # this source's own setup-time DNS check — so a host that now resolves to a private/
+        # internal address is denied every attempt. Without this entry, `_handle_import_error`
+        # would retry the activity to its maximum before giving up, instead of stopping after a
+        # few attempts (see `get_non_retryable_errors`'s matching entry).
+        non_retryable_errors = source.get_non_retryable_errors()
+        matching = [key for key in non_retryable_errors if key in observed_error]
+        assert matching, "Error should be recognised as non-retryable"
+        assert all(non_retryable_errors[key] == expected_message for key in matching)
+
+
+class TestGetSchemas:
+    """Tests `get_schemas` with a fully mocked ClickHouse client."""
+
+    def _make_mock_client(self, rows):
+        client = MagicMock()
+        result = MagicMock()
+        result.result_rows = rows
+        client.query.return_value = result
+        return client
+
+    def test_excludes_materialized_view_inner_tables(self):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import clickhouse as ch_module
+
+        rows = [
+            ("events", "id", "UInt64"),
+            (".inner_id.8c612ff0-b72c-4b20-8ea5-405ed002c2f6", "id", "UInt64"),
+            (".inner_id.8c612ff0-b72c-4b20-8ea5-405ed002c2f6", "count", "UInt64"),
+            (".inner.my_legacy_mv", "value", "String"),
+        ]
+        mock_client = self._make_mock_client(rows)
+
+        with patch.object(ch_module, "_get_client", return_value=mock_client):
+            schemas = ch_module.get_schemas(
+                host="localhost",
+                port=8443,
+                database="default",
+                user="default",
+                password="",
+                secure=True,
+                verify=True,
+            )
+
+        assert set(schemas.keys()) == {"events"}
+
+
+class TestSourceClassValidateCredentials:
+    """High-level checks on validate_credentials error mapping."""
+
+    def test_returns_error_when_clickhouse_connection_fails(self):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import source as source_module
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse.clickhouse import (
+            ClickHouseConnectionError,
+        )
+
+        source = source_module.ClickHouseSource()
+
+        config = MagicMock()
+        config.host = "play.clickhouse.com"
+        config.ssh_tunnel = None
+
+        with patch.object(source, "ssh_tunnel_is_valid", return_value=(True, None)):
+            with patch.object(source, "is_database_host_valid", return_value=(True, None)):
+                with patch.object(
+                    source,
+                    "get_schemas",
+                    side_effect=ClickHouseConnectionError("Code: 516. Authentication failed"),
+                ):
+                    valid, msg = source.validate_credentials(config, team_id=1)
+
+        assert valid is False
+        assert msg is not None and "rejected the username or password" in msg
+
+    def test_url_in_host_field_returns_actionable_message_without_reflecting_input(self):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import source as source_module
+
+        source = source_module.ClickHouseSource()
+
+        config = MagicMock()
+        config.host = "https://secret.clickhouse.cloud"
+        config.ssh_tunnel = None
+
+        with patch.object(source, "ssh_tunnel_is_valid", return_value=(True, None)):
+            with patch.object(source, "is_database_host_valid") as host_valid:
+                valid, msg = source.validate_credentials(config, team_id=1)
+
+        assert valid is False
+        assert "Enter just the hostname" in (msg or "")
+        # The pasted value can embed credentials — it must never be echoed back.
+        assert "secret.clickhouse.cloud" not in (msg or "")
+        # Short-circuits before we attempt DNS resolution of the bad host.
+        host_valid.assert_not_called()
+
+    def test_returns_generic_message_for_unknown_error(self):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import source as source_module
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse.clickhouse import (
+            ClickHouseConnectionError,
+        )
+
+        source = source_module.ClickHouseSource()
+
+        config = MagicMock()
+        config.host = "play.clickhouse.com"
+        config.ssh_tunnel = None
+
+        with patch.object(source, "ssh_tunnel_is_valid", return_value=(True, None)):
+            with patch.object(source, "is_database_host_valid", return_value=(True, None)):
+                with patch.object(
+                    source,
+                    "get_schemas",
+                    side_effect=ClickHouseConnectionError("something weird happened"),
+                ):
+                    valid, msg = source.validate_credentials(config, team_id=1)
+
+        assert valid is False
+        assert msg == GENERIC_CONNECTION_ERROR
+
+    @pytest.mark.parametrize(
+        "raw_error,expected",
+        [
+            ("Could not establish session to SSH gateway", "Could not connect to your SSH tunnel"),
+            (
+                "Could not establish session to SSH gateway: the SSH server did not accept a connection within 15 seconds",
+                "Could not connect to your SSH tunnel",
+            ),
+            (
+                "Problem setting SSH Forwarder up: Couldn't open tunnel 127.0.0.1:0 <> bastion.example.com:9000",
+                "SSH tunnel settings",
+            ),
+        ],
+    )
+    def test_ssh_tunnel_errors_return_user_facing_message(self, raw_error, expected):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import source as source_module
+
+        source = source_module.ClickHouseSource()
+
+        config = MagicMock()
+        config.host = "play.clickhouse.com"
+        config.ssh_tunnel = None
+
+        with patch.object(source, "ssh_tunnel_is_valid", return_value=(True, None)):
+            with patch.object(source, "is_database_host_valid", return_value=(True, None)):
+                with patch.object(source, "get_schemas", side_effect=BaseSSHTunnelForwarderError(raw_error)):
+                    with patch.object(source_module, "capture_exception"):
+                        valid, msg = source.validate_credentials(config, team_id=1)
+
+        assert valid is False
+        assert msg is not None and expected in msg
+        assert "SSH gateway" not in msg
+        assert "example.com" not in msg
+
+
+class TestHasDuplicatePrimaryKeys:
+    def _logger(self):
+        return MagicMock()
+
+    def test_returns_false_when_no_primary_keys(self):
+        client = MagicMock()
+        assert _has_duplicate_primary_keys(client, "db", "t", None, self._logger()) is False
+        assert _has_duplicate_primary_keys(client, "db", "t", [], self._logger()) is False
+        client.query.assert_not_called()
+
+    def test_captures_unexpected_clickhouse_error(self):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import clickhouse as ch_module
+
+        client = MagicMock()
+        client.query.side_effect = ClickHouseError("Code: 62. DB::Exception: Syntax error")
+
+        with patch.object(ch_module, "capture_exception") as mock_capture:
+            assert _has_duplicate_primary_keys(client, "db", "t", ["id"], self._logger()) is True
+
+        mock_capture.assert_called_once()
+
+    @parameterized.expand(
+        [
+            (
+                "remote_disconnected",
+                "Caused by ProxyError('Cannot connect to proxy.', "
+                "RemoteDisconnected('Remote end closed connection without response'))",
+            ),
+            ("timeout", "Caused by ProxyError('Cannot connect to proxy.', TimeoutError('timed out'))"),
+            (
+                "new_connection_error",
+                "Caused by ProxyError('Cannot connect to proxy.', NewConnectionError('could not connect'))",
+            ),
+        ]
+    )
+    def test_egress_proxy_blip_leaves_key_unverified_without_capturing(self, _name, cause):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import clickhouse as ch_module
+
+        client = MagicMock()
+        client.query.side_effect = ClickHouseError(
+            f"HTTPSConnectionPool(host='ch.example.com', port=8443): Max retries exceeded with url: / ({cause})"
+        )
+
+        with patch.object(ch_module, "capture_exception") as mock_capture:
+            assert _has_duplicate_primary_keys(client, "db", "t", ["id"], self._logger()) is None
+
+        mock_capture.assert_not_called()
+
+    def test_access_denied_leaves_key_unverified_without_capturing(self):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import clickhouse as ch_module
+
+        client = MagicMock()
+        client.query.side_effect = ClickHouseError(
+            "Code: 497. DB::Exception: posthog: Not enough privileges. To execute this query, it's necessary "
+            "to have the grant SELECT ON db.t. (ACCESS_DENIED)"
+        )
+
+        with patch.object(ch_module, "capture_exception") as mock_capture:
+            assert _has_duplicate_primary_keys(client, "db", "t", ["id"], self._logger()) is None
+
+        mock_capture.assert_not_called()
+
+
+class TestDuplicateProbeTargetsMergeKey:
+    _MEMORY_LIMIT = ClickHouseError("Code: 241. DB::Exception: Query memory limit exceeded. (MEMORY_LIMIT_EXCEEDED)")
+    _INCREMENTAL = ExternalDataSchemaSyncType.INCREMENTAL
+
+    def _run(self, *, sync_type, stored_primary_keys, sorting_key, probe_outcome, last_value=None):
+        probe_queries: list[str] = []
+        probe_parameters: list[dict | None] = []
+
+        def fake_query(query, parameters=None, **_kwargs):
+            result = MagicMock()
+            if "is_in_sorting_key" in query:
+                result.result_rows = [(name,) for name in sorting_key]
+            elif "HAVING count() > 1" in query:
+                probe_queries.append(query)
+                probe_parameters.append(parameters)
+                if isinstance(probe_outcome, Exception):
+                    raise probe_outcome
+                result.result_rows = probe_outcome
+            else:
+                result.result_rows = []
+            return result
+
+        client = MagicMock()
+        client.query.side_effect = fake_query
+
+        mock_table = MagicMock()
+        mock_table.columns = [
+            ClickHouseColumn(name=n, data_type="String", nullable=False) for n in ("region", "created_at", "id")
+        ]
+        mock_table.to_arrow_schema.return_value = pa.schema([pa.field("id", pa.string())])
+
+        @contextmanager
+        def fake_tunnel():
+            yield ("localhost", 8443)
+
+        with (
+            patch.object(ch_module, "_get_client", return_value=client),
+            patch.object(ch_module, "_get_table", return_value=mock_table),
+            patch.object(ch_module, "_get_partition_settings", return_value=None),
+            patch.object(ch_module, "get_clickhouse_row_count", return_value={}),
+        ):
+            response = ch_module.clickhouse_source(
+                tunnel=fake_tunnel,
+                user="u",
+                password="p",
+                database="db",
+                secure=True,
+                verify=True,
+                table_names=["events"],
+                should_use_incremental_field=True,
+                incremental_field="created_at",
+                incremental_field_type=IncrementalFieldType.Timestamp,
+                logger=MagicMock(),
+                db_incremental_field_last_value=last_value,
+                stored_primary_keys=stored_primary_keys,
+                sync_type=sync_type,
+            )
+        return response, probe_queries, probe_parameters
+
+    @pytest.mark.parametrize(
+        "sync_type,stored_primary_keys,sorting_key,probe_outcome,expected_group_by,expected_blocked",
+        [
+            (_INCREMENTAL, ["id"], ["created_at", "id", "region"], [], "GROUP BY `id` HAVING", False),
+            (_INCREMENTAL, None, ["region", "id"], [], "GROUP BY `region`, `id` HAVING", False),
+            (_INCREMENTAL, ["id"], ["region", "id"], [(1,)], "GROUP BY `id` HAVING", True),
+            (_INCREMENTAL, ["id"], ["region", "id"], _MEMORY_LIMIT, "GROUP BY `id` HAVING", False),
+            (ExternalDataSchemaSyncType.APPEND, ["id"], ["region", "id"], [(1,)], None, False),
+        ],
+        ids=[
+            "stored_key_wins",
+            "sorting_key_when_nothing_stored",
+            "duplicates_block",
+            "exhausted_budget_does_not_block",
+            "append_does_not_probe",
+        ],
+    )
+    def test_probe_checks_the_merge_key(
+        self, sync_type, stored_primary_keys, sorting_key, probe_outcome, expected_group_by, expected_blocked
+    ):
+        response, probe_queries, _ = self._run(
+            sync_type=sync_type,
+            stored_primary_keys=stored_primary_keys,
+            sorting_key=sorting_key,
+            probe_outcome=probe_outcome,
+        )
+
+        if expected_group_by is None:
+            assert probe_queries == []
+        else:
+            assert len(probe_queries) == 1
+            assert expected_group_by in probe_queries[0]
+        assert response.has_duplicate_primary_keys is expected_blocked
+
+    @pytest.mark.parametrize(
+        "last_value,expected_from,expected_last_value",
+        [
+            (None, "FROM `db`.`events` GROUP BY", None),
+            (
+                datetime(2026, 1, 1, tzinfo=UTC),
+                "FROM `db`.`events` WHERE `created_at` > fromUnixTimestamp64Micro(%(last_value)s) GROUP BY",
+                1_767_225_600_000_000,
+            ),
+        ],
+        ids=["first_sync_probes_the_table", "cursor_scopes_the_probe_to_new_rows"],
+    )
+    def test_probe_reads_only_the_rows_after_the_cursor(self, last_value, expected_from, expected_last_value):
+        _, probe_queries, probe_parameters = self._run(
+            sync_type=self._INCREMENTAL,
+            stored_primary_keys=["id"],
+            sorting_key=["created_at", "id"],
+            probe_outcome=[],
+            last_value=last_value,
+        )
+
+        assert len(probe_queries) == 1
+        assert expected_from in probe_queries[0]
+        assert (probe_parameters[0] or {}).get("last_value") == expected_last_value
+
+    def test_source_for_pipeline_passes_the_schema_key_to_the_probe(self):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import source as source_module
+
+        source = ClickHouseSource()
+        inputs = MagicMock()
+        inputs.primary_keys = ["id"]
+
+        with (
+            patch.object(ExternalDataSchema, "objects"),
+            patch.object(source, "make_ssh_tunnel_func"),
+            patch.object(source, "_bypass_env_proxy", return_value=None),
+            patch.object(source_module, "clickhouse_source") as mock_clickhouse_source,
+        ):
+            source.source_for_pipeline(MagicMock(), inputs)
+
+        assert mock_clickhouse_source.call_args.kwargs["stored_primary_keys"] == ["id"]
+        assert mock_clickhouse_source.call_args.kwargs["sync_type"] is inputs.sync_type
+
+
+def _failing_server(*_args: object, **_kwargs: object) -> MagicMock:
+    raise ClickHouseError("timeout")
+
+
+def _readonly_server(*_args: object, settings: dict[str, object] | None = None, **_kwargs: object) -> MagicMock:
+    if settings:
+        raise ProgrammingError("Setting max_execution_time is unknown or readonly")
+    return MagicMock(result_rows=[(42,)])
+
+
+def _readonly_server_that_times_out(
+    *_args: object, settings: dict[str, object] | None = None, **_kwargs: object
+) -> MagicMock:
+    if settings:
+        raise ProgrammingError("Setting max_execution_time is unknown or readonly")
+    raise OperationalError("Read timed out")
+
+
+class TestGetIncrementalRowCount:
+    def _logger(self):
+        return MagicMock()
+
+    @pytest.mark.parametrize(
+        "server, expected",
+        [
+            pytest.param(_failing_server, None, id="query_fails"),
+            pytest.param(_readonly_server, 42, id="server_refuses_settings"),
+            pytest.param(_readonly_server_that_times_out, None, id="server_refuses_settings_and_the_count_fails"),
+        ],
+    )
+    def test_counts_the_rows_after_the_cursor_or_gives_none(
+        self, server: Callable[..., MagicMock], expected: int | None
+    ) -> None:
+        client = MagicMock()
+        client.query.side_effect = server
+        assert _get_incremental_row_count(client, "db", "t", "id", 0, self._logger()) == expected
+
+
+class TestGetPartitionSettings:
+    def _logger(self):
+        return MagicMock()
+
+    @parameterized.expand(
+        [
+            ("unexpected_error", "Code: 62. DB::Exception: Syntax error", True),
+            (
+                "read_timeout",
+                "HTTPSConnectionPool(host='ch.example.com', port=8443): Read timed out. (read timeout=120)",
+                False,
+            ),
+        ]
+    )
+    def test_falls_back_and_captures_only_actionable_errors(self, _name, message, should_capture):
+        client = MagicMock()
+        client.query.side_effect = ClickHouseError(message)
+
+        with patch.object(ch_module, "capture_exception") as mock_capture:
+            assert _get_partition_settings(client, "db", "t", self._logger()) is None
+
+        assert mock_capture.called is should_capture
+
+    def test_falls_back_on_a_row_narrower_than_the_select(self):
+        client = MagicMock()
+        client.query.return_value.result_rows = [(100,)]
+
+        assert _get_partition_settings(client, "db", "t", self._logger()) is None
+
+
+class TestGetRowsBatching:
+    """The source accumulates small Arrow blocks into larger pa.Tables before
+    yielding so Delta gets fewer, larger commits. Verify the accumulation
+    boundaries."""
+
+    def _stream_context(self, blocks):
+        """Build a fake `query_arrow_stream(...)` that returns `blocks`."""
+        cm = MagicMock()
+        cm.__enter__.return_value = iter(blocks)
+        cm.__exit__.return_value = False
+        return cm
+
+    def _run_get_rows(self, blocks, stream_client=None, columns=None):
+        """Invoke `clickhouse_source(...).items()` against a stream of `blocks`."""
+        from contextlib import contextmanager
+
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import clickhouse as ch_module
+
+        # Minimal discovery stubs so clickhouse_source builds a SourceResponse.
+        mock_client = MagicMock()
+        mock_table = MagicMock()
+        mock_table.to_arrow_schema.return_value = pa.schema([pa.field("id", pa.int64())])
+        if columns is not None:
+            mock_table.columns = columns
+
+        if stream_client is None:
+            stream_client = MagicMock()
+            stream_client.query_arrow_stream.return_value = self._stream_context(blocks)
+
+        @contextmanager
+        def fake_tunnel():
+            yield ("localhost", 8443)
+
+        clients = [mock_client, stream_client]
+
+        def fake_get_client(**_kwargs):
+            return clients.pop(0)
+
+        with (
+            patch.object(ch_module, "_get_client", side_effect=fake_get_client),
+            patch.object(ch_module, "_get_table", return_value=mock_table),
+            patch.object(ch_module, "_get_primary_keys", return_value=["id"]),
+            patch.object(ch_module, "_has_duplicate_primary_keys", return_value=False),
+            patch.object(ch_module, "_get_partition_settings", return_value=None),
+            patch.object(ch_module, "get_clickhouse_row_count", return_value={}),
+        ):
+            response = ch_module.clickhouse_source(
+                tunnel=fake_tunnel,
+                user="u",
+                password="p",
+                database="db",
+                secure=True,
+                verify=True,
+                table_names=["events"],
+                should_use_incremental_field=False,
+                logger=MagicMock(),
+                db_incremental_field_last_value=None,
+            )
+            items = response.items()
+            assert not isinstance(items, AsyncIterable)
+            return list(items)
+
+    def _block(self, rows):
+        return pa.RecordBatch.from_arrays([pa.array(list(range(rows)), type=pa.int64())], names=["id"])
+
+    def test_accumulates_until_row_target(self):
+        # 5 blocks × 30k rows = 150k total > YIELD_TARGET_ROWS (100k).
+        # Expect 2 yielded tables: one at/after 100k rows, one with the rest.
+        blocks = [self._block(30_000) for _ in range(5)]
+        yielded = self._run_get_rows(blocks)
+        assert len(yielded) == 2
+        assert sum(t.num_rows for t in yielded) == 150_000
+        # First yield must have crossed the row target.
+        assert yielded[0].num_rows >= YIELD_TARGET_ROWS
+
+    def test_skips_empty_blocks(self):
+        blocks = [self._block(0), self._block(50), self._block(0)]
+        yielded = self._run_get_rows(blocks)
+        assert len(yielded) == 1
+        assert yielded[0].num_rows == 50
+
+    @parameterized.expand(
+        [
+            ("http_403", "HTTP driver received HTTP status 403, server response: invalid format ArrowStream"),
+            ("unknown_format", "Code: 73. DB::Exception: Unknown format ArrowStream. (UNKNOWN_FORMAT)"),
+        ]
+    )
+    def test_reads_native_blocks_when_host_rejects_arrow(self, _name, error_msg):
+        columns = [
+            ClickHouseColumn("id", "UInt64", False),
+            ClickHouseColumn("created_at", "DateTime('UTC')", False),
+            ClickHouseColumn("label", "Nullable(String)", True),
+            ClickHouseColumn("location", "Point", False),
+            ClickHouseColumn("exact_at", "Nullable(DateTime64(9, 'UTC'))", True),
+            ClickHouseColumn("tenth_at", "DateTime64(1)", False),
+        ]
+        new_york = ZoneInfo("America/New_York")
+        native_blocks = [
+            [
+                array.array("Q", [1, 2]),
+                [datetime(2026, 1, 1, 12, tzinfo=UTC), datetime(2026, 1, 1, 7, tzinfo=new_york)],
+                ["a", None],
+                [(1.5, 2.5), (0.0, 0.0)],
+                [1767268800123456789, None],
+                [17672688001, 17672688002],
+            ],
+            [array.array("Q", [3]), [datetime(2026, 1, 2, tzinfo=UTC)], ["c"], [(3.0, 4.0)], [1], [0]],
+        ]
+        stream_client = MagicMock()
+        stream_client.query_arrow_stream.side_effect = ClickHouseError(error_msg)
+        stream_client.query_column_block_stream.return_value = self._stream_context(native_blocks)
+
+        yielded = self._run_get_rows([], stream_client=stream_client, columns=columns)
+
+        assert stream_client.query_column_block_stream.call_args.kwargs["column_formats"] == {
+            "exact_at": "int",
+            "tenth_at": "int",
+        }
+        assert len(yielded) == 1
+        assert yielded[0].schema == pa.schema([column.to_arrow_field() for column in columns])
+        assert yielded[0].column("exact_at").cast(pa.int64()).to_pylist() == [1767268800123456789, None, 1]
+        assert yielded[0].column("tenth_at").cast(pa.int64()).to_pylist() == [1767268800100, 1767268800200, 0]
+        assert yielded[0].drop_columns(["exact_at", "tenth_at"]).to_pydict() == {
+            "id": [1, 2, 3],
+            "created_at": [
+                datetime(2026, 1, 1, 12, tzinfo=UTC),
+                datetime(2026, 1, 1, 12, tzinfo=UTC),
+                datetime(2026, 1, 2, tzinfo=UTC),
+            ],
+            "label": ["a", None, "c"],
+            "location": ["(1.5, 2.5)", "(0.0, 0.0)", "(3.0, 4.0)"],
+        }
+
+    def test_treats_empty_arrow_response_as_zero_rows(self):
+        stream_client = MagicMock()
+        stream_client.query_arrow_stream.side_effect = pa.ArrowInvalid(
+            "Tried reading schema message, was null or length 0"
+        )
+
+        yielded = self._run_get_rows([], stream_client=stream_client)
+
+        assert yielded == []
+        stream_client.query_column_block_stream.assert_not_called()
+
+    def test_other_arrow_invalid_errors_are_not_treated_as_zero_rows(self):
+        stream_client = MagicMock()
+        stream_client.query_arrow_stream.side_effect = pa.ArrowInvalid("Invalid IPC stream: unsupported feature")
+
+        with pytest.raises(pa.ArrowInvalid, match="unsupported feature"):
+            self._run_get_rows([], stream_client=stream_client)
+
+    def test_other_query_errors_do_not_fall_back_to_native(self):
+        stream_client = MagicMock()
+        stream_client.query_arrow_stream.side_effect = ClickHouseError(
+            "Code: 60. DB::Exception: Unknown table expression identifier. (UNKNOWN_TABLE)"
+        )
+
+        with pytest.raises(ClickHouseError, match="UNKNOWN_TABLE"):
+            self._run_get_rows([], stream_client=stream_client)
+
+        stream_client.query_column_block_stream.assert_not_called()
+
+    def test_retries_with_the_servers_max_execution_time_ceiling(self):
+        constraint_error = ClickHouseError(
+            "Received ClickHouse exception, code: 452, server response: Code: 452. DB::Exception: "
+            "Setting max_execution_time shouldn't be greater than 600. (SETTING_CONSTRAINT_VIOLATION)"
+        )
+        stream_client = MagicMock()
+        stream_client.query_arrow_stream.side_effect = [constraint_error, self._stream_context([self._block(5)])]
+
+        yielded = self._run_get_rows([], stream_client=stream_client)
+
+        assert len(yielded) == 1
+        assert yielded[0].num_rows == 5
+        stream_client.set_client_setting.assert_called_once_with("max_execution_time", 600)
+        assert stream_client.query_arrow_stream.call_count == 2
+
+    def test_gives_up_after_one_max_execution_time_retry(self):
+        # A host that keeps rejecting every value we set must not spin the sync forever.
+        constraint_error = ClickHouseError(
+            "Received ClickHouse exception, code: 452, server response: Code: 452. DB::Exception: "
+            "Setting max_execution_time shouldn't be greater than 600. (SETTING_CONSTRAINT_VIOLATION)"
+        )
+        stream_client = MagicMock()
+        stream_client.query_arrow_stream.side_effect = [constraint_error, constraint_error]
+
+        with pytest.raises(ClickHouseError, match="SETTING_CONSTRAINT_VIOLATION"):
+            self._run_get_rows([], stream_client=stream_client)
+
+        stream_client.set_client_setting.assert_called_once_with("max_execution_time", 600)
+        assert stream_client.query_arrow_stream.call_count == 2
+
+    def test_limit_error_after_rows_were_read_does_not_fall_back_to_pages(self):
+        def blocks_then_limit_error():
+            yield self._block(10)
+            raise ClickHouseError("Code: 396. DB::Exception: Limit for result exceeded. (TOO_MANY_ROWS_OR_BYTES)")
+
+        stream_client = MagicMock()
+        stream_client.query_arrow_stream.return_value = self._stream_context(blocks_then_limit_error())
+
+        with pytest.raises(ClickHouseError, match="TOO_MANY_ROWS_OR_BYTES"):
+            self._run_get_rows([], stream_client=stream_client, columns=[ClickHouseColumn("id", "UInt64", False)])
+
+        stream_client.query_arrow_stream.assert_called_once()
+        stream_client.query.assert_not_called()
+
+
+class TestPagedReadFallback:
+    _HOST_LIMITS = {"max_result_rows": 10, "result_overflow_mode": "throw", "http_wait_end_of_query": 1}
+    _BASE_NANOS = 1_767_225_600_000_000_000
+
+    @pytest.fixture
+    def make_table(self) -> Iterator[Callable[[str], str]]:
+        admin = clickhouse_connect.get_client(
+            host=settings.CLICKHOUSE_HOST,
+            port=8123,
+            username=settings.CLICKHOUSE_USER,
+            password=settings.CLICKHOUSE_PASSWORD,
+        )
+        admin.command(f"CREATE DATABASE IF NOT EXISTS {settings.CLICKHOUSE_DATABASE}")
+        created: list[str] = []
+
+        def make(order_by: str) -> str:
+            name = f"paged_read_{uuid.uuid4().hex}"
+            qualified = f"{settings.CLICKHOUSE_DATABASE}.{name}"
+            created.append(qualified)
+            admin.command(f"""
+                CREATE TABLE {qualified} (id UInt64, grp String, ts DateTime64(9, 'UTC'))
+                ENGINE = MergeTree ORDER BY {order_by}
+            """)
+            admin.command(f"""
+                INSERT INTO {qualified}
+                SELECT number, if(number % 2 = 0, 'a', 'b'), fromUnixTimestamp64Nano(toInt64({self._BASE_NANOS} + intDiv(number, 3) * 500), 'UTC')
+                FROM numbers(30)
+            """)
+            return name
+
+        yield make
+        for qualified in created:
+            admin.command(f"DROP TABLE IF EXISTS {qualified}")
+        admin.close()
+
+    def _read(self, table: str, host_limits: dict, **source_kwargs) -> pa.Table:
+        @contextmanager
+        def tunnel():
+            yield (settings.CLICKHOUSE_HOST, 8123)
+
+        real_query_settings = ch_module._query_settings
+        with (
+            patch.object(
+                ch_module, "_query_settings", lambda chunk_size: {**real_query_settings(chunk_size), **host_limits}
+            ),
+            patch.object(ch_module, "PAGED_READ_INITIAL_ROWS", 16),
+            patch.object(ch_module, "PAGED_READ_MIN_ROWS", 4),
+        ):
+            response = ch_module.clickhouse_source(
+                tunnel=tunnel,
+                user=settings.CLICKHOUSE_USER,
+                password=settings.CLICKHOUSE_PASSWORD,
+                database=settings.CLICKHOUSE_DATABASE,
+                secure=False,
+                verify=False,
+                table_names=[table],
+                logger=MagicMock(),
+                **source_kwargs,
+            )
+            items = response.items()
+            assert not isinstance(items, AsyncIterable)
+            return pa.concat_tables(list(items))
+
+    @pytest.mark.parametrize(
+        "last_value, expected_ids",
+        [
+            pytest.param(None, list(range(30)), id="first_sync"),
+            pytest.param(datetime.fromtimestamp(_BASE_NANOS // 10**9, tz=UTC), list(range(3, 30)), id="resume"),
+        ],
+    )
+    def test_incremental_sync_pages_through_a_result_cap_in_cursor_order(self, make_table, last_value, expected_ids):
+        rows = self._read(
+            make_table("id"),
+            self._HOST_LIMITS,
+            should_use_incremental_field=True,
+            incremental_field="ts",
+            incremental_field_type=IncrementalFieldType.Timestamp,
+            db_incremental_field_last_value=last_value,
+        )
+
+        assert rows.column("ts").equals(rows.sort_by("ts").column("ts"))
+        assert rows.sort_by("id").column("id").to_pylist() == expected_ids
+
+    @pytest.mark.parametrize(
+        "host_limits, order_by, should_use_incremental_field",
+        [
+            pytest.param({**_HOST_LIMITS, "max_result_rows": 2}, "id", True, id="cursor_ties_above_cap_at_min_page"),
+            pytest.param(_HOST_LIMITS, "tuple()", False, id="full_refresh_without_sorting_key"),
+        ],
+    )
+    def test_raises_the_limit_error_when_paging_cannot_fit_under_it(
+        self, make_table, host_limits, order_by, should_use_incremental_field
+    ):
+        with pytest.raises(ClickHouseError, match="TOO_MANY_ROWS_OR_BYTES"):
+            self._read(
+                make_table(order_by),
+                host_limits,
+                should_use_incremental_field=should_use_incremental_field,
+                incremental_field="ts" if should_use_incremental_field else None,
+                incremental_field_type=IncrementalFieldType.Timestamp if should_use_incremental_field else None,
+                db_incremental_field_last_value=None,
+            )
+
+
+class TestIncrementalResumeAgainstServer:
+    @pytest.fixture
+    def make_table(self) -> Iterator[Callable[[str], str]]:
+        admin = clickhouse_connect.get_client(
+            host=settings.CLICKHOUSE_HOST,
+            port=8123,
+            username=settings.CLICKHOUSE_USER,
+            password=settings.CLICKHOUSE_PASSWORD,
+        )
+        admin.command(f"CREATE DATABASE IF NOT EXISTS {settings.CLICKHOUSE_DATABASE}")
+        created: list[str] = []
+
+        def make(ts_type: str) -> str:
+            name = f"cursor_resume_{uuid.uuid4().hex}"
+            qualified = f"{settings.CLICKHOUSE_DATABASE}.{name}"
+            created.append(qualified)
+            admin.command(f"CREATE TABLE {qualified} (id UInt64, ts {ts_type}) ENGINE = MergeTree ORDER BY id")
+            admin.command(f"""
+                INSERT INTO {qualified}
+                SELECT number, fromUnixTimestamp64Nano(toInt64(1767225600000000000 + intDiv(number, 3) * 500), 'UTC')
+                FROM numbers(30)
+            """)
+            return name
+
+        yield make
+        for qualified in created:
+            admin.command(f"DROP TABLE IF EXISTS {qualified}")
+        admin.close()
+
+    @pytest.mark.parametrize(
+        "ts_type, last_value, expected_ids",
+        [
+            pytest.param(
+                "DateTime64(9, 'UTC')", datetime(2026, 1, 1, 0, 0, 0, 4, tzinfo=UTC), [27, 28, 29], id="sub_second"
+            ),
+            pytest.param(
+                "DateTime64(9, 'America/New_York')",
+                datetime(2026, 1, 1, 0, 0, 0, 4, tzinfo=UTC),
+                [27, 28, 29],
+                id="column_timezone",
+            ),
+            pytest.param("DateTime64(9)", datetime(2026, 1, 1, 0, 0, 0, 4), [27, 28, 29], id="naive_cursor"),
+            pytest.param(
+                "DateTime('America/New_York')",
+                datetime(2025, 12, 31, 23, 59, 59, tzinfo=UTC),
+                list(range(30)),
+                id="datetime_column_timezone",
+            ),
+            pytest.param("DateTime64(9, 'UTC')", 1767225600, list(range(3, 30)), id="epoch_seconds_cursor"),
+        ],
+    )
+    def test_incremental_resume_reads_only_rows_after_the_cursor(self, make_table, ts_type, last_value, expected_ids):
+        @contextmanager
+        def tunnel():
+            yield (settings.CLICKHOUSE_HOST, 8123)
+
+        response = ch_module.clickhouse_source(
+            tunnel=tunnel,
+            user=settings.CLICKHOUSE_USER,
+            password=settings.CLICKHOUSE_PASSWORD,
+            database=settings.CLICKHOUSE_DATABASE,
+            secure=False,
+            verify=False,
+            table_names=[make_table(ts_type)],
+            should_use_incremental_field=True,
+            incremental_field="ts",
+            incremental_field_type=IncrementalFieldType.Timestamp,
+            db_incremental_field_last_value=last_value,
+            logger=MagicMock(),
+        )
+        items = response.items()
+        assert not isinstance(items, AsyncIterable)
+        rows = pa.concat_tables(list(items))
+
+        assert rows.sort_by("id").column("id").to_pylist() == expected_ids
+        assert response.rows_to_sync == len(expected_ids)
+
+
+class TestClickHouseReconcileSchemaMetadata(BaseTest):
+    """The ClickHouse-specific override that routes through the shared reconcile helper."""
+
+    def test_persists_schema_metadata_for_clickhouse_source(self) -> None:
+        source = ExternalDataSource.objects.create(team=self.team, source_type=ExternalDataSourceType.CLICKHOUSE)
+        schema = ExternalDataSchema.objects.create(team=self.team, source=source, name="events")
+
+        result = ClickHouseSource().reconcile_schema_metadata(
+            source=source,
+            source_schemas=[
+                SourceSchema(
+                    name="events",
+                    supports_incremental=False,
+                    supports_append=False,
+                    columns=[("uuid", "UUID", False), ("timestamp", "DateTime64(6)", False)],
+                )
+            ],
+            team_id=self.team.pk,
+        )
+
+        assert result == []
+        schema.refresh_from_db()
+        metadata = schema.schema_metadata
+        assert metadata is not None
+        assert [column["name"] for column in metadata["columns"]] == ["uuid", "timestamp"]
+
+
+class TestBypassEnvProxy:
+    """The proxy bypass for PostHog-internal direct connections.
+
+    `bypass_env_proxy=True` must hand clickhouse-connect a pool manager, which
+    stops it consulting HTTP(S)_PROXY env vars; `False` must leave the default
+    (proxy-honouring) behaviour intact.
+    """
+
+    def test_eviction_releases_the_manager_everywhere_it_is_retained(self):
+        # The cache key contains the user-controlled hostname, so it must be bounded — and a
+        # bounded cache only helps if eviction also drops the manager from clickhouse-connect's
+        # process-global registry, the other place that would retain it for the worker's life.
+        from clickhouse_connect.driver.httputil import all_managers
+
+        with patch.object(ch_module, "_POOL_MANAGER_CACHE_MAX", 2):
+            first = ch_module._no_env_proxy_pool_manager(True, "evict-me.example")
+            assert first in all_managers
+            for n in range(2):
+                ch_module._no_env_proxy_pool_manager(True, f"filler-{n}.example")
+
+        assert first not in all_managers
+        assert ch_module._no_env_proxy_pool_manager(True, "evict-me.example") is not first
+
+
+class TestInternalHostTeamAllowlist:
+    @pytest.mark.parametrize(
+        "region,team_id,expected",
+        [
+            ("US", 2, True),
+            ("US", 1, False),
+            ("US", 12345, False),
+            ("EU", 1, True),
+            ("EU", 2, False),
+            ("EU", 12345, False),
+            (None, 2, False),
+            ("DEV", 2, False),
+        ],
+    )
+    def test_allowlist(self, region, team_id, expected):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.common import mixins
+
+        with patch.object(mixins, "get_instance_region", return_value=region):
+            assert mixins.is_team_allowlisted_for_internal_hosts(team_id) is expected
+
+
+_FORBIDDEN_RESPONSE = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+
+@contextmanager
+def _recording_server(response: bytes = _FORBIDDEN_RESPONSE) -> Iterator[tuple[int, list[str]]]:
+    server = socket.create_server(("127.0.0.1", 0))
+    server.settimeout(0.1)
+    requests: list[str] = []
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except (TimeoutError, OSError):
+                continue
+            with conn:
+                requests.append(conn.recv(8192).decode("latin-1").split("\r\n")[0])
+                conn.sendall(response)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield server.getsockname()[1], requests
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        server.close()
+
+
+def _connect_to(*, port: int, bypass_env_proxy: "ch_module.BypassEnvProxy") -> None:
+    _get_client(
+        host="127.0.0.1",
+        port=port,
+        database="default",
+        user="default",
+        password=None,
+        secure=False,
+        verify=True,
+        bypass_env_proxy=bypass_env_proxy,
+    )
+
+
+class TestGetClientEgressProxyRouting:
+    """Where the connection actually goes, which is what decides whether a tunnel works.
+
+    PostHog's runtime points HTTP_PROXY at the Smokescreen egress proxy, and Smokescreen blocks
+    loopback. Routing a tunneled connection through it means the request never reaches the SSH
+    tunnel's local forwarded port, so the tunnel opens no channel to the customer's ClickHouse
+    and the source fails with a generic connection error. The stub servers answer with a
+    deterministic 403 rather than dropping the connection so that `_get_client` raises on the
+    first attempt instead of entering its transient-retry backoff.
+    """
+
+    @parameterized.expand([("tunneled", "tunnel_loopback"), ("internal", "internal_team"), ("proxied", None)])
+    def test_only_a_proxied_connection_goes_through_the_egress_proxy(self, _name: str, reason) -> None:
+        with _recording_server() as (proxy_port, proxy_requests):
+            with _recording_server() as (bound_port, bound_requests):
+                proxy_url = f"http://127.0.0.1:{proxy_port}"
+                env = {"HTTP_PROXY": proxy_url, "http_proxy": proxy_url}
+                with patch.dict(os.environ, env):
+                    os.environ.pop("NO_PROXY", None)
+                    os.environ.pop("no_proxy", None)
+
+                    with pytest.raises(ClickHouseConnectionError):
+                        _connect_to(port=bound_port, bypass_env_proxy=reason)
+
+        bypassed = reason is not None
+        assert bool(bound_requests) == bypassed
+        assert bool(proxy_requests) == (not bypassed)
+
+    def test_redirect_away_from_the_target_is_not_followed(self) -> None:
+        # A bypassing connection skips the egress proxy, so following a redirect would let the
+        # host we reached send us to an address the proxy would have denied.
+        with _recording_server() as (elsewhere_port, elsewhere_requests):
+            redirect = (
+                f"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{elsewhere_port}/\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ).encode()
+            with _recording_server(response=redirect) as (bound_port, bound_requests):
+                with pytest.raises(ClickHouseConnectionError):
+                    _connect_to(port=bound_port, bypass_env_proxy="tunnel_loopback")
+
+        assert bound_requests
+        assert elsewhere_requests == []
+
+    def test_tunnel_claim_with_non_loopback_host_is_refused(self) -> None:
+        # The flag and the host reach `_get_client` independently; a caller pairing the
+        # tunnel claim with a host that didn't come from a tunnel must fail loudly, before
+        # any connection is attempted with the proxy-bypassing manager.
+        with patch.object(ch_module, "get_client") as mock_get_client:
+            with pytest.raises(Exception, match="non-loopback"):
+                _get_client(
+                    host="ch.example.com",
+                    port=8443,
+                    database="default",
+                    user="default",
+                    password=None,
+                    secure=True,
+                    verify=True,
+                    bypass_env_proxy="tunnel_loopback",
+                )
+        mock_get_client.assert_not_called()
+
+
+class TestDirectQueryClientBypassEnvProxy:
+    """`direct_query_client` backs the HogQL direct-SQL adapter, and unlike every other
+    `_get_client` call site on `ClickHouseSource` it once omitted `bypass_env_proxy` entirely —
+    an allowlisted internal team's direct query silently routed through the egress proxy and
+    failed to reach the PostHog-internal host it was pointed at.
+
+    A tunneled connection must bypass for a different reason: the address is our own loopback
+    bind, which the proxy blocks, so a customer team with a tunnel never reached its ClickHouse.
+    """
+
+    @pytest.mark.parametrize(
+        "region,team_id,tunneled,expected_bypass",
+        [
+            ("US", 2, False, "internal_team"),
+            ("US", 12345, False, None),
+            ("US", 12345, True, "tunnel_loopback"),
+        ],
+    )
+    def test_forwards_bypass_env_proxy_from_team_allowlist(self, region, team_id, tunneled, expected_bypass):
+        from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse import source as source_module
+        from products.warehouse_sources.backend.temporal.data_imports.sources.common import mixins
+
+        source = ClickHouseSource()
+        config = MagicMock()
+        config.host = "db.example.com"
+        config.database = "default"
+        config.user = "default"
+        config.password = None
+        config.secure = True
+        config.verify = True
+        config.ssh_tunnel = MagicMock(enabled=True) if tunneled else None
+
+        with patch.object(mixins, "get_instance_region", return_value=region):
+            with patch.object(source, "with_ssh_tunnel") as mock_with_ssh_tunnel:
+                mock_with_ssh_tunnel.return_value.__enter__.return_value = ("host", 8443)
+                with patch.object(source_module, "_get_client") as mock_get_client:
+                    with source.direct_query_client(config, team_id, query_timeout=60):
+                        pass
+
+        assert mock_get_client.call_args.kwargs["bypass_env_proxy"] == expected_bypass
+        # The configured host always rides along; `_get_client` only applies it to TLS when
+        # the bypass reason is the tunnel.
+        assert mock_get_client.call_args.kwargs["server_hostname"] == "db.example.com"

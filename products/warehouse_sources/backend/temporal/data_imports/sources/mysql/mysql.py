@@ -1,0 +1,2277 @@
+"""MySQL driver for PostHog's data-warehouse import pipeline.
+
+Everything MySQL-specific — connection lifecycle (with SSH tunnel),
+schema listing, per-cursor metadata for the streaming sync, the dlt
+pipeline build, type conversions, the `FORCE INDEX` bad-plan fallback —
+lives on `MySQLImplementation`. The source-class `MySQLSource` is a
+thin PostHog-layer wrapper that just holds an instance and validates
+credentials.
+
+Module-level free helpers (`_build_query`, `_sanitize_identifier`,
+`_safe_convert_date`, `_safe_convert_datetime`, `_is_bad_plan_error`)
+are pure functions used by `MySQLImplementation` and exercised directly
+by unit tests. They take no MySQL-driver state and are fine as
+module-scope primitives.
+"""
+
+from __future__ import annotations
+
+import time
+import socket
+import datetime
+import collections
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import ExitStack, contextmanager
+from typing import Any, TypeVar
+
+import psycopg
+import pyarrow as pa
+import pymysql
+import structlog
+import pymysql.converters
+from pymysql.charset import charset_by_id
+from pymysql.connections import MySQLResult
+from pymysql.constants import CLIENT, CR, FIELD_TYPE
+from pymysql.cursors import Cursor, SSCursor
+from pymysql.protocol import MysqlPacket
+from structlog.types import FilteringBoundLogger
+
+# Module-level error-capture seam. This module's best-effort probes (get_rows_to_sync,
+# explain_query, fetch_average_row_size) deliberately do NOT report handled failures here;
+# their guard tests patch `mysql.capture_exception` to enforce that.
+from posthog.dataclasses import frozen
+from posthog.exceptions_capture import capture_exception  # noqa: F401
+from posthog.psycopg_helpers import (
+    is_resolvable_hostname,
+    prefer_routable_addresses,
+    resolve_psycopg_hostaddr_with_timeout,
+)
+from posthog.security.oob_domains import OOB_DOMAIN_REFUSAL
+
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.arrow_utils import (
+    DEFAULT_NUMERIC_PRECISION,
+    DEFAULT_NUMERIC_SCALE,
+    BinaryColumnReporter,
+    build_pyarrow_decimal_type,
+    restrict_schema_to_columns,
+    table_from_iterator,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.mixins import (
+    DATABASE_HOST_NOT_ALLOWED_ERROR,
+    DATABASE_HOST_NOT_ALLOWED_GUIDANCE,
+    HostNotAllowedError,
+    check_oob_domain,
+    check_resolved_addresses,
+    host_lookup_is_skipped,
+    open_ssh_tunnel,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql import (
+    BacktickIdentifierQuoter,
+    Column,
+    InvalidIdentifierError,
+    SafeSQL,
+    SelectQueryBuilder,
+    Table,
+    TableProjection,
+    ValidatedRowFilter,
+    resolve_table_projection,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.batching import fetch_row_batches
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.implementation import (
+    SourceMetadata,
+    SQLSourceImplementation,
+    TableStats,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.incremental import (
+    IncrementalFieldFilter,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.keyset import (
+    KeysetPage,
+    KeysetResumeState,
+    iter_keyset_pages,
+    keyset_last_key,
+    keyset_state,
+    resolve_keyset_eligibility,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.location import (
+    normalize_namespace,
+    resolve_source_location,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.tls import (
+    system_ca_bundle,
+    tls_files,
+    tls_options,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.mysql import MySQLSourceConfig
+from products.warehouse_sources.backend.types import IncrementalFieldType, PartitionSettings
+
+__all__ = [
+    "MySQLColumn",
+    "MySQLImplementation",
+    "STATEMENT_TIMEOUT_SECONDS",
+    "filter_mysql_incremental_fields",
+    "get_connection_metadata",
+]
+
+# The source type the managed-warehouse host exemption is keyed on. No managed warehouse
+# serves MySQL, so the exemption grants nothing here; naming it keeps the call site
+# explicit rather than relying on the missing port to deny.
+_HOST_CHECK_SOURCE_TYPE = "mysql"
+
+_IDENTIFIER_QUOTER = BacktickIdentifierQuoter()
+_QUERY_BUILDER = SelectQueryBuilder(quoter=_IDENTIFIER_QUOTER)
+
+# Applied to the row-streaming connection so large result preparation
+# (e.g. filesort on a multi-GB table) doesn't hit MySQL's default 60s
+# net_write_timeout before the first rows are ready. Used for both the
+# client-side PyMySQL read_timeout and the server-side SET SESSION
+# net_write_timeout / net_read_timeout — PyMySQL and MySQL both take seconds.
+STATEMENT_TIMEOUT_SECONDS = 600  # 10 mins
+
+# Client-side PyMySQL read_timeout for a connection that reads metadata: schema discovery and the
+# setup work before the first row. Without it a server that stops answering holds the caller for
+# as long as the socket stays open. Schema discovery must also end before the 10 minute
+# `start_to_close_timeout` of its Temporal activity.
+METADATA_READ_TIMEOUT_SECONDS = 300
+
+# PyMySQL applies `read_timeout` to each socket read, not to a statement. It is thus a limit on one
+# silent wait: a read that keeps receiving rows never reaches it, and a server that goes silent
+# ends with error 2013 after this long. The limits above are sized for a slow query. The ones
+# below cover the two waits that those limits made too long.
+#
+# The TCP connect and the DNS lookup.
+CONNECT_TIMEOUT_SECONDS = 10
+# The server greeting and the login. Without it they wait for the read timeout of the caller, so a
+# server that accepts the socket and then says nothing costs up to 10 minutes for each of the
+# connect attempts.
+HANDSHAKE_READ_TIMEOUT_SECONDS = 30
+# One send of a statement. PyMySQL has no default, and a statement is small.
+WRITE_TIMEOUT_SECONDS = 60
+
+# TCP options that end a connection whose peer went away: a dead peer on an idle socket in about
+# 80 seconds, and data that the peer never acknowledges in 60. Both stay quiet while the peer
+# answers at the TCP level, so neither ends a statement that the server still works on. Each is
+# set only where the platform has it.
+_TCP_LIVENESS_OPTIONS: tuple[tuple[str, int], ...] = (
+    ("TCP_KEEPIDLE", 30),
+    ("TCP_KEEPINTVL", 10),
+    ("TCP_KEEPCNT", 5),
+    ("TCP_USER_TIMEOUT", 60_000),
+)
+
+# pymysql error code for "Lost connection to MySQL server during query" — the
+# symptom we see when the optimizer picks a bad plan (full scan + filesort) and
+# the filesort preparation exceeds a middlebox / server-side query timeout
+# before any rows stream back.
+_LOST_CONNECTION_DURING_QUERY_CODE = 2013
+
+# pymysql error code for "Out of sort memory, consider increasing server sort
+# buffer size" — the same bad plan (full scan + filesort over the incremental
+# field) seen from the other side: the filesort completes its planning but the
+# server's `sort_buffer_size` is too small to hold the sort, so MySQL aborts
+# before streaming. Forcing the incremental-field index lets MySQL read rows in
+# index order and skip the filesort entirely, so the same FORCE INDEX fallback
+# resolves it.
+_OUT_OF_SORT_MEMORY_CODE = 1038
+
+# pymysql error code for "Query execution was interrupted, maximum statement
+# execution time exceeded" — the same bad plan (full scan + filesort over the
+# incremental field) seen from a third side: the server's own `max_execution_time`
+# cap kills the query outright before the filesort can finish. Forcing the
+# incremental-field index lets MySQL read rows in index order and skip the
+# filesort entirely, so the same FORCE INDEX fallback resolves it.
+_QUERY_EXECUTION_TIME_EXCEEDED_CODE = 3024
+
+# pymysql error code for MariaDB's "Query execution was interrupted (max_statement_time
+# exceeded)" — MariaDB's own `max_statement_time` session/global cap, the same bad plan
+# (full scan + filesort over the incremental field) seen from a fourth side. It's MariaDB's
+# equivalent of MySQL's `max_execution_time` (3024) above, so the same FORCE INDEX fallback
+# resolves it.
+_MAX_STATEMENT_TIME_EXCEEDED_CODE = 1969
+
+# Raised in place of the raw pymysql 2013 when a lost-connection bad plan can't be dodged by the
+# FORCE INDEX fallback because the incremental field has no usable index. The un-indexed full-table
+# sort re-times-out on every run, so it's deterministic — distinct from a genuine transient mid-query
+# drop, which the raw 2013 stays retryable for. `MySQLSource.get_non_retryable_errors` matches this
+# marker to pause the schema with an actionable message.
+UNAVOIDABLE_FILESORT_LOST_CONNECTION_ERROR = "MySQL lost the connection during an unavoidable full-table sort"
+
+
+class MySQLUnavoidableFilesortError(Exception):
+    """A lost-connection bad plan (error 2013) the FORCE INDEX fallback can't avoid — the incremental
+    field has no usable index, so every run repeats the same doomed full-table sort."""
+
+    def __init__(self, message: str = UNAVOIDABLE_FILESORT_LOST_CONNECTION_ERROR) -> None:
+        super().__init__(message)
+
+
+# pymysql error code for "Can't connect to MySQL server on '...'" — raised at
+# connect time when the socket connect can't be established. The parenthesised
+# suffix carries the underlying cause (a timeout vs. a refused connection vs. a
+# failed DNS lookup), which is how we tell a transient timeout apart from a hard
+# config error.
+_CANT_CONNECT_CODE = 2003
+
+_SYSTEM_SCHEMAS = (
+    "information_schema",
+    "mysql",
+    "performance_schema",
+    "sys",
+    # Vitess's internal sidecar database (vreplication/schema-tracking metadata). It shows
+    # up in `information_schema` like any other schema, but VTGate doesn't expose it as a
+    # routable keyspace, so a sync-all-databases discovery that picks it up fails every
+    # streaming read against it with "unknown database '_vt' in vschema" (VT05003).
+    "_vt",
+)
+
+
+def _configured_schema(config: MySQLSourceConfig) -> str | None:
+    return normalize_namespace(config.schema)
+
+
+def _display_table_name(source_schema: str, table_name: str, *, configured_schema: str | None) -> str:
+    if configured_schema is not None:
+        return table_name
+    return f"{source_schema}.{table_name}"
+
+
+def _source_table_names(display_names: list[str], *, configured_schema: str | None) -> tuple[str, ...]:
+    names = set()
+    for display_name in display_names:
+        if configured_schema is None and "." in display_name:
+            _, _, table_name = display_name.partition(".")
+            names.add(table_name)
+        else:
+            names.add(display_name)
+    return tuple(sorted(names))
+
+
+def _matches_requested_name(
+    requested_names: set[str],
+    *,
+    source_schema: str,
+    table_name: str,
+    configured_schema: str | None,
+) -> bool:
+    display_name = _display_table_name(source_schema, table_name, configured_schema=configured_schema)
+    return (
+        display_name in requested_names
+        or table_name in requested_names
+        or f"{source_schema}.{table_name}" in requested_names
+    )
+
+
+def _source_location_from_display_name(display_name: str, *, configured_schema: str | None) -> tuple[str | None, str]:
+    if configured_schema is not None:
+        return configured_schema, display_name
+    source_schema, separator, table_name = display_name.partition(".")
+    if separator:
+        return normalize_namespace(source_schema), table_name
+    return None, display_name
+
+
+def _safe_convert_date(obj: Any) -> datetime.date | None:
+    """Convert MySQL date, returning None for invalid dates like '0000-00-00'."""
+    if isinstance(obj, (bytes, bytearray)):
+        obj = obj.decode("utf-8")
+    try:
+        parts = obj.split("-", 2)
+        return datetime.date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
+def _safe_convert_datetime(obj: Any) -> datetime.datetime | None:
+    """Convert MySQL datetime/timestamp, returning None for invalid values like '0000-00-00 00:00:00'."""
+    if isinstance(obj, (bytes, bytearray)):
+        obj = obj.decode("utf-8")
+    try:
+        date_part, time_part = obj.split(" ", 1)
+        date_values = [int(x) for x in date_part.split("-", 2)]
+        time_parts = time_part.split(":", 2)
+        hours = int(time_parts[0])
+        minutes = int(time_parts[1])
+        # Handle optional microseconds
+        sec_parts = time_parts[2].split(".", 1)
+        seconds = int(sec_parts[0])
+        microseconds = int(sec_parts[1].ljust(6, "0")) if len(sec_parts) > 1 else 0
+        return datetime.datetime(date_values[0], date_values[1], date_values[2], hours, minutes, seconds, microseconds)
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
+# Custom conversions that return None for MySQL zero dates instead of raw strings
+_MYSQL_SAFE_CONVERSIONS: dict[type[object] | int, Any] = {
+    **pymysql.converters.conversions,
+    FIELD_TYPE.DATE: _safe_convert_date,
+    FIELD_TYPE.DATETIME: _safe_convert_datetime,
+    FIELD_TYPE.TIMESTAMP: _safe_convert_datetime,
+}
+
+
+def filter_mysql_incremental_fields(
+    columns: list[tuple[str, str, bool]],
+) -> list[tuple[str, IncrementalFieldType, bool]]:
+    results: list[tuple[str, IncrementalFieldType, bool]] = []
+    for column_name, type, nullable in columns:
+        type = type.lower()
+        if type.startswith("timestamp"):
+            results.append((column_name, IncrementalFieldType.Timestamp, nullable))
+        elif type == "date":
+            results.append((column_name, IncrementalFieldType.Date, nullable))
+        elif type == "datetime":
+            results.append((column_name, IncrementalFieldType.DateTime, nullable))
+        elif type == "tinyint" or type == "smallint" or type == "mediumint" or type == "int" or type == "bigint":
+            results.append((column_name, IncrementalFieldType.Integer, nullable))
+
+    return results
+
+
+def _sanitize_identifier(identifier: str) -> str:
+    """Back-compat shim for callers that still expect a plain `ValueError`.
+
+    New code should use `BacktickIdentifierQuoter` directly — same allowlist,
+    same quoting, exposed through the shared `IdentifierQuoter` interface.
+    """
+    try:
+        return _IDENTIFIER_QUOTER.quote(identifier)
+    except InvalidIdentifierError as e:
+        # Preserve the old message shape so semgrep / log-matching rules that
+        # key on the old text keep working.
+        raise ValueError(f"Invalid SQL identifier: {identifier}") from e
+
+
+def _build_query(
+    schema: str,
+    table_name: str,
+    should_use_incremental_field: bool,
+    incremental_field: str | None,
+    incremental_field_type: IncrementalFieldType | None,
+    db_incremental_field_last_value: Any | None,
+    force_index_name: str | None = None,
+    enabled_columns: list[str] | None = None,
+    primary_keys: list[str] | None = None,
+    row_filters: list[ValidatedRowFilter] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    hint: str | None = None
+    if force_index_name is not None:
+        # Sanitize before building the hint — bad names must fail fast.
+        hint = f"FORCE INDEX ({_IDENTIFIER_QUOTER.quote(force_index_name)})"
+
+    if not should_use_incremental_field:
+        result = _QUERY_BUILDER.select_all(
+            schema=schema,
+            table_name=table_name,
+            extra_table_hint=hint,
+            enabled_columns=enabled_columns,
+            primary_keys=primary_keys,
+            row_filters=row_filters,
+        )
+        params = result.params if isinstance(result.params, dict) else {}
+        return result.sql, params
+
+    if incremental_field is None or incremental_field_type is None:
+        raise ValueError("incremental_field and incremental_field_type can't be None")
+
+    result = _QUERY_BUILDER.select_all(
+        schema=schema,
+        table_name=table_name,
+        incremental_field=incremental_field,
+        incremental_field_type=incremental_field_type,
+        incremental_last_value=db_incremental_field_last_value,
+        extra_table_hint=hint,
+        enabled_columns=enabled_columns,
+        primary_keys=primary_keys,
+        row_filters=row_filters,
+    )
+    params = result.params if isinstance(result.params, dict) else {}
+    return result.sql, params
+
+
+def _is_bad_plan_error(e: pymysql.err.OperationalError) -> bool:
+    """Return True if the error is a symptom of MySQL filesorting the incremental
+    `ORDER BY` instead of using an index — recoverable via the FORCE INDEX fallback.
+
+    Matches four codes, all signalling the optimizer picked a full scan + filesort
+    over the incremental field:
+
+    - `2013` (lost connection during query): the filesort preparation outran a
+      middlebox / server-side query timeout before any rows streamed back.
+    - `1038` (out of sort memory): the filesort itself overran the server's
+      `sort_buffer_size`.
+    - `3024` (query execution was interrupted): the server's own `max_execution_time`
+      cap killed the query before the filesort could finish.
+    - `1969` (query execution was interrupted): MariaDB's own `max_statement_time`
+      cap killed the query before the filesort could finish — MariaDB's equivalent
+      of 3024.
+
+    Forcing the incremental-field index makes MySQL read rows in index order and
+    skip the filesort, resolving all four. Other `OperationalError`s (access denied,
+    table missing, etc.) should propagate untouched.
+    """
+    code = e.args[0] if e.args else None
+    return code in (
+        _LOST_CONNECTION_DURING_QUERY_CODE,
+        _OUT_OF_SORT_MEMORY_CODE,
+        _QUERY_EXECUTION_TIME_EXCEEDED_CODE,
+        _MAX_STATEMENT_TIME_EXCEEDED_CODE,
+    )
+
+
+# Number of times `connect` will open a fresh pymysql connection before giving up. Matches the
+# Postgres source's `_retry_on_connection_dropped` budget so the in-process window spans the few
+# seconds a real failover / idle cull / tunnel hiccup takes to recover, rather than exhausting in
+# ~3s and surfacing the drop as error-tracking noise.
+_MAX_CONNECT_ATTEMPTS = 5
+
+# pymysql error code 2003 (CR_CONN_HOST_ERROR): the catch-all "Can't connect to MySQL server
+# on '<host>'" raised for any failure to establish the connection. Almost always a deterministic
+# config problem (wrong host/port, closed firewall) and so non-retryable — the one transient
+# exception is an SSL handshake the peer aborted with an unexpected EOF (see
+# `_is_transient_connect_drop`).
+_CANT_CONNECT_TO_SERVER_CODE = 2003
+
+# OpenSSL's signature for "the peer closed the connection before the TLS handshake finished".
+# pymysql wraps it as the 2003 connect failure above. Unlike WRONG_VERSION_NUMBER (a server that
+# doesn't speak TLS at all — a deterministic config error, already non-retryable), an unexpected
+# EOF mid-handshake is a transient drop: an overloaded server, a proxy/load-balancer idle cull, a
+# failover, or a momentary network blip, all of which a fresh attempt recovers from. Mirrors the
+# Postgres source, which retries its own "SSL connection has been closed unexpectedly" on connect.
+_SSL_UNEXPECTED_EOF_TOKEN = "[SSL: UNEXPECTED_EOF_WHILE_READING]"
+
+# Newer OpenSSL/Python raise `ssl.SSLZeroReturnError` — "TLS/SSL connection has been closed (EOF)" —
+# for the same peer-closed-the-TLS-connection condition the token above covers, just a different
+# rendering (a clean SSL_ERROR_ZERO_RETURN close rather than an abrupt read EOF). pymysql wraps it as
+# the same 2003 connect failure, so it's equally transient and must be retried too. Match the stable
+# phrase, not the volatile `_ssl.c:<line>` suffix that shifts across Python builds.
+_SSL_CONNECTION_CLOSED_EOF_TOKEN = "TLS/SSL connection has been closed (EOF)"
+
+# CPython's ssl module raises this when the peer closes the raw socket (a TCP RST or FIN) after
+# sending some bytes that never got consumed by the still-in-progress TLS handshake — a third
+# rendering of the same peer-closed-mid-handshake condition as the two tokens above (an overloaded
+# server, a proxy/load-balancer idle cull, a failover, or a momentary network blip). pymysql wraps
+# it as the same 2003 connect failure, so it's equally transient and must be retried too.
+_SSL_CLOSED_WITH_BUFFERED_DATA_TOKEN = "Closed before TLS handshake with data in recv buffer"
+
+# paramiko raises a bare, message-less EOFError from `start_client` when the SSH gateway accepts
+# the TCP connection but closes it during the SSH handshake — a non-SSH service on the port, a
+# bastion refusing PostHog's IPs, or a proxy that resets the stream. sshtunnel doesn't wrap it
+# (it only translates *auth* failures into BaseSSHTunnelForwarderError), so it escapes with an
+# empty `str()`, matching no non-retryable rule and retrying forever. `connect` translates it into
+# this stable, classifiable message (see `MySQLSource.get_non_retryable_errors`) — same
+# gateway-configuration class as a wrapped "Could not establish session to SSH gateway" failure.
+# Distinct from the `[SSL: UNEXPECTED_EOF_WHILE_READING]` token above, which is a transient drop in
+# the *database* TLS handshake (deliberately kept retryable).
+_SSH_HANDSHAKE_EOF_ERROR = "SSH gateway closed the connection during the SSH handshake"
+
+
+def _is_transient_connect_drop(e: BaseException) -> bool:
+    """Return True if the connection was dropped mid-handshake — a transient blip.
+
+    Two shapes share this transient class, both surfaced by pymysql as an
+    `OperationalError` at connect time:
+
+    - `2013` (lost connection): a socket close while reading the server greeting —
+      an overloaded server, a proxy idle cull, a failover, a momentary network blip.
+      A fresh attempt recovers. The one 2013 that is *not* transient is the SSL-version
+      mismatch (a deterministic config error, already non-retryable): it arrives with an
+      `[SSL: ...` suffix, so exclude that and let it surface.
+    - `2003` (can't connect) carrying an SSL peer-close cause — `[SSL:
+      UNEXPECTED_EOF_WHILE_READING]` (an abrupt read EOF), "TLS/SSL connection has been
+      closed (EOF)" (`SSLZeroReturnError`, a clean close), or "Closed before TLS handshake
+      with data in recv buffer" (a raw socket close mid-handshake): the peer dropped the
+      TLS connection mid-handshake — the SSL-flavoured sibling of the 2013 drop, equally
+      transient. The generic 2003 (wrong host/port, firewall) stays non-retryable, so
+      match only the SSL peer-close tokens.
+    """
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    args_text = " ".join(str(arg) for arg in e.args)
+    if code == _LOST_CONNECTION_DURING_QUERY_CODE:
+        return "[SSL:" not in args_text
+    if code == _CANT_CONNECT_TO_SERVER_CODE:
+        return (
+            _SSL_UNEXPECTED_EOF_TOKEN in args_text
+            or _SSL_CONNECTION_CLOSED_EOF_TOKEN in args_text
+            or _SSL_CLOSED_WITH_BUFFERED_DATA_TOKEN in args_text
+        )
+    return False
+
+
+# pymysql error code 2006 (CR_SERVER_GONE_ERROR): the server closed the socket while pymysql was
+# writing to it — `_write_bytes` wraps the underlying `ConnectionResetError` / `BrokenPipeError`
+# as "MySQL server has gone away (<os error>)". Mid-handshake (sending the auth packet) this is the
+# write-side sibling of the 2013 read-side drop above: an overloaded server, a proxy/load-balancer
+# idle cull, or a failover reset the connection, all of which a fresh attempt recovers from. Unlike
+# 2013 there's no deterministic-config subcase to exclude, so match the bare code.
+_SERVER_GONE_AWAY_CODE = 2006
+
+
+def _is_transient_connect_gone_away(e: BaseException) -> bool:
+    """Return True if the server went away while establishing the connection — a transient blip."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    return code == _SERVER_GONE_AWAY_CODE
+
+
+def _is_transient_connect_timeout(e: BaseException) -> bool:
+    """Return True if the initial connect timed out — a transient blip.
+
+    A connect that outruns `connect_timeout` surfaces as pymysql 2003
+    ("Can't connect to MySQL server on '...' (timed out)") wrapping the socket
+    `TimeoutError`. Unlike the other 2003 causes — a refused connection or a
+    failed DNS lookup, both deterministic host/port misconfig that stay
+    non-retryable via the "Can't connect to MySQL server on" classifier — a
+    timeout usually means the server was momentarily slow or unreachable (an
+    overloaded server, a cold PlanetScale endpoint, a brief network blip), so a
+    fresh attempt recovers. Match only the "timed out" payload so the persistent
+    failures still surface.
+    """
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    if code != _CANT_CONNECT_CODE:
+        return False
+    return "timed out" in " ".join(str(arg) for arg in e.args)
+
+
+# glibc's getaddrinfo returns EAI_AGAIN — "Temporary failure in name resolution" — when the DNS
+# resolver is momentarily unavailable (the nameserver couldn't be reached, returned SERVFAIL, or a
+# resolver-side blip prevented the lookup). pymysql wraps it as the 2003 connect failure, so without
+# this it falls through to the non-retryable "Can't connect to MySQL server on" classifier and the
+# sync gives up on a recoverable blip. EAI_AGAIN is a "try again later" condition — distinct from
+# EAI_NONAME ("Name or service not known"), where the host genuinely doesn't resolve and staying
+# non-retryable is correct. Match the stable, locale-independent gai_strerror text rather than the
+# platform-specific errno number.
+_DNS_TEMPORARY_FAILURE_TOKEN = "Temporary failure in name resolution"
+
+
+def _is_transient_connect_dns_failure(e: BaseException) -> bool:
+    """Return True if connect failed on a transient DNS-resolver blip — recoverable on retry."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    if code != _CANT_CONNECT_CODE:
+        return False
+    return _DNS_TEMPORARY_FAILURE_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+# ECONNRESET at connect time: the peer sent a RST while the connection was being established, so
+# pymysql wraps the underlying `ConnectionResetError` as the 2003 "Can't connect to MySQL server
+# on '<host>' ([Errno 104] Connection reset by peer)" failure. Unlike a refused connection
+# (ECONNREFUSED, "Connection refused") or a failed DNS lookup — deterministic host/port misconfig
+# that stay non-retryable via the "Can't connect to MySQL server on" classifier — a reset means
+# something *was* reachable (an overloaded server, or a TCP proxy/load balancer in front of the DB
+# that accepts then resets while its backend is cycling or briefly down) and dropped us mid-connect,
+# so a fresh attempt usually recovers. Match the stable strerror phrase, not the volatile host or
+# the platform-specific [Errno NNN] prefix.
+_CONNECTION_RESET_TOKEN = "Connection reset by peer"
+
+
+def _is_transient_connect_reset(e: BaseException) -> bool:
+    """Return True if the peer reset the connection during connect — a transient blip."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    if code != _CANT_CONNECT_CODE:
+        return False
+    return _CONNECTION_RESET_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+# EPIPE at connect time: pymysql wraps a write to an already-closed socket — e.g. sending the
+# auth packet or the TLS handshake — as the 2003 "Can't connect to MySQL server on '<host>'
+# ([Errno 32] Broken pipe)" failure. It is the write-side sibling of the `Connection reset by
+# peer` case above (which fires on the read side): the peer, often a TCP proxy or load balancer
+# in front of the DB, accepted the connection then closed it while pymysql was still writing —
+# an overloaded server, a proxy idle cull, or a backend cycling. A fresh attempt usually reaches
+# a healthy backend. Match the stable strerror phrase, not the volatile host.
+_BROKEN_PIPE_TOKEN = "Broken pipe"
+
+
+def _is_transient_connect_broken_pipe(e: BaseException) -> bool:
+    """Return True if writing to the peer failed with a broken pipe during connect — a transient blip."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    if code != _CANT_CONNECT_CODE:
+        return False
+    return _BROKEN_PIPE_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+# pymysql raises this `InternalError` from `_read_packet` when an incoming packet's
+# sequence number doesn't match the expected one (it `_force_close()`s the socket first).
+_PACKET_SEQUENCE_ERROR_PHRASE = "Packet sequence number wrong"
+
+
+def _is_transient_packet_sequence_error(e: BaseException) -> bool:
+    """Return True if the handshake stream desynced mid-exchange — a transient blip.
+
+    A packet-sequence mismatch during connect means the server's handshake reply
+    arrived out of order or truncated (an overloaded server, a proxy/load balancer
+    interfering, a momentary network blip) and pymysql force-closed the dead socket.
+    It's the same transient class as the 2013 drop above and a fresh attempt recovers,
+    but it surfaces as `InternalError`, not `OperationalError`, so it needs its own
+    predicate. Match the stable phrase, not the volatile got/expected packet numbers.
+    """
+    if not isinstance(e, pymysql.err.InternalError):
+        return False
+    return any(_PACKET_SEQUENCE_ERROR_PHRASE in str(arg) for arg in e.args)
+
+
+# Vitess/PlanetScale vtgate surfaces a backend tablet it can't reach as pymysql
+# OperationalError(1815, 'internal connection error: dial tcp <addr>: connect: connection timed
+# out, after N attempts, reqid=...'): the vtgate handshake succeeds but dialing the tablet behind
+# it times out — a failover, a restart, or a momentary network blip that a fresh attempt recovers
+# from. 1815 is MySQL's generic ER_INTERNAL_ERROR, so key on the Go-network `dial tcp` +
+# `connection timed out` signature (no plain MySQL error carries the `dial tcp` token) rather than
+# the bare code; the volatile tablet address, attempt count, and reqid stay untouched. Like the
+# `code = Unavailable` tablet-unavailable case (see `_is_transient_tablet_unavailable`), this can
+# land either at connect time or on the first query against a freshly opened connection (e.g.
+# `get_table_metadata`'s information_schema lookup), so both `_connect_with_transient_retry` and
+# `_retry_on_transient_tablet_unavailable` check it.
+_VITESS_DIAL_TOKEN = "dial tcp"
+_VITESS_DIAL_TIMEOUT_TOKEN = "connection timed out"
+
+
+def _is_transient_vitess_dial_timeout(e: BaseException) -> bool:
+    """Return True if a Vitess vtgate timed out dialing its backend tablet — a transient blip."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    args_text = " ".join(str(arg) for arg in e.args)
+    return _VITESS_DIAL_TOKEN in args_text and _VITESS_DIAL_TIMEOUT_TOKEN in args_text
+
+
+# Vitess/PlanetScale vtgate surfaces this 1105 error (gRPC `Unavailable`, the same status as
+# `_is_transient_tablet_unavailable`'s `code = Unavailable` wrapping) when its tablet discovery
+# has zero serving tablets for the target keyspace/shard/tablet-type at the moment the connection
+# is opened — a failover, a restart, or a rollout that briefly leaves no tablet registered as
+# healthy. A fresh attempt after a short backoff usually lands once a tablet comes back online.
+# Match the stable `vtgate connection error: no endpoints` phrase, excluding the volatile attempt
+# count and reqid that follow it.
+_VITESS_NO_ENDPOINTS_TOKEN = "vtgate connection error: no endpoints"
+
+
+def _is_transient_vitess_no_endpoints(e: BaseException) -> bool:
+    """Return True if a Vitess vtgate found no serving tablet endpoints — a transient blip."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    return _VITESS_NO_ENDPOINTS_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+# MySQL/MariaDB error 1040 (ER_CON_COUNT_ERROR): the server refuses a *new* connection because
+# `max_connections` is already reached. A transient capacity condition on the customer's database,
+# not a misconfiguration — a slot frees the moment another connection closes — so a fresh attempt
+# after a short backoff usually succeeds. Mirrors the Postgres source's "sorry, too many clients
+# already" / "remaining connection slots are reserved" handling, which is retried the same way and
+# likewise kept out of `get_non_retryable_errors` (see `MySQLSource.get_retryable_errors`).
+_TOO_MANY_CONNECTIONS_CODE = 1040
+
+
+def _is_transient_too_many_connections(e: BaseException) -> bool:
+    """Return True if the server refused a new connection because it's at `max_connections`."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    return code == _TOO_MANY_CONNECTIONS_CODE
+
+
+# MySQL/MariaDB error 1135 (ER_CANT_CREATE_THREAD): the server accepted the TCP connection but the
+# OS refused to spawn the thread that would service it (`errno 11`, EAGAIN — "Resource temporarily
+# unavailable"). Like `_TOO_MANY_CONNECTIONS_CODE` above, this is a transient capacity condition on
+# the customer's database host (it's hit its process/thread ulimit, not out of memory), not a
+# misconfiguration — it clears as other connections close and free up OS threads — so a fresh
+# attempt after a short backoff usually succeeds. Kept out of `get_non_retryable_errors` (see
+# `MySQLSource.get_retryable_errors`).
+_CANT_CREATE_THREAD_CODE = 1135
+
+
+def _is_transient_cant_create_thread(e: BaseException) -> bool:
+    """Return True if the server couldn't spawn an OS thread to service the new connection."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    return code == _CANT_CREATE_THREAD_CODE
+
+
+def _pinned_addresses(host: str, port: int, connect_timeout: int, team_id: int | None) -> tuple[str, ...]:
+    """Resolve `host` once, validate the answer, and return the addresses the connection may dial.
+
+    pymysql resolves the hostname itself inside `Connection.connect`, and the tunnel layer only
+    checked the host without pinning, so that second lookup is the one that picks the socket
+    target. A record can answer public on the check and private on the connect. Resolving here and
+    dialing exactly this answer leaves it nothing to slip past.
+
+    Empty means there is nothing to pin and pymysql connects by name: an IP literal (the SSH
+    tunnel yields its loopback bind address this way), or an exempt host whose lookup failed. An
+    exempt host that resolved dials what it resolved. A refused host raises the typed rejection
+    the non-retryable classifiers match. The lookup is bounded by `connect_timeout`; a deadline
+    or a resolver "try again" answer raises the error pymysql raises for its own failed lookup,
+    so the transient-connect retry runs a fresh lookup on the next attempt.
+    """
+    if check_oob_domain(host, team_id) is not None:
+        raise HostNotAllowedError(f"{DATABASE_HOST_NOT_ALLOWED_ERROR}: {OOB_DOMAIN_REFUSAL}")
+
+    if host_lookup_is_skipped():
+        return ()
+
+    if not is_resolvable_hostname(host):
+        return ()
+
+    try:
+        addresses = (
+            resolve_psycopg_hostaddr_with_timeout(host, port, connect_timeout, raise_on_temporary_failure=True) or []
+        )
+    except psycopg.OperationalError as e:
+        # The bounded resolver reports a blip and a deadline as a psycopg error. pymysql's own
+        # wording for the same failures is what the transient-connect classifiers match.
+        reason = (
+            _DNS_TEMPORARY_FAILURE_TOKEN if isinstance(e.__cause__, socket.gaierror) else "timed out resolving host"
+        )
+        raise pymysql.err.OperationalError(
+            CR.CR_CONN_HOST_ERROR, f"Can't connect to MySQL server on {host!r} ({reason})"
+        ) from e
+    except UnicodeError:
+        addresses = []
+
+    resolution = check_resolved_addresses(host, addresses, team_id, port=port, source_type=_HOST_CHECK_SOURCE_TYPE)
+    if resolution.connect_host is None:
+        raise HostNotAllowedError(
+            f"{DATABASE_HOST_NOT_ALLOWED_ERROR}: {resolution.error or DATABASE_HOST_NOT_ALLOWED_GUIDANCE}"
+        )
+    return tuple(prefer_routable_addresses(list(resolution.addresses)))
+
+
+def _dial_pinned_address(host: str, addresses: tuple[str, ...], port: int, connect_timeout: int) -> socket.socket:
+    """Open the TCP socket for pymysql to one of `addresses`, trying them in order.
+
+    pymysql skips its own socket setup when it is handed a socket, so this mirrors it: the same
+    keepalive and no-delay options, and the timeout cleared after the connect because pymysql
+    applies its read and write timeouts per operation. A failure is raised as the same
+    `OperationalError(2003)` pymysql raises for its own connect, so the transient-connect
+    classifiers keep matching on the message.
+    """
+    last_error: OSError | None = None
+    for address in addresses:
+        try:
+            sock = socket.create_connection((address, port), connect_timeout)
+        except OSError as e:
+            last_error = e
+            continue
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.settimeout(None)
+        return sock
+    raise pymysql.err.OperationalError(
+        CR.CR_CONN_HOST_ERROR, f"Can't connect to MySQL server on {host!r} ({last_error})"
+    ) from last_error
+
+
+def _pinned_socket(host: str, port: int, connect_timeout: int, team_id: int | None) -> socket.socket | None:
+    """The socket pymysql connects over, or None when it may dial `host` by name."""
+    addresses = _pinned_addresses(host, port, connect_timeout, team_id)
+    if not addresses:
+        return None
+    return _dial_pinned_address(host, addresses, port, connect_timeout)
+
+
+def _reconnect_pinned(connection: pymysql.Connection, team_id: int | None) -> None:
+    """Reopen a dropped pymysql connection to a freshly validated address.
+
+    `Connection.connect()` with no socket resolves `connection.host` again and dials whatever
+    that lookup returns, which would reopen the gap the pinned first connect closed.
+    """
+    connection.connect(sock=_pinned_socket(connection.host, connection.port, connection.connect_timeout, team_id))
+
+
+# Numbers and temporals always arrive as ASCII text, so pymysql's ASCII decode is safe for them.
+_ASCII_FIELD_TYPES = frozenset(
+    {
+        FIELD_TYPE.DECIMAL,
+        FIELD_TYPE.TINY,
+        FIELD_TYPE.SHORT,
+        FIELD_TYPE.LONG,
+        FIELD_TYPE.FLOAT,
+        FIELD_TYPE.DOUBLE,
+        FIELD_TYPE.NULL,
+        FIELD_TYPE.TIMESTAMP,
+        FIELD_TYPE.LONGLONG,
+        FIELD_TYPE.INT24,
+        FIELD_TYPE.DATE,
+        FIELD_TYPE.TIME,
+        FIELD_TYPE.DATETIME,
+        FIELD_TYPE.YEAR,
+        FIELD_TYPE.NEWDATE,
+        FIELD_TYPE.NEWDECIMAL,
+    }
+)
+
+_BINARY_CHARSET_ID = 63
+
+
+def _field_encoding(charset_id: int, connection_encoding: str) -> str | None:
+    """Python codec for a column's values, or None to keep binary values as bytes."""
+    if charset_id == _BINARY_CHARSET_ID:
+        return None
+    try:
+        return charset_by_id(charset_id).encoding
+    except KeyError:
+        return connection_encoding
+
+
+class _FieldCharsetResult(MySQLResult):
+    """A result that decodes string-like columns by the charset the server reports for them.
+
+    pymysql decodes every column outside its own text types as ASCII. Some MySQL-compatible
+    servers send ENUM and SET values under their own type codes, and newer servers add types
+    pymysql predates, so one non-ASCII value in such a column fails the whole read.
+
+    The server does not check that stored bytes are valid in the charset it reports, so rows are
+    decoded with invalid bytes replaced by U+FFFD rather than failing every sync on one bad value.
+    """
+
+    def _get_descriptions(self) -> None:
+        super()._get_descriptions()  # type: ignore[misc]
+        connection_encoding = self.connection.encoding
+        for index, field in enumerate(self.fields):  # type: ignore[attr-defined]
+            encoding, converter = self.converters[index]  # type: ignore[attr-defined]
+            if encoding == "ascii" and field.type_code not in _ASCII_FIELD_TYPES:
+                self.converters[index] = (_field_encoding(field.charsetnr, connection_encoding), converter)  # type: ignore[attr-defined]
+
+    def _read_row_from_packet(self, packet: MysqlPacket) -> tuple[Any, ...]:
+        row: list[Any] = []
+        for encoding, converter in self.converters:  # type: ignore[attr-defined]
+            try:
+                data = packet.read_length_coded_string()
+            except IndexError:
+                break
+            if data is not None:
+                if encoding is not None:
+                    data = data.decode(encoding, errors="replace")
+                if converter is not None:
+                    data = converter(data)
+            row.append(data)
+        return tuple(row)
+
+
+def _set_tcp_liveness(sock: socket.socket) -> None:
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in _TCP_LIVENESS_OPTIONS:
+            option = getattr(socket, name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+    except OSError as e:
+        # Best-effort: the read timeout still limits each wait on a socket that refuses an option.
+        structlog.get_logger().debug("Could not set TCP liveness options on a MySQL socket", error=str(e))
+
+
+class _SourceConnection(pymysql.Connection):
+    """A pymysql connection that reads every result through `_FieldCharsetResult`."""
+
+    def connect(self, sock: socket.socket | None = None) -> None:
+        # pymysql keeps the read timeout in a private attribute and has no setter for it.
+        read_timeout: float | None = getattr(self, "_read_timeout", None)
+        handshake_read_timeout = (
+            HANDSHAKE_READ_TIMEOUT_SECONDS
+            if read_timeout is None
+            else min(read_timeout, HANDSHAKE_READ_TIMEOUT_SECONDS)
+        )
+        self._configured_read_timeout = read_timeout
+        setattr(self, "_read_timeout", handshake_read_timeout)  # noqa: B010
+        try:
+            super().connect(sock)
+        finally:
+            setattr(self, "_read_timeout", read_timeout)  # noqa: B010
+        _set_tcp_liveness(self._sock)  # type: ignore[attr-defined]
+
+    def _request_authentication(self) -> None:
+        super()._request_authentication()  # type: ignore[misc]
+        # pymysql runs SET NAMES, `init_command` and the autocommit setup right after the login,
+        # inside `connect`, so they get the configured limit and not the handshake limit.
+        if hasattr(self, "_configured_read_timeout"):
+            setattr(self, "_read_timeout", self._configured_read_timeout)  # noqa: B010
+
+    def _read_query_result(self, unbuffered: bool = False) -> int:
+        # Mirrors `pymysql.Connection._read_query_result` (1.1.1) with the result class swapped.
+        self._result = None
+        if unbuffered:
+            try:
+                result = _FieldCharsetResult(self)
+                result.init_unbuffered_query()
+            except BaseException:
+                result.unbuffered_active = False  # type: ignore[attr-defined]
+                result.connection = None
+                raise
+        else:
+            result = _FieldCharsetResult(self)
+            result.read()
+        self._result = result
+        if result.server_status is not None:
+            self.server_status = result.server_status
+        return result.affected_rows
+
+
+class _TLSRequiredConnection(_SourceConnection):
+    """A connection that refuses to authenticate when the server offers no TLS.
+
+    pymysql wraps the socket only when the server advertises the TLS capability, and that check
+    has no else branch, so a missing or stripped flag is served in plaintext and raises nothing.
+    Refusing here stops the credentials before they cross that connection, and covers every
+    reconnect as well: `Connection.connect()` runs this method each time it reopens the socket.
+    """
+
+    def _request_authentication(self) -> None:
+        # The stubs declare neither the handshake hook nor the capability flags it reads.
+        offers_tls = bool(self.server_capabilities & CLIENT.SSL)  # type: ignore[attr-defined]
+        if self.ssl and not offers_tls:
+            raise pymysql.err.OperationalError(
+                CR.CR_SSL_CONNECTION_ERROR,
+                "The MySQL server did not offer a TLS connection. Enable TLS on the server, or turn off "
+                "certificate verification and remove the certificate authority and client certificate "
+                "for this source.",
+            )
+        super()._request_authentication()
+
+
+def connection_timeouts(read_timeout: int) -> dict[str, int]:
+    """The pymysql timeout arguments of every source connection.
+
+    `read_timeout` has no default and no None on purpose: a connection without it waits on a silent
+    server for as long as the socket stays open.
+    """
+    return {
+        "connect_timeout": CONNECT_TIMEOUT_SECONDS,
+        "read_timeout": read_timeout,
+        "write_timeout": WRITE_TIMEOUT_SECONDS,
+    }
+
+
+def _new_connection(kwargs: dict[str, Any], **extra: Any) -> pymysql.Connection:
+    """Build the connection, refusing plaintext when this source verifies or presents a certificate."""
+    if kwargs.get("ssl_verify_cert") or kwargs.get("ssl_cert"):
+        return _TLSRequiredConnection(**kwargs, **extra)
+    return _SourceConnection(**kwargs, **extra)
+
+
+def _open_pymysql_connection(kwargs: dict[str, Any], team_id: int | None) -> pymysql.Connection:
+    sock = _pinned_socket(kwargs["host"], kwargs["port"], kwargs["connect_timeout"], team_id)
+    if sock is None:
+        return _new_connection(kwargs)
+
+    # `host` stays the hostname so pymysql sends it as the TLS server name, and PlanetScale, which
+    # turns on `ssl_verify_identity`, verifies the certificate against it. Python sends no SNI for
+    # an IP literal. Only the TCP connect goes to the pinned address.
+    connection = _new_connection(kwargs, defer_connect=True)
+    connection.connect(sock=sock)
+    return connection
+
+
+def _connect_with_transient_retry(kwargs: dict[str, Any], team_id: int | None) -> pymysql.Connection:
+    """Open a pymysql connection, retrying a transient drop or timeout on connect.
+
+    Mirrors the in-process connect retry the Postgres source uses: a momentary
+    drop or timeout while establishing the connection recovers on a fresh attempt,
+    so retry it here with a bounded backoff instead of failing schema discovery /
+    sync setup on the first blip and surfacing it as captured error-tracking noise.
+    The pinned lookup runs inside the loop, so a resolver blip retries with a
+    fresh answer rather than a stale address list.
+    """
+    attempt = 0
+    while True:
+        try:
+            return _open_pymysql_connection(kwargs, team_id)
+        except pymysql.err.DatabaseError as e:
+            attempt += 1
+            if attempt >= _MAX_CONNECT_ATTEMPTS or not (
+                _is_transient_connect_drop(e)
+                or _is_transient_connect_gone_away(e)
+                or _is_transient_connect_timeout(e)
+                or _is_transient_connect_dns_failure(e)
+                or _is_transient_connect_reset(e)
+                or _is_transient_connect_broken_pipe(e)
+                or _is_transient_packet_sequence_error(e)
+                or _is_transient_vitess_dial_timeout(e)
+                or _is_transient_vitess_no_endpoints(e)
+                or _is_transient_tiproxy_unavailable(e)
+                or _is_transient_no_available_tidb_instances(e)
+                or _is_transient_too_many_connections(e)
+                or _is_transient_cant_create_thread(e)
+            ):
+                raise
+            structlog.get_logger().warning(
+                "Transient MySQL connection error during connect; retrying",
+                attempt=attempt,
+                max_attempts=_MAX_CONNECT_ATTEMPTS,
+                exc_info=e,
+            )
+            time.sleep(min(2 * attempt, 30))
+
+
+_T = TypeVar("_T")
+
+# Vitess/PlanetScale vtgate wraps a momentarily-unreachable backend tablet (a failover,
+# restart, or rollout) as pymysql OperationalError(1105) carrying the gRPC status
+# `code = Unavailable`. 1105 is MySQL's generic ER_UNKNOWN_ERROR catch-all, so we key on
+# the stable `code = Unavailable` token rather than the bare code — the volatile
+# target/host/port and other 1105 payloads stay untouched.
+_GRPC_UNAVAILABLE_TOKEN = "code = Unavailable"
+
+
+def _is_transient_tablet_unavailable(e: BaseException) -> bool:
+    """Return True if a Vitess vtgate reported its backend tablet transiently unavailable.
+
+    gRPC `Unavailable` is the canonical retry-me status: the tablet is briefly
+    unreachable (failover, restart) even though the vtgate handshake succeeded, so the
+    first query after connect fails with a 1105 `code = Unavailable`. A fresh attempt
+    after a short backoff usually lands on a healthy tablet.
+    """
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    return _GRPC_UNAVAILABLE_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+# Vitess/PlanetScale also fails a query against a shard mid-failover with pymysql
+# OperationalError(1105) whose message carries "primary is not serving, there may be a
+# reparent operation in progress": a planned/emergency reparent is promoting a new primary,
+# so the old one briefly stops serving. Like the `code = Unavailable` case this is transient —
+# a fresh attempt after a short backoff lands on the newly promoted primary. Key on the stable
+# `reparent operation in progress` phrase: the target keyspace/shard/tablet-type prefix is
+# volatile, and this stays robust to the primary/master wording difference across Vitess versions.
+_VITESS_REPARENT_TOKEN = "reparent operation in progress"
+
+
+def _is_transient_vitess_reparent(e: BaseException) -> bool:
+    """Return True if a Vitess shard is mid-reparent and its primary is briefly not serving."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    return _VITESS_REPARENT_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+# TiProxy (TiDB's connection proxy) surfaces this 1105 error when it cannot reach a TiDB
+# node due to a failover, a restart, or a momentary network blip. It arrives during the
+# MySQL auth handshake: TiProxy accepts the TCP connection but then cannot route to a
+# backend TiDB node and sends back ER_UNKNOWN_ERROR (1105) with this fixed message. Like
+# the Vitess `code = Unavailable` case above (same error code, same proxy-layer pattern),
+# a fresh attempt recovers once a healthy TiDB node is available.
+_TIPROXY_UNAVAILABLE_TOKEN = "TiProxy fails to connect to TiDB"
+
+
+def _is_transient_tiproxy_unavailable(e: BaseException) -> bool:
+    """Return True if TiProxy could not reach a TiDB backend due to a transient failure."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    return _TIPROXY_UNAVAILABLE_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+# A TiDB-fronting gateway's own ER_UNKNOWN_ERROR (1105) wording for the same "no backend reachable"
+# condition as the TiProxy case above, just phrased differently — the gateway found zero TiDB
+# instances to route to (a scale-down, rolling restart, or momentary control-plane blip) rather
+# than failing to reach one it knew about. Same proxy-layer pattern: a fresh attempt recovers once
+# a TiDB instance is available again. The message carries no host/port, so match it in full.
+_TIDB_NO_AVAILABLE_INSTANCES_TOKEN = "No available TiDB instances, please make sure TiDB is available"
+
+
+def _is_transient_no_available_tidb_instances(e: BaseException) -> bool:
+    """Return True if a TiDB-fronting gateway reported zero reachable TiDB instances."""
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    return _TIDB_NO_AVAILABLE_INSTANCES_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+def _is_transient_metadata_query_reset(e: BaseException) -> bool:
+    """Return True if a metadata query's connection was reset mid-query — a transient blip.
+
+    `_is_transient_connect_drop` already retries this same 2013 code when it fires inside
+    `connect()` (a socket close while reading the server greeting); this predicate covers the
+    sibling case where the connection was already established and the reset landed once a real
+    query was in flight — e.g. `get_table_metadata`'s small `information_schema.columns` lookup.
+    A bare `ConnectionResetError` payload means the socket itself was reset (an overloaded
+    server, a proxy/load-balancer cycling its backend, a momentary network blip), not the
+    bad-plan filesort-timeout symptom `_is_bad_plan_error` also keys on this code for — that one
+    only applies to the streaming data query, which has its own FORCE INDEX fallback. Match the
+    stable strerror phrase, not the volatile host.
+    """
+    if not isinstance(e, pymysql.err.OperationalError):
+        return False
+    code = e.args[0] if e.args else None
+    if code != _LOST_CONNECTION_DURING_QUERY_CODE:
+        return False
+    return _CONNECTION_RESET_TOKEN in " ".join(str(arg) for arg in e.args)
+
+
+def _retry_on_transient_tablet_unavailable(
+    operation: Callable[[], _T],
+    logger: FilteringBoundLogger,
+    *,
+    max_attempts: int = _MAX_CONNECT_ATTEMPTS,
+) -> _T:
+    """Run `operation`, retrying a transient error hit during metadata discovery.
+
+    Mirrors `_connect_with_transient_retry`, but covers the metadata queries that run on
+    a freshly opened connection: reconnecting alone doesn't help when the vtgate
+    handshake succeeds and only the first query hits an unavailable tablet, so retry the
+    whole operation (which reopens the connection) with a bounded backoff instead of
+    failing sync setup on the first blip and surfacing it as captured error-tracking
+    noise. Non-transient errors re-raise immediately — the predicates only match the gRPC
+    `Unavailable` status, a mid-reparent primary, a dial-timeout reaching a backend tablet,
+    a vtgate with no serving tablet endpoints, a TiProxy failover, or a plain peer-reset
+    connection drop, all self-healing.
+    """
+    attempt = 0
+    while True:
+        try:
+            return operation()
+        except pymysql.err.OperationalError as e:
+            attempt += 1
+            if attempt >= max_attempts or not (
+                _is_transient_tablet_unavailable(e)
+                or _is_transient_vitess_reparent(e)
+                or _is_transient_vitess_dial_timeout(e)
+                or _is_transient_vitess_no_endpoints(e)
+                or _is_transient_tiproxy_unavailable(e)
+                or _is_transient_metadata_query_reset(e)
+            ):
+                raise
+            logger.warning(
+                "Transient MySQL error during metadata discovery; retrying",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                exc_info=e,
+            )
+            time.sleep(min(2 * attempt, 30))
+
+
+def _release_streaming_cursor(cursor: SSCursor) -> None:
+    """Detach an unbuffered cursor from its connection without draining it.
+
+    PyMySQL's `SSCursor.close()` (and its `__del__`) finishes the unbuffered
+    query by reading every outstanding row packet from the server via
+    `_finish_unbuffered_query`. When we abandon a stream early — a cancelled
+    Temporal activity injects `GeneratorExit`, or the FORCE INDEX fallback
+    restarts the query — that drain runs against a connection that is already
+    going away and raises `OperationalError(2013, 'Lost connection to MySQL
+    server during query')` from inside the teardown path, masking the real
+    reason iteration stopped. Clearing the connection reference is exactly what
+    PyMySQL does once a query is fully consumed, so the cursor's later
+    `close`/`__del__` becomes a no-op and the owning `with self.connect(...)`
+    block closes the socket cleanly.
+    """
+    # PyMySQL clears this same attribute once a query is fully consumed; the
+    # stub types it non-optional, so we mirror that runtime behaviour here.
+    cursor.connection = None  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+
+
+def get_connection_metadata(conn: pymysql.Connection, *, database: str) -> dict[str, Any]:
+    """Connection metadata persisted on a direct-query source for the HogQL executor."""
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT DATABASE(), VERSION()")
+        row = cursor.fetchone()
+    current_database = str(row[0]) if row and row[0] is not None else database
+    version = str(row[1]) if row and row[1] is not None else ""
+    # The HogQL direct-query executor only branches postgres-vs-mysql on `engine`, so
+    # MariaDB also reports "mysql"; the version string still identifies MariaDB servers.
+    return {
+        "database": current_database,
+        "version": version,
+        "engine": "mysql",
+    }
+
+
+# MySQL 8.0.23+ can mark a column `INVISIBLE`: `information_schema.columns` still lists it, but
+# `SELECT *` never returns it. `EXTRA` holds space-separated attributes, so a generated invisible
+# primary key reads `auto_increment INVISIBLE`.
+_INVISIBLE_COLUMN_EXTRA_TOKEN = "INVISIBLE"
+
+
+def _is_invisible_column(extra: str | None) -> bool:
+    """Return whether an `information_schema.columns` row describes an invisible column."""
+    return _INVISIBLE_COLUMN_EXTRA_TOKEN in (extra or "").upper().split()
+
+
+@frozen
+class MySQLTableSetup:
+    """Everything `build_pipeline` learns about a table before it can stream rows."""
+
+    primary_keys: list[str] | None
+    primary_keys_are_declared: bool
+    """Whether the database declared these, as opposed to `build_pipeline` guessing `id`."""
+    projection: TableProjection[MySQLColumn]
+    chunk_size: int
+    rows_to_sync: int
+    partition_settings: PartitionSettings | None
+
+
+def _syncable_column_names(table: Table[MySQLColumn], logger: FilteringBoundLogger) -> list[str]:
+    """Return the column names a sync-all read can name, or nothing to keep `SELECT *`.
+
+    Invisible columns stay out, because `SELECT *` never returned them either. Catalog column
+    names also legitimately carry characters the backtick allowlist rejects, such as a space or
+    the `:` in `Ach:CompanyId`. Naming one raises before the first row is read, so hand back an
+    empty list and let the caller keep the `SELECT *` that such a table always synced with.
+    Skipping only the offending column is not an option, because that drops it from the read.
+    """
+    names = [column.name for column in table.columns if not column.invisible]
+    for name in names:
+        try:
+            _IDENTIFIER_QUOTER.quote(name)
+        except InvalidIdentifierError:
+            logger.warning(f"Can't quote the column name {name!r}, so this sync reads the whole table with SELECT *")
+            return []
+    return names
+
+
+class MySQLColumn(Column):
+    """`Column` for a MySQL source — carries enough type info to build a PyArrow field.
+
+    Attributes:
+        name: Column name.
+        data_type: Base MySQL type (`int`, `varchar`, `decimal`, …).
+        column_type: Full type string including modifiers (e.g. `int(10) unsigned`),
+            used to detect `unsigned` which affects the PyArrow integer width.
+        nullable: Whether the column is nullable in MySQL.
+        numeric_precision / numeric_scale: Populated only for `decimal` / `numeric`.
+        invisible: Whether MySQL hides the column from `SELECT *`.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        data_type: str,
+        column_type: str,
+        nullable: bool,
+        numeric_precision: int | None = None,
+        numeric_scale: int | None = None,
+        invisible: bool = False,
+    ) -> None:
+        self.name = name
+        self.data_type = data_type
+        self.column_type = column_type
+        self.nullable = nullable
+        self.numeric_precision = numeric_precision
+        self.numeric_scale = numeric_scale
+        self.invisible = invisible
+
+    def to_arrow_field(self) -> pa.Field[pa.DataType]:
+        """Return a `pyarrow.Field` that closely matches this column."""
+        arrow_type: pa.DataType
+
+        # deltalake doesn't support unsigned types, so unsigned ints are
+        # widened to the next signed type that can hold their range.
+        is_unsigned = "unsigned" in self.column_type
+
+        match self.data_type.lower():
+            case "bigint":
+                # No larger type than (u)int64 — keep unsigned semantics.
+                arrow_type = pa.uint64() if is_unsigned else pa.int64()
+            case "int" | "integer" | "mediumint":
+                arrow_type = pa.uint64() if is_unsigned else pa.int32()
+            case "smallint":
+                arrow_type = pa.uint32() if is_unsigned else pa.int16()
+            case "tinyint":
+                arrow_type = pa.uint16() if is_unsigned else pa.int8()
+            case "decimal" | "numeric":
+                if self.numeric_precision is None or self.numeric_scale is None:
+                    raise TypeError("expected `numeric_precision` and `numeric_scale` to be `int`, got `NoneType`")
+                arrow_type = build_pyarrow_decimal_type(self.numeric_precision, self.numeric_scale)
+            case "float":
+                arrow_type = pa.float32()
+            case "double" | "double precision":
+                arrow_type = pa.float64()
+            case "varchar" | "char" | "text" | "mediumtext" | "longtext":
+                arrow_type = pa.string()
+            case "date":
+                # MySQL allows zero dates ('0000-00-00') which we map to None,
+                # so date columns must always be nullable in the Arrow schema.
+                arrow_type = pa.date32()
+                return pa.field(self.name, arrow_type, nullable=True)
+            case "datetime" | "timestamp":
+                arrow_type = pa.timestamp("us")
+                return pa.field(self.name, arrow_type, nullable=True)
+            case "time":
+                arrow_type = pa.time64("us")
+            case "boolean" | "bool":
+                arrow_type = pa.bool_()
+            case "binary" | "varbinary" | "blob" | "mediumblob" | "longblob":
+                arrow_type = pa.binary()
+            case "uuid":
+                arrow_type = pa.string()
+            case "json":
+                arrow_type = pa.string()
+            case _ if self.data_type.endswith("[]"):  # Array types (not native in MySQL)
+                arrow_type = pa.string()
+            case _:
+                arrow_type = pa.string()
+
+        return pa.field(self.name, arrow_type, nullable=self.nullable)
+
+
+class MySQLImplementation(SQLSourceImplementation[MySQLSourceConfig, pymysql.Connection, Cursor]):
+    """MySQL driver implementation paired with `MySQLSource`.
+
+    One class owns everything MySQL-specific: the SSH tunnel + pymysql
+    connection lifecycle, `information_schema`-style batch queries used
+    during schema listing, per-cursor metadata used during the streaming
+    sync (primary keys, column types, row counts, partition/chunk sizing,
+    `FORCE INDEX` index lookup, `EXPLAIN` diagnostics), and the dlt
+    pipeline factory (`build_pipeline`).
+    """
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def connect(
+        self,
+        config: MySQLSourceConfig,
+        *,
+        read_timeout: int = METADATA_READ_TIMEOUT_SECONDS,
+        autocommit: bool = False,
+        team_id: int | None = None,
+    ) -> Iterator[pymysql.Connection]:
+        """Open a pymysql connection for the duration of the context.
+
+        Opens the SSH tunnel (if configured), then connects with the
+        MySQL-wide conventions: safe date/datetime converters, and a
+        PlanetScale workload hint injected automatically when the host
+        resolves to a `*.psdb.cloud` address. Callers vary two things —
+        metadata work keeps the default `METADATA_READ_TIMEOUT_SECONDS`,
+        the streaming path sets `read_timeout=STATEMENT_TIMEOUT_SECONDS`
+        so multi-GB filesorts don't drop on middlebox timeouts before the
+        first rows are ready, and the keyset path sets `autocommit` so each
+        page is its own transaction (see `_keyset_get_rows`).
+        """
+        tls = tls_options(config)
+        # Any TLS option implies TLS, so a user who sets one gets the encrypted connection it needs,
+        # whatever `using_ssl` says.
+        use_tls = config.using_ssl or tls.is_set
+
+        with self._ssh_tunnel_endpoint(config, team_id) as (host, port), tls_files(tls) as files:
+            kwargs: dict[str, Any] = {
+                "host": host,
+                # pymysql rejects a non-int port; config.port can arrive as a string when the
+                # config is built directly rather than through the int-coercing from_dict.
+                "port": int(port),
+                "database": config.database,
+                "user": config.user,
+                "password": config.password,
+                **connection_timeouts(read_timeout),
+                "ssl_ca": (files.ca_certificate or system_ca_bundle()) if use_tls else None,
+                "ssl_cert": files.client_certificate,
+                "ssl_key": files.client_key,
+                # pymysql resolves `ssl_ca` on its own to `verify_mode=CERT_NONE`, so only an
+                # explicit True verifies. None leaves that prior behavior untouched.
+                "ssl_verify_cert": True if tls.verify else None,
+                "ssl_verify_identity": True if tls.verify_hostname else None,
+                "conv": _MYSQL_SAFE_CONVERSIONS,
+                "autocommit": autocommit,
+                "init_command": "SET workload = 'OLAP';" if host.endswith("psdb.cloud") else None,
+            }
+            with _connect_with_transient_retry(kwargs, team_id) as conn:
+                yield conn
+
+    @contextmanager
+    def _ssh_tunnel_endpoint(self, config: MySQLSourceConfig, team_id: int | None) -> Iterator[tuple[str, int]]:
+        """Yield the `(host, port)` to connect to, going through the SSH tunnel if configured.
+
+        Translates a bare paramiko handshake `EOFError` into `_SSH_HANDSHAKE_EOF_ERROR`. The
+        `yield` sits outside the `except` so a failure raised by the connection body can never be
+        misattributed to the tunnel handshake.
+        """
+        with ExitStack() as stack:
+            try:
+                host, port = stack.enter_context(open_ssh_tunnel(config, team_id))
+            except EOFError as e:
+                raise Exception(_SSH_HANDSHAKE_EOF_ERROR) from e
+            yield host, port
+
+    # ------------------------------------------------------------------
+    # Listing — batch queries run once during `get_schemas`
+    # ------------------------------------------------------------------
+
+    def get_columns(
+        self,
+        conn: pymysql.Connection,
+        config: MySQLSourceConfig,
+        names: list[str] | None,
+    ) -> dict[str, list[tuple[str, str, bool]]]:
+        configured_schema = _configured_schema(config)
+        requested_names = set(names or [])
+        params: dict[str, Any] = {}
+        schema_filter = "table_schema NOT IN %(system_schemas)s"
+        if configured_schema is not None:
+            schema_filter = "table_schema = %(schema)s"
+            params["schema"] = configured_schema
+        else:
+            params["system_schemas"] = _SYSTEM_SCHEMAS
+
+        names_filter = ""
+        if names:
+            params["names"] = _source_table_names(names, configured_schema=configured_schema)
+            names_filter = "AND table_name IN %(names)s"
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT table_schema, table_name, column_name, data_type, is_nullable"
+                " FROM information_schema.columns"
+                f" WHERE {schema_filter} {names_filter}"
+                " ORDER BY table_schema ASC, table_name ASC, ordinal_position ASC",
+                params,
+            )
+            rows = cursor.fetchall()
+
+        result: dict[str, list[tuple[str, str, bool]]] = collections.defaultdict(list)
+        for source_schema, table_name, column_name, data_type, is_nullable in rows:
+            if requested_names and not _matches_requested_name(
+                requested_names,
+                source_schema=source_schema,
+                table_name=table_name,
+                configured_schema=configured_schema,
+            ):
+                continue
+            display_name = _display_table_name(source_schema, table_name, configured_schema=configured_schema)
+            result[display_name].append((column_name, data_type, is_nullable == "YES"))
+        return dict(result)
+
+    def get_primary_keys(
+        self,
+        conn: pymysql.Connection,
+        config: MySQLSourceConfig,
+        tables: list[str],
+    ) -> dict[str, list[str] | None]:
+        """Detect primary keys for every table in a single query.
+
+        Permission-sensitive — some MySQL deployments restrict access to
+        `information_schema.TABLE_CONSTRAINTS`. Swallow and log any
+        failure so schema discovery keeps working without PKs.
+        """
+        result: dict[str, list[str] | None] = dict.fromkeys(tables)
+        if not tables:
+            return result
+
+        configured_schema = _configured_schema(config)
+        schema_filter = "tc.TABLE_SCHEMA NOT IN %(system_schemas)s"
+        params: dict[str, Any] = {
+            "names": _source_table_names(tables, configured_schema=configured_schema),
+        }
+        if configured_schema is not None:
+            schema_filter = "tc.TABLE_SCHEMA = %(schema)s"
+            params["schema"] = configured_schema
+        else:
+            params["system_schemas"] = _SYSTEM_SCHEMAS
+
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT tc.TABLE_SCHEMA, tc.TABLE_NAME, kcu.COLUMN_NAME
+                    FROM information_schema.TABLE_CONSTRAINTS tc
+                    JOIN information_schema.KEY_COLUMN_USAGE kcu
+                    ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                    AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+                    AND tc.TABLE_NAME = kcu.TABLE_NAME
+                    WHERE {schema_filter}
+                    AND tc.TABLE_NAME IN %(names)s
+                    AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                    """.format(schema_filter=schema_filter),
+                    params,
+                )
+                rows = cursor.fetchall()
+        except Exception as e:
+            structlog.get_logger().warning("Failed to detect primary keys for MySQL schemas", exc_info=e)
+            return result
+
+        pks: dict[str, list[str]] = collections.defaultdict(list)
+        for source_schema, table_name, column_name in rows:
+            display_name = _display_table_name(source_schema, table_name, configured_schema=configured_schema)
+            if display_name in result:
+                pks[display_name].append(column_name)
+        for table_name, pk_cols in pks.items():
+            result[table_name] = pk_cols
+        return result
+
+    def get_incremental_filter(self) -> IncrementalFieldFilter:
+        return filter_mysql_incremental_fields
+
+    def get_leading_index_columns(
+        self,
+        conn: pymysql.Connection,
+        config: MySQLSourceConfig,
+        tables: list[str],
+    ) -> dict[str, set[str]] | None:
+        """Return the leading column of each index per table.
+
+        `information_schema.STATISTICS` lists every index (primary, unique,
+        secondary) one row per column. `SEQ_IN_INDEX = 1` identifies the
+        first column of each index, which is what speeds up
+        `WHERE col >= …` predicates. Returns `None` when discovery fails
+        so the caller defaults to no warning; tables with no indexes still
+        appear with an empty set so the UI can distinguish them from
+        "lookup failed".
+        """
+        if not tables:
+            return {}
+
+        configured_schema = _configured_schema(config)
+        schema_filter = "TABLE_SCHEMA NOT IN %(system_schemas)s"
+        params: dict[str, Any] = {
+            "names": _source_table_names(tables, configured_schema=configured_schema),
+        }
+        if configured_schema is not None:
+            schema_filter = "TABLE_SCHEMA = %(schema)s"
+            params["schema"] = configured_schema
+        else:
+            params["system_schemas"] = _SYSTEM_SCHEMAS
+
+        result: dict[str, set[str]] = {table: set() for table in tables}
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+                    FROM information_schema.STATISTICS
+                    WHERE {schema_filter}
+                      AND TABLE_NAME IN %(names)s
+                      AND SEQ_IN_INDEX = 1
+                    """.format(schema_filter=schema_filter),
+                    params,
+                )
+                for source_schema, table_name, column_name in cursor.fetchall():
+                    display_name = _display_table_name(source_schema, table_name, configured_schema=configured_schema)
+                    if display_name in result:
+                        result[display_name].add(column_name)
+        except Exception as e:
+            structlog.get_logger().warning("Failed to detect leading index columns for MySQL schemas", exc_info=e)
+            return None
+        return result
+
+    def get_source_metadata(
+        self,
+        conn: pymysql.Connection,
+        config: MySQLSourceConfig,
+        tables: list[str],
+    ) -> SourceMetadata:
+        configured_schema = _configured_schema(config)
+        metadata = SourceMetadata()
+        for display_name in tables:
+            source_schema, source_table_name = _source_location_from_display_name(
+                display_name,
+                configured_schema=configured_schema,
+            )
+            metadata.schema_by_table[display_name] = source_schema
+            metadata.table_name_by_table[display_name] = source_table_name
+        return metadata
+
+    # ------------------------------------------------------------------
+    # Per-cursor metadata — used during `build_pipeline`
+    # ------------------------------------------------------------------
+
+    def get_primary_keys_for_table(self, cursor: Cursor, schema: str, table_name: str) -> list[str] | None:
+        """Return the primary-key column names for a single table, or None."""
+        cursor.execute(
+            """
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = %(schema)s
+                AND TABLE_NAME = %(table_name)s
+                AND COLUMN_KEY = 'PRI'
+            """,
+            {"schema": schema, "table_name": table_name},
+        )
+        rows = cursor.fetchall()
+        if len(rows) > 0:
+            return [row[0] for row in rows]
+        return None
+
+    def get_table_metadata(self, cursor: Cursor, schema: str, table_name: str) -> Table[MySQLColumn]:
+        """Return rich column metadata for building a PyArrow schema."""
+        cursor.execute(
+            """
+                SELECT
+                    column_name,
+                    data_type,
+                    column_type,
+                    is_nullable,
+                    numeric_precision,
+                    numeric_scale,
+                    extra
+                FROM
+                    information_schema.columns
+                WHERE
+                    table_schema = %(schema)s
+                    AND table_name = %(table_name)s
+            """,
+            {"schema": schema, "table_name": table_name},
+        )
+
+        numeric_data_types = {"numeric", "decimal"}
+        columns = []
+        for (
+            name,
+            data_type,
+            column_type,
+            nullable,
+            numeric_precision_candidate,
+            numeric_scale_candidate,
+            extra,
+        ) in cursor:
+            if data_type in numeric_data_types:
+                numeric_precision = (
+                    numeric_precision_candidate
+                    if numeric_precision_candidate is not None
+                    else DEFAULT_NUMERIC_PRECISION
+                )
+                numeric_scale = (
+                    numeric_scale_candidate if numeric_scale_candidate is not None else DEFAULT_NUMERIC_SCALE
+                )
+            else:
+                numeric_precision = None
+                numeric_scale = None
+
+            columns.append(
+                MySQLColumn(
+                    name=name,
+                    data_type=data_type,
+                    column_type=column_type,
+                    nullable=nullable,
+                    numeric_precision=numeric_precision,
+                    numeric_scale=numeric_scale,
+                    invisible=_is_invisible_column(extra),
+                )
+            )
+
+        return Table(name=table_name, parents=(schema,), columns=columns)
+
+    def get_rows_to_sync(
+        self,
+        cursor: Cursor,
+        inner_query: str,
+        inner_query_args: Any,
+        logger: FilteringBoundLogger,
+    ) -> int:
+        """Count the rows the given `inner_query` will produce. Returns 0 on error."""
+        try:
+            # The MAX_EXECUTION_TIME optimizer hint bounds this probe at 60s —
+            # we'd rather return 0 and let the sync proceed than block here.
+            query = f"SELECT /*+ MAX_EXECUTION_TIME(60000) */ COUNT(*) FROM ({inner_query}) as t"
+
+            cursor.execute(query, inner_query_args)
+            row = cursor.fetchone()
+
+            if row is None:
+                logger.debug("get_rows_to_sync: No results returned. Using 0 as rows to sync")
+                return 0
+
+            rows_to_sync = row[0] or 0
+            rows_to_sync_int = int(rows_to_sync)
+
+            logger.debug(f"get_rows_to_sync: rows_to_sync_int={rows_to_sync_int}")
+            return rows_to_sync_int
+        except Exception as e:
+            # This COUNT(*) is a best-effort estimate for progress reporting and partition sizing.
+            # It shares its FROM/WHERE with the real streaming query, so any genuine problem
+            # (missing column, bad incremental field, permissions) resurfaces there and is
+            # classified through the normal retryable/non-retryable path. The MAX_EXECUTION_TIME
+            # hint above also makes timeouts here expected. Capturing it would only flood error
+            # tracking with handled duplicates, so we log at debug and fall back to 0.
+            logger.debug(f"get_rows_to_sync: Error: {e}. Using 0 as rows to sync", exc_info=e)
+            return 0
+
+    def fetch_table_stats(
+        self,
+        cursor: Cursor,
+        schema: str,
+        table_name: str,
+        logger: FilteringBoundLogger,
+    ) -> TableStats | None:
+        """Return DATA_LENGTH / TABLE_ROWS for `schema.table_name`.
+
+        `DATA_LENGTH` only covers values in the clustered index — types
+        like `TEXT` are stored off-page, so the figure can under-count.
+        `TABLE_ROWS` is an InnoDB estimate. Both are close enough to
+        size partitions, and cheap compared to a `COUNT(*)` full scan
+        that can time out on large tables.
+        """
+        query = """
+            SELECT
+                t.DATA_LENGTH AS table_size,
+                t.TABLE_ROWS AS row_count
+            FROM
+                information_schema.TABLES AS t
+            WHERE
+                t.TABLE_SCHEMA = %(schema)s
+                AND t.TABLE_NAME = %(table_name)s
+        """
+        logger.debug(f"fetch_table_stats: running query {query}")
+        cursor.execute(query, {"schema": schema, "table_name": table_name})
+        result = cursor.fetchone()
+        if result is None:
+            logger.debug("fetch_table_stats: no results returning None")
+            return None
+
+        table_size, row_count = result
+        if table_size is None or row_count is None:
+            logger.debug("fetch_table_stats: missing table_size or row_count, returning None")
+            return None
+
+        return TableStats(table_size_bytes=int(table_size), row_count=int(row_count))
+
+    def fetch_average_row_size(
+        self,
+        cursor: Cursor,
+        schema: str,
+        table_name: str,
+        inner_query: str,
+        inner_query_args: Any,
+        logger: FilteringBoundLogger,
+    ) -> int | None:
+        """Sample `LENGTH(COALESCE(col, ''))` across columns on the first 1000 rows.
+
+        Column names are pulled from `information_schema.COLUMNS`, then
+        each name is passed through the identifier quoter before being
+        interpolated into the `LENGTH(...)` sum. `inner_query` is the
+        SELECT the sync is about to run — its identifiers were already
+        quoted by the shared `SelectQueryBuilder`, and its arguments are
+        rebound as parameters here. No untrusted value ever reaches raw
+        SQL.
+        """
+        try:
+            cursor.execute(
+                """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = %(schema)s
+                    AND TABLE_NAME = %(table_name)s
+                    ORDER BY ORDINAL_POSITION
+                """,
+                {"schema": schema, "table_name": table_name},
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                logger.debug("fetch_average_row_size: No columns found.")
+                return None
+
+            columns = [row[0] for row in rows]
+            # Column names come from the DB catalog and can legitimately contain
+            # characters the identifier allowlist rejects (e.g. `:` or spaces in
+            # `Ach:CompanyId`). Row-size estimation is best-effort, so skip any
+            # column we can't safely quote rather than abandoning the whole
+            # estimate. The allowlist stays the hard boundary for user-supplied
+            # identifiers elsewhere.
+            quoted_columns = []
+            skipped_columns = []
+            for col in columns:
+                try:
+                    quoted_columns.append(_IDENTIFIER_QUOTER.quote(col))
+                except InvalidIdentifierError:
+                    skipped_columns.append(col)
+
+            if skipped_columns:
+                logger.debug(
+                    f"fetch_average_row_size: skipping {len(skipped_columns)} unquotable column(s): {skipped_columns}."
+                )
+
+            if not quoted_columns:
+                logger.debug("fetch_average_row_size: No quotable columns found.")
+                return None
+
+            length_sum = " + ".join(f"LENGTH(COALESCE({quoted}, ''))" for quoted in quoted_columns)
+            # length_sum and inner_query are built from sanitized identifiers;
+            # no user-supplied values are interpolated into the SQL itself.
+            size_query = "SELECT AVG(" + length_sum + ") as avg_row_size FROM (" + inner_query + " LIMIT 1000) as t"
+
+            cursor.execute(size_query, inner_query_args)
+            row = cursor.fetchone()
+
+            if row is None or row[0] is None:
+                logger.debug("fetch_average_row_size: No results returned.")
+                return None
+
+            row_size_bytes = max(row[0] or 0, 1)
+            return int(row_size_bytes)
+        except Exception as e:
+            # Row-size sampling is a best-effort probe: on any failure the caller falls back to the
+            # default chunk size and the sync proceeds. A genuine problem (missing table, revoked
+            # permission) resurfaces in the real extraction query and is classified through the normal
+            # retryable/non-retryable path, while a transient connection drop here (e.g. pymysql's
+            # `InterfaceError(0, '')` when the socket was already closed) stays retryable there too.
+            # Capturing it would only flood error tracking with handled duplicates, so log at debug and
+            # fall back. Mirrors `get_partition_settings` and the Redshift source's `fetch_average_row_size`.
+            logger.debug(f"fetch_average_row_size: Error: {e}.", exc_info=e)
+            return None
+
+    def find_index_for_cursor(
+        self,
+        cursor: Cursor,
+        schema: str,
+        table_name: str,
+        cursor_field: str,
+        logger: FilteringBoundLogger,
+    ) -> str | None:
+        """Return an index whose leading column equals `cursor_field`.
+
+        Used for the `FORCE INDEX (...)` retry when the optimizer picks
+        a full table scan over the incremental field's index.
+        Identifiers are quoted before being interpolated into
+        `SHOW INDEX FROM ...`; `SHOW INDEX` has no parameterized form in
+        MySQL.
+        """
+        try:
+            query = f"SHOW INDEX FROM {_IDENTIFIER_QUOTER.quote(schema)}.{_IDENTIFIER_QUOTER.quote(table_name)}"
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            column_names = [col[0] for col in cursor.description or []]
+            # SHOW INDEX column positions vary by MySQL version; look them up by name.
+            try:
+                key_name_idx = column_names.index("Key_name")
+                seq_idx = column_names.index("Seq_in_index")
+                column_idx = column_names.index("Column_name")
+            except ValueError:
+                logger.debug("SHOW INDEX returned unexpected columns: %s", column_names)
+                return None
+
+            for row in rows:
+                if row[column_idx] == cursor_field and row[seq_idx] == 1:
+                    return row[key_name_idx]
+            return None
+        except Exception as e:
+            logger.debug(f"find_index_for_cursor failed: {e}", exc_info=e)
+            return None
+
+    def explain_query(
+        self,
+        cursor: Cursor,
+        query: str,
+        query_args: Any,
+        logger: FilteringBoundLogger,
+    ) -> None:
+        """Log MySQL `EXPLAIN` output for `query` at debug level.
+
+        Used to diagnose sync failures on large tables — reveals whether
+        the optimizer chose full-scan + filesort vs. a range scan on the
+        incremental index.
+        """
+        try:
+            explain_query = f"EXPLAIN {query}"
+            logger.debug(f"Running EXPLAIN on: {query}")
+            cursor.execute(explain_query, query_args)
+            rows = cursor.fetchall()
+            column_names = [col[0] for col in cursor.description or []]
+            explain_lines = [str(dict(zip(column_names, row))) for row in rows]
+            logger.debug(f"EXPLAIN result: {' | '.join(explain_lines) if explain_lines else '(empty)'}")
+        except Exception as e:
+            # EXPLAIN is best-effort diagnostics; its failure never affects the
+            # sync (the streaming query runs right after regardless). Capturing
+            # here just floods error tracking with benign, non-actionable noise —
+            # e.g. MySQL 1345 when EXPLAINing a view whose underlying tables the
+            # connected user lacks SHOW VIEW on. Debug-log only, like
+            # `find_index_for_cursor`.
+            logger.debug(f"EXPLAIN raised an exception: {e}", exc_info=e)
+
+    def check_keyset_page_plan(self, cursor: Cursor, page_sql: SafeSQL, logger: FilteringBoundLogger) -> None:
+        """Warn when a keyset page isn't reading the clustered index in key order.
+
+        A seek page is only cheap if the optimizer answers it as a range scan on `PRIMARY`: one
+        B-tree descent, then `LIMIT n` rows already in `ORDER BY` order. Row filters give it another
+        choice — take the filter's secondary index, lose the index ordering, and sort the whole
+        matched set — and that filesort runs *per page*, turning one table scan into thousands.
+
+        Diagnostics only: log a stable token so the bad-plan rate is greppable, and let the page run.
+        The streaming path's `FORCE INDEX` retry is the hammer if this turns out to be common.
+        """
+        try:
+            cursor.execute(f"EXPLAIN {page_sql.sql}", page_sql.params)
+            rows = cursor.fetchall()
+            column_names = [column[0] for column in cursor.description or []]
+            plans = [dict(zip(column_names, row)) for row in rows]
+        except Exception as e:
+            # Best-effort, exactly like `explain_query`: a failed EXPLAIN must never fail the page.
+            logger.debug(f"Keyset EXPLAIN raised an exception: {e}", exc_info=e)
+            return
+
+        for plan in plans:
+            index_used = plan.get("key")
+            extra = str(plan.get("Extra") or "")
+            sorts = "Using filesort" in extra or "Using temporary" in extra
+            if index_used == "PRIMARY" and not sorts:
+                continue
+            logger.warning(
+                f"Keyset page not served by the primary key: reason=bad_keyset_plan "
+                f"key={index_used} type={plan.get('type')} rows={plan.get('rows')} extra='{extra}'"
+            )
+
+    # ------------------------------------------------------------------
+    # Pipeline build — the dlt `SourceResponse` for a single table
+    # ------------------------------------------------------------------
+
+    def build_pipeline(
+        self,
+        config: MySQLSourceConfig,
+        inputs: SourceInputs,
+        resumable_source_manager: ResumableSourceManager[KeysetResumeState] | None = None,
+    ) -> SourceResponse:
+        location = resolve_source_location(
+            inputs,
+            config_namespace=_configured_schema(config),
+            default=normalize_namespace(config.database),
+        )
+        schema = location.schema
+        table_name = location.table_name
+        if not schema:
+            raise ValueError("Schema is missing")
+        if not table_name:
+            raise ValueError("Table name is missing")
+
+        logger = inputs.logger
+        should_use_incremental_field = inputs.should_use_incremental_field
+        incremental_field = inputs.incremental_field
+        incremental_field_type = inputs.incremental_field_type
+        db_incremental_field_last_value = inputs.db_incremental_field_last_value
+        enabled_columns = inputs.enabled_columns
+        row_filters = inputs.row_filters
+
+        def _resolve_projection(
+            full_table: Table[MySQLColumn], primary_keys: list[str] | None
+        ) -> TableProjection[MySQLColumn]:
+            # An invisible primary key is kept out of the catalog names but comes back through
+            # `compute_projected_columns`, which a merge needs.
+            available_columns = _syncable_column_names(full_table, logger) if enabled_columns is None else None
+            return resolve_table_projection(
+                full_table,
+                enabled_columns=enabled_columns,
+                primary_keys=primary_keys,
+                incremental_field=incremental_field,
+                available_columns=available_columns,
+            )
+
+        def _discover_metadata() -> MySQLTableSetup:
+            with self.connect(config, team_id=inputs.team_id) as connection:
+                with connection.cursor() as cursor:
+                    primary_keys = self.get_primary_keys_for_table(cursor, schema, table_name)
+                    full_table = self.get_table_metadata(cursor, schema, table_name)
+
+                    # Whether the database itself declared these as the primary key, as opposed to
+                    # the `id` guess below. Only a declared PK is guaranteed NOT NULL, which is what
+                    # keyset pagination needs to seek past every page (see `resolve_keyset_eligibility`).
+                    primary_keys_are_declared = primary_keys is not None
+
+                    # Resolve PKs before the projection so probe/sample queries match the streaming SELECT.
+                    if primary_keys is None and "id" in full_table:
+                        primary_keys = ["id"]
+
+                    projection = _resolve_projection(full_table, primary_keys)
+                    logger.debug(f"Source schema: {projection.table.to_arrow_schema()}")
+
+                    inner_query, inner_query_args = _build_query(
+                        schema,
+                        table_name,
+                        should_use_incremental_field,
+                        incremental_field,
+                        incremental_field_type,
+                        db_incremental_field_last_value,
+                        enabled_columns=projection.enabled_columns,
+                        primary_keys=primary_keys,
+                        row_filters=row_filters,
+                    )
+
+                    rows_to_sync = self.get_rows_to_sync(cursor, inner_query, inner_query_args, logger)
+                    chunk_size = self.get_chunk_size(cursor, schema, table_name, inner_query, inner_query_args, logger)
+                    partition_settings = (
+                        self.get_partition_settings(cursor, schema, table_name, logger)
+                        if should_use_incremental_field
+                        else None
+                    )
+            return MySQLTableSetup(
+                primary_keys=primary_keys,
+                primary_keys_are_declared=primary_keys_are_declared,
+                projection=projection,
+                chunk_size=chunk_size,
+                rows_to_sync=rows_to_sync,
+                partition_settings=partition_settings,
+            )
+
+        # A PlanetScale/Vitess tablet can be momentarily unavailable even once the vtgate
+        # handshake succeeds, so retry the whole metadata-discovery block (reopening the
+        # connection) on a transient `code = Unavailable` rather than failing setup on the
+        # first blip — see `_retry_on_transient_tablet_unavailable`.
+        setup = _retry_on_transient_tablet_unavailable(_discover_metadata, logger)
+        primary_keys = setup.primary_keys
+        primary_keys_are_declared = setup.primary_keys_are_declared
+        setup_projection = setup.projection
+        chunk_size = setup.chunk_size
+        rows_to_sync = setup.rows_to_sync
+        partition_settings = setup.partition_settings
+        binary_reporter = BinaryColumnReporter(logger)
+
+        def _refreshed_projection(connection: pymysql.Connection) -> TableProjection[MySQLColumn]:
+            """Re-read the catalog on the connection that runs the read, right before the query.
+
+            A probe that fails keeps the setup projection, which is where this read would have
+            started anyway. See `resolve_table_projection` for why the read resolves again.
+            """
+            try:
+                with connection.cursor() as cursor:
+                    fresh_table = self.get_table_metadata(cursor, schema, table_name)
+            except Exception as e:
+                logger.debug(f"Could not re-read the catalog before streaming: {e}", exc_info=e)
+                return setup_projection
+            return _resolve_projection(fresh_table, primary_keys)
+
+        # A full load over a single orderable primary key can page with keyset (seek) pagination
+        # instead of one long streaming cursor, which makes it resumable across pods. Incremental syncs
+        # already resume from their watermark, and keyless/composite/non-orderable tables fall through
+        # to the streaming path below.
+        eligibility = resolve_keyset_eligibility(
+            primary_keys=primary_keys,
+            arrow_schema=setup_projection.table.to_arrow_schema(),
+            should_use_incremental_field=should_use_incremental_field,
+            primary_key_is_declared=primary_keys_are_declared,
+        )
+        keyset_column = eligibility.column
+        if keyset_column is None:
+            # Logged for every ineligible table so the ineligible share (and its breakdown) is
+            # measurable before keyset pagination is extended to the other SQL dialects.
+            logger.info(f"MySQL keyset resume unavailable: reason={eligibility.reason}")
+
+        if keyset_column is not None and resumable_source_manager is not None:
+            manager = resumable_source_manager
+
+            def _keyset_get_rows() -> Iterator[Any]:
+                state = manager.load_state() if manager.can_resume() else None
+                resume_key = keyset_last_key(state, key_length=1)
+                initial_last_value = resume_key[0] if resume_key is not None else None
+                if initial_last_value is not None:
+                    logger.debug(f"MySQL keyset resume: {keyset_column} > {initial_last_value}")
+
+                # Autocommit: each page is its own transaction, so the load never holds a read view
+                # (and the metadata lock that blocks DDL) across the whole table the way the
+                # streaming cursor does. A resume on a fresh pod starts a new snapshot regardless, so
+                # there is no cross-page consistency here to give up — and the delta merge dedupes by
+                # primary key if a row shifts between pages.
+                with self.connect(
+                    config, read_timeout=STATEMENT_TIMEOUT_SECONDS, autocommit=True, team_id=inputs.team_id
+                ) as connection:
+                    projection = _refreshed_projection(connection)
+                    arrow_schema = projection.table.to_arrow_schema()
+                    plan_checked = False
+
+                    def _run_page(page_sql: SafeSQL) -> KeysetPage | None:
+                        nonlocal plan_checked
+                        with connection.cursor() as cursor:
+                            # Check the first page that actually seeks — page 1 has no `pk >`
+                            # predicate, so its plan says nothing about how the walk will behave.
+                            seeks = isinstance(page_sql.params, dict) and "keyset_value" in page_sql.params
+                            if not plan_checked and seeks:
+                                plan_checked = True
+                                self.check_keyset_page_plan(cursor, page_sql, logger)
+
+                            cursor.execute(page_sql.sql, page_sql.params)
+                            rows = cursor.fetchall()
+                            if not rows:
+                                return None
+                            return KeysetPage(columns=[column[0] for column in cursor.description or []], rows=rows)
+
+                    def _to_table(column_names: list[str], rows: list[Sequence[Any]]) -> pa.Table:
+                        return table_from_iterator((dict(zip(column_names, row)) for row in rows), arrow_schema)
+
+                    def _checkpoint(last_key: Any) -> None:
+                        manager.save_state(keyset_state((last_key,)))
+
+                    yield from iter_keyset_pages(
+                        builder=_QUERY_BUILDER,
+                        schema=schema,
+                        table_name=table_name,
+                        keyset_column=keyset_column,
+                        chunk_size=chunk_size,
+                        run_page=_run_page,
+                        to_table=_to_table,
+                        initial_last_value=initial_last_value,
+                        checkpoint=_checkpoint,
+                        enabled_columns=projection.enabled_columns,
+                        primary_keys=primary_keys,
+                        row_filters=row_filters,
+                        worker_deaths=inputs.worker_deaths,
+                    )
+
+                # Only reached when the walk exhausted the table. An abandoned generator (draining
+                # worker) unwinds at the yield above, leaving the checkpoint in place to resume from.
+                manager.clear_state()
+
+            return SourceResponse(
+                name=location.response_name,
+                items=_keyset_get_rows,
+                primary_keys=primary_keys,
+                rows_to_sync=rows_to_sync,
+                supports_resume=True,
+            )
+
+        def _stream_with_optional_force_index(force_index_name: str | None) -> Iterator[Any]:
+            """Open a fresh connection and stream rows.
+
+            The pipeline itself persists the per-batch cursor value (see
+            `update_incremental_field_values`), so a retry that restarts
+            from the original starting cursor is correct but occasionally
+            replays a few already-processed rows; the delta merge
+            dedupes by primary key.
+            """
+            with self.connect(
+                config, read_timeout=STATEMENT_TIMEOUT_SECONDS, team_id=inputs.team_id
+            ) as streaming_connection:
+                # Bump server-side timeouts for large table scans. The
+                # defaults (60s each) are too low for multi-GB unbuffered
+                # queries — the server drops the connection before the
+                # first rows are ready.
+                try:
+                    with streaming_connection.cursor() as setup_cursor:
+                        setup_cursor.execute(
+                            f"SET SESSION net_write_timeout = {STATEMENT_TIMEOUT_SECONDS}, net_read_timeout = {STATEMENT_TIMEOUT_SECONDS}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to set session timeouts on MySQL sync connection: {e}")
+
+                projection = _refreshed_projection(streaming_connection)
+                arrow_schema = projection.table.to_arrow_schema()
+
+                ss_cursor = streaming_connection.cursor(SSCursor)
+                try:
+                    query, args = _build_query(
+                        schema,
+                        table_name,
+                        should_use_incremental_field,
+                        incremental_field,
+                        incremental_field_type,
+                        db_incremental_field_last_value,
+                        force_index_name=force_index_name,
+                        enabled_columns=projection.enabled_columns,
+                        primary_keys=primary_keys,
+                        row_filters=row_filters,
+                    )
+                    logger.debug(f"MySQL query: {query.format(args)}")
+
+                    # EXPLAIN before the streaming query to help
+                    # diagnose failures where MySQL picks full scan
+                    # + filesort over the incremental index.
+                    # `explain_query` consumes its rows via
+                    # fetchall(), leaving the cursor in a clean
+                    # state for the streaming execute() below.
+                    self.explain_query(ss_cursor, query, args, logger)
+
+                    # The best-effort preamble above (the session-timeout SET and the diagnostic
+                    # EXPLAIN) runs on this streaming connection. A transient drop during either
+                    # force-closes the socket silently, which would leave the streaming execute
+                    # below raising an opaque `InterfaceError(0, '')` — pymysql's signal that the
+                    # socket is already gone — that masks the recoverable lost connection. Reopen
+                    # once so the real query runs on a live socket instead of failing the attempt
+                    # on a blip a fresh connection recovers from.
+                    if not streaming_connection.open:
+                        logger.warning(
+                            "MySQL connection dropped during pre-stream setup; reopening before streaming query"
+                        )
+                        # Detach the cursor bound to the dead socket first so its later teardown
+                        # can't drain the freshly reopened connection (see _release_streaming_cursor).
+                        _release_streaming_cursor(ss_cursor)
+                        _reconnect_pinned(streaming_connection, inputs.team_id)
+                        ss_cursor = streaming_connection.cursor(SSCursor)
+
+                    ss_cursor.execute(query, args)
+
+                    column_names = [column[0] for column in ss_cursor.description or []]
+
+                    # The streaming read can return a strict subset of the columns discovered
+                    # during setup (a column dropped at the source, or the table recreated
+                    # narrower, between discovery and the read), so restrict the schema to what
+                    # the query actually returned instead of failing the batch build.
+                    read_schema = restrict_schema_to_columns(arrow_schema, column_names)
+
+                    for batch in fetch_row_batches(ss_cursor.fetchmany, max_rows=chunk_size):
+                        yield table_from_iterator(
+                            (dict(zip(column_names, row)) for row in batch),
+                            read_schema,
+                            primary_keys=primary_keys,
+                            binary_reporter=binary_reporter,
+                        )
+                finally:
+                    # Tear the streaming cursor down without draining the rest of
+                    # the unbuffered result set — see `_release_streaming_cursor`.
+                    # Closing it normally here would reissue the lost-connection
+                    # error over a cancellation or the FORCE INDEX restart.
+                    _release_streaming_cursor(ss_cursor)
+
+        def get_rows() -> Iterator[Any]:
+            # Track whether any batch reached the pipeline. If one did,
+            # the retry path can't safely restart from the original
+            # cursor: the delta merge only dedupes rows for `incremental`
+            # writes into an existing table (see
+            # `DeltaWriter.write`), so full-refresh
+            # and first-ever-sync scenarios would get silent duplicates
+            # on replay. The observed bad-plan failure fails before any
+            # rows stream, so this guard is defensive — it enforces the
+            # invariant the PR assumes.
+            yielded_any = False
+            try:
+                for chunk in _stream_with_optional_force_index(force_index_name=None):
+                    yielded_any = True
+                    yield chunk
+                return
+            except pymysql.err.OperationalError as e:
+                if not _is_bad_plan_error(e):
+                    raise
+                if yielded_any:
+                    logger.warning(
+                        f"Streaming query died with a bad query plan (error {e.args[0] if e.args else '?'}) "
+                        f"after already yielding rows — skipping FORCE INDEX fallback to avoid duplicates."
+                    )
+                    raise
+                logger.warning(
+                    f"Streaming query died with a bad query plan (error {e.args[0] if e.args else '?'}). "
+                    f"Attempting FORCE INDEX fallback."
+                )
+                if not should_use_incremental_field or not incremental_field:
+                    # Without an incremental field there's no cursor to force an index on.
+                    logger.warning(
+                        "Bad query plan hit, but sync has no incremental field — cannot apply FORCE INDEX fallback."
+                    )
+                    raise
+
+                with self.connect(config, team_id=inputs.team_id) as probe_connection:
+                    with probe_connection.cursor() as probe_cursor:
+                        force_index_name = self.find_index_for_cursor(
+                            probe_cursor, schema, table_name, incremental_field, logger
+                        )
+
+                if not force_index_name:
+                    logger.warning(
+                        f"Bad query plan hit and no usable index on "
+                        f"{schema}.{table_name}.{incremental_field} — cannot apply FORCE INDEX fallback. "
+                        f"Customer should add an index on the incremental field."
+                    )
+                    # A lost connection here recurs every run: with no usable index the incremental
+                    # sort is unavoidable and re-times-out. Re-raise it as a deterministic error so
+                    # the schema is paused with guidance instead of looping. Out-of-sort-memory (1038),
+                    # query-execution-time-exceeded (3024), and MariaDB's max_statement_time-exceeded
+                    # (1969) already carry their own stable, locale-independent codes, so leave those raw.
+                    if e.args and e.args[0] == _LOST_CONNECTION_DURING_QUERY_CODE:
+                        raise MySQLUnavoidableFilesortError() from e
+                    raise
+
+                logger.warning(f"Retrying streaming query with FORCE INDEX ({force_index_name}) after bad query plan")
+                yield from _stream_with_optional_force_index(force_index_name)
+
+        return SourceResponse(
+            name=location.response_name,
+            items=get_rows,
+            primary_keys=primary_keys,
+            partition_count=partition_settings.partition_count if partition_settings else None,
+            partition_size=partition_settings.partition_size if partition_settings else None,
+            rows_to_sync=rows_to_sync,
+            # The streaming path can't be resumed across pods (its cursor is bound to one connection),
+            # so this run is not cheaply resumable — treated as non-resumable for shutdown handling.
+            supports_resume=False,
+            # One streamed statement with `ORDER BY <incremental field>`. The FORCE INDEX retry
+            # keeps the clause and runs only before the first row.
+            sort_mode="asc" if should_use_incremental_field and incremental_field is not None else None,
+        )

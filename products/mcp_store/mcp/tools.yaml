@@ -1,0 +1,44 @@
+# MCP tool definitions. Tools are opt-in: an operation is exposed only when it has an entry here.
+# List operations without an entry: pnpm --filter=@posthog/mcp run scaffold-yaml -- --candidates --product mcp_store
+# Add one: pnpm --filter=@posthog/mcp run scaffold-yaml -- --add <operationId> --product mcp_store
+# To keep an operation off on purpose, set enabled: false and give a disabled_reason.
+category: MCP Store
+feature: mcp_store
+url_prefix: /settings/mcp-servers
+ui_apps: {}
+tools:
+    mcp-connection-tools-list:
+        operation: mcp_server_installations_tools_retrieve
+        enabled: true
+        scopes:
+            - project:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        list: true
+        title: List a connection's tools
+        description: >
+            Load a connected MCP server's live tool catalog by connection `id` (from mcp-connections-list). Returns each
+            tool's `tool_name`, `description`, `input_schema`, and `approval_state`. ALWAYS call this to load a
+            connection's REAL tool names before curating per-agent MCP tool permissions (an agent's
+            `spec.mcps[].tools[]` with `level` / `default_tool_approval`) — never invent or guess tool names from past
+            sessions or skill prose.
+    mcp-connections-list:
+        operation: mcp_server_installations_list
+        enabled: true
+        scopes:
+            - project:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        list: true
+        title: List MCP connections
+        description: >
+            List the MCP servers connected to this project (the "connections"). Each entry returns its `id` (the
+            connection id you pass to mcp-connection-tools-list), `gateway_server_id` (the id of the MCP server the
+            connection belongs to), `display_name`, `url`, and status fields (`is_enabled`, `needs_reauth`,
+            `pending_oauth`) plus `tool_count`. Use this to discover which connections exist before loading a
+            connection's live tool catalog with mcp-connection-tools-list. To link to a server's page with
+            generate-app-url (`mcpGatewayServer`), pass `gateway_server_id`, never the connection `id`.

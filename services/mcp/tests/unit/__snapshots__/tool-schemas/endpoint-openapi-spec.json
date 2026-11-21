@@ -1,0 +1,14 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "name": {
+            "type": "string"
+        },
+        "version": {
+            "description": "Endpoint version to act on. Defaults to the current version.",
+            "type": "number"
+        }
+    },
+    "required": ["name"],
+    "type": "object"
+}

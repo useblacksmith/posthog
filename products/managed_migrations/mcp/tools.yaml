@@ -1,0 +1,32 @@
+# MCP tool definitions. Tools are opt-in: an operation is exposed only when it has an entry here.
+# List operations without an entry: pnpm --filter=@posthog/mcp run scaffold-yaml -- --candidates --product managed_migrations
+# Add one: pnpm --filter=@posthog/mcp run scaffold-yaml -- --add <operationId> --product managed_migrations
+# To keep an operation off on purpose, set enabled: false and give a disabled_reason.
+category: Managed migrations
+feature: managed_migrations
+url_prefix: /managed_migrations
+ui_apps: {}
+tools:
+    managed-migrations-support-get:
+        operation: managed_migrations_support_retrieve
+        enabled: true
+        scopes:
+            - batch_import_support:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get one batch import job with raw worker state (PostHog staff only)
+        description_file: ./prompts/managed-migrations-support-get.md
+    managed-migrations-support-list:
+        operation: managed_migrations_support_list
+        enabled: true
+        scopes:
+            - batch_import_support:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        list: true
+        title: List batch import jobs across all teams (PostHog staff only)
+        description_file: ./prompts/managed-migrations-support-list.md

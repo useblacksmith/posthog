@@ -1,0 +1,421 @@
+from datetime import datetime
+from typing import Literal, Optional, Union
+from zoneinfo import ZoneInfo
+
+from rest_framework.exceptions import ValidationError
+
+from posthog.schema import (
+    ActionsNode,
+    BaseMathType,
+    CalendarHeatmapMathType,
+    CountPerActorMathType,
+    DateRange,
+    EventsNode,
+    ExperimentDataWarehouseNode,
+    ExperimentEventExposureConfig,
+    ExperimentFunnelMetric,
+    ExperimentMetricMathType,
+    ExperimentWarehouseNativeNode,
+    FunnelConversionWindowTimeUnit,
+    FunnelMathType,
+    GroupMathType,
+    PropertyMathType,
+)
+
+from posthog.hogql import ast
+from posthog.hogql.errors import ExposedHogQLError
+from posthog.hogql.parser import parse_expr
+from posthog.hogql.property import action_to_expr, property_to_expr
+
+from posthog.clickhouse.query_tagging import tag_contains_user_hogql
+from posthog.models.team.team import Team
+
+from products.actions.backend.facade.api import get_action
+from products.actions.backend.facade.contracts import ActionNotFound
+from products.ai_observability.backend.facade.api import resolve_evaluation_pass_markers
+from products.experiments.backend.hogql_queries.exposure_query_logic import rule_exposure_criteria_error
+from products.experiments.backend.hogql_queries.hogql_aggregation_utils import (
+    contains_aggregation,
+    extract_aggregation_and_inner_expr,
+)
+from products.experiments.backend.models.experiment import Experiment, get_experiment_rule
+from products.feature_flags.backend.facade.config import ConfigFormatError
+from products.feature_flags.backend.facade.rules import ExperimentRuleConfig, ExperimentRuleError
+from products.product_analytics.backend.facade.queries import ALLOWED_SESSION_MATH_PROPERTIES
+
+
+def is_session_property_metric(source: Union[EventsNode, ActionsNode]) -> bool:
+    """
+    Session properties need special handling:
+    1. They are read from session.X instead of properties.X.
+    2. They need deduplication per session, so that a session with many events counts once.
+
+    Keep in sync with the session property checks in product_analytics trends/aggregation_operations.py.
+    """
+    if not hasattr(source, "math_property"):
+        return False
+
+    math_property = getattr(source, "math_property", None)
+    if not math_property:
+        return False
+
+    # Backwards compatibility: $session_duration works without explicit math_property_type
+    if math_property == "$session_duration":
+        return True
+
+    math_property_type = getattr(source, "math_property_type", None)
+    return math_property_type == "session_properties" and math_property in ALLOWED_SESSION_MATH_PROPERTIES
+
+
+def validate_session_property(source: Union[EventsNode, ActionsNode]) -> str:
+    """
+    Keep in sync with the session property checks in product_analytics trends/aggregation_operations.py.
+    """
+    math_property = getattr(source, "math_property", None)
+    if not math_property:
+        raise ValueError("No math_property specified for session-level aggregation")
+
+    if math_property not in ALLOWED_SESSION_MATH_PROPERTIES:
+        raise ValueError(
+            f"Invalid session property: {math_property}. "
+            f"Allowed properties are: {', '.join(sorted(ALLOWED_SESSION_MATH_PROPERTIES))}"
+        )
+
+    return math_property
+
+
+def is_continuous(
+    math_type: BaseMathType
+    | FunnelMathType
+    | PropertyMathType
+    | CountPerActorMathType
+    | ExperimentMetricMathType
+    | CalendarHeatmapMathType
+    | GroupMathType
+    | Literal["hogql"]
+    | None,
+) -> bool:
+    if math_type in [
+        ExperimentMetricMathType.SUM,
+        ExperimentMetricMathType.AVG,
+        ExperimentMetricMathType.MIN,
+        ExperimentMetricMathType.MAX,
+    ]:
+        return True
+    return False
+
+
+def is_threshold_supported_math(math_type: ExperimentMetricMathType | None) -> bool:
+    """Whether a per-user value can be meaningfully compared to a threshold.
+
+    Only sum/count produce a per-user accumulation where "did the user reach N"
+    turns cleanly into a binary outcome.
+    """
+    return math_type in [ExperimentMetricMathType.SUM, ExperimentMetricMathType.TOTAL]
+
+
+def get_source_value_expr(
+    source: Union[EventsNode, ActionsNode, ExperimentDataWarehouseNode, ExperimentWarehouseNativeNode],
+) -> ast.Expr:
+    """
+    Return the per-row value that the metric aggregates.
+    """
+    if isinstance(source, ExperimentWarehouseNativeNode):
+        raise ExposedHogQLError("Warehouse-native sources cannot be calculated yet.")
+
+    if isinstance(source, EventsNode) or isinstance(source, ActionsNode):
+        if hasattr(source, "math") and is_continuous(source.math):
+            metric_property = getattr(source, "math_property", None)
+            if metric_property:
+                # Access the property the same way as trends, so that the property groups optimization applies.
+                return ast.Call(name="toFloat", args=[ast.Field(chain=["properties", metric_property])])
+        elif hasattr(source, "math") and source.math == ExperimentMetricMathType.UNIQUE_SESSION:
+            return ast.Field(chain=["$session_id"])
+        elif hasattr(source, "math") and source.math == ExperimentMetricMathType.DAU:
+            return ast.Field(chain=["person_id"])
+        elif (
+            hasattr(source, "math")
+            and source.math == ExperimentMetricMathType.UNIQUE_GROUP
+            and source.math_group_type_index
+        ):
+            return ast.Field(chain=[f"$group_{int(source.math_group_type_index)}"])
+        elif (
+            hasattr(source, "math")
+            and source.math == ExperimentMetricMathType.HOGQL
+            and getattr(source, "math_hogql", None) is not None
+        ):
+            math_hogql = source.math_hogql
+            if math_hogql:
+                tag_contains_user_hogql()
+                _, inner_expr, _, _ = extract_aggregation_and_inner_expr(math_hogql)
+                # The inner expression is evaluated per event row, so any aggregate call
+                # left in it (a compound expression like sum(a) / count(), or a nested
+                # aggregate) would generate invalid SQL and fail in ClickHouse with
+                # NOT_AN_AGGREGATE. Reject it with an actionable error instead.
+                if contains_aggregation(inner_expr):
+                    raise ValidationError(
+                        "HogQL metric expressions must be a single aggregation, e.g. sum(properties.revenue). "
+                        "Compound expressions like sum(a) / count() are not supported."
+                    )
+                return inner_expr
+    elif isinstance(source, ExperimentDataWarehouseNode):
+        metric_property = getattr(source, "math_property", None)
+        if metric_property:
+            tag_contains_user_hogql()
+            parsed = parse_expr(metric_property)
+            # Same constraint as math_hogql above: this is a per-row value expression.
+            if contains_aggregation(parsed):
+                raise ValidationError(
+                    "Data warehouse metric properties cannot contain aggregate functions; "
+                    "reference a column or a per-row expression instead."
+                )
+            return parsed
+
+    # Count metrics: each row contributes 1, so the sum is the event count.
+    return ast.Constant(value=1)
+
+
+def event_or_action_to_filter(
+    team: Team, entity_node: Union[EventsNode, ActionsNode, ExperimentEventExposureConfig]
+) -> ast.Expr:
+    if isinstance(entity_node, ActionsNode):
+        try:
+            action = get_action(action_id=int(entity_node.id), project_id=team.project_id)
+            event_filter = action_to_expr(action)
+        except ActionNotFound:
+            # A missing action matches no events, so that the query still runs.
+            event_filter = ast.Constant(value=False)
+    else:
+        # An event of None means "All events", so there is no event name filter.
+        if entity_node.event is None:
+            event_filter = ast.Constant(value=True)
+        else:
+            event_filter = ast.CompareOperation(
+                op=ast.CompareOperationOp.Eq,
+                left=ast.Field(chain=["event"]),
+                right=ast.Constant(value=entity_node.event),
+            )
+
+    if entity_node.properties:
+        properties = resolve_evaluation_pass_markers(entity_node.properties, team.pk)
+        event_properties = ast.And(exprs=[property_to_expr(property, team) for property in properties])
+        event_filter = ast.And(exprs=[event_filter, event_properties])
+
+    return event_filter
+
+
+def data_warehouse_node_to_filter(team: Team, node: ExperimentDataWarehouseNode) -> ast.Expr:
+    all_properties = []
+
+    if node.properties:
+        all_properties.extend(node.properties)
+
+    if node.fixedProperties:
+        all_properties.extend(node.fixedProperties)
+
+    if not all_properties:
+        return ast.Constant(value=True)
+
+    return property_to_expr(all_properties, team)
+
+
+def conversion_window_to_seconds(conversion_window: int, conversion_window_unit: FunnelConversionWindowTimeUnit) -> int:
+    multipliers = {
+        FunnelConversionWindowTimeUnit.SECOND: 1,
+        FunnelConversionWindowTimeUnit.MINUTE: 60,
+        FunnelConversionWindowTimeUnit.HOUR: 60 * 60,
+        FunnelConversionWindowTimeUnit.DAY: 24 * 60 * 60,
+        FunnelConversionWindowTimeUnit.WEEK: 7 * 24 * 60 * 60,
+        FunnelConversionWindowTimeUnit.MONTH: 30 * 24 * 60 * 60,
+    }
+
+    if conversion_window_unit not in multipliers:
+        raise ValueError(f"Unsupported conversion window unit: {conversion_window_unit}")
+
+    return conversion_window * multipliers[conversion_window_unit]
+
+
+def winsorization_bound_expr(level: float, value: str, *, ignore_zeros: bool = False) -> ast.Expr:
+    """The outlier bound at the percentile `level` of `value` across the entities. `value` is an internal column name,
+    never user input, because it is interpolated into the expression. `quantile_exact_position` mirrors the value that
+    this function picks, so a change of the aggregate here must change that function too."""
+    over = f"if({value} != 0, {value}, null)" if ignore_zeros else value
+    return parse_expr(f"quantileExact({{level}})({over})", placeholders={"level": ast.Constant(value=level)})
+
+
+def quantile_exact_position(level: float, count: int) -> int:
+    """The position, among `count` values in ascending order, of the value that `quantileExact(level)` returns."""
+    # ClickHouse truncates `level * count` computed in double precision, which Python's float multiplication matches.
+    return int(level * count) if level < 1 else count - 1
+
+
+def analysis_window_end(end_date: Optional[datetime], as_of: datetime) -> datetime:
+    """Upper edge of an experiment's analysis window, evaluated at ``as_of``.
+
+    The window can't extend past the evaluation point ``as_of`` nor past the experiment's
+    ``end_date``, so the edge is the earlier of the two (``end_date`` acts as +infinity when unset):
+
+    - running (``end_date is None``)   -> ``as_of``
+    - ``as_of`` at/after ``end_date``  -> ``end_date`` (stopped; the common "view it later" case)
+    - ``as_of`` before ``end_date``    -> ``as_of`` (a timeseries point taken mid-experiment)
+
+    For an ordinary "current results" query the caller passes ``as_of = end_date or now``, so a stopped
+    experiment resolves to ``end_date`` and a running one to ``now``. A recalc passes its frozen run
+    snapshot. A timeseries backfill passes each historical day, which is why an ``as_of`` *below*
+    ``end_date`` must win: the per-day points stay distinct instead of all collapsing onto ``end_date``.
+
+    The function takes values instead of the model on purpose. A caller holding a serialized query whose
+    result is cached under a key hashed from that query (the exposure runner) must pass the query's
+    ``end_date`` here, not live model state. Otherwise the key can describe a window the result wasn't
+    computed for. Callers that hold the model use the :func:`experiment_window_end` wrapper.
+
+    ``as_of`` (and ``end_date`` when set) must be timezone-aware.
+    """
+    if end_date is None:
+        return as_of
+    return min(as_of, end_date)
+
+
+def analysis_window(
+    start_date: Optional[datetime], end_date: Optional[datetime], team: Team, as_of: datetime
+) -> DateRange:
+    """Build an experiment's analysis ``DateRange`` from raw start/end dates.
+
+    Derive every analysis window here. The upper edge always comes from :func:`analysis_window_end`
+    (earlier of ``as_of`` and ``end_date``), so no call site can extend the window past ``end_date``.
+    A draft experiment (no ``start_date``) has no window.
+    """
+    if start_date is None:
+        return DateRange(date_from=None, date_to=None, explicitDate=True)
+
+    resolved_end = analysis_window_end(end_date, as_of)
+
+    if team.timezone:
+        tz = ZoneInfo(team.timezone)
+        start_date = start_date.astimezone(tz)
+        resolved_end = resolved_end.astimezone(tz)
+
+    return DateRange(
+        date_from=start_date.isoformat(),
+        date_to=resolved_end.isoformat(),
+        explicitDate=True,
+    )
+
+
+def rule_for_query(experiment: Experiment) -> Optional[ExperimentRuleConfig]:
+    """The rule that a query of a rule-linked experiment analyses, or None for a legacy experiment.
+
+    A query never falls back to the legacy analysis or to the flag's current config. When the rule cannot
+    be read, or the stored exposure criteria name something the rule analysis cannot count, the query
+    fails with the reason.
+    """
+    if not experiment.is_rule_linked:
+        return None
+    try:
+        rule = get_experiment_rule(experiment)
+    except (ExperimentRuleError, ConfigFormatError) as error:
+        raise ValidationError(f"This experiment's feature flag rule can't be read: {error}") from error
+    criteria_error = rule_exposure_criteria_error(experiment.exposure_criteria)
+    if criteria_error is not None:
+        raise ValidationError(criteria_error)
+    return rule
+
+
+def experiment_window_end(experiment: Experiment, as_of: datetime) -> datetime:
+    """:func:`analysis_window_end` for a caller that holds the experiment model."""
+    return analysis_window_end(experiment.end_date, as_of)
+
+
+def experiment_window(experiment: Experiment, team: Team, as_of: datetime) -> DateRange:
+    """:func:`analysis_window` for a caller that holds the experiment model."""
+    return analysis_window(experiment.start_date, experiment.end_date, team, as_of)
+
+
+def funnel_steps_to_filter(
+    team: Team, funnel_steps: list[EventsNode | ActionsNode | ExperimentDataWarehouseNode]
+) -> ast.Expr:
+    """
+    Match a row if it matches any funnel step.
+
+    Data warehouse steps are skipped because they are not event filters. The funnel query
+    reads them through a separate UNION ALL.
+    """
+    event_and_action_steps = [step for step in funnel_steps if not isinstance(step, ExperimentDataWarehouseNode)]
+
+    if not event_and_action_steps:
+        # Validation should reject a funnel with only data warehouse steps. Return False
+        # if one gets through, because an empty ast.Or is not a valid expression.
+        return ast.Constant(value=False)
+
+    return ast.Or(exprs=[event_or_action_to_filter(team, funnel_step) for funnel_step in event_and_action_steps])
+
+
+def funnel_evaluation_expr(
+    team: Team, funnel_metric: ExperimentFunnelMetric, events_alias: str, include_exposure: bool = False
+) -> ast.Expr:
+    """
+    Evaluate the funnel with the aggregate_funnel_array UDF.
+
+    The expression returns a tuple of (highest step reached, 0-indexed; uuid of that step's event).
+    The `events_alias` table must have precomputed `step_0`, `step_1`, ... columns.
+    """
+
+    if funnel_metric.conversion_window is not None and funnel_metric.conversion_window_unit is not None:
+        conversion_window_seconds = conversion_window_to_seconds(
+            funnel_metric.conversion_window, funnel_metric.conversion_window_unit
+        )
+    else:
+        # Without a conversion window, all events count. 3 years is large enough to act as no limit.
+        conversion_window_seconds = 3 * 365 * 24 * 60 * 60
+
+    num_steps = len(funnel_metric.series)
+    if include_exposure:
+        num_steps += 1
+
+    timestamp_field = f"{events_alias}.timestamp"
+    uuid_field = f"{events_alias}.uuid"
+
+    step_conditions = [f"{i + 1} * {events_alias}.step_{i}" for i in range(num_steps)]
+
+    step_conditions_str = ", ".join(step_conditions)
+
+    # Metrics saved without funnel_order_type use "ordered", the original behavior.
+    funnel_order_type = funnel_metric.funnel_order_type or "ordered"
+
+    # aggregate_funnel_array returns an array of tuples. result.1 is the step reached (0-indexed),
+    # and result.4 is an array of arrays of UUIDs for each step.
+    expression = f"""
+    arraySort(x -> -x.1,
+        arrayMap(
+            result -> tuple(
+                result.1,
+                if(result.1 >= 0 AND length(result.4) > result.1,
+                    if(length(arrayElement(result.4, result.1 + 1)) > 0,
+                        toString(arrayElement(result.4, result.1 + 1)[1]),
+                        ''
+                    ),
+                    ''
+                )
+            ),
+            aggregate_funnel_array(
+                {num_steps},
+                {conversion_window_seconds},
+                'first_touch',
+                '{funnel_order_type}',
+                array(array('')),
+                [],
+                arraySort(t -> t.1, arrayFilter(
+                    t -> isNotNull(t.1) AND isNotNull(t.2),
+                    groupArray(tuple(
+                        toFloat({timestamp_field}),
+                        {uuid_field},
+                        array(''),
+                        arrayFilter(x -> x > 0, [{step_conditions_str}])
+                    ))
+                ))
+            )
+        )
+    )[1]
+    """
+
+    return parse_expr(expression)

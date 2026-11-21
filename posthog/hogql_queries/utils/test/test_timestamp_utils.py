@@ -1,0 +1,715 @@
+import datetime
+from zoneinfo import ZoneInfo
+
+import time_machine
+from posthog.test.base import (
+    APIBaseTest,
+    BaseTest,
+    ClickhouseDestroyTablesMixin,
+    _create_event,
+    flush_persons_and_events,
+)
+from unittest.mock import MagicMock, patch
+
+from django.core.cache import cache
+from django.test import override_settings
+from django.utils import timezone
+
+from dateutil import parser
+from parameterized import parameterized
+
+from posthog.schema import ActionsNode, DataWarehouseNode, DateRange, EventsNode, HogQLQueryModifiers, IntervalType
+
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.clickhouse.query_tagging import Feature, Product, get_query_tags, tags_context
+from posthog.hogql_queries.utils.query_date_range import QueryDateRange
+from posthog.hogql_queries.utils.timestamp_utils import (
+    EARLIEST_EVENT_TIMESTAMP,
+    _coerce_to_datetime,
+    _events_route_cache_key,
+    _events_route_modifiers,
+    _get_earliest_timestamp_cache_key,
+    format_label_date,
+    get_earliest_timestamp_from_series,
+    get_earliest_timestamp_unfiltered,
+)
+from posthog.models.event.new_events_schema import events_route_scope
+from posthog.models.instance_setting import override_instance_config
+from posthog.models.team import WeekStartDay
+
+from products.actions.backend.facade.testing import create_action
+from products.data_modeling.backend.facade.models import DataModelingJob, DataModelingJobStatus, DataWarehouseSavedQuery
+
+
+@override_settings(IN_UNIT_TESTING=True)
+class TestTimestampUtils(APIBaseTest, ClickhouseDestroyTablesMixin):
+    def tearDown(self):
+        super().tearDown()
+        # Clear the cache after each test to avoid interference
+        cache.clear()
+
+    def test_format_label_date_with_hour_interval(self):
+        date = datetime.datetime(2022, 12, 31, 23, 59)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2022-12-30 00:00:00", date_to="2023-01-01 23:59:59"),
+            interval=IntervalType.HOUR,
+            now=parser.isoparse("2025-06-21T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+        assert formatted_date == "31-Dec 23:59"
+
+    def test_format_label_date_with_month_interval(self):
+        date = datetime.datetime(2022, 12, 31)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2022-12-01 00:00:00", date_to="2022-12-31 23:59:59"),
+            interval=IntervalType.MONTH,
+            now=parser.isoparse("2025-06-21T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+        assert formatted_date == "Dec 2022"
+
+    def test_format_label_date_with_day_interval(self):
+        date = datetime.datetime(2022, 12, 31)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2022-01-01 00:00:00", date_to="2022-12-31 23:59:59"),
+            interval=IntervalType.DAY,
+            now=parser.isoparse("2025-06-21T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+        assert formatted_date == "31-Dec-2022"
+
+    def test_format_label_date_with_date_input(self):
+        date = datetime.date(2022, 12, 31)
+
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2022-01-01 00:00:00", date_to="2022-12-31 23:59:59"),
+            interval=IntervalType.DAY,
+            now=parser.isoparse("2025-06-21T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)  # type: ignore[arg-type]
+        assert formatted_date == "31-Dec-2022"
+
+    def test_format_label_date_with_missing_interval(self):
+        date = datetime.datetime(2022, 12, 31)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2022-01-01 00:00:00", date_to="2022-12-31 23:59:59"),
+            interval=None,
+            now=parser.isoparse("2025-06-21T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+        assert formatted_date == "31-Dec-2022"
+
+    def test_format_label_date_with_week_interval_and_date_input(self):
+        date = datetime.date(2025, 6, 11)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2025-01-01 00:00:00", date_to="2025-06-30 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)  # type: ignore[arg-type]
+        assert formatted_date == "8–14 Jun"
+
+    def test_format_label_date_with_week_interval_same_month_and_year(self):
+        date = datetime.datetime(2025, 6, 11)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2025-01-01 00:00:00", date_to="2025-06-30 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+        assert formatted_date == "8–14 Jun"
+
+    def test_format_label_date_with_week_interval_different_months_same_year(self):
+        date = datetime.datetime(2025, 4, 30)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2025-04-01 00:00:00", date_to="2025-06-30 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+
+        # Since the week starts on Sunday, the week containing April 30, 2025, is from April 27 to May 3.
+        assert formatted_date == "27-Apr – 3-May"
+
+    def test_format_label_date_with_week_interval_different_years(self):
+        date = datetime.datetime(2025, 1, 1)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2024-12-01 00:00:00", date_to="2025-01-31 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+
+        # Since the week starts on Sunday, the week containing January 5, 2025, is from December 29, 2024, to January 4, 2025.
+        assert formatted_date == "29-Dec-2024 – 4-Jan-2025"
+
+    def test_format_label_date_with_week_interval_same_day_start_and_end(self):
+        date = datetime.datetime(2025, 6, 11)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2025-06-11 00:00:00", date_to="2025-06-11 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+
+        assert formatted_date == "11-Jun-2025"
+
+    def test_format_label_date_with_week_interval_bounded_by_date_range(self):
+        date = datetime.datetime(2025, 6, 11)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2025-06-10 00:00:00", date_to="2025-06-12 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+
+        assert formatted_date == "10–12 Jun"
+
+    def test_format_label_date_with_week_interval_date_to_before_from(self):
+        date = datetime.datetime(2025, 6, 11)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2025-06-01 00:00:00", date_to="2025-06-07 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.SUNDAY)
+
+        # Since the week starts on Sunday, the week containing June 11, 2025, is from June 8 to June 14.
+        # The date_to limits the range to June 7, so we can't return a whole week.
+        # The expected output should be the week start date, which is June 8, 2025.
+
+        assert formatted_date == "8-Jun-2025"
+
+    def test_format_label_date_with_week_interval_default_week_start(self):
+        date = datetime.datetime(2025, 6, 11)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2025-06-01 00:00:00", date_to="2025-06-30 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range)
+
+        # Default week start is Sunday
+        assert formatted_date == "8–14 Jun"
+
+    def test_format_label_date_with_week_interval_monday_week_start(self):
+        date = datetime.datetime(2025, 6, 11)
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="2025-06-01 00:00:00", date_to="2025-06-30 23:59:59"),
+            interval=IntervalType.WEEK,
+            now=parser.isoparse("2025-06-30T00:00:00.000Z"),
+        )
+        formatted_date = format_label_date(date, query_date_range, WeekStartDay.MONDAY)
+
+        # Since the week starts on Monday, the week containing June 11, 2025, is from June 9 to June 15.
+        assert formatted_date == "9–15 Jun"
+
+    def test_returns_earliest_timestamp_one_node(self):
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2021-01-01T12:00:00Z",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2022-01-01T12:00:00Z",
+        )
+        flush_persons_and_events()
+
+        series = [
+            EventsNode(event="$pageview"),
+        ]
+        earliest_timestamp = get_earliest_timestamp_from_series(self.team, series)
+
+        self.assertEqual(earliest_timestamp, datetime.datetime(2021, 1, 1, 12, 0, 0, tzinfo=datetime.UTC))
+
+    def test_returns_earliest_timestamp_series_nodes(self):
+        _create_event(
+            team=self.team,
+            event="$pageleave",
+            distinct_id="person1",
+            timestamp="2020-01-01T12:00:00Z",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2022-01-01T12:00:00Z",
+        )
+        flush_persons_and_events()
+
+        series = [
+            EventsNode(event="$pageview"),
+            EventsNode(event="$pageleave"),
+        ]
+        earliest_timestamp = get_earliest_timestamp_from_series(self.team, series)
+        self.assertEqual(earliest_timestamp, datetime.datetime(2020, 1, 1, 12, 0, 0, tzinfo=datetime.UTC))
+
+        earliest_timestamp_pageview = get_earliest_timestamp_from_series(self.team, [EventsNode(event="$pageview")])
+        self.assertEqual(earliest_timestamp_pageview, datetime.datetime(2022, 1, 1, 12, 0, 0, tzinfo=datetime.UTC))
+        earliest_timestamp_pageleave = get_earliest_timestamp_from_series(self.team, [EventsNode(event="$pageleave")])
+        self.assertEqual(earliest_timestamp_pageleave, datetime.datetime(2020, 1, 1, 12, 0, 0, tzinfo=datetime.UTC))
+
+    def test_returns_earliest_timestamp_for_all_events(self):
+        """Test that event=None returns earliest across ALL events"""
+        _create_event(
+            team=self.team,
+            event="$pageleave",
+            distinct_id="person1",
+            timestamp="2020-01-01T12:00:00Z",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2022-01-01T12:00:00Z",
+        )
+        flush_persons_and_events()
+
+        # When event is None, it should return the earliest timestamp across ALL events
+        earliest_timestamp = get_earliest_timestamp_from_series(self.team, [EventsNode(event=None)])
+        self.assertEqual(earliest_timestamp, datetime.datetime(2020, 1, 1, 12, 0, 0, tzinfo=datetime.UTC))
+
+    def test_returns_earliest_timestamp_multiple_actions(self):
+        """Test that multiple actions return the earliest timestamp across all actions"""
+        action1 = create_action(team=self.team, name="Action 1", steps_json=[{"event": "$pageview"}])
+        action2 = create_action(team=self.team, name="Action 2", steps_json=[{"event": "$pageleave"}])
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2022-01-01T12:00:00Z",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageleave",
+            distinct_id="person1",
+            timestamp="2020-01-01T12:00:00Z",
+        )
+        flush_persons_and_events()
+
+        series = [ActionsNode(id=action1.id), ActionsNode(id=action2.id)]
+        earliest_timestamp = get_earliest_timestamp_from_series(self.team, series)
+        self.assertEqual(earliest_timestamp, datetime.datetime(2020, 1, 1, 12, 0, 0, tzinfo=datetime.UTC))
+
+    def test_returns_earliest_timestamp_mixed_nodes(self):
+        """Test that mixing EventsNode and ActionsNode returns earliest timestamp across all"""
+        action = create_action(team=self.team, name="Action 1", steps_json=[{"event": "$pageview"}])
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2022-01-01T12:00:00Z",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageleave",
+            distinct_id="person1",
+            timestamp="2019-01-01T12:00:00Z",
+        )
+        flush_persons_and_events()
+
+        series: list[ActionsNode | EventsNode] = [ActionsNode(id=action.id), EventsNode(event="$pageleave")]
+        earliest_timestamp = get_earliest_timestamp_from_series(self.team, series)
+        self.assertEqual(earliest_timestamp, datetime.datetime(2019, 1, 1, 12, 0, 0, tzinfo=datetime.UTC))
+
+    def test_caches_earliest_timestamp(self):
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2021-01-01T12:00:00Z",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2022-01-01T12:00:00Z",
+        )
+        flush_persons_and_events()
+
+        series = [
+            EventsNode(event="$pageview"),
+        ]
+        earliest_timestamp = get_earliest_timestamp_from_series(self.team, series)
+
+        # create an earlier event to test caching
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="person1",
+            timestamp="2020-01-01T12:00:00Z",
+        )
+        flush_persons_and_events()
+
+        # should still return the earliest timestamp from the first query
+        cached_earliest_timestamp = get_earliest_timestamp_from_series(self.team, series)
+        self.assertEqual(cached_earliest_timestamp, earliest_timestamp)
+
+    @time_machine.travel("2021-01-21", tick=False)
+    def test_unfiltered_earliest_timestamp_returns_earliest_event(self):
+        _create_event(team=self.team, event="sign up", distinct_id="1", timestamp="2020-01-04T14:10:00Z")
+        _create_event(team=self.team, event="sign up", distinct_id="1", timestamp="2020-01-06T14:10:00Z")
+        flush_persons_and_events()
+
+        assert get_earliest_timestamp_unfiltered(self.team) == datetime.datetime(
+            2020, 1, 4, 14, 10, tzinfo=datetime.UTC
+        )
+
+    @time_machine.travel("2021-01-21", tick=False)
+    def test_unfiltered_earliest_timestamp_floors_at_2015(self):
+        # Events before 2015-01-01 are treated as corrupt and ignored.
+        _create_event(team=self.team, event="sign up", distinct_id="1", timestamp="1984-01-06T14:10:00Z")
+        _create_event(team=self.team, event="sign up", distinct_id="1", timestamp="2014-01-01T01:00:00Z")
+        _create_event(team=self.team, event="sign up", distinct_id="1", timestamp="2015-01-01T01:00:00Z")
+        _create_event(team=self.team, event="sign up", distinct_id="1", timestamp="2020-01-04T14:10:00Z")
+        flush_persons_and_events()
+
+        assert get_earliest_timestamp_unfiltered(self.team) == datetime.datetime(2015, 1, 1, 1, tzinfo=datetime.UTC)
+
+    @time_machine.travel("2021-01-21", tick=False)
+    def test_unfiltered_earliest_timestamp_falls_back_when_no_events(self):
+        # No events: fall back to now - DEFAULT_EARLIEST_TIME_DELTA (one week).
+        assert get_earliest_timestamp_unfiltered(self.team) == datetime.datetime(2021, 1, 14, tzinfo=datetime.UTC)
+
+    @time_machine.travel("2021-01-21", tick=False)
+    def test_unfiltered_earliest_timestamp_caches_real_result(self):
+        _create_event(team=self.team, event="sign up", distinct_id="1", timestamp="2021-01-01T12:00:00Z")
+        flush_persons_and_events()
+
+        earliest_timestamp = get_earliest_timestamp_unfiltered(self.team)
+
+        # A later-added earlier event should not change the cached value within the TTL.
+        _create_event(team=self.team, event="sign up", distinct_id="1", timestamp="2020-01-01T12:00:00Z")
+        flush_persons_and_events()
+
+        assert get_earliest_timestamp_unfiltered(self.team) == earliest_timestamp
+
+    def test_unfiltered_earliest_timestamp_reads_in_sort_key_order(self):
+        printed: list[str | None] = []
+        lookups: list[str | None] = []
+
+        def run(*args, **kwargs):
+            lookups.append(get_query_tags().lookup)
+            response = execute_hogql_query(*args, **kwargs)
+            printed.append(response.clickhouse)
+            return response
+
+        with patch("posthog.hogql_queries.utils.timestamp_utils.execute_hogql_query", side_effect=run):
+            get_earliest_timestamp_unfiltered(self.team)
+
+        assert printed[0] is not None
+        self.assertRegex(
+            printed[0],
+            r"ORDER BY\s+toDate\(events\.timestamp\) ASC,\s+toTimeZone\(events\.timestamp, %\(hogql_val_\d+\)s\) ASC\s+LIMIT 1",
+        )
+        self.assertEqual(lookups, ["earliest_timestamp"])
+
+    @parameterized.expand(
+        [
+            # Naive inputs are interpreted in the passed (team) timezone, not UTC.
+            (
+                "naive_datetime",
+                datetime.datetime(2023, 5, 1, 12, 30, 0),
+                datetime.datetime(2023, 5, 1, 12, 30, 0, tzinfo=ZoneInfo("America/New_York")),
+            ),
+            (
+                "aware_datetime",
+                datetime.datetime(2023, 5, 1, 12, 30, 0, tzinfo=datetime.UTC),
+                datetime.datetime(2023, 5, 1, 12, 30, 0, tzinfo=datetime.UTC),
+            ),
+            (
+                "date",
+                datetime.date(2023, 5, 1),
+                datetime.datetime(2023, 5, 1, 0, 0, 0, tzinfo=ZoneInfo("America/New_York")),
+            ),
+            (
+                "string",
+                "2023-05-01 12:30:00",
+                datetime.datetime(2023, 5, 1, 12, 30, 0, tzinfo=ZoneInfo("America/New_York")),
+            ),
+            (
+                "date_string",
+                "2023-05-01",
+                datetime.datetime(2023, 5, 1, 0, 0, 0, tzinfo=ZoneInfo("America/New_York")),
+            ),
+            ("none", None, EARLIEST_EVENT_TIMESTAMP),
+            ("unsupported", 12345, EARLIEST_EVENT_TIMESTAMP),
+            ("unparseable_na", "N/A", EARLIEST_EVENT_TIMESTAMP),
+            ("unparseable_null", "null", EARLIEST_EVENT_TIMESTAMP),
+            ("unparseable_empty", "", EARLIEST_EVENT_TIMESTAMP),
+            ("unparseable_freeform", "not a date at all", EARLIEST_EVENT_TIMESTAMP),
+        ]
+    )
+    def test_coerce_to_datetime(self, _name, value, expected):
+        result = _coerce_to_datetime(value, ZoneInfo("America/New_York"))
+        self.assertEqual(result, expected)
+        # Must be timezone-aware so it can be compared against the tz-aware date_to.
+        self.assertIsNotNone(result.tzinfo)
+
+    @parameterized.expand(
+        [
+            (
+                "string_column_parses_as_dates",
+                "formatDateTime(timestamp, '%m/%d/%Y')",
+                {"hogql": "StringDatabaseField", "clickhouse": "String", "valid": True},
+                datetime.datetime(2023, 12, 30, tzinfo=datetime.UTC),
+            ),
+            (
+                "datetime64_column_keeps_subseconds",
+                "timestamp",
+                {"hogql": "DateTimeDatabaseField", "clickhouse": "DateTime64(6, 'UTC')", "valid": True},
+                datetime.datetime(2023, 12, 30, 0, 0, 0, 500000, tzinfo=datetime.UTC),
+            ),
+        ]
+    )
+    def test_data_warehouse_all_time_reads_earliest_by_column_type(self, _name, created_at_expr, column, expected):
+        for timestamp in ("2023-12-30T00:00:00.500Z", "2026-01-15T09:00:00Z"):
+            _create_event(team=self.team, event="order_placed", distinct_id="person1", timestamp=timestamp)
+        flush_persons_and_events()
+        DataWarehouseSavedQuery.objects.create(
+            team=self.team,
+            name="orders_view",
+            query={"kind": "HogQLQuery", "query": f"SELECT {created_at_expr} AS created_at FROM events"},
+            columns={"created_at": column},
+        )
+        node = DataWarehouseNode(
+            id="orders_view",
+            table_name="orders_view",
+            id_field="created_at",
+            distinct_id_field="created_at",
+            timestamp_field="created_at",
+        )
+
+        earliest_timestamp = get_earliest_timestamp_from_series(self.team, [node])
+
+        self.assertEqual(earliest_timestamp, expected)
+
+    @parameterized.expand(
+        [
+            ("string_timestamp", "2022-03-15 08:00:00", datetime.datetime(2022, 3, 15, 8, 0, 0, tzinfo=datetime.UTC)),
+            ("date_only_string", "2022-03-15", datetime.datetime(2022, 3, 15, 0, 0, 0, tzinfo=datetime.UTC)),
+            ("date_object", datetime.date(2022, 3, 15), datetime.datetime(2022, 3, 15, 0, 0, 0, tzinfo=datetime.UTC)),
+        ]
+    )
+    def test_data_warehouse_all_time_resolves_string_timestamp(self, _name, raw_value, expected):
+        # Data warehouse tables can return a non-datetime min(timestamp); it must be
+        # coerced before reaching QueryDateRange, which calls .strftime() and compares with <.
+        DataWarehouseSavedQuery.objects.create(
+            team=self.team,
+            name="dw_table",
+            query={"kind": "HogQLQuery", "query": "SELECT '' AS ts"},
+            columns={"ts": {"hogql": "StringDatabaseField", "clickhouse": "String", "valid": True}},
+        )
+        node = DataWarehouseNode(
+            id="dw_table",
+            table_name="dw_table",
+            id_field="id",
+            distinct_id_field="distinct_id",
+            timestamp_field="ts",
+        )
+
+        with patch("posthog.hogql_queries.utils.timestamp_utils.execute_hogql_query") as mock_execute:
+            mock_execute.return_value.results = [[raw_value]]
+
+            earliest_timestamp = get_earliest_timestamp_from_series(self.team, [node])
+
+        self.assertIsInstance(earliest_timestamp, datetime.datetime)
+        self.assertEqual(earliest_timestamp, expected)
+
+        query_date_range = QueryDateRange(
+            team=self.team,
+            date_range=DateRange(date_from="all"),
+            interval=IntervalType.DAY,
+            now=parser.isoparse("2025-06-21T00:00:00.000Z"),
+            earliest_timestamp_fallback=earliest_timestamp,
+        )
+
+        # These previously raised AttributeError / TypeError when date_from="all"
+        # resolved to a str instead of a datetime.
+        self.assertEqual(query_date_range.date_from(), expected)
+        self.assertEqual(query_date_range.date_from_str, expected.strftime("%Y-%m-%d %H:%M:%S"))
+        # A Date-typed column yields a naive datetime; comparing it against the tz-aware
+        # date_to raised "can't compare offset-naive and offset-aware datetimes" here.
+        self.assertGreater(len(query_date_range.all_values()), 0)
+
+    @parameterized.expand([("view_edited",), ("view_materialized_again",)])
+    def test_data_warehouse_view_change_refreshes_cached_earliest_timestamp(self, change):
+        view = DataWarehouseSavedQuery.objects.create(
+            team=self.team, name="orders_view", query={"kind": "HogQLQuery", "query": "SELECT 1 AS id"}
+        )
+        node = DataWarehouseNode(
+            id="orders_view",
+            table_name="orders_view",
+            id_field="id",
+            distinct_id_field="id",
+            timestamp_field="created_at",
+        )
+        before_change = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
+        after_change = datetime.datetime(2022, 1, 1, tzinfo=datetime.UTC)
+
+        with patch("posthog.hogql_queries.utils.timestamp_utils.execute_hogql_query") as mock_execute:
+            mock_execute.return_value.results = [[before_change]]
+            self.assertEqual(get_earliest_timestamp_from_series(self.team, [node]), before_change)
+
+            mock_execute.return_value.results = [[after_change]]
+            self.assertEqual(get_earliest_timestamp_from_series(self.team, [node]), before_change)
+
+            if change == "view_edited":
+                view.query = {"kind": "HogQLQuery", "query": "SELECT 2 AS id"}
+                view.save()
+            else:
+                DataModelingJob.objects.create(
+                    team=self.team, saved_query=view, status=DataModelingJobStatus.COMPLETED, last_run_at=timezone.now()
+                )
+
+            self.assertEqual(get_earliest_timestamp_from_series(self.team, [node]), after_change)
+
+    def test_cached_raw_value_is_coerced_on_read(self):
+        # Entries cached before the coercion fix shipped hold a raw str/date for up to the
+        # TTL window. A cache hit must still pass through _coerce_to_datetime instead of
+        # returning the raw value, otherwise downstream date math hits AttributeError/TypeError.
+        node = EventsNode(event="$pageview")
+        cache_key = _events_route_cache_key(
+            self.team, _events_route_modifiers(self.team), _get_earliest_timestamp_cache_key(self.team, node)
+        )
+        # team timezone is UTC in tests; "2021-03-15" is the pre-fix raw Date/String shape.
+        cache.set(cache_key, "2021-03-15", timeout=3600)
+
+        result = get_earliest_timestamp_from_series(self.team, [node])
+
+        self.assertIsInstance(result, datetime.datetime)
+        self.assertEqual(result, datetime.datetime(2021, 3, 15, 0, 0, 0, tzinfo=datetime.UTC))
+
+    @parameterized.expand(
+        [
+            # No caller tags: the earliest-timestamp query must still carry product/feature,
+            # otherwise it raises UntaggedQueryError in dev for uncached series.
+            ("fills_defaults_when_unset", None, None, Product.PRODUCT_ANALYTICS, Feature.INSIGHT),
+            # Caller already attributed the query (e.g. marketing analytics): keep their tags.
+            (
+                "preserves_caller_tags",
+                Product.MARKETING_ANALYTICS,
+                Feature.QUERY,
+                Product.MARKETING_ANALYTICS,
+                Feature.QUERY,
+            ),
+        ]
+    )
+    def test_single_path_query_tags(self, _name, caller_product, caller_feature, expected_product, expected_feature):
+        captured: dict[str, object] = {}
+
+        def capture(query, team, user=None, modifiers=None):
+            tags = get_query_tags()
+            captured["product"] = tags.product
+            captured["feature"] = tags.feature
+            captured["lookup"] = tags.lookup
+            result = MagicMock()
+            result.results = [[datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)]]
+            return result
+
+        with tags_context(product=caller_product, feature=caller_feature):
+            with patch(
+                "posthog.hogql_queries.utils.timestamp_utils.execute_hogql_query",
+                side_effect=capture,
+            ):
+                get_earliest_timestamp_from_series(self.team, [EventsNode(event="$pageview")])
+
+        self.assertEqual(captured["product"], expected_product)
+        self.assertEqual(captured["feature"], expected_feature)
+        self.assertEqual(captured["lookup"], "earliest_timestamp")
+
+
+class TestEarliestTimestampRouting(BaseTest):
+    def tearDown(self):
+        super().tearDown()
+        cache.clear()
+
+    @parameterized.expand([("series",), ("unfiltered",)])
+    @override_settings(CLICKHOUSE_HOGQL_USE_NEW_EVENTS_SCHEMA=False)
+    def test_native_route_reads_events_json_and_skips_the_legacy_cache(self, lookup: str) -> None:
+        node = EventsNode(event="$pageview")
+        legacy = datetime.datetime(2022, 1, 1, tzinfo=ZoneInfo("UTC"))
+        native = datetime.datetime(2020, 1, 1, tzinfo=ZoneInfo("UTC"))
+        if lookup == "series":
+            cache.set(_get_earliest_timestamp_cache_key(self.team, node), legacy)
+        else:
+            cache.set(f"earliest_timestamp_unfiltered_{self.team.pk}", legacy)
+
+        def earliest() -> datetime.datetime:
+            if lookup == "series":
+                return get_earliest_timestamp_from_series(self.team, [node])
+            return get_earliest_timestamp_unfiltered(self.team)
+
+        with patch(
+            "posthog.hogql.query.sync_execute", return_value=([(native,)], [("timestamp", "DateTime")])
+        ) as execute:
+            with events_route_scope(HogQLQueryModifiers(useNewEventsSchema=True)):
+                self.assertEqual(earliest(), native)
+                self.assertEqual(earliest(), native)
+            self.assertEqual(earliest(), legacy)
+        execute.assert_called_once()
+        self.assertIn("events_json", execute.call_args.args[0])
+
+    def test_route_keys_never_collide_with_legacy_event_keys(self) -> None:
+        legacy_events_json_event = datetime.datetime(2022, 1, 1, tzinfo=ZoneInfo("UTC"))
+        cache.set(
+            _get_earliest_timestamp_cache_key(self.team, EventsNode(event="events_json")), legacy_events_json_event
+        )
+        native = datetime.datetime(2020, 1, 1, tzinfo=ZoneInfo("UTC"))
+        with (
+            patch("posthog.hogql.query.sync_execute", return_value=([(native,)], [("timestamp", "DateTime")])),
+            events_route_scope(HogQLQueryModifiers(useNewEventsSchema=True)),
+        ):
+            self.assertEqual(get_earliest_timestamp_from_series(self.team, [EventsNode(event=None)]), native)
+
+    @parameterized.expand(
+        [
+            ("allowlisted_project", True, {}, True),
+            ("stored_project_modifier_is_ignored", False, {"useNewEventsSchema": True}, False),
+        ]
+    )
+    @override_settings(CLICKHOUSE_HOGQL_USE_NEW_EVENTS_SCHEMA=False)
+    def test_lookup_outside_a_run_keys_on_the_events_table_it_reads(
+        self, _name: str, allowlisted: bool, team_modifiers: dict[str, bool], reads_events_json: bool
+    ) -> None:
+        self.team.modifiers = team_modifiers
+        node = EventsNode(event="$pageview")
+        legacy = datetime.datetime(2022, 1, 1, tzinfo=ZoneInfo("UTC"))
+        native = datetime.datetime(2020, 1, 1, tzinfo=ZoneInfo("UTC"))
+        cache.set(_get_earliest_timestamp_cache_key(self.team, node), legacy)
+        with (
+            override_instance_config(
+                "CLICKHOUSE_HOGQL_USE_NEW_EVENTS_SCHEMA_TEAMS", str(self.team.pk) if allowlisted else ""
+            ),
+            patch(
+                "posthog.hogql.query.sync_execute", return_value=([(native,)], [("timestamp", "DateTime")])
+            ) as execute,
+        ):
+            earliest = get_earliest_timestamp_from_series(self.team, [node])
+        if reads_events_json:
+            self.assertEqual(earliest, native)
+            self.assertIn("events_json", execute.call_args.args[0])
+        else:
+            self.assertEqual(earliest, legacy)
+            execute.assert_not_called()

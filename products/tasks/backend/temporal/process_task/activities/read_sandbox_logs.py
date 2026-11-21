@@ -1,0 +1,145 @@
+import json
+import time
+import logging
+from dataclasses import dataclass
+
+from temporalio import activity
+
+from posthog.temporal.common.utils import asyncify
+
+from products.tasks.backend.exceptions import SandboxNotRunningError
+from products.tasks.backend.logic.services.memory_watchdog import parse_memory_watchdog_read_output
+from products.tasks.backend.logic.services.sandbox import SandboxBase, get_sandbox_class_for_sandbox_id
+from products.tasks.backend.logic.services.sandbox_teardown_stats import (
+    build_sandbox_teardown_read_command,
+    parse_sandbox_teardown_stats,
+    split_sandbox_teardown_read_output,
+)
+from products.tasks.backend.temporal.metrics import (
+    increment_memory_watchdog_events,
+    increment_memory_watchdog_teardown,
+    record_memory_peak_ratio,
+    record_sandbox_cpu_pressure_ratio,
+    record_sandbox_network_bytes,
+)
+from products.tasks.backend.temporal.observability import log_activity_execution
+
+logger = logging.getLogger(__name__)
+
+MAX_LOG_SIZE = 50_000
+
+
+@dataclass
+class ReadSandboxLogsInput:
+    sandbox_id: str
+    run_id: str | None = None
+
+
+SANDBOX_TERMINATED_MESSAGE = "Sandbox terminated before logs could be captured; no agent-server logs available."
+
+
+def _report_memory_watchdog(stdout: str, sandbox_id: str, run_id: str | None) -> None:
+    summary = parse_memory_watchdog_read_output(stdout, time.time())
+    logger.info(
+        f"Sandbox memory watchdog summary run_id={run_id} sandbox_id={sandbox_id} kills={summary.kill_count} "
+        f"no_target={summary.no_target} pressure_episodes={summary.pressure_episodes} "
+        f"peak_ratio={summary.peak_ratio} alive={summary.alive} source={summary.source}"
+    )
+    increment_memory_watchdog_teardown(summary.status)
+    increment_memory_watchdog_events("kill", summary.kill_count)
+    increment_memory_watchdog_events("no_target", summary.no_target)
+    increment_memory_watchdog_events("pressure", summary.pressure_episodes)
+    if summary.peak_ratio is not None:
+        record_memory_peak_ratio(summary.peak_ratio)
+
+
+def _report_teardown_stats(stdout: str, sandbox_id: str, run_id: str | None) -> None:
+    stats = parse_sandbox_teardown_stats(stdout)
+    logger.info(
+        f"Sandbox teardown stats run_id={run_id} sandbox_id={sandbox_id} rx_bytes={stats.rx_bytes} "
+        f"tx_bytes={stats.tx_bytes} cpu_pressure_ratio={stats.cpu_pressure_ratio}"
+    )
+    if stats.rx_bytes is not None:
+        record_sandbox_network_bytes("rx", stats.rx_bytes)
+    if stats.tx_bytes is not None:
+        record_sandbox_network_bytes("tx", stats.tx_bytes)
+    if stats.cpu_pressure_ratio is not None:
+        record_sandbox_cpu_pressure_ratio(stats.cpu_pressure_ratio)
+
+
+def _report_teardown(sandbox: SandboxBase, sandbox_id: str, run_id: str | None) -> None:
+    result = sandbox.execute(build_sandbox_teardown_read_command(), timeout_seconds=10)
+    output = split_sandbox_teardown_read_output(result.stdout)
+    _report_memory_watchdog(output.watchdog_output, sandbox_id, run_id)
+    _report_teardown_stats(output.stats_output, sandbox_id, run_id)
+
+
+@activity.defn
+@asyncify
+def read_sandbox_logs(input: ReadSandboxLogsInput) -> str:
+    """Read agent-server logs from the sandbox before it's destroyed."""
+    with log_activity_execution(
+        "read_sandbox_logs",
+        sandbox_id=input.sandbox_id,
+    ):
+        try:
+            sandbox = get_sandbox_class_for_sandbox_id(input.sandbox_id).get_by_id(input.sandbox_id)
+            if not sandbox.is_running():
+                logger.info(f"Sandbox {input.sandbox_id} already terminated; skipping log capture")
+                return SANDBOX_TERMINATED_MESSAGE
+            result = sandbox.execute(
+                f"tail -c {MAX_LOG_SIZE} /tmp/agent-server.log 2>/dev/null || echo 'No log file found'",
+                timeout_seconds=10,
+            )
+            logs = result.stdout.strip()
+            if logs:
+                logger.info(f"Sandbox {input.sandbox_id} agent-server logs:\n{logs}")
+
+            # agentsh diagnostics
+            agentsh_result = sandbox.execute(
+                "cat /var/log/agentsh/agentsh.log 2>/dev/null || true",
+                timeout_seconds=10,
+            )
+            agentsh_logs = agentsh_result.stdout.strip()
+            if agentsh_logs:
+                logger.info(f"Sandbox {input.sandbox_id} agentsh diagnostics:\n{agentsh_logs}")
+                if input.run_id:
+                    from products.tasks.backend.temporal.observability import emit_agent_log
+
+                    emit_agent_log(input.run_id, "debug", f"agentsh logs:\n{agentsh_logs[:2000]}")
+
+            # agentsh audit events (network policy decisions)
+            try:
+                from products.tasks.backend.logic.services.agentsh import build_audit_query_command
+
+                audit_result = sandbox.execute(build_audit_query_command(), timeout_seconds=10)
+                audit_output = audit_result.stdout.strip()
+                if audit_output and audit_output != "[]":
+                    events = json.loads(audit_output)
+                    lines = []
+                    for e in events:
+                        decision = (e.get("effective_decision") or "").upper()
+                        domain = e.get("domain") or e.get("remote") or "unknown"
+                        rule = e.get("policy_rule") or ""
+                        etype = e.get("type") or ""
+                        lines.append(f"  {decision:5s} {domain} (rule: {rule}, type: {etype})")
+                    if lines:
+                        msg = "agentsh network events:\n" + "\n".join(lines)
+                        logger.info(f"Sandbox {input.sandbox_id} {msg}")
+                        if input.run_id:
+                            emit_agent_log(input.run_id, "debug", msg)
+            except Exception:
+                logger.debug("agentsh audit query failed for sandbox %s", input.sandbox_id, exc_info=True)
+
+            try:
+                _report_teardown(sandbox, input.sandbox_id, input.run_id)
+            except Exception:
+                logger.warning("Teardown stats failed for sandbox %s", input.sandbox_id, exc_info=True)
+
+            return logs
+        except SandboxNotRunningError:
+            logger.info(f"Sandbox {input.sandbox_id} terminated mid-capture; no logs available")
+            return SANDBOX_TERMINATED_MESSAGE
+        except Exception as e:
+            logger.warning(f"Failed to read sandbox logs: {e}")
+            return f"Failed to read logs: {e}"

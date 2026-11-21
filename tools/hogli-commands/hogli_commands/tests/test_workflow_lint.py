@@ -1,0 +1,2909 @@
+"""Tests for the workflow_lint package.
+
+These tests are fully isolated — each rule gets a passing fixture and a
+failing fixture written to a tmp_path. Avoids touching the live repo state
+except for one smoke test against ``.github/workflows/`` which exercises the
+parser end-to-end.
+"""
+
+from __future__ import annotations
+
+import textwrap
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from click.testing import CliRunner
+from hogli_commands.workflow_lint.check import CheckResult, WorkflowCheck
+from hogli_commands.workflow_lint.checks import (
+    CHECKS,
+    _build_lookup,
+    get_check,
+    shell_split_action_args as _ssaa,
+)
+from hogli_commands.workflow_lint.checks.cache_writes import (
+    _can_run_on_branch_ref,
+    _is_gated,
+    _push_trigger_is_default_only,
+    _violation_kind,
+    _write_kind,
+)
+from hogli_commands.workflow_lint.checks.checkout_full_depth import CheckoutFullDepthCheck
+from hogli_commands.workflow_lint.checks.dorny_negation import DornyNegationCheck
+from hogli_commands.workflow_lint.checks.job_timeouts import JobTimeoutsCheck
+from hogli_commands.workflow_lint.checks.mcp_filter_coverage import McpFilterCoverageCheck, _resolve
+from hogli_commands.workflow_lint.checks.paused_public_image_pulls import PausedPublicImagePullsCheck
+from hogli_commands.workflow_lint.checks.pinned_runner_images import PinnedRunnerImagesCheck
+from hogli_commands.workflow_lint.checks.pr_concurrency import PrConcurrencyCheck
+from hogli_commands.workflow_lint.checks.pr_event_fanout import PrEventFanoutCheck
+from hogli_commands.workflow_lint.checks.required_gates import RequiredGateCheck
+from hogli_commands.workflow_lint.checks.reusable_secret_passthrough import ReusableSecretPassthroughCheck
+from hogli_commands.workflow_lint.checks.semgrep_services_coverage import SemgrepServicesCoverageCheck
+from hogli_commands.workflow_lint.checks.shell_split_action_args import (
+    SHELL_SPLIT_INPUTS,
+    ShellSplitActionArgsCheck,
+    derive_shell_split_inputs,
+    unparseable_actions,
+)
+from hogli_commands.workflow_lint.checks.storybook_static_dirs_coverage import StorybookStaticDirsCoverageCheck
+from hogli_commands.workflow_lint.cli import cmd_lint_workflows
+from hogli_commands.workflow_lint.model import PR_TRIGGERS, Workflow, WorkflowParseError, read_workflows
+
+
+def _write(dir_: Path, name: str, content: str) -> Path:
+    path = dir_ / name
+    path.write_text(textwrap.dedent(content).lstrip())
+    return path
+
+
+def _sparse_out(repo_root: Path, *paths: str) -> None:
+    """Track every file in ``repo_root``, then leave ``paths`` out of the worktree the way a sparse checkout does."""
+    for command in (("init",), ("add", "-A"), ("update-index", "--skip-worktree", *paths)):
+        subprocess.run(["git", *command], cwd=repo_root, check=True, capture_output=True)
+    for path in paths:
+        (repo_root / path).unlink()
+        for parent in (repo_root / path).parents:
+            if parent == repo_root or any(parent.iterdir()):
+                break
+            parent.rmdir()
+
+
+def _read_all(dir_: Path) -> list[Workflow]:
+    return list(read_workflows(dir_))
+
+
+# ---------------------------------------------------------------------------
+# WorkflowReader / model
+# ---------------------------------------------------------------------------
+
+
+class TestReadWorkflows:
+    def test_normalizes_on_true_key(self, tmp_path: Path) -> None:
+        # PyYAML parses `on:` as the boolean True. The reader must surface it
+        # as the original triggers regardless.
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on:
+              pull_request:
+                branches: [master]
+            jobs: {}
+            """,
+        )
+        wf = next(read_workflows(tmp_path))
+        assert wf.is_pr_triggered, f"expected PR-trigger detection, got on={wf.on!r}"
+
+    def test_quoted_on_string_also_works(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            "on": pull_request
+            jobs: {}
+            """,
+        )
+        wf = next(read_workflows(tmp_path))
+        assert wf.is_pr_triggered
+
+    def test_non_pr_trigger(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [push]
+            jobs: {}
+            """,
+        )
+        wf = next(read_workflows(tmp_path))
+        assert not wf.is_pr_triggered
+        assert "push" not in PR_TRIGGERS  # sanity
+
+    def test_reusable_call_job_marked(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              call:
+                uses: ./.github/workflows/other.yml
+            """,
+        )
+        wf = next(read_workflows(tmp_path))
+        [job] = wf.jobs
+        assert job.is_reusable_call
+        assert job.uses == "./.github/workflows/other.yml"
+
+    def test_flattens_parallel_steps(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              build:
+                timeout-minutes: 5
+                runs-on: depot-ubuntu-latest
+                steps:
+                  - run: echo before
+                  - parallel:
+                      - id: cache
+                        uses: actions/cache/save@v5
+                      - run: echo nested
+            """,
+        )
+        wf = next(read_workflows(tmp_path))
+        [job] = wf.jobs
+        assert [(step.id_, step.uses, step.run) for step in job.steps] == [
+            (None, None, "echo before"),
+            ("cache", "actions/cache/save@v5", None),
+            (None, None, "echo nested"),
+        ]
+
+    def test_parse_error_raises_typed(self, tmp_path: Path) -> None:
+        bad = tmp_path / "wf.yml"
+        bad.write_text("name: x\non: [\njobs: {}\n")
+        with pytest.raises(WorkflowParseError) as exc:
+            list(read_workflows(tmp_path))
+        assert exc.value.path == bad
+
+
+# ---------------------------------------------------------------------------
+# JobTimeoutsCheck
+# ---------------------------------------------------------------------------
+
+
+class TestJobTimeoutsCheck:
+    def test_passes_when_all_jobs_have_timeout(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 10
+                steps:
+                  - run: echo ok
+            """,
+        )
+        result = JobTimeoutsCheck().run(_read_all(tmp_path))
+        assert result.issues == []
+
+    def test_fails_when_timeout_missing(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - run: echo ok
+            """,
+        )
+        result = JobTimeoutsCheck().run(_read_all(tmp_path))
+        [issue] = result.issues
+        assert issue.workflow == "wf.yml"
+        assert issue.job == "build"
+        assert "timeout-minutes" in issue.message
+
+    def test_skips_reusable_call_jobs(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              call:
+                uses: ./.github/workflows/other.yml
+            """,
+        )
+        result = JobTimeoutsCheck().run(_read_all(tmp_path))
+        assert result.issues == []
+
+
+# ---------------------------------------------------------------------------
+# PinnedRunnerImagesCheck
+# ---------------------------------------------------------------------------
+
+
+class TestPinnedRunnerImagesCheck:
+    @pytest.mark.parametrize(
+        "job_body",
+        [
+            "runs-on: ubuntu-24.04",
+            "runs-on: depot-ubuntu-24.04-4",
+            "runs-on: [self-hosted, linux]",
+            "runs-on: ${{ matrix.browser == 'webkit' && 'depot-ubuntu-24.04' || 'ubuntu-24.04' }}",
+            "runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [ubuntu-24.04, macos-15]",
+            "runs-on: ubuntu-24.04\n    strategy:\n      matrix:\n        artifact: [cli-macos-latest, cli-windows-latest]",
+            "runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [ubuntu-24.04]\n        artifact: [cli-macos-latest]",
+        ],
+        ids=["plain", "depot", "label-list", "expression", "matrix", "non-runner-matrix", "unreferenced-matrix-key"],
+    )
+    def test_passes_pinned_labels(self, tmp_path: Path, job_body: str) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            f"""
+            name: My
+            on: [pull_request]
+            jobs:
+              build:
+                {job_body.replace(chr(10), chr(10) + "            ")}
+                timeout-minutes: 10
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PinnedRunnerImagesCheck().run(_read_all(tmp_path)).issues == []
+
+    @pytest.mark.parametrize(
+        "job_body,source,label",
+        [
+            ("runs-on: ubuntu-latest", "runs-on", "ubuntu-latest"),
+            ("runs-on: depot-ubuntu-latest-4", "runs-on", "depot-ubuntu-latest-4"),
+            ("runs-on: [macos-latest]", "runs-on", "macos-latest"),
+            (
+                "runs-on: ${{ matrix.browser == 'webkit' && 'depot-ubuntu-24.04' || 'ubuntu-latest' }}",
+                "runs-on",
+                "ubuntu-latest",
+            ),
+            (
+                "runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [ubuntu-latest, depot-ubuntu-24.04]",
+                "strategy.matrix.runner",
+                "ubuntu-latest",
+            ),
+            (
+                "runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n          - os: windows-latest",
+                "strategy.matrix.os",
+                "windows-latest",
+            ),
+            (
+                "runs-on: ${{ matrix['runner'] }}\n    strategy:\n      matrix:\n        runner: [ubuntu-latest]",
+                "strategy.matrix.runner",
+                "ubuntu-latest",
+            ),
+        ],
+        ids=["plain", "depot-suffixed", "label-list", "expression", "matrix-list", "matrix-include", "matrix-bracket"],
+    )
+    def test_fails_floating_labels(self, tmp_path: Path, job_body: str, source: str, label: str) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            f"""
+            name: My
+            on: [pull_request]
+            jobs:
+              build:
+                {job_body.replace(chr(10), chr(10) + "            ")}
+                timeout-minutes: 10
+                steps:
+                  - run: echo ok
+            """,
+        )
+        [issue] = PinnedRunnerImagesCheck().run(_read_all(tmp_path)).issues
+        assert issue.job == "build"
+        assert issue.message.startswith(source)
+        assert label in issue.message
+
+    def test_generated_runner_matrix_fails_closed_without_marker(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              plan:
+                runs-on: ubuntu-24.04
+                timeout-minutes: 10
+                outputs:
+                  matrix: ${{ steps.plan.outputs.matrix }}
+                steps:
+                  - id: plan
+                    run: echo ok
+              build:
+                needs: [plan]
+                runs-on: ${{ matrix.runner }}
+                timeout-minutes: 10
+                strategy:
+                  matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+                steps:
+                  - run: echo ok
+            """,
+        )
+        [issue] = PinnedRunnerImagesCheck().run(_read_all(tmp_path)).issues
+        assert issue.job == "build"
+        assert "allow-generated-runner-matrix" in issue.message
+
+    def test_generated_matrix_used_only_in_a_comparison_needs_no_marker(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ${{ matrix.browser == 'webkit' && 'depot-ubuntu-24.04' || 'ubuntu-24.04' }}
+                timeout-minutes: 10
+                strategy:
+                  matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PinnedRunnerImagesCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_generated_runner_matrix_passes_with_marker_and_reason(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              # hogli-lint: allow-generated-runner-matrix -- labels are pinned in dist-workspace.toml
+              build:
+                runs-on: ${{ matrix.runner }}
+                timeout-minutes: 10
+                strategy:
+                  matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PinnedRunnerImagesCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_generated_runner_matrix_marker_without_reason_still_fails(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              # hogli-lint: allow-generated-runner-matrix
+              build:
+                runs-on: ${{ matrix.runner }}
+                timeout-minutes: 10
+                strategy:
+                  matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+                steps:
+                  - run: echo ok
+            """,
+        )
+        [issue] = PinnedRunnerImagesCheck().run(_read_all(tmp_path)).issues
+        assert issue.job == "build"
+
+    def test_ignores_latest_outside_runner_fields(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: My
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-24.04
+                timeout-minutes: 10
+                steps:
+                  - run: docker pull ghcr.io/example/ubuntu-latest
+            """,
+        )
+        assert PinnedRunnerImagesCheck().run(_read_all(tmp_path)).issues == []
+
+
+# ---------------------------------------------------------------------------
+# PrConcurrencyCheck
+# ---------------------------------------------------------------------------
+
+
+class TestPrConcurrencyCheck:
+    def test_passes_with_concurrency(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "ci-foo.yml",
+            """
+            name: CI Foo
+            on: [pull_request]
+            concurrency:
+              group: x
+              cancel-in-progress: true
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PrConcurrencyCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_string_concurrency_counts_as_present(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "ci-foo.yml",
+            """
+            name: CI Foo
+            on: [pull_request]
+            concurrency: "${{ github.workflow }}-${{ github.head_ref || github.ref }}"
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PrConcurrencyCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_fails_without_concurrency(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "ci-foo.yml",
+            """
+            name: CI Foo
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        [issue] = PrConcurrencyCheck().run(_read_all(tmp_path)).issues
+        assert issue.workflow == "ci-foo.yml"
+        assert "concurrency" in issue.message
+
+    def test_fails_with_run_id_fallback(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "ci-foo.yml",
+            """
+            name: CI Foo
+            on: [pull_request]
+            concurrency:
+              group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+              cancel-in-progress: true
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        [issue] = PrConcurrencyCheck().run(_read_all(tmp_path)).issues
+        assert issue.workflow == "ci-foo.yml"
+        assert "github.run_id" in issue.message
+        assert "github.ref" in issue.message
+
+    def test_passes_with_job_level_concurrency_on_all_jobs(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "ci-foo.yml",
+            """
+            name: CI Foo
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                concurrency:
+                  group: build-${{ github.head_ref || github.ref }}
+                  cancel-in-progress: true
+                steps:
+                  - run: echo ok
+              test:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                concurrency:
+                  group: test-${{ github.head_ref || github.ref }}
+                  cancel-in-progress: true
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PrConcurrencyCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_passes_with_partial_job_level_concurrency(self, tmp_path: Path) -> None:
+        """Workflows managing concurrency at job-level for some (heavy) jobs pass."""
+        _write(
+            tmp_path,
+            "ci-foo.yml",
+            """
+            name: CI Foo
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                concurrency:
+                  group: build-${{ github.head_ref || github.ref }}
+                  cancel-in-progress: true
+                steps:
+                  - run: echo ok
+              lightweight:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PrConcurrencyCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_skips_non_ci_prefix(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "shellcheck.yml",
+            """
+            name: Shell
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PrConcurrencyCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_skips_non_pr_trigger(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "ci-foo.yml",
+            """
+            name: CI Foo
+            on: [push]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PrConcurrencyCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_skips_listed_filenames(self, tmp_path: Path) -> None:
+        skip_name = next(iter(PrConcurrencyCheck.SKIP))
+        _write(
+            tmp_path,
+            skip_name,
+            """
+            name: Skipped
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert PrConcurrencyCheck().run(_read_all(tmp_path)).issues == []
+
+    @pytest.mark.parametrize(
+        "name,triggers,group,cancel,flagged",
+        [
+            ("publish.yml", "[pull_request, push]", "${{ github.workflow }}-${{ github.ref }}", "true", True),
+            ("publish.yml", "[push]", "${{ github.workflow }}-${{ github.ref }}", "true", True),
+            ("publish.yml", "[pull_request]", "${{ github.workflow }}-${{ github.ref }}", "true", False),
+            (
+                "publish.yml",
+                "[pull_request, push]",
+                "${{ github.workflow }}-${{ github.ref }}",
+                "${{ github.event_name == 'pull_request' }}",
+                False,
+            ),
+            (
+                "publish.yml",
+                "[pull_request, push]",
+                "${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}",
+                "true",
+                False,
+            ),
+            # SKIP exempts a workflow from needing a block, never from cancelling master runs.
+            (
+                next(iter(PrConcurrencyCheck.SKIP)),
+                "[push]",
+                "${{ github.workflow }}-${{ github.ref }}",
+                "true",
+                True,
+            ),
+            # A SHA on a non-push arm still leaves every push sharing one ref.
+            (
+                "publish.yml",
+                "[pull_request, push]",
+                "${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.sha || github.ref }}",
+                "true",
+                True,
+            ),
+            ("publish.yml", "[push]", "${{ github.workflow }}-${{ github.sha }}", "true", False),
+        ],
+    )
+    def test_bare_cancel_flagged_only_when_it_can_kill_a_push_run(
+        self, tmp_path: Path, name: str, triggers: str, group: str, cancel: str, flagged: bool
+    ) -> None:
+        _write(
+            tmp_path,
+            name,
+            f"""
+            name: Publish
+            on: {triggers}
+            concurrency:
+              group: {group}
+              cancel-in-progress: {cancel}
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        issues = PrConcurrencyCheck().run(_read_all(tmp_path)).issues
+        assert bool(issues) is flagged
+
+    @pytest.mark.parametrize(
+        "marker,exempted",
+        [
+            ("# hogli-lint: allow-master-cancel -- cache warmer, latest wins", True),
+            ("# hogli-lint: allow-master-cancel", False),
+            ("# hogli-lint: allow-master-cancel --", False),
+        ],
+    )
+    def test_master_cancel_marker_needs_a_reason_to_exempt(self, tmp_path: Path, marker: str, exempted: bool) -> None:
+        _write(
+            tmp_path,
+            "publish.yml",
+            f"""
+            name: Publish
+            on: [push]
+            concurrency:
+              group: ${{{{ github.workflow }}}}-${{{{ github.ref }}}}
+              {marker}
+              cancel-in-progress: true
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert (PrConcurrencyCheck().run(_read_all(tmp_path)).issues == []) is exempted
+
+
+# ---------------------------------------------------------------------------
+# PrEventFanoutCheck
+# ---------------------------------------------------------------------------
+
+
+class TestPrEventFanoutCheck:
+    @pytest.mark.parametrize(
+        "workflow,budget,expected",
+        [
+            (
+                """
+                name: Agent
+                on:
+                  pull_request:
+                    types: [closed]
+                  pull_request_target:
+                    types: [opened, reopened, ready_for_review, edited]
+                jobs: {}
+                """,
+                {"closed": 1},
+                [
+                    "unscoped `edited` PR dispatch fanout is 1; budget is 0",
+                    "unscoped `opened` PR dispatch fanout is 1; budget is 0",
+                    "unscoped `ready_for_review` PR dispatch fanout is 1; budget is 0",
+                    "unscoped `reopened` PR dispatch fanout is 1; budget is 0",
+                ],
+            ),
+            (
+                """
+                name: New workflow
+                on: [pull_request]
+                jobs: {}
+                """,
+                {},
+                [
+                    "unscoped `opened` PR dispatch fanout is 1; budget is 0",
+                    "unscoped `reopened` PR dispatch fanout is 1; budget is 0",
+                    "unscoped `synchronize` PR dispatch fanout is 1; budget is 0",
+                ],
+            ),
+            (
+                """
+                name: Focused
+                on:
+                  pull_request:
+                    paths: [products/example/**]
+                jobs: {}
+                """,
+                {},
+                [],
+            ),
+            # paths-ignore usually excludes a narrow slice, so it still fires on nearly every PR.
+            (
+                """
+                name: Nearly everything
+                on:
+                  pull_request:
+                    paths-ignore: [docs/**]
+                jobs: {}
+                """,
+                {},
+                [
+                    "unscoped `opened` PR dispatch fanout is 1; budget is 0",
+                    "unscoped `reopened` PR dispatch fanout is 1; budget is 0",
+                    "unscoped `synchronize` PR dispatch fanout is 1; budget is 0",
+                ],
+            ),
+            # Label-driven workflows are the intended use, and labels cannot burst.
+            (
+                """
+                name: Opt in by label
+                on:
+                  pull_request:
+                    types: [labeled, unlabeled]
+                jobs: {}
+                """,
+                {},
+                [],
+            ),
+        ],
+    )
+    def test_counts_unscoped_pr_dispatches(
+        self, tmp_path: Path, workflow: str, budget: dict[str, int], expected: list[str]
+    ) -> None:
+        _write(tmp_path, "workflow.yml", workflow)
+
+        result = PrEventFanoutCheck(budget=budget).run(_read_all(tmp_path))
+
+        assert [issue.message for issue in result.issues] == expected
+
+
+# ---------------------------------------------------------------------------
+# DornyNegationCheck
+# ---------------------------------------------------------------------------
+
+
+_DORNY_USES = "dorny/paths-filter@v3"
+
+
+class TestDornyNegationCheck:
+    def test_passes_without_dorny(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [pull_request]
+            jobs:
+              j:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert DornyNegationCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_passes_with_positive_filters_only(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            f"""
+            name: x
+            on: [pull_request]
+            jobs:
+              j:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: {_DORNY_USES}
+                    with:
+                      filters: |
+                        backend:
+                          - posthog/**
+            """,
+        )
+        assert DornyNegationCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_fails_on_negation_without_quantifier(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            f"""
+            name: x
+            on: [pull_request]
+            jobs:
+              j:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: {_DORNY_USES}
+                    with:
+                      filters: |
+                        backend:
+                          - posthog/**
+                          - "!docs/**"
+            """,
+        )
+        [issue] = DornyNegationCheck().run(_read_all(tmp_path)).issues
+        assert "negation" in issue.message
+        assert "predicate-quantifier" in issue.message
+
+    def test_passes_with_every_quantifier(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            f"""
+            name: x
+            on: [pull_request]
+            jobs:
+              j:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: {_DORNY_USES}
+                    with:
+                      predicate-quantifier: 'every'
+                      filters: |
+                        backend:
+                          - posthog/**
+                          - "!docs/**"
+            """,
+        )
+        assert DornyNegationCheck().run(_read_all(tmp_path)).issues == []
+
+
+# ---------------------------------------------------------------------------
+# SemgrepServicesCoverageCheck
+# ---------------------------------------------------------------------------
+
+
+class TestSemgrepServicesCoverageCheck:
+    def test_passes_when_all_services_are_covered(self, tmp_path: Path) -> None:
+        repo_root = tmp_path
+        (repo_root / "services" / "api").mkdir(parents=True)
+        (repo_root / "services" / "worker").mkdir()
+        workflows_dir = repo_root / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        _write(
+            workflows_dir,
+            "ci-security.yaml",
+            """
+            name: Security
+            on: [pull_request]
+            jobs:
+              semgrep-python:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: semgrep scan services/api/
+              semgrep-go:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: semgrep scan services/worker/
+              semgrep-js:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        assert SemgrepServicesCoverageCheck(repo_root=repo_root).run(_read_all(workflows_dir)).issues == []
+
+    def test_fails_when_a_service_is_missing(self, tmp_path: Path) -> None:
+        repo_root = tmp_path
+        (repo_root / "services" / "api").mkdir(parents=True)
+        (repo_root / "services" / "worker").mkdir()
+        workflows_dir = repo_root / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        _write(
+            workflows_dir,
+            "ci-security.yaml",
+            """
+            name: Security
+            on: [pull_request]
+            jobs:
+              semgrep-python:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: semgrep scan services/api/
+              semgrep-js:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        [issue] = SemgrepServicesCoverageCheck(repo_root=repo_root).run(_read_all(workflows_dir)).issues
+        assert issue.workflow == "ci-security.yaml"
+        assert "services/worker/" in issue.message
+
+    def test_judges_tracked_services_only(self, tmp_path: Path) -> None:
+        # Build residue left by another branch (node_modules and friends, no
+        # tracked source) is not a service CI can scan, so it must not fail —
+        # while a tracked service that really is uncovered still must.
+        repo_root = tmp_path
+        for service in ("api", "worker"):
+            (repo_root / "services" / service).mkdir(parents=True)
+            (repo_root / "services" / service / "main.py").write_text("x = 1\n")
+        (repo_root / "services" / "stale" / "node_modules").mkdir(parents=True)
+        for command in (("init",), ("add", "services/api/main.py", "services/worker/main.py")):
+            subprocess.run(["git", *command], cwd=repo_root, check=True, capture_output=True)
+        workflows_dir = repo_root / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        _write(
+            workflows_dir,
+            "ci-security.yaml",
+            """
+            name: Security
+            on: [pull_request]
+            jobs:
+              semgrep-python:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: semgrep scan services/api/
+              semgrep-js:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        [issue] = SemgrepServicesCoverageCheck(repo_root=repo_root).run(_read_all(workflows_dir)).issues
+        assert "services/worker/" in issue.message
+
+    def test_judges_services_a_sparse_checkout_left_out(self, tmp_path: Path) -> None:
+        repo_root = tmp_path
+        _write_file(repo_root / "services" / "worker" / "main.py", "x = 1\n")
+        workflows_dir = repo_root / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        _write(workflows_dir, "ci-security.yaml", "name: Security\non: [pull_request]\njobs: {}\n")
+        _sparse_out(repo_root, "services/worker/main.py")
+        [issue] = SemgrepServicesCoverageCheck(repo_root=repo_root).run(_read_all(workflows_dir)).issues
+        assert "services/worker/" in issue.message
+
+    def test_reads_composite_action_with_args(self, tmp_path: Path) -> None:
+        # The real jobs pass scan targets through the semgrep-ci composite
+        # action's `args` input, as `--include /services/<name>` with no
+        # trailing slash — those must count as coverage. Excluded services and
+        # prefix matches must not: `--exclude /services/api-v2` is not
+        # coverage of api-v2, and `/services/api` does not cover it either.
+        repo_root = tmp_path
+        for service in ("api", "api-v2"):
+            (repo_root / "services" / service).mkdir(parents=True)
+        workflows_dir = repo_root / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        _write(
+            workflows_dir,
+            "ci-security.yaml",
+            """
+            name: Security
+            on: [pull_request]
+            jobs:
+              semgrep-python:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: ./.github/actions/semgrep-ci
+                    with:
+                      image: semgrep/semgrep:1.0.0
+                      args: >-
+                        --config p/python
+                        --include /services/api
+                        --exclude /services/api-v2
+              semgrep-js:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo ok
+            """,
+        )
+        [issue] = SemgrepServicesCoverageCheck(repo_root=repo_root).run(_read_all(workflows_dir)).issues
+        assert "services/api-v2/" in issue.message
+
+
+# ---------------------------------------------------------------------------
+# CheckoutFullDepthCheck
+# ---------------------------------------------------------------------------
+
+
+class TestCheckoutFullDepthCheck:
+    def test_passes_default_checkout(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: actions/checkout@v6
+            """,
+        )
+        assert CheckoutFullDepthCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_passes_blobless_full_depth_checkout(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: actions/checkout@v6
+                    with:
+                      fetch-depth: 0
+                      filter: blob:none
+            """,
+        )
+        assert CheckoutFullDepthCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_passes_sparse_full_depth_checkout(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: actions/checkout@v6
+                    with:
+                      fetch-depth: 0
+                      sparse-checkout: |
+                        rust/
+                        proto/
+            """,
+        )
+        assert CheckoutFullDepthCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_passes_explicit_allow_marker_with_reason(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [push]
+            jobs:
+              mirror:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  # hogli-lint: allow-full-depth-checkout -- mirror needs full blobs
+                  - name: Checkout mirror
+                    uses: "actions/checkout@v6"
+                    with:
+                      fetch-depth: 0
+            """,
+        )
+        assert CheckoutFullDepthCheck().run(_read_all(tmp_path)).issues == []
+
+    def test_fails_full_depth_without_optimization(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: actions/checkout@v6
+                    with:
+                      fetch-depth: "0"
+            """,
+        )
+        [issue] = CheckoutFullDepthCheck().run(_read_all(tmp_path)).issues
+        assert issue.workflow == "wf.yml"
+        assert issue.job == "build"
+        assert "fetch-depth: 0" in issue.message
+
+    def test_allow_marker_requires_reason(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [push]
+            jobs:
+              mirror:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  # hogli-lint: allow-full-depth-checkout
+                  - uses: actions/checkout@v6
+                    with:
+                      fetch-depth: 0
+            """,
+        )
+        [issue] = CheckoutFullDepthCheck().run(_read_all(tmp_path)).issues
+        assert "allow-full-depth-checkout" in issue.message
+
+    def test_allow_marker_does_not_apply_to_previous_checkout(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [push]
+            jobs:
+              mirror:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: "actions/checkout@v6"
+                    with:
+                      fetch-depth: 0
+
+                  # hogli-lint: allow-full-depth-checkout -- mirror needs full blobs
+                  - uses: actions/checkout@v6
+                    with:
+                      fetch-depth: 0
+            """,
+        )
+        [issue] = CheckoutFullDepthCheck().run(_read_all(tmp_path)).issues
+        assert issue.step == "step[0]"
+        assert "fetch-depth: 0" in issue.message
+
+    def test_passes_filter_combined_with_sparse_checkout(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [pull_request]
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - uses: actions/checkout@v6
+                    with:
+                      fetch-depth: 0
+                      filter: blob:none
+                      sparse-checkout: |
+                        rust/
+            """,
+        )
+        assert CheckoutFullDepthCheck().run(_read_all(tmp_path)).issues == []
+
+
+# ---------------------------------------------------------------------------
+# CacheWriteGateCheck
+# ---------------------------------------------------------------------------
+
+
+def _cache_step(if_cond: str | None = None, key: str | None = None) -> dict:
+    step: dict = {"uses": "actions/cache@v4"}
+    if if_cond is not None:
+        step["if"] = if_cond
+    if key is not None:
+        step["with"] = {"key": key}
+    return step
+
+
+class TestCacheWriteGateCheck:
+    @pytest.mark.parametrize(
+        "uses, with_, expected",
+        [
+            ("actions/cache@v4", None, "cache (combined)"),
+            ("actions/cache/save@v4", None, "cache/save"),
+            ("actions/cache/restore@v4", None, None),
+            ("actions/setup-node@v4", {"cache": "pnpm"}, "setup auto-cache"),
+            ("actions/setup-node@v4", {}, None),
+            ("actions/checkout@v4", None, None),
+        ],
+    )
+    def test_write_kind(self, uses: str, with_: dict | None, expected: str | None) -> None:
+        step: dict = {"uses": uses}
+        if with_ is not None:
+            step["with"] = with_
+        assert _write_kind(step) == expected
+
+    @pytest.mark.parametrize(
+        "if_cond, gated",
+        [
+            ("github.ref == 'refs/heads/master'", True),
+            ("github.ref == 'refs/heads/main'", True),
+            ("github.ref_name == 'master'", True),
+            # AND only narrows — still pinned to master
+            ("github.ref == 'refs/heads/master' && github.event_name == 'push'", True),
+            # both OR alternatives pin to a default branch
+            ("github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'", True),
+            # the nit: negation runs on branches, not master
+            ("github.ref != 'refs/heads/master'", False),
+            # the nit: OR re-opens the write to PRs
+            ("github.ref == 'refs/heads/master' || github.event_name == 'pull_request'", False),
+            ("", False),
+        ],
+    )
+    def test_is_gated(self, if_cond: str, gated: bool) -> None:
+        assert _is_gated({"if": if_cond}, push_is_default_only=True) is gated
+
+    @pytest.mark.parametrize("push_is_default_only, gated", [(True, True), (False, False)])
+    def test_event_name_push_gate_depends_on_push_scope(self, push_is_default_only: bool, gated: bool) -> None:
+        # `event_name == 'push'` only pins to master when push can't fire on a branch
+        assert _is_gated({"if": "github.event_name == 'push'"}, push_is_default_only) is gated
+
+    @pytest.mark.parametrize(
+        "step, expected",
+        [
+            (_cache_step(), "cache (combined)"),
+            (_cache_step(if_cond="github.ref == 'refs/heads/master'"), None),
+            (_cache_step(key="pnpm-${{ github.event.pull_request.number }}"), None),
+            # the nit: previously these slipped through as gated
+            (_cache_step(if_cond="github.ref != 'refs/heads/master'"), "cache (combined)"),
+            (
+                _cache_step(if_cond="github.ref == 'refs/heads/master' || github.event_name == 'pull_request'"),
+                "cache (combined)",
+            ),
+        ],
+    )
+    def test_violation_kind(self, step: dict, expected: str | None) -> None:
+        assert _violation_kind(step, push_is_default_only=True) == expected
+
+    def test_setup_autocache_cannot_be_gated(self) -> None:
+        # gating the whole setup step would skip the toolchain on PRs, so the
+        # auto-save is always a violation regardless of `if:`
+        step = {"uses": "actions/setup-node@v4", "if": "github.ref == 'refs/heads/master'", "with": {"cache": "pnpm"}}
+        assert _violation_kind(step, push_is_default_only=True) == "setup auto-cache"
+
+    @pytest.mark.parametrize(
+        "on, can_run_on_branch",
+        [
+            ("pull_request", True),
+            (["pull_request", "push"], True),
+            ({"push": None}, True),  # bare push fires on every branch
+            ({"push": {"branches": ["master"]}}, False),
+            ({"push": {"tags": ["*"]}}, False),  # release pushes
+            ("workflow_dispatch", False),
+            ("schedule", False),
+        ],
+    )
+    def test_can_run_on_branch_ref(self, on: object, can_run_on_branch: bool) -> None:
+        assert _can_run_on_branch_ref(on) is can_run_on_branch
+
+    @pytest.mark.parametrize(
+        "on, default_only",
+        [
+            ("pull_request", True),  # no push trigger
+            ({"push": {"branches": ["master"]}}, True),
+            ({"push": None}, False),  # bare push leaks to branches
+            ({"push": {"branches": ["master", "feature"]}}, False),
+        ],
+    )
+    def test_push_trigger_is_default_only(self, on: object, default_only: bool) -> None:
+        assert _push_trigger_is_default_only(on) is default_only
+
+
+# ---------------------------------------------------------------------------
+# Registry / smoke
+# ---------------------------------------------------------------------------
+
+
+class TestRegistry:
+    def test_check_ids_are_unique(self) -> None:
+        ids = [c.id for c in CHECKS]
+        assert len(ids) == len(set(ids)), f"duplicate check ids: {ids}"
+
+    def test_get_check_finds_each(self) -> None:
+        for c in CHECKS:
+            assert get_check(c.id) is c
+
+    def test_get_check_accepts_prefix(self) -> None:
+        for c in CHECKS:
+            prefix = c.id.split("-", 1)[0]
+            assert get_check(prefix) is c
+            assert get_check(prefix.lower()) is c
+
+    def test_get_check_unknown_returns_none(self) -> None:
+        assert get_check("not-a-real-id") is None
+        assert get_check("WF999") is None
+
+    def test_build_lookup_rejects_duplicate_prefix(self) -> None:
+        class _A(WorkflowCheck):
+            id = "WF001-alpha"
+            label = "a"
+            description = "a"
+
+            def run(self, workflows: list[Workflow]) -> CheckResult:
+                return CheckResult()
+
+        class _B(WorkflowCheck):
+            id = "WF001-beta"
+            label = "b"
+            description = "b"
+
+            def run(self, workflows: list[Workflow]) -> CheckResult:
+                return CheckResult()
+
+        with pytest.raises(ValueError, match="WF001"):
+            _build_lookup([_A(), _B()])
+
+    def test_run_returns_check_result(self, tmp_path: Path) -> None:
+        # A near-empty workflow set should not crash any check.
+        _write(
+            tmp_path,
+            "wf.yml",
+            """
+            name: x
+            on: [push]
+            jobs: {}
+            """,
+        )
+        wfs = _read_all(tmp_path)
+        for check in CHECKS:
+            result = check.run(wfs)
+            assert isinstance(result, CheckResult)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+class TestCli:
+    def test_fanout_over_budget_fails_run(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "assigned.yml",
+            """
+            name: Assigned
+            on:
+              pull_request:
+                types: [assigned]
+            jobs: {}
+            """,
+        )
+
+        result = CliRunner().invoke(
+            cmd_lint_workflows,
+            ["--check", "WF008", "--workflows-dir", str(tmp_path)],
+        )
+
+        assert result.exit_code == 1
+        assert "1 issue(s) across 1 check(s)" in result.output
+
+
+# The shape these fixtures guard against: a `changes` detector cleared with a bare
+# `== "failure"`, then its outputs read to decide "nothing to test". Those outputs
+# are empty on a cancelled job, so the gate exits 0 green with no tests run.
+def _gate(body: str, condition: str | None = "${{ !cancelled() }}", step_condition: str | None = None) -> str:
+    step_if = f"if: {step_condition}\n            " if step_condition is not None else ""
+    job_if = f"        if: {condition}\n" if condition is not None else ""
+    return f"""
+    name: ci-thing
+    on: pull_request
+    jobs:
+      changes:
+        timeout-minutes: 5
+        steps:
+          - run: echo detect
+      build:
+        timeout-minutes: 5
+        steps:
+          - run: echo build
+      thing_tests:
+        name: Thing Tests Pass
+        needs: [changes, build]
+        timeout-minutes: 5
+{job_if}        steps:
+          - {step_if}run: |
+{textwrap.indent(textwrap.dedent(body).strip(), " " * 14)}
+"""
+
+
+SAFE_BODY = """
+    if [[ "${{ needs.changes.result }}" != "success" && "${{ needs.changes.result }}" != "skipped" ]]; then
+      exit 1
+    fi
+    if [[ "${{ needs.changes.outputs.thing }}" != "true" ]]; then
+      exit 0
+    fi
+    if [[ "${{ needs.build.result }}" != "success" && "${{ needs.build.result }}" != "skipped" ]]; then
+      exit 1
+    fi
+"""
+
+# One dependency allowlisted, one denylisted — the shape a global scan for
+# result words calls clean.
+MIXED_BODY = SAFE_BODY.replace(
+    """if [[ "${{ needs.changes.result }}" != "success" && "${{ needs.changes.result }}" != "skipped" ]]; then""",
+    """if [[ "${{ needs.changes.result }}" == "failure" ]]; then""",
+)
+
+# Two dependencies denylisted while the rest are allowlisted.
+TWO_BAD_BODY = MIXED_BODY.replace(
+    """if [[ "${{ needs.changes.outputs.thing }}" != "true" ]]; then""",
+    """if [[ "${{ needs.affected.result }}" == "failure" ]]; then
+      exit 1
+    fi
+    if [[ "${{ needs.changes.outputs.thing }}" != "true" ]]; then""",
+)
+
+# Some gates route every result through one shell function, so no guard sits
+# next to `needs.<dep>.result`.
+HELPER_BODY = """
+    check() {
+      if [[ "$2" != "success" && "$2" != "skipped" ]]; then
+        exit 1
+      fi
+    }
+    check "Changes" "${{ needs.changes.result }}"
+    check "Build" "${{ needs.build.result }}"
+"""
+
+UNSAFE_HELPER_BODY = HELPER_BODY.replace(
+    """if [[ "$2" != "success" && "$2" != "skipped" ]]; then""",
+    """if [[ "$2" == "failure" ]]; then""",
+)
+
+# The positional is bound to a local before being tested, so the trace has to
+# follow the assignment as well as the call site to reach the guard.
+LOCAL_ALIAS_HELPER_BODY = """
+    check() {
+      local result="$2"
+      if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+        exit 1
+      fi
+    }
+    check "Changes" "${{ needs.changes.result }}"
+    check "Build" "${{ needs.build.result }}"
+"""
+
+# Guard-shaped text in a comment or log line asserts nothing. The only executed
+# test in these fixtures still clears everything but `failure`.
+DECOY_COMMENT_BODY = UNSAFE_HELPER_BODY.replace(
+    """    check() {""",
+    """    check() {
+      # if [[ "$2" != "success" && "$2" != "skipped" ]]; then exit 1; fi""",
+)
+
+DECOY_ECHO_BODY = UNSAFE_HELPER_BODY.replace(
+    """        exit 1""",
+    """        echo 'if [[ "$2" != "success" && "$2" != "skipped" ]]; then exit 1; fi'
+        exit 1""",
+)
+
+NON_FAILING_ALLOWLIST_BODY = """
+    check() {
+      if [[ "$2" != "success" && "$2" != "skipped" ]]; then
+        echo "dependency did not succeed"
+      fi
+    }
+    check "Changes" "${{ needs.changes.result }}"
+    check "Build" "${{ needs.build.result }}"
+"""
+
+INVERTED_ALLOWLIST_BODY = """
+    check() {
+      if [[ "$2" == "success" ]]; then
+        exit 1
+      fi
+    }
+    check "Changes" "${{ needs.changes.result }}"
+    check "Build" "${{ needs.build.result }}"
+"""
+
+# Results that are only ever logged reach no comparison at all, which has to fail
+# closed: the absence of a test is not evidence of a safe one.
+LOGGED_ONLY_BODY = """
+    echo "changes: ${{ needs.changes.result }}"
+    echo "build: ${{ needs.build.result }}"
+"""
+
+BUILD_CALL = """    check "Build" "${{ needs.build.result }}\""""
+
+# Helper calls whose trailing comment or label contains `()`. Discarding those lines
+# loses the argument binding, which reports a gate that does allowlist its results.
+COMMENTED_CALL_BODY = HELPER_BODY.replace(BUILD_CALL, f"{BUILD_CALL}  # see check() above")
+PAREN_LABEL_CALL_BODY = HELPER_BODY.replace(BUILD_CALL, """    check "Build ()" "${{ needs.build.result }}\"""")
+
+# A job wired into `needs:` that the gate never tests. Judging only the results the
+# body mentions would approve the two assertions that are here and say nothing
+# about the dependency whose assertion was forgotten.
+UNTESTED_DEPENDENCY_GATE = (
+    _gate(SAFE_BODY)
+    .replace(
+        "      build:",
+        "      lint:\n        timeout-minutes: 5\n        steps:\n          - run: echo lint\n      build:",
+    )
+    .replace("needs: [changes, build]", "needs: [changes, build, lint]")
+)
+
+# The env-loop form maps results into env and loops over the variable names.
+ENV_LOOP_GATE = """
+    name: ci-thing
+    on: pull_request
+    jobs:
+      build:
+        timeout-minutes: 5
+        steps:
+          - run: echo build
+      thing_tests:
+        name: Thing Tests Pass
+        needs: [build]
+        timeout-minutes: 5
+        if: ${{ !cancelled() }}
+        steps:
+          - name: Check outcomes
+            env:
+              BUILD: ${{ needs.build.result }}
+            run: |
+              for var in BUILD; do
+                val="${!var}"
+                if [[ "$val" != "success" && "$val" != "skipped" ]]; then
+                  exit 1
+                fi
+              done
+"""
+
+CROSS_STEP_ENV_GATE = """
+    name: ci-thing
+    on: pull_request
+    jobs:
+      build:
+        timeout-minutes: 5
+        steps:
+          - run: echo build
+      thing_tests:
+        name: Thing Tests Pass
+        needs: [build]
+        timeout-minutes: 5
+        if: ${{ !cancelled() }}
+        steps:
+          - name: Log outcome
+            env:
+              RESULT: ${{ needs.build.result }}
+            run: echo "$RESULT"
+          - name: Check unrelated value
+            env:
+              RESULT: success
+            run: |
+              if [[ "$RESULT" != "success" && "$RESULT" != "skipped" ]]; then
+                exit 1
+              fi
+"""
+
+
+# A gate whose display name doesn't end in "Pass", so only structural detection finds it.
+def _off_convention_gate(marker: str = "", condition: str = "${{ !cancelled() }}") -> str:
+    yaml_ = _gate(MIXED_BODY, condition=condition).replace("Thing Tests Pass", "Thing decision")
+    if marker:
+        yaml_ = yaml_.replace("      thing_tests:", f"      # {marker}\n      thing_tests:")
+    return yaml_
+
+
+def _off_convention_env_gate() -> str:
+    return ENV_LOOP_GATE.replace("Thing Tests Pass", "Thing decision").replace(
+        'if [[ "$val" != "success" && "$val" != "skipped" ]]; then',
+        'if [[ "$val" == "failure" ]]; then',
+    )
+
+
+def _nested_allow_marker_gate() -> str:
+    return _off_convention_gate().replace(
+        "      changes:\n",
+        """      changes:
+        env:
+          # hogli-lint: not-a-required-gate - nested keys cannot exempt a job
+          thing_tests:
+""",
+    )
+
+
+_CHAIN_GUARD = """
+    if [[ "${{ needs.DEP.result }}" != "success" && "${{ needs.DEP.result }}" != "skipped" ]]; then
+      exit 1
+    fi
+"""
+
+
+def _chained_gate(*dependencies: str, build_if: str | None = None) -> str:
+    """A gate over `build`, which itself needs `detect`.
+
+    GitHub skips `build` when `detect` fails, and the gate reads that skip as a
+    pass, so `detect` has to be a dependency of the gate too. `build_if` sets the
+    condition on `build`, which is what decides whether the skip travels: a job that
+    runs past a failed `detect` recovers, and the gate must not demand it.
+    """
+    body = "".join(_CHAIN_GUARD.replace("DEP", dep) for dep in dependencies)
+    build_condition = f"        if: {build_if}\n" if build_if else ""
+    return (
+        """
+    name: ci-thing
+    on: pull_request
+    jobs:
+      detect:
+        timeout-minutes: 5
+        steps:
+          - run: echo detect
+      build:
+        needs: [detect]
+"""
+        + build_condition
+        + """        timeout-minutes: 5
+        steps:
+          - run: echo build
+      thing_tests:
+        name: Thing Tests Pass
+        needs: [DEPENDENCIES]
+        timeout-minutes: 5
+        if: ${{ !cancelled() }}
+        steps:
+          - run: |
+""".replace("DEPENDENCIES", ", ".join(dependencies))
+        + textwrap.indent(textwrap.dedent(body).strip(), " " * 14)
+        + "\n"
+    )
+
+
+class TestRequiredGateCheck:
+    @pytest.mark.parametrize(
+        "content",
+        [
+            _gate(SAFE_BODY),
+            _gate(SAFE_BODY, condition='"!cancelled()"'),
+            _gate(SAFE_BODY, step_condition="always()"),
+            _gate(HELPER_BODY),
+            _gate(LOCAL_ALIAS_HELPER_BODY),
+            _gate(COMMENTED_CALL_BODY),
+            _gate(PAREN_LABEL_CALL_BODY),
+            ENV_LOOP_GATE,
+            _gate(SAFE_BODY, step_condition="${{ !cancelled() }}"),
+            _gate(SAFE_BODY, condition="${{ !cancelled() || needs.build.outputs.deterministic_failure == 'true' }}"),
+            _gate(
+                SAFE_BODY,
+                condition="${{ !cancelled() || needs.build.outputs.deterministic_failure == 'true' }}",
+                step_condition="always()",
+            ),
+        ],
+        ids=[
+            "inline-allowlist",
+            "quoted-bare-not-cancelled",
+            "guards-in-step-level-always",
+            "shared-helper",
+            "helper-via-local",
+            "helper-call-with-trailing-comment",
+            "helper-call-with-parens-in-label",
+            "env-block-loop",
+            "step-level-not-cancelled",
+            "not-cancelled-or-deterministic-failure",
+            "always-step-in-or-widened-gate",
+        ],
+    )
+    def test_passes_when_every_dependency_is_allowlisted(self, tmp_path: Path, content: str) -> None:
+        _write(tmp_path, "ci-thing.yml", content)
+        assert RequiredGateCheck().run(_read_all(tmp_path)).issues == []
+
+    @pytest.mark.parametrize(
+        "body,expected_deps",
+        [(MIXED_BODY, ["changes"]), (TWO_BAD_BODY, ["affected", "changes"])],
+        ids=["one-denylisted-among-allowlisted", "two-denylisted-among-allowlisted"],
+    )
+    def test_flags_exactly_the_denylisted_dependencies(
+        self, tmp_path: Path, body: str, expected_deps: list[str]
+    ) -> None:
+        _write(tmp_path, "ci-thing.yml", _gate(body))
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert sorted(i.message.split("'")[1] for i in issues) == expected_deps
+
+    # A gate with no condition defaults to success(), so it disappears the moment a
+    # dependency fails — the fail-open this rule exists to stop.
+    @pytest.mark.parametrize(
+        "condition",
+        ["always()", "${{ !cancelled() && false }}", "${{ cancelled() }}", None],
+        ids=["bare-always", "conditional-not-cancelled", "unnegated-cancelled", "no-condition"],
+    )
+    def test_flags_gate_condition_other_than_not_cancelled(self, tmp_path: Path, condition: str | None) -> None:
+        _write(tmp_path, "ci-thing.yml", _gate(SAFE_BODY, condition=condition))
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert len(issues) == 1
+        assert "!cancelled()" in issues[0].message
+
+    # Every fixture can exit zero for a cancelled dependency despite mentioning
+    # the expected statuses or guard shape.
+    @pytest.mark.parametrize(
+        "content",
+        [
+            _gate(UNSAFE_HELPER_BODY),
+            _gate(DECOY_COMMENT_BODY),
+            _gate(DECOY_ECHO_BODY),
+            _gate(NON_FAILING_ALLOWLIST_BODY),
+            _gate(INVERTED_ALLOWLIST_BODY),
+            _gate(LOGGED_ONLY_BODY),
+            _gate(SAFE_BODY, step_condition="${{ always() && false }}"),
+            _gate(
+                SAFE_BODY,
+                condition="${{ !cancelled() || needs.build.outputs.deterministic_failure == 'true' }}",
+                step_condition="${{ !cancelled() }}",
+            ),
+        ],
+        ids=[
+            "failure-only-helper",
+            "allowlist-guard-in-comment",
+            "allowlist-guard-in-echo",
+            "non-failing-allowlist",
+            "inverted-allowlist",
+            "results-only-logged",
+            "guards-in-conditional-step",
+            "not-cancelled-step-in-or-widened-gate",
+        ],
+    )
+    def test_flags_gate_whose_results_reach_no_fail_closed_guard(self, tmp_path: Path, content: str) -> None:
+        _write(tmp_path, "ci-thing.yml", content)
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert sorted(i.message.split("'")[1] for i in issues) == ["build", "changes"]
+        assert all("fail-closed guard" in i.message for i in issues)
+
+    def test_flags_dependency_declared_in_needs_but_never_tested(self, tmp_path: Path) -> None:
+        _write(tmp_path, "ci-thing.yml", UNTESTED_DEPENDENCY_GATE)
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert [i.message.split("'")[1] for i in issues] == ["lint"]
+        assert "never reaches" in issues[0].message
+
+    # Each row is a shape our workflows really use: a worker with no condition, a gate
+    # that names the whole chain, a suite that runs past a failed selector, a job held
+    # behind success(), a recovery job that reads the failure, and a consumer that
+    # demands a detector's output.
+    @pytest.mark.parametrize(
+        "dependencies,build_if,expected_missing",
+        [
+            (("build",), None, ["detect"]),
+            (("detect", "build"), None, []),
+            (("build",), "${{ !cancelled() }}", []),
+            (("build",), "${{ success() }}", ["detect"]),
+            (("build",), "${{ failure() && needs.detect.result == 'failure' }}", []),
+            (("build",), "${{ !cancelled() && success() }}", ["detect"]),
+            (("build",), "${{ !cancelled() && needs.detect.outputs.mode == 'go' }}", ["detect"]),
+        ],
+        ids=[
+            "upstream-of-a-dependency-unnamed",
+            "whole-chain-named",
+            "dependency-recovers-from-upstream",
+            "dependency-held-behind-success",
+            "dependency-recovers-on-the-failure-itself",
+            "dependency-mixes-a-surviving-and-a-skipping-status-call",
+            "dependency-demands-an-upstream-output",
+        ],
+    )
+    def test_flags_upstream_of_a_dependency_that_the_gate_never_tests(
+        self, tmp_path: Path, dependencies: tuple[str, ...], build_if: str | None, expected_missing: list[str]
+    ) -> None:
+        _write(tmp_path, "ci-thing.yml", _chained_gate(*dependencies, build_if=build_if))
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert [i.message.split("'")[1] for i in issues] == expected_missing
+        assert all("is not a dependency of this gate" in i.message for i in issues)
+
+    def test_ignores_non_gate_jobs(self, tmp_path: Path) -> None:
+        # Worker jobs share the !cancelled() condition, but they gate nothing,
+        # so WF007 has no dependency-guard demands on them.
+        _write(
+            tmp_path,
+            "ci-thing.yml",
+            """
+            name: ci-thing
+            on: pull_request
+            jobs:
+              shards:
+                timeout-minutes: 5
+                if: ${{ !cancelled() }}
+                steps:
+                  - run: echo test
+            """,
+        )
+        assert RequiredGateCheck().run(_read_all(tmp_path)).issues == []
+
+    # A gate named off-convention is still a gate, so detection can't key on the
+    # name alone.
+    def test_finds_gate_not_named_pass(self, tmp_path: Path) -> None:
+        _write(tmp_path, "ci-thing.yml", _off_convention_gate())
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert [i.message.split("'")[1] for i in issues] == ["changes"]
+
+    def test_finds_off_convention_gate_without_not_cancelled(self, tmp_path: Path) -> None:
+        _write(tmp_path, "ci-thing.yml", _off_convention_gate(condition="always()"))
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert any("must use `if: ${{ !cancelled() }}`" in issue.message for issue in issues)
+        assert [issue.message.split("'")[1] for issue in issues if "dependency" in issue.message] == ["changes"]
+
+    def test_finds_env_routed_gate_not_named_pass(self, tmp_path: Path) -> None:
+        _write(tmp_path, "ci-thing.yml", _off_convention_env_gate())
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert [issue.message.split("'")[1] for issue in issues] == ["build"]
+
+    def test_does_not_trace_step_env_into_another_step(self, tmp_path: Path) -> None:
+        _write(tmp_path, "ci-thing.yml", CROSS_STEP_ENV_GATE)
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert [issue.message.split("'")[1] for issue in issues] == ["build"]
+
+    @pytest.mark.parametrize(
+        "marker,exempted",
+        [
+            ("hogli-lint: not-a-required-gate", False),
+            ("hogli-lint: not-a-required-gate — decides a side effect, emits no check", True),
+        ],
+        ids=["without-reason", "with-reason"],
+    )
+    def test_allow_marker_needs_a_reason_to_exempt(self, tmp_path: Path, marker: str, exempted: bool) -> None:
+        _write(tmp_path, "ci-thing.yml", _off_convention_gate(marker))
+        assert (RequiredGateCheck().run(_read_all(tmp_path)).issues == []) is exempted
+
+    def test_nested_allow_marker_does_not_exempt_job(self, tmp_path: Path) -> None:
+        _write(tmp_path, "ci-thing.yml", _nested_allow_marker_gate())
+        issues = RequiredGateCheck().run(_read_all(tmp_path)).issues
+        assert [issue.message.split("'")[1] for issue in issues] == ["changes"]
+
+
+# ---------------------------------------------------------------------------
+# McpFilterCoverageCheck
+# ---------------------------------------------------------------------------
+
+_MCP_TSCONFIG = """
+{
+    "compilerOptions": {
+        "paths": {
+            "products/*": ["../../products/*"],
+            "@posthog/quill-charts": ["../../packages/quill/packages/charts/dist/index.d.ts"]
+        }
+    }
+}
+"""
+
+_UI_APP_SOURCE = (
+    "import { Chart } from '@posthog/quill-charts'\n"
+    "import { transform } from 'products/product_analytics/frontend/insights/trends/transforms'\n"
+)
+
+_INSIGHTS = "products/product_analytics/frontend/insights"
+_INSIGHTS_TRENDS = f"{_INSIGHTS}/trends"
+_INSIGHTS_SHARED = f"{_INSIGHTS}/shared"
+_COVERING_PATTERNS = ["services/mcp/**", "packages/quill/**", f"{_INSIGHTS}/**"]
+
+
+def _write_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def _filter_workflow(patterns: list[str]) -> str:
+    return "\n".join(
+        [
+            "name: x",
+            "on: [pull_request]",
+            "jobs:",
+            "  changes:",
+            "    runs-on: ubuntu-latest",
+            "    timeout-minutes: 5",
+            "    steps:",
+            "      - uses: ./.github/actions/paths-filter",
+            "        with:",
+            "          filters: |",
+            "            mcp:",
+            *(f"              - '{pattern}'" for pattern in patterns),
+            "",
+        ]
+    )
+
+
+def _mcp_repo(
+    repo_root: Path,
+    *,
+    mcp_patterns: list[str],
+    ui_apps_patterns: list[str],
+    tool_source: str = "",
+) -> Path:
+    """Fixture repo: an MCP tsconfig, MCP sources, the trees they import, both workflows.
+
+    The UI app imports a product transform through an alias, and that transform
+    relatively imports a sibling tree, so the fixture exercises both hops.
+    """
+    _write_file(repo_root / "services" / "mcp" / "tsconfig.json", _MCP_TSCONFIG)
+    _write_file(repo_root / "services" / "mcp" / "src" / "ui-apps" / "Chart.tsx", _UI_APP_SOURCE)
+    _write_file(repo_root / "services" / "mcp" / "src" / "tools" / "tool.ts", tool_source)
+    insights = repo_root / "products" / "product_analytics" / "frontend" / "insights"
+    _write_file(insights / "trends" / "transforms.ts", "import { helper } from '../shared/helper'\n")
+    _write_file(insights / "shared" / "helper.ts", "export const helper = 1\n")
+    _write_file(repo_root / "products" / "notebooks" / "catalog.json", "{}\n")
+    workflows_dir = repo_root / ".github" / "workflows"
+    workflows_dir.mkdir(parents=True)
+    _write(workflows_dir, "ci-mcp.yml", _filter_workflow(mcp_patterns))
+    _write(workflows_dir, "ci-mcp-ui-apps.yml", _filter_workflow(ui_apps_patterns))
+    return workflows_dir
+
+
+def _coverage_issues(repo_root: Path, workflows_dir: Path, workflow: str) -> list[str]:
+    result = McpFilterCoverageCheck(repo_root=repo_root).run(_read_all(workflows_dir))
+    return [issue.message for issue in result.issues if issue.workflow == workflow]
+
+
+class TestMcpAliasResolution:
+    @pytest.mark.parametrize(
+        "alias, specifier, target",
+        [
+            ("products/*", "products/pa/frontend/x", "products/pa/frontend/x"),
+            ("@app/*/index", "@app/charts/index", "products/charts"),
+            ("@app/*/index", "@app//index", "products/"),
+            # The tail is empty and the end index is 0, which must not read as
+            # "slice to the end" and substitute the suffix for the wildcard.
+            ("*/index", "/index", "products/"),
+        ],
+    )
+    def test_substitutes_the_wildcard_tail(self, alias: str, specifier: str, target: str) -> None:
+        assert _resolve(specifier, {alias: ["products/*"]}) == [target]
+
+    def test_an_alias_without_a_wildcard_matches_whole(self) -> None:
+        aliases = {"@posthog/quill": ["packages/quill/dist/index.d.ts"]}
+        assert _resolve("@posthog/quill", aliases) == ["packages/quill/dist/index.d.ts"]
+        assert _resolve("@posthog/quill/extra", aliases) == []
+
+
+class TestMcpFilterCoverageCheck:
+    def test_passes_when_directory_patterns_cover_every_import(self, tmp_path: Path) -> None:
+        # quill's alias target is a built `dist` file absent from a fresh checkout;
+        # the check must still demand coverage of it, and 'packages/quill/**' gives it.
+        workflows_dir = _mcp_repo(tmp_path, mcp_patterns=_COVERING_PATTERNS, ui_apps_patterns=_COVERING_PATTERNS)
+        assert McpFilterCoverageCheck(repo_root=tmp_path).run(_read_all(workflows_dir)).issues == []
+
+    @pytest.mark.parametrize(
+        "patterns, uncovered",
+        [
+            pytest.param([], [_INSIGHTS_SHARED, _INSIGHTS_TRENDS], id="no-pattern"),
+            # A module reaches its own relative imports, so covering the directly
+            # imported directory alone still leaves the sibling tree uncovered.
+            pytest.param([f"{_INSIGHTS_TRENDS}/**"], [_INSIGHTS_SHARED], id="only-the-imported-directory"),
+            pytest.param(
+                [f"{_INSIGHTS_TRENDS}/transforms.ts", f"{_INSIGHTS_SHARED}/helper.ts"],
+                [_INSIGHTS_SHARED, _INSIGHTS_TRENDS],
+                id="patterns-naming-the-files",
+            ),
+        ],
+    )
+    def test_flags_a_tree_no_directory_pattern_covers(
+        self, tmp_path: Path, patterns: list[str], uncovered: list[str]
+    ) -> None:
+        product_patterns = ["services/mcp/**", "packages/quill/**", *patterns]
+        workflows_dir = _mcp_repo(tmp_path, mcp_patterns=product_patterns, ui_apps_patterns=product_patterns)
+        messages = _coverage_issues(tmp_path, workflows_dir, "ci-mcp.yml")
+        assert sorted(message.split("'")[1] for message in messages) == uncovered
+
+    @pytest.mark.parametrize(
+        "tsconfig, reported",
+        [
+            pytest.param("{ not json", True, id="unparseable"),
+            pytest.param('{"compilerOptions": {}}', True, id="no-paths-key"),
+            pytest.param(None, False, id="no-mcp-service-in-this-checkout"),
+        ],
+    )
+    def test_an_unusable_tsconfig_is_reported_rather_than_passed(
+        self, tmp_path: Path, tsconfig: str | None, reported: bool
+    ) -> None:
+        # Deriving no aliases means reading no imports, which clears every filter
+        # by not looking. Only an absent MCP service is a legitimate pass.
+        workflows_dir = _mcp_repo(tmp_path, mcp_patterns=_COVERING_PATTERNS, ui_apps_patterns=_COVERING_PATTERNS)
+        path = tmp_path / "services" / "mcp" / "tsconfig.json"
+        path.unlink()
+        if tsconfig is not None:
+            path.write_text(tsconfig)
+        messages = _coverage_issues(tmp_path, workflows_dir, "ci-mcp.yml")
+        assert bool(messages) is reported
+        assert not reported or "compilerOptions.paths" in messages[0]
+
+    def test_walks_files_a_sparse_checkout_left_out(self, tmp_path: Path) -> None:
+        # CI lints from a sparse checkout. A tsconfig or imported module it left out
+        # is still tracked, so the walk must read it rather than stop short.
+        patterns = ["services/mcp/**", "packages/quill/**"]
+        workflows_dir = _mcp_repo(tmp_path, mcp_patterns=patterns, ui_apps_patterns=patterns)
+        _sparse_out(tmp_path, "services/mcp/tsconfig.json", f"{_INSIGHTS_TRENDS}/transforms.ts")
+        messages = _coverage_issues(tmp_path, workflows_dir, "ci-mcp.yml")
+        assert sorted(message.split("'")[1] for message in messages) == [_INSIGHTS_SHARED, _INSIGHTS_TRENDS]
+
+    def test_a_relative_import_out_of_the_mcp_tree_needs_coverage(self, tmp_path: Path) -> None:
+        # The MCP tests reach the frontend insight fixtures this way, so a relative
+        # specifier that leaves services/mcp/ counts like an aliased one.
+        _mcp_repo(tmp_path, mcp_patterns=_COVERING_PATTERNS, ui_apps_patterns=_COVERING_PATTERNS)
+        _write_file(tmp_path / "frontend" / "fixtures" / "trends.json", "{}\n")
+        _write_file(
+            tmp_path / "services" / "mcp" / "tests" / "fixtures.ts",
+            "import trends from '../../../frontend/fixtures/trends.json'\n",
+        )
+        workflows_dir = tmp_path / ".github" / "workflows"
+        messages = _coverage_issues(tmp_path, workflows_dir, "ci-mcp.yml")
+        assert [message.split("'")[1] for message in messages] == ["frontend/fixtures/trends.json"]
+
+    def test_a_relative_specifier_that_resolves_to_nothing_is_ignored(self, tmp_path: Path) -> None:
+        # generate-ui-apps.ts holds import statements inside the code it emits, and
+        # from services/mcp/scripts/ those climb clear of the MCP tree. The regex
+        # cannot tell them from real imports, so the missing file is the signal.
+        workflows_dir = _mcp_repo(tmp_path, mcp_patterns=_COVERING_PATTERNS, ui_apps_patterns=_COVERING_PATTERNS)
+        _write_file(
+            tmp_path / "services" / "mcp" / "scripts" / "generate.ts",
+            "const template = `import { App } from '../../components/App'`\n",
+        )
+        assert McpFilterCoverageCheck(repo_root=tmp_path).run(_read_all(workflows_dir)).issues == []
+
+    def test_a_data_import_is_covered_by_a_pattern_naming_it(self, tmp_path: Path) -> None:
+        # A JSON import has no relative imports of its own, so naming the file is enough.
+        workflows_dir = _mcp_repo(
+            tmp_path,
+            mcp_patterns=[*_COVERING_PATTERNS, "products/notebooks/catalog.json"],
+            ui_apps_patterns=_COVERING_PATTERNS,
+            tool_source="import catalog from 'products/notebooks/catalog.json'\n",
+        )
+        assert McpFilterCoverageCheck(repo_root=tmp_path).run(_read_all(workflows_dir)).issues == []
+
+    def test_ui_apps_workflow_ignores_imports_it_does_not_compile(self, tmp_path: Path) -> None:
+        # ci-mcp-ui-apps.yml builds only the UI apps, so an import reachable only
+        # from services/mcp/src/tools is not its filter's problem.
+        workflows_dir = _mcp_repo(
+            tmp_path,
+            mcp_patterns=_COVERING_PATTERNS,
+            ui_apps_patterns=_COVERING_PATTERNS,
+            tool_source="import catalog from 'products/notebooks/catalog.json'\n",
+        )
+        assert _coverage_issues(tmp_path, workflows_dir, "ci-mcp-ui-apps.yml") == []
+        assert [message.split("'")[1] for message in _coverage_issues(tmp_path, workflows_dir, "ci-mcp.yml")] == [
+            "products/notebooks/catalog.json"
+        ]
+
+
+# ---------------------------------------------------------------------------
+# StorybookStaticDirsCoverageCheck
+# ---------------------------------------------------------------------------
+
+_STORYBOOK_MAIN = """
+const config = {
+    staticDirs: [
+        'public',
+        { from: '../../../frontend/public', to: '/static' },
+        // { from: '../../../commented/out', to: '/x' },
+        { from: '../../../frontend/node_modules/emojibase-data/en', to: '/static/emoji/en' },
+        { from: '../../../posthog/templates/replay_player_frame', to: '/replay_player_frame' },
+    ],
+}
+"""
+
+
+def _storybook_repo(repo_root: Path, filters: dict[str, list[str]], main: str = _STORYBOOK_MAIN) -> Path:
+    _write_file(repo_root / "common" / "storybook" / ".storybook" / "main.ts", main)
+    lines = ["name: x", "on: [pull_request]", "jobs:", "  changes:", "    runs-on: ubuntu-24.04"]
+    lines += ["    timeout-minutes: 5", "    steps:", "      - uses: ./.github/actions/paths-filter"]
+    lines += ["        with:", "          filters: |"]
+    for name, patterns in filters.items():
+        lines += [f"            {name}:", *(f"              - '{pattern}'" for pattern in patterns)]
+    workflows_dir = repo_root / ".github" / "workflows"
+    workflows_dir.mkdir(parents=True)
+    _write(workflows_dir, "ci-storybook.yml", "\n".join([*lines, ""]))
+    return workflows_dir
+
+
+class TestStorybookStaticDirsCoverageCheck:
+    @pytest.mark.parametrize(
+        "filters, uncovered",
+        [
+            pytest.param(
+                {
+                    "frontend": [
+                        "frontend/**",
+                        "common/{mosaic,storybook}/**",
+                        "posthog/templates/replay_player_frame/**",
+                    ]
+                },
+                [],
+                id="covered-with-a-brace-group",
+            ),
+            pytest.param(
+                {"frontend": ["frontend/**", "common/{mosaic,storybook}/**"]},
+                ["posthog/templates/replay_player_frame"],
+                id="template-dir-missing",
+            ),
+            pytest.param(
+                {"frontend": ["frontend/**", "common/storybook/**"], "other": ["posthog/templates/**"]},
+                ["posthog/templates/replay_player_frame"],
+                id="covered-only-by-another-filter",
+            ),
+            pytest.param(
+                {"frontend": ["frontend/**", "common/storybook/**", "{a,b,c,d,e,f,g,h,i,j}" * 9]},
+                ["posthog/templates/replay_player_frame"],
+                id="brace-groups-over-the-expansion-cap",
+            ),
+        ],
+    )
+    def test_flags_static_dirs_the_frontend_filter_misses(
+        self, tmp_path: Path, filters: dict[str, list[str]], uncovered: list[str]
+    ) -> None:
+        workflows_dir = _storybook_repo(tmp_path, filters)
+        issues = StorybookStaticDirsCoverageCheck(repo_root=tmp_path).run(_read_all(workflows_dir)).issues
+        assert [issue.message.split("'")[1] for issue in issues] == uncovered
+
+    def test_a_config_with_no_readable_static_dirs_is_reported(self, tmp_path: Path) -> None:
+        workflows_dir = _storybook_repo(tmp_path, {"frontend": ["frontend/**"]}, main="const config = {}\n")
+        issues = StorybookStaticDirsCoverageCheck(repo_root=tmp_path).run(_read_all(workflows_dir)).issues
+        assert len(issues) == 1 and "staticDirs" in issues[0].message
+
+
+class TestLiveTreeSmoke:
+    """Smoke test against the live ``.github/workflows/`` tree.
+
+    Asserts that parsing and every check execute without raising — does NOT
+    assert pass/fail of individual rules. This keeps the test stable as
+    workflows evolve while still catching crashes that fixtures miss.
+    """
+
+    def test_live_tree_parses_and_checks_run(self) -> None:
+        from hogli.manifest import REPO_ROOT
+
+        workflows_dir = REPO_ROOT / ".github" / "workflows"
+        if not workflows_dir.exists():
+            pytest.skip("no .github/workflows directory in this checkout")
+        workflows = list(read_workflows(workflows_dir))
+        for check in CHECKS:
+            assert isinstance(check.run(workflows), CheckResult)
+
+
+class TestReusableSecretPassthroughCheck:
+    @staticmethod
+    def _callee(required: bool, reads: bool = True) -> str:
+        env = "T: ${{ secrets.NEEDED }}" if reads else "T: static"
+        return f"""
+        name: R
+        on:
+          workflow_call:
+            secrets:
+              NEEDED:
+                required: {str(required).lower()}
+        jobs:
+          build:
+            runs-on: ubuntu-latest
+            timeout-minutes: 5
+            steps:
+              - run: echo
+                env:
+                  {env}
+        """
+
+    @pytest.mark.parametrize(
+        "on_block",
+        ["on:\n  workflow_call:", "on: workflow_call", "on: [workflow_call, push]"],
+        ids=["empty-mapping", "scalar", "list"],
+    )
+    def test_flags_a_read_the_callee_never_declares(self, tmp_path: Path, on_block: str) -> None:
+        _write(
+            tmp_path,
+            "_callee.yml",
+            "name: R\n"
+            + on_block
+            + "\njobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: 5\n"
+            + "    steps:\n      - run: echo\n        env:\n          T: ${{ secrets.NEVER_ARRIVES }}\n",
+        )
+        issues = ReusableSecretPassthroughCheck().run(_read_all(tmp_path)).issues
+        assert len(issues) == 1, [i.render() for i in issues]
+        assert "does not declare it" in issues[0].message
+
+    def test_reads_come_only_from_expressions(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "_callee.yml",
+            """
+            name: R
+            # Needs secrets.COMMENTED_ONLY to be configured in the repo.
+            on:
+              workflow_call:
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: 5
+                steps:
+                  - run: echo secrets.SHELL_LITERAL_ONLY
+                    env:
+                      T: ${{ secrets['BRACKETED'] }}
+            """,
+        )
+        issues = ReusableSecretPassthroughCheck().run(_read_all(tmp_path)).issues
+        assert [i.message.split(" ")[1] for i in issues] == ["secrets.BRACKETED"], [i.render() for i in issues]
+
+    @pytest.mark.parametrize("reads", [True, False], ids=["read", "declared-only"])
+    def test_flags_a_caller_omitting_a_required_secret(self, tmp_path: Path, reads: bool) -> None:
+        _write(tmp_path, "_callee.yml", self._callee(required=True, reads=reads))
+        _write(
+            tmp_path,
+            "caller.yml",
+            """
+            name: C
+            on: [push]
+            jobs:
+              call:
+                uses: ./.github/workflows/_callee.yml
+            """,
+        )
+        issues = ReusableSecretPassthroughCheck().run(_read_all(tmp_path)).issues
+        assert len(issues) == 1, [i.render() for i in issues]
+        assert issues[0].job == "call"
+        assert "does not pass it" in issues[0].message
+
+    def test_allows_a_caller_omitting_an_optional_secret(self, tmp_path: Path) -> None:
+        # `required: false` is the callee sanctioning absence, which callers rely on
+        # to withhold a publish credential from a dry-run build.
+        _write(tmp_path, "_callee.yml", self._callee(required=False))
+        _write(
+            tmp_path,
+            "caller.yml",
+            """
+            name: C
+            on: [push]
+            jobs:
+              call:
+                uses: ./.github/workflows/_callee.yml
+            """,
+        )
+        assert ReusableSecretPassthroughCheck().run(_read_all(tmp_path)).issues == []
+
+    @pytest.mark.parametrize(
+        "secrets_block",
+        [
+            "        secrets: inherit",
+            "        secrets:\n            NEEDED: ${{ secrets.SOME_OTHER_NAME }}",
+        ],
+        ids=["inherit", "renamed-passthrough"],
+    )
+    def test_satisfied_by_inherit_or_a_renamed_passthrough(self, tmp_path: Path, secrets_block: str) -> None:
+        _write(tmp_path, "_callee.yml", self._callee(required=True))
+        _write(
+            tmp_path,
+            "caller.yml",
+            "name: C\non: [push]\njobs:\n    call:\n        uses: ./.github/workflows/_callee.yml\n"
+            + secrets_block
+            + "\n",
+        )
+        issues = ReusableSecretPassthroughCheck().run(_read_all(tmp_path)).issues
+        assert issues == [], [i.render() for i in issues]
+
+
+# ---------------------------------------------------------------------------
+# ShellSplitActionArgsCheck
+# ---------------------------------------------------------------------------
+
+
+def _write_table_actions(repo_root: Path, *, declared: bool = True) -> None:
+    for action, names in _ssaa.SHELL_SPLIT_INPUTS.items():
+        directory = repo_root / action
+        directory.mkdir(parents=True, exist_ok=True)
+        declarations = sorted(names) if declared else ["renamed"]
+        lines = ["name: A", "description: A", "inputs:"]
+        lines += [f"  {name}:\n    description: d\n    required: true" for name in declarations]
+        lines += ["runs:", "  using: composite", "  steps:", "    - shell: bash", "      env:"]
+        lines += [f"        {name.upper()}: ${{{{ inputs.{name} }}}}" for name in declarations]
+        refs = " ".join(f"${name.upper()}" for name in declarations)
+        lines += [f'      run: sh -c "echo {refs}"']
+        (directory / "action.yml").write_text("\n".join(lines) + "\n")
+
+
+def _caller(args: str, *, uses: str = "./.github/actions/semgrep-ci") -> str:
+    return f"""
+    name: Security
+    on: [pull_request]
+    jobs:
+      semgrep:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 5
+        steps:
+          - uses: {uses}
+            with:
+              image: semgrep/semgrep:1.0.0
+              args: >-
+                {args}
+    """
+
+
+class TestShellSplitActionArgsCheck:
+    @pytest.fixture(autouse=True)
+    def _hazardous_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The live table is empty because semgrep-ci stopped splicing. Enforcement
+        # still has to work for any action that has not been fixed yet, so these
+        # tests supply one.
+        monkeypatch.setattr(_ssaa, "SHELL_SPLIT_INPUTS", {".github/actions/semgrep-ci": frozenset({"args"})})
+
+    @staticmethod
+    def _run(repo_root: Path, workflow: str) -> list[str]:
+        workflows_dir = repo_root / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True, exist_ok=True)
+        _write(workflows_dir, "ci-security.yaml", workflow)
+        check = ShellSplitActionArgsCheck(repo_root=repo_root)
+        return [issue.render() for issue in check.run(_read_all(workflows_dir)).issues]
+
+    def test_flags_a_hash_in_a_listed_input(self, tmp_path: Path) -> None:
+        _write_table_actions(tmp_path)
+        [issue] = self._run(
+            tmp_path,
+            _caller("--config p/security-audit\n                # temporarily off\n                --config p/python"),
+        )
+        assert "with.args" in issue, issue
+        assert "'#'" in issue and "hands this value to a shell" in issue, issue
+
+    def test_flags_a_semicolon_the_inner_shell_would_treat_as_a_terminator(self, tmp_path: Path) -> None:
+        _write_table_actions(tmp_path)
+        [issue] = self._run(tmp_path, _caller("--config p/python ; --include /posthog"))
+        assert "';'" in issue, issue
+
+    def test_flags_a_newline_a_more_indented_line_leaves_unfolded(self, tmp_path: Path) -> None:
+        # A folded scalar does not fold a MORE-INDENTED line: YAML keeps the breaks
+        # around it, so an author indenting one flag for readability ships a literal
+        # newline, which truncates the command exactly as a '#' does.
+        _write_table_actions(tmp_path)
+        [issue] = self._run(
+            tmp_path,
+            _caller("--config p/python\n                  --indented /posthog\n                --jobs 4"),
+        )
+        assert "\\n" in issue or "newline" in issue, issue
+
+    def test_derivation_reads_a_single_quoted_shell_c_operand(self, tmp_path: Path) -> None:
+        # Actions substitutes `${{ inputs.x }}` before the shell parses, so a
+        # single-quoted script splices an input exactly as a double-quoted one does.
+        action_dir = tmp_path / ".github" / "actions" / "singlequoted"
+        action_dir.mkdir(parents=True)
+        (action_dir / "action.yml").write_text(
+            "name: A\ndescription: A\ninputs:\n  flags:\n    description: d\n    required: true\n"
+            "runs:\n  using: composite\n  steps:\n    - shell: bash\n"
+            "      run: sh -c 'tool ${{ inputs.flags }}'\n",
+            encoding="utf-8",
+        )
+        derived = derive_shell_split_inputs(tmp_path)
+        assert derived.get(".github/actions/singlequoted") == frozenset({"flags"}), derived
+
+    @staticmethod
+    def _shipped_split() -> str:
+        """The `set -f` … `set +f` block from the real action, so these cannot drift from it."""
+        from hogli.manifest import REPO_ROOT
+
+        text = (REPO_ROOT / ".github" / "actions" / "semgrep-ci" / "action.yml").read_text(encoding="utf-8")
+        lines = text.splitlines()
+        first = next(i for i, line in enumerate(lines) if line.strip() == "set -f")
+        last = next(i for i in range(first, len(lines)) if lines[i].strip() == "set +f")
+        return textwrap.dedent("\n".join(line.strip() for line in lines[first : last + 1]))
+
+    @staticmethod
+    def _dispatch(script: str, args: str) -> str:
+        done = subprocess.run(
+            ["bash", "-c", script + '\nsh -c \'printf "[%s]" "$@"\' sh "${semgrep_args[@]}"'],
+            env={"SEMGREP_ARGS": args, "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+        )
+        assert done.returncode == 0, done.stderr
+        return done.stdout
+
+    def test_the_shipped_action_still_passes_arguments_positionally(self) -> None:
+        from hogli.manifest import REPO_ROOT
+
+        text = (REPO_ROOT / ".github" / "actions" / "semgrep-ci" / "action.yml").read_text(encoding="utf-8")
+        assert '"$@"' in text, "the action must hand semgrep positional parameters"
+        assert "$SEMGREP_ARGS" not in text.split("docker run")[1], (
+            "the value must not be spliced into the command the container shell parses"
+        )
+
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            ("--config p/python --jobs 4", "[--config][p/python][--jobs][4]"),
+            # the three terminators that used to truncate the scan silently
+            ("--config p/python # note --jobs 4", "[--config][p/python][#][note][--jobs][4]"),
+            ("--config p/python ; --jobs 4", "[--config][p/python][;][--jobs][4]"),
+            ("--config p/python\n--jobs 4", "[--config][p/python][--jobs][4]"),
+            # globs reach semgrep unexpanded; semgrep does its own matching
+            ("--include *.py --exclude tests/**", "[--include][*.py][--exclude][tests/**]"),
+            ("--config p/python\t--jobs 4", "[--config][p/python][--jobs][4]"),
+        ],
+    )
+    def test_the_shipped_split_hands_over_every_argument(self, args: str, expected: str) -> None:
+        assert self._dispatch(self._shipped_split(), args) == expected
+
+    @pytest.mark.parametrize("args", ["", "   ", "\n"])
+    def test_an_empty_args_value_passes_no_arguments_at_all(self, args: str) -> None:
+        # An empty string must not become one EMPTY argument: semgrep would read
+        # that as a target path and scan the wrong tree. Count the arguments
+        # rather than rendering them -- `printf "[%s]"` runs its format once even
+        # with nothing to substitute, so a rendering cannot tell 0 from 1 here.
+        script = self._shipped_split() + '\nsh -c \'printf %s "$#"\' sh "${semgrep_args[@]}"'
+        done = subprocess.run(
+            ["bash", "-c", script],
+            env={"SEMGREP_ARGS": args, "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+        )
+        assert done.stdout == "0", done.stdout
+
+    def test_the_shipped_split_leaves_globbing_enabled_afterwards(self) -> None:
+        # `set -f` suppresses expansion for the split. Leaving it set would change
+        # every later command in the step.
+        script = self._shipped_split() + "\ncase $- in *f*) echo LEAKED ;; *) echo restored ;; esac"
+        done = subprocess.run(
+            ["bash", "-c", script],
+            env={"SEMGREP_ARGS": "--config p/python", "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+        )
+        assert done.stdout.strip() == "restored", done.stdout
+
+    def test_derivation_follows_an_input_through_an_env_hop(self, tmp_path: Path) -> None:
+        # The shape the real action used: `env:` binds the input, the script reads
+        # the variable. Derivation has to follow that hop, not just direct interpolation.
+        action_dir = tmp_path / ".github" / "actions" / "envhop"
+        action_dir.mkdir(parents=True)
+        (action_dir / "action.yml").write_text(
+            "name: A\ndescription: A\ninputs:\n  flags:\n    description: d\n    required: true\n"
+            "runs:\n  using: composite\n  steps:\n    - shell: bash\n      env:\n"
+            "        FLAGS: ${{ inputs.flags }}\n"
+            '      run: sh -c "tool $FLAGS"\n',
+            encoding="utf-8",
+        )
+        assert derive_shell_split_inputs(tmp_path).get(".github/actions/envhop") == frozenset({"flags"})
+
+    @staticmethod
+    def _write_action(repo_root: Path, name: str, run: str, *, env: bool = True) -> None:
+        directory = repo_root / ".github" / "actions" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        env_block = "      env:\n        ARGS: ${{ inputs.flags }}\n" if env else ""
+        (directory / "action.yml").write_text(
+            "name: A\ndescription: A\ninputs:\n  flags:\n    description: d\n    required: true\n"
+            f"runs:\n  using: composite\n  steps:\n    - shell: bash\n{env_block}      run: {run}\n",
+            encoding="utf-8",
+        )
+
+    @pytest.mark.parametrize(
+        ("run", "spliced"),
+        [
+            # unquoted: the action, not the caller, decides where the value
+            # splits into flags, and a `*` in it globs against the container
+            ('sh -c "tool $ARGS"', True),
+            ("sh -c 'tool $ARGS'", True),
+            # double-quoted -- ONE argument, nothing re-parses it
+            ("sh -c 'tool \"$ARGS\"'", False),
+            ("sh -c 'tool --flag \"${ARGS}\" --other'", False),
+            # quoted somewhere, unquoted somewhere else: still listed
+            ("sh -c 'tool \"$OTHER\" $ARGS'", True),
+            # A GitHub expression is NOT a shell variable: Actions substitutes it into
+            # the script text before any shell parses, so a quote in the value closes the
+            # quote around it. Quoting cannot protect it -- both forms are hazards.
+            ("sh -c \"tool '${{ inputs.flags }}'\"", True),
+            ('sh -c "tool ${{ inputs.flags }}"', True),
+        ],
+    )
+    def test_derivation_ignores_a_reference_the_inner_shell_cannot_split(
+        self, tmp_path: Path, run: str, spliced: bool
+    ) -> None:
+        self._write_action(tmp_path, "probe", run)
+        derived = derive_shell_split_inputs(tmp_path)
+        assert (".github/actions/probe" in derived) is spliced, derived
+
+    @pytest.mark.parametrize("metadata", ["action.yml", "action.yaml"])
+    def test_an_action_whose_metadata_does_not_parse_is_reported(self, tmp_path: Path, metadata: str) -> None:
+        # An unreadable action returns None exactly as an absent one does, so
+        # without this the derivation finds nothing and the check passes clean --
+        # the check silently doing nothing, which is what it exists to catch.
+        # Both spellings are reported under the name actually on disk, so the
+        # annotation has a real file to attach to.
+        broken = tmp_path / ".github" / "actions" / "broken"
+        broken.mkdir(parents=True)
+        (broken / metadata).write_text("name: A\n  bad: [unclosed\n", encoding="utf-8")
+        assert unparseable_actions(tmp_path) == [f".github/actions/broken/{metadata}"]
+        issues = self._run(tmp_path, _caller("--config p/python"))
+        assert any(f"broken/{metadata}: does not parse" in issue for issue in issues), issues
+
+    def test_derivation_reads_an_unquoted_shell_c_operand(self, tmp_path: Path) -> None:
+        # `sh -c $FLAGS` is if anything worse than a quoted operand: the value is
+        # split before the inner shell even sees it. It must not go uninspected.
+        self._write_action(tmp_path, "bare", "sh -c $ARGS")
+        assert derive_shell_split_inputs(tmp_path).get(".github/actions/bare") == frozenset({"flags"})
+
+    @pytest.mark.parametrize(
+        ("run", "spliced"),
+        [
+            # quoting makes the reference one argument, but `eval` parses that
+            # argument a second time, so the value is read as script anyway
+            ("""sh -c 'eval "$ARGS"'""", True),
+            ("""sh -c 'tool "$OTHER" && eval "$ARGS"'""", True),
+            # eval's command ends at the terminator: $ARGS is tool's argument
+            ("""sh -c 'eval "$OTHER"; tool "$ARGS"'""", False),
+            # `eval` as a literal or an argument re-parses nothing
+            ("""sh -c 'echo "eval $ARGS"'""", False),
+            ("""sh -c 'tool --eval "$ARGS"'""", False),
+            # a nested `-c` parses its argument exactly as `eval` does
+            ("""sh -c 'bash -c "$ARGS"'""", True),
+            ("""sh -c 'docker exec c sh -c "$ARGS"'""", True),
+            ("""sh -c 'sh -c "$OTHER"; tool "$ARGS"'""", False),
+        ],
+    )
+    def test_derivation_reads_a_quoted_reference_handed_to_a_second_parse(
+        self, tmp_path: Path, run: str, spliced: bool
+    ) -> None:
+        # The quoted-reference skip cleared these as safe, which is worse than
+        # missing them: the check affirmatively said a hazardous script had none.
+        self._write_action(tmp_path, "evaluator", run)
+        assert (".github/actions/evaluator" in derive_shell_split_inputs(tmp_path)) is spliced, run
+
+    @pytest.mark.parametrize(
+        ("run", "spliced"),
+        [
+            # a shell joins adjacent segments into ONE word, and the outer shell
+            # expands the double-quoted and bare ones while doing so
+            ("sh -c 'tool '\"$ARGS\"", True),
+            ('sh -c "tool "$ARGS', True),
+            # both segments single-quoted: the text reaches the inner shell
+            # untouched, so its own quotes still protect the variable
+            ("sh -c 'tool \"$ARGS\"'' --flag'", False),
+        ],
+    )
+    def test_derivation_reads_a_concatenated_shell_c_operand(self, tmp_path: Path, run: str, spliced: bool) -> None:
+        # Reading only the first segment left the rest of the operand uninspected.
+        self._write_action(tmp_path, "joined", run)
+        assert (".github/actions/joined" in derive_shell_split_inputs(tmp_path)) is spliced, run
+
+    @pytest.mark.parametrize(
+        "invocation",
+        [
+            "bash -lc",
+            "sh -lc",
+            "bash -euxc",
+            "sh -c",
+            "bash --norc -c",
+            # options whose value is a separate token: the value is not a flag, so
+            # a repetition that accepted only flags stopped there
+            "bash -O extglob -c",
+            "bash -o pipefail -c",
+            "bash +o history -c",
+            "bash --rcfile /dev/null -c",
+        ],
+    )
+    def test_derivation_reads_shell_options_before_c(self, tmp_path: Path, invocation: str) -> None:
+        # `bash -lc "..."` is the same hazard as `bash -l -c "..."`; requiring a
+        # separate -c left those actions uninspected.
+        self._write_action(tmp_path, "bundled", f'{invocation} "tool $ARGS"')
+        assert derive_shell_split_inputs(tmp_path).get(".github/actions/bundled") == frozenset({"flags"}), invocation
+
+    @pytest.mark.parametrize("content", ["", "- a list\n", "just a scalar\n"])
+    def test_action_metadata_that_parses_but_is_unusable_is_reported(self, tmp_path: Path, content: str) -> None:
+        # Parsing is not the bar. These parse fine and are then discarded exactly
+        # as an absent action is, so without this they read as safe.
+        directory = tmp_path / ".github" / "actions" / "odd"
+        directory.mkdir(parents=True)
+        (directory / "action.yml").write_text(content, encoding="utf-8")
+        assert unparseable_actions(tmp_path) == [".github/actions/odd/action.yml"], content
+
+    @pytest.mark.parametrize(
+        ("run", "spliced"),
+        [
+            # single-quoted OPERAND: the outer shell passes the text through, the
+            # inner shell expands "$ARGS" itself -> genuinely one argument
+            ("sh -c 'tool \"$ARGS\"'", False),
+            # double-quoted or bare OPERAND: the OUTER shell expands $ARGS into the
+            # script text first, so inner quoting cannot protect it
+            ("sh -c \"tool '$ARGS'\"", True),
+            ('sh -c "tool \\"$ARGS\\""', True),
+            ('sh -c "$ARGS"', True),
+        ],
+    )
+    def test_inner_quotes_only_protect_inside_a_single_quoted_operand(
+        self, tmp_path: Path, run: str, spliced: bool
+    ) -> None:
+        self._write_action(tmp_path, "operand", run)
+        assert (".github/actions/operand" in derive_shell_split_inputs(tmp_path)) is spliced, run
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "${{ inputs.flags }}",
+            "${{ inputs.flags || '' }}",
+            "${{ format('{0}', inputs.flags) }}",
+            "${{ inputs['flags'] }}",
+        ],
+    )
+    def test_derivation_reads_a_transformed_input_expression(self, tmp_path: Path, expression: str) -> None:
+        # These interpolate exactly the same text as a bare reference; matching
+        # only the bare form left the transformed ones unchecked.
+        self._write_action(tmp_path, "expr", f'sh -c "tool {expression}"', env=False)
+        assert derive_shell_split_inputs(tmp_path).get(".github/actions/expr") == frozenset({"flags"}), expression
+
+    def test_undecodable_action_metadata_is_reported_not_raised(self, tmp_path: Path) -> None:
+        # read_text raises UnicodeDecodeError, which is a ValueError and not an
+        # OSError -- so this used to take the whole lint down rather than report.
+        directory = tmp_path / ".github" / "actions" / "binary"
+        directory.mkdir(parents=True)
+        (directory / "action.yml").write_bytes(b"name: A\ndescription: \xff\xfe\n")
+        assert unparseable_actions(tmp_path) == [".github/actions/binary/action.yml"]
+
+    def test_a_nested_action_with_unreadable_metadata_is_reported(self, tmp_path: Path) -> None:
+        # The derivation scans `.github/actions/**` recursively; this alarm has to
+        # reach as far, or a nested action it would have scanned goes unmentioned.
+        nested = tmp_path / ".github" / "actions" / "group" / "inner"
+        nested.mkdir(parents=True)
+        (nested / "action.yml").write_text("name: A\n  bad: [unclosed\n", encoding="utf-8")
+        assert unparseable_actions(tmp_path) == [".github/actions/group/inner/action.yml"]
+
+    def test_a_parseable_action_is_not_reported_as_unparseable(self, tmp_path: Path) -> None:
+        self._write_action(tmp_path, "fine", """sh -c 'tool "$ARGS"'""")
+        assert unparseable_actions(tmp_path) == []
+
+    def test_reverse_drift_stays_quiet_while_the_action_still_splices(self, tmp_path: Path) -> None:
+        _write_table_actions(tmp_path)
+        issues = self._run(tmp_path, _caller("--config p/python"))
+        assert not any("no longer splices" in issue or "nothing there splices" in issue for issue in issues), issues
+
+    def test_flags_a_table_entry_the_tree_no_longer_splices(self, tmp_path: Path) -> None:
+        # Reverse drift. Without this, a table entry outlives the hazard and keeps
+        # callers being checked against something that is gone.
+        action_dir = tmp_path / ".github" / "actions" / "semgrep-ci"
+        action_dir.mkdir(parents=True)
+        (action_dir / "action.yml").write_text(
+            "name: A\ndescription: A\ninputs:\n  args:\n    description: d\n    required: true\n"
+            "runs:\n  using: composite\n  steps:\n    - shell: bash\n"
+            "      run: sh -c 'tool \"$@\"' sh $ARGS\n",
+            encoding="utf-8",
+        )
+        issues = self._run(tmp_path, _caller("--config p/python"))
+        assert any("no longer splices" in issue or "nothing there splices" in issue for issue in issues), issues
+
+    def test_a_foreign_action_sharing_our_layout_is_not_matched(self, tmp_path: Path) -> None:
+        # `OtherOrg/repo/.github/actions/semgrep-ci` is a different action. Matching it
+        # would fail a workflow over semantics that action does not have.
+        _write_table_actions(tmp_path)
+        assert (
+            self._run(
+                tmp_path,
+                _caller("--config p/python # off", uses="OtherOrg/repo/.github/actions/semgrep-ci@abc123"),
+            )
+            == []
+        )
+
+    def test_allows_a_value_with_no_hash(self, tmp_path: Path) -> None:
+        _write_table_actions(tmp_path)
+        assert self._run(tmp_path, _caller("--config p/python\n                --include /posthog")) == []
+
+    def test_ignores_an_input_the_table_does_not_list(self, tmp_path: Path) -> None:
+        _write_table_actions(tmp_path)
+        workflows_dir = tmp_path / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        _write(
+            workflows_dir,
+            "ci-security.yaml",
+            """
+            name: Security
+            on: [pull_request]
+            jobs:
+              semgrep:
+                runs-on: ubuntu-24.04
+                timeout-minutes: 5
+                steps:
+                  - uses: ./.github/actions/semgrep-ci
+                    with:
+                      image: semgrep/semgrep@sha256:abc # pinned
+                      args: --config p/python
+            """,
+        )
+        check = ShellSplitActionArgsCheck(repo_root=tmp_path)
+        assert check.run(_read_all(workflows_dir)).issues == []
+
+    def test_ignores_an_action_the_table_does_not_list(self, tmp_path: Path) -> None:
+        # 38 `with:` inputs in this repo carry a `#` legitimately, so the rule
+        # has to stay per-input rather than blanket.
+        _write_table_actions(tmp_path)
+        workflows_dir = tmp_path / ".github" / "workflows"
+        workflows_dir.mkdir(parents=True)
+        _write(
+            workflows_dir,
+            "ci-other.yml",
+            """
+            name: Other
+            on: [pull_request]
+            jobs:
+              changes:
+                runs-on: ubuntu-24.04
+                timeout-minutes: 5
+                steps:
+                  - uses: dorny/paths-filter@v3
+                    with:
+                      filters: |
+                        # the backend tree, minus docs
+                        backend:
+                          - 'posthog/**'
+                  - uses: actions/github-script@v7
+                    with:
+                      script: |
+                        // #1 in the queue
+                        core.info('ok')
+            """,
+        )
+        check = ShellSplitActionArgsCheck(repo_root=tmp_path)
+        assert check.run(_read_all(workflows_dir)).issues == []
+
+    def test_matches_a_repo_qualified_uses(self, tmp_path: Path) -> None:
+        _write_table_actions(tmp_path)
+        issues = self._run(
+            tmp_path,
+            _caller("--config p/python # off", uses="PostHog/posthog/.github/actions/semgrep-ci@abc123"),
+        )
+        assert len(issues) == 1, issues
+
+    def test_reports_an_action_missing_from_the_table(self, tmp_path: Path) -> None:
+        _write_table_actions(tmp_path)
+        made_up = tmp_path / ".github" / "actions" / "made-up"
+        made_up.mkdir(parents=True)
+        (made_up / "action.yml").write_text(
+            "name: M\ndescription: M\ninputs:\n  flags:\n    description: d\n    required: true\n"
+            "runs:\n  using: composite\n  steps:\n    - shell: bash\n      env:\n"
+            '        FLAGS: ${{ inputs.flags }}\n      run: sh -c "tool $FLAGS"\n'
+        )
+        [issue] = self._run(tmp_path, _caller("--config p/python"))
+        assert ".github/actions/made-up" in issue, issue
+        assert "missing from SHELL_SPLIT_INPUTS" in issue, issue
+
+    def test_reports_a_table_entry_whose_action_was_renamed_away(self, tmp_path: Path) -> None:
+        issues = self._run(tmp_path, _caller("--config p/python"))
+        assert len(issues) == len(_ssaa.SHELL_SPLIT_INPUTS), issues
+        assert all("no action there" in issue for issue in issues), issues
+
+    def test_reports_a_table_input_the_action_no_longer_declares(self, tmp_path: Path) -> None:
+        _write_table_actions(tmp_path, declared=False)
+        issues = self._run(tmp_path, _caller("--config p/python"))
+        assert any("no longer declares" in issue for issue in issues), issues
+
+    def test_derivation_reads_only_the_shell_c_operand(self, tmp_path: Path) -> None:
+        # Harvesting the whole run body would derive `image` too and fire a
+        # drift alarm on a correctly written action.
+        action = tmp_path / ".github" / "actions" / "runner"
+        action.mkdir(parents=True)
+        (action / "action.yml").write_text(
+            "name: R\ndescription: R\ninputs:\n  args:\n    description: d\n  image:\n    description: d\n"
+            "runs:\n  using: composite\n  steps:\n    - shell: bash\n      env:\n"
+            "        A: ${{ inputs.args }}\n        I: ${{ inputs.image }}\n"
+            '      run: |\n        docker run "$I" sh -c "tool $A"\n'
+        )
+        assert derive_shell_split_inputs(tmp_path) == {".github/actions/runner": frozenset({"args"})}
+
+    def test_live_tree_is_clean(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The real table, not the class fixture's hazardous stand-in.
+        monkeypatch.setattr(_ssaa, "SHELL_SPLIT_INPUTS", SHELL_SPLIT_INPUTS)
+        from hogli.manifest import REPO_ROOT
+
+        workflows_dir = REPO_ROOT / ".github" / "workflows"
+        if not workflows_dir.exists():
+            pytest.skip("no .github/workflows directory in this checkout")
+        check = ShellSplitActionArgsCheck(repo_root=REPO_ROOT)
+        issues = check.run(list(read_workflows(workflows_dir))).issues
+        assert issues == [], [issue.render() for issue in issues]
+        assert derive_shell_split_inputs(REPO_ROOT) == SHELL_SPLIT_INPUTS
+
+
+# ---------------------------------------------------------------------------
+# PausedPublicImagePullsCheck
+# ---------------------------------------------------------------------------
+
+
+def _image_job(push_to_ghcr: str, verify_step: str) -> str:
+    return f"""
+    name: x
+    on: [push]
+    jobs:
+      build:
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+          - id: docker-meta
+            uses: ./.github/actions/docker-meta
+            with:
+              image-name: app
+              push-to-ghcr: {push_to_ghcr}
+{textwrap.indent(textwrap.dedent(verify_step).strip(), " " * 10)}
+    """
+
+
+PAUSABLE = "${{ vars.PUBLIC_IMAGE_PUSH_PAUSED != 'true' }}"
+
+
+class TestPausedPublicImagePullsCheck:
+    @pytest.mark.parametrize(
+        "verify_step",
+        [
+            pytest.param(
+                """
+                - env:
+                    IMAGE: ghcr.io/posthog/app:${{ github.sha }}
+                  run: docker pull "$IMAGE"
+                """,
+                id="ghcr-via-env",
+            ),
+            pytest.param("- run: docker run --rm posthog/app:latest true", id="dockerhub-inline"),
+            pytest.param("- run: docker buildx imagetools inspect docker.io/posthog/app:latest", id="imagetools"),
+        ],
+    )
+    def test_flags_public_reads_when_push_can_pause(self, tmp_path: Path, verify_step: str) -> None:
+        _write(tmp_path, "wf.yml", _image_job(PAUSABLE, verify_step))
+        issues = PausedPublicImagePullsCheck().run(_read_all(tmp_path)).issues
+        assert len(issues) == 1, [i.render() for i in issues]
+        assert issues[0].job == "build"
+
+    @pytest.mark.parametrize(
+        "push_to_ghcr, verify_step",
+        [
+            pytest.param(
+                PAUSABLE,
+                """
+                - env:
+                    IMAGE: ${{ steps.docker-meta.outputs.ecr-registry }}/app@${{ steps.image.outputs.digest }}
+                  run: docker pull "$IMAGE"
+                """,
+                id="ecr-by-digest",
+            ),
+            pytest.param("'true'", "- run: docker pull ghcr.io/posthog/app:latest", id="push-never-pauses"),
+            pytest.param(
+                PAUSABLE,
+                """
+                - run: |
+                    echo "tags=ghcr.io/posthog/app:1.0" >> "$GITHUB_OUTPUT"
+                """,
+                id="tag-list-not-a-read",
+            ),
+        ],
+    )
+    def test_passes(self, tmp_path: Path, push_to_ghcr: str, verify_step: str) -> None:
+        _write(tmp_path, "wf.yml", _image_job(push_to_ghcr, verify_step))
+        assert PausedPublicImagePullsCheck().run(_read_all(tmp_path)).issues == []

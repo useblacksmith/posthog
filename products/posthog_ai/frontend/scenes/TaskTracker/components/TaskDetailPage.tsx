@@ -1,0 +1,151 @@
+import { useActions, useValues } from 'kea'
+
+import { IconExternal, IconGithub, IconPlay } from '@posthog/icons'
+import { LemonButton } from '@posthog/lemon-ui'
+
+import { NotFound } from 'lib/components/NotFound'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { urls } from 'scenes/urls'
+
+import { useThreadSkin } from '../../../hooks/useThreadSkin'
+import { nextTaskTitle } from '../../../lib/task-title'
+import { isPiTaskRuntime } from '../../../types/taskTypes'
+import { taskDetailSceneLogic } from '../taskDetailSceneLogic'
+import { taskTrackerSceneLogic } from '../taskTrackerSceneLogic'
+import { QuillTaskHeaderActions } from './QuillTaskHeaderActions'
+import { QuillTaskShareControl } from './QuillTaskShareControl'
+import { TaskHeaderActionsSkeleton } from './taskDetailSkeletons'
+import { TaskRunTabs } from './TaskRunArtifacts'
+import { TaskRunLog } from './TaskRunLog'
+import { TaskRunSceneShell } from './TaskRunSceneShell'
+
+export interface TaskDetailPageProps {
+    taskId: string
+    isMobile: boolean
+    titleActions?: JSX.Element
+}
+
+export function TaskDetailPage({ taskId, isMobile, titleActions }: TaskDetailPageProps): JSX.Element {
+    const sceneLogic = taskDetailSceneLogic({ taskId })
+    const { task, taskNotFound, taskError, latestRun, selectedRun, isTaskPending, isHeaderLoading, runTaskInFlight } =
+        useValues(sceneLogic)
+    const { runTask, deleteTask, loadTask, updateTask } = useActions(sceneLogic)
+    const { activeCreation, hasDesktopAccess } = useValues(taskTrackerSceneLogic)
+    const isActiveCreation = activeCreation?.taskId === taskId
+    const artifactsTabEnabled = useFeatureFlag('TODAY_RAIL_NAV')
+    const skin = useThreadSkin()
+    const piAcpEnabled = useFeatureFlag('PI_ACP')
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+
+    if (taskNotFound && !task) {
+        return <NotFound object="task" />
+    }
+
+    if (!isTaskPending && !task && !taskError) {
+        return <NotFound object="task" />
+    }
+
+    const isLatestRunInProgress = latestRun?.status === 'in_progress' || latestRun?.status === 'queued'
+    const isLatestRunCompleted = latestRun?.status === 'completed'
+    const runButtonText = latestRun ? 'Retry task' : 'Run task'
+
+    const prUrl = selectedRun?.output?.pr_url as string | undefined
+    const renameTask = (title: string): void => {
+        const nextTitle = nextTaskTitle(title, task?.title)
+        if (nextTitle) {
+            updateTask({ data: { title: nextTitle } })
+        }
+    }
+    const canRun =
+        !!task && (!isPiTaskRuntime(task.runtime) || piAcpEnabled) && !isLatestRunInProgress && !isLatestRunCompleted
+    const taskActions =
+        isHeaderLoading || !task ? (
+            isActiveCreation ? undefined : (
+                <TaskHeaderActionsSkeleton />
+            )
+        ) : skin === 'quill' || todayRailNav ? (
+            <QuillTaskHeaderActions
+                desktopUrl={hasDesktopAccess ? urls.codeTaskLink(task.id) : null}
+                prUrl={prUrl}
+                runLabel={canRun && latestRun ? runButtonText : null}
+                onRun={runTask}
+                running={runTaskInFlight}
+            />
+        ) : (
+            <div className="flex flex-wrap items-center gap-2">
+                {hasDesktopAccess && (
+                    <LemonButton
+                        type="secondary"
+                        size="small"
+                        icon={<IconExternal />}
+                        to={urls.codeTaskLink(task.id)}
+                        targetBlank
+                        className="hidden lg:inline-flex"
+                    >
+                        Open in PostHog Desktop
+                    </LemonButton>
+                )}
+                {prUrl && (
+                    <LemonButton
+                        type="secondary"
+                        size="small"
+                        icon={<IconGithub />}
+                        onClick={() => window.open(prUrl, '_blank')}
+                    >
+                        View PR
+                    </LemonButton>
+                )}
+                {canRun && (
+                    <LemonButton
+                        type="primary"
+                        size="small"
+                        icon={<IconPlay />}
+                        onClick={runTask}
+                        loading={runTaskInFlight}
+                        disabledReason={runTaskInFlight ? 'Starting the run' : undefined}
+                    >
+                        {runButtonText}
+                    </LemonButton>
+                )}
+            </div>
+        )
+
+    // When this task was just created optimistically, the seeded run stream lives under the creation's client
+    // `streamKey`. Hand it to the run log so it adopts that instance (and renders the thread immediately)
+    // instead of cold-bootstrapping a fresh, skeleton-flashing one.
+    const optimisticStreamKey = isActiveCreation ? activeCreation?.streamKey : undefined
+    const optimisticRunId = isActiveCreation ? activeCreation?.runId : undefined
+
+    const runLog = (
+        <TaskRunLog
+            taskId={taskId}
+            optimisticStreamKey={optimisticStreamKey}
+            optimisticRunId={optimisticRunId}
+            interactionKey={isActiveCreation ? activeCreation?.interactionKey : undefined}
+            autoFocus={isActiveCreation && activeCreation?.composerWasFocused}
+        />
+    )
+
+    return (
+        <TaskRunSceneShell
+            task={task}
+            selectedRun={selectedRun}
+            isHeaderLoading={isHeaderLoading && !isActiveCreation}
+            headerDivider={!artifactsTabEnabled}
+            titleActions={
+                <div className="flex flex-wrap items-center gap-2">
+                    {todayRailNav && task && <QuillTaskShareControl taskId={task.id} />}
+                    {taskActions}
+                    {titleActions}
+                </div>
+            }
+            onRename={task ? renameTask : undefined}
+            onArchive={deleteTask}
+            taskError={taskError}
+            onRetry={loadTask}
+            isMobile={isMobile}
+        >
+            {artifactsTabEnabled ? <TaskRunTabs taskId={taskId} conversation={runLog} /> : runLog}
+        </TaskRunSceneShell>
+    )
+}

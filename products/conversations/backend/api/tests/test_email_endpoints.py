@@ -1,0 +1,3400 @@
+from datetime import timedelta
+from email import message_from_bytes
+from io import BytesIO
+
+from posthog.test.base import BaseTest
+from unittest.mock import MagicMock, call, patch
+
+from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import Client, SimpleTestCase
+from django.utils import timezone
+
+from parameterized import parameterized
+from PIL import Image
+
+from posthog.models.comment import Comment
+from posthog.models.organization import Organization, OrganizationMembership
+from posthog.models.team import Team
+from posthog.models.uploaded_media import UploadedMedia
+from posthog.models.user import User
+
+from products.conversations.backend.api.tests.mailgun_signing import MailgunWebhookTestMixin, post_mailgun
+from products.conversations.backend.mailgun import (
+    MailgunDomainConflict,
+    MailgunDomainNotRegistered,
+    MailgunNotConfigured,
+    MailgunPermanentError,
+    MailgunTransientError,
+)
+from products.conversations.backend.models import (
+    EmailChannel,
+    EmailChannelConnectionStatus,
+    EmailChannelKind,
+    EmailChannelSetup,
+    EmailChannelSetupProvider,
+    EmailMessageMapping,
+    EmailOutboxMessage,
+)
+from products.conversations.backend.models.ticket import Ticket
+
+
+def _make_png_bytes() -> bytes:
+    """Generate a minimal valid 1x1 PNG."""
+    buf = BytesIO()
+    Image.new("RGB", (1, 1), color="red").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _make_image_bytes(image_format: str) -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", (1, 1), color="red").save(buf, format=image_format)
+    return buf.getvalue()
+
+
+class TestEmailConnectDomainCaseInsensitivity(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.client.force_login(self.user)
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_connect_lowercases_domain(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock):
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "Support@Example.COM", "from_name": "Support"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        config = EmailChannel.objects.get(team=self.team)
+        assert config.from_email == "support@example.com"
+        assert config.domain == "example.com"
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_connect_rejects_duplicate_domain_different_casing_cross_org(
+        self, _mock_setting: MagicMock, _mock_mailgun: MagicMock
+    ):
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+
+        # A team in a different org tries the same domain with different casing
+        other_org = Organization.objects.create(name="Other Org")
+        second_team = Team.objects.create(organization=other_org)
+        OrganizationMembership.objects.create(
+            user=self.user, organization=other_org, level=OrganizationMembership.Level.ADMIN
+        )
+        self.user.current_team = second_team
+        self.user.save()
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "help@Example.COM", "from_name": "Help"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 409
+        assert "already in use" in response.json()["error"]
+
+
+class TestEmailChannelPermissions(BaseTest):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+        self.client.force_login(self.user)
+
+    @parameterized.expand(
+        [
+            (
+                "connect",
+                "post",
+                "/api/conversations/v1/email/connect",
+                {"from_email": "s@example.com", "from_name": "S"},
+            ),
+            (
+                "disconnect",
+                "post",
+                "/api/conversations/v1/email/disconnect",
+                {"config_id": "00000000-0000-0000-0000-000000000999"},
+            ),
+            (
+                "set-default",
+                "post",
+                "/api/conversations/v1/email/set-default",
+                {"config_id": "00000000-0000-0000-0000-000000000999"},
+            ),
+            (
+                "set-trusted-relay",
+                "post",
+                "/api/conversations/v1/email/set-trusted-relay",
+                {
+                    "config_id": "00000000-0000-0000-0000-000000000999",
+                    "trusted_relay_sender": "relay@example.com",
+                },
+            ),
+        ]
+    )
+    def test_member_cannot_access(self, _name, method, path, body):
+        response = getattr(self.client, method)(path, body, content_type="application/json")
+        assert response.status_code == 403
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_admin_can_connect_email(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "s@example.com", "from_name": "S"},
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+
+    def test_admin_can_disconnect_email(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        # Disconnect with a nonexistent config_id returns 404 (not crash)
+        response = self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": "00000000-0000-0000-0000-000000000999"},
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+    def test_member_lists_only_owned_customer_communication_channels(self) -> None:
+        other_owner = User.objects.create(email="other-owner@example.com")
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=other_owner,
+            level=OrganizationMembership.Level.MEMBER,
+        )
+        for owner, token in ((self.user, "owned-token"), (other_owner, "other-token")):
+            EmailChannel.objects.create(
+                team=self.team,
+                kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+                owner=owner,
+                inbound_token=token,
+                from_email=owner.email,
+                from_name="Customer success",
+                domain="example.com",
+            )
+
+        response = self.client.get(f"/api/conversations/v1/email/status?kind={EmailChannelKind.CUSTOMER_COMMUNICATION}")
+
+        assert response.status_code == 200
+        assert [config["owner_id"] for config in response.json()["configs"]] == [self.user.id]
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_member_can_connect_and_disconnect_own_customer_channel_without_mailgun(
+        self, _mock_setting: MagicMock, mock_mailgun_add_domain: MagicMock
+    ) -> None:
+        connect_response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": self.user.email,
+                "from_name": self.user.email,
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": self.user.id,
+            },
+            content_type="application/json",
+        )
+
+        assert connect_response.status_code == 200
+        channel = EmailChannel.objects.get(team=self.team)
+        assert channel.owner_id == self.user.id
+        assert channel.domain_verified is False
+        assert channel.dns_records == {}
+        assert channel.connection_status == EmailChannelConnectionStatus.PENDING_CONFIRMATION
+        setup = EmailChannelSetup.objects.for_team(self.team.id).get(channel=channel)
+        assert setup.provider == EmailChannelSetupProvider.GOOGLE
+        assert setup.expires_at > timezone.now()
+        assert setup.confirmation_action is None
+        assert connect_response.json()["config"]["connection_status"] == "pending_confirmation"
+        assert connect_response.json()["config"]["confirmation_available"] is False
+        mock_mailgun_add_domain.assert_not_called()
+
+        disconnect_response = self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert disconnect_response.status_code == 200
+        assert not EmailChannel.objects.filter(id=channel.id).exists()
+
+    def test_owner_opens_confirmation_action_without_activating_channel(self) -> None:
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="pending-token",
+            from_email=self.user.email,
+            from_name=self.user.email,
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+        setup = EmailChannelSetup.objects.for_team(self.team.id).create(
+            team=self.team,
+            channel=channel,
+            provider=EmailChannelSetupProvider.GOOGLE,
+            expires_at=timezone.now() + timedelta(hours=1),
+            confirmation_action="https://mail-settings.google.com/mail/vf-confirmation",
+            confirmation_received_at=timezone.now(),
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/confirm-forwarding",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "confirmation_url": "https://mail-settings.google.com/mail/vf-confirmation",
+        }
+        channel.refresh_from_db()
+        assert channel.connection_status == EmailChannelConnectionStatus.PENDING_CONFIRMATION
+        assert EmailChannelSetup.objects.for_team(self.team.id).filter(id=setup.id).exists()
+
+    @patch("products.conversations.backend.api.email_settings.is_smtp_email_service_available", return_value=True)
+    @patch("posthog.email.is_email_available", return_value=True)
+    @patch("products.conversations.backend.api.email_settings.EmailMessage.send", autospec=True)
+    def test_owner_sends_forwarding_challenge_only_to_claimed_mailbox(
+        self,
+        mock_send: MagicMock,
+        _mock_email_available: MagicMock,
+        _mock_smtp_available: MagicMock,
+    ) -> None:
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="challenge-token",
+            from_email="claimed-mailbox@example.com",
+            from_name="Customer success",
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+        setup = EmailChannelSetup.objects.for_team(self.team.id).create(
+            team=self.team,
+            channel=channel,
+            provider=EmailChannelSetupProvider.GOOGLE,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/verify-forwarding",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+        mock_send.assert_called_once()
+        message = mock_send.call_args.args[0]
+        challenge_token = message.headers["X-PostHog-Forwarding-Challenge"]
+        assert message.to == [
+            {
+                "recipient": "claimed-mailbox@example.com",
+                "raw_email": "claimed-mailbox@example.com",
+            }
+        ]
+        assert f"posthog-forwarding-challenge:{challenge_token}" in message.html_body
+        assert challenge_token not in str(response.json())
+        assert EmailChannelSetup.objects.for_team(self.team.id).filter(id=setup.id).exists()
+
+    @patch("products.conversations.backend.api.email_settings.is_smtp_email_service_available", return_value=False)
+    def test_forwarding_challenge_requires_transactional_email(self, _mock_smtp_available: MagicMock) -> None:
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="missing-smtp-token",
+            from_email=self.user.email,
+            from_name="Customer success",
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+        EmailChannelSetup.objects.for_team(self.team.id).create(
+            team=self.team,
+            channel=channel,
+            provider=EmailChannelSetupProvider.GOOGLE,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/verify-forwarding",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {"error": "Email verification is not configured on this PostHog instance."}
+
+    @patch("products.conversations.backend.api.email_settings.cache.delete")
+    @patch("products.conversations.backend.api.email_settings.cache.add", return_value=True)
+    @patch("products.conversations.backend.api.email_settings.is_smtp_email_service_available", return_value=True)
+    @patch(
+        "products.conversations.backend.api.email_settings.EmailMessage",
+        side_effect=RuntimeError("queue unavailable"),
+    )
+    def test_forwarding_challenge_enqueue_failure_releases_cooldown(
+        self,
+        _mock_email_message: MagicMock,
+        _mock_smtp_available: MagicMock,
+        _mock_cache_add: MagicMock,
+        mock_cache_delete: MagicMock,
+    ) -> None:
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="enqueue-failure-token",
+            from_email=self.user.email,
+            from_name="Customer success",
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+        setup = EmailChannelSetup.objects.for_team(self.team.id).create(
+            team=self.team,
+            channel=channel,
+            provider=EmailChannelSetupProvider.GOOGLE,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/verify-forwarding",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 502
+        assert response.json() == {"error": "Could not send the verification email. Try again."}
+        mock_cache_delete.assert_called_once()
+        assert EmailChannelSetup.objects.for_team(self.team.id).filter(id=setup.id).exists()
+
+    @patch("products.conversations.backend.api.email_settings.cache", wraps=cache)
+    @patch("products.conversations.backend.api.email_settings.is_smtp_email_service_available", return_value=True)
+    @patch("products.conversations.backend.api.email_settings.EmailMessage")
+    def test_forwarding_challenge_resend_respects_channel_cooldown(
+        self,
+        mock_email_message: MagicMock,
+        _mock_smtp_available: MagicMock,
+        mock_cache: MagicMock,
+    ) -> None:
+        mock_cache.add.side_effect = [True, False]
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="cooldown-token",
+            from_email=self.user.email,
+            from_name="Customer success",
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+        EmailChannelSetup.objects.for_team(self.team.id).create(
+            team=self.team,
+            channel=channel,
+            provider=EmailChannelSetupProvider.GOOGLE,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        first_response = self.client.post(
+            "/api/conversations/v1/email/verify-forwarding",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+        second_response = self.client.post(
+            "/api/conversations/v1/email/verify-forwarding",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert first_response.status_code == 200
+        assert second_response.status_code == 429
+        assert [cache_call.kwargs["timeout"] for cache_call in mock_cache.add.call_args_list] == [30, 60]
+        assert mock_email_message.call_count == 1
+
+    @patch("products.conversations.backend.api.email_settings.cache", wraps=cache)
+    @patch("products.conversations.backend.api.email_settings.is_smtp_email_service_available", return_value=True)
+    @patch("products.conversations.backend.api.email_settings.EmailMessage")
+    def test_forwarding_challenge_stops_after_the_address_reaches_its_attempt_limit(
+        self,
+        mock_email_message: MagicMock,
+        _mock_smtp_available: MagicMock,
+        mock_cache: MagicMock,
+    ) -> None:
+        mock_cache.get.side_effect = lambda key, default=None: 8 if key.endswith(":attempts") else default
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="attempt-limit-token",
+            from_email=self.user.email,
+            from_name="Customer success",
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+        EmailChannelSetup.objects.for_team(self.team.id).create(
+            team=self.team,
+            channel=channel,
+            provider=EmailChannelSetupProvider.GOOGLE,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/verify-forwarding",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 429
+        assert "verification limit" in response.json()["error"]
+        mock_email_message.assert_not_called()
+
+    @parameterized.expand(["confirm-forwarding", "verify-forwarding"])
+    def test_non_owner_cannot_access_forwarding_setup_action(self, endpoint: str) -> None:
+        owner = User.objects.create(email="channel-owner@example.com")
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=owner,
+            level=OrganizationMembership.Level.MEMBER,
+        )
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=owner,
+            inbound_token="other-pending-token",
+            from_email=owner.email,
+            from_name=owner.email,
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+        setup = EmailChannelSetup.objects.for_team(self.team.id).create(
+            team=self.team,
+            channel=channel,
+            provider=EmailChannelSetupProvider.GOOGLE,
+            expires_at=timezone.now() + timedelta(hours=1),
+            confirmation_action="https://mail-settings.google.com/mail/vf-other",
+        )
+
+        response = self.client.post(
+            f"/api/conversations/v1/email/{endpoint}",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 404
+        assert EmailChannelSetup.objects.for_team(self.team.id).filter(id=setup.id).exists()
+        channel.refresh_from_db()
+        assert channel.connection_status == EmailChannelConnectionStatus.PENDING_CONFIRMATION
+
+    def test_status_expires_pending_setup(self) -> None:
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="expired-token",
+            from_email=self.user.email,
+            from_name=self.user.email,
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+        setup = EmailChannelSetup.objects.for_team(self.team.id).create(
+            team=self.team,
+            channel=channel,
+            provider=EmailChannelSetupProvider.GOOGLE,
+            expires_at=timezone.now() - timedelta(seconds=1),
+            confirmation_action="https://mail-settings.google.com/mail/vf-expired",
+        )
+
+        response = self.client.get(f"/api/conversations/v1/email/status?kind={EmailChannelKind.CUSTOMER_COMMUNICATION}")
+
+        assert response.status_code == 200
+        assert response.json()["configs"][0]["connection_status"] == "confirmation_expired"
+        assert response.json()["configs"][0]["confirmation_available"] is False
+        assert not EmailChannelSetup.objects.for_team(self.team.id).filter(id=setup.id).exists()
+
+    @parameterized.expand(
+        [
+            ("pending_with_expired_setup", EmailChannelConnectionStatus.PENDING_CONFIRMATION, True),
+            ("confirmation_expired", EmailChannelConnectionStatus.CONFIRMATION_EXPIRED, False),
+        ]
+    )
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_connect_releases_expired_customer_email_reservation(
+        self,
+        _name: str,
+        connection_status: str,
+        create_setup: bool,
+        _mock_setting: MagicMock,
+    ) -> None:
+        other_organization = Organization.objects.create(name="Other organization")
+        other_team = Team.objects.create(organization=other_organization)
+        other_owner = User.objects.create(email="other-owner@example.com")
+        OrganizationMembership.objects.create(
+            organization=other_organization,
+            user=other_owner,
+            level=OrganizationMembership.Level.MEMBER,
+        )
+        stale_channel = EmailChannel.objects.create(
+            team=other_team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=other_owner,
+            inbound_token="stale-token",
+            from_email="reserved@example.com",
+            from_name="Reserved",
+            domain="example.com",
+            connection_status=connection_status,
+        )
+        if create_setup:
+            EmailChannelSetup.objects.for_team(other_team.id).create(
+                team=other_team,
+                channel=stale_channel,
+                provider=EmailChannelSetupProvider.GOOGLE,
+                expires_at=timezone.now() - timedelta(seconds=1),
+            )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": "reserved@example.com",
+                "from_name": "Customer success",
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": self.user.id,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        assert not EmailChannel.objects.filter(id=stale_channel.id).exists()
+        replacement = EmailChannel.objects.get(team=self.team, from_email="reserved@example.com")
+        assert replacement.owner_id == self.user.id
+        assert replacement.connection_status == EmailChannelConnectionStatus.PENDING_CONFIRMATION
+
+    @patch(
+        "products.conversations.backend.api.email_settings.MAX_PENDING_CUSTOMER_COMMUNICATION_CHANNELS_PER_OWNER",
+        1,
+    )
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_member_cannot_exhaust_team_quota_with_pending_channels(self, _mock_setting: MagicMock) -> None:
+        EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="pending-token",
+            from_email="pending@example.com",
+            from_name="Pending",
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.PENDING_CONFIRMATION,
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": "another@example.com",
+                "from_name": "Another address",
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": self.user.id,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 400
+        assert "awaiting confirmation" in response.json()["error"]
+        assert EmailChannel.objects.filter(team=self.team).count() == 1
+
+    @patch("products.conversations.backend.api.email_settings.MAX_CUSTOMER_COMMUNICATION_CHANNELS_PER_TEAM", 1)
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_expired_customer_channels_do_not_count_toward_team_limit(self, _mock_setting: MagicMock) -> None:
+        EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="expired-token-for-limit",
+            from_email="expired@example.com",
+            from_name="Expired",
+            domain="example.com",
+            connection_status=EmailChannelConnectionStatus.CONFIRMATION_EXPIRED,
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": "new@example.com",
+                "from_name": "New address",
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": self.user.id,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        assert EmailChannel.objects.filter(team=self.team).count() == 2
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_member_cannot_connect_customer_channel_for_another_owner(
+        self, _mock_setting: MagicMock, mock_mailgun_add_domain: MagicMock
+    ) -> None:
+        other_owner = User.objects.create(email="other-owner@example.com")
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=other_owner,
+            level=OrganizationMembership.Level.MEMBER,
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": other_owner.email,
+                "from_name": other_owner.email,
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": other_owner.id,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+        assert not EmailChannel.objects.filter(team=self.team).exists()
+        mock_mailgun_add_domain.assert_not_called()
+
+    def test_member_cannot_disconnect_another_owners_customer_channel(self) -> None:
+        other_owner = User.objects.create(email="other-owner@example.com")
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=other_owner,
+            level=OrganizationMembership.Level.MEMBER,
+        )
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=other_owner,
+            inbound_token="other-owner-token",
+            from_email=other_owner.email,
+            from_name=other_owner.email,
+            domain="example.com",
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 404
+        assert EmailChannel.objects.filter(id=channel.id).exists()
+
+    @patch("products.conversations.backend.api.email_settings.send_mime")
+    def test_member_cannot_send_test_from_another_owners_channel(self, mock_send_mime: MagicMock) -> None:
+        other_owner = User.objects.create(email="other-owner@example.com")
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=other_owner,
+            level=OrganizationMembership.Level.MEMBER,
+        )
+        channel = EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=other_owner,
+            inbound_token="other-token",
+            from_email=other_owner.email,
+            from_name="Customer success",
+            domain="example.com",
+            domain_verified=True,
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/send-test",
+            {"config_id": str(channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 404
+        mock_send_mime.assert_not_called()
+
+
+class TestEmailMultiConfig(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.client.force_login(self.user)
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_connect_multiple_emails(self, _mock_setting: MagicMock, mock_mailgun: MagicMock):
+        r1 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        assert r1.status_code == 200
+
+        r2 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+        assert r2.status_code == 200
+
+        configs = EmailChannel.objects.filter(team=self.team)
+        assert configs.count() == 2
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_support_channel_rejects_shared_provider_domain(self, _mock_setting: MagicMock, mock_mailgun: MagicMock):
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@gmail.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 400
+        assert "gmail.com" in response.json()["error"]
+        mock_mailgun.assert_not_called()
+        assert not EmailChannel.objects.filter(team=self.team).exists()
+
+    @parameterized.expand(
+        [
+            ("domain_still_in_mailgun", {"id": "mg-1", "state": "unverified"}, False),
+            ("domain_expired_from_mailgun", None, True),
+        ]
+    )
+    @patch("products.conversations.backend.api.email_settings.mailgun_get_domain")
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_same_domain_reuses_registration_unless_mailgun_dropped_it(
+        self,
+        _name: str,
+        mailgun_domain: dict | None,
+        should_register_again: bool,
+        _mock_setting: MagicMock,
+        mock_add_domain: MagicMock,
+        mock_get_domain: MagicMock,
+    ):
+        old_records = {"sending_dns_records": [{"record_type": "TXT", "value": "old"}]}
+        new_records = {"sending_dns_records": [{"record_type": "TXT", "value": "new"}]}
+        mock_add_domain.return_value = old_records
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        mock_add_domain.reset_mock()
+        mock_add_domain.return_value = new_records
+        mock_get_domain.return_value = mailgun_domain
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        assert mock_add_domain.called == should_register_again
+        expected = new_records if should_register_again else old_records
+        assert list(EmailChannel.objects.filter(team=self.team).values_list("dns_records", flat=True)) == [
+            expected,
+            expected,
+        ]
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_get_domain", return_value=None)
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_same_domain_fails_when_registering_the_dropped_domain_again_fails(
+        self, _mock_setting: MagicMock, mock_add_domain: MagicMock, _mock_get_domain: MagicMock
+    ):
+        mock_add_domain.return_value = {"sending_dns_records": [{"record_type": "TXT", "value": "old"}]}
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        mock_add_domain.side_effect = Exception("mailgun down")
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 502
+        assert list(EmailChannel.objects.filter(team=self.team).values_list("from_email", flat=True)) == [
+            "support@example.com"
+        ]
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_reject_duplicate_from_email(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock):
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        r2 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support Again"},
+            content_type="application/json",
+        )
+        assert r2.status_code == 409
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_same_org_different_team_domain_allowed(self, _mock_setting: MagicMock, mock_mailgun: MagicMock):
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        mock_mailgun.reset_mock()
+
+        second_team = Team.objects.create(organization=self.organization)
+        self.user.current_team = second_team
+        self.user.save()
+
+        r2 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+        assert r2.status_code == 200
+        # Reuses existing Mailgun registration — no second add_domain call
+        mock_mailgun.assert_not_called()
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_cross_org_domain_rejected(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock):
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+
+        other_org = Organization.objects.create(name="Other Org")
+        second_team = Team.objects.create(organization=other_org)
+        OrganizationMembership.objects.create(
+            user=self.user, organization=other_org, level=OrganizationMembership.Level.ADMIN
+        )
+        self.user.current_team = second_team
+        self.user.save()
+
+        r2 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+        assert r2.status_code == 409
+        assert "another organization" in r2.json()["error"]
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_disconnect_one_keeps_email_enabled(
+        self, _mock_setting: MagicMock, _mock_delete: MagicMock, _mock_add: MagicMock
+    ):
+        r1 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+
+        config1_id = r1.json()["config"]["id"]
+
+        response = self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": config1_id},
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+
+        self.team.refresh_from_db()
+        settings = self.team.conversations_settings or {}
+        assert settings.get("email_enabled") is True
+        assert EmailChannel.objects.filter(team=self.team).count() == 1
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_disconnect_last_disables_email(
+        self, _mock_setting: MagicMock, _mock_delete: MagicMock, _mock_add: MagicMock
+    ):
+        r1 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        config_id = r1.json()["config"]["id"]
+
+        self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": config_id},
+            content_type="application/json",
+        )
+
+        self.team.refresh_from_db()
+        settings = self.team.conversations_settings or {}
+        assert settings.get("email_enabled") is False
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_disconnect_keeps_domain_if_sibling_exists(
+        self, _mock_setting: MagicMock, mock_delete: MagicMock, _mock_add: MagicMock
+    ):
+        r1 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+
+        config1_id = r1.json()["config"]["id"]
+        self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": config1_id},
+            content_type="application/json",
+        )
+
+        # Domain NOT deleted from Mailgun since billing@ still uses it
+        mock_delete.assert_not_called()
+
+    @patch("products.conversations.backend.api.email_settings.logger.info")
+    @patch("products.conversations.backend.api.email_settings.mailgun_get_domain", return_value=None)
+    @patch(
+        "products.conversations.backend.api.email_settings.mailgun_add_domain",
+        side_effect=MailgunDomainConflict(
+            "Domain example.com already exists",
+            provider_message="domain example.com already exists",
+            status_code=400,
+        ),
+    )
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_connect_rejects_domain_claimed_by_another_mailgun_account(
+        self,
+        _mock_setting: MagicMock,
+        mock_mailgun_delete: MagicMock,
+        _mock_mailgun_add: MagicMock,
+        _mock_get_domain: MagicMock,
+        mock_logger_info: MagicMock,
+    ):
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == (
+            "example.com is already registered with another Mailgun account. If that registration is no longer "
+            "needed, remove it and try again. If you cannot find it, contact Mailgun support."
+        )
+        assert EmailChannel.objects.filter(team=self.team).count() == 0
+        mock_mailgun_delete.assert_not_called()
+        mock_logger_info.assert_called_once_with(
+            "email_connect_mailgun_domain_conflict",
+            team_id=self.team.id,
+            domain="example.com",
+            error="Domain example.com already exists",
+            mailgun_status=400,
+            mailgun_message="domain example.com already exists",
+            conflict_reason="registered_to_another_account",
+        )
+
+        self.team.refresh_from_db()
+        settings = self.team.conversations_settings or {}
+        assert settings.get("email_enabled") is not True
+
+    @parameterized.expand(
+        [
+            ("already_unverified", "unverified", "unverified", 200),
+            ("stale_active_reverifies_unverified", "active", "unverified", 200),
+            ("still_active_after_reverify", "active", "active", 409),
+            ("disabled", "disabled", "disabled", 409),
+        ]
+    )
+    @patch("products.conversations.backend.api.email_settings.mailgun_verify_domain")
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    @patch("products.conversations.backend.api.email_settings.mailgun_get_domain")
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_connect_reclaims_stranded_mailgun_domain(
+        self,
+        _name,
+        mailgun_state,
+        reverified_state,
+        expected_status,
+        _mock_setting: MagicMock,
+        mock_add: MagicMock,
+        mock_get_domain: MagicMock,
+        mock_delete: MagicMock,
+        mock_verify: MagicMock,
+    ):
+        fresh_records = {"sending_dns_records": [{"record_type": "TXT", "name": "example.com", "value": "v=spf1"}]}
+        mock_add.side_effect = [MailgunDomainConflict("Domain example.com already exists"), fresh_records]
+        mock_get_domain.return_value = {"name": "example.com", "state": mailgun_state}
+        mock_verify.return_value = {"state": reverified_state}
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == expected_status
+        if expected_status == 200:
+            config = EmailChannel.objects.get(team=self.team)
+            assert config.dns_records == fresh_records
+            mock_delete.assert_called_once_with("example.com")
+        else:
+            assert "already registered with Mailgun" in response.json()["error"]
+            assert not EmailChannel.objects.filter(team=self.team).exists()
+            mock_delete.assert_not_called()
+
+    @patch(
+        "products.conversations.backend.api.email_settings.mailgun_get_domain",
+        side_effect=RuntimeError("mailgun unavailable"),
+    )
+    @patch(
+        "products.conversations.backend.api.email_settings.mailgun_add_domain",
+        side_effect=MailgunDomainConflict("Domain example.com already exists"),
+    )
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_connect_conflict_stands_when_reclaim_lookup_fails(
+        self,
+        _mock_setting: MagicMock,
+        _mock_mailgun_add: MagicMock,
+        _mock_get_domain: MagicMock,
+    ):
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 502
+        assert "could not check the existing Mailgun registration" in response.json()["error"]
+        assert EmailChannel.objects.filter(team=self.team).count() == 0
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_status_returns_all_configs(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock):
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+
+        response = self.client.get("/api/conversations/v1/email/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["configs"]) == 2
+        emails = {c["from_email"] for c in data["configs"]}
+        assert emails == {"support@example.com", "billing@example.com"}
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_connect_customer_communication_channel(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock) -> None:
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": "csm@example.com",
+                "from_name": "Customer success",
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": self.user.id,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        config = EmailChannel.objects.get(team=self.team)
+        assert config.kind == EmailChannelKind.CUSTOMER_COMMUNICATION
+        assert config.owner_id == self.user.id
+        assert config.is_default is False
+        assert response.json()["config"]["kind"] == EmailChannelKind.CUSTOMER_COMMUNICATION
+        assert response.json()["config"]["owner_id"] == self.user.id
+        self.team.refresh_from_db()
+        assert (self.team.conversations_settings or {}).get("email_enabled") is not True
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_customer_channel_allows_shared_email_domain_across_organizations(
+        self, _mock_setting: MagicMock, mock_mailgun: MagicMock
+    ) -> None:
+        other_org = Organization.objects.create(name="Other Org")
+        other_team = Team.objects.create(organization=other_org)
+        other_owner = User.objects.create(email="other@gmail.com")
+        OrganizationMembership.objects.create(
+            user=other_owner,
+            organization=other_org,
+            level=OrganizationMembership.Level.MEMBER,
+        )
+        EmailChannel.objects.create(
+            team=other_team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=other_owner,
+            inbound_token="other-customer-token",
+            from_email=other_owner.email,
+            from_name="Other owner",
+            domain="gmail.com",
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": "csm@gmail.com",
+                "from_name": "Customer success",
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": self.user.id,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        assert EmailChannel.objects.filter(team=self.team, from_email="csm@gmail.com").exists()
+        mock_mailgun.assert_not_called()
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_customer_channel_rejects_owner_outside_organization(
+        self, _mock_setting: MagicMock, mock_mailgun: MagicMock
+    ) -> None:
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": "csm@example.com",
+                "from_name": "Customer success",
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": 999999,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "Owner must be an active member of this organization."
+        assert not EmailChannel.objects.filter(team=self.team).exists()
+        mock_mailgun.assert_not_called()
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_customer_channel_does_not_use_support_sending_domain(
+        self, _mock_setting: MagicMock, mock_mailgun: MagicMock
+    ) -> None:
+        EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="support-token",
+            from_email="support@example.com",
+            from_name="Support",
+            domain="example.com",
+            domain_verified=True,
+            dns_records={"sending_dns_records": [{"record_type": "TXT", "value": "verified"}]},
+            is_default=True,
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": "csm@example.com",
+                "from_name": "Customer success",
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": self.user.id,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        customer_channel = EmailChannel.objects.get(kind=EmailChannelKind.CUSTOMER_COMMUNICATION)
+        assert customer_channel.domain_verified is False
+        assert customer_channel.dns_records == {}
+        mock_mailgun.assert_not_called()
+
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_status_filters_channels_by_kind(self, _mock_setting: MagicMock) -> None:
+        EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="support-token",
+            from_email="support@example.com",
+            from_name="Support",
+            domain="example.com",
+        )
+        EmailChannel.objects.create(
+            team=self.team,
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+            owner=self.user,
+            inbound_token="customer-token",
+            from_email="csm@example.com",
+            from_name="Customer success",
+            domain="example.com",
+        )
+
+        support_response = self.client.get("/api/conversations/v1/email/status")
+        customer_response = self.client.get(
+            f"/api/conversations/v1/email/status?kind={EmailChannelKind.CUSTOMER_COMMUNICATION}"
+        )
+
+        assert [config["from_email"] for config in support_response.json()["configs"]] == ["support@example.com"]
+        assert [config["from_email"] for config in customer_response.json()["configs"]] == ["csm@example.com"]
+        assert customer_response.json()["configs"][0]["owner_id"] == self.user.id
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_support_channel_limit_does_not_block_customer_channels(
+        self, _mock_setting: MagicMock, mock_mailgun: MagicMock
+    ) -> None:
+        from products.conversations.backend.models.team_conversations_email_config import MAX_EMAIL_CONFIGS_PER_TEAM
+
+        for index in range(MAX_EMAIL_CONFIGS_PER_TEAM):
+            EmailChannel.objects.create(
+                team=self.team,
+                inbound_token=f"support-token-{index}",
+                from_email=f"support-{index}@example.com",
+                from_name="Support",
+                domain="example.com",
+            )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {
+                "from_email": "csm@example.com",
+                "from_name": "Customer success",
+                "kind": EmailChannelKind.CUSTOMER_COMMUNICATION,
+                "owner_id": self.user.id,
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        assert EmailChannel.objects.filter(kind=EmailChannelKind.CUSTOMER_COMMUNICATION).count() == 1
+        mock_mailgun.assert_not_called()
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_config_limit_enforced(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock, mock_delete: MagicMock):
+        from products.conversations.backend.models.team_conversations_email_config import MAX_EMAIL_CONFIGS_PER_TEAM
+
+        for i in range(MAX_EMAIL_CONFIGS_PER_TEAM):
+            r = self.client.post(
+                "/api/conversations/v1/email/connect",
+                {"from_email": f"addr{i}@example{i}.com", "from_name": f"Name {i}"},
+                content_type="application/json",
+            )
+            assert r.status_code == 200, f"Failed to connect config {i}: {r.json()}"
+
+        # A failed Mailgun release must not mask the limit error
+        mock_delete.side_effect = RuntimeError("mailgun unavailable")
+        r = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "overflow@overflow.com", "from_name": "Overflow"},
+            content_type="application/json",
+        )
+        assert r.status_code == 400
+        assert "Maximum" in r.json()["error"]
+        # The rejected connect releases its Mailgun registration instead of stranding the domain
+        mock_delete.assert_called_once_with("overflow.com")
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    @patch("products.conversations.backend.api.email_settings.mailgun_get_domain")
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain")
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_config_limit_releases_reclaimed_domain(
+        self,
+        _mock_setting: MagicMock,
+        mock_add: MagicMock,
+        mock_get_domain: MagicMock,
+        mock_delete: MagicMock,
+    ):
+        from products.conversations.backend.models.team_conversations_email_config import MAX_EMAIL_CONFIGS_PER_TEAM
+
+        fresh_records: dict = {"sending_dns_records": []}
+        # First MAX connects register cleanly; the overflow connect hits a Mailgun
+        # conflict, reclaims a stranded unverified domain, then fails on the limit.
+        mock_add.side_effect = [{}] * MAX_EMAIL_CONFIGS_PER_TEAM + [
+            MailgunDomainConflict("Domain overflow.com already exists"),
+            fresh_records,
+        ]
+        mock_get_domain.return_value = {"name": "overflow.com", "state": "unverified"}
+
+        for i in range(MAX_EMAIL_CONFIGS_PER_TEAM):
+            r = self.client.post(
+                "/api/conversations/v1/email/connect",
+                {"from_email": f"addr{i}@example{i}.com", "from_name": f"Name {i}"},
+                content_type="application/json",
+            )
+            assert r.status_code == 200, f"Failed to connect config {i}: {r.json()}"
+
+        r = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "overflow@overflow.com", "from_name": "Overflow"},
+            content_type="application/json",
+        )
+
+        assert r.status_code == 400
+        assert "Maximum" in r.json()["error"]
+        assert not EmailChannel.objects.filter(domain="overflow.com").exists()
+        # overflow.com is deleted twice: once churning the stranded registration during
+        # reclaim, once releasing the fresh registration after the limit rejection.
+        assert mock_delete.call_args_list == [call("overflow.com"), call("overflow.com")]
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_idor_disconnect_other_teams_config(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock):
+        r1 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@team1.com", "from_name": "Team1"},
+            content_type="application/json",
+        )
+        config_id = r1.json()["config"]["id"]
+
+        second_team = Team.objects.create(organization=self.organization)
+        self.user.current_team = second_team
+        self.user.save()
+
+        response = self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": config_id},
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.mailgun_verify_domain",
+        return_value={"state": "active", "sending_dns_records": []},
+    )
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_verify_domain_updates_all_siblings(
+        self, _mock_setting: MagicMock, _mock_verify: MagicMock, _mock_add: MagicMock
+    ):
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        r2 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+
+        # Also connect on a different team in the same org
+        second_team = Team.objects.create(organization=self.organization)
+        self.user.current_team = second_team
+        self.user.save()
+        self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "sales@example.com", "from_name": "Sales"},
+            content_type="application/json",
+        )
+
+        # Switch back to original team to verify
+        self.user.current_team = self.team
+        self.user.save()
+
+        config2_id = r2.json()["config"]["id"]
+        response = self.client.post(
+            "/api/conversations/v1/email/verify-domain",
+            {"config_id": config2_id},
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+        assert response.json()["domain_verified"] is True
+
+        # All configs across the org sharing the domain should be verified
+        configs = EmailChannel.objects.filter(team__organization_id=self.organization.id, domain="example.com")
+        assert configs.count() == 3
+        assert all(c.domain_verified for c in configs)
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.mailgun_verify_domain",
+        return_value={"state": "active", "sending_dns_records": []},
+    )
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_idor_verify_other_teams_config(
+        self, _mock_setting: MagicMock, _mock_verify: MagicMock, _mock_add: MagicMock
+    ):
+        r1 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@team1.com", "from_name": "Team1"},
+            content_type="application/json",
+        )
+        config_id = r1.json()["config"]["id"]
+
+        second_team = Team.objects.create(organization=self.organization)
+        self.user.current_team = second_team
+        self.user.save()
+
+        response = self.client.post(
+            "/api/conversations/v1/email/verify-domain",
+            {"config_id": config_id},
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+
+class TestEmailTrustedRelaySettings(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.client.force_login(self.user)
+        self.config = EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="relay-settings",
+            from_email="support@example.com",
+            from_name="Support",
+            domain="example.com",
+            domain_verified=True,
+        )
+
+    def test_admin_can_set_and_clear_trusted_relay_sender(self):
+        response = self.client.post(
+            "/api/conversations/v1/email/set-trusted-relay",
+            {
+                "config_id": str(self.config.id),
+                "trusted_relay_sender": "Relay@Example.COM",
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        self.config.refresh_from_db()
+        assert self.config.trusted_relay_sender == "relay@example.com"
+
+        status_response = self.client.get("/api/conversations/v1/email/status")
+        assert status_response.json()["configs"][0]["trusted_relay_sender"] == "relay@example.com"
+
+        response = self.client.post(
+            "/api/conversations/v1/email/set-trusted-relay",
+            {
+                "config_id": str(self.config.id),
+                "trusted_relay_sender": "",
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        self.config.refresh_from_db()
+        assert self.config.trusted_relay_sender == ""
+
+    def test_trusted_relay_update_is_scoped_to_the_current_team(self):
+        other_team = Team.objects.create(organization=self.organization)
+        other_config = EmailChannel.objects.create(
+            team=other_team,
+            inbound_token="other-relay-settings",
+            from_email="other@example.com",
+            from_name="Other",
+            domain="example.com",
+            domain_verified=True,
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/set-trusted-relay",
+            {
+                "config_id": str(other_config.id),
+                "trusted_relay_sender": "relay@example.com",
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 404
+        other_config.refresh_from_db()
+        assert other_config.trusted_relay_sender == ""
+
+    def test_invalid_trusted_relay_sender_returns_field_error(self):
+        response = self.client.post(
+            "/api/conversations/v1/email/set-trusted-relay",
+            {
+                "config_id": str(self.config.id),
+                "trusted_relay_sender": "not-an-email",
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["attr"] == "trusted_relay_sender"
+        assert response.json()["detail"] == "Enter a valid email address."
+
+
+class TestEmailInboundRegionRouting(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+
+    def _post(self, data: dict[str, str]):
+        return post_mailgun(self.client, "/api/conversations/v1/email/inbound", data=data)
+
+    @parameterized.expand(
+        [
+            ("the owning region accepts it", 202, 202),
+            # Mailgun redelivers on a non-2xx, so a forward that never landed must not be receipted.
+            ("the owning region is unreachable", 500, 502),
+        ]
+    )
+    def test_an_inbox_another_region_owns_is_forwarded_from_the_primary(
+        self, _name: str, secondary_status: int, expected_status: int
+    ):
+        with (
+            patch("posthog.regions.PRIMARY_REGION_DOMAIN", "testserver"),
+            patch("posthog.ingress.dispatch.forward.requests.request") as mock_forward,
+        ):
+            mock_forward.return_value = MagicMock(ok=200 <= secondary_status < 300, status_code=secondary_status)
+            response = self._post({"recipient": "team-deadbeef@mg.posthog.com"})
+
+        assert response.status_code == expected_status
+        mock_forward.assert_called_once()
+
+    def test_an_unknown_inbox_is_not_forwarded_again_from_the_secondary(self):
+        with patch("posthog.ingress.dispatch.forward.requests.request") as mock_forward:
+            response = self._post({"recipient": "team-deadbeef@mg.posthog.com"})
+
+        assert response.status_code == 202
+        mock_forward.assert_not_called()
+
+    def test_a_recipient_that_names_no_inbox_is_not_forwarded(self):
+        with (
+            patch("posthog.regions.PRIMARY_REGION_DOMAIN", "testserver"),
+            patch("posthog.ingress.dispatch.forward.requests.request") as mock_forward,
+        ):
+            response = self._post({"recipient": "hello@mg.posthog.com"})
+
+        assert response.status_code == 202
+        mock_forward.assert_not_called()
+
+
+class TestBuildProxyKwargs(SimpleTestCase):
+    """Unit tests for _build_proxy_kwargs multipart fallback."""
+
+    def test_raw_body_available(self):
+        from django.test import RequestFactory
+
+        from products.conversations.backend.services.region_routing import _build_proxy_kwargs
+
+        factory = RequestFactory()
+        request = factory.post(
+            "/api/conversations/v1/email/inbound",
+            data=b"key=val",
+            content_type="application/x-www-form-urlencoded",
+        )
+        result = _build_proxy_kwargs(request, {"Content-Type": "application/x-www-form-urlencoded"})
+        assert "data" in result
+        assert "files" not in result
+        assert result["data"] == b"key=val"
+
+    def test_multipart_fallback_after_stream_consumed(self):
+        from unittest.mock import PropertyMock, patch
+
+        from django.http.request import RawPostDataException
+        from django.test import RequestFactory
+
+        from products.conversations.backend.services.region_routing import _build_proxy_kwargs
+
+        factory = RequestFactory()
+        png = SimpleUploadedFile("photo.png", _make_png_bytes(), content_type="image/png")
+        request = factory.post(
+            "/api/conversations/v1/email/inbound",
+            data={"recipient": "team-abc@mg.posthog.com", "attachment-1": png},
+        )
+
+        _ = request.POST
+        _ = request.FILES
+
+        headers = {"Content-Type": "multipart/form-data; boundary=xxx"}
+        with patch.object(type(request), "body", new_callable=PropertyMock, side_effect=RawPostDataException()):
+            result = _build_proxy_kwargs(request, headers)
+
+        assert "files" in result
+        assert len(result["files"]) == 1
+        key, (name, content_bytes, ct) = result["files"][0]
+        assert key == "attachment-1"
+        assert name == "photo.png"
+        assert ct == "image/png"
+        assert len(content_bytes) > 0
+
+        assert any(k == "recipient" and v == "team-abc@mg.posthog.com" for k, v in result["data"])
+        assert "content-type" not in {k.lower() for k in result["headers"]}
+
+
+class TestEmailInboundMultiConfig(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        # Enable email on team
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+
+    def _create_config(self, from_email: str, token: str) -> EmailChannel:
+        return EmailChannel.objects.create(
+            team=self.team,
+            inbound_token=token,
+            from_email=from_email,
+            from_name="Test",
+            domain=from_email.split("@")[1],
+            domain_verified=True,
+        )
+
+    def test_inbound_routes_to_correct_config(self):
+        config1 = self._create_config("support@example.com", "aaa111")
+        self._create_config("billing@example.com", "bbb222")
+
+        response = post_mailgun(
+            self.client,
+            "/api/conversations/v1/email/inbound",
+            {
+                "recipient": "team-aaa111@mg.posthog.com",
+                "from": "customer@test.com",
+                "Message-Id": "<msg1@test.com>",
+                "subject": "Help",
+                "stripped-text": "I need help",
+            },
+        )
+        assert response.status_code == 202
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.email_config_id == config1.id
+        assert ticket.email_from == "customer@test.com"
+
+    def test_inbound_routes_to_second_config(self):
+        self._create_config("support@example.com", "aaa111")
+        config2 = self._create_config("billing@example.com", "bbb222")
+
+        response = post_mailgun(
+            self.client,
+            "/api/conversations/v1/email/inbound",
+            {
+                "recipient": "team-bbb222@mg.posthog.com",
+                "from": "vendor@test.com",
+                "Message-Id": "<msg2@test.com>",
+                "subject": "Invoice",
+                "stripped-text": "Here is your invoice",
+            },
+        )
+        assert response.status_code == 202
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.email_config_id == config2.id
+
+
+class TestEmailInboundContent(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+        EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="cc00dd11ee2233ff",
+            from_email="support@example.com",
+            from_name="Support",
+            domain="example.com",
+            domain_verified=True,
+        )
+
+    @parameterized.expand(
+        [
+            # Mailgun sometimes mis-classifies trailing content (e.g. a list of bare emails)
+            # as a signature — it must be reattached, not dropped.
+            (
+                "signature_reattached",
+                {"stripped-text": "Missing recordings for:", "stripped-signature": "a@gmail.com\nb@gmail.com"},
+                "Missing recordings for:\n\na@gmail.com\nb@gmail.com",
+            ),
+            (
+                "stripped_text_only",
+                {"stripped-text": "Just a question"},
+                "Just a question",
+            ),
+            (
+                "falls_back_to_body_plain",
+                {"body-plain": "Full body text"},
+                "Full body text",
+            ),
+            # A forwarded email's original content is inside the "quoted" block that
+            # Mailgun strips — on a new ticket the full body must be kept.
+            (
+                "new_ticket_keeps_forwarded_context",
+                {
+                    "stripped-text": "FYI, see below",
+                    "body-plain": "FYI, see below\n\n---------- Forwarded message ---------\nOriginal content",
+                },
+                "FYI, see below\n\n---------- Forwarded message ---------\nOriginal content",
+            ),
+        ]
+    )
+    def test_inbound_content_extraction(self, _name: str, body_fields: dict[str, str], expected_content: str):
+        response = post_mailgun(
+            self.client,
+            "/api/conversations/v1/email/inbound",
+            {
+                "recipient": "team-cc00dd11ee2233ff@mg.posthog.com",
+                "from": "customer@test.com",
+                "Message-Id": f"<content-{_name}@test.com>",
+                "subject": "Help",
+                **body_fields,
+            },
+        )
+        assert response.status_code == 202
+
+        comment = Comment.objects.get(team=self.team, scope="conversations_ticket")
+        mapping = EmailMessageMapping.objects.get(comment=comment)
+        item_context = comment.item_context
+        assert item_context is not None
+        assert comment.content == expected_content
+        assert item_context["has_full_email_content"] is False
+        assert mapping.full_body_plain is None
+
+    def test_reply_strips_quoted_thread(self):
+        base = {
+            "recipient": "team-cc00dd11ee2233ff@mg.posthog.com",
+            "from": "customer@test.com",
+            "subject": "Help",
+        }
+        post_mailgun(
+            self.client,
+            "/api/conversations/v1/email/inbound",
+            {**base, "Message-Id": "<thread-init@test.com>", "stripped-text": "Initial question"},
+        )
+        response = post_mailgun(
+            self.client,
+            "/api/conversations/v1/email/inbound",
+            {
+                **base,
+                "Message-Id": "<thread-reply@test.com>",
+                "In-Reply-To": "<thread-init@test.com>",
+                "stripped-text": "Thanks, that worked",
+                "body-plain": "Thanks, that worked\n\nOn Mon, Support wrote:\n> Initial question",
+            },
+        )
+        assert response.status_code == 202
+
+        reply = Comment.objects.filter(team=self.team, scope="conversations_ticket").order_by("created_at")[1]
+        assert reply.content == "Thanks, that worked"
+
+    @parameterized.expand(
+        [
+            (
+                "different_content",
+                "I added the details below.\n\nUnsubscribe from this list.",
+                "I added the details below.\n\nStep 1: open the report.\nStep 2: run it again."
+                "\n\nOn Mon, Support wrote:\n> Initial question",
+                (
+                    "<p>I added the details below.</p>"
+                    '<p>Step 1: open <a href="https://example.com/report">the report</a>.</p>'
+                    "<p>Step 2: run it again.</p>"
+                    "<blockquote>On Mon, Support wrote: Initial question</blockquote>"
+                ),
+                "I added the details below.\n\nStep 1: open [the report](https://example.com/report)."
+                "\nStep 2: run it again.\n\nOn Mon, Support wrote:\n> Initial question",
+            ),
+            ("line_endings_only", "Same reply\nSame details", "Same reply\r\nSame details", "", None),
+        ]
+    )
+    def test_reply_full_body_preservation(
+        self,
+        _name: str,
+        stripped_text: str,
+        full_body_plain: str,
+        body_html: str,
+        expected_full_body: str | None,
+    ) -> None:
+        base = {
+            "recipient": "team-cc00dd11ee2233ff@mg.posthog.com",
+            "from": "customer@example.com",
+            "subject": "Help",
+        }
+        post_mailgun(
+            self.client,
+            "/api/conversations/v1/email/inbound",
+            {**base, "Message-Id": "<full-body-init@example.com>", "stripped-text": "Initial question"},
+        )
+
+        response = post_mailgun(
+            self.client,
+            "/api/conversations/v1/email/inbound",
+            {
+                **base,
+                "Message-Id": f"<full-body-reply-{_name}@example.com>",
+                "In-Reply-To": "<full-body-init@example.com>",
+                "stripped-text": stripped_text,
+                "body-plain": full_body_plain,
+                "body-html": body_html,
+            },
+        )
+        assert response.status_code == 202
+
+        ticket = Ticket.objects.get(team=self.team)
+        reply = Comment.objects.filter(team=self.team, scope="conversations_ticket").order_by("created_at")[1]
+        mapping = EmailMessageMapping.objects.get(comment=reply)
+        item_context = reply.item_context
+        assert item_context is not None
+        assert reply.content == stripped_text
+        assert item_context["has_full_email_content"] is (expected_full_body is not None)
+        assert mapping.full_body_plain == expected_full_body
+
+        self.client.force_login(self.user)
+        response = self.client.get(
+            f"/api/projects/{self.team.id}/conversations/tickets/{ticket.id}/messages/{reply.id}/full_email/"
+        )
+        assert response.status_code == (200 if expected_full_body is not None else 404)
+        if expected_full_body is not None:
+            assert response.json() == {"content": expected_full_body}
+
+
+class TestSendEmailReplyMultiConfig(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+
+    def _create_config(self, from_email: str, token: str, verified: bool = True) -> EmailChannel:
+        return EmailChannel.objects.create(
+            team=self.team,
+            inbound_token=token,
+            from_email=from_email,
+            from_name="Test",
+            domain=from_email.split("@")[1],
+            domain_verified=verified,
+        )
+
+    def _create_ticket(self, config: EmailChannel | None) -> Ticket:
+        from products.conversations.backend.models.constants import Channel, Status
+
+        return Ticket.objects.create_with_number(
+            team=self.team,
+            channel_source=Channel.EMAIL,
+            email_config=config,
+            widget_session_id="",
+            distinct_id="customer@test.com",
+            status=Status.NEW,
+            email_subject="Test",
+            email_from="customer@test.com",
+        )
+
+    def _create_outbox(
+        self, ticket: Ticket, content: str = "Reply from agent", rich_content: dict | None = None
+    ) -> tuple[Comment, EmailOutboxMessage]:
+        """Create the reply comment + its durable outbox row, mirroring the signal path."""
+        comment = Comment.objects.create(
+            team=self.team,
+            scope="conversations_ticket",
+            item_id=str(ticket.id),
+            content=content,
+            rich_content=rich_content,
+            created_by=self.user,
+            item_context={"author_type": "support"},
+        )
+        # The post_save signal creates the outbox row when created_by is set; fall back
+        # to creating it explicitly so the test is robust to signal gating changes.
+        outbox = EmailOutboxMessage.objects.filter(comment=comment).first()
+        if outbox is None:
+            outbox = EmailOutboxMessage.objects.create(
+                team=self.team,
+                ticket=ticket,
+                comment=comment,
+                message_id="<test@mg.posthog.com>",
+            )
+        return comment, outbox
+
+    def _run_reply(self, ticket: Ticket, content: str = "Reply from agent") -> tuple[Comment, EmailOutboxMessage]:
+        from products.conversations.backend.tasks.email import send_email_reply
+
+        comment, outbox = self._create_outbox(ticket, content=content)
+        send_email_reply(str(outbox.id))
+        outbox.refresh_from_db()
+        return comment, outbox
+
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_uses_ticket_config(self, mock_send_mime: MagicMock):
+        config1 = self._create_config("support@example.com", "aaa111")
+        self._create_config("billing@example.com", "bbb222")
+        ticket = self._create_ticket(config1)
+        # Legacy tickets may carry the requester in cc_participants; they must not
+        # be delivered to twice (they're already the To recipient).
+        ticket.cc_participants = ["cc1@example.com", "customer@test.com", "cc2@example.com"]
+        ticket.save(update_fields=["cc_participants"])
+
+        _, outbox = self._run_reply(ticket)
+
+        mock_send_mime.assert_called_once()
+        args, kwargs = mock_send_mime.call_args
+
+        # Regression guard: must use the ticket's domain, not a shared/global one.
+        assert args[0] == "example.com"
+
+        # Recipients include the customer and every CC participant, minus the requester.
+        assert kwargs["recipients"] == ["customer@test.com", "cc1@example.com", "cc2@example.com"]
+
+        # MIME body carries the From header with the config's from_email.
+        # Separate substring checks avoid formataddr quoting flakes.
+        mime_bytes = args[1]
+        assert b"From: " in mime_bytes
+        assert b"support@example.com" in mime_bytes
+
+        # Guard against someone dropping linesep="\r\n" from mime_bytes_with_crlf().
+        # RFC 5322 wants CRLF; Django's default is LF-only.
+        assert b"\r\n" in mime_bytes
+
+        assert outbox.status == EmailOutboxMessage.Status.SENT
+        assert outbox.sent_at is not None
+
+    @parameterized.expand(
+        [
+            ("email_disabled", "email disabled for team"),
+            ("no_email_config", "no email config"),
+            ("no_customer_email", "no customer email"),
+        ]
+    )
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_undeliverable_reply_fails_visibly(self, name: str, expected_error: str, mock_send_mime: MagicMock):
+        from products.conversations.backend.tasks.email import send_email_reply
+
+        config = self._create_config("support@example.com", "aaa111")
+        if name == "email_disabled":
+            ticket = self._create_ticket(config)
+            self.team.conversations_settings = {"email_enabled": False}
+            self.team.save()
+        elif name == "no_email_config":
+            ticket = self._create_ticket(None)
+        else:
+            ticket = self._create_ticket(config)
+            ticket.email_from = None
+            ticket.save(update_fields=["email_from"])
+
+        comment = Comment.objects.create(
+            team=self.team,
+            scope="conversations_ticket",
+            item_id=str(ticket.id),
+            content="Reply from agent",
+            created_by=self.user,
+            item_context={"author_type": "support"},
+        )
+        # The signal must create the row even for undeliverable replies; skipping it would
+        # leave the reply with no delivery record at all.
+        outbox = EmailOutboxMessage.objects.filter(comment=comment).first()
+        assert outbox is not None
+
+        send_email_reply(str(outbox.id))
+        outbox.refresh_from_db()
+
+        assert outbox.status == EmailOutboxMessage.Status.FAILED_PERMANENT
+        assert outbox.last_error == expected_error
+        mock_send_mime.assert_not_called()
+        comment.refresh_from_db()
+        assert (comment.item_context or {}).get("email_delivery_status") == "failed"
+
+    @parameterized.expand(
+        [
+            # name, error raised by send_mime, whether it flips the domain back to unverified
+            ("permanent_error", MailgunPermanentError("bad recipient"), False),
+            ("not_configured", MailgunNotConfigured("mailgun not configured"), False),
+            ("domain_not_registered", MailgunDomainNotRegistered("gone from mailgun"), True),
+        ]
+    )
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_terminal_errors_mark_failed(
+        self, _name: str, error: Exception, flips_domain_verified: bool, mock_send_mime: MagicMock
+    ):
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+
+        mock_send_mime.side_effect = error
+
+        _, outbox = self._run_reply(ticket)
+
+        # One attempt, no retry, terminal failure recorded.
+        assert mock_send_mime.call_count == 1
+        assert outbox.status == EmailOutboxMessage.Status.FAILED_PERMANENT
+
+        config.refresh_from_db()
+        assert config.domain_verified is (not flips_domain_verified)
+
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_renders_markdown_without_rich_content(self, mock_send_mime: MagicMock):
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+
+        self._run_reply(
+            ticket,
+            content="See [the docs](https://posthog.com/docs).\nThen [verify](https://attacker.example/phish)\n\nNew paragraph\n\n```\ncurl https://example.com/api\n```",
+        )
+
+        message = message_from_bytes(mock_send_mime.call_args.args[1])
+        html_part = next(part for part in message.walk() if part.get_content_type() == "text/html")
+        payload = html_part.get_payload(decode=True)
+        assert isinstance(payload, bytes)
+        html = payload.decode()
+        assert '<a href="https://posthog.com/docs"' in html and ">the docs</a>" in html
+        assert "attacker.example" not in html
+        assert "<br" in html
+        assert html.count("<p>") == 2
+        assert "<code>curl https://example.com/api\r\n</code>" in html
+
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_delivers_to_team_member_ticket(self, mock_send_mime: MagicMock):
+        """An in-app agent reply on a ticket opened by a team member (e.g. dogfooding
+        the support inbox) must still be delivered to them."""
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+        ticket.email_from = self.user.email
+        ticket.save(update_fields=["email_from"])
+
+        _, outbox = self._run_reply(ticket)
+
+        mock_send_mime.assert_called_once()
+        assert mock_send_mime.call_args[1]["recipients"] == [self.user.email]
+        assert outbox.status == EmailOutboxMessage.Status.SENT
+
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_skips_comment_from_inbound_email(self, mock_send_mime: MagicMock):
+        """Last-mile echo guard: an outbox row pointing at a comment that itself arrived
+        via inbound email must never be sent, even if a regression enqueues one."""
+        from products.conversations.backend.tasks.email import send_email_reply
+
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+        comment = Comment.objects.create(
+            team=self.team,
+            scope="conversations_ticket",
+            item_id=str(ticket.id),
+            content="Inbound team-member email",
+            created_by=self.user,
+            item_context={"author_type": "support", "from_email": True},
+        )
+        # The signal guard skips outbox creation; create the row explicitly to
+        # simulate a regression in enqueueing.
+        outbox = EmailOutboxMessage.objects.create(
+            team=self.team,
+            ticket=ticket,
+            comment=comment,
+            message_id="<echo-guard@mg.posthog.com>",
+        )
+
+        send_email_reply(str(outbox.id))
+        outbox.refresh_from_db()
+
+        mock_send_mime.assert_not_called()
+        assert outbox.status == EmailOutboxMessage.Status.FAILED_PERMANENT
+        assert outbox.last_error == "comment originated from inbound email"
+
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_transient_error_schedules_retry(self, mock_send_mime: MagicMock):
+        """Transient errors must NOT be dropped or raised — the row stays pending with a
+        backed-off next_attempt_at so the sweeper re-drives it. This is what survives a
+        multi-day provider outage."""
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+
+        mock_send_mime.side_effect = MailgunTransientError("mailgun 503")
+
+        before = timezone.now()
+        _, outbox = self._run_reply(ticket, content="Reply")
+
+        assert mock_send_mime.call_count == 1
+        assert outbox.status == EmailOutboxMessage.Status.PENDING
+        assert outbox.attempts == 1
+        assert outbox.next_attempt_at > before
+        assert outbox.locked_until is None
+
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_reuses_message_id_across_attempts(self, mock_send_mime: MagicMock):
+        """A retried send must reuse the same Message-ID so threading/dedup stay stable."""
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+
+        # First attempt fails transiently.
+        mock_send_mime.side_effect = MailgunTransientError("mailgun 503")
+        _, outbox = self._run_reply(ticket, content="Reply")
+        original_message_id = outbox.message_id
+
+        # Make it due again and let the next attempt succeed.
+        from products.conversations.backend.tasks.email import send_email_reply
+
+        EmailOutboxMessage.objects.filter(id=outbox.id).update(next_attempt_at=timezone.now(), locked_until=None)
+        mock_send_mime.side_effect = None
+        send_email_reply(str(outbox.id))
+
+        outbox.refresh_from_db()
+        assert outbox.status == EmailOutboxMessage.Status.SENT
+        assert outbox.message_id == original_message_id
+        # Both attempts carried the same Message-ID header.
+        first_mime = mock_send_mime.call_args_list[0].args[1]
+        second_mime = mock_send_mime.call_args_list[1].args[1]
+        assert original_message_id.encode() in first_mime
+        assert original_message_id.encode() in second_mime
+
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_idempotent_when_already_sent(self, mock_send_mime: MagicMock):
+        from products.conversations.backend.tasks.email import send_email_reply
+
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+        _, outbox = self._create_outbox(ticket)
+        EmailOutboxMessage.objects.filter(id=outbox.id).update(status=EmailOutboxMessage.Status.SENT)
+
+        send_email_reply(str(outbox.id))
+
+        mock_send_mime.assert_not_called()
+
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_send_email_reply_marks_failed_when_no_config(self, mock_send_mime: MagicMock):
+        ticket = self._create_ticket(None)
+
+        _, outbox = self._run_reply(ticket, content="Reply")
+
+        assert outbox.status == EmailOutboxMessage.Status.FAILED_PERMANENT
+        mock_send_mime.assert_not_called()
+
+    def test_outbox_row_created_in_signal_survives_without_broker(self):
+        """The durable outbox row is created in the comment's transaction, so a reply is
+        recoverable even if the broker never picks up the immediate send task."""
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+
+        comment = Comment.objects.create(
+            team=self.team,
+            scope="conversations_ticket",
+            item_id=str(ticket.id),
+            content="Reply",
+            created_by=self.user,
+            item_context={"author_type": "support"},
+        )
+
+        outbox = EmailOutboxMessage.objects.filter(comment=comment).first()
+        assert outbox is not None
+        assert outbox.status == EmailOutboxMessage.Status.PENDING
+        assert outbox.message_id
+
+    @parameterized.expand(
+        [
+            # name, scenario, expect send_mime called, resulting status
+            ("due_row_is_sent", "due", True, EmailOutboxMessage.Status.SENT),
+            ("locked_row_is_skipped", "locked", False, EmailOutboxMessage.Status.PENDING),
+            ("expired_row_is_given_up", "expired", False, EmailOutboxMessage.Status.FAILED_PERMANENT),
+        ]
+    )
+    @patch("products.conversations.backend.tasks.email.send_mime")
+    def test_flush_pending_email_replies(
+        self, _name: str, scenario: str, expect_send: bool, expected_status: str, mock_send_mime: MagicMock
+    ):
+        from products.conversations.backend.tasks.email import EMAIL_OUTBOX_MAX_AGE, flush_pending_email_replies
+
+        config = self._create_config("support@example.com", "aaa111")
+        ticket = self._create_ticket(config)
+        _, outbox = self._create_outbox(ticket)
+
+        now = timezone.now()
+        if scenario == "locked":
+            EmailOutboxMessage.objects.filter(id=outbox.id).update(locked_until=now + timedelta(minutes=5))
+        elif scenario == "expired":
+            EmailOutboxMessage.objects.filter(id=outbox.id).update(
+                created_at=now - EMAIL_OUTBOX_MAX_AGE - timedelta(hours=1), next_attempt_at=now
+            )
+
+        flush_pending_email_replies()
+
+        outbox.refresh_from_db()
+        assert mock_send_mime.called is expect_send
+        assert outbox.status == expected_status
+
+
+class TestEmailInboundDmarcRewrite(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+        self.config = EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="dd00aa11cc2233ee",
+            from_email="merch@posthog.com",
+            from_name="Merch",
+            domain="posthog.com",
+            domain_verified=True,
+        )
+
+    def _base_data(self, msg_id: str) -> dict[str, str]:
+        return {
+            "recipient": "team-dd00aa11cc2233ee@mg.posthog.com",
+            "Message-Id": msg_id,
+            "subject": "Order question",
+            "stripped-text": "Where is my order?",
+        }
+
+    @parameterized.expand(
+        [
+            (
+                "x_original_from",
+                {
+                    "from": "'Alex Smith' via Merch <merch@posthog.com>",
+                    "X-Original-From": "Alex Smith <alex@strictdmarc.com>",
+                },
+                "alex@strictdmarc.com",
+                "Alex Smith",
+            ),
+            (
+                "x_original_sender",
+                {"from": "'Bob' via Merch <merch@posthog.com>", "X-Original-Sender": "bob@company.io"},
+                "bob@company.io",
+                "bob",
+            ),
+            (
+                "reply_to_with_name",
+                {"from": "'Jane Doe' via Merch <merch@posthog.com>", "Reply-To": "Jane Doe <jane@strictdmarc.com>"},
+                "jane@strictdmarc.com",
+                "Jane Doe",
+            ),
+            (
+                "reply_to_bare_email",
+                {"from": "'Someone' via Merch <merch@posthog.com>", "Reply-To": "someone@example.org"},
+                "someone@example.org",
+                "someone",
+            ),
+            (
+                "x_original_from_over_reply_to",
+                {
+                    "from": "'Charlie' via Merch <merch@posthog.com>",
+                    "X-Original-From": "Charlie <charlie@real.com>",
+                    "Reply-To": "charlie-alt@other.com",
+                },
+                "charlie@real.com",
+                "Charlie",
+            ),
+            (
+                "no_recovery_headers_strips_via",
+                {"from": "'Alex Smith' via Merch <merch@posthog.com>"},
+                "merch@posthog.com",
+                "Alex Smith",
+            ),
+            (
+                "reply_to_matching_config_falls_through",
+                {"from": "'Alice' via Merch <merch@posthog.com>", "Reply-To": "merch@posthog.com"},
+                "merch@posthog.com",
+                "Alice",
+            ),
+            (
+                "non_rewritten_from_unchanged",
+                {"from": "Regular User <regular@gmail.com>"},
+                "regular@gmail.com",
+                "Regular User",
+            ),
+            (
+                "forged_from_no_via_skips_recovery",
+                {"from": "Attacker <merch@posthog.com>", "X-Original-From": "attacker@evil.com"},
+                "merch@posthog.com",
+                "Attacker",
+            ),
+            (
+                "malformed_x_original_from_rejected",
+                {"from": "'Eve' via Merch <merch@posthog.com>", "X-Original-From": "not-an-email"},
+                "merch@posthog.com",
+                "Eve",
+            ),
+            (
+                "malformed_reply_to_rejected",
+                {"from": "'Eve' via Merch <merch@posthog.com>", "Reply-To": "bad@"},
+                "merch@posthog.com",
+                "Eve",
+            ),
+        ]
+    )
+    def test_dmarc_sender_recovery(self, _name, extra_headers, expected_email, expected_name):
+        data = self._base_data(f"<dmarc-{_name}@test.com>")
+        data.update(extra_headers)
+        post_mailgun(self.client, "/api/conversations/v1/email/inbound", data)
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.email_from == expected_email
+        assert ticket.anonymous_traits["email"] == expected_email
+        assert ticket.anonymous_traits["name"] == expected_name
+
+    def test_recovered_sender_flows_to_comment_context(self):
+        data = self._base_data("<dmarc-ctx@test.com>")
+        data["from"] = "'Alex Smith' via Merch <merch@posthog.com>"
+        data["X-Original-From"] = "Alex Smith <alex@strictdmarc.com>"
+        post_mailgun(self.client, "/api/conversations/v1/email/inbound", data)
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.distinct_id == "alex@strictdmarc.com"
+
+        comment = Comment.objects.get(team=self.team, scope="conversations_ticket")
+        assert comment.item_context is not None
+        assert comment.item_context["email_from"] == "alex@strictdmarc.com"
+        assert comment.item_context["email_from_name"] == "Alex Smith"
+
+
+class TestEmailInboundTrustedRelay(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+        self.config = EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="aa11bb22cc33dd44",
+            from_email="support@example.com",
+            from_name="Support",
+            domain="example.com",
+            domain_verified=True,
+            trusted_relay_sender="relay@relay.example.com",
+        )
+
+    def _post(self, message_id: str, extra: dict[str, str]) -> None:
+        post_mailgun(
+            self.client,
+            "/api/conversations/v1/email/inbound",
+            {
+                "recipient": "team-aa11bb22cc33dd44@mg.posthog.com",
+                "from": "Relay <relay@relay.example.com>",
+                "sender": "relay@relay.example.com",
+                "X-Mailgun-Spf": "Pass",
+                "Message-Id": message_id,
+                "subject": "Support request",
+                "stripped-text": "Please help",
+                **extra,
+            },
+        )
+
+    @parameterized.expand(
+        [
+            (
+                "posthog_requester",
+                {"message-headers": '[["X-PostHog-Requester", "Alex Smith <alex@example.net>"]]'},
+                "alex@example.net",
+                "Alex Smith",
+            ),
+            (
+                "reply_to",
+                {"Reply-To": "Jane Doe <jane@example.net>"},
+                "jane@example.net",
+                "Jane Doe",
+            ),
+            (
+                "requester_precedes_reply_to",
+                {
+                    "X-PostHog-Requester": "Alex Smith <alex@example.net>",
+                    "Reply-To": "jane@example.net",
+                },
+                "alex@example.net",
+                "Alex Smith",
+            ),
+            (
+                "posthog_inbound_requester_falls_back_to_reply_to",
+                {
+                    "X-PostHog-Requester": "team-deadbeef@mg.eu.posthog.com",
+                    "Reply-To": "Jane Doe <jane@example.net>",
+                },
+                "jane@example.net",
+                "Jane Doe",
+            ),
+            (
+                "dkim_signed_requester",
+                {
+                    "X-Mailgun-Spf": "",
+                    "X-Mailgun-Dkim-Check-Result": "Pass",
+                    "DKIM-Signature": "v=1; d=relay.example.com; h=from:subject:x-posthog-requester; b=abc",
+                    "X-PostHog-Requester": "Alex Smith <alex@example.net>",
+                },
+                "alex@example.net",
+                "Alex Smith",
+            ),
+        ]
+    )
+    def test_trusted_relay_attributes_ticket_to_requester(
+        self,
+        name: str,
+        headers: dict[str, str],
+        expected_email: str,
+        expected_name: str,
+    ):
+        self._post(f"<trusted-relay-{name}@example.com>", headers)
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.email_from == expected_email
+        assert ticket.distinct_id == expected_email
+        assert ticket.anonymous_traits == {"name": expected_name, "email": expected_email, "email_relayed": True}
+        assert ticket.identity_verified is False
+
+        comment = Comment.objects.get(team=self.team, scope="conversations_ticket")
+        assert comment.item_context is not None
+        assert comment.item_context["email_from"] == expected_email
+        assert comment.item_context["email_from_name"] == expected_name
+        assert comment.item_context["email_relay_from"] == "relay@relay.example.com"
+
+    @parameterized.expand(
+        [
+            (
+                "different_from",
+                {
+                    "from": "Other <other@relay.example.com>",
+                    "sender": "other@relay.example.com",
+                },
+                "other@relay.example.com",
+            ),
+            (
+                "different_envelope_sender",
+                {"sender": "other@relay.example.com"},
+                "relay@relay.example.com",
+            ),
+            (
+                "unauthenticated_relay",
+                {"X-Mailgun-Spf": ""},
+                "relay@relay.example.com",
+            ),
+            (
+                "dkim_does_not_sign_requester",
+                {
+                    "X-Mailgun-Spf": "",
+                    "X-Mailgun-Dkim-Check-Result": "Pass",
+                    "DKIM-Signature": "v=1; d=relay.example.com; h=from:subject; b=abc",
+                },
+                "relay@relay.example.com",
+            ),
+            (
+                "dkim_signs_one_of_duplicate_requesters",
+                {
+                    "X-Mailgun-Spf": "",
+                    "X-Mailgun-Dkim-Check-Result": "Pass",
+                    "DKIM-Signature": "v=1; d=relay.example.com; h=from:subject:x-posthog-requester; b=abc",
+                    "message-headers": '[["X-PostHog-Requester", "Alex Smith <alex@example.net>"]]',
+                },
+                "relay@relay.example.com",
+            ),
+        ]
+    )
+    def test_untrusted_mail_cannot_override_requester(
+        self,
+        name: str,
+        sender_fields: dict[str, str],
+        expected_email: str,
+    ):
+        self._post(
+            f"<untrusted-relay-{name}@example.com>",
+            {
+                "X-PostHog-Requester": "Victim <victim@example.net>",
+                **sender_fields,
+            },
+        )
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.email_from == expected_email
+        assert ticket.distinct_id == expected_email
+
+    def test_same_domain_relay_does_not_authenticate_the_requester(self):
+        self.config.trusted_relay_sender = "relay@posthog.com"
+        self.config.save(update_fields=["trusted_relay_sender"])
+
+        self._post(
+            "<same-domain-relay@posthog.com>",
+            {
+                "from": "Relay <relay@posthog.com>",
+                "sender": "relay@posthog.com",
+                "X-PostHog-Requester": self.user.email,
+            },
+        )
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.identity_verified is False
+        assert ticket.unread_team_count == 1
+
+        comment = Comment.objects.get(team=self.team, scope="conversations_ticket")
+        assert comment.item_context is not None
+        assert comment.item_context["author_type"] == "customer"
+        assert comment.created_by is None
+
+
+class TestEmailInboundSelfAddressedAutoreply(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+        self.config = EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="ab11cd22ef33ab44",
+            from_email="security@posthog.com",
+            from_name="Security",
+            domain="posthog.com",
+            domain_verified=True,
+        )
+
+    def _post(self, msg_id: str, extra: dict[str, str]) -> None:
+        data = {
+            "recipient": "team-ab11cd22ef33ab44@mg.posthog.com",
+            "Message-Id": msg_id,
+            "subject": "We've got your email",
+            "stripped-text": "Our team is looking into your email.",
+            "To": "security@posthog.com",
+            **extra,
+        }
+        post_mailgun(self.client, "/api/conversations/v1/email/inbound", data)
+
+    @parameterized.expand(
+        [
+            ("auto_submitted", {"Auto-Submitted": "auto-replied"}),
+            ("auto_submitted_with_parameters", {"Auto-Submitted": "auto-generated; owner-token=abc"}),
+            ("precedence_auto_reply", {"Precedence": "auto_reply"}),
+            ("x_autoreply", {"X-Autoreply": "yes"}),
+        ]
+    )
+    def test_autoreply_from_the_inbox_itself_is_dropped(self, name, headers):
+        self._post(f"<loop-{name}@posthog.com>", {"from": "PostHog Security <security@posthog.com>", **headers})
+
+        assert Ticket.objects.filter(team=self.team).count() == 0
+
+    def test_autoreply_from_the_inbound_address_is_dropped(self):
+        self._post(
+            "<loop-inbound-address@posthog.com>",
+            {"from": "team-ab11cd22ef33ab44@mg.posthog.com", "Auto-Submitted": "auto-replied"},
+        )
+
+        assert Ticket.objects.filter(team=self.team).count() == 0
+
+    def test_auto_submitted_header_is_read_from_the_message_headers_blob(self):
+        self._post(
+            "<loop-headers-blob@posthog.com>",
+            {
+                "from": "PostHog Security <security@posthog.com>",
+                "message-headers": '[["Auto-Submitted", "auto-replied"]]',
+            },
+        )
+
+        assert Ticket.objects.filter(team=self.team).count() == 0
+
+    @parameterized.expand(
+        [
+            # A person's mail relayed by a list arrives From the list address, and the list marks it
+            # with a Precedence that only asks receivers not to auto-reply. Reading any of those as
+            # "a machine wrote this" would drop the customer's email.
+            ("relayed_person_precedence_list", {"from": "Alex Smith <security@posthog.com>", "Precedence": "list"}),
+            ("relayed_person_precedence_bulk", {"from": "Alex Smith <security@posthog.com>", "Precedence": "bulk"}),
+            ("relayed_person_no_markers", {"from": "Alex Smith <security@posthog.com>"}),
+            ("auto_submitted_no", {"from": "Alex Smith <security@posthog.com>", "Auto-Submitted": "no"}),
+        ]
+    )
+    def test_self_addressed_human_mail_still_opens_a_ticket(self, name, headers):
+        self._post(f"<human-{name}@posthog.com>", headers)
+
+        assert Ticket.objects.filter(team=self.team).count() == 1
+
+    def test_external_automated_mail_still_opens_a_ticket(self):
+        # Teams route infrastructure alerts to support on purpose, so being machine-generated is
+        # only half the test: the message also has to claim to come from the inbox itself.
+        self._post(
+            "<external-auto-submitted@example.com>",
+            {"from": "Alerts <no-reply@example.com>", "Auto-Submitted": "auto-replied"},
+        )
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.email_from == "no-reply@example.com"
+
+
+class TestEmailInboundTeamMemberDetection(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+        self.config = EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="ab01cd23ef45",
+            from_email="security@posthog.com",
+            from_name="Security",
+            domain="posthog.com",
+            domain_verified=True,
+        )
+
+    def _post(self, data: dict[str, str]):
+        return post_mailgun(self.client, "/api/conversations/v1/email/inbound", data)
+
+    def test_team_member_reply_attribution_and_unread(self):
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "from": "Customer <customer@external.com>",
+                "Message-Id": "<init@external.com>",
+                "subject": "Security question",
+                "stripped-text": "Hello",
+            }
+        )
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.email_from == "customer@external.com"
+        assert ticket.unread_team_count == 1
+
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "sender": self.user.email,
+                "from": f"{self.user.first_name} <{self.user.email}>",
+                "Message-Id": "<reply@team.com>",
+                "In-Reply-To": "<init@external.com>",
+                "stripped-text": "Looking into this",
+                "X-Mailgun-Spf": "Pass",
+            }
+        )
+
+        comments = Comment.objects.filter(team=self.team, scope="conversations_ticket").order_by("created_at")
+        assert comments.count() == 2
+
+        customer_comment = comments[0]
+        assert customer_comment.item_context["author_type"] == "customer"
+        assert customer_comment.created_by is None
+
+        support_comment = comments[1]
+        assert support_comment.item_context["author_type"] == "support"
+        assert support_comment.created_by_id == self.user.id
+
+        ticket.refresh_from_db()
+        assert ticket.unread_team_count == 1
+
+    def test_team_member_inbound_stamps_from_email_and_no_outbox(self):
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "from": "Customer <customer@external.com>",
+                "Message-Id": "<echo-init@external.com>",
+                "subject": "Help please",
+                "stripped-text": "Need help",
+            }
+        )
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "sender": self.user.email,
+                "from": f"{self.user.first_name} <{self.user.email}>",
+                "Message-Id": "<echo-reply@team.com>",
+                "In-Reply-To": "<echo-init@external.com>",
+                "stripped-text": "I will look into this",
+                "X-Mailgun-Spf": "Pass",
+            }
+        )
+
+        support_comment = Comment.objects.filter(team=self.team, scope="conversations_ticket").order_by("created_at")[1]
+
+        assert isinstance(support_comment.item_context, dict)
+        assert support_comment.item_context["from_email"] is True
+        assert support_comment.item_context["author_type"] == "support"
+        assert EmailOutboxMessage.objects.filter(comment=support_comment).count() == 0
+
+    def test_customer_inbound_stamps_from_email(self):
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "from": "Customer <customer@external.com>",
+                "Message-Id": "<cust-from@external.com>",
+                "subject": "Question",
+                "stripped-text": "Hello",
+            }
+        )
+
+        comment = Comment.objects.get(team=self.team, scope="conversations_ticket")
+        assert isinstance(comment.item_context, dict)
+        assert comment.item_context["from_email"] is True
+        assert comment.item_context["author_type"] == "customer"
+
+    @parameterized.expand(
+        [
+            # (name, extra_post_fields, expected_identity_verified)
+            ("spf_pass_aligned_domain", {"sender": "alice@external.com", "X-Mailgun-Spf": "Pass"}, True),
+            ("no_spf", {}, False),
+            ("spf_pass_misaligned_domain", {"sender": "alice@evil.com", "X-Mailgun-Spf": "Pass"}, False),
+        ]
+    )
+    def test_inbound_identity_verified_reflects_spf(
+        self, _name: str, extra_fields: dict[str, str], expected_verified: bool
+    ):
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "from": "Alice <alice@external.com>",
+                "Message-Id": f"<iv-{_name}@external.com>",
+                "subject": "Question",
+                "stripped-text": "Hello",
+                **extra_fields,
+            }
+        )
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.identity_verified is expected_verified
+        comment = Comment.objects.get(team=self.team, scope="conversations_ticket")
+        assert isinstance(comment.item_context, dict)
+        assert comment.item_context["email_sender_authenticated"] is expected_verified
+
+    def test_no_spf_treated_as_customer(self):
+        """From header matches a team member but no SPF pass → customer."""
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "from": "Customer <customer@external.com>",
+                "Message-Id": "<nospf-init@external.com>",
+                "subject": "Question",
+                "stripped-text": "Hello",
+            }
+        )
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "sender": self.user.email,
+                "from": f"Forged <{self.user.email}>",
+                "Message-Id": "<nospf-reply@external.com>",
+                "In-Reply-To": "<nospf-init@external.com>",
+                "stripped-text": "I am totally a team member",
+            }
+        )
+        forged = Comment.objects.filter(team=self.team, scope="conversations_ticket").order_by("created_at")[1]
+        assert forged.item_context["author_type"] == "customer"
+        assert forged.created_by is None
+
+    def test_spf_pass_but_mismatched_envelope_treated_as_customer(self):
+        """SPF passes but envelope sender domain != From domain → customer."""
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "from": "Customer <customer@external.com>",
+                "Message-Id": "<align-init@external.com>",
+                "subject": "Question",
+                "stripped-text": "Hello",
+            }
+        )
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "sender": "attacker@evil.com",
+                "from": f"Forged <{self.user.email}>",
+                "Message-Id": "<align-reply@evil.com>",
+                "In-Reply-To": "<align-init@external.com>",
+                "stripped-text": "Cross-domain forgery attempt",
+                "X-Mailgun-Spf": "Pass",
+            }
+        )
+        forged = Comment.objects.filter(team=self.team, scope="conversations_ticket").order_by("created_at")[1]
+        assert forged.item_context["author_type"] == "customer"
+        assert forged.created_by is None
+
+    @parameterized.expand(
+        [
+            # (name, claimed_email, reply_sender, expected_verified)
+            # Same identity re-authenticates on a later message → legitimately promoted.
+            ("matching_sender", "alice@external.com", "alice@external.com", True),
+            # A different SPF-aligned sender threads onto a ticket claiming someone else's
+            # identity — must NOT promote it to verified (confused-deputy / impersonation).
+            ("different_sender", "victim@external.com", "attacker@evil.com", False),
+        ]
+    )
+    def test_promotion_requires_authenticated_sender_to_match_ticket_identity(
+        self, _name: str, claimed_email: str, reply_sender: str, expected_verified: bool
+    ):
+        # First message: unauthenticated (no SPF) → unverified ticket claiming `claimed_email`.
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "from": f"Claimant <{claimed_email}>",
+                "Message-Id": f"<promote-init-{_name}@external.com>",
+                "subject": "Question",
+                "stripped-text": "Hello",
+            }
+        )
+        # Reply: SPF-authenticated (envelope sender aligned with From) threaded onto the same ticket.
+        self._post(
+            {
+                "recipient": "team-ab01cd23ef45@mg.posthog.com",
+                "from": f"Reply <{reply_sender}>",
+                "sender": reply_sender,
+                "X-Mailgun-Spf": "Pass",
+                "Message-Id": f"<promote-reply-{_name}@external.com>",
+                "In-Reply-To": f"<promote-init-{_name}@external.com>",
+                "stripped-text": "Follow-up",
+            }
+        )
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.identity_verified is expected_verified
+
+
+class TestEmailInboundCcParticipants(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+        self.config = EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="cc00ee11ff22",
+            from_email="support@example.com",
+            from_name="Support",
+            domain="example.com",
+            domain_verified=True,
+        )
+
+    def _base_data(self, msg_id: str) -> dict[str, str]:
+        return {
+            "recipient": "team-cc00ee11ff22@mg.posthog.com",
+            "from": "sender@test.com",
+            "Message-Id": msg_id,
+            "subject": "Help",
+            "stripped-text": "Need help",
+        }
+
+    @parameterized.expand(
+        [
+            # (_name, to_header, cc_header, expected)
+            (
+                "cc_with_display_names",
+                None,
+                "Dev <dev@company.com>, pm@company.com",
+                ["dev@company.com", "pm@company.com"],
+            ),
+            ("self_cc_filtered", None, "dev@company.com, team-cc00ee11ff22@mg.posthog.com", ["dev@company.com"]),
+            ("no_recipients", None, None, []),
+            # Direct recipient in To, support address only CC'd — the recipient must survive.
+            (
+                "to_recipient_kept_channel_dropped",
+                "auser@example.com",
+                "support@example.com",
+                ["auser@example.com"],
+            ),
+            # Channel's own address and the sender are never participants.
+            ("channel_and_sender_excluded", "sender@test.com, support@example.com", None, []),
+            # To + Cc merge and dedupe.
+            ("to_and_cc_merged", "auser@example.com", "dev@company.com", ["auser@example.com", "dev@company.com"]),
+        ]
+    )
+    def test_new_ticket_participants(self, _name, to_header, cc_header, expected):
+        data = self._base_data(f"<cc-{_name}@test.com>")
+        if to_header:
+            data["To"] = to_header
+        if cc_header:
+            data["Cc"] = cc_header
+        response = post_mailgun(self.client, "/api/conversations/v1/email/inbound", data)
+        assert response.status_code == 202
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.cc_participants == expected
+
+    def test_reply_merges_cc_participants(self):
+        data1 = self._base_data("<cc2@test.com>")
+        data1["Cc"] = "dev@company.com"
+        post_mailgun(self.client, "/api/conversations/v1/email/inbound", data1)
+
+        ticket = Ticket.objects.get(team=self.team)
+        assert ticket.cc_participants == ["dev@company.com"]
+
+        data2 = self._base_data("<cc3@test.com>")
+        data2["In-Reply-To"] = "<cc2@test.com>"
+        data2["Cc"] = "dev@company.com, new@company.com"
+        post_mailgun(self.client, "/api/conversations/v1/email/inbound", data2)
+
+        ticket.refresh_from_db()
+        assert ticket.cc_participants == ["dev@company.com", "new@company.com"]
+
+        # A participant reply-alls: the requester lands in To but is already the
+        # reply target, so they must not be merged into cc_participants.
+        data3 = self._base_data("<cc4@test.com>")
+        data3["from"] = "dev@company.com"
+        data3["In-Reply-To"] = "<cc2@test.com>"
+        data3["To"] = "sender@test.com, support@example.com"
+        data3["Cc"] = "new@company.com"
+        post_mailgun(self.client, "/api/conversations/v1/email/inbound", data3)
+
+        ticket.refresh_from_db()
+        assert ticket.cc_participants == ["dev@company.com", "new@company.com"]
+
+
+class TestEmailInboundAttachments(MailgunWebhookTestMixin, BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client = Client()
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save()
+        self.config = EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="aabbcc111222",
+            from_email="support@example.com",
+            from_name="Support",
+            domain="example.com",
+            domain_verified=True,
+        )
+
+    def _base_post_data(self, msg_id: str = "<att@test.com>") -> dict:
+        return {
+            "recipient": "team-aabbcc111222@mg.posthog.com",
+            "from": "sender@test.com",
+            "Message-Id": msg_id,
+            "subject": "With attachment",
+            "stripped-text": "See attached",
+        }
+
+    @parameterized.expand(
+        [
+            ("png", _make_png_bytes(), "image/png"),
+            ("jpeg_labelled_png", _make_image_bytes("JPEG"), "image/jpeg"),
+        ]
+    )
+    @patch("products.conversations.backend.services.attachments.save_content_to_object_storage")
+    def test_inbound_with_image_attachment(
+        self, _name: str, content: bytes, expected_content_type: str, mock_storage: MagicMock
+    ):
+        attachment = SimpleUploadedFile("photo.png", content, content_type="image/png")
+
+        data = self._base_post_data("<img@test.com>")
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            response = post_mailgun(
+                self.client, "/api/conversations/v1/email/inbound", {**data, "attachment-1": attachment}
+            )
+
+        assert response.status_code == 202
+        mock_storage.assert_called_once()
+
+        comment = Comment.objects.filter(team=self.team, scope="conversations_ticket").first()
+        assert comment is not None
+        assert "![photo.png]" in comment.content
+        assert comment.rich_content is not None
+        image_nodes = [n for n in comment.rich_content["content"] if n["type"] == "image"]
+        assert len(image_nodes) == 1
+        assert image_nodes[0]["attrs"]["alt"] == "photo.png"
+        assert comment.item_context["email_attachments"] is not None
+        assert len(comment.item_context["email_attachments"]) == 1
+        assert comment.item_context["email_attachments"][0]["content_type"] == expected_content_type
+        assert UploadedMedia.objects.get(team=self.team).content_type == expected_content_type
+
+    @patch("products.conversations.backend.services.attachments.save_content_to_object_storage")
+    def test_inbound_with_non_image_attachment(self, mock_storage: MagicMock):
+        pdf = SimpleUploadedFile("invoice.pdf", b"%PDF-1.4 fake content", content_type="application/pdf")
+
+        data = self._base_post_data("<pdf@test.com>")
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            response = post_mailgun(self.client, "/api/conversations/v1/email/inbound", {**data, "attachment-1": pdf})
+
+        assert response.status_code == 202
+
+        comment = Comment.objects.filter(team=self.team, scope="conversations_ticket").first()
+        assert comment is not None
+        assert "[invoice.pdf]" in comment.content
+        assert comment.rich_content is not None
+        link_nodes = [
+            n
+            for n in comment.rich_content["content"]
+            if n["type"] == "paragraph"
+            and any(m.get("type") == "link" for child in n.get("content", []) for m in child.get("marks", []))
+        ]
+        assert len(link_nodes) == 1
+
+    @patch("products.conversations.backend.services.attachments.save_content_to_object_storage")
+    def test_inbound_with_multiple_attachments(self, mock_storage: MagicMock):
+        png = SimpleUploadedFile("photo.png", _make_png_bytes(), content_type="image/png")
+        pdf = SimpleUploadedFile("doc.pdf", b"%PDF-1.4 content", content_type="application/pdf")
+
+        data = self._base_post_data("<multi@test.com>")
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            response = post_mailgun(
+                self.client, "/api/conversations/v1/email/inbound", {**data, "attachment-1": png, "attachment-2": pdf}
+            )
+
+        assert response.status_code == 202
+        assert mock_storage.call_count == 2
+
+        comment = Comment.objects.filter(team=self.team, scope="conversations_ticket").first()
+        assert comment is not None
+        assert comment.rich_content is not None
+        assert len(comment.rich_content["content"]) == 3  # text paragraph + image + file link
+        assert comment.item_context["email_attachments"] is not None
+        assert len(comment.item_context["email_attachments"]) == 2
+
+    @patch("products.conversations.backend.services.attachments.save_content_to_object_storage")
+    @patch("products.conversations.backend.services.mailgun_events.MAX_ATTACHMENT_SIZE", 100)
+    def test_inbound_attachment_too_large_is_skipped(self, mock_storage: MagicMock):
+        oversized = SimpleUploadedFile("big.bin", b"x" * 101, content_type="application/octet-stream")
+
+        data = self._base_post_data("<huge@test.com>")
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            response = post_mailgun(
+                self.client, "/api/conversations/v1/email/inbound", {**data, "attachment-1": oversized}
+            )
+
+        assert response.status_code == 202
+        mock_storage.assert_not_called()
+
+        comment = Comment.objects.filter(team=self.team, scope="conversations_ticket").first()
+        assert comment is not None
+        assert comment.content == "See attached"
+        assert comment.rich_content is None
+        assert comment.item_context.get("email_attachments") is None
+
+    @patch("products.conversations.backend.services.attachments.save_content_to_object_storage")
+    def test_inbound_without_object_storage_skips_attachments(self, mock_storage: MagicMock):
+        png = SimpleUploadedFile("photo.png", _make_png_bytes(), content_type="image/png")
+
+        data = self._base_post_data("<nostorage@test.com>")
+        with self.settings(OBJECT_STORAGE_ENABLED=False):
+            response = post_mailgun(self.client, "/api/conversations/v1/email/inbound", {**data, "attachment-1": png})
+
+        assert response.status_code == 202
+        mock_storage.assert_not_called()
+
+        comment = Comment.objects.filter(team=self.team, scope="conversations_ticket").first()
+        assert comment is not None
+        assert comment.content == "See attached"
+        assert comment.rich_content is None
+
+    @parameterized.expand(
+        [
+            ("html", b"<html>not an image</html>"),
+            ("tiff", _make_image_bytes("TIFF")),
+        ]
+    )
+    @patch("products.conversations.backend.services.attachments.save_content_to_object_storage")
+    def test_inbound_invalid_image_is_rejected(self, _name: str, content: bytes, mock_storage: MagicMock):
+        fake_image = SimpleUploadedFile("evil.png", content, content_type="image/png")
+
+        data = self._base_post_data("<evil@test.com>")
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            response = post_mailgun(
+                self.client, "/api/conversations/v1/email/inbound", {**data, "attachment-1": fake_image}
+            )
+
+        assert response.status_code == 202
+        mock_storage.assert_not_called()
+
+        comment = Comment.objects.filter(team=self.team, scope="conversations_ticket").first()
+        assert comment is not None
+        assert comment.content == "See attached"
+        assert comment.rich_content is None
+
+    @patch("products.conversations.backend.services.attachments.save_content_to_object_storage")
+    def test_inbound_no_attachments_unchanged(self, mock_storage: MagicMock):
+        data = self._base_post_data("<plain@test.com>")
+        with self.settings(OBJECT_STORAGE_ENABLED=True):
+            response = post_mailgun(self.client, "/api/conversations/v1/email/inbound", data)
+
+        assert response.status_code == 202
+        mock_storage.assert_not_called()
+
+        comment = Comment.objects.filter(team=self.team, scope="conversations_ticket").first()
+        assert comment is not None
+        assert comment.content == "See attached"
+        assert comment.rich_content is None
+        assert comment.item_context.get("email_attachments") is None
+
+
+class TestEmailSendTestView(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+        self.config = EmailChannel.objects.create(
+            team=self.team,
+            inbound_token="send11test22",
+            from_email="support@example.com",
+            from_name="Support",
+            domain="example.com",
+            domain_verified=True,
+        )
+
+    def _post(self) -> dict:
+        return {"config_id": str(self.config.id)}
+
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    @patch("products.conversations.backend.api.email_settings.send_mime")
+    def test_success(self, mock_send_mime: MagicMock, _mock_setting: MagicMock):
+        mock_send_mime.return_value = "<mg-id@example.com>"
+
+        response = self.client.post(
+            "/api/conversations/v1/email/send-test", self._post(), content_type="application/json"
+        )
+
+        assert response.status_code == 200
+        mock_send_mime.assert_called_once()
+        args, kwargs = mock_send_mime.call_args
+        assert args[0] == "example.com"
+        assert kwargs["recipients"] == [self.user.email]
+
+    @parameterized.expand(
+        [
+            ("not_configured", "MailgunNotConfigured", "no api key", 500),
+            ("domain_not_registered", "MailgunDomainNotRegistered", "gone", 502),
+            ("permanent_error", "MailgunPermanentError", "bad recipient", 502),
+        ]
+    )
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    @patch("products.conversations.backend.api.email_settings.send_mime")
+    def test_mailgun_error_maps_to_status(
+        self,
+        _name: str,
+        exc_name: str,
+        exc_arg: str,
+        expected_status: int,
+        mock_send_mime: MagicMock,
+        _mock_setting: MagicMock,
+    ):
+        import products.conversations.backend.mailgun as mailgun_mod
+
+        mock_send_mime.side_effect = getattr(mailgun_mod, exc_name)(exc_arg)
+
+        response = self.client.post(
+            "/api/conversations/v1/email/send-test", self._post(), content_type="application/json"
+        )
+
+        assert response.status_code == expected_status
+
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    @patch("products.conversations.backend.api.email_settings.send_mime")
+    def test_domain_not_registered_flips_verified(self, mock_send_mime: MagicMock, _mock_setting: MagicMock):
+        from products.conversations.backend.mailgun import MailgunDomainNotRegistered
+
+        mock_send_mime.side_effect = MailgunDomainNotRegistered("gone")
+
+        self.client.post("/api/conversations/v1/email/send-test", self._post(), content_type="application/json")
+
+        self.config.refresh_from_db()
+        assert self.config.domain_verified is False
+
+
+class TestEmailDefaultChannel(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.client.force_login(self.user)
+
+    def _create_config(
+        self,
+        from_email: str,
+        *,
+        verified: bool = True,
+        is_default: bool = False,
+        kind: str = EmailChannelKind.SUPPORT,
+    ) -> EmailChannel:
+        return EmailChannel.objects.create(
+            team=self.team,
+            kind=kind,
+            owner=self.user if kind == EmailChannelKind.CUSTOMER_COMMUNICATION else None,
+            inbound_token=from_email,
+            from_email=from_email,
+            from_name="Support",
+            domain=from_email.split("@")[1],
+            domain_verified=verified,
+            is_default=is_default,
+        )
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_add_domain", return_value={})
+    @patch(
+        "products.conversations.backend.api.email_settings.get_instance_setting",
+        return_value="mg.posthog.com",
+    )
+    def test_first_connected_channel_becomes_default(self, _mock_setting: MagicMock, _mock_mailgun: MagicMock):
+        r1 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "support@example.com", "from_name": "Support"},
+            content_type="application/json",
+        )
+        r2 = self.client.post(
+            "/api/conversations/v1/email/connect",
+            {"from_email": "billing@example.com", "from_name": "Billing"},
+            content_type="application/json",
+        )
+        assert r1.json()["config"]["is_default"] is True
+        assert r2.json()["config"]["is_default"] is False
+        assert EmailChannel.objects.filter(team=self.team, is_default=True).count() == 1
+
+    def test_set_default_switches_and_unsets_previous(self):
+        first = self._create_config("support@example.com", is_default=True)
+        second = self._create_config("billing@example.com")
+
+        response = self.client.post(
+            "/api/conversations/v1/email/set-default",
+            {"config_id": str(second.id)},
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        assert first.is_default is False
+        assert second.is_default is True
+
+    def test_customer_communication_channel_cannot_become_default(self) -> None:
+        customer_channel = self._create_config(
+            "csm@example.com",
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/set-default",
+            {"config_id": str(customer_channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 400
+        customer_channel.refresh_from_db()
+        assert customer_channel.is_default is False
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    def test_disconnecting_default_promotes_a_support_replacement(self, _mock_delete: MagicMock) -> None:
+        default = self._create_config("support@example.com", is_default=True)
+        other = self._create_config("billing@example.com")
+        customer_channel = self._create_config(
+            "csm@example.com",
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+        )
+
+        response = self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": str(default.id)},
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+
+        other.refresh_from_db()
+        customer_channel.refresh_from_db()
+        assert other.is_default is True
+        assert customer_channel.is_default is False
+
+    @patch("products.conversations.backend.api.email_settings.mailgun_delete_domain")
+    def test_disconnecting_last_support_channel_disables_support_email(self, _mock_delete: MagicMock) -> None:
+        support_channel = self._create_config("support@example.com", is_default=True)
+        self._create_config(
+            "csm@example.com",
+            kind=EmailChannelKind.CUSTOMER_COMMUNICATION,
+        )
+        self.team.conversations_settings = {"email_enabled": True}
+        self.team.save(update_fields=["conversations_settings"])
+
+        response = self.client.post(
+            "/api/conversations/v1/email/disconnect",
+            {"config_id": str(support_channel.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        self.team.refresh_from_db()
+        assert (self.team.conversations_settings or {}).get("email_enabled") is False

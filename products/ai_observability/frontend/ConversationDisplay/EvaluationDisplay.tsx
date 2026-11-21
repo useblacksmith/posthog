@@ -1,0 +1,83 @@
+import { useValues } from 'kea'
+
+import { Link } from '@posthog/lemon-ui'
+
+import { lowercaseFirstLetter } from 'lib/utils/strings'
+import { urls } from 'scenes/urls'
+
+import { EventType } from '~/types'
+
+import { EvaluationExplanation } from '../components/EvaluationExplanation'
+import { EvaluationResultTag } from '../components/EvaluationResultTag'
+import { MetadataTag } from '../components/MetadataTag'
+import { llmEvaluationsLogic } from '../evaluations/llmEvaluationsLogic'
+import { isExplicitEvaluationPass, normalizeEvaluationResultProperties, normalizeOptionalNumber } from '../utils'
+
+export function EvaluationDisplay({ eventProperties }: { eventProperties: EventType['properties'] }): JSX.Element {
+    const { detectorEvaluationIds, evaluations } = useValues(llmEvaluationsLogic)
+    const reasoning = eventProperties.$ai_evaluation_reasoning
+    const probability = normalizeOptionalNumber(eventProperties.$ai_evaluation_probability)
+    const evaluationName = eventProperties.$ai_evaluation_name
+    const model = eventProperties.$ai_model ?? eventProperties.$ai_evaluation_model
+    const traceId = eventProperties.$ai_trace_id
+    const targetEventId = eventProperties.$ai_target_event_id
+    const evaluationId = eventProperties.$ai_evaluation_id
+    const evaluation = evaluations?.find((evaluation) => evaluation.id === evaluationId)
+    const resultRun = {
+        status: 'completed' as const,
+        skipped: isExplicitEvaluationPass(eventProperties.$ai_evaluation_skipped),
+        ...normalizeEvaluationResultProperties({
+            rawScore: eventProperties.$ai_evaluation_numeric_result,
+            rawCategories: eventProperties.$ai_evaluation_categorical_result,
+            rawScoreMin: eventProperties.$ai_evaluation_numeric_result_min,
+            rawScoreMax: eventProperties.$ai_evaluation_numeric_result_max,
+            rawResult: eventProperties.$ai_evaluation_result,
+            rawApplicable: eventProperties.$ai_evaluation_applicable,
+            rawEvaluationType: eventProperties.$ai_evaluation_runtime,
+            rawResultType: eventProperties.$ai_evaluation_result_type,
+            rawSentimentLabel: eventProperties.$ai_sentiment_label,
+            rawSentimentScore: eventProperties.$ai_sentiment_score,
+        }),
+    }
+
+    return (
+        <div className="space-y-4">
+            <div className="flex flex-wrap gap-2">
+                <EvaluationResultTag
+                    run={resultRun}
+                    passingRule={evaluation?.output_config.passing_rule}
+                    categoryOptions={evaluation?.output_config.options}
+                    trueIsFailure={detectorEvaluationIds.includes(evaluationId)}
+                />
+                {evaluationName && (
+                    <MetadataTag label="Evaluation" textToCopy={evaluationName}>
+                        {evaluationName}
+                    </MetadataTag>
+                )}
+                {typeof model === 'string' && model && (
+                    <MetadataTag label="Judge model" textToCopy={lowercaseFirstLetter(model)}>
+                        {lowercaseFirstLetter(model)}
+                    </MetadataTag>
+                )}
+                {traceId && targetEventId && (
+                    <MetadataTag label="Target event">
+                        <Link to={urls.aiObservabilityTrace(traceId, { event: targetEventId })}>
+                            {targetEventId.slice(0, 12)}...
+                        </Link>
+                    </MetadataTag>
+                )}
+            </div>
+
+            {(reasoning || probability !== null) && (
+                <div className="p-3 border rounded bg-surface-primary">
+                    <div className="font-medium text-xs text-muted mb-1.5">Evaluation details</div>
+                    {probability !== null ? (
+                        <EvaluationExplanation probability={probability} />
+                    ) : (
+                        <div className="text-sm whitespace-pre-wrap">{reasoning}</div>
+                    )}
+                </div>
+            )}
+        </div>
+    )
+}

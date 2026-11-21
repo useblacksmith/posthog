@@ -1,0 +1,74 @@
+import { BindLogic, useActions, useValues } from 'kea'
+import { Suspense, useEffect, useRef } from 'react'
+
+import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
+import { ScrollableShadows } from 'lib/lemon-ui/ScrollableShadows/ScrollableShadows'
+import { uuid } from 'lib/utils/dom'
+import { lazyWithRetry } from 'lib/utils/retryImport'
+import { ThreadAutoScroller } from 'scenes/max/components/ThreadAutoScroller'
+import { maxLogic } from 'scenes/max/maxLogic'
+import { MaxThreadLogicProps, maxThreadLogic } from 'scenes/max/maxThreadLogic'
+import { SceneContentFallback } from 'scenes/SceneContentFallback'
+
+import { aiFirstHomepageLogic } from './aiFirstHomepageLogic'
+import { HOMEPAGE_TAB_ID } from './constants'
+
+const Thread = lazyWithRetry(() => import('scenes/max/Thread').then((m) => ({ default: m.Thread })))
+
+export function HomepageThread(): JSX.Element {
+    const { query } = useValues(aiFirstHomepageLogic)
+    const { threadLogicKey, conversation } = useValues(maxLogic({ panelId: HOMEPAGE_TAB_ID }))
+    const { askMax, setQuestion } = useActions(maxLogic({ panelId: HOMEPAGE_TAB_ID }))
+
+    const scrollRef = useRef<HTMLDivElement | null>(null)
+
+    // Mark the scroll container so ThreadAutoScroller can find it
+    useEffect(() => {
+        scrollRef.current?.setAttribute('data-attr', 'max-scrollable')
+    }, [])
+
+    // Send the initial query once on mount
+    const hasSentInitial = useRef(false)
+
+    // Depends on `query` so a prompt that lands after mount is still sent. With an empty dependency
+    // list the effect read whatever `query` held on the first render, so a prompt set a tick later
+    // was dropped, and the send went out against a stale snapshot.
+    useEffect(() => {
+        if (query && !hasSentInitial.current) {
+            hasSentInitial.current = true
+            setQuestion(query)
+            // Cleared on unmount, so a fast navigation away doesn't send a prompt into a thread
+            // the user has already left.
+            const sendTimer = setTimeout(() => {
+                askMax(query)
+            }, 100)
+            return () => clearTimeout(sendTimer)
+        }
+    }, [query]) // eslint-disable-line react-hooks/exhaustive-deps
+
+    const threadProps: MaxThreadLogicProps = {
+        panelId: HOMEPAGE_TAB_ID,
+        conversationId: threadLogicKey || uuid(),
+        conversation,
+    }
+
+    return (
+        <BindLogic logic={maxLogic} props={{ panelId: HOMEPAGE_TAB_ID }}>
+            <BindLogic logic={maxThreadLogic} props={threadProps}>
+                <ScrollableShadows direction="vertical" styledScrollbars className="grow min-h-0" scrollRef={scrollRef}>
+                    <Suspense
+                        fallback={
+                            <SceneContentFallback>
+                                <LemonSkeleton className="h-24 w-full" />
+                            </SceneContentFallback>
+                        }
+                    >
+                        <ThreadAutoScroller>
+                            <Thread />
+                        </ThreadAutoScroller>
+                    </Suspense>
+                </ScrollableShadows>
+            </BindLogic>
+        </BindLogic>
+    )
+}

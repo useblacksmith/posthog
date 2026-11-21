@@ -1,0 +1,1897 @@
+import { useActions, useValues } from 'kea'
+import { useCallback, useEffect, useRef, useState } from 'react'
+
+import { IconInfo } from '@posthog/icons'
+import {
+    LemonBanner,
+    LemonButton,
+    LemonDialog,
+    LemonInput,
+    LemonSelect,
+    LemonSelectOption,
+    LemonSkeleton,
+    LemonSwitch,
+    LemonTag,
+    Link,
+    Tooltip,
+    lemonToast,
+} from '@posthog/lemon-ui'
+
+import api, { ApiConfig } from 'lib/api'
+import { TZLabel } from 'lib/components/TZLabel'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { newInternalTab } from 'lib/utils/newInternalTab'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import {
+    AvailableColumn,
+    DataWarehouseSyncInterval,
+    ExternalDataSchemaSourceSummary,
+    ExternalDataSource,
+    ExternalDataSourceSchema,
+    RowFilter,
+} from '~/types'
+
+import { supportsDirectQuery } from 'products/data_warehouse/frontend/shared/components/forms/schemaGroupingUtils'
+import {
+    SyncMethodForm,
+    SyncMethodFormHandle,
+} from 'products/data_warehouse/frontend/shared/components/forms/SyncMethodForm'
+import {
+    SchemaEditorAction,
+    useSchemaEditorAccess,
+} from 'products/data_warehouse/frontend/shared/components/SourceEditorAction'
+import { confirmPendingSelfManagedSync } from 'products/data_warehouse/frontend/shared/confirmPendingSelfManagedSync'
+import { isFileUploadSource } from 'products/data_warehouse/frontend/shared/fileUploadSources'
+import {
+    IncrementalSyncBlockedMessageMap,
+    StatusTagSetting,
+    SyncFrequencyLabelMap,
+    SyncTypeLabelMap,
+    allowedCdcSyncFrequencies,
+    allowedSyncFrequencies,
+    defaultQuery,
+    syncAnchorIntervalToHumanReadable,
+} from 'products/data_warehouse/frontend/utils'
+import {
+    externalDataSchemasPartialUpdate,
+    externalDataSourcesBulkUpdateSchemasPartialUpdate,
+} from 'products/warehouse_sources/frontend/generated/api'
+import type {
+    ExternalDataSchemaApi,
+    IncrementalFieldTypeEnumApi,
+} from 'products/warehouse_sources/frontend/generated/api.schemas'
+
+import { ApiVersionDeprecationBanner } from '../SourceScene/SourceScene'
+import { ColumnSelectionPicker } from '../SourceScene/tabs/ColumnSelectionModal'
+import { replaceFileDisabledReason, replaceFileLogic, replaceFileTarget } from '../SourceScene/tabs/replaceFileLogic'
+import { RowFilterEditor } from '../SourceScene/tabs/RowFilterEditor'
+import { validateRowFilters } from '../SourceScene/tabs/rowFilterUtils'
+import { columnAnnotationsLogic } from './columnAnnotationsLogic'
+import { confirmHistoryAccessRules, turnsHistoryOn } from './confirmHistoryAccessRules'
+import { DestinationsSection } from './DestinationsSection'
+import { masksDropHistory, stopsWritingHistory, writesHistoryTable } from './historyTable'
+import { SchemaConfigurationSection, schemaSceneLogic } from './schemaSceneLogic'
+
+// null means "all columns" on either side, so switching to null after a partial list flags
+// every previously-excluded column as added.
+function getAddedColumns(prev: string[] | null, next: string[] | null, available: { name: string }[]): string[] {
+    const allColumns = available.map((c) => c.name)
+    const prevSet = new Set(prev ?? allColumns)
+    const nextSet = new Set(next ?? allColumns)
+    return allColumns.filter((c) => nextSet.has(c) && !prevSet.has(c))
+}
+
+// null normalizes to "all columns" so an explicit full list and null compare equal.
+function sameColumns(a: string[] | null, b: string[] | null, available: { name: string }[]): boolean {
+    const allColumns = available.map((c) => c.name)
+    const setA = new Set(a ?? allColumns)
+    const setB = new Set(b ?? allColumns)
+    return setA.size === setB.size && [...setA].every((c) => setB.has(c))
+}
+
+/** The schema page's source is the retrieve-endpoint summary widened to the full type (see schemaSceneLogic). */
+export type SchemaSceneSource = ExternalDataSource & Partial<ExternalDataSchemaSourceSummary>
+
+export interface ConfigurationTabProps {
+    sourceId: string
+    schema: ExternalDataSourceSchema
+    source: SchemaSceneSource | null
+    section: SchemaConfigurationSection
+    onConfigureSyncMethod: () => void
+    /** Omitted when the source has no sync history to link to. */
+    syncHistoryUrl?: string
+}
+
+export function ConfigurationTab({
+    sourceId,
+    schema,
+    source,
+    section,
+    onConfigureSyncMethod,
+    syncHistoryUrl,
+}: ConfigurationTabProps): JSX.Element {
+    const logic = schemaSceneLogic({ sourceId, schemaId: schema.id })
+    const { isProjectTime, refreshingSchemas, resyncingSchema, supportsRowFilters, savingLiveQuery } = useValues(logic)
+    const {
+        setIsProjectTime,
+        setLiveQueryEnabled,
+        updateSchema,
+        reloadSchema,
+        resyncSchema,
+        cancelSchema,
+        deleteTable,
+        deleteHistoryTable,
+        refreshSchemas,
+    } = useActions(logic)
+    const { openReplaceFile } = useActions(replaceFileLogic({ sourceId }))
+    const fileUpload: FileUploadDetails | undefined = isFileUploadSource(source)
+        ? {
+              fileName: source?.file_name ?? null,
+              onReplaceFile: () => openReplaceFile(replaceFileTarget(schema)),
+              replaceDisabledReason: replaceFileDisabledReason(schema),
+          }
+        : undefined
+
+    switch (section) {
+        case 'details':
+            return (
+                <DetailsSection
+                    schema={schema}
+                    servesLiveQueries={
+                        source?.access_method !== 'direct' &&
+                        !!source?.direct_query_enabled &&
+                        supportsDirectQuery(source.source_type)
+                    }
+                    setLiveQueryEnabled={setLiveQueryEnabled}
+                    savingLiveQuery={savingLiveQuery}
+                    reloadSchema={reloadSchema}
+                    cancelSchema={cancelSchema}
+                    updateSchema={updateSchema}
+                    onConfigureSyncMethod={onConfigureSyncMethod}
+                    syncHistoryUrl={syncHistoryUrl}
+                    fileUpload={fileUpload}
+                />
+            )
+        case 'sync-method':
+            return (
+                <div className="flex flex-col gap-6">
+                    <SyncMethodSection sourceId={sourceId} schema={schema} />
+                    <ApiVersionSection sourceId={sourceId} source={source} schema={schema} />
+                </div>
+            )
+        case 'destinations':
+            return <DestinationsSection schemaId={schema.id} />
+        case 'columns':
+            return (
+                <ColumnsAndRowFiltersSection
+                    source={source}
+                    schema={schema}
+                    updateSchema={updateSchema}
+                    resyncSchema={resyncSchema}
+                    refreshSchemas={refreshSchemas}
+                    refreshingSchemas={refreshingSchemas}
+                    supportsRowFilters={supportsRowFilters}
+                />
+            )
+        case 'schedule':
+            return (
+                <ScheduleSection
+                    sourceId={sourceId}
+                    schema={schema}
+                    isProjectTime={isProjectTime}
+                    setIsProjectTime={setIsProjectTime}
+                />
+            )
+        case 'descriptions':
+            return <DescriptionsSection schema={schema} />
+        case 'danger-zone':
+            return (
+                <DangerZoneSection
+                    source={source}
+                    schema={schema}
+                    resyncSchema={resyncSchema}
+                    resyncingSchema={resyncingSchema}
+                    deleteTable={deleteTable}
+                    deleteHistoryTable={deleteHistoryTable}
+                />
+            )
+    }
+}
+
+function SectionHeader({ title, description }: { title: string; description?: string }): JSX.Element {
+    return (
+        <div className="mb-4">
+            <h2 className="text-base font-semibold mb-1">{title}</h2>
+            {description && <p className="text-sm text-secondary">{description}</p>}
+        </div>
+    )
+}
+
+interface FileUploadDetails {
+    fileName: string | null
+    onReplaceFile: () => void
+    replaceDisabledReason?: string
+}
+
+function DetailsSection({
+    schema,
+    servesLiveQueries,
+    setLiveQueryEnabled,
+    savingLiveQuery,
+    reloadSchema,
+    cancelSchema,
+    updateSchema,
+    onConfigureSyncMethod,
+    syncHistoryUrl,
+    fileUpload,
+}: {
+    schema: ExternalDataSourceSchema
+    servesLiveQueries: boolean
+    setLiveQueryEnabled: (enabled: boolean) => void
+    savingLiveQuery: boolean
+    reloadSchema: (schema: ExternalDataSourceSchema) => void
+    cancelSchema: (schema: ExternalDataSourceSchema) => void
+    updateSchema: (schema: ExternalDataSourceSchema) => void
+    onConfigureSyncMethod: () => void
+    syncHistoryUrl?: string
+    /** Set for a file upload schema, which refreshes by replacing its file and not by syncing. */
+    fileUpload?: FileUploadDetails
+}): JSX.Element {
+    const syncedTableName = schema.table?.hogql_name ?? schema.table?.name
+    const liveQueryOn = !schema.live_query_unavailable_reason && (schema.should_sync || !!schema.live_query_enabled)
+
+    return (
+        <div>
+            <SectionHeader
+                title="Details"
+                description={
+                    fileUpload
+                        ? 'See the current state of this table and replace the file it imports.'
+                        : 'Enable or disable syncing for this schema, see its current state, and trigger a sync on demand.'
+                }
+            />
+            <div className="border rounded p-4 bg-surface-primary flex flex-col gap-3">
+                {schema.incremental_sync_blocked && (
+                    <LemonBanner
+                        type="warning"
+                        action={{ children: 'Change sync method', onClick: onConfigureSyncMethod }}
+                    >
+                        {IncrementalSyncBlockedMessageMap[schema.incremental_sync_blocked]}
+                    </LemonBanner>
+                )}
+                {!fileUpload && (
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="flex flex-col">
+                            <span>Enabled</span>
+                            <span className="text-xs text-muted max-w-md">
+                                When enabled, this schema runs on the configured schedule and data is imported into
+                                PostHog. Disabling pauses all syncs — existing data stays in place but is not updated
+                                until you re-enable.
+                            </span>
+                        </div>
+                        <SchemaEditorAction schema={schema}>
+                            <LemonSwitch
+                                checked={schema.should_sync}
+                                label={schema.should_sync ? 'Syncing' : 'Disabled'}
+                                onChange={(active) => {
+                                    // A blocked table is not routed away here on purpose. An operator who fixed
+                                    // the duplicates or added the key at the source has to be able to turn the
+                                    // table back on themselves; the banner above says what the last run found.
+                                    if (active && !schema.sync_type) {
+                                        // No sync method saved yet — open the sync method section to set one up.
+                                        onConfigureSyncMethod()
+                                        return
+                                    }
+                                    if (!active && schema.sync_type === 'cdc') {
+                                        LemonDialog.open({
+                                            title: 'Disable CDC table?',
+                                            content: (
+                                                <div className="text-sm text-secondary space-y-2">
+                                                    <p>
+                                                        Disabling <strong>{schema.table?.name ?? schema.name}</strong>{' '}
+                                                        will remove it from the replication publication. Changes made
+                                                        while disabled will be permanently lost.
+                                                    </p>
+                                                    <p>
+                                                        Re-enabling this table will require a{' '}
+                                                        <strong>full resync</strong> to ensure data consistency.
+                                                    </p>
+                                                </div>
+                                            ),
+                                            primaryButton: {
+                                                children: 'Disable',
+                                                status: 'danger',
+                                                onClick: () => updateSchema({ ...schema, should_sync: false }),
+                                            },
+                                            secondaryButton: { children: 'Cancel', type: 'tertiary' },
+                                        })
+                                    } else if (!active && schema.sync_type === 'webhook') {
+                                        LemonDialog.open({
+                                            title: 'Disable webhook sync?',
+                                            description:
+                                                'Turning off this table will stop the webhook from consuming any more data. When you re-enable it, a full refresh sync will need to be completed to ensure no data is missing.',
+                                            primaryButton: {
+                                                children: 'Disable',
+                                                status: 'danger',
+                                                onClick: () => updateSchema({ ...schema, should_sync: false }),
+                                            },
+                                            secondaryButton: { children: 'Cancel' },
+                                        })
+                                    } else {
+                                        updateSchema({ ...schema, should_sync: active })
+                                    }
+                                }}
+                            />
+                        </SchemaEditorAction>
+                    </div>
+                )}
+                {servesLiveQueries && (
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="flex flex-col">
+                            <span>Live query</span>
+                            <span className="text-xs text-muted max-w-md">
+                                Query this table straight from your database without syncing it.
+                            </span>
+                        </div>
+                        <SchemaEditorAction schema={schema}>
+                            <LemonSwitch
+                                checked={liveQueryOn}
+                                label={liveQueryOn ? 'On' : 'Off'}
+                                disabledReason={
+                                    schema.live_query_unavailable_reason ??
+                                    (schema.should_sync ? 'Synced tables can always be queried live' : undefined)
+                                }
+                                loading={savingLiveQuery}
+                                onChange={setLiveQueryEnabled}
+                                data-attr="schema-live-query-switch"
+                            />
+                        </SchemaEditorAction>
+                    </div>
+                )}
+                {fileUpload && (
+                    <div className="flex items-center justify-between">
+                        <span className="text-muted">File</span>
+                        <span>{fileUpload.fileName ?? 'Unknown'}</span>
+                    </div>
+                )}
+                <div className="flex items-center justify-between">
+                    <span className="text-muted">Current status</span>
+                    {schema.status ? (
+                        <Tooltip title={schema.latest_error ?? undefined} interactive={!!schema.latest_error}>
+                            <LemonTag type={StatusTagSetting[schema.status] || 'default'}>{schema.status}</LemonTag>
+                        </Tooltip>
+                    ) : (
+                        <span className="text-muted">—</span>
+                    )}
+                </div>
+                <div className="flex items-center justify-between">
+                    <span className="text-muted">Last synced</span>
+                    {schema.last_synced_at ? (
+                        <TZLabel time={schema.last_synced_at} formatDate="MMM DD, YYYY" formatTime="HH:mm" />
+                    ) : (
+                        <span className="text-muted">Never</span>
+                    )}
+                </div>
+                <div className="flex items-center justify-between">
+                    <span className="text-muted">Row count</span>
+                    <span>{schema.table?.row_count?.toLocaleString() ?? '—'}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                    <span className="text-muted">Synced table</span>
+                    {schema.table && syncedTableName ? (
+                        <Link
+                            to={urls.sqlEditor({
+                                query: defaultQuery(syncedTableName, schema.table.columns).source.query,
+                            })}
+                            onClick={(event) => {
+                                event.preventDefault()
+                                newInternalTab(
+                                    urls.sqlEditor({
+                                        query: defaultQuery(syncedTableName, schema.table!.columns).source.query,
+                                    })
+                                )
+                            }}
+                        >
+                            <code>{syncedTableName}</code>
+                        </Link>
+                    ) : (
+                        <span className="text-muted">Not yet synced</span>
+                    )}
+                </div>
+            </div>
+            <div className="mt-4 flex gap-2 flex-wrap">
+                {fileUpload ? (
+                    <SchemaEditorAction schema={schema}>
+                        {({ disabledReason }) => (
+                            <LemonButton
+                                type="primary"
+                                onClick={fileUpload.onReplaceFile}
+                                disabledReason={disabledReason ?? fileUpload.replaceDisabledReason}
+                                data-attr="schema-replace-file"
+                            >
+                                Replace file
+                            </LemonButton>
+                        )}
+                    </SchemaEditorAction>
+                ) : (
+                    <SchemaEditorAction schema={schema}>
+                        {({ disabledReason }) => (
+                            <Tooltip
+                                title={
+                                    schema.sync_type === 'cdc'
+                                        ? 'Trigger a CDC extraction run now.'
+                                        : schema.incremental
+                                          ? 'Sync incremental data since the last run.'
+                                          : 'Sync all data.'
+                                }
+                            >
+                                <LemonButton
+                                    type="primary"
+                                    onClick={() => reloadSchema(schema)}
+                                    disabledReason={
+                                        disabledReason ??
+                                        (!schema.sync_type
+                                            ? 'Set up the sync method first'
+                                            : schema.status === 'Running'
+                                              ? 'A sync is already running'
+                                              : undefined)
+                                    }
+                                >
+                                    {schema.sync_type === 'cdc' ? 'Sync CDC now' : 'Sync now'}
+                                </LemonButton>
+                            </Tooltip>
+                        )}
+                    </SchemaEditorAction>
+                )}
+                {schema.status === 'Running' && (
+                    <SchemaEditorAction schema={schema}>
+                        {({ disabledReason }) => (
+                            <LemonButton
+                                type="secondary"
+                                status="danger"
+                                onClick={() => cancelSchema(schema)}
+                                disabledReason={disabledReason}
+                            >
+                                Cancel current sync
+                            </LemonButton>
+                        )}
+                    </SchemaEditorAction>
+                )}
+                {syncHistoryUrl && (
+                    <LemonButton type="secondary" to={syncHistoryUrl}>
+                        View sync history
+                    </LemonButton>
+                )}
+            </div>
+        </div>
+    )
+}
+
+function SyncMethodSection({ sourceId, schema }: { sourceId: string; schema: ExternalDataSourceSchema }): JSX.Element {
+    // Incremental fields + saving both go through schemaSceneLogic — deliberately NOT
+    // syncMethodModalLogic, which connects sourceManagementLogic and would mount + poll the full
+    // sources list (the heavy `external_data_sources` fetch this page is meant to avoid).
+    const logic = schemaSceneLogic({ sourceId, schemaId: schema.id })
+    const { schemaIncrementalFields, schemaIncrementalFieldsLoading, sourceSupportsCdc, source } = useValues(logic)
+    const { loadSchemaIncrementalFields, loadSchema, loadSourceConfig } = useActions(logic)
+
+    const formRef = useRef<SyncMethodFormHandle>(null)
+    const [saveDisabledReason, setSaveDisabledReason] = useState<string | undefined>()
+    const [saving, setSaving] = useState(false)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const { currentProjectId } = useValues(teamLogic)
+
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
+
+    // Load incremental fields only when the schema id changes. We intentionally exclude the kea
+    // action refs from the deps — if they aren't stable, the effect would re-fire on every parent
+    // re-render, reset `schemaIncrementalFields` to null, unmount the form, and blow away the
+    // user's in-progress radio/field selections.
+    useEffect(() => {
+        loadSchemaIncrementalFields(schema.id)
+        loadSourceConfig()
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [schema.id])
+
+    const loading = schemaIncrementalFieldsLoading || !schemaIncrementalFields
+
+    // Only offer these as merge keys when the source reported them. Without source metadata the API
+    // fills the list from the synced table instead, whose names went through the snake_case naming
+    // convention, so `createdAt` reads back as `created_at` and a key picked from it names a column
+    // the source query cannot resolve. That is also the state where the API accepts a keyless
+    // incremental switch, so there is no refusal left without a remedy.
+    const storedColumns: AvailableColumn[] = schema.source_column_metadata_available
+        ? (schema.available_columns ?? []).map((column) => ({
+              field: column.name,
+              label: column.name,
+              type: column.data_type ?? '',
+              nullable: column.is_nullable ?? false,
+          }))
+        : []
+
+    const persistSyncMethod = (
+        syncType: ExternalDataSourceSchema['sync_type'],
+        incrementalField: string | null,
+        incrementalFieldType: string | null,
+        primaryKeyColumns: string[] | null,
+        cdcTableMode?: 'consolidated' | 'cdc_only' | 'both',
+        incrementalFieldLookbackSeconds?: number | null
+    ): void => {
+        const noIncrementalField = syncType === 'full_refresh' || syncType === 'cdc' || syncType === 'xmin'
+
+        const applyUpdate = async ({
+            dropHistoryTable = false,
+            copyAccessRulesToHistory = false,
+        }: { dropHistoryTable?: boolean; copyAccessRulesToHistory?: boolean } = {}): Promise<void> => {
+            setSaving(true)
+            try {
+                const saved = await externalDataSchemasPartialUpdate(String(ApiConfig.getCurrentTeamId()), schema.id, {
+                    should_sync: true,
+                    sync_type: syncType,
+                    incremental_field: noIncrementalField ? null : incrementalField,
+                    // The form picks it from the field types this API returned.
+                    incremental_field_type: noIncrementalField
+                        ? null
+                        : (incrementalFieldType as IncrementalFieldTypeEnumApi | null),
+                    incremental_field_lookback_seconds:
+                        syncType === 'incremental' ? (incrementalFieldLookbackSeconds ?? null) : null,
+                    primary_key_columns:
+                        syncType === 'incremental' || syncType === 'cdc' || syncType === 'xmin'
+                            ? (primaryKeyColumns ?? null)
+                            : null,
+                    ...((syncType === 'cdc' || syncType === 'incremental') && cdcTableMode
+                        ? { cdc_table_mode: cdcTableMode }
+                        : {}),
+                    ...(dropHistoryTable ? { drop_history_table: true } : {}),
+                    ...(copyAccessRulesToHistory ? { copy_access_rules_to_history: true } : {}),
+                })
+                if (dropHistoryTable && saved.registered_history_table_name) {
+                    lemonToast.warning(
+                        `Sync method saved, but ${saved.registered_history_table_name} was kept. A sync was still running or its files couldn't be deleted. Delete it from the danger zone later.`
+                    )
+                } else {
+                    lemonToast.success(
+                        dropHistoryTable ? 'Sync method saved and history table deleted' : 'Sync method saved'
+                    )
+                }
+                loadSchema()
+            } catch (e: any) {
+                lemonToast.error(e?.message || "Can't save sync method at this time")
+            } finally {
+                setSaving(false)
+            }
+        }
+
+        // Asked after the xmin and self-managed confirmations, right before the save.
+        const askAboutHistoryThenApply = (): void => {
+            const table = schema.table
+            if (
+                table &&
+                currentProjectId &&
+                featureFlags[FEATURE_FLAGS.WAREHOUSE_HISTORY_ACCESS_RULES] &&
+                turnsHistoryOn(schema, syncType, cdcTableMode)
+            ) {
+                // Disables Save through the lookup and the dialog, so a second click can't send another update.
+                setSaving(true)
+                void confirmHistoryAccessRules(
+                    currentProjectId,
+                    table.id,
+                    (copy) => void applyUpdate({ copyAccessRulesToHistory: copy }),
+                    () => setSaving(false)
+                )
+                return
+            }
+            const historyTableName = schema.registered_history_table_name
+            if (!historyTableName || !stopsWritingHistory(schema, syncType, cdcTableMode)) {
+                void applyUpdate()
+                return
+            }
+            LemonDialog.open({
+                title: 'Delete the history table too?',
+                content: (
+                    <div className="text-sm text-secondary deprecated-space-y-2">
+                        <p>
+                            After this change, <strong>{historyTableName}</strong> stops recording new versions of each
+                            row.
+                        </p>
+                        <p>
+                            Delete it to remove the table, every past version in it, and the joins that use it. This
+                            can't be undone. Keep it to go on querying the versions recorded so far. You can delete it
+                            later from the danger zone.
+                        </p>
+                    </div>
+                ),
+                primaryButton: {
+                    children: 'Delete history table',
+                    status: 'danger',
+                    onClick: () => void applyUpdate({ dropHistoryTable: true }),
+                    'data-attr': 'schema-sync-method-delete-history-table',
+                },
+                secondaryButton: {
+                    children: 'Keep history table',
+                    type: 'secondary',
+                    onClick: () => void applyUpdate(),
+                    'data-attr': 'schema-sync-method-keep-history-table',
+                },
+            })
+        }
+
+        // Switching to or from xmin changes the table's physical schema (the `_ph_xmin` control
+        // column), so the backend rebuilds the table from scratch. Warn before discarding the data.
+        const crossesXminBoundary = syncType === 'xmin' || schema.sync_type === 'xmin'
+        if (crossesXminBoundary && syncType !== schema.sync_type && schema.last_synced_at) {
+            LemonDialog.open({
+                title: 'Switching sync method requires a full resync',
+                content: (
+                    <div className="text-sm text-secondary deprecated-space-y-2">
+                        <p>
+                            Switching <strong>{schema.table?.name ?? schema.name}</strong> from{' '}
+                            <strong>{SyncTypeLabelMap[schema.sync_type ?? 'full_refresh']}</strong> to{' '}
+                            <strong>{SyncTypeLabelMap[syncType ?? 'full_refresh']}</strong> changes the table's
+                            structure, so it will be deleted and resynced from scratch.
+                        </p>
+                        <p>The existing synced data is replaced. This can take a while for large tables.</p>
+                    </div>
+                ),
+                primaryButton: { children: 'Resync now', onClick: askAboutHistoryThenApply },
+                secondaryButton: { children: 'Cancel', type: 'tertiary' },
+            })
+            return
+        }
+
+        if (!schema.should_sync && schema.pending_self_managed_table) {
+            confirmPendingSelfManagedSync(1, askAboutHistoryThenApply)
+            return
+        }
+
+        askAboutHistoryThenApply()
+    }
+
+    return (
+        <div>
+            <SectionHeader
+                title="Sync method"
+                description="How this schema is synced from the source — incremental, full refresh, CDC, append, or webhook."
+            />
+            <div className="border rounded p-4 bg-surface-primary">
+                {loading && (
+                    <div className="deprecated-space-y-2">
+                        <LemonSkeleton className="w-1/2 h-4" />
+                        <LemonSkeleton.Row repeat={3} />
+                    </div>
+                )}
+                {!loading && schemaIncrementalFields && (
+                    <fieldset disabled={!!accessDisabledReason}>
+                        <SyncMethodForm
+                            ref={formRef}
+                            sourceType={source?.source_type}
+                            hideFooter
+                            onSaveDisabledReasonChange={setSaveDisabledReason}
+                            saveButtonIsLoading={saving}
+                            schema={{
+                                table: schema.name,
+                                should_sync: schema.should_sync,
+                                description: schema.description,
+                                should_sync_default: schema.should_sync_default ?? true,
+                                sync_type: schema.sync_type,
+                                sync_time_of_day: schema.sync_time_of_day ?? null,
+                                incremental_field: schema.incremental_field ?? null,
+                                incremental_field_type: schema.incremental_field_type ?? null,
+                                incremental_field_lookback_seconds: schema.incremental_field_lookback_seconds ?? null,
+                                incremental_available: schemaIncrementalFields.incremental_available,
+                                append_available: schemaIncrementalFields.append_available,
+                                cdc_available: schemaIncrementalFields.cdc_available,
+                                xmin_available: schemaIncrementalFields.xmin_available,
+                                incremental_history_available: schemaIncrementalFields.incremental_history_available,
+                                cdc_table_mode: schema.cdc_table_mode,
+                                incremental_fields: schemaIncrementalFields.incremental_fields,
+                                supports_webhooks: schemaIncrementalFields.supports_webhooks ?? false,
+                                primary_key_columns: schema.primary_key_columns ?? null,
+                                available_columns: storedColumns,
+                                detected_primary_keys: null,
+                            }}
+                            availableColumns={schemaIncrementalFields.available_columns ?? []}
+                            detectedPrimaryKeys={schemaIncrementalFields.detected_primary_keys ?? null}
+                            primaryKeyDetectionSupported={
+                                schemaIncrementalFields.primary_key_detection_supported ?? false
+                            }
+                            primaryKeyLocked={!!schema.table && !!schema.primary_key_columns?.length}
+                            sourceSupportsCdc={sourceSupportsCdc}
+                            sourceConfigurationUrl={urls.dataWarehouseSource(`managed-${sourceId}`, 'configuration')}
+                            onClose={() => {}}
+                            onSave={persistSyncMethod}
+                        />
+                    </fieldset>
+                )}
+            </div>
+            {!loading && schemaIncrementalFields && (
+                <div className="mt-4 flex justify-end">
+                    <LemonButton
+                        type="primary"
+                        loading={saving}
+                        disabledReason={accessDisabledReason ?? saveDisabledReason}
+                        onClick={() => formRef.current?.triggerSave()}
+                    >
+                        Save
+                    </LemonButton>
+                </div>
+            )}
+        </div>
+    )
+}
+
+function ApiVersionSection({
+    sourceId,
+    source,
+    schema,
+}: {
+    sourceId: string
+    source: SchemaSceneSource | null
+    schema: ExternalDataSourceSchema
+}): JSX.Element | null {
+    const { loadSchema, resyncSchema } = useActions(schemaSceneLogic({ sourceId, schemaId: schema.id }))
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
+
+    const supportedVersions = source?.supported_api_versions ?? []
+    const sourceVersion = source?.api_version
+
+    const [draftVersion, setDraftVersion] = useState<string | null>(schema.api_version ?? null)
+    const [saving, setSaving] = useState(false)
+
+    // Reset the draft when navigating to another schema or after a save reloads the server value.
+    useEffect(() => {
+        setDraftVersion(schema.api_version ?? null)
+    }, [schema.id, schema.api_version])
+
+    // A single supported version means an unversioned vendor (the framework's "v1" default) or
+    // nothing to choose between — hide the picker unless an override is already stored (so it can
+    // still be seen and cleared).
+    if (supportedVersions.length <= 1 && !schema.api_version) {
+        return null
+    }
+
+    const isWebhook = schema.sync_type === 'webhook'
+    const isDirty = (draftVersion ?? null) !== (schema.api_version ?? null)
+    const deprecation = schema.api_version_deprecation
+
+    const sourceVersionRetired = !!sourceVersion && !supportedVersions.includes(sourceVersion)
+    const options: LemonSelectOption<string | null>[] = [
+        {
+            value: null,
+            label: `Source default${sourceVersion ? ` (${sourceVersion}${sourceVersionRetired ? ', no longer supported' : ''})` : ''}`,
+        },
+        ...supportedVersions.map((version) => ({ value: version, label: version })),
+        // A stored override can outlive its version's removal from supported_versions — the backend
+        // keeps honoring it verbatim, so keep it visible here. Saving it again is blocked by
+        // validation; this entry exists so the current state is representable, not as a choice.
+        ...(schema.api_version && !supportedVersions.includes(schema.api_version)
+            ? [{ value: schema.api_version, label: `${schema.api_version} (no longer supported)` }]
+            : []),
+    ]
+
+    const persist = async (resyncAfter: boolean): Promise<void> => {
+        setSaving(true)
+        try {
+            await api.externalDataSchemas.update(schema.id, { api_version: draftVersion })
+            if (resyncAfter) {
+                resyncSchema(schema)
+                lemonToast.success('API version saved — full resync queued')
+            } else {
+                lemonToast.success('API version saved')
+            }
+            loadSchema()
+        } catch (e: any) {
+            lemonToast.error(e?.detail || e?.message || "Can't save API version at this time")
+        } finally {
+            setSaving(false)
+        }
+    }
+
+    const handleSave = (): void => {
+        // Only warn when there is synced data that could mix shapes with the new version.
+        if (!schema.last_synced_at) {
+            void persist(false)
+            return
+        }
+        const isRunning = schema.status === 'Running'
+        LemonDialog.open({
+            title: 'Change API version for already-synced data?',
+            content: (
+                <div className="text-sm text-secondary space-y-2">
+                    <p>
+                        <strong>{schema.table?.name ?? schema.name}</strong> already contains data synced with the
+                        previous API version. Vendors can rename or remove fields between versions, so future syncs may
+                        not line up with the existing rows. A full resync is recommended.
+                    </p>
+                    {isRunning && <p>The sync currently running will be canceled when you save.</p>}
+                </div>
+            ),
+            primaryButton: { children: 'Save and resync', onClick: () => void persist(true) },
+            secondaryButton: { children: 'Save only', onClick: () => void persist(false) },
+            tertiaryButton: { children: 'Cancel', type: 'tertiary' },
+        })
+    }
+
+    return (
+        <div>
+            <SectionHeader
+                title="Vendor API version"
+                description={`Which version of the ${
+                    source?.source_type ?? 'vendor'
+                } API this schema syncs with. Overriding pins this schema only — other schemas keep following the source's version, and version migrations never change an override.`}
+            />
+            {deprecation && (
+                <div className="mb-4">
+                    <ApiVersionDeprecationBanner
+                        sourceType={source?.source_type ?? 'vendor'}
+                        deprecation={deprecation}
+                        subject="This schema"
+                        cta={`Switch to version ${deprecation.default_version} before syncs stop working.`}
+                    />
+                </div>
+            )}
+            <div className="border rounded p-4 bg-surface-primary flex flex-col gap-1">
+                <span>API version override</span>
+                <span className="text-xs text-muted max-w-md">
+                    Only override this if the schema needs a specific vendor API version — for example to verify a new
+                    version on one table before moving the whole source.
+                </span>
+                <LemonSelect
+                    fullWidth
+                    disabledReason={
+                        accessDisabledReason ?? (isWebhook ? 'Not available for webhook-synced schemas' : undefined)
+                    }
+                    value={draftVersion}
+                    onChange={(value) => setDraftVersion(value)}
+                    options={options}
+                />
+            </div>
+            <div className="mt-4 flex justify-end">
+                <LemonButton
+                    type="primary"
+                    loading={saving}
+                    disabledReason={
+                        accessDisabledReason ??
+                        (isWebhook
+                            ? 'Not available for webhook-synced schemas'
+                            : !isDirty
+                              ? 'No changes to save'
+                              : undefined)
+                    }
+                    onClick={handleSave}
+                >
+                    Save
+                </LemonButton>
+            </div>
+        </div>
+    )
+}
+
+function ColumnsAndRowFiltersSection({
+    source,
+    schema,
+    updateSchema,
+    resyncSchema,
+    refreshSchemas,
+    refreshingSchemas,
+    supportsRowFilters,
+}: {
+    source: SchemaSceneSource | null
+    schema: ExternalDataSourceSchema
+    updateSchema: (schema: ExternalDataSourceSchema) => void
+    resyncSchema: (schema: ExternalDataSourceSchema) => void
+    refreshSchemas: () => void
+    refreshingSchemas: boolean
+    supportsRowFilters: boolean
+}): JSX.Element {
+    const available = schema.available_columns ?? []
+    const hasAvailableColumns = available.length > 0
+    const columnSelectionNeedsRefresh =
+        !!source?.requires_exact_column_metadata && schema.source_column_metadata_available === false
+
+    // Plain value, not the render-prop form of SchemaEditorAction: a fresh inline render-prop on
+    // every edit would remount the editors and wipe their drafts. See useSchemaEditorAccess's docstring.
+    const { disabledReason: editorDisabledReason } = useSchemaEditorAccess(schema)
+
+    // Both editors run in `hideActions` mode and report edits up here, so one Save commits both.
+    const [draftColumns, setDraftColumns] = useState<string[] | null>(schema.enabled_columns ?? null)
+    const [draftRowFilters, setDraftRowFilters] = useState<RowFilter[] | null>(schema.row_filters ?? null)
+    const [draftMasked, setDraftMasked] = useState<string[]>(schema.masked_columns ?? [])
+    const [saving, setSaving] = useState(false)
+
+    // Reset drafts on schema switch or when server values change (e.g. reload after save).
+    // Keyed on content so unrelated re-renders don't wipe edits.
+    useEffect(() => {
+        setDraftColumns(schema.enabled_columns ?? null)
+        setDraftRowFilters(schema.row_filters ?? null)
+        setDraftMasked(schema.masked_columns ?? [])
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [
+        schema.id,
+        JSON.stringify(schema.enabled_columns ?? null),
+        JSON.stringify(schema.row_filters ?? null),
+        JSON.stringify(schema.masked_columns ?? []),
+    ])
+
+    const alwaysRetained = new Set<string>([
+        ...(schema.primary_key_columns ?? []),
+        ...(schema.incremental_field ? [schema.incremental_field] : []),
+    ])
+    const syncedCount = draftColumns ? new Set([...draftColumns, ...alwaysRetained]).size : available.length
+    const columnsSummary = !draftColumns
+        ? `Syncing all ${available.length || 'discovered'} columns`
+        : `Syncing ${syncedCount} of ${available.length} columns`
+
+    const filterCount = draftRowFilters?.length ?? 0
+    const rowFiltersSummary =
+        filterCount === 0 ? 'Syncing all rows' : `${filterCount} ${filterCount === 1 ? 'filter' : 'filters'} active`
+
+    // A source that filters on a fixed set of columns lists them; other sources filter on any synced column.
+    const rowFilterColumns = schema.row_filter_columns ?? available
+    const rowFilterSchema = schema.row_filter_columns ? { ...schema, available_columns: rowFilterColumns } : schema
+    const rowFilterErrors = validateRowFilters(draftRowFilters ?? [], { availableColumns: rowFilterColumns })
+    const hasRowFilterErrors = Object.keys(rowFilterErrors).length > 0
+
+    const savedMasked = schema.masked_columns ?? []
+    const newlyMasked = draftMasked.filter((column) => !savedMasked.includes(column))
+    const unmasked = savedMasked.filter((column) => !draftMasked.includes(column))
+    const masksChanged = newlyMasked.length > 0 || unmasked.length > 0
+    const masksDeleteHistory = masksDropHistory(schema, newlyMasked)
+
+    const isDirty =
+        !sameColumns(draftColumns, schema.enabled_columns ?? null, available) ||
+        JSON.stringify(draftRowFilters ?? null) !== JSON.stringify(schema.row_filters ?? null) ||
+        masksChanged
+
+    const commit = (resyncAfter: boolean): void => {
+        // A second save would validate against the old masks and request another rebuild.
+        if (saving) {
+            return
+        }
+        const next = {
+            ...schema,
+            enabled_columns: draftColumns,
+            row_filters: draftRowFilters,
+            masked_columns: draftMasked,
+        }
+        if (resyncAfter || masksChanged) {
+            // Bypass the bulk-update debounce so resync reads the new config from the DB, not the
+            // stale one a still-queued PATCH hasn't written yet.
+            // The backend starts the resync itself when it saves a mask change, and it can refuse one.
+            setSaving(true)
+            void externalDataSchemasPartialUpdate(String(ApiConfig.getCurrentTeamId()), schema.id, {
+                enabled_columns: draftColumns,
+                row_filters: draftRowFilters,
+                // Unchanged masks stay out, so a column that left the source can't block the save.
+                ...(masksChanged ? { masked_columns: draftMasked } : {}),
+                ...(masksDeleteHistory ? { drop_history_table: true } : {}),
+            })
+                .then(() => {
+                    updateSchema(next)
+                    if (!masksChanged) {
+                        resyncSchema(next)
+                    }
+                    // The backend only stages the rebuild of a table that does not sync.
+                    lemonToast.success(
+                        !resyncAfter
+                            ? 'Saved'
+                            : masksChanged && !schema.should_sync
+                              ? 'Saved. The full resync starts when you turn syncing on.'
+                              : 'Saved — full resync queued'
+                    )
+                })
+                .catch((e: any) => {
+                    lemonToast.error(e?.message || "Can't save at this time")
+                })
+                .finally(() => setSaving(false))
+            return
+        }
+        updateSchema(next)
+        lemonToast.success('Saved')
+    }
+
+    const handleSave = (): void => {
+        const syncType = schema.sync_type
+
+        // A mask change also cancels and restarts a running first sync, which has no last_synced_at yet.
+        const isRunning = schema.status === 'Running'
+        if (masksChanged && (!!schema.last_synced_at || isRunning || masksDeleteHistory)) {
+            LemonDialog.open({
+                title: 'Changing masked columns starts a full resync',
+                description: (
+                    <div className="flex flex-col gap-2">
+                        <span>
+                            The table is rebuilt from the source, because rows that are already synced can't be masked
+                            or unmasked in place. A masked column no longer matches the same values in tables where it
+                            isn't masked.
+                        </span>
+                        {isRunning && syncType !== 'cdc' && (
+                            <span>The sync currently running will be canceled when you save.</span>
+                        )}
+                        {masksDeleteHistory && (
+                            <span>
+                                {writesHistoryTable(schema.sync_type, schema.cdc_table_mode) ? (
+                                    <>
+                                        Masking also deletes everything in the history table{' '}
+                                        <code>{schema.registered_history_table_name}</code>, because its past versions
+                                        keep the unmasked values. Its history is lost and can't be restored. The table
+                                        and its access rules stay, and the rebuild fills it again with the column
+                                        masked.
+                                    </>
+                                ) : (
+                                    <>
+                                        Masking also deletes the history table{' '}
+                                        <code>{schema.registered_history_table_name}</code>, because its past versions
+                                        keep the unmasked values. Its history is lost and can't be restored.
+                                    </>
+                                )}
+                            </span>
+                        )}
+                        {newlyMasked.length > 0 && newlyMasked.length <= 6 && (
+                            <span className="text-xs text-muted">
+                                Masking: {newlyMasked.map((c) => `"${c}"`).join(', ')}
+                            </span>
+                        )}
+                        {unmasked.length > 0 && unmasked.length <= 6 && (
+                            <span className="text-xs text-muted">
+                                Unmasking: {unmasked.map((c) => `"${c}"`).join(', ')}
+                            </span>
+                        )}
+                    </div>
+                ),
+                primaryButton: {
+                    children: 'Save and resync',
+                    onClick: () => commit(true),
+                },
+                secondaryButton: { children: 'Cancel' },
+            })
+            return
+        }
+
+        const added = getAddedColumns(schema.enabled_columns ?? null, draftColumns, available)
+        const requiresPrompt =
+            !!schema.last_synced_at &&
+            (syncType === 'incremental' || syncType === 'append' || syncType === 'cdc') &&
+            added.length > 0
+
+        if (!requiresPrompt) {
+            commit(false)
+            return
+        }
+
+        LemonDialog.open({
+            title: 'New columns added to a partial-sync table',
+            description: (
+                <div className="flex flex-col gap-2">
+                    <span>
+                        You added {added.length === 1 ? '1 column' : `${added.length} columns`} to a{' '}
+                        <code>{syncType}</code> table. Existing rows will be backfilled with <code>NULL</code> for the
+                        new column(s) unless you full-resync the table.
+                    </span>
+                    {added.length <= 6 && (
+                        <span className="text-xs text-muted">Added: {added.map((c) => `"${c}"`).join(', ')}</span>
+                    )}
+                </div>
+            ),
+            primaryButton: { children: 'Full resync now', onClick: () => commit(true) },
+            secondaryButton: { children: 'Sync forward only', onClick: () => commit(false) },
+        })
+    }
+
+    return (
+        <div className="flex flex-col gap-6">
+            <div>
+                <SectionHeader
+                    title="Columns"
+                    description="Choose which columns from this table get synced, and mask sensitive ones to replace their values with a one-way hash. Primary keys and the active incremental field are always synced and can't be masked."
+                />
+                <div className="border rounded p-4 bg-surface-primary flex flex-col gap-3">
+                    {!hasAvailableColumns || columnSelectionNeedsRefresh ? (
+                        <div className="flex flex-col items-center gap-2 text-center text-muted-alt py-6">
+                            <span className="text-sm">
+                                {columnSelectionNeedsRefresh
+                                    ? 'Pull the latest source schema before changing columns. Existing synced columns remain available under Descriptions.'
+                                    : !schema.last_synced_at
+                                      ? 'No columns discovered yet for this schema — they will appear after the first successful sync.'
+                                      : 'No columns discovered yet for this schema.'}
+                            </span>
+                            {source?.supports_table_discovery !== false && (
+                                <SchemaEditorAction schema={schema}>
+                                    <LemonButton
+                                        type="secondary"
+                                        size="small"
+                                        loading={refreshingSchemas}
+                                        onClick={() => refreshSchemas()}
+                                    >
+                                        Pull new schemas
+                                    </LemonButton>
+                                </SchemaEditorAction>
+                            )}
+                        </div>
+                    ) : (
+                        <>
+                            <span className="text-sm text-secondary">
+                                {columnsSummary}
+                                {draftMasked.length > 0 && `, ${draftMasked.length} masked`}
+                            </span>
+                            <fieldset disabled={!!editorDisabledReason}>
+                                <ColumnSelectionPicker
+                                    hideActions
+                                    enableMasking={source?.access_method !== 'direct'}
+                                    schema={schema}
+                                    onChange={setDraftColumns}
+                                    onMaskedChange={setDraftMasked}
+                                />
+                            </fieldset>
+                        </>
+                    )}
+                </div>
+            </div>
+
+            {supportsRowFilters &&
+                source?.access_method !== 'direct' &&
+                schema.sync_type !== 'cdc' &&
+                schema.row_filter_columns?.length !== 0 && (
+                    <div>
+                        <SectionHeader
+                            title="Row filters"
+                            description="Sync only rows that match these conditions. Filters are ANDed together and applied on the next sync — they don't remove rows already synced."
+                        />
+                        <div className="border rounded p-4 bg-surface-primary flex flex-col gap-3">
+                            {!schema.row_filter_columns && (!hasAvailableColumns || columnSelectionNeedsRefresh) ? (
+                                <div className="text-sm text-muted-alt py-2 text-center">
+                                    No columns discovered yet — pull schemas from the Columns section above to add row
+                                    filters.
+                                </div>
+                            ) : (
+                                <>
+                                    <span className="text-sm text-secondary">{rowFiltersSummary}</span>
+                                    <fieldset disabled={!!editorDisabledReason}>
+                                        <RowFilterEditor
+                                            hideActions
+                                            schema={rowFilterSchema}
+                                            onChange={setDraftRowFilters}
+                                        />
+                                    </fieldset>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+            {(hasAvailableColumns || !!schema.row_filter_columns?.length) && (
+                <div className="flex justify-end">
+                    <LemonButton
+                        type="primary"
+                        onClick={handleSave}
+                        loading={saving}
+                        disabledReason={
+                            editorDisabledReason ??
+                            (hasRowFilterErrors
+                                ? 'Fix the highlighted row filters first'
+                                : !isDirty
+                                  ? 'No changes to save'
+                                  : undefined)
+                        }
+                    >
+                        Save
+                    </LemonButton>
+                </div>
+            )}
+        </div>
+    )
+}
+
+const SCHEDULED_FULL_REFRESH_SYNC_TYPES: ExternalDataSourceSchema['sync_type'][] = ['incremental', 'append', 'xmin']
+const MAX_FULL_REFRESH_INTERVAL_DAYS = 90
+// A full refresh runs on a scheduled sync, so it cannot come around more often than the table syncs.
+const MIN_FULL_REFRESH_DAYS_BY_FREQUENCY: Partial<Record<DataWarehouseSyncInterval, number>> = {
+    '7day': 7,
+    '30day': 30,
+}
+
+type ScheduleSectionSchema = ExternalDataSourceSchema &
+    Partial<
+        Pick<ExternalDataSchemaApi, 'full_refresh_interval_days' | 'full_refresh_time_of_day' | 'next_full_refresh_at'>
+    >
+
+function utcTimeToDisplayTime(utcTime: string, isProjectTime: boolean, timezone: string): string {
+    return isProjectTime
+        ? dayjs
+              .utc(`${dayjs().format('YYYY-MM-DD')}T${utcTime}`)
+              .tz(timezone)
+              .format('HH:mm:00')
+        : utcTime
+}
+
+function displayTimeToUtcTime(displayTime: string, isProjectTime: boolean, timezone: string): string {
+    // dayjs.tz(str, zone) interprets the wall-clock time in the project
+    // timezone; plain dayjs(str) would parse it in the browser's timezone.
+    return isProjectTime
+        ? dayjs
+              .tz(`${dayjs().format('YYYY-MM-DD')}T${displayTime}`, timezone)
+              .utc()
+              .format('HH:mm:00')
+        : displayTime
+}
+
+function fullRefreshDaysError(days: number | null, frequency: DataWarehouseSyncInterval): string | null {
+    if (days === null) {
+        return null
+    }
+    if (!Number.isInteger(days) || days < 1 || days > MAX_FULL_REFRESH_INTERVAL_DAYS) {
+        return `Enter a whole number of days from 1 to ${MAX_FULL_REFRESH_INTERVAL_DAYS}, or leave it empty`
+    }
+    const minDays = MIN_FULL_REFRESH_DAYS_BY_FREQUENCY[frequency]
+    if (minDays !== undefined && days < minDays) {
+        return `A full refresh runs on a scheduled sync, so enter at least ${minDays} days, or sync more often`
+    }
+    return null
+}
+
+function ScheduleSection({
+    sourceId,
+    schema,
+    isProjectTime,
+    setIsProjectTime,
+}: {
+    sourceId: string
+    schema: ScheduleSectionSchema
+    isProjectTime: boolean
+    setIsProjectTime: (v: boolean) => void
+}): JSX.Element {
+    const { loadSchema } = useActions(schemaSceneLogic({ sourceId, schemaId: schema.id }))
+    const isCdc = schema.sync_type === 'cdc'
+    const supportsScheduledFullRefresh = SCHEDULED_FULL_REFRESH_SYNC_TYPES.includes(schema.sync_type)
+    const frequencyOptions: LemonSelectOption<DataWarehouseSyncInterval>[] = (
+        isCdc ? allowedCdcSyncFrequencies() : allowedSyncFrequencies()
+    ).map((value) => ({
+        value,
+        label: SyncFrequencyLabelMap[value],
+    }))
+
+    const [draftFrequency, setDraftFrequency] = useState<DataWarehouseSyncInterval>(
+        schema.sync_frequency || (isCdc ? '5min' : '6hour')
+    )
+    const [draftSyncTimeOfDay, setDraftSyncTimeOfDay] = useState<string | null>(schema.sync_time_of_day ?? null)
+    const [draftFullRefreshDays, setDraftFullRefreshDays] = useState<number | null>(
+        schema.full_refresh_interval_days ?? null
+    )
+    const [draftFullRefreshTime, setDraftFullRefreshTime] = useState<string | null>(
+        schema.full_refresh_time_of_day ?? null
+    )
+    const [saving, setSaving] = useState(false)
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
+
+    const serverFrequency = schema.sync_frequency || (isCdc ? '5min' : '6hour')
+    const serverSyncTimeOfDay = schema.sync_time_of_day ?? null
+    const serverFullRefreshDays = schema.full_refresh_interval_days ?? null
+    const serverFullRefreshTime = schema.full_refresh_time_of_day ?? null
+
+    // Reset the draft when the user navigates to a different schema or when the server values
+    // change (e.g. after the sync type switches between CDC and non-CDC, which flips the default
+    // frequency).
+    useEffect(() => {
+        setDraftFrequency(serverFrequency)
+        setDraftSyncTimeOfDay(serverSyncTimeOfDay)
+        setDraftFullRefreshDays(serverFullRefreshDays)
+        setDraftFullRefreshTime(serverFullRefreshTime)
+    }, [schema.id, serverFrequency, serverSyncTimeOfDay, serverFullRefreshDays, serverFullRefreshTime])
+
+    const isFullRefreshDraftSaved =
+        draftFullRefreshDays === serverFullRefreshDays && draftFullRefreshTime === serverFullRefreshTime
+    const isDirty =
+        draftFrequency !== serverFrequency || draftSyncTimeOfDay !== serverSyncTimeOfDay || !isFullRefreshDraftSaved
+    const fullRefreshError = supportsScheduledFullRefresh
+        ? fullRefreshDaysError(draftFullRefreshDays, draftFrequency)
+        : null
+
+    const handleSave = async (): Promise<void> => {
+        setSaving(true)
+        try {
+            await externalDataSourcesBulkUpdateSchemasPartialUpdate(String(ApiConfig.getCurrentTeamId()), sourceId, {
+                schemas: [
+                    {
+                        id: schema.id,
+                        should_sync: schema.should_sync,
+                        sync_type: schema.sync_type,
+                        incremental_field: schema.incremental_field,
+                        incremental_field_type: schema.incremental_field_type,
+                        sync_frequency: draftFrequency,
+                        sync_time_of_day: draftSyncTimeOfDay,
+                        cdc_table_mode: schema.cdc_table_mode,
+                        ...(supportsScheduledFullRefresh
+                            ? {
+                                  full_refresh_interval_days: draftFullRefreshDays,
+                                  full_refresh_time_of_day: draftFullRefreshTime,
+                              }
+                            : {}),
+                    },
+                ],
+            })
+            lemonToast.success('Schedule saved')
+            loadSchema()
+        } catch (e: any) {
+            lemonToast.error(e?.message || "Can't save schedule at this time")
+        } finally {
+            setSaving(false)
+        }
+    }
+
+    return (
+        <div>
+            <SectionHeader
+                title="Schedule"
+                description="Configure how often this schema is synced. Changes are only applied when you click Save."
+            />
+            <div className="border rounded p-4 bg-surface-primary flex flex-col gap-4">
+                <div className="flex flex-col gap-1">
+                    <span>Sync frequency</span>
+                    <span className="text-xs text-muted max-w-md">
+                        {isCdc
+                            ? 'How often PostHog loads the changes it captured for this table. Shorter intervals mean fresher data.'
+                            : 'How often PostHog pulls new data from the source. Shorter intervals mean fresher data but more load on the source database.'}
+                    </span>
+                    <LemonSelect
+                        fullWidth
+                        disabledReason={accessDisabledReason}
+                        value={draftFrequency}
+                        onChange={(value) => setDraftFrequency(value as DataWarehouseSyncInterval)}
+                        options={frequencyOptions}
+                    />
+                </div>
+                <AnchorTimeField
+                    schema={schema}
+                    draftFrequency={draftFrequency}
+                    draftSyncTimeOfDay={draftSyncTimeOfDay}
+                    setDraftSyncTimeOfDay={setDraftSyncTimeOfDay}
+                    isProjectTime={isProjectTime}
+                    setIsProjectTime={setIsProjectTime}
+                />
+                {supportsScheduledFullRefresh && (
+                    <FullRefreshIntervalField
+                        schema={schema}
+                        draftFullRefreshDays={draftFullRefreshDays}
+                        setDraftFullRefreshDays={setDraftFullRefreshDays}
+                        draftFullRefreshTime={draftFullRefreshTime}
+                        setDraftFullRefreshTime={setDraftFullRefreshTime}
+                        isProjectTime={isProjectTime}
+                        isDraftSaved={isFullRefreshDraftSaved}
+                    />
+                )}
+            </div>
+            <div className="mt-4 flex justify-end">
+                <LemonButton
+                    type="primary"
+                    loading={saving}
+                    onClick={handleSave}
+                    disabledReason={accessDisabledReason ?? (!isDirty ? 'No changes to save' : fullRefreshError)}
+                >
+                    Save
+                </LemonButton>
+            </div>
+        </div>
+    )
+}
+
+function FullRefreshIntervalField({
+    schema,
+    draftFullRefreshDays,
+    setDraftFullRefreshDays,
+    draftFullRefreshTime,
+    setDraftFullRefreshTime,
+    isProjectTime,
+    isDraftSaved,
+}: {
+    schema: ScheduleSectionSchema
+    draftFullRefreshDays: number | null
+    setDraftFullRefreshDays: (value: number | null) => void
+    draftFullRefreshTime: string | null
+    setDraftFullRefreshTime: (value: string | null) => void
+    isProjectTime: boolean
+    isDraftSaved: boolean
+}): JSX.Element {
+    const { currentTeam } = useValues(teamLogic)
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
+    const timezone = currentTeam?.timezone || 'UTC'
+    const isTimeSet = draftFullRefreshTime !== null
+    const timeDisabledReason =
+        accessDisabledReason ?? (draftFullRefreshDays === null ? 'Enter the number of days first' : undefined)
+
+    return (
+        <div className="flex flex-col gap-1">
+            <span>Scheduled full refresh</span>
+            <span className="text-xs text-muted max-w-md">
+                Re-import every row of the table on this cadence, so rows deleted at the source are removed. The refresh
+                runs on a scheduled sync, and queries keep showing the current rows until it finishes. Re-imported rows
+                count toward your usage. Leave it empty to turn it off.
+                {schema.sync_type === 'append' && (
+                    <span>
+                        {' '}
+                        For append only tables, a refresh replaces the rows collected so far with the rows the source
+                        has now.
+                    </span>
+                )}
+            </span>
+            <div className="flex items-center gap-2">
+                <LemonInput
+                    type="number"
+                    min={1}
+                    max={MAX_FULL_REFRESH_INTERVAL_DAYS}
+                    value={draftFullRefreshDays ?? NaN}
+                    onChange={(value) => {
+                        const days = value === undefined || Number.isNaN(value) ? null : value
+                        setDraftFullRefreshDays(days)
+                        if (days === null) {
+                            setDraftFullRefreshTime(null)
+                        }
+                    }}
+                    placeholder="Off"
+                    className="w-24"
+                    disabledReason={accessDisabledReason}
+                    data-attr="schema-full-refresh-interval-days"
+                />
+                <span>days</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+                <LemonSwitch
+                    label="At a set time"
+                    checked={isTimeSet}
+                    disabledReason={timeDisabledReason}
+                    onChange={(checked) => setDraftFullRefreshTime(checked ? '00:00:00' : null)}
+                    data-attr="schema-full-refresh-time-toggle"
+                />
+                <LemonInput
+                    type="time"
+                    className="w-32"
+                    disabledReason={timeDisabledReason ?? (!isTimeSet ? 'Turn on "At a set time" first' : undefined)}
+                    value={
+                        isTimeSet
+                            ? utcTimeToDisplayTime(draftFullRefreshTime, isProjectTime, timezone).substring(0, 5)
+                            : undefined
+                    }
+                    onChange={(value) =>
+                        setDraftFullRefreshTime(
+                            value ? displayTimeToUtcTime(`${value}:00`, isProjectTime, timezone) : null
+                        )
+                    }
+                    data-attr="schema-full-refresh-time"
+                />
+                <span className="text-xs text-muted">{isProjectTime ? timezone : 'UTC'}</span>
+            </div>
+            <span className="text-xs text-muted max-w-md">
+                Set a time to keep refreshes outside working hours. The refresh runs with the first sync near or after
+                that time, which can be hours later for a table that syncs every few hours. The time is saved in UTC, so
+                it does not follow daylight saving changes.
+            </span>
+            {schema.next_full_refresh_at && isDraftSaved && (
+                <span className="text-xs text-muted">
+                    Next full refresh:{' '}
+                    <TZLabel time={schema.next_full_refresh_at} formatDate="MMM DD, YYYY" formatTime="HH:mm" />
+                </span>
+            )}
+            {draftFullRefreshDays !== null && (
+                <LemonBanner type="warning" className="max-w-md">
+                    If workflows or destinations run on new rows of this table, each full refresh runs them again for
+                    every row.
+                </LemonBanner>
+            )}
+        </div>
+    )
+}
+
+function AnchorTimeField({
+    schema,
+    draftFrequency,
+    draftSyncTimeOfDay,
+    setDraftSyncTimeOfDay,
+    isProjectTime,
+    setIsProjectTime,
+}: {
+    schema: ExternalDataSourceSchema
+    draftFrequency: DataWarehouseSyncInterval
+    draftSyncTimeOfDay: string | null
+    setDraftSyncTimeOfDay: (value: string | null) => void
+    isProjectTime: boolean
+    setIsProjectTime: (v: boolean) => void
+}): JSX.Element {
+    const { currentTeam } = useValues(teamLogic)
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
+
+    const isSyncTimeSet = draftSyncTimeOfDay !== null
+    const utcTime = draftSyncTimeOfDay || '00:00:00'
+    const localTime = utcTimeToDisplayTime(utcTime, isProjectTime, currentTeam?.timezone || 'UTC')
+
+    const disabledReasonForInput = useCallback((): string | undefined => {
+        if (!schema.should_sync && !isSyncTimeSet) {
+            return 'Enable syncing and anchor times to set anchor time'
+        }
+
+        if (!schema.should_sync) {
+            return 'Enable syncing to set anchor time'
+        }
+
+        if (!isSyncTimeSet) {
+            return 'Enable anchor times to set anchor time'
+        }
+
+        if (['1min', '5min', '15min', '30min', '1hour'].indexOf(draftFrequency) !== -1) {
+            return 'Anchor time does not apply to sync intervals one hour or less'
+        }
+        return undefined
+    }, [isSyncTimeSet, schema.should_sync, draftFrequency])
+
+    return (
+        <div className="flex flex-col gap-1">
+            <div className="flex items-start justify-between gap-4">
+                <div className="flex flex-col">
+                    <span>
+                        Anchor time
+                        {(currentTeam?.timezone === 'UTC' || currentTeam?.timezone === 'GMT') && (
+                            <span className="text-muted"> (UTC)</span>
+                        )}
+                    </span>
+                    <span className="text-xs text-muted max-w-md">
+                        Pin the sync schedule so runs start at a predictable time each day (useful for coordinating with
+                        downstream jobs). Only applies to intervals longer than one hour.
+                    </span>
+                </div>
+                {currentTeam?.timezone !== 'UTC' && currentTeam?.timezone !== 'GMT' && (
+                    <div className="flex items-center gap-1 text-xs shrink-0">
+                        <span>UTC</span>
+                        <LemonSwitch size="xsmall" checked={isProjectTime} onChange={setIsProjectTime} />
+                        <span>{currentTeam?.timezone || 'UTC'}</span>
+                    </div>
+                )}
+            </div>
+            <div className="flex items-center gap-2">
+                <LemonSwitch
+                    checked={isSyncTimeSet}
+                    disabledReason={
+                        accessDisabledReason ?? (!schema.should_sync ? 'Enable syncing to set anchor time' : undefined)
+                    }
+                    onChange={(checked) => {
+                        setDraftSyncTimeOfDay(checked ? utcTime : null)
+                    }}
+                />
+                <LemonInput
+                    className="flex-1"
+                    type="time"
+                    disabledReason={accessDisabledReason ?? disabledReasonForInput()}
+                    value={isSyncTimeSet ? localTime.substring(0, 5) : undefined}
+                    onChange={(value) => {
+                        setDraftSyncTimeOfDay(
+                            displayTimeToUtcTime(`${value}:00`, isProjectTime, currentTeam?.timezone || 'UTC')
+                        )
+                    }}
+                    suffix={
+                        isSyncTimeSet && schema.should_sync ? (
+                            <Tooltip title={syncAnchorIntervalToHumanReadable(utcTime, draftFrequency)}>
+                                <IconInfo className="text-muted-alt" />
+                            </Tooltip>
+                        ) : undefined
+                    }
+                />
+            </div>
+        </div>
+    )
+}
+
+function DangerZoneSection({
+    source,
+    schema,
+    resyncSchema,
+    resyncingSchema,
+    deleteTable,
+    deleteHistoryTable,
+}: {
+    source: ExternalDataSource | null
+    schema: ExternalDataSourceSchema
+    resyncSchema: (schema: ExternalDataSourceSchema) => void
+    resyncingSchema: boolean
+    deleteTable: (schema: ExternalDataSourceSchema) => void
+    deleteHistoryTable: (schema: ExternalDataSourceSchema) => void
+}): JSX.Element {
+    const hasFullCdcResync = schema.sync_type === 'cdc'
+    const hasDeleteAndResync = schema.incremental || schema.sync_type === 'webhook' || schema.sync_type === 'xmin'
+    const canDeleteTable = !!schema.table
+    const retiredHistoryTableName = writesHistoryTable(schema.sync_type, schema.cdc_table_mode)
+        ? null
+        : schema.registered_history_table_name
+
+    if (!hasFullCdcResync && !hasDeleteAndResync && !canDeleteTable && !retiredHistoryTableName) {
+        return (
+            <div>
+                <SectionHeader title="Danger zone" />
+                <div className="border border-dashed rounded p-4 bg-surface-primary text-muted">
+                    No destructive actions are available for this schema yet.
+                </div>
+            </div>
+        )
+    }
+
+    return (
+        <div>
+            <SectionHeader
+                title="Danger zone"
+                description="Destructive actions that rebuild or remove data. Use only if you understand the impact."
+            />
+            <div className="border border-danger/40 rounded p-4 bg-surface-primary flex flex-col gap-2">
+                <SchemaEditorAction schema={schema}>
+                    {({ disabledReason }) => (
+                        <>
+                            {hasFullCdcResync && (
+                                <Tooltip title="Re-snapshot the full table and replay all CDC changes on top. Use this to recover from a corrupted or out-of-sync table.">
+                                    <LemonButton
+                                        type="secondary"
+                                        status="danger"
+                                        onClick={() => {
+                                            LemonDialog.open({
+                                                title: 'Full resync — all existing data will be replaced',
+                                                content: (
+                                                    <div className="text-sm text-secondary space-y-2">
+                                                        <p>
+                                                            This will re-snapshot the entire table from the source
+                                                            database. All rows currently in the{' '}
+                                                            <strong>{schema.table?.name ?? schema.name}</strong> table
+                                                            will be replaced with the new snapshot.
+                                                        </p>
+                                                        {schema.history_table_name && (
+                                                            <p>
+                                                                The <strong>{schema.history_table_name}</strong> history
+                                                                table will also be reset — all change history will be
+                                                                lost and replaced with the new snapshot as the starting
+                                                                point.
+                                                            </p>
+                                                        )}
+                                                    </div>
+                                                ),
+                                                primaryButton: {
+                                                    children: 'Full resync',
+                                                    status: 'danger',
+                                                    onClick: () => resyncSchema(schema),
+                                                },
+                                                secondaryButton: { children: 'Cancel', type: 'tertiary' },
+                                            })
+                                        }}
+                                        loading={resyncingSchema}
+                                        disabledReason={disabledReason}
+                                    >
+                                        Full resync
+                                    </LemonButton>
+                                </Tooltip>
+                            )}
+                            {hasDeleteAndResync && (
+                                <Tooltip title="Completely resync data by deleting the existing table and re-importing. Only recommended if there is an issue with data quality in previously imported data.">
+                                    <LemonButton
+                                        type="secondary"
+                                        status="danger"
+                                        onClick={() => resyncSchema(schema)}
+                                        loading={resyncingSchema}
+                                        disabledReason={disabledReason}
+                                    >
+                                        Delete table and resync
+                                    </LemonButton>
+                                </Tooltip>
+                            )}
+                            {canDeleteTable && (
+                                <Tooltip
+                                    title={`Delete this table from PostHog. ${
+                                        source?.source_type
+                                            ? `This will not delete the data in ${source.source_type}`
+                                            : ''
+                                    }`}
+                                >
+                                    <LemonButton
+                                        type="secondary"
+                                        status="danger"
+                                        onClick={() => {
+                                            LemonDialog.open({
+                                                title: `Delete ${schema.table?.name ?? schema.name} from PostHog?`,
+                                                description: `This also turns off syncing for the table.${
+                                                    source?.source_type
+                                                        ? ` The data in ${source.source_type} will not be touched.`
+                                                        : ''
+                                                }`,
+                                                primaryButton: {
+                                                    children: 'Delete',
+                                                    status: 'danger',
+                                                    onClick: () => deleteTable(schema),
+                                                },
+                                                secondaryButton: { children: 'Cancel', type: 'tertiary' },
+                                            })
+                                        }}
+                                        disabledReason={disabledReason}
+                                    >
+                                        Delete table from PostHog
+                                    </LemonButton>
+                                </Tooltip>
+                            )}
+                            {retiredHistoryTableName && (
+                                <Tooltip title="Delete the history table this table no longer writes, with every past version of each row in it.">
+                                    <LemonButton
+                                        type="secondary"
+                                        status="danger"
+                                        data-attr="schema-delete-history-table"
+                                        onClick={() => {
+                                            LemonDialog.open({
+                                                title: `Delete ${retiredHistoryTableName}?`,
+                                                description:
+                                                    "This deletes the history table, every past version of each row in it, and the joins that use it. This can't be undone.",
+                                                primaryButton: {
+                                                    children: 'Delete history table',
+                                                    status: 'danger',
+                                                    onClick: () => deleteHistoryTable(schema),
+                                                },
+                                                secondaryButton: { children: 'Cancel', type: 'tertiary' },
+                                            })
+                                        }}
+                                        disabledReason={disabledReason}
+                                    >
+                                        Delete history table
+                                    </LemonButton>
+                                </Tooltip>
+                            )}
+                        </>
+                    )}
+                </SchemaEditorAction>
+            </div>
+        </div>
+    )
+}
+
+const DESCRIPTION_SOURCE_LABELS: Record<string, string> = {
+    native_comment: 'From source',
+    ai_generated: 'AI generated',
+    user_edited: 'Edited',
+}
+
+function DescriptionSourceTag({ source }: { source?: string }): JSX.Element | null {
+    if (!source) {
+        return null
+    }
+    return (
+        <LemonTag type={source === 'user_edited' ? 'success' : 'muted'} size="small">
+            {DESCRIPTION_SOURCE_LABELS[source] ?? source}
+        </LemonTag>
+    )
+}
+
+function DescriptionRow({
+    columnName,
+    label,
+    dataType,
+    description,
+    source,
+    saving,
+    onSave,
+    disabledReason,
+}: {
+    columnName: string
+    label: string
+    dataType?: string
+    description: string
+    source?: string
+    saving: boolean
+    onSave: (columnName: string, description: string) => void
+    disabledReason?: string
+}): JSX.Element {
+    const [value, setValue] = useState(description)
+    // Keep local state in sync when the annotation reloads (e.g. after a save or AI enrichment).
+    useEffect(() => setValue(description), [description])
+    const dirty = value !== description
+
+    return (
+        <div className="flex items-center gap-2 py-1.5 border-b border-border last:border-b-0">
+            <div className="w-1/4 min-w-0">
+                <code className="text-xs">{label}</code>
+                {dataType && <span className="text-muted text-xs ml-2">{dataType}</span>}
+            </div>
+            <LemonInput
+                className="flex-1"
+                size="small"
+                value={value}
+                onChange={setValue}
+                placeholder="Describe what this means…"
+                onPressEnter={() => dirty && onSave(columnName, value)}
+                disabled={!!disabledReason}
+            />
+            <DescriptionSourceTag source={source} />
+            <LemonButton
+                size="small"
+                type="secondary"
+                onClick={() => onSave(columnName, value)}
+                loading={saving}
+                disabledReason={disabledReason ?? (!dirty ? 'No changes to save' : undefined)}
+            >
+                Save
+            </LemonButton>
+        </div>
+    )
+}
+
+function DescriptionsSection({ schema }: { schema: ExternalDataSourceSchema }): JSX.Element {
+    const tableId = schema.table?.id
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
+
+    if (!tableId) {
+        return (
+            <div>
+                <SectionHeader title="Descriptions" />
+                <div className="border border-dashed rounded p-4 bg-surface-primary text-muted">
+                    Sync this table at least once to add descriptions for its columns.
+                </div>
+            </div>
+        )
+    }
+
+    return (
+        <DescriptionsSectionContent
+            tableId={tableId}
+            columns={schema.available_columns ?? []}
+            disabledReason={accessDisabledReason}
+        />
+    )
+}
+
+function DescriptionsSectionContent({
+    tableId,
+    columns,
+    disabledReason,
+}: {
+    tableId: string
+    columns: { name: string; data_type?: string; is_nullable?: boolean }[]
+    disabledReason?: string
+}): JSX.Element {
+    const logic = columnAnnotationsLogic({ tableId })
+    const { annotationByColumn, annotationsLoading, savingColumn } = useValues(logic)
+    const { saveDescription } = useActions(logic)
+
+    const tableAnnotation = annotationByColumn['']
+
+    return (
+        <div>
+            <SectionHeader
+                title="Descriptions"
+                description="Describe what this table and its columns mean. These descriptions help PostHog AI write correct queries against your data. Descriptions are generated automatically (from the source's documentation or AI) and anything you edit here is preserved."
+            />
+            <div className="border rounded p-4 bg-surface-primary">
+                <DescriptionRow
+                    columnName=""
+                    label="(whole table)"
+                    description={tableAnnotation?.description ?? ''}
+                    source={tableAnnotation?.description_source}
+                    saving={savingColumn === ''}
+                    onSave={saveDescription}
+                    disabledReason={disabledReason}
+                />
+                {annotationsLoading && columns.length === 0 ? (
+                    <LemonSkeleton className="w-full h-8 mt-2" />
+                ) : columns.length === 0 ? (
+                    <div className="text-muted text-sm mt-2">No columns discovered yet for this schema.</div>
+                ) : (
+                    columns.map((column) => {
+                        const annotation = annotationByColumn[column.name]
+                        return (
+                            <DescriptionRow
+                                key={column.name}
+                                columnName={column.name}
+                                label={column.name}
+                                dataType={column.data_type}
+                                description={annotation?.description ?? ''}
+                                source={annotation?.description_source}
+                                saving={savingColumn === column.name}
+                                onSave={saveDescription}
+                                disabledReason={disabledReason}
+                            />
+                        )
+                    })
+                )}
+            </div>
+        </div>
+    )
+}

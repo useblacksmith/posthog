@@ -1,0 +1,871 @@
+import { DateTime } from 'luxon'
+
+import { VMState } from '@posthog/hogvm'
+
+import { CyclotronInputType, CyclotronInvocationQueueParametersType } from '~/cdp/schema/cyclotron'
+import { HogFlow } from '~/cdp/schema/hogflow'
+
+import {
+    ClickHouseTimestamp,
+    ElementPropertyFilter,
+    EventPropertyFilter,
+    HogQLPropertyFilter,
+    PersonPropertyFilter,
+    Team,
+} from '../types'
+import type { QueuedSend } from './services/hogflows/transactional-email'
+import type { HogErrorClass } from './utils/hog-error-classification'
+import type { RebuildableInputsSource } from './utils/rebuildable-inputs'
+
+export type HogBytecode = any[]
+
+// subset of EntityFilter
+export interface HogFunctionFilterBase {
+    id: string | null
+    name?: string | null
+    order?: number
+    properties?: (EventPropertyFilter | PersonPropertyFilter | ElementPropertyFilter | HogQLPropertyFilter)[]
+}
+
+export interface HogFunctionFilterEvent extends HogFunctionFilterBase {
+    type: 'events'
+    bytecode?: HogBytecode
+}
+
+export interface HogFunctionFilterAction extends HogFunctionFilterBase {
+    type: 'actions'
+    // Loaded at run time from Action model
+    bytecode?: HogBytecode
+}
+
+export type HogFunctionFilter = HogFunctionFilterEvent | HogFunctionFilterAction
+
+export type HogFunctionMasking = {
+    ttl: number | null
+    hash: string
+    bytecode: HogBytecode
+    threshold: number | null
+}
+
+export type HogFunctionFilterDataWarehouse = {
+    table_name?: string
+}
+
+export interface HogFunctionFilters {
+    source?: 'events' | 'internal-events' | 'person-updates' | 'data-warehouse-table' | 'data-warehouse-view' // Special case to identify what kind of thing this filters on
+    events?: HogFunctionFilterEvent[]
+    actions?: HogFunctionFilterAction[]
+    // Warehouse tables this function is subscribed to. Never compiled into bytecode, so the
+    // consumer has to match on it directly.
+    data_warehouse?: HogFunctionFilterDataWarehouse[]
+    properties?: Record<string, any>[] // Global property filters that apply to all events
+    filter_test_accounts?: boolean
+    bytecode?: HogBytecode
+    /** Set by Django when compilation failed. The bytecode is null beside it, unless the save kept the last working one. */
+    bytecode_error?: string
+    /**
+     * The runtime contract hash the bytecode was compiled against, from filter_globals.json. Absent on
+     * bytecode saved before the compiler checked globals and functions.
+     */
+    bytecode_contract?: string
+}
+
+export type GroupType = {
+    id: string // the "key" of the group
+    type: string
+    index: number
+    url: string
+    properties: Record<string, any>
+}
+
+export type CyclotronPerson = {
+    id: string
+    properties: Record<string, any>
+    name: string
+    url: string
+    // Populated whenever the manager could resolve a distinct_id for this person.
+    // Always present when looked up by distinct_id; for person_id lookups, present
+    // when the person has at least one distinct_id in the persondistinctid table.
+    distinct_id?: string
+}
+
+export type HogFunctionInvocationGlobals = {
+    project: {
+        id: number
+        name: string
+        url: string
+    }
+    source?: {
+        id?: string
+        name: string
+        url: string
+    }
+    event: {
+        /* Database fields */
+        uuid: string
+        event: string
+        distinct_id: string
+        properties: Record<string, unknown>
+        elements_chain: string
+        timestamp: string
+        captured_at?: string | null
+
+        /* Special fields in Hog */
+        url: string
+    }
+    person?: CyclotronPerson
+    groups?: Record<string, GroupType>
+
+    // Unique to sources - will be modified later
+    request?: {
+        method: string
+        headers: Record<string, string | undefined>
+        query: Record<string, string | undefined>
+        ip?: string
+        body: Record<string, any>
+        stringBody: string
+    }
+
+    unsubscribe_url?: string // For email actions, the unsubscribe URL to use
+    unsubscribe_url_one_click?: string // For email actions, the one-click unsubscribe URL to use
+
+    actions?: HogFunctionInvocationActionVariables
+    variables?: Record<string, any> // For HogFlows, workflow-level variables
+}
+
+/**
+ * A map of key value variables that persist across actions in a flow
+ * These variables can be used to store loop state or pass data between actions
+ *
+ * Action's can read and write to these variables. Any value stored in the variables
+ * map must be JSON serializable, and limited to 5KB in size.
+ *
+ * After execution, every action will have a corresponding entry in the map with
+ * the key `$action/{actionId}` containing the result of the action.
+ */
+export type HogFunctionInvocationActionVariables = {
+    [key: string]: { result: any; error?: any }
+}
+
+export type HogFunctionInvocationGlobalsWithInputs = HogFunctionInvocationGlobals & {
+    inputs: Record<string, any>
+}
+
+export type HogFunctionFilterGlobals = {
+    // Filter Hog is built in the same way as analytics so the global object is meant to be an event
+    event: string
+    uuid: string
+    timestamp: string
+    elements_chain: string
+    elements_chain_href: string
+    elements_chain_texts: string[]
+    elements_chain_ids: string[]
+    elements_chain_elements: string[]
+    properties: Record<string, any>
+    distinct_id: string
+
+    person: {
+        id: string
+        properties: Record<string, any>
+    } | null
+    pdi: {
+        distinct_id: string
+        person_id: string
+        person: {
+            id: string
+            properties: Record<string, any>
+        }
+    } | null
+
+    // Used by groupId filters on event_metadata
+    $group_0: string | null
+    $group_1: string | null
+    $group_2: string | null
+    $group_3: string | null
+    $group_4: string | null
+
+    // Used by group property filters
+    group_0: {
+        properties: Record<string, any>
+    }
+    group_1: {
+        properties: Record<string, any>
+    }
+    group_2: {
+        properties: Record<string, any>
+    }
+    group_3: {
+        properties: Record<string, any>
+    }
+    group_4: {
+        properties: Record<string, any>
+    }
+
+    variables: Record<string, any> | undefined // For HogFlows, workflow-level variables
+    cohort_ids?: number[] // Cohorts the person is a member of, read by the inCohort/notInCohort STL functions
+}
+
+export type MetricLogSource = 'hog_function' | 'hog_flow' | 'legacy_plugin'
+
+export type LogEntryLevel = 'debug' | 'info' | 'warn' | 'error'
+
+export type MinimalLogEntry = {
+    timestamp: DateTime
+    level: LogEntryLevel
+    message: string
+}
+
+export type LogEntry = MinimalLogEntry & {
+    team_id: number
+    log_source: MetricLogSource // The kind of source (hog_function)
+    log_source_id: string // The id of the hog function
+    instance_id: string // The id of the specific invocation
+}
+
+export type LogEntrySerialized = Omit<LogEntry, 'timestamp'> & {
+    timestamp: ClickHouseTimestamp
+}
+
+export type MinimalAppMetric = {
+    team_id: number
+    app_source_id: string // The main item (like the hog function or hog flow ID)
+    instance_id?: string // The specific instance of the item (can be the invocation ID or a sub item like an action ID)
+    metric_kind: 'failure' | 'success' | 'other' | 'email' | 'sms' | 'push' | 'billing' | 'fetch'
+    metric_name:
+        | 'early_exit'
+        | 'canceled'
+        | 'triggered'
+        | 'trigger_failed'
+        | 'succeeded'
+        | 'failed'
+        | 'filtered'
+        | 'disabled_temporarily'
+        | 'disabled_permanently'
+        | 'rate_limited'
+        | 'masked'
+        | 'audience_truncated'
+        | 'filtering_failed'
+        | 'inputs_failed'
+        | 'missing_credential'
+        | 'missing_addon'
+        | 'fetch'
+        | 'billable_invocation'
+        | 'dropped'
+        | 'budget_skipped'
+        | 'email_queued'
+        | 'email_sent'
+        | 'email_delivered'
+        | 'email_failed'
+        | 'email_opened'
+        | 'email_link_clicked'
+        | 'email_link_clicked_by_link'
+        | 'email_opened_by_person'
+        | 'email_clicked_by_person'
+        | 'email_bounced'
+        | 'email_bounced_hard'
+        | 'email_bounced_transient'
+        | 'email_bounced_undetermined'
+        | 'email_bounce_prevented'
+        | 'message_frequency_capped'
+        | 'message_frequency_cap_held'
+        | 'message_frequency_cap_hold_ended'
+        | 'email_suppressed'
+        | 'email_opted_out'
+        | 'email_missing_recipient'
+        | 'email_suspended'
+        | 'email_paused'
+        | 'email_blocked'
+        | 'email_unsubscribed'
+        | 'email_untracked'
+        | 'email_sending_limit_delayed'
+        | 'email_sending_limit_delayed_over_1h'
+        | 'email_sandbox_sent'
+        | 'email_sandbox_failed'
+        | 'email_sandbox_blocked'
+        | 'email_sandbox_delivered'
+        | 'email_sandbox_bounced'
+        | 'email_sandbox_complained'
+        | 'push_sent'
+        | 'push_failed'
+        | 'push_skipped'
+        | 'push_opened'
+        | 'quota_limited'
+        | 'conversion'
+        | 'conversion_by_start'
+        | 'exited_workflow_changed'
+        | 'redirected_workflow_changed'
+    count: number
+    timestamp?: DateTime
+    // Key parts for the mirrored version-scoped row: the flow and the `version` of the HogFlow row that
+    // actually executed the step. Not columns on `app_metrics2` — the monitoring service consumes these
+    // to key a row under the `hog_flow_version` app source, and never forwards them to Kafka. Absent
+    // means this metric only lands in the version-agnostic series.
+    //
+    // `id` is carried rather than reusing `app_source_id` because that field is substituted with
+    // `parentRunId` for batch-triggered runs, so per-run views group by the run. A per-version rollup
+    // has to key on the flow itself, or a broadcast's metrics never aggregate across its runs.
+    app_source_version?: { id: string; version: number }
+}
+
+export type AppMetricType = MinimalAppMetric & {
+    timestamp: ClickHouseTimestamp
+    app_source: MetricLogSource
+}
+
+/**
+ * Where an event stopped, for a record on a dead-letter topic.
+ *
+ * `filter` and `inputs` are the two failures the pipeline expects and handles per function.
+ * `parse`, `lookup` and `process` are the ones it does not: a message it cannot read, a team, hog
+ * function or hog flow lookup that failed with an error that is not retriable, and anything else
+ * that throws while the pipeline turns an event into invocations. Those three park a lone
+ * unanticipated failure rather than stalling the partition it arrived on.
+ */
+export type DeadLetterStep = 'parse' | 'lookup' | 'filter' | 'inputs' | 'process'
+
+export type InvocationBuildFailure = {
+    sourceId: string
+    sourceKind: 'hog_function' | 'hog_flow'
+    step: DeadLetterStep
+    error: string
+    /** Who has to act on it. Only our own classes are worth parking, see HogErrorClass. */
+    errorClass?: HogErrorClass
+}
+
+export interface HogFunctionTiming {
+    kind: 'hog' | 'async_function'
+    duration_ms: number
+}
+
+// IMPORTANT: All queue names should be lowercase and only [A-Z0-9] characters are allowed.
+export const CYCLOTRON_INVOCATION_JOB_QUEUES = [
+    'hog',
+    'hogoverflow',
+    'hogdlq',
+    'hogflow',
+    'email',
+    'emailsandbox',
+] as const
+export type CyclotronJobQueueKind = (typeof CYCLOTRON_INVOCATION_JOB_QUEUES)[number]
+
+export const DEAD_LETTER_QUEUE = 'hogdlq' satisfies CyclotronJobQueueKind
+
+export const CYCLOTRON_JOB_QUEUE_SOURCES = ['postgres', 'postgres-v2', 'kafka'] as const
+export type CyclotronJobQueueSource = (typeof CYCLOTRON_JOB_QUEUE_SOURCES)[number]
+
+// Agnostic job invocation type
+export type CyclotronJobInvocation = {
+    id: string
+    teamId: Team['id']
+    functionId: string
+    // Optional parent run ID, e.g. if this invocation is part of a batch workflow run
+    parentRunId?: string | null
+    state: Record<string, any> | null
+    // The queue that the invocation is on
+    queue: CyclotronJobQueueKind
+    // Optional parameters for that queue to use
+    queueParameters?: CyclotronInvocationQueueParametersType | null
+    // Priority of the invocation
+    queuePriority: number
+    // When the invocation is scheduled to run
+    queueScheduledAt?: DateTime
+    // When the queue first stored the job. A reschedule moves queueScheduledAt but not this, and a clone keeps it.
+    queueCreatedAt?: DateTime
+    // The scheduled time this job had when it was dequeued. A clone resets queueScheduledAt but keeps this.
+    queueDueAt?: DateTime
+    // Metadata for the invocation - TODO: check when this gets cleared
+    queueMetadata?: Record<string, any> | null
+    // Where the invocation came from (kafka or postgres)
+    queueSource?: CyclotronJobQueueSource
+    queueLockId?: string
+    // Cancellation was requested (CyclotronV2Manager.cancelJobs) while this invocation
+    // was in flight. The consumer must terminate it as canceled instead of executing.
+    cancelRequestedAt?: DateTime
+    // A Fernet token that holds the content fields of a transactional send while it is stored. See sealInvocation.
+    sealed?: string
+    // The stored token could not be opened, so the state holds only its plaintext fields and must not run.
+    stateUnreadable?: true
+}
+
+// The result of an execution
+export type CyclotronJobInvocationResult<T extends CyclotronJobInvocation = CyclotronJobInvocation> = {
+    invocation: T
+    finished: boolean
+    /** The invocation deliberately finished without running because its trigger did not match. */
+    skipped?: boolean
+    /**
+     * Whether a send reached a recipient. Distinct from `skipped` above, which is set only for a
+     * trigger or recipient-preference skip: a push that found no device token sets neither that
+     * flag nor an error, so nothing else on the result tells the two apart.
+     */
+    deliveredToRecipient?: boolean
+    emailSendResult?: { status: 'accepted' | 'skipped' | 'failed'; reason?: string }
+    parked?: boolean
+    // The run was canceled rather than succeeding or failing. Only meaningful with
+    // finished=true and no error: the job row and the lifecycle row both flip to
+    // 'canceled'.
+    canceled?: boolean
+    error?: any
+    logs: MinimalLogEntry[]
+    metrics: MinimalAppMetric[]
+    capturedPostHogEvents: HogFunctionCapturedEvent[]
+    warehouseWebhookPayloads: WarehouseWebhookPayload[]
+    messageAssets: MessageAssetRow[]
+    conversionWatchers: ConversionWatcherRow[]
+    execResult?: unknown
+}
+
+// The compiled conversion goal as it stood when a run enrolled. Pinned to the run rather than read
+// from the live flow, so editing a goal changes what future runs are measured against without
+// re-judging cohorts already in flight under the old one.
+export type PinnedConversionGoal = {
+    // Property-based goal, evaluated against person properties.
+    properties?: any[]
+    // Event-based goals, any one of which converts.
+    events?: any[][]
+}
+
+// One per enrolled run on a workflow with a conversion goal, outliving the run so a conversion that
+// lands after the last step is still observable. See the conversion_watchers migration for why this
+// is not a cyclotron_jobs row.
+export type ConversionWatcherRow = {
+    id: string
+    team_id: number
+    function_id: string
+    run_id: string
+    parent_run_id: string | null
+    distinct_id: string | null
+    person_id: string | null
+    flow_version: number | null
+    goal: PinnedConversionGoal
+    created_at: Date
+    expires_at: Date
+}
+
+export type CyclotronJobInvocationHogFunctionContext = {
+    globals: HogFunctionInvocationGlobalsWithInputs
+    vmState?: VMState
+    timings: HogFunctionTiming[]
+    attempts: number // Indicates the number of times this invocation has been attempted (for example if it gets scheduled for retries)
+    // Distinct from `attempts` (fetch-retry counter, reset between runs).
+    // `rerunAttempts` is incremented when an invocation is rehydrated by the
+    // rerun paginator and stays sticky across the entire rerun run. The
+    // lifecycle row producer reads this to drive the `attempts` + `is_retry`
+    // columns in `hog_invocation_results`.
+    rerunAttempts?: number
+    // ISO timestamp of the *original* cyclotron-scheduled time. Stamped on the
+    // first 'running' lifecycle row and carried through both cyclotron fetch
+    // retries and reruns so the producer can populate `first_scheduled_at`
+    // verbatim — ReplacingMergeTree would otherwise collapse to the latest
+    // version (a retry's scheduled time) and lose the original.
+    firstScheduledAt?: string
+    actionId?: string // The hogflow action node ID, used for metrics instance_id when executing within a workflow
+    // Set when a protected workflow step pauses mid-send, so its retries stay protected.
+    sensitive?: boolean
+    actionStepCount?: number
+    customerTaskIdempotencyVersion?: 1
+    send?: QueuedSend
+    scheduledAt?: string
+    // Copied from the workflow state, like `send`, so the email step can measure the send's wait from its acceptance.
+    acceptedAt?: string
+    renderedWorkflowVersion?: number
+    // Set when the inputs come from the stored function config, so the job queue can drop them and the
+    // executor can build them again. The job queue sets `inputsOmitted` when it drops them.
+    inputsSource?: RebuildableInputsSource
+    inputsOmitted?: true
+}
+
+export type SandboxEmailOutcome = {
+    outcome: 'accepted' | 'skipped' | 'failed'
+    reason?: string
+    messageId?: string
+    retries?: number
+}
+
+export type WorkflowStepResumeStatus = 'completed' | 'failed' | 'cancelled'
+
+export type CyclotronJobInvocationHogFunction = CyclotronJobInvocation & {
+    state: CyclotronJobInvocationHogFunctionContext
+    hogFunction: HogFunctionType
+}
+
+export type CyclotronJobInvocationHogFlow = CyclotronJobInvocation & {
+    state?: HogFlowInvocationContext
+    hogFlow: HogFlow
+    person?: CyclotronPerson
+    groups?: HogFunctionInvocationGlobals['groups']
+    filterGlobals: HogFunctionFilterGlobals
+    // Re-reads the person uncached and rebuilds filterGlobals from it. The worker supplies this; a
+    // wait step calls it before its first evaluation, where a stale person parks the run for good.
+    // It returns the values rather than mutating, so it stays correct on a cloned invocation.
+    refreshPerson?: () => Promise<{ person?: CyclotronPerson; filterGlobals: HogFunctionFilterGlobals }>
+    loadPersonProperties?: (
+        keys: string[]
+    ) => Promise<{ person?: CyclotronPerson; filterGlobals: HogFunctionFilterGlobals }>
+}
+
+export type MessageOptOutRecord = {
+    identifier: string
+    // A message category id, or '$all' for all marketing messages.
+    categoryId: string
+}
+
+export type HogFlowInvocationContext = {
+    event: HogFunctionInvocationGlobals['event']
+    personId?: string // Persisted person UUID, used when distinct_id is not available (e.g. batch workflows, manual person triggers)
+    // Stamped at enqueue for account-audience batch children: event.distinct_id is the account's
+    // group key, not a person distinct_id. The worker must trust this over the live trigger config,
+    // which can be edited to a person audience while these children are still queued.
+    accountAudience?: boolean
+    // Set by the subscription matcher when it wrote this job's personId anchor: either a merge repointed
+    // the distinct_id onto a survivor, or the distinct_id acquired its first person. Tells the worker to
+    // resolve the person by personId, not the distinct_id (whose ~1min PersonsManager cache entry still
+    // points at the pre-merge person, or at no person at all) — otherwise the woken step reads stale
+    // person props (e.g. an email step gets no recipient and drops the send).
+    personIdRepointed?: boolean
+    // High-water mark of the repoint version last applied to this job's personId. Repoints aren't
+    // Kafka-keyed, so a delayed lower-version move can arrive in a later batch than a higher one already
+    // applied; the matcher rejects any repoint whose version isn't strictly greater, so an out-of-order
+    // older move can't rewind the wait onto an obsolete person.
+    personIdRepointVersion?: number
+    // Version this run's conversions attribute to: the one that sent the last message, or the one
+    // the run started under if it hasn't sent yet. Never the currently published version — a
+    // conversion arriving after a republish belongs to the version whose message the person
+    // actually received, not whatever happens to be live when they convert.
+    // Absent on runs parked before this was introduced — those attribute to no version at all
+    // rather than to a wrong one.
+    flowVersion?: number
+    // Opt-outs this run's "Opt out of messages" steps made. Message steps check them before the recipient cache,
+    // because a worker that resumes the run can hold the recipient's preferences from before the opt-out.
+    messageOptOuts?: MessageOptOutRecord[]
+    // Stamped on every execution of a protected workflow and persisted with the state, so a recovery path that holds only the
+    // workflow id still keeps a sensitive run's message data out of its snapshot.
+    sensitive?: boolean
+    // Set by the transactional email API, which skips the trigger pipeline. The email worker counts the run as
+    // `triggered` and clears this flag, so a rescheduled run does not count again.
+    triggerMetricPending?: boolean
+    // ISO time the API accepted a transactional email send. It lives in the state so that it travels with the job
+    // through Kafka, the queue and every reschedule, and the send's wait counts from it.
+    acceptedAt?: string
+    actionStepCount: number
+    // Missing on legacy runs, which must keep run:action keys even when no function state was persisted.
+    customerTaskIdempotencyVersion?: 1
+    currentAction?: {
+        id: string
+        startedAtTimestamp: number
+        // The instant a delay_until step resolved to when it first parked, as an ISO string. A resumed
+        // invocation rebuilds its filter globals from stored state, which can arrive without the event
+        // properties the expression reads, so re-evaluating on wake is allowed to fail back to this.
+        delayUntilAt?: string
+        // Set when a delay_until or time window step could not work out when to continue. The run aborts on it whatever
+        // on_error says, because "no date" is not an ambiguous failure to carry on from: continuing would
+        // run the next step immediately, which for a "N days before X" message is worse than not sending.
+        delayUntilUnresolved?: boolean
+        // Failed cohort membership lookups so far on this step. The step retries on a backoff while
+        // this stays under the limit, because a lookup timeout is usually a short stall.
+        cohortLookupAttempts?: number
+        renderTimeoutAttempts?: number
+        // Set when a cohort membership lookup failed on every attempt. The run aborts on it whatever
+        // on_error says, because the default 'continue' takes the continue edge, and on a branch that
+        // edge sends a member down the path for people outside the cohort.
+        cohortLookupFailed?: boolean
+        hogFunctionState?: CyclotronJobInvocationHogFunctionContext
+        // Set by the subscription matcher consumer when it wakes a wait_until_condition
+        // job because a matching event arrived (as opposed to a scheduled timeout firing).
+        eventMatched?: boolean
+        // Name of the event that triggered the wake, so the executor can surface
+        // "woken by event: X" in logs instead of echoing the trigger event.
+        eventMatchedEvent?: string
+        // UUID of the exact event that triggered the wake, so the logs view can link to
+        // it precisely (the name alone is ambiguous when a person fires it repeatedly).
+        eventMatchedEventUuid?: string
+        // Paired with the UUID to build the event link in the logs view; never displayed.
+        eventMatchedEventTimestamp?: string
+        // Set by the subscription matcher when it re-keys a parked wait onto a merge survivor and wakes
+        // it (scheduled=now). The wait handler consumes it to attribute the re-check outcome
+        // (advanced vs re-parked) to the re-key, so the wasted-re-park churn is observable.
+        rekeyWake?: boolean
+        // Set when a distinct_id's first mapping fills a parked wait's missing person anchor and wakes
+        // it. A matcher wake carrying no eventMatched, so the handler consumes it like rekeyWake.
+        anchorWake?: boolean
+        // Set when the matcher wakes a wait it cannot decide itself, because the condition reads data
+        // only the worker holds. Carries no eventMatched, so the worker evaluates and may re-park.
+        recheckWake?: boolean
+        // The max_wait_duration this wait parked against. The timing sweep moves `scheduled` with a
+        // bulk UPDATE and cannot stamp a marker the way the matcher does, so a wake that follows a
+        // shortened ceiling is otherwise indistinguishable from the deadline arriving. Comparing the
+        // parked ceiling with the action's current one tells the two apart.
+        parkedMaxWaitDuration?: string
+        // Set by hog-function action handler when it returns `finished: false` without an
+        // explicit `queueScheduledAt` — i.e. the reschedule is purely to move the job onto a
+        // dedicated queue (e.g. 'email' for SES rate-limit gating) and the next dequeue will
+        // continue the same action. Consumed across three sites in hogflow-executor.service.ts
+        // to suppress the redundant log lines that would otherwise leak the routing into
+        // customer-visible workflow logs:
+        //   - `scheduleInvocation` on the dequeue that set it: skips the "Workflow will pause
+        //     until..." line (the pause is sub-millisecond and not a real workflow pause).
+        //   - Top of the next `execute()`: skips the "Resuming workflow execution at..." line.
+        //     The flag is *not* cleared here — it stays set so `executeCurrentAction` can
+        //     also act on it.
+        //   - `executeCurrentAction` on the same next dequeue: skips the "Executing action..."
+        //     debug line *and clears the flag* so any subsequent actions on the same dequeue
+        //     (the email handler's `nextAction: exit`, etc.) log normally.
+        routingOnlyReschedule?: boolean
+        // A step parked on an external run: cleared when the matcher writes a matching `resumeResult`.
+        awaitingResume?: {
+            key: string
+            deadlineAt: string
+            dispatch: Record<string, unknown>
+            label?: string
+            parkedAt?: string
+        }
+        resumeResult?: { key: string; status: WorkflowStepResumeStatus; result?: Record<string, unknown> }
+        // Set when a message step first finds the person at the frequency cap and the team holds capped
+        // messages. The step re-checks the cap on each wake and skips the send once this ISO time passes.
+        frequencyCapHoldDeadlineAt?: string
+        sandboxEmail?: SandboxEmailOutcome
+        sandboxEmailRetries?: number
+        sandboxEmailUncertainSends?: number
+    }
+    // Set by the subscription matcher consumer when an incoming event matched the
+    // workflow's event-based conversion goals. shouldExitEarly reads and clears it.
+    conversionMatched?: boolean
+    // Set once the membership table has caught up with the change that started a cohort-triggered run.
+    // The writer that fills the table lags the trigger, so a mismatch read before this means a pending write.
+    cohortTriggerConfirmed?: boolean
+    // Once-per-run guard for the property-based conversion metric. Executor-owned:
+    // shouldExitEarly runs on every resume, so without this a persistently-true
+    // conversion filter would emit a `conversion` metric on every step. Event-based
+    // conversions are counted by the matcher and never touch this flag.
+    conversionCounted?: boolean
+    variables?: Record<string, any>
+    send?: QueuedSend
+    senderKind?: 'email_sandbox'
+    scheduledAt?: string
+    statusAt?: string
+    // Sticky counter incremented by the rerun paginator on rehydration. Lets
+    // the lifecycle row producer derive `attempts` / `is_retry` for hog flows
+    // the same way it does for hog functions, so the `max_attempts` guard on
+    // the rerun filter actually applies to flows.
+    rerunAttempts?: number
+    // Stamped on the first 'running' row and carried verbatim through cyclotron
+    // fetch retries and reruns so `first_scheduled_at` survives the
+    // ReplacingMergeTree collapse on the hog_invocation_results table.
+    firstScheduledAt?: string
+}
+
+// Mostly copied from frontend types
+export type HogFunctionInputSchemaType = {
+    type:
+        | 'string'
+        | 'number'
+        | 'boolean'
+        | 'dictionary'
+        | 'choice'
+        | 'json'
+        | 'integration'
+        | 'integration_multi'
+        | 'integration_field'
+        | 'email'
+        | 'native_email'
+        | 'posthog_assignee'
+        | 'posthog_ticket_tags'
+        | 'posthog_business_hours'
+        | 'push_subscription'
+        | 'non_failure_status_codes'
+        | 'customer_analytics_account_properties'
+        | 'customer_analytics_account_relationships'
+        | 'task_model'
+        | 'task_repository'
+        | 'task_mcp_installations'
+        | 'signals_scout'
+        | 'posthog_survey'
+        | 'replay_vision_scan'
+        | 'task_skills'
+    key: string
+    label?: string
+    choices?: { value: string; label: string }[]
+    /** For `choice` inputs: render as a searchable select instead of a plain dropdown. */
+    searchable?: boolean
+    required?: boolean
+    default?: any
+    secret?: boolean
+    hidden?: boolean
+    description?: string
+    integration?: string
+    integration_key?: string
+    requires_field?: string
+    integration_field?: string
+    platform?: 'android' | 'ios'
+    /**
+     * Space-separated OAuth scopes. On an `integration` input these are the scopes the connection
+     * must grant, and a connection missing one gets an error banner. On any other input, paired
+     * with `integration_key`, they are the scopes only that field needs — a connection without them
+     * still works, so the field just says what it is missing. Neither is enforced at runtime.
+     */
+    requiredScopes?: string
+    /**
+     * templating: true indicates the field supports templating. Alternatively
+     * it can be set to 'hog' or 'liquid' to specify the default templating engine to use.
+     */
+    templating?: boolean | 'hog' | 'liquid'
+}
+
+export type HogFunctionTypeType =
+    | 'destination'
+    | 'transformation'
+    | 'transformation_log'
+    | 'internal_destination'
+    | 'source_webhook'
+    | 'warehouse_source_webhook'
+    | 'site_destination'
+    | 'legacy_destination'
+
+// Function types a cyclotron worker actually executes, so a rerun can safely re-enqueue
+// the stored invocation onto the cyclotron hog queue and have it run. Every other type
+// runs elsewhere (source webhooks inline in the cdp-api HTTP handler, transformations
+// during ingestion, site_* transpiled to client-side JS) and would never drain from that
+// queue — re-enqueuing one wedges the partition. Mirror of the Django `TYPES_THAT_CAN_RERUN`
+// allowlist and the frontend invocations UI.
+export const RERUNNABLE_HOG_FUNCTION_TYPES = new Set<HogFunctionTypeType>(['destination', 'internal_destination'])
+
+export interface HogFunctionMappingType {
+    name?: string | null
+    inputs_schema?: HogFunctionInputSchemaType[]
+    inputs?: Record<string, CyclotronInputType> | null
+    filters?: HogFunctionFilters | null
+}
+
+export type HogFunctionType = {
+    id: string
+    type: HogFunctionTypeType
+    team_id: number
+    name: string
+    enabled: boolean
+    deleted: boolean
+    hog: string
+    bytecode: HogBytecode
+    inputs_schema?: HogFunctionInputSchemaType[]
+    inputs?: Record<string, CyclotronInputType | null>
+    encrypted_inputs?: Record<string, CyclotronInputType>
+    filters?: HogFunctionFilters | null
+    mappings?: HogFunctionMappingType[] | null
+    masking?: HogFunctionMasking | null
+    template_id?: string
+    execution_order?: number
+    created_at: string
+    updated_at: string
+    metadata?: Record<string, any>
+    batch_export_id?: string | null
+}
+
+export type HogFunctionMappingTemplate = HogFunctionMappingType & {
+    name: string
+    include_by_default?: boolean
+    use_all_events_by_default?: boolean
+}
+
+export type HogFunctionTemplate = {
+    status: 'stable' | 'alpha' | 'beta' | 'deprecated' | 'coming_soon' | 'hidden'
+    free: boolean
+    type: HogFunctionTypeType
+    id: string
+    name: string
+    description: string
+    code: string
+    inputs_schema: HogFunctionInputSchemaType[]
+    category: string[]
+    filters?: HogFunctionFilters
+    mappings?: HogFunctionMappingType[]
+    mapping_templates?: HogFunctionMappingTemplate[]
+    masking?: HogFunctionMasking
+    icon_url?: string
+    code_language: 'javascript' | 'hog'
+}
+
+export type HogFunctionTemplateCompiled = HogFunctionTemplate & {
+    bytecode: HogBytecode
+}
+
+// Slightly different model from the DB
+export type DBHogFunctionTemplate = {
+    id: string
+    template_id: string
+    sha: string
+    name: string
+    inputs_schema: HogFunctionInputSchemaType[]
+    bytecode: HogBytecode
+    type: HogFunctionTypeType
+    free: boolean
+}
+
+export type IntegrationType = {
+    id: number
+    team_id: number
+    kind: 'slack' | 'email' | 'email_sandbox' | 'oauth' | 'firebase' | 'apns' | 'posthog'
+    config: Record<string, any>
+    sensitive_config: Record<string, any>
+}
+
+export type HogFunctionCapturedEvent = {
+    team_id: number
+    event: string
+    distinct_id: string
+    timestamp: string
+    properties: Record<string, any>
+}
+
+export type WarehouseWebhookPayload = {
+    team_id: number
+    schema_id: string
+    payload: Record<string, any>
+}
+
+export type MessageAssetRow = {
+    team_id: number
+    function_kind: 'hog_flow' | 'hog_function'
+    function_id: string
+    parent_run_id: string
+    invocation_id: string
+    action_id: string
+    kind: 'email' | 'push'
+    distinct_id: string
+    person_id: string
+    // Where the message went: the address for email. Push has no address, so this carries the
+    // recipient's distinct_id instead. The delivering channels are deliberately not stored here,
+    // because the captured preview is a snapshot of what the recipient saw and they never saw those.
+    recipient: string
+    // The message's headline: an email subject line, or a push notification title.
+    subject: string
+    // Only delivered messages are captured, so this is 'sent' today. It stays a union because open
+    // tracking will write a higher-version row with its own status and collapse onto this one.
+    status: 'sent'
+    sent_at: string // ISO microsecond DateTime64
+    version: string // microsecond-precision UInt64, serialized as string to dodge JS's 53-bit cap
+    is_deleted: 0 | 1
+    html: string
+}
+
+export type Response = {
+    status: number
+    data: any
+    content: string
+    headers: Record<string, any>
+}
+
+export type NativeTemplate = Omit<HogFunctionTemplate, 'code' | 'code_language'> & {
+    perform: (
+        request: (
+            url: string,
+            options: {
+                method?: 'POST' | 'GET' | 'PATCH' | 'PUT' | 'DELETE'
+                headers: Record<string, any>
+                json?: any
+                body?: string | URLSearchParams
+                throwHttpErrors?: boolean
+                searchParams?: Record<string, any>
+            }
+        ) => Promise<Response>,
+        inputs: Record<string, any>
+    ) => Promise<any> | any
+}

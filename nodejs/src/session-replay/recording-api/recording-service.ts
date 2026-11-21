@@ -1,0 +1,689 @@
+import { GetObjectCommand, NoSuchKey, S3Client, S3ServiceException } from '@aws-sdk/client-s3'
+import { ClickHouseClient } from '@clickhouse/client'
+import snappy from 'snappy'
+
+import { PostgresRouter, PostgresUse } from '~/common/utils/db/postgres'
+import { isCloud } from '~/common/utils/env-utils'
+import { logger, serializeError } from '~/common/utils/logger'
+import { ValidRetentionPeriods } from '~/ingestion/pipelines/sessionreplay/shared/constants'
+import { createDeletionBlockMetadata } from '~/ingestion/pipelines/sessionreplay/shared/metadata/session-block-metadata'
+import { SessionMetadataStore } from '~/ingestion/pipelines/sessionreplay/shared/metadata/session-metadata-store'
+
+import { blockRefEncoder, decodeBlockRef } from './block-refs'
+import { ClickHouseCredential } from './clickhouse-credential'
+import { RecordingApiMetrics } from './metrics'
+import {
+    KeyStore,
+    RecordingBlock,
+    RecordingDecryptor,
+    RecordingEncryptor,
+    SessionKey,
+    SessionKeyDeletedError,
+} from './types'
+
+export interface GetBlockParams {
+    sessionId: string
+    teamId: number
+    key: string
+    startByte: number
+    endByte: number
+    decompress?: boolean
+    // A caller that already read the session key passes it, so the block is decrypted without a second lookup.
+    sessionKey?: SessionKey
+    // The public block route's role cannot list the bucket, so S3 answers a missing key with AccessDenied there.
+    accessDeniedMeansMissing?: boolean
+    // Aborts the S3 request and the body read, so a stalled read cannot hold the caller's byte budget.
+    timeoutMs?: number
+}
+
+export type RecordingDeletedResult = { ok: false; error: 'deleted'; deletedAt?: number; deletedBy: string }
+
+export type GetBlockResult = { ok: true; data: Buffer } | { ok: false; error: 'not_found' } | RecordingDeletedResult
+
+export type BlockAdmission = 'ok' | 'too_large' | 'busy'
+
+export type GetBlockByRefResult = GetBlockResult | { ok: false; error: Exclude<BlockAdmission, 'ok'> }
+
+export type ListedBlock = RecordingBlock & { ref?: string }
+
+export type EncryptBlocksResult =
+    | { ok: true; blocks: Buffer[] }
+    | { ok: false; error: 'recording_exists' }
+    | { ok: false; error: 'key_unavailable' }
+    | RecordingDeletedResult
+
+export type DeleteRecordingResult =
+    | { sessionId: string; ok: true; status: 'deleted'; deletedAt: number; deletedBy: string }
+    | { sessionId: string; ok: true; status: 'already_deleted'; deletedAt: number; deletedBy: string }
+    | { sessionId: string; ok: false; status: 'delete_failed' }
+
+interface BlockListingRow {
+    start_time: string
+    block_first_timestamps: string[]
+    block_last_timestamps: string[]
+    block_urls: string[]
+}
+
+function deletionOf(sessionKey: SessionKey): RecordingDeletedResult | null {
+    if (sessionKey.sessionState !== 'deleted') {
+        return null
+    }
+    return { ok: false, error: 'deleted', deletedAt: sessionKey.deletedAt, deletedBy: sessionKey.deletedBy ?? '' }
+}
+
+export class RecordingService {
+    constructor(
+        private s3Client: S3Client,
+        private s3Bucket: string,
+        private s3Prefix: string,
+        private keyStore: KeyStore,
+        private decryptor: RecordingDecryptor,
+        private metadataStore?: SessionMetadataStore,
+        private postgres?: PostgresRouter,
+        private clickhouse?: { client: ClickHouseClient; credential: ClickHouseCredential },
+        private encryptor?: RecordingEncryptor
+    ) {}
+
+    // Lets a caller write a copied recording without its own access to KMS or the key table.
+    async encryptBlocks(
+        sessionId: string,
+        teamId: number,
+        blocks: Buffer[],
+        retentionDays: number
+    ): Promise<EncryptBlocksResult> {
+        const encryptor = this.encryptor
+        if (!encryptor) {
+            throw new Error('Encryptor not initialized')
+        }
+        // Encrypting only for sessions with no stored recording keeps this route from touching ingested data,
+        // and stops a new key from breaking the plaintext blocks of a pre-encryption recording.
+        if (await this.recordingExists(sessionId, teamId)) {
+            return { ok: false, error: 'recording_exists' }
+        }
+        let sessionKey = await this.keyStore.getKey(sessionId, teamId)
+        if (sessionKey.sessionState === 'cleartext') {
+            sessionKey = await this.keyStore.generateKey(sessionId, teamId, retentionDays)
+        }
+        // A lost race on the conditional key write can read back no key, and encrypting with it returns plaintext.
+        if (sessionKey.sessionState === 'cleartext' && isCloud()) {
+            return { ok: false, error: 'key_unavailable' }
+        }
+        const deletion = deletionOf(sessionKey)
+        if (deletion) {
+            return deletion
+        }
+        return {
+            ok: true,
+            blocks: blocks.map((block) => encryptor.encryptBlockWithKey(sessionId, teamId, block, sessionKey).data),
+        }
+    }
+
+    validateS3Key(key: string): boolean {
+        const pattern = `^${this.s3Prefix}/(${ValidRetentionPeriods.join('|')})/\\d+-[0-9a-f]{16}$`
+        return new RegExp(pattern).test(key)
+    }
+
+    formatS3KeyError(): string {
+        return `Invalid key format: must match ${this.s3Prefix}/{${ValidRetentionPeriods.join(',')}}/{timestamp}-{hex}`
+    }
+
+    async getBlock(params: GetBlockParams): Promise<GetBlockResult> {
+        const { sessionId, teamId, key, startByte, endByte, decompress } = params
+        const startTime = performance.now()
+
+        logger.debug('[RecordingService] getBlock request', {
+            teamId,
+            sessionId,
+            key,
+            start: startByte,
+            end: endByte,
+        })
+
+        try {
+            const command = new GetObjectCommand({
+                Bucket: this.s3Bucket,
+                Key: key,
+                Range: `bytes=${startByte}-${endByte}`,
+            })
+
+            logger.debug('[RecordingService] Fetching from S3', {
+                bucket: this.s3Bucket,
+                key,
+                range: `bytes=${startByte}-${endByte}`,
+            })
+
+            const response = params.timeoutMs
+                ? await this.s3Client.send(command, { abortSignal: AbortSignal.timeout(params.timeoutMs) })
+                : await this.s3Client.send(command)
+
+            if (!response.Body) {
+                logger.debug('[RecordingService] S3 returned no body', { key })
+                RecordingApiMetrics.observeGetBlock('not_found', (performance.now() - startTime) / 1000, 'unknown')
+                return { ok: false, error: 'not_found' }
+            }
+
+            const bodyContents = await response.Body.transformToByteArray()
+            logger.debug('[RecordingService] S3 returned data', {
+                key,
+                bytesReceived: bodyContents.length,
+            })
+
+            const { data, sessionState } = params.sessionKey
+                ? this.decryptor.decryptBlockWithKey(sessionId, teamId, Buffer.from(bodyContents), params.sessionKey)
+                : await this.decryptor.decryptBlock(sessionId, teamId, Buffer.from(bodyContents))
+
+            logger.debug('[RecordingService] Decrypted block', {
+                sessionId,
+                teamId,
+                inputSize: bodyContents.length,
+                outputSize: data.length,
+                sessionState,
+            })
+
+            let result = data
+            if (decompress) {
+                try {
+                    result = (await snappy.uncompress(data, { asBuffer: true })) as Buffer
+                } catch (decompressError) {
+                    logger.error('[RecordingService] Failed to decompress block', {
+                        sessionId,
+                        teamId,
+                        key,
+                        dataSize: data.length,
+                        error: serializeError(decompressError),
+                    })
+                    throw decompressError
+                }
+            }
+
+            RecordingApiMetrics.observeGetBlock(
+                'success',
+                (performance.now() - startTime) / 1000,
+                sessionState,
+                !!decompress
+            )
+            return { ok: true, data: result }
+        } catch (error) {
+            if (error instanceof NoSuchKey) {
+                logger.warn('[RecordingService] S3 object not found (NoSuchKey)', {
+                    key,
+                    teamId,
+                    sessionId,
+                })
+                RecordingApiMetrics.observeGetBlock('not_found', (performance.now() - startTime) / 1000, 'unknown')
+                return { ok: false, error: 'not_found' }
+            }
+
+            // Elsewhere AccessDenied is a real permission fault and stays an error. The separate metric result keeps a public
+            // role fault visible on the dashboard.
+            if (
+                params.accessDeniedMeansMissing &&
+                error instanceof S3ServiceException &&
+                error.name === 'AccessDenied'
+            ) {
+                logger.warn('[RecordingService] S3 denied the read, treating the block as missing', {
+                    key,
+                    teamId,
+                    sessionId,
+                })
+                RecordingApiMetrics.observeGetBlock('access_denied', (performance.now() - startTime) / 1000, 'unknown')
+                return { ok: false, error: 'not_found' }
+            }
+
+            if (error instanceof SessionKeyDeletedError) {
+                logger.info('[RecordingService] Session key has been deleted', {
+                    teamId,
+                    sessionId,
+                    deleted_at: error.deletedAt,
+                    deleted_by: error.deletedBy,
+                })
+                RecordingApiMetrics.observeGetBlock('deleted', (performance.now() - startTime) / 1000, 'unknown')
+                return { ok: false, error: 'deleted', deletedAt: error.deletedAt, deletedBy: error.deletedBy }
+            }
+
+            RecordingApiMetrics.observeGetBlock('error', (performance.now() - startTime) / 1000, 'unknown')
+            throw error
+        }
+    }
+
+    private async recordingExists(sessionId: string, teamId: number): Promise<boolean> {
+        if (!this.clickhouse) {
+            throw new Error('ClickHouse client not initialized')
+        }
+        const { client, credential } = this.clickhouse
+        // No retention or is_deleted filter: an expired or deleted recording still has blocks a new key would break.
+        const result = await client.query({
+            query: `/* team_id:${teamId} query_type:recording_api_recording_exists */ SELECT 1
+                FROM session_replay_events
+                PREWHERE team_id = {team_id:Int32} AND session_id = {session_id:String}
+                LIMIT 1
+            `,
+            query_params: { team_id: teamId, session_id: sessionId },
+            format: 'JSONEachRow',
+            auth: await credential.auth(),
+            clickhouse_settings: {
+                log_comment: JSON.stringify({
+                    team_id: teamId,
+                    product: 'replay',
+                    kind: 'node',
+                    query_type: 'recording_api_recording_exists',
+                    service_name: 'recording-api',
+                    container_hostname: process.env.HOSTNAME || 'unknown',
+                }),
+                max_execution_time: 30,
+                // The lookup has no date bound, so cap it to keep it from starving playback listings on the shared pool.
+                max_threads: 4,
+                max_bytes_to_read: '10000000000',
+            },
+        })
+        const rows = await result.json()
+        return rows.length > 0
+    }
+
+    // Reports a deletion the key store recorded before ClickHouse learns of it through Kafka, and names each block of an
+    // encrypted session with a ref the browser can fetch and cache. Cleartext sessions have no key to derive refs from.
+    // Call it only for a session that has blocks; a session without any has no key worth reading yet.
+    async annotateBlocks(
+        sessionId: string,
+        teamId: number,
+        blocks: RecordingBlock[]
+    ): Promise<RecordingDeletedResult | ListedBlock[]> {
+        const sessionKey = await this.keyStore.getKey(sessionId, teamId)
+        const deletion = deletionOf(sessionKey)
+        if (deletion) {
+            return deletion
+        }
+        if (sessionKey.sessionState !== 'ciphertext') {
+            return blocks
+        }
+        const encodeRef = blockRefEncoder(sessionKey.plaintextKey)
+        return blocks.map((block) => ({
+            ...block,
+            ref: encodeRef({ teamId, sessionId, key: block.key, startByte: block.start_byte, endByte: block.end_byte }),
+        }))
+    }
+
+    // `admit` sees the block's size before the S3 read and can refuse it.
+    async getBlockByRef(
+        teamId: number,
+        sessionId: string,
+        ref: string,
+        admit: (bytes: number) => BlockAdmission = () => 'ok',
+        timeoutMs?: number
+    ): Promise<GetBlockByRefResult> {
+        const sessionKey = await this.keyStore.getKey(sessionId, teamId)
+        const deletion = deletionOf(sessionKey)
+        if (deletion) {
+            return deletion
+        }
+        const location =
+            sessionKey.sessionState === 'ciphertext'
+                ? decodeBlockRef(sessionKey.plaintextKey, ref, teamId, sessionId)
+                : null
+        if (!location || !this.validateS3Key(location.key)) {
+            return { ok: false, error: 'not_found' }
+        }
+        const admission = admit(location.endByte - location.startByte + 1)
+        if (admission !== 'ok') {
+            return { ok: false, error: admission }
+        }
+        return this.getBlock({ sessionId, teamId, ...location, sessionKey, accessDeniedMeansMissing: true, timeoutMs })
+    }
+
+    async listBlocks(sessionId: string, teamId: number): Promise<RecordingBlock[]> {
+        if (!this.clickhouse) {
+            throw new Error('ClickHouse client not initialized')
+        }
+        const { client, credential } = this.clickhouse
+
+        const startTime = performance.now()
+
+        logger.debug('[RecordingService] listBlocks request', { teamId, sessionId })
+
+        try {
+            const result = await client.query({
+                query: `/* team_id:${teamId} query_type:recording_api_list_blocks */ SELECT
+                        min(min_first_timestamp) as start_time,
+                        groupArrayArray(block_first_timestamps) as block_first_timestamps,
+                        groupArrayArray(block_last_timestamps) as block_last_timestamps,
+                        groupArrayArray(block_urls) as block_urls,
+                        max(retention_period_days) as retention_period_days,
+                        dateTrunc('DAY', start_time) + toIntervalDay(coalesce(retention_period_days, 30)) as expiry_time
+                    FROM session_replay_events
+                    PREWHERE
+                        team_id = {team_id:Int32}
+                        AND session_id = {session_id:String}
+                        AND min_first_timestamp <= now()
+                    GROUP BY session_id
+                    HAVING
+                        expiry_time >= now()
+                        AND max(is_deleted) = 0
+                `,
+                query_params: {
+                    team_id: teamId,
+                    session_id: sessionId,
+                },
+                format: 'JSONEachRow',
+                auth: await credential.auth(),
+                clickhouse_settings: {
+                    date_time_output_format: 'iso',
+                    log_comment: JSON.stringify({
+                        team_id: teamId,
+                        product: 'replay',
+                        kind: 'node',
+                        query_type: 'recording_api_list_blocks',
+                        service_name: 'recording-api',
+                        container_hostname: process.env.HOSTNAME || 'unknown',
+                    }),
+                    max_execution_time: 30,
+                    max_threads: 45,
+                    max_bytes_to_read: '10000000000',
+                },
+            })
+
+            const rows = await result.json<BlockListingRow>()
+            if (rows.length === 0) {
+                RecordingApiMetrics.observeListBlocks('empty', (performance.now() - startTime) / 1000)
+                return []
+            }
+
+            const blocks = RecordingService.buildBlockList(sessionId, teamId, rows[0])
+
+            RecordingApiMetrics.observeListBlocks(
+                blocks.length > 0 ? 'success' : 'empty',
+                (performance.now() - startTime) / 1000
+            )
+            logger.debug('[RecordingService] listBlocks complete', {
+                teamId,
+                sessionId,
+                blockCount: blocks.length,
+            })
+
+            return blocks
+        } catch (error) {
+            RecordingApiMetrics.observeListBlocks('error', (performance.now() - startTime) / 1000)
+            throw error
+        }
+    }
+
+    static buildBlockList(sessionId: string, teamId: number, row: BlockListingRow): RecordingBlock[] {
+        const { start_time, block_first_timestamps, block_last_timestamps, block_urls } = row
+
+        if (
+            !block_first_timestamps?.length ||
+            !block_last_timestamps?.length ||
+            !block_urls?.length ||
+            block_first_timestamps.length !== block_last_timestamps.length ||
+            block_first_timestamps.length !== block_urls.length
+        ) {
+            logger.error('[RecordingService] Block listing arrays length mismatch', {
+                sessionId,
+                teamId,
+                firstTimestampsLength: block_first_timestamps?.length ?? 0,
+                lastTimestampsLength: block_last_timestamps?.length ?? 0,
+                urlsLength: block_urls?.length ?? 0,
+            })
+            return []
+        }
+
+        const blocks: { sortKey: string; block: RecordingBlock }[] = []
+        for (let i = 0; i < block_urls.length; i++) {
+            const parsed = RecordingService.parseBlockUrl(block_urls[i])
+            if (parsed) {
+                blocks.push({
+                    sortKey: block_first_timestamps[i],
+                    block: {
+                        ...parsed,
+                        start_timestamp: block_first_timestamps[i],
+                        end_timestamp: block_last_timestamps[i],
+                    },
+                })
+            }
+        }
+
+        blocks.sort((a, b) => a.sortKey.localeCompare(b.sortKey))
+
+        if (blocks.length === 0 || blocks[0].sortKey !== start_time) {
+            return []
+        }
+
+        return blocks.map((b) => b.block)
+    }
+
+    static parseBlockUrl(blockUrl: string): { key: string; start_byte: number; end_byte: number } | null {
+        try {
+            const url = new URL(blockUrl)
+            const key = url.pathname.replace(/^\//, '')
+            const match = url.search.match(/range=bytes=(\d+)-(\d+)/)
+            if (!match) {
+                logger.warn('[RecordingService] Invalid block URL range', { blockUrl })
+                return null
+            }
+            return { key, start_byte: parseInt(match[1]), end_byte: parseInt(match[2]) }
+        } catch {
+            logger.warn('[RecordingService] Failed to parse block URL', { blockUrl })
+            return null
+        }
+    }
+
+    async deleteRecordings(sessionIds: string[], teamId: number, deletedBy: string): Promise<DeleteRecordingResult[]> {
+        const startTime = performance.now()
+        logger.debug('[RecordingService] deleteRecordings request', { teamId, count: sessionIds.length, deletedBy })
+
+        const results = await Promise.all(
+            sessionIds.map((sessionId) => this.deleteRecording(sessionId, teamId, deletedBy))
+        )
+
+        const deleted = results.filter((r) => r.ok && r.status === 'deleted')
+        const alreadyDeleted = results.filter((r) => r.ok && r.status === 'already_deleted')
+        const failed = results.filter((r) => !r.ok)
+
+        if (deleted.length > 0) {
+            RecordingApiMetrics.incrementRecordingsDeleted('deleted', deleted.length)
+        }
+        if (alreadyDeleted.length > 0) {
+            RecordingApiMetrics.incrementRecordingsDeleted('already_deleted', alreadyDeleted.length)
+        }
+        if (failed.length > 0) {
+            RecordingApiMetrics.incrementRecordingsDeleted('failed', failed.length)
+        }
+
+        await this.propagateDeletion(
+            deleted.map((r) => r.sessionId),
+            // A shred that already happened still gets its derived data cleaned up. Cleanup is
+            // best-effort, so without this a failed pass is never retried: the next delete of the
+            // same recording reports already_deleted and skips it.
+            [...deleted, ...alreadyDeleted].map((r) => r.sessionId),
+            teamId,
+            deletedBy
+        )
+
+        const outcome = failed.length === 0 ? 'success' : failed.length === sessionIds.length ? 'failure' : 'partial'
+        RecordingApiMetrics.observeDeleteRecordings(outcome, (performance.now() - startTime) / 1000)
+        logger.info('[RecordingService] deleteRecordings complete', {
+            teamId,
+            deleted: deleted.length,
+            failed: failed.length,
+        })
+
+        return results
+    }
+
+    private async deleteRecording(
+        sessionId: string,
+        teamId: number,
+        deletedBy: string
+    ): Promise<DeleteRecordingResult> {
+        const result = await this.keyStore.deleteKey(sessionId, teamId, deletedBy).catch((): null => null)
+        if (result === null) {
+            return { sessionId, ok: false, status: 'delete_failed' }
+        }
+        return { sessionId, ok: true, ...result }
+    }
+
+    /**
+     * Propagate a successful key shred to Kafka, Postgres, and the activity log.
+     * Failures are non-fatal — the key shred already makes the recording unplayable (410).
+     * Stale metadata from failed propagation is harmless but won't be automatically cleaned up.
+     */
+    private async propagateDeletion(
+        sessionIds: string[],
+        cleanupSessionIds: string[],
+        teamId: number,
+        deletedBy: string
+    ): Promise<void> {
+        if (sessionIds.length === 0 && cleanupSessionIds.length === 0) {
+            return
+        }
+        const [kafka, postgres, activity] = await Promise.allSettled([
+            this.emitDeletionEvents(sessionIds, teamId),
+            this.deletePostgresRecords(cleanupSessionIds, teamId),
+            this.logActivity(sessionIds, teamId, deletedBy),
+        ])
+        if (kafka.status === 'rejected') {
+            RecordingApiMetrics.incrementCleanupFailure('kafka')
+            logger.error('[RecordingService] Failed to emit deletion events to Kafka', {
+                teamId,
+                error: serializeError(kafka.reason),
+            })
+        }
+        if (postgres.status === 'rejected') {
+            RecordingApiMetrics.incrementCleanupFailure('postgres')
+            logger.error('[RecordingService] Failed to delete Postgres records', {
+                teamId,
+                error: serializeError(postgres.reason),
+            })
+        }
+        if (activity.status === 'rejected') {
+            RecordingApiMetrics.incrementCleanupFailure('activity_log')
+            logger.error('[RecordingService] Failed to log activity', {
+                teamId,
+                error: serializeError(activity.reason),
+            })
+        }
+    }
+
+    private async emitDeletionEvents(sessionIds: string[], teamId: number): Promise<void> {
+        await this.metadataStore?.storeSessionBlocks(
+            sessionIds.map((sessionId) => createDeletionBlockMetadata(sessionId, teamId))
+        )
+    }
+
+    private async deletePostgresRecords(sessionIds: string[], teamId: number): Promise<void> {
+        if (sessionIds.length === 0 || !this.postgres) {
+            return
+        }
+
+        const tables = [
+            'ee_single_session_summary',
+            'posthog_exportedrecording',
+            'posthog_comment',
+            'replay_vision_replayobservation',
+            'posthog_exportedasset',
+        ] as const
+        const results = await Promise.allSettled([
+            this.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `DELETE FROM ee_single_session_summary WHERE team_id = $1 AND session_id = ANY($2)`,
+                [teamId, sessionIds],
+                'deleteSessionSummaries'
+            ),
+            this.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `DELETE FROM posthog_exportedrecording WHERE team_id = $1 AND session_id = ANY($2)`,
+                [teamId, sessionIds],
+                'deleteExportedRecordings'
+            ),
+            this.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `DELETE FROM posthog_comment WHERE team_id = $1 AND scope = 'recording' AND item_id = ANY($2)`,
+                [teamId, sessionIds],
+                'deleteRecordingComments'
+            ),
+            // One statement: the children's foreign keys are NO ACTION, so separate deletes would have to run child-first.
+            // The AsyncDeletion row (deletion_type 5 = Event) queues the observation's $recording_observed event for the ClickHouse sweep, atomically with the delete.
+            this.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `WITH observations AS (
+                     SELECT id FROM replay_vision_replayobservation
+                     WHERE team_id = $1 AND session_id = ANY($2)
+                 ), queued_events AS (
+                     INSERT INTO posthog_asyncdeletion (deletion_type, team_id, key, created_at)
+                     SELECT 5, $1, id::text, now() FROM observations
+                     ON CONFLICT DO NOTHING
+                 ), deleted_labels AS (
+                     DELETE FROM replay_vision_replayobservationlabel
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 ), deleted_views AS (
+                     DELETE FROM replay_vision_replayobservationview
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 ), deleted_matches AS (
+                     DELETE FROM replay_vision_visionalertmatch
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 ), deleted_media AS (
+                     DELETE FROM replay_vision_replayobservationmedia
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 ), deleted_dismissals AS (
+                     DELETE FROM replay_vision_replayobservationfeeddismissal
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 ), deleted_impressions AS (
+                     DELETE FROM replay_vision_replayobservationfeedimpression
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 ), deleted_similarities AS (
+                     DELETE FROM replay_vision_replayobservationanchorsimilarity
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 ), deleted_ranks AS (
+                     DELETE FROM replay_vision_replayobservationrank
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 ), deleted_feed_entries AS (
+                     DELETE FROM replay_vision_replayhighlightfeedentry
+                     WHERE observation_id IN (SELECT id FROM observations)
+                 )
+                 DELETE FROM replay_vision_replayobservation
+                 WHERE id IN (SELECT id FROM observations)`,
+                [teamId, sessionIds],
+                'deleteReplayVisionObservations'
+            ),
+            // Expired, not deleted: the row is the only pointer to the stored object, which the expiry sweep needs.
+            this.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                // `= ANY` over jsonb so the planner can use exportedasset_session; a subquery cannot.
+                `UPDATE posthog_exportedasset
+                 SET expires_after = now()
+                 WHERE team_id = $1
+                   AND expires_after > now()
+                   AND export_context -> 'session_recording_id' = ANY($2::jsonb[])`,
+                [teamId, sessionIds.map((sessionId) => JSON.stringify(sessionId))],
+                'expireRecordingExports'
+            ),
+        ])
+
+        const failures: string[] = []
+        for (const [i, result] of results.entries()) {
+            if (result.status === 'rejected') {
+                failures.push(tables[i])
+            }
+        }
+
+        if (failures.length > 0) {
+            throw new Error(`Failed to delete from: ${failures.join(', ')}`)
+        }
+
+        logger.info('[RecordingService] PostgreSQL records deleted', { teamId, sessionCount: sessionIds.length })
+    }
+
+    private async logActivity(sessionIds: string[], teamId: number, deletedBy: string): Promise<void> {
+        if (sessionIds.length === 0 || !this.postgres) {
+            return
+        }
+
+        const detail = JSON.stringify({ type: 'recording_shredded', deleted_by: deletedBy })
+        await this.postgres.query(
+            PostgresUse.COMMON_WRITE,
+            `INSERT INTO posthog_activitylog (id, team_id, is_system, activity, item_id, scope, detail, created_at)
+             SELECT gen_random_uuid(), $1, true, 'deleted', unnest($2::text[]), 'Replay', $3::jsonb, now()`,
+            [teamId, sessionIds, detail],
+            'logRecordingDeletion'
+        )
+    }
+}
