@@ -1,0 +1,390 @@
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * MCP service uses these Zod schemas for generated tool handlers.
+ * To regenerate: hogli build:openapi
+ *
+ * PostHog API - MCP 13 enabled ops
+ * OpenAPI spec version: 1.0.0
+ */
+import * as zod from 'zod'
+
+export const IntegrationsListParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const IntegrationsListQueryParams = () => zod.object({
+    kind: zod
+        .enum([
+            'anthropic',
+            'apns',
+            'apple-ads',
+            'aws-redshift',
+            'aws-s3',
+            'azure-blob',
+            'bing-ads',
+            'clickup',
+            'customerio-app',
+            'customerio-track',
+            'customerio-webhook',
+            'databricks',
+            'email',
+            'email_sandbox',
+            'firebase',
+            'github',
+            'gitlab',
+            'google-ads',
+            'google-analytics',
+            'google-calendar',
+            'google-cloud-service-account',
+            'google-cloud-storage',
+            'google-pubsub',
+            'google-search-console',
+            'google-sheets',
+            'helpscout',
+            'hubspot',
+            'instagram',
+            'intercom',
+            'jira',
+            'linear',
+            'linkedin-ads',
+            'meta-ads',
+            'motherduck',
+            'pardot',
+            'pinterest-ads',
+            'postgresql',
+            'posthog',
+            'reddit-ads',
+            'resend',
+            's3-compatible',
+            'salesforce',
+            'slack',
+            'slack-posthog-code',
+            'snapchat',
+            'snowflake',
+            'stripe',
+            'tiktok-ads',
+            'twilio',
+            'twitter-ads',
+            'vercel',
+            'youtube-analytics',
+        ])
+        .optional()
+        .describe(
+            '\* `anthropic` - Anthropic\n\* `apple-ads` - Apple Ads\n\* `apns` - Apple Push\n\* `aws-redshift` - Aws Redshift\n\* `aws-s3` - Aws S3\n\* `azure-blob` - Azure Blob\n\* `bing-ads` - Bing Ads\n\* `clickup` - Clickup\n\* `customerio-app` - Customerio App\n\* `customerio-track` - Customerio Track\n\* `customerio-webhook` - Customerio Webhook\n\* `databricks` - Databricks\n\* `email` - Email\n\* `email_sandbox` - Email Sandbox\n\* `firebase` - Firebase\n\* `github` - Github\n\* `gitlab` - Gitlab\n\* `google-ads` - Google Ads\n\* `google-analytics` - Google Analytics\n\* `google-calendar` - Google Calendar\n\* `google-cloud-service-account` - Google Cloud Service Account\n\* `google-cloud-storage` - Google Cloud Storage\n\* `google-pubsub` - Google Pubsub\n\* `google-search-console` - Google Search Console\n\* `google-sheets` - Google Sheets\n\* `helpscout` - Helpscout\n\* `hubspot` - Hubspot\n\* `instagram` - Instagram\n\* `intercom` - Intercom\n\* `jira` - Jira\n\* `linear` - Linear\n\* `linkedin-ads` - Linkedin Ads\n\* `meta-ads` - Meta Ads\n\* `motherduck` - Motherduck\n\* `pardot` - Pardot\n\* `pinterest-ads` - Pinterest Ads\n\* `postgresql` - Postgresql\n\* `posthog` - Posthog\n\* `reddit-ads` - Reddit Ads\n\* `twitter-ads` - Twitter Ads\n\* `resend` - Resend\n\* `s3-compatible` - S3 Compatible\n\* `salesforce` - Salesforce\n\* `slack` - Slack\n\* `slack-posthog-code` - Slack Posthog Code\n\* `snapchat` - Snapchat\n\* `snowflake` - Snowflake\n\* `stripe` - Stripe\n\* `tiktok-ads` - Tiktok Ads\n\* `twilio` - Twilio\n\* `vercel` - Vercel\n\* `youtube-analytics` - Youtube Analytics'
+        ),
+    limit: zod.number().optional().describe('Number of results to return per page.'),
+    offset: zod.number().optional().describe('The initial index from which to return the results.'),
+})
+
+export const IntegrationsCreateParams = () => zod.object({
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const IntegrationsCreateBody = () => zod
+    .object({
+        config: zod.unknown().optional(),
+    })
+    .describe('The request schema of a create. A create accepts only the public kinds, so the schema lists them.')
+
+export const IntegrationsRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const IntegrationsDestroyParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const IntegrationsChannelsRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const integrationsChannelsRetrieveQueryChannelIdDefault = ``
+export const integrationsChannelsRetrieveQueryForceRefreshDefault = false
+export const integrationsChannelsRetrieveQueryLimitDefault = 50
+export const integrationsChannelsRetrieveQueryLimitMax = 200
+
+export const integrationsChannelsRetrieveQueryOffsetDefault = 0
+export const integrationsChannelsRetrieveQueryOffsetMin = 0
+
+export const integrationsChannelsRetrieveQuerySearchDefault = ``
+
+export const IntegrationsChannelsRetrieveQueryParams = () => zod.object({
+    channel_id: zod
+        .string()
+        .default(integrationsChannelsRetrieveQueryChannelIdDefault)
+        .describe(
+            'Look up one channel directly by Slack channel ID (e.g. C0123ABC). When set, `search`, `limit`, and `offset` are ignored and the response holds at most that channel.'
+        ),
+    force_refresh: zod
+        .boolean()
+        .default(integrationsChannelsRetrieveQueryForceRefreshDefault)
+        .describe(
+            "Bypass the 1 hour channel cache, including for a `channel_id` lookup, which is how a caller reads the channel's current membership after inviting the app to it. Honored only for browser session callers; API key, OAuth, and MCP callers always read through the cache."
+        ),
+    limit: zod
+        .number()
+        .min(1)
+        .max(integrationsChannelsRetrieveQueryLimitMax)
+        .default(integrationsChannelsRetrieveQueryLimitDefault)
+        .describe('Maximum number of channels to return per request (max 200).'),
+    offset: zod
+        .number()
+        .min(integrationsChannelsRetrieveQueryOffsetMin)
+        .default(integrationsChannelsRetrieveQueryOffsetDefault)
+        .describe('Number of channels to skip before returning results.'),
+    search: zod
+        .string()
+        .default(integrationsChannelsRetrieveQuerySearchDefault)
+        .describe('Optional case-insensitive channel name or ID search query.'),
+})
+
+/**
+ * Read the setup progress of an email sender's domain from SES and public DNS without changing either. Poll this until status is verified, then call email/verify once so the sender can send.
+ * @summary Get email sending domain status
+ */
+export const IntegrationsEmailStatusRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const integrationsEmailStatusRetrieveQueryRefreshDefault = false
+
+export const IntegrationsEmailStatusRetrieveQueryParams = () => zod.object({
+    refresh: zod
+        .boolean()
+        .default(integrationsEmailStatusRetrieveQueryRefreshDefault)
+        .describe('Skip the 10 second status cache and read SES and DNS again. Use it after changing DNS records.'),
+})
+
+/**
+ * Ask SES to check the domain's DNS records again. When SES has verified the domain, mark the domain's senders as verified so they can send. Call it once email/status reports status verified.
+ * @summary Verify an email sending domain
+ */
+export const IntegrationsEmailVerifyCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const IntegrationsGithubReposRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const integrationsGithubReposRetrieveQueryCompactDefault = false
+export const integrationsGithubReposRetrieveQueryLimitDefault = 100
+export const integrationsGithubReposRetrieveQueryLimitMax = 500
+
+export const integrationsGithubReposRetrieveQueryOffsetDefault = 0
+export const integrationsGithubReposRetrieveQueryOffsetMin = 0
+
+export const integrationsGithubReposRetrieveQuerySearchDefault = ``
+
+export const IntegrationsGithubReposRetrieveQueryParams = () => zod.object({
+    compact: zod
+        .boolean()
+        .default(integrationsGithubReposRetrieveQueryCompactDefault)
+        .describe(
+            'When true, return only id, name, and full_name for each repository. Use it to list large rosters in fewer, smaller pages.'
+        ),
+    limit: zod
+        .number()
+        .min(1)
+        .max(integrationsGithubReposRetrieveQueryLimitMax)
+        .default(integrationsGithubReposRetrieveQueryLimitDefault)
+        .describe('Maximum number of repositories to return per request (max 500).'),
+    offset: zod
+        .number()
+        .min(integrationsGithubReposRetrieveQueryOffsetMin)
+        .default(integrationsGithubReposRetrieveQueryOffsetDefault)
+        .describe('Number of repositories to skip before returning results.'),
+    search: zod
+        .string()
+        .default(integrationsGithubReposRetrieveQuerySearchDefault)
+        .describe('Optional case-insensitive repository name search query.'),
+})
+
+export const IntegrationsJiraProjectsRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const IntegrationsLinearTeamsRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+/**
+ * Register existing device tokens, for example exported from another provider, on this push channel. Each token is stored encrypted on its person, as the mobile SDK stores it. A row fails when no person has its distinct ID, unless create_missing_persons is set, or when the token is the wrong kind for the channel. Send dry_run first to see every failure without storing anything.
+ * @summary Import push device tokens
+ */
+export const IntegrationsPushTokensCreateParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const integrationsPushTokensCreateBodySubscriptionsItemDistinctIdMax = 200
+
+export const integrationsPushTokensCreateBodySubscriptionsItemDeviceTokenMax = 4096
+
+export const integrationsPushTokensCreateBodyDryRunDefault = false
+export const integrationsPushTokensCreateBodyCreateMissingPersonsDefault = false
+
+export const IntegrationsPushTokensCreateBody = () => zod.object({
+    subscriptions: zod
+        .array(
+            zod.object({
+                distinct_id: zod
+                    .string()
+                    .max(integrationsPushTokensCreateBodySubscriptionsItemDistinctIdMax)
+                    .describe("The person's distinct ID in this project: the ID your app passes to `identify`."),
+                device_token: zod
+                    .string()
+                    .max(integrationsPushTokensCreateBodySubscriptionsItemDeviceTokenMax)
+                    .describe(
+                        'The token of one device. An APNs channel takes the hex APNs device token. A Firebase channel takes the FCM registration token. Expo push tokens are not accepted.'
+                    ),
+            })
+        )
+        .describe('Up to 1000 devices to register on this push channel. List a person once per device.'),
+    dry_run: zod
+        .boolean()
+        .default(integrationsPushTokensCreateBodyDryRunDefault)
+        .describe(
+            'Check every row and report what would fail, without storing anything. Run this first and fix the failed rows before importing.'
+        ),
+    import_id: zod
+        .string()
+        .nullish()
+        .describe(
+            'A new UUID for each batch. Send the same value when you retry that batch, so a retried batch can be recognized as a repeat.'
+        ),
+    create_missing_persons: zod
+        .boolean()
+        .default(integrationsPushTokensCreateBodyCreateMissingPersonsDefault)
+        .describe(
+            "Create a person for a distinct ID that has none. Off by default, because a distinct ID that does not match your app's identify call creates a person that never gets a push."
+        ),
+})
+
+export const IntegrationsUsersRetrieveParams = () => zod.object({
+    id: zod.number().describe('A unique integer value identifying this integration.'),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const integrationsUsersRetrieveQueryForceRefreshDefault = false
+export const integrationsUsersRetrieveQueryLimitDefault = 50
+export const integrationsUsersRetrieveQueryLimitMax = 200
+
+export const integrationsUsersRetrieveQueryOffsetDefault = 0
+export const integrationsUsersRetrieveQueryOffsetMin = 0
+
+export const integrationsUsersRetrieveQuerySearchDefault = ``
+export const integrationsUsersRetrieveQueryUserIdDefault = ``
+
+export const IntegrationsUsersRetrieveQueryParams = () => zod.object({
+    force_refresh: zod
+        .boolean()
+        .default(integrationsUsersRetrieveQueryForceRefreshDefault)
+        .describe(
+            'Bypass the 1 hour member cache. Honored only for browser session callers; API key, OAuth, and MCP callers always read through the cache.'
+        ),
+    limit: zod
+        .number()
+        .min(1)
+        .max(integrationsUsersRetrieveQueryLimitMax)
+        .default(integrationsUsersRetrieveQueryLimitDefault)
+        .describe('Maximum number of members to return per request (max 200).'),
+    offset: zod
+        .number()
+        .min(integrationsUsersRetrieveQueryOffsetMin)
+        .default(integrationsUsersRetrieveQueryOffsetDefault)
+        .describe('Number of members to skip before returning results.'),
+    search: zod
+        .string()
+        .default(integrationsUsersRetrieveQuerySearchDefault)
+        .describe('Optional case-insensitive member name or ID search query.'),
+    user_id: zod
+        .string()
+        .default(integrationsUsersRetrieveQueryUserIdDefault)
+        .describe(
+            'Look up one member directly by Slack member ID (e.g. U0123ABC). When set, `search`, `limit`, and `offset` are ignored and the response holds at most that member.'
+        ),
+})
+
+/**
+ * Replay an API request against the connected PostHog project. The server injects the connection's token; the response is passed through.
+ * @summary Forward a request through a PostHog connection
+ */
+export const PosthogConnectionsForwardCreateParams = () => zod.object({
+    id: zod.string(),
+    project_id: zod
+        .string()
+        .describe(
+            "Project ID of the project you're trying to access. To find the ID of the project, make a call to \/api\/projects\/."
+        ),
+})
+
+export const PosthogConnectionsForwardCreateBody = () => zod.object({
+    method: zod
+        .enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+        .describe('\* `GET` - GET\n\* `POST` - POST\n\* `PUT` - PUT\n\* `PATCH` - PATCH\n\* `DELETE` - DELETE')
+        .describe(
+            "HTTP method to use against the target project's API.\n\n\* `GET` - GET\n\* `POST` - POST\n\* `PUT` - PUT\n\* `PATCH` - PATCH\n\* `DELETE` - DELETE"
+        ),
+    path: zod
+        .string()
+        .describe('Relative target API path with no host or scheme, e.g. `api\/projects\/2\/insights\/`.'),
+    query: zod.record(zod.string(), zod.string()).optional().describe('Query parameters to send to the target.'),
+    data: zod.unknown().optional().describe('JSON request body for write methods.'),
+})

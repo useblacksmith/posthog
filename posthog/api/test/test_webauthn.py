@@ -1,0 +1,810 @@
+import uuid
+from importlib import import_module
+
+from posthog.test.base import APIBaseTest
+from unittest.mock import MagicMock, patch
+
+from django.conf import settings
+from django.contrib.auth import SESSION_KEY
+from django.utils import timezone
+
+from parameterized import parameterized
+from rest_framework import status
+from rest_framework.exceptions import AuthenticationFailed
+from webauthn.helpers import bytes_to_base64url
+
+from posthog.api.webauthn import (
+    PASSKEY_NOT_REGISTERED_ERROR,
+    PASSKEY_NOT_VERIFIED_ERROR,
+    WEBAUTHN_REGISTRATION_CHALLENGE_KEY,
+    WebAuthnLoginViewSet,
+    user_uuid_to_handle,
+)
+from posthog.auth import WebauthnBackend
+from posthog.models import Organization, User
+from posthog.models.identity_provider_config import IdentityProviderConfig
+from posthog.models.linked_identity_provider_config import LinkedIdentityProviderConfig
+from posthog.models.organization_domain import OrganizationDomain
+from posthog.models.webauthn_credential import WebauthnCredential
+from posthog.session.models import Session
+
+
+def _enforce_sso(user: User, organization: Organization) -> None:
+    email_domain = user.email.split("@", 1)[1]
+    organization.available_product_features = [
+        {"key": "sso_enforcement", "name": "sso_enforcement"},
+        {"key": "saml", "name": "saml"},
+    ]
+    organization.save()
+
+    domain = OrganizationDomain.objects.create(
+        domain=email_domain,
+        organization=organization,
+        verified_at=timezone.now(),
+        sso_enforcement="saml",
+    )
+    config = IdentityProviderConfig.objects.create(
+        organization=organization,
+        config_scope="saml",
+        domain_scope="all",
+        saml_entity_id="https://idp.example.com",
+        saml_acs_url="https://idp.example.com/saml",
+        saml_x509_cert="test-certificate",
+    )
+    LinkedIdentityProviderConfig.objects.create(organization_domain=domain, identity_provider_config=config)
+
+
+class TestWebAuthnRegistration(APIBaseTest):
+    """Tests for WebAuthn passkey registration flow."""
+
+    def test_registration_begin_requires_authentication(self):
+        self.client.logout()
+        response = self.client.post("/api/webauthn/register/begin/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_registration_begin_returns_options(self):
+        response = self.client.post("/api/webauthn/register/begin/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        data = response.json()
+        self.assertIn("rp", data)
+        self.assertIn("user", data)
+        self.assertIn("challenge", data)
+        self.assertIn("pubKeyCredParams", data)
+        self.assertIn("timeout", data)
+        self.assertIn("authenticatorSelection", data)
+
+        self.assertEqual(data["rp"]["name"], "PostHog")
+        self.assertEqual(data["user"]["name"], self.user.email)
+        self.assertEqual(data["authenticatorSelection"]["residentKey"], "required")
+
+    def test_registration_begin_excludes_existing_credentials(self):
+        WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"existing-credential-id",
+            label="Existing Passkey",
+            public_key=b"public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=True,
+        )
+
+        response = self.client.post("/api/webauthn/register/begin/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        data = response.json()
+        self.assertEqual(len(data["excludeCredentials"]), 1)
+
+    def test_registration_begin_disallowed_when_sso_enforced(self):
+        _enforce_sso(self.user, self.organization)
+
+        response = self.client.post("/api/webauthn/register/begin/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("requires SSO", response.json().get("detail", ""))
+
+    def test_registration_complete_disallowed_when_sso_enforced(self):
+        _enforce_sso(self.user, self.organization)
+
+        session = self.client.session
+        session[WEBAUTHN_REGISTRATION_CHALLENGE_KEY] = "dummy"
+        session.save()
+
+        response = self.client.post("/api/webauthn/register/complete/", {}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("requires SSO", response.json().get("detail", ""))
+
+    def test_registration_complete_without_challenge_fails(self):
+        response = self.client.post("/api/webauthn/register/complete/", {})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("error", response.json())
+
+    @patch("posthog.api.webauthn.decode_credential_public_key")
+    @patch("posthog.api.webauthn.verify_passkey_registration_response")
+    def test_registration_complete_stores_unverified_credential(self, mock_verify, mock_decode):
+        begin_response = self.client.post("/api/webauthn/register/begin/")
+        self.assertEqual(begin_response.status_code, status.HTTP_200_OK)
+
+        mock_verify.return_value = MagicMock(
+            credential_id=b"new-credential-id",
+            credential_public_key=b"public-key-bytes",
+            sign_count=0,
+        )
+        mock_decode.return_value = MagicMock(alg=-7)
+
+        complete_response = self.client.post(
+            "/api/webauthn/register/complete/",
+            {
+                "id": "base64url-encoded-id",
+                "rawId": "base64url-encoded-raw-id",
+                "type": "public-key",
+                "response": {
+                    "attestationObject": "base64url-encoded",
+                    "clientDataJSON": "base64url-encoded",
+                    "transports": ["internal", "hybrid"],
+                },
+                "label": "My New Passkey",
+            },
+            format="json",
+        )
+        self.assertEqual(complete_response.status_code, status.HTTP_200_OK)
+
+        data = complete_response.json()
+        self.assertTrue(data["success"])
+        self.assertIn("credential_id", data)
+
+        credential = WebauthnCredential.objects.get(pk=data["credential_id"])
+        self.assertEqual(credential.user, self.user)
+        self.assertEqual(credential.label, "My New Passkey")
+        self.assertFalse(credential.verified)
+
+
+class TestWebAuthnLogin(APIBaseTest):
+    """Tests for WebAuthn passkey login flow."""
+
+    CONFIG_AUTO_LOGIN = False
+
+    def setUp(self):
+        super().setUp()
+        self.credential = WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"test-credential-id",
+            label="Test Passkey",
+            public_key=b"test-public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=True,
+        )
+
+    def test_login_begin_returns_options(self):
+        response = self.client.post("/api/webauthn/login/begin/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        data = response.json()
+        self.assertIn("challenge", data)
+        self.assertIn("timeout", data)
+        self.assertIn("rpId", data)
+        self.assertEqual(data["allowCredentials"], [])
+        self.assertEqual(data["userVerification"], "required")
+
+    def test_login_complete_without_challenge_fails(self):
+        response = self.client.post("/api/webauthn/login/complete/", {})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @parameterized.expand(
+        [
+            (
+                "missing_user_handle",
+                {"authenticatorData": "data", "clientDataJSON": "data", "signature": "sig"},
+                "some-raw-id",
+                "userHandle",
+            ),
+            (
+                "missing_raw_id",
+                {"authenticatorData": "data", "clientDataJSON": "data", "signature": "sig", "userHandle": "handle"},
+                None,
+                "credential ID",
+            ),
+            (
+                "missing_signature",
+                {"authenticatorData": "data", "clientDataJSON": "data", "userHandle": "handle"},
+                "some-raw-id",
+                "Missing required fields",
+            ),
+        ]
+    )
+    def test_login_complete_with_unreadable_assertion_fails(
+        self, _name: str, response_data: dict, raw_id: str | None, expected_error: str
+    ):
+        self.client.post("/api/webauthn/login/begin/")
+
+        payload = {"id": "some-id", "type": "public-key", "response": response_data}
+        if raw_id is not None:
+            payload["rawId"] = raw_id
+
+        response = self.client.post("/api/webauthn/login/complete/", payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(expected_error, response.json()["error"])
+
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_login_complete_success(self, mock_verify):
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.api.webauthn import user_uuid_to_handle
+
+        self.client.post("/api/webauthn/login/begin/")
+
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        # user handle is the user.uuid encoded as bytes
+        user_handle = user_uuid_to_handle(self.user.uuid)
+
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(self.credential.credential_id),
+                "rawId": bytes_to_base64url(self.credential.credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(user_handle),
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.json()["success"])
+
+        me_response = self.client.get("/api/users/@me/")
+        self.assertEqual(me_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(me_response.json()["email"], self.user.email)
+
+    def test_backend_does_not_restore_session_for_inactive_user(self):
+        # A queryset update skips the pre_save signal that revokes sessions on deactivation.
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+
+        self.assertIsNone(WebauthnBackend().get_user(self.user.pk))
+
+    @patch(
+        "posthog.api.webauthn.refuse_blocked_account",
+        side_effect=AuthenticationFailed("We couldn't sign you in.", code="access_blocked"),
+    )
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_login_complete_is_refused_by_an_access_rule(self, mock_verify, _refuse):
+        self.client.logout()
+        self.client.post("/api/webauthn/login/begin/")
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(self.credential.credential_id),
+                "rawId": bytes_to_base64url(self.credential.credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(user_uuid_to_handle(self.user.uuid)),
+                },
+            },
+            format="json",
+        )
+
+        # The view's catch-all would turn the refusal into a generic 400 and hide its code.
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED, response.content)
+        self.assertEqual(response.json()["code"], "access_blocked")
+        self.assertEqual(self.client.get("/api/users/@me/").status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @patch("posthog.api.authentication.is_email_available", return_value=True)
+    @patch("posthog.api.authentication.email_verification_code_verifier.send_code")
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_login_blocks_explicitly_unverified_email_accounts(
+        self, mock_verify, mock_send_email_verification, mock_is_email_available
+    ):
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.api.webauthn import user_uuid_to_handle
+
+        self.user.is_email_verified = False
+        self.user.save()
+
+        self.client.post("/api/webauthn/login/begin/")
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        user_handle = user_uuid_to_handle(self.user.uuid)
+
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(self.credential.credential_id),
+                "rawId": bytes_to_base64url(self.credential.credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(user_handle),
+                },
+            },
+            format="json",
+        )
+        # The contract is the same as the password login path: the frontend uses the
+        # uuid to route to the code entry page at /verify_email/<uuid>.
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.json()["code"], "verify_email_pending")
+        self.assertEqual(response.json()["detail"], str(self.user.uuid))
+
+        me_response = self.client.get("/api/users/@me/")
+        self.assertEqual(me_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        mock_is_email_available.assert_called_once()
+        mock_send_email_verification.assert_called_once_with(self.user)
+
+    @parameterized.expand(
+        [
+            ("unverified_credential", False, b"test-credential-id", False, PASSKEY_NOT_REGISTERED_ERROR),
+            ("unknown_credential", True, b"removed-credential-id", False, PASSKEY_NOT_REGISTERED_ERROR),
+            ("failed_assertion", True, b"test-credential-id", True, PASSKEY_NOT_VERIFIED_ERROR),
+        ]
+    )
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_login_failure_names_the_cause(
+        self,
+        _name: str,
+        credential_verified: bool,
+        presented_credential_id: bytes,
+        assertion_fails: bool,
+        expected_error: str,
+        mock_verify,
+    ):
+        self.credential.verified = credential_verified
+        self.credential.save()
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+        if assertion_fails:
+            mock_verify.side_effect = Exception("signature mismatch")
+
+        self.client.post("/api/webauthn/login/begin/")
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(presented_credential_id),
+                "rawId": bytes_to_base64url(presented_credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(user_uuid_to_handle(self.user.uuid)),
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["error"], expected_error)
+
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_login_rejects_spoofed_user_handle(self, mock_verify):
+        """Spoofed userHandle pointing to a different user must be rejected."""
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.api.webauthn import user_uuid_to_handle
+
+        other_user = User.objects.create_and_join(self.organization, "other@posthog.com", "password123")
+
+        self.client.post("/api/webauthn/login/begin/")
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        # Credential belongs to self.user, but userHandle points to other_user
+        spoofed_handle = user_uuid_to_handle(other_user.uuid)
+
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(self.credential.credential_id),
+                "rawId": bytes_to_base64url(self.credential.credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(spoofed_handle),
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("authentication failed", response.json()["error"].lower())
+
+        # Verify the user is NOT logged in
+        me_response = self.client.get("/api/users/@me/")
+        self.assertEqual(me_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_login_rejects_nonexistent_user_handle(self, mock_verify):
+        """userHandle pointing to a nonexistent user must be rejected."""
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.api.webauthn import user_uuid_to_handle
+
+        self.client.post("/api/webauthn/login/begin/")
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        # userHandle points to a UUID that doesn't exist
+        fake_handle = user_uuid_to_handle(uuid.uuid4())
+
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(self.credential.credential_id),
+                "rawId": bytes_to_base64url(self.credential.credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(fake_handle),
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("authentication failed", response.json()["error"].lower())
+
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_login_enforces_sso_against_authenticated_user(self, mock_verify):
+        """SSO enforcement must be checked against the cryptographically verified user,
+        not the unverified userHandle."""
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.api.webauthn import user_uuid_to_handle
+
+        _enforce_sso(self.user, self.organization)
+
+        self.client.post("/api/webauthn/login/begin/")
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        user_handle = user_uuid_to_handle(self.user.uuid)
+
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(self.credential.credential_id),
+                "rawId": bytes_to_base64url(self.credential.credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(user_handle),
+                },
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        body = response.json()
+        self.assertIn("SSO", body["error"])
+        self.assertEqual(body["code"], "sso_enforced")
+        self.assertEqual(body["sso_enforcement"], "saml")
+        self.assertEqual(body["email"], self.user.email)
+
+        # Verify the user is NOT logged in
+        me_response = self.client.get("/api/users/@me/")
+        self.assertEqual(me_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_login_blocked_for_member_when_org_requires_verified_domain(self, mock_verify):
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.api.webauthn import user_uuid_to_handle
+
+        self.organization.enforce_verified_domains = True
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
+        self.client.post("/api/webauthn/login/begin/")
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        user_handle = user_uuid_to_handle(self.user.uuid)
+
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(self.credential.credential_id),
+                "rawId": bytes_to_base64url(self.credential.credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(user_handle),
+                },
+            },
+            format="json",
+        )
+        # A blocked member is refused; only blocked admins get the gated session (covered in the
+        # password login tests, where the escape-hatch loop is exercised).
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("verified email domain", response.json()["error"])
+        self.assertEqual(self.client.get("/api/users/@me/").status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_spoofed_user_handle_cannot_bypass_sso_enforcement(self, mock_verify):
+        """An attacker with a valid passkey cannot bypass SSO enforcement by spoofing
+        the userHandle to point to a user without SSO enforcement."""
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.api.webauthn import user_uuid_to_handle
+
+        # Create a second user in a different org without SSO enforcement
+        from posthog.models.organization import Organization
+
+        other_org = Organization.objects.create(name="No SSO Org")
+        non_sso_user = User.objects.create_and_join(other_org, "nosso@other.com", "password123")
+
+        # Enforce SSO for the credential owner's domain
+        email_domain = self.user.email.split("@", 1)[1]
+        self.organization.available_product_features = [
+            {"key": "sso_enforcement", "name": "sso_enforcement"},
+            {"key": "saml", "name": "saml"},
+        ]
+        self.organization.save()
+
+        OrganizationDomain.objects.create(
+            domain=email_domain,
+            organization=self.organization,
+            verified_at=timezone.now(),
+            sso_enforcement="saml",
+        )
+
+        self.client.post("/api/webauthn/login/begin/")
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        # Attacker spoofs userHandle to point to the non-SSO user
+        spoofed_handle = user_uuid_to_handle(non_sso_user.uuid)
+
+        response = self.client.post(
+            "/api/webauthn/login/complete/",
+            {
+                "id": bytes_to_base64url(self.credential.credential_id),
+                "rawId": bytes_to_base64url(self.credential.credential_id),
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "data",
+                    "clientDataJSON": "data",
+                    "signature": "sig",
+                    "userHandle": bytes_to_base64url(spoofed_handle),
+                },
+            },
+            format="json",
+        )
+        # The mismatch check should reject this before even reaching SSO checks
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("authentication failed", response.json()["error"].lower())
+
+        # Verify the user is NOT logged in
+        me_response = self.client.get("/api/users/@me/")
+        self.assertEqual(me_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @patch("posthog.auth.verify_passkey_authentication_response")
+    def test_spoofed_user_handle_records_failure_against_verified_user(self, mock_verify):
+        """A spoofed userHandle mismatch must record an axes failure against the
+        credential owner (verified user), so repeated attempts trigger rate limiting."""
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.api.webauthn import user_uuid_to_handle
+
+        other_user = User.objects.create_and_join(self.organization, "other@posthog.com", "password123")
+        spoofed_handle = user_uuid_to_handle(other_user.uuid)
+
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        with patch.object(
+            WebAuthnLoginViewSet,
+            "_handle_authentication_failure",
+            wraps=WebAuthnLoginViewSet()._handle_authentication_failure,
+        ) as mock_handle_failure:
+            self.client.post("/api/webauthn/login/begin/")
+            self.client.post(
+                "/api/webauthn/login/complete/",
+                {
+                    "id": bytes_to_base64url(self.credential.credential_id),
+                    "rawId": bytes_to_base64url(self.credential.credential_id),
+                    "type": "public-key",
+                    "response": {
+                        "authenticatorData": "data",
+                        "clientDataJSON": "data",
+                        "signature": "sig",
+                        "userHandle": bytes_to_base64url(spoofed_handle),
+                    },
+                },
+                format="json",
+            )
+
+            mock_handle_failure.assert_called_once()
+            # The failure must be recorded against the verified user (credential owner),
+            # not the spoofed user from userHandle
+            call_args = mock_handle_failure.call_args
+            recorded_user = call_args[0][1]
+            self.assertEqual(recorded_user.pk, self.user.pk)
+
+
+class TestWebAuthnCredentialManagement(APIBaseTest):
+    """Tests for WebAuthn credential CRUD operations."""
+
+    def setUp(self):
+        super().setUp()
+        self.credential = WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"test-credential-id",
+            label="My Passkey",
+            public_key=b"public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=True,
+        )
+
+    def test_list_credentials_requires_auth(self):
+        self.client.logout()
+        response = self.client.get("/api/webauthn/credentials/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_list_credentials_returns_all(self):
+        WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"unverified-credential",
+            label="Unverified",
+            public_key=b"public-key",
+            algorithm=-7,
+            counter=0,
+            transports=[],
+            verified=False,
+        )
+
+        response = self.client.get("/api/webauthn/credentials/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        credentials = response.json()
+        self.assertEqual(len(credentials), 2)
+
+    def test_list_credentials_only_returns_own(self):
+        other_user = User.objects.create_and_join(self.organization, "other@posthog.com", "password123")
+        WebauthnCredential.objects.create(
+            user=other_user,
+            credential_id=b"other-credential",
+            label="Other User Passkey",
+            public_key=b"public-key",
+            algorithm=-7,
+            counter=0,
+            transports=[],
+            verified=True,
+        )
+
+        response = self.client.get("/api/webauthn/credentials/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        credentials = response.json()
+        self.assertEqual(len(credentials), 1)
+        self.assertEqual(credentials[0]["label"], "My Passkey")
+
+    @patch("posthog.api.webauthn.send_passkey_removed_email")
+    def test_delete_credential(self, mock_send_email):
+        response = self.client.delete(f"/api/webauthn/credentials/{self.credential.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        mock_send_email.delay.assert_called_once_with(self.user.id)
+        self.assertFalse(WebauthnCredential.objects.filter(pk=self.credential.pk).exists())
+
+    def test_delete_nonexistent_credential(self):
+        response = self.client.delete(f"/api/webauthn/credentials/{uuid.uuid4()}/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_delete_other_users_credential_fails(self):
+        other_user = User.objects.create_and_join(self.organization, "other@posthog.com", "password123")
+        other_credential = WebauthnCredential.objects.create(
+            user=other_user,
+            credential_id=b"other-credential",
+            label="Other Passkey",
+            public_key=b"public-key",
+            algorithm=-7,
+            counter=0,
+            transports=[],
+            verified=True,
+        )
+
+        response = self.client.delete(f"/api/webauthn/credentials/{other_credential.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_rename_credential(self):
+        response = self.client.patch(
+            f"/api/webauthn/credentials/{self.credential.pk}/",
+            {"label": "Renamed Passkey"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["label"], "Renamed Passkey")
+
+        self.credential.refresh_from_db()
+        self.assertEqual(self.credential.label, "Renamed Passkey")
+
+    @patch("posthog.api.webauthn.send_passkey_added_email")
+    @patch("posthog.api.webauthn.verify_passkey_authentication_response")
+    def test_verify_complete_sends_passkey_added_email(self, mock_verify, mock_send_email):
+        unverified_credential = WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"unverified-credential-id",
+            label="Unverified Passkey",
+            public_key=b"public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=False,
+        )
+
+        verify_begin_response = self.client.post(f"/api/webauthn/credentials/{unverified_credential.pk}/verify/")
+        self.assertEqual(verify_begin_response.status_code, status.HTTP_200_OK)
+
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        verify_complete_response = self.client.post(
+            f"/api/webauthn/credentials/{unverified_credential.pk}/verify_complete/",
+            {},
+            format="json",
+        )
+        self.assertEqual(verify_complete_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(verify_complete_response.json()["verified"])
+
+        mock_send_email.delay.assert_called_once_with(self.user.id)
+
+    @patch("posthog.api.webauthn.send_passkey_added_email")
+    @patch("posthog.api.webauthn.verify_passkey_authentication_response")
+    def test_verify_complete_first_passkey_revokes_other_sessions(self, mock_verify, _mock_send_email):
+        # Only the FIRST verified passkey (a new login factor) revokes other sessions.
+        WebauthnCredential.objects.filter(user=self.user).delete()
+        engine = import_module(settings.SESSION_ENGINE)
+        other = engine.SessionStore()
+        other[SESSION_KEY] = str(self.user.pk)
+        other.create()
+
+        unverified = WebauthnCredential.objects.create(
+            user=self.user,
+            credential_id=b"first-passkey-id",
+            label="First",
+            public_key=b"public-key",
+            algorithm=-7,
+            counter=0,
+            transports=["internal"],
+            verified=False,
+        )
+        self.client.post(f"/api/webauthn/credentials/{unverified.pk}/verify/")
+        mock_verify.return_value = MagicMock(new_sign_count=1)
+
+        response = self.client.post(f"/api/webauthn/credentials/{unverified.pk}/verify_complete/", {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertFalse(Session.objects.filter(session_key=other.session_key).exists())
+        # The current session is kept — only OTHER sessions are revoked.
+        self.assertTrue(Session.objects.filter(session_key=self.client.session.session_key).exists())
+
+    @parameterized.expand(
+        [
+            ("empty", "", "Label is required"),
+            ("too_long", "x" * 201, "200 characters"),
+        ]
+    )
+    def test_rename_with_invalid_label(self, name, label, expected_error):
+        response = self.client.patch(
+            f"/api/webauthn/credentials/{self.credential.pk}/",
+            {"label": label},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(expected_error, response.json()["error"])

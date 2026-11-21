@@ -1,0 +1,265 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { handleAuthorize } from '@/handlers/authorize'
+import { hashKey } from '@/lib/kv'
+
+import { createMockKV, mockKVGet } from './helpers'
+
+const mockKV = createMockKV()
+
+beforeEach(() => {
+    vi.clearAllMocks()
+})
+
+describe('handleAuthorize', () => {
+    it('shows region picker when no _region param', async () => {
+        const request = new Request(
+            'https://oauth.posthog.com/oauth/authorize/?client_id=abc&redirect_uri=http://localhost:3000/callback&response_type=code'
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.status).toBe(200)
+        expect(response.headers.get('content-type')).toContain('text/html')
+
+        const html = await response.text()
+        expect(html).toContain('Authenticate with PostHog')
+        expect(html).toContain('US Cloud')
+        expect(html).toContain('EU Cloud')
+    })
+
+    it.each([
+        ['neither region cookie', ''],
+        ['both region cookies', 'ph_authenticated_us=1; ph_authenticated_eu=1'],
+        ['only the Strict cookie the proxy never receives', 'ph_current_instance="https://eu.posthog.com"'],
+    ])('shows region picker with %s', async (_label, cookie) => {
+        const request = new Request(
+            'https://oauth.posthog.com/oauth/authorize/?client_id=abc&redirect_uri=http://localhost:3000/callback&response_type=code',
+            cookie ? { headers: { Cookie: cookie } } : undefined
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.status).toBe(200)
+    })
+
+    it.each([
+        ['us', 'ph_authenticated_us=1', 'https://us.posthog.com/oauth/authorize/'],
+        ['eu', 'ph_authenticated_eu=1', 'https://eu.posthog.com/oauth/authorize/'],
+    ])('redirects to %s without the picker when only that region has a live session', async (_region, cookie, base) => {
+        const request = new Request(
+            'https://oauth.posthog.com/oauth/authorize/?client_id=abc&redirect_uri=http://localhost:3000/callback&response_type=code&state=xyz',
+            { headers: { Cookie: `${cookie}; ph_current_instance="https://us.posthog.com"` } }
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.status).toBe(302)
+        const location = new URL(response.headers.get('location') as string)
+        expect(`${location.origin}${location.pathname}`).toBe(base)
+        expect(location.searchParams.get('client_id')).toBe('abc')
+        expect(location.searchParams.get('_region')).toBeNull()
+    })
+
+    it('redirects to US authorize with translated client_id and proxy callback when _region=us', async () => {
+        const mapping = {
+            us_client_id: 'us_real_id',
+            eu_client_id: 'eu_real_id',
+            redirect_uris: ['http://localhost:3000/callback'],
+            created_at: Date.now(),
+        }
+        mockKVGet(mockKV, (_key: string, type?: unknown) => {
+            if (type === 'json') {
+                return Promise.resolve(mapping)
+            }
+            return Promise.resolve(null)
+        })
+
+        const request = new Request(
+            'https://oauth.posthog.com/oauth/authorize/?client_id=us_real_id&redirect_uri=http://localhost:3000/callback&response_type=code&_region=us'
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.status).toBe(302)
+        const location = new URL(response.headers.get('location')!)
+        expect(location.origin).toBe('https://us.posthog.com')
+        expect(location.pathname).toBe('/oauth/authorize/')
+        expect(location.searchParams.get('client_id')).toBe('us_real_id')
+        expect(location.searchParams.get('redirect_uri')).toBe('https://oauth.posthog.com/oauth/callback/')
+        expect(location.searchParams.has('_region')).toBe(false)
+    })
+
+    it('redirects to EU authorize with translated client_id and proxy callback when _region=eu', async () => {
+        const mapping = {
+            us_client_id: 'us_real_id',
+            eu_client_id: 'eu_real_id',
+            redirect_uris: ['http://localhost:3000/callback'],
+            created_at: Date.now(),
+        }
+        mockKVGet(mockKV, (_key: string, type?: unknown) => {
+            if (type === 'json') {
+                return Promise.resolve(mapping)
+            }
+            return Promise.resolve(null)
+        })
+
+        const request = new Request(
+            'https://oauth.posthog.com/oauth/authorize/?client_id=us_real_id&redirect_uri=http://localhost:3000/callback&response_type=code&_region=eu'
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.status).toBe(302)
+        const location = new URL(response.headers.get('location')!)
+        expect(location.origin).toBe('https://eu.posthog.com')
+        expect(location.pathname).toBe('/oauth/authorize/')
+        expect(location.searchParams.get('client_id')).toBe('eu_real_id')
+        expect(location.searchParams.get('redirect_uri')).toBe('https://oauth.posthog.com/oauth/callback/')
+        expect(location.searchParams.has('_region')).toBe(false)
+    })
+
+    it('rejects unregistered redirect_uri to prevent open redirects', async () => {
+        const mapping = {
+            us_client_id: 'us_id',
+            eu_client_id: 'eu_id',
+            redirect_uris: ['http://localhost:3000/callback'],
+            created_at: Date.now(),
+        }
+        mockKVGet(mockKV, (_key: string, type?: unknown) => {
+            if (type === 'json') {
+                return Promise.resolve(mapping)
+            }
+            return Promise.resolve(null)
+        })
+
+        const request = new Request(
+            'https://oauth.posthog.com/oauth/authorize/?client_id=us_id&redirect_uri=https://attacker.com/steal&response_type=code&state=abc&_region=eu'
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.status).toBe(400)
+        const data = (await response.json()) as Record<string, unknown>
+        expect(data.error).toBe('invalid_request')
+        expect(data.error_description).toBe('redirect_uri is not registered for this client')
+    })
+
+    it('stores region selection and callback redirect_uri keyed by client_id, and a pending callback keyed by nonce', async () => {
+        const mapping = {
+            us_client_id: 'us_id',
+            eu_client_id: 'eu_id',
+            redirect_uris: ['http://localhost:3000/callback'],
+            created_at: Date.now(),
+        }
+        mockKVGet(mockKV, (_key: string, type?: unknown) => {
+            if (type === 'json') {
+                return Promise.resolve(mapping)
+            }
+            return Promise.resolve(null)
+        })
+
+        const request = new Request(
+            'https://oauth.posthog.com/oauth/authorize/?client_id=us_id&redirect_uri=http://localhost:3000/callback&response_type=code&state=abc123&_region=eu'
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        const location = new URL(response.headers.get('location')!)
+        const nonce = location.searchParams.get('state')!
+        expect(nonce).not.toBe('abc123')
+
+        const putCalls = vi.mocked(mockKV.put).mock.calls
+
+        const clientHash = await hashKey('us_id')
+        const nonceHash = await hashKey(nonce)
+
+        const regionByClient = putCalls.find(([key]) => (key as string) === `region:${clientHash}`)
+        expect(regionByClient).toBeTruthy()
+        expect(regionByClient![1]).toBe('eu')
+
+        const callbackByClient = putCalls.find(([key]) => (key as string) === `callback:${clientHash}`)
+        expect(callbackByClient).toBeTruthy()
+        expect(callbackByClient![1]).toBe('http://localhost:3000/callback')
+
+        const pendingByNonce = putCalls.find(([key]) => (key as string) === `pending_callback:${nonceHash}`)
+        expect(pendingByNonce).toBeTruthy()
+        expect(JSON.parse(pendingByNonce![1] as string)).toEqual({
+            redirect_uri: 'http://localhost:3000/callback',
+            state: 'abc123',
+        })
+
+        const stateHash = await hashKey('abc123')
+        expect(putCalls.find(([key]) => (key as string) === `region:${stateHash}`)).toBeUndefined()
+        expect(putCalls.find(([key]) => (key as string) === `callback:${stateHash}`)).toBeUndefined()
+    })
+
+    it('writes bounded-length KV keys even for very large state values, and holds the state in the flow record', async () => {
+        const mapping = {
+            us_client_id: 'us_id',
+            eu_client_id: 'eu_id',
+            redirect_uris: ['http://localhost:3000/callback'],
+            created_at: Date.now(),
+        }
+        mockKVGet(mockKV, (_key: string, type?: unknown) => {
+            if (type === 'json') {
+                return Promise.resolve(mapping)
+            }
+            return Promise.resolve(null)
+        })
+
+        // A JWT-shaped state well above Cloudflare's 512-byte KV key limit.
+        const longState = 'x'.repeat(2000)
+        const request = new Request(
+            `https://oauth.posthog.com/oauth/authorize/?client_id=us_id&redirect_uri=http://localhost:3000/callback&response_type=code&state=${longState}&_region=us`
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.status).toBe(302)
+
+        const location = new URL(response.headers.get('location')!)
+        const nonce = location.searchParams.get('state')!
+        expect(nonce).not.toBe(longState)
+        expect(nonce.length).toBeLessThan(100)
+
+        const putCalls = vi.mocked(mockKV.put).mock.calls
+        expect(putCalls.length).toBeGreaterThan(0)
+        for (const [key] of putCalls) {
+            expect((key as string).length).toBeLessThanOrEqual(512)
+        }
+
+        const nonceHash = await hashKey(nonce)
+        const pendingCallback = putCalls.find(([key]) => (key as string) === `pending_callback:${nonceHash}`)
+        expect(pendingCallback).toBeTruthy()
+        expect((JSON.parse(pendingCallback![1] as string) as { state: string }).state).toBe(longState)
+    })
+
+    it('passes redirect_uri through without interception for legacy clients (no stored redirect_uris)', async () => {
+        const mapping = { us_client_id: 'us_id', eu_client_id: 'eu_id', created_at: Date.now() }
+        mockKVGet(mockKV, (_key: string, type?: unknown) => {
+            if (type === 'json') {
+                return Promise.resolve(mapping)
+            }
+            return Promise.resolve(null)
+        })
+
+        const request = new Request(
+            'https://oauth.posthog.com/oauth/authorize/?client_id=us_id&redirect_uri=http://localhost:3000/callback&response_type=code&_region=eu'
+        )
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.status).toBe(302)
+        const location = new URL(response.headers.get('location')!)
+        expect(location.searchParams.get('redirect_uri')).toBe('http://localhost:3000/callback')
+
+        // No callback redirect_uri should be stored
+        const putCalls = vi.mocked(mockKV.put).mock.calls
+        const callbackPuts = putCalls.filter(([key]) => (key as string).startsWith('callback:'))
+        expect(callbackPuts).toHaveLength(0)
+    })
+
+    it('sets security and cache headers on region picker page', async () => {
+        const request = new Request('https://oauth.posthog.com/oauth/authorize/?client_id=abc&response_type=code')
+        const response = await handleAuthorize(request, mockKV)
+
+        expect(response.headers.get('x-frame-options')).toBe('DENY')
+        expect(response.headers.get('x-content-type-options')).toBe('nosniff')
+        expect(response.headers.get('referrer-policy')).toBe('no-referrer')
+        expect(response.headers.get('cache-control')).toBe(
+            'public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800'
+        )
+    })
+})

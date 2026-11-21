@@ -1,0 +1,3377 @@
+import { MakeLogicType, actions, afterMount, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import posthog from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import {
+    DISPLAY_TYPES_WITHOUT_DETAILED_RESULTS,
+    DISPLAY_TYPES_WITHOUT_LEGEND,
+} from 'lib/components/InsightLegend/utils'
+import { Intervals, intervals } from 'lib/components/IntervalFilter/intervals'
+import { parseProperties } from 'lib/components/PropertyFilters/utils'
+import { dataWarehouseColumnsWithJoins } from 'lib/components/TaxonomicFilter/dataWarehouseColumns'
+import {
+    FEATURE_FLAGS,
+    NON_TIME_SERIES_DISPLAY_TYPES,
+    NON_VALUES_ON_SERIES_DISPLAY_TYPES,
+    PIE_DISPLAY_TYPES,
+} from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { keyForInsightLogicProps } from 'lib/insights/sharedUtils'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { dateMapping, is12HoursOrLess, isLessThan2Days } from 'lib/utils/dateFilters'
+import { objectsEqual } from 'lib/utils/objects'
+import { databaseTableListLogic } from 'scenes/data-management/database/databaseTableListLogic'
+import { dataThemeLogic } from 'scenes/dataThemeLogic'
+import {
+    FLAG_EVALUATIONS_TABLE,
+    FlagCallsRetentionGap,
+    flagCallsRetentionGap,
+    flagEvaluationsRetentionStartDate,
+} from 'scenes/feature-flags/flagEvaluationsTable'
+import { MathAvailability } from 'scenes/insights/filters/ActionFilter/ActionFilterRow/types'
+import { cleanSeriesNodes } from 'scenes/insights/filters/ActionFilter/cleanSeriesNodes'
+import {
+    flagCallsSeriesName,
+    dataWarehouseSeriesNodes,
+    everyWarehouseSeriesReadsFlagCalls,
+    flagCallsBreakdownFromEventBreakdown,
+    readsFlagCalls,
+    withFlagCallsAggregationTarget,
+} from 'scenes/insights/filters/ActionFilter/flagCallsSeries'
+import type { SeriesNode } from 'scenes/insights/filters/ActionFilter/seriesNode'
+import { insightDataLogic } from 'scenes/insights/insightDataLogic'
+import { insightLogic } from 'scenes/insights/insightLogic'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { filterTestAccountsDefaultsLogic } from 'scenes/settings/environment/filterTestAccountDefaultsLogic'
+
+import { actionsModel } from '~/models/actionsModel'
+import { trendsResultsMatchQuery } from '~/queries/nodes/InsightViz/queryUtils'
+import {
+    extractValidationError,
+    extractValidationErrorCode,
+    getAllEventNames,
+    queryFromKind,
+} from '~/queries/nodes/InsightViz/utils'
+import {
+    getBreakdown,
+    getCompareFilter,
+    getDisplay,
+    getFormula,
+    getInterval,
+    getSeries,
+} from '~/queries/schema/node-accessors'
+import {
+    isActionsNode,
+    isAnyDataWarehouseNode,
+    isDataWarehouseNode,
+    isEventsNode,
+    isFunnelsQuery,
+    isInsightQueryNode,
+    isInsightVizNode,
+    isLifecycleDataWarehouseNode,
+    isLifecycleQuery,
+    isNodeWithSource,
+    isPathsQuery,
+    isPathsV2Query,
+    isRetentionQuery,
+    isStickinessQuery,
+    isTrendsQuery,
+    isWebOverviewQuery,
+    isWebStatsTableQuery,
+    hasBreakdownFilter,
+} from '~/queries/schema/node-guards'
+import {
+    AnyDataWarehouseNode,
+    AnyEntityNode,
+    BreakdownFilter,
+    CompareFilter,
+    DatabaseSchemaField,
+    DateRange,
+    FunnelsDataWarehouseNode,
+    FunnelsFilter,
+    FunnelsQuery,
+    GroupNode,
+    InsightFilter,
+    InsightFilterProperty,
+    InsightQueryNode,
+    LifecycleQuery,
+    Node,
+    NodeKind,
+    ProductAnalyticsInsightQueryNode,
+    RetentionQuery,
+    StickinessQuery,
+    TrendsFilter,
+    TrendsFormulaNode,
+    TrendsQuery,
+    VizSpecificOptions,
+} from '~/queries/schema/schema-general'
+import {
+    filterForQuery,
+    filterKeyForQuery,
+    getAggregationGroupTypeIndex,
+    getFormulaNodes,
+    getFormulas,
+    getGoalLines,
+    getLegendPosition,
+    getResultCustomizationBy,
+    getShowAlertThresholdLines,
+    getAnnotationsScope,
+    getShowAnnotations,
+    getShowLabelsOnSeries,
+    getShowLegend,
+    getShowMultipleYAxes,
+    getShowPercentagesOnSeries,
+    getShowPercentStackView,
+    getShowValuesOnSeries,
+    getYAxisScaleType,
+    isWebAnalyticsInsightQuery,
+    nodeKindToFilterProperty,
+    supportsBarValueStacking,
+    supportsPercentStackView,
+} from '~/queries/utils'
+import {
+    BaseMathType,
+    ChartDisplayType,
+    FunnelVizType,
+    InsightLogicProps,
+    IntervalType,
+    LabelGroupType,
+    SlowQueryPossibilities,
+    AnnotationScope,
+} from '~/types'
+
+import { getClampedFunnelStepRange } from 'products/product_analytics/frontend/insights/funnels/funnelUtils'
+import { AggregationType } from 'products/product_analytics/frontend/insights/shared/InsightsTable/insightsTableDataLogic'
+import { BASE_MATH_DEFINITIONS } from 'products/product_analytics/frontend/insights/trends/mathsLogic'
+
+import type { DataColorTheme } from '../../lib/colors'
+import type { FeatureFlagsSet } from '../../lib/logic/featureFlagLogic'
+import type {
+    Breakdown,
+    DataNode,
+    DataWarehouseNode,
+    DatabaseSchemaTable,
+    ErrorTrackingQueryResponse,
+    EventsQueryResponse,
+    FunnelPathsFilter,
+    GoalLine,
+    HogQLAutocompleteResponse,
+    HogQLMetadataResponse,
+    HogQLQueryResponse,
+    HogQueryResponse,
+    LifecycleFilter,
+    LogAttributesQueryResponse,
+    LogValuesQueryResponse,
+    LogsQueryResponse,
+    MetricsQueryResponse,
+    PathsFilter,
+    PathsV2Filter,
+    PathsQuery,
+    RefreshType,
+    ResultCustomizationBy,
+    RetentionFilter,
+    SessionsQueryResponse,
+    StickinessFilter,
+    TraceSpansAggregationQueryResponse,
+    TraceSpansAttributeBreakdownQueryResponse,
+    TraceSpansQueryResponse,
+    TraceSpansTreeQueryResponse,
+    WebOverviewQuery,
+    WebStatsTableQuery,
+} from '../../queries/schema/schema-general'
+import type { PathsV2Query } from '../../queries/schema/schema-general'
+import type { ActionType, AnyPropertyFilter, GroupTypeIndex, PropertyGroupFilter } from '../../types'
+
+const SHOW_TIMEOUT_MESSAGE_AFTER = 5000
+
+// Stable empty list so the allEventNames selector does not recompute while actionsModel is unmounted
+const NO_ACTIONS: ActionType[] = []
+
+// Trends/stickiness displays whose chart renders the in-chart quill legend (line/area/cumulative,
+// bar layouts, and pie). Lifecycle always renders it regardless of display.
+export const DISPLAYS_WITH_IN_CHART_LEGEND = [
+    ChartDisplayType.ActionsLineGraph,
+    ChartDisplayType.ActionsLineGraphCumulative,
+    ChartDisplayType.ActionsAreaGraph,
+    ChartDisplayType.ActionsBar,
+    ChartDisplayType.ActionsUnstackedBar,
+    ChartDisplayType.ActionsPie,
+    ChartDisplayType.ActionsDonut,
+    ChartDisplayType.ActionsProportionBar,
+]
+
+/** The parts a proportion bar draws: one per result row, leaving out a previous period saved with compare on. */
+function proportionBarPartCount(query: InsightQueryNode, insightData: Record<string, any> | null): number | undefined {
+    const result = insightData?.result
+    if (
+        !isTrendsQuery(query) ||
+        query.trendsFilter?.display !== ChartDisplayType.ActionsProportionBar ||
+        !Array.isArray(result)
+    ) {
+        return undefined
+    }
+    return result.reduce((count: number, row) => (row?.compare_label === 'previous' ? count : count + 1), 0)
+}
+
+// Omit must distribute over the query-node union: a plain Omit would collapse the update type
+// to the keys shared by every insight kind, dropping fields like samplingFactor that only some have
+type DistributiveOmit<T, K extends keyof any> = T extends any ? Omit<T, K> : never
+export type QuerySourceUpdate = DistributiveOmit<Partial<InsightQueryNode>, 'kind'>
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface insightVizDataLogicValues {
+    getTheme: (themeId: number | string | null | undefined) => DataColorTheme | null // dataThemeLogic
+    allTablesMap: Record<string, DatabaseSchemaTable> // databaseTableListLogic
+    featureFlags: FeatureFlagsSet // featureFlagLogic
+    filterTestAccountsDefault: boolean // filterTestAccountsDefaultsLogic
+    insightData: Record<string, any> // insightDataLogic
+    insightDataError: Record<string, any> | null // insightDataLogic
+    insightDataLoading: boolean // insightDataLogic
+    insightQuery: DataNode<Record<string, any>> // insightDataLogic
+    query: Node | null // insightDataLogic
+    activeUsersMath: BaseMathType.MonthlyActiveUsers | BaseMathType.WeeklyActiveUsers | null
+    aggregationGroupTypeIndex: GroupTypeIndex | null | undefined
+    allEventNames: string[]
+    annotationsScope: AnnotationScope | null | undefined
+    breakdownFilter: BreakdownFilter | null | undefined
+    compareFilter: CompareFilter | null | undefined
+    currentDataWarehouseSchemaColumns: DatabaseSchemaField[]
+    dataWarehouseSeriesTableNames: string[]
+    dateRange: DateRange | null | undefined
+    detailedResultsAggregationType: AggregationType | undefined
+    display: ChartDisplayType | null | undefined
+    enabledIntervals: Intervals
+    erroredQueryId: any
+    flagCallsRetentionGap: FlagCallsRetentionGap | null
+    flagCallsRetentionStartDate: string
+    formula: string | null | undefined
+    formulaNodes: TrendsFormulaNode[]
+    formulas: string[] | null | undefined
+    funnelPathsFilter: FunnelPathsFilter | null | undefined
+    funnelsFilter: FunnelsFilter | null | undefined
+    globalFiltersUnsupported: boolean
+    goalLines: GoalLine[] | null | undefined
+    hasDataWarehouseSeries: boolean
+    hasDetailedResultsTable: boolean
+    hasFormula: boolean
+    hasLegend: boolean
+    hasOnlyDataWarehouseSeries: boolean
+    hasRenderableResults: boolean
+    insightFilter: InsightFilter | null | undefined
+    interval: IntervalType | null | undefined
+    isAllEventsQuery: boolean
+    isBreakdownSeries: boolean
+    isFirstTimeForUserQuery: boolean
+    isFormulaModeOpenedExplicitly: boolean
+    isFunnels: boolean
+    isIntervalManuallySet: boolean
+    isLifecycle: boolean
+    isNonTimeSeriesDisplay: boolean
+    isPaths: boolean
+    isPathsV2: boolean
+    isRetention: boolean
+    isSingleSeriesDefinition: boolean
+    isSingleSeriesOutput: boolean
+    isStickiness: boolean
+    isStrictFunnelQuery: boolean
+    isTrends: boolean
+    isTrendsLike: boolean
+    isUsingSessionAnalysis: boolean | Breakdown
+    isWebAnalytics: boolean
+    isWebOverview: boolean
+    isWebStatsTable: boolean
+    labelGroupType: LabelGroupType
+    legendPosition: string | null | undefined
+    lifecycleFilter: LifecycleFilter | null | undefined
+    localQuerySource: InsightQueryNode
+    pathsFilter: PathsFilter | null
+    pathsV2Filter: PathsV2Filter | null | undefined
+    properties: PropertyGroupFilter | AnyPropertyFilter[] | null | undefined
+    querySource:
+        | FunnelsQuery
+        | LifecycleQuery
+        | PathsQuery
+        | PathsV2Query
+        | RetentionQuery
+        | StickinessQuery
+        | TrendsQuery
+        | WebOverviewQuery
+        | WebStatsTableQuery
+        | null
+    resultCustomizationBy: ResultCustomizationBy | null | undefined
+    retentionFilter: RetentionFilter | null
+    samplingFactor: number | null | undefined
+    series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined
+    seriesMathAvailability: MathAvailability
+    shouldShowSessionAnalysisWarning: boolean
+    showAlertThresholdLines: boolean | null | undefined
+    showAnnotations: boolean | null | undefined
+    showLabelOnSeries: boolean | null | undefined
+    showLegend: boolean | null | undefined
+    showMultipleYAxes: boolean | null | undefined
+    showPercentStackView: boolean | null | undefined
+    showPercentagesOnSeries: boolean | null | undefined
+    showValuesOnSeries: boolean | null | undefined
+    slowQueryPossibilities: SlowQueryPossibilities[]
+    stickinessFilter: StickinessFilter | null | undefined
+    supportsBarValueStacking: boolean
+    supportsCompare: boolean
+    supportsDisplay: boolean
+    supportsPercentStackView: boolean
+    supportsResultCustomizationBy: boolean
+    supportsValueOnSeries: boolean
+    theme: DataColorTheme | null
+    timedOutQueryId: string | null
+    timezone: any
+    trendsFilter: TrendsFilter | null | undefined
+    usesInChartLegend: boolean
+    validationError: string | null
+    validationErrorCode: string | null
+    valueOnSeries: boolean
+    vizSpecificOptions: VizSpecificOptions | null | undefined
+    yAxisScaleType: string | null | undefined
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface insightVizDataLogicActions {
+    ensureAllTableFields: () => {
+        value: true
+    } // databaseTableListLogic
+    cancelChanges: () => {
+        value: true
+    } // insightDataLogic
+    loadData: (
+        refresh?: RefreshType | undefined,
+        alreadyRunningQueryId?: string | undefined,
+        overrideQuery?: DataNode<Record<string, any>> | undefined
+    ) => {
+        overrideQuery: DataNode<Record<string, any>> | undefined
+        pollOnly: boolean
+        queryId: string
+        refresh: RefreshType | undefined
+    } // insightDataLogic
+    loadDataFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    } // insightDataLogic
+    loadDataSuccess: (
+        response:
+            | ErrorTrackingQueryResponse
+            | HogQLAutocompleteResponse
+            | HogQLMetadataResponse
+            | HogQLQueryResponse<any[]>
+            | HogQueryResponse
+            | LogAttributesQueryResponse
+            | LogValuesQueryResponse
+            | MetricsQueryResponse
+            | Record<string, any>
+            | SessionsQueryResponse
+            | TraceSpansAggregationQueryResponse
+            | TraceSpansAttributeBreakdownQueryResponse
+            | TraceSpansQueryResponse
+            | TraceSpansTreeQueryResponse
+            | null,
+        payload?:
+            | {
+                  overrideQuery: DataNode<Record<string, any>> | undefined
+                  pollOnly: boolean
+                  queryId: string
+                  refresh: RefreshType | undefined
+              }
+            | undefined
+    ) => {
+        payload?: {
+            overrideQuery: DataNode<Record<string, any>> | undefined
+            pollOnly: boolean
+            queryId: string
+            refresh: RefreshType | undefined
+        }
+        response:
+            | ErrorTrackingQueryResponse
+            | HogQLAutocompleteResponse
+            | HogQLMetadataResponse
+            | HogQLQueryResponse<any[]>
+            | HogQueryResponse
+            | LogAttributesQueryResponse
+            | LogValuesQueryResponse
+            | MetricsQueryResponse
+            | Record<string, any>
+            | SessionsQueryResponse
+            | TraceSpansAggregationQueryResponse
+            | TraceSpansAttributeBreakdownQueryResponse
+            | TraceSpansQueryResponse
+            | TraceSpansTreeQueryResponse
+            | null
+    } // insightDataLogic
+    setInsightData: (
+        response:
+            | ErrorTrackingQueryResponse
+            | EventsQueryResponse
+            | HogQLAutocompleteResponse
+            | HogQLMetadataResponse
+            | HogQLQueryResponse<any[]>
+            | HogQueryResponse
+            | LogAttributesQueryResponse
+            | LogsQueryResponse
+            | LogValuesQueryResponse
+            | MetricsQueryResponse
+            | Record<string, any>
+            | SessionsQueryResponse
+            | TraceSpansAggregationQueryResponse
+            | TraceSpansAttributeBreakdownQueryResponse
+            | TraceSpansQueryResponse
+            | TraceSpansTreeQueryResponse
+    ) =>
+        | ErrorTrackingQueryResponse
+        | EventsQueryResponse
+        | HogQLAutocompleteResponse
+        | HogQLMetadataResponse
+        | HogQLQueryResponse<any[]>
+        | HogQueryResponse
+        | LogAttributesQueryResponse
+        | LogsQueryResponse
+        | LogValuesQueryResponse
+        | MetricsQueryResponse
+        | Record<string, any>
+        | SessionsQueryResponse
+        | TraceSpansAggregationQueryResponse
+        | TraceSpansAttributeBreakdownQueryResponse
+        | TraceSpansQueryResponse
+        | TraceSpansTreeQueryResponse // insightDataLogic
+    setQuery: (
+        query: Node<Record<string, any>> | null,
+        fromUrl?: boolean | undefined
+    ) => {
+        fromUrl: boolean
+        query: Node<Record<string, any>> | null
+    } // insightDataLogic
+    removeFormulaNode: (formulas: TrendsFormulaNode[]) => {
+        formulas: TrendsFormulaNode[]
+    }
+    saveInsight: (redirectToViewMode?: any) => {
+        redirectToViewMode: any
+    }
+    setDetailedResultsAggregationType: (detailedResultsAggregationType: AggregationType) => {
+        detailedResultsAggregationType: AggregationType
+    }
+    setFormulaMode: (enabled: boolean) => {
+        enabled: boolean
+    }
+    setIsIntervalManuallySet: (isIntervalManuallySet: boolean) => {
+        isIntervalManuallySet: boolean
+    }
+    setTimedOutQueryId: (id: string | null) => {
+        id: string | null
+    }
+    updateBreakdownFilter: (breakdownFilter: BreakdownFilter) => {
+        breakdownFilter: BreakdownFilter
+    }
+    updateCompareFilter: (compareFilter: CompareFilter) => {
+        compareFilter: CompareFilter
+    }
+    updateDateRange: (
+        dateRange: DateRange,
+        ignoreDebounce?: boolean
+    ) => {
+        dateRange: DateRange
+        ignoreDebounce: boolean
+    }
+    updateDisplay: (display: ChartDisplayType | undefined) => {
+        display: ChartDisplayType | undefined
+    }
+    updateInsightFilter: (insightFilter: InsightFilter) => {
+        insightFilter: InsightFilter
+    }
+    updateQuerySource: (querySource: QuerySourceUpdate) => {
+        querySource: QuerySourceUpdate
+    }
+    updateSeries: (series: SeriesNode[]) => {
+        series: SeriesNode[]
+    }
+    updateVizSpecificOptions: (vizSpecificOptions: VizSpecificOptions) => {
+        vizSpecificOptions: VizSpecificOptions
+    }
+    zoomDateRange: (
+        dateFrom: string,
+        dateTo: string
+    ) => {
+        dateFrom: string
+        dateTo: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface insightVizDataLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        querySource: (
+            query: Node<Record<string, any>> | null
+        ) =>
+            | FunnelsQuery
+            | LifecycleQuery
+            | PathsQuery
+            | PathsV2Query
+            | RetentionQuery
+            | StickinessQuery
+            | TrendsQuery
+            | WebOverviewQuery
+            | WebStatsTableQuery
+            | null
+        localQuerySource: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null,
+            filterTestAccountsDefault: boolean
+        ) => InsightQueryNode
+        isTrends: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isFunnels: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isRetention: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isPaths: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isPathsV2: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isStickiness: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isLifecycle: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isWebStatsTable: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isWebOverview: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isWebAnalytics: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isTrendsLike: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        supportsDisplay: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        supportsCompare: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null,
+            display: ChartDisplayType | null | undefined,
+            dateRange: DateRange | null | undefined
+        ) => boolean
+        supportsPercentStackView: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        supportsBarValueStacking: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        supportsValueOnSeries: (
+            isTrends: boolean,
+            isFunnels: boolean,
+            isStickiness: boolean,
+            isLifecycle: boolean,
+            display: ChartDisplayType | null | undefined
+        ) => boolean
+        supportsResultCustomizationBy: (isTrends: boolean, display: ChartDisplayType | null | undefined) => boolean
+        dateRange: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => DateRange | null | undefined
+        breakdownFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => BreakdownFilter | null | undefined
+        compareFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => CompareFilter | null | undefined
+        display: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => ChartDisplayType | null | undefined
+        formula: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => string | null | undefined
+        formulas: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => string[] | null | undefined
+        formulaNodes: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => TrendsFormulaNode[]
+        series: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined
+        interval: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => IntervalType | null | undefined
+        properties: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => PropertyGroupFilter | AnyPropertyFilter[] | null | undefined
+        samplingFactor: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => number | null | undefined
+        showAlertThresholdLines: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean | null | undefined
+        showAnnotations: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean | null | undefined
+        annotationsScope: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => AnnotationScope | null | undefined
+        showLegend: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null,
+            insightData: Record<string, any>
+        ) => boolean | null | undefined
+        legendPosition: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => string | null | undefined
+        showValuesOnSeries: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean | null | undefined
+        showPercentagesOnSeries: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean | null | undefined
+        showLabelOnSeries: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean | null | undefined
+        showPercentStackView: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean | null | undefined
+        yAxisScaleType: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => string | null | undefined
+        showMultipleYAxes: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean | null | undefined
+        resultCustomizationBy: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => ResultCustomizationBy | null | undefined
+        aggregationGroupTypeIndex: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => GroupTypeIndex | null | undefined
+        labelGroupType: (aggregationGroupTypeIndex: GroupTypeIndex | null | undefined) => LabelGroupType
+        goalLines: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => GoalLine[] | null | undefined
+        insightFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => InsightFilter | null | undefined
+        trendsFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => TrendsFilter | null | undefined
+        detailedResultsAggregationType: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => AggregationType | undefined
+        funnelsFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => FunnelsFilter | null | undefined
+        retentionFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => RetentionFilter | null
+        pathsFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => PathsFilter | null
+        pathsV2Filter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => PathsV2Filter | null | undefined
+        stickinessFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => StickinessFilter | null | undefined
+        lifecycleFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => LifecycleFilter | null | undefined
+        funnelPathsFilter: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => FunnelPathsFilter | null | undefined
+        vizSpecificOptions: (query: Node<Record<string, any>> | null) => VizSpecificOptions | null | undefined
+        isUsingSessionAnalysis: (
+            series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined,
+            breakdownFilter: BreakdownFilter | null | undefined,
+            properties: PropertyGroupFilter | AnyPropertyFilter[] | null | undefined
+        ) => boolean | Breakdown
+        shouldShowSessionAnalysisWarning: (
+            isUsingSessionAnalysis: boolean | Breakdown,
+            query: Node<Record<string, any>> | null
+        ) => boolean
+        flagCallsRetentionGap: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null,
+            dateRange: DateRange | null | undefined,
+            compareFilter: CompareFilter | null | undefined,
+            insightData: Record<string, any>
+        ) => FlagCallsRetentionGap | null
+        flagCallsRetentionStartDate: (insightData: Record<string, any>) => string
+        isNonTimeSeriesDisplay: (display: ChartDisplayType | null | undefined) => boolean
+        isSingleSeriesOutput: (
+            isTrends: boolean,
+            formula: string | null | undefined,
+            formulas: string[] | null | undefined,
+            formulaNodes: TrendsFormulaNode[],
+            series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined,
+            breakdownFilter: BreakdownFilter | null | undefined
+        ) => boolean
+        isBreakdownSeries: (breakdownFilter: BreakdownFilter | null | undefined) => boolean
+        seriesMathAvailability: (
+            isFunnels: boolean,
+            isLifecycle: boolean,
+            isStickiness: boolean,
+            display: ChartDisplayType | null | undefined
+        ) => MathAvailability
+        isSingleSeriesDefinition: (
+            isTrends: boolean,
+            formula: string | null | undefined,
+            formulas: string[] | null | undefined,
+            formulaNodes: TrendsFormulaNode[],
+            series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined
+        ) => boolean
+        hasDataWarehouseSeries: (
+            series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined
+        ) => boolean
+        globalFiltersUnsupported: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        hasOnlyDataWarehouseSeries: (
+            series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined
+        ) => boolean
+        dataWarehouseSeriesTableNames: (
+            series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined
+        ) => string[]
+        currentDataWarehouseSchemaColumns: (
+            dataWarehouseSeriesTableNames: string[],
+            isSingleSeriesOutput: boolean,
+            isTrends: boolean,
+            hasDataWarehouseSeries: boolean,
+            isBreakdownSeries: boolean,
+            allTablesMap: Record<string, DatabaseSchemaTable>
+        ) => DatabaseSchemaField[]
+        valueOnSeries: (
+            isTrends: boolean,
+            isStickiness: boolean,
+            isLifecycle: boolean,
+            insightFilter: InsightFilter | null | undefined
+        ) => boolean
+        hasLegend: (
+            isTrends: boolean,
+            isStickiness: boolean,
+            isLifecycle: boolean,
+            display: ChartDisplayType | null | undefined
+        ) => boolean
+        usesInChartLegend: (
+            isTrends: boolean,
+            isStickiness: boolean,
+            isLifecycle: boolean,
+            display: ChartDisplayType | null | undefined
+        ) => boolean
+        hasDetailedResultsTable: (
+            isTrends: boolean,
+            isStickiness: boolean,
+            display: ChartDisplayType | null | undefined
+        ) => boolean
+        hasFormula: (formulaNodes: TrendsFormulaNode[], isFormulaModeOpenedExplicitly: boolean) => boolean
+        activeUsersMath: (
+            series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<DataWarehouseNode>)[] | null | undefined
+        ) => BaseMathType.MonthlyActiveUsers | BaseMathType.WeeklyActiveUsers | null
+        enabledIntervals: (
+            activeUsersMath: BaseMathType.WeeklyActiveUsers | BaseMathType.MonthlyActiveUsers | null,
+            isTrends: boolean,
+            featureFlags: FeatureFlagsSet
+        ) => Intervals
+        erroredQueryId: (insightDataError: Record<string, any> | null) => any
+        validationError: (insightDataError: Record<string, any> | null) => string | null
+        validationErrorCode: (insightDataError: Record<string, any> | null) => string | null
+        timezone: (insightData: Record<string, any>) => any
+        hasRenderableResults: (
+            insightData: Record<string, any>,
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        allEventNames: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null,
+            arg: ActionType[]
+        ) => string[]
+        theme: (
+            getTheme: (themeId: number | string | null | undefined) => DataColorTheme | null, // dataThemeLogic
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => DataColorTheme | null
+        isAllEventsQuery: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isFirstTimeForUserQuery: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        isStrictFunnelQuery: (
+            querySource:
+                | FunnelsQuery
+                | LifecycleQuery
+                | PathsQuery
+                | PathsV2Query
+                | RetentionQuery
+                | StickinessQuery
+                | TrendsQuery
+                | WebOverviewQuery
+                | WebStatsTableQuery
+                | null
+        ) => boolean
+        slowQueryPossibilities: (
+            isAllEventsQuery: boolean,
+            isFirstTimeForUserQuery: boolean,
+            isStrictFunnelQuery: boolean
+        ) => SlowQueryPossibilities[]
+    }
+}
+
+export type insightVizDataLogicType = MakeLogicType<
+    insightVizDataLogicValues,
+    insightVizDataLogicActions,
+    InsightLogicProps,
+    insightVizDataLogicMeta
+>
+
+// A debounced update targets the query as it was at dispatch, so it is dropped if
+// the user discarded their changes or switched insight type while it waited.
+const trackPendingUpdate = (cache: Record<string, any>, getKind: () => NodeKind | undefined): (() => boolean) => {
+    const discardCount = cache.discardCount ?? 0
+    const kind = getKind()
+    return () => (cache.discardCount ?? 0) !== discardCount || getKind() !== kind
+}
+
+export const insightVizDataLogic = kea<insightVizDataLogicType>([
+    props({} as InsightLogicProps),
+    key(keyForInsightLogicProps('new')),
+    path((key) => ['scenes', 'insights', 'insightVizDataLogic', key]),
+
+    connect(() => ({
+        values: [
+            insightDataLogic,
+            ['query', 'insightQuery', 'insightData', 'insightDataLoading', 'insightDataError'],
+            filterTestAccountsDefaultsLogic,
+            ['filterTestAccountsDefault'],
+            databaseTableListLogic,
+            ['allTablesMap'],
+            dataThemeLogic,
+            ['getTheme'],
+            featureFlagLogic,
+            ['featureFlags'],
+        ],
+        actions: [
+            databaseTableListLogic,
+            ['ensureAllTableFields'],
+            insightDataLogic,
+            ['setQuery', 'setInsightData', 'loadData', 'loadDataSuccess', 'loadDataFailure', 'cancelChanges'],
+        ],
+    })),
+
+    actions({
+        saveInsight: (redirectToViewMode = true) => ({ redirectToViewMode }),
+        updateQuerySource: (querySource: QuerySourceUpdate) => ({ querySource }),
+        updateSeries: (series: SeriesNode[]) => ({ series }),
+        updateInsightFilter: (insightFilter: InsightFilter) => ({ insightFilter }),
+        updateDateRange: (dateRange: DateRange, ignoreDebounce: boolean = false) => ({ dateRange, ignoreDebounce }),
+        /** Apply a drag-to-zoom date range to the insight's query. Both dates are bucket starts;
+         *  the end is widened to its bucket's end using the query's interval. */
+        zoomDateRange: (dateFrom: string, dateTo: string) => ({ dateFrom, dateTo }),
+        updateBreakdownFilter: (breakdownFilter: BreakdownFilter) => ({ breakdownFilter }),
+        updateCompareFilter: (compareFilter: CompareFilter) => ({ compareFilter }),
+        updateDisplay: (display: ChartDisplayType | undefined) => ({ display }),
+        setTimedOutQueryId: (id: string | null) => ({ id }),
+        setIsIntervalManuallySet: (isIntervalManuallySet: boolean) => ({ isIntervalManuallySet }),
+        setFormulaMode: (enabled: boolean) => ({ enabled }),
+        removeFormulaNode: (formulas: TrendsFormulaNode[]) => ({ formulas }),
+        setDetailedResultsAggregationType: (detailedResultsAggregationType: AggregationType) => ({
+            detailedResultsAggregationType,
+        }),
+        updateVizSpecificOptions: (vizSpecificOptions: VizSpecificOptions) => ({ vizSpecificOptions }),
+    }),
+
+    reducers({
+        timedOutQueryId: [
+            null as null | string,
+            {
+                setTimedOutQueryId: (_, { id }) => id,
+            },
+        ],
+
+        isIntervalManuallySet: [
+            false,
+            {
+                updateQuerySource: (state, { querySource }) => {
+                    return 'interval' in querySource ? true : state
+                },
+                setIsIntervalManuallySet: (_, { isIntervalManuallySet }) => isIntervalManuallySet,
+            },
+        ],
+        isFormulaModeOpenedExplicitly: [
+            false,
+            {
+                setFormulaMode: (_, { enabled }) => enabled,
+                // A blank row left behind still empties the query's formula list, so hold the
+                // mode open or hasFormula closes the editor mid-edit. A filled row needs no flag.
+                removeFormulaNode: (state, { formulas }) =>
+                    formulas.length > 0 && formulas.every((node) => node.formula.trim() === '') ? true : state,
+                // A query that holds a formula keeps the mode open on its own, so drop the flag
+                // there. It would otherwise outlive the removal that set it and hold the editor
+                // open over the next empty field. The reset keys on setQuery, which is what writes
+                // the formula into the query: reset it one action earlier and hasFormula is false
+                // for a render, which closes the editor the user is typing in.
+                setQuery: (state, { query }) =>
+                    isInsightVizNode(query) && (getFormulaNodes(query.source)?.length ?? 0) > 0 ? false : state,
+            },
+        ],
+    }),
+
+    selectors({
+        querySource: [
+            (s) => [s.query],
+            (query: Node | null) => {
+                if (!isNodeWithSource(query) || !isInsightQueryNode(query.source)) {
+                    return null
+                }
+
+                const source = query.source
+
+                // Clean up Web Analytics queries by removing invalid fields that might have been saved
+                if (isWebStatsTableQuery(source) || isWebOverviewQuery(source)) {
+                    const { series, breakdownFilter, ...cleanSource } = source as typeof source & {
+                        series?: unknown
+                        breakdownFilter?: unknown
+                    }
+                    return cleanSource as typeof source
+                }
+
+                return source
+            },
+        ],
+        localQuerySource: [
+            (s) => [s.querySource, s.filterTestAccountsDefault],
+            (
+                querySource:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery,
+                filterTestAccountsDefault: boolean
+            ) => (querySource ? querySource : queryFromKind(NodeKind.TrendsQuery, filterTestAccountsDefault).source),
+        ],
+
+        isTrends: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isTrendsQuery(q),
+        ],
+        isFunnels: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isFunnelsQuery(q),
+        ],
+        isRetention: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isRetentionQuery(q),
+        ],
+        isPaths: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isPathsQuery(q),
+        ],
+        isPathsV2: [(s) => [s.querySource], (q: InsightQueryNode | null) => isPathsV2Query(q)],
+        isStickiness: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isStickinessQuery(q),
+        ],
+        isLifecycle: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isLifecycleQuery(q),
+        ],
+        isWebStatsTable: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isWebStatsTableQuery(q),
+        ],
+        isWebOverview: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isWebOverviewQuery(q),
+        ],
+        isWebAnalytics: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isWebAnalyticsInsightQuery(q),
+        ],
+        isTrendsLike: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isTrendsQuery(q) || isLifecycleQuery(q) || isStickinessQuery(q),
+        ], // this is for filtering out world map
+        supportsDisplay: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => isTrendsQuery(q) || isStickinessQuery(q),
+        ],
+        supportsCompare: [
+            (s) => [s.querySource, s.display, s.dateRange],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery,
+                display: ChartDisplayType | null | undefined,
+                dateRange: DateRange | null | undefined
+            ) => {
+                if (dateRange?.date_from === 'all') {
+                    return false
+                }
+                if (isTrendsQuery(q) || isStickinessQuery(q) || isWebAnalyticsInsightQuery(q)) {
+                    return (
+                        display !== ChartDisplayType.WorldMap &&
+                        display !== ChartDisplayType.CalendarHeatmap &&
+                        display !== ChartDisplayType.ActionsProportionBar
+                    )
+                }
+                // Funnel compare is supported for the STEPS, TRENDS and TIME_TO_CONVERT viz modes.
+                // FLOW is excluded — the backend ignores compare for it (mirrors `_is_compare_active`).
+                if (isFunnelsQuery(q)) {
+                    return (q.funnelsFilter?.funnelVizType ?? FunnelVizType.Steps) !== FunnelVizType.Flow
+                }
+                return false
+            },
+        ],
+        supportsPercentStackView: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => supportsPercentStackView(q),
+        ],
+        supportsBarValueStacking: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => supportsBarValueStacking(q),
+        ],
+        supportsValueOnSeries: [
+            (s) => [s.isTrends, s.isFunnels, s.isStickiness, s.isLifecycle, s.display],
+            (
+                isTrends: boolean,
+                isFunnels: boolean,
+                isStickiness: boolean,
+                isLifecycle: boolean,
+                display: ChartDisplayType | null | undefined
+            ) => {
+                if (isTrends || isStickiness) {
+                    return !NON_VALUES_ON_SERIES_DISPLAY_TYPES.includes(display || ChartDisplayType.ActionsLineGraph)
+                } else if (isLifecycle || isFunnels) {
+                    return true
+                }
+                return false
+            },
+        ],
+        supportsResultCustomizationBy: [
+            (s) => [s.isTrends, s.display],
+            (isTrends: boolean, display: ChartDisplayType | null | undefined) =>
+                isTrends && [ChartDisplayType.ActionsLineGraph].includes(display || ChartDisplayType.ActionsLineGraph),
+        ],
+
+        dateRange: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? q.dateRange : null),
+        ],
+        breakdownFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getBreakdown(q) : null),
+        ],
+        compareFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getCompareFilter(q) : null),
+        ],
+        display: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getDisplay(q) : null),
+        ],
+        formula: [
+            (s) => [s.querySource],
+            (querySource: InsightQueryNode | null) => (querySource ? getFormula(querySource) : null),
+        ],
+        formulas: [
+            (s) => [s.querySource],
+            (querySource: InsightQueryNode | null) => (querySource ? getFormulas(querySource) : null),
+        ],
+        formulaNodes: [
+            (s) => [s.querySource],
+            (querySource: InsightQueryNode | null): TrendsFormulaNode[] => {
+                const formula = getFormula(querySource)
+                const formulas = getFormulas(querySource)
+
+                return querySource
+                    ? getFormulaNodes(querySource) ||
+                          (formulas ? formulas.map((f) => ({ formula: f })) : formula ? [{ formula }] : [])
+                    : []
+            },
+        ],
+        series: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getSeries(q) : null),
+        ],
+        interval: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getInterval(q) : null),
+        ],
+        properties: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? q.properties : null),
+        ],
+        samplingFactor: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q && 'samplingFactor' in q ? q.samplingFactor : null),
+        ],
+        showAlertThresholdLines: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getShowAlertThresholdLines(q) : null),
+        ],
+        showAnnotations: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getShowAnnotations(q) : null),
+        ],
+        annotationsScope: [
+            (s) => [s.querySource],
+            (querySource: InsightQueryNode | null) => (querySource ? getAnnotationsScope(querySource) : null),
+        ],
+        showLegend: [
+            (s) => [s.querySource, s.insightData],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery,
+                insightData: Record<string, any> | null
+            ) => (q ? getShowLegend(q, proportionBarPartCount(q, insightData)) : null),
+        ],
+        legendPosition: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getLegendPosition(q) : null),
+        ],
+        showValuesOnSeries: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getShowValuesOnSeries(q) : null),
+        ],
+        showPercentagesOnSeries: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getShowPercentagesOnSeries(q) : null),
+        ],
+        showLabelOnSeries: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getShowLabelsOnSeries(q) : null),
+        ],
+        showPercentStackView: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getShowPercentStackView(q) : null),
+        ],
+        yAxisScaleType: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getYAxisScaleType(q) : null),
+        ],
+        showMultipleYAxes: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getShowMultipleYAxes(q) : null),
+        ],
+        resultCustomizationBy: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getResultCustomizationBy(q) : null),
+        ],
+        aggregationGroupTypeIndex: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q ? getAggregationGroupTypeIndex(q) : null),
+        ],
+        labelGroupType: [
+            (s) => [s.aggregationGroupTypeIndex],
+            (aggregationGroupTypeIndex: null | import('~/types').GroupTypeIndex | undefined): LabelGroupType =>
+                aggregationGroupTypeIndex ?? 'people',
+        ],
+        goalLines: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (isTrendsQuery(q) || isFunnelsQuery(q) || isRetentionQuery(q) ? getGoalLines(q) : null),
+        ],
+        insightFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (q && !isWebAnalyticsInsightQuery(q) ? filterForQuery(q) : null),
+        ],
+        trendsFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (isTrendsQuery(q) ? q.trendsFilter : null),
+        ],
+        detailedResultsAggregationType: [
+            (s) => [s.querySource],
+            (
+                querySource:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ): AggregationType | undefined => {
+                if (isTrendsQuery(querySource)) {
+                    return querySource.trendsFilter?.detailedResultsAggregationType as AggregationType | undefined
+                }
+            },
+        ],
+        funnelsFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (isFunnelsQuery(q) ? q.funnelsFilter : null),
+        ],
+        retentionFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (isRetentionQuery(q) ? q.retentionFilter : null),
+        ],
+        pathsFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (isPathsQuery(q) ? q.pathsFilter : null),
+        ],
+        pathsV2Filter: [
+            (s) => [s.querySource],
+            (q: InsightQueryNode | null) => (isPathsV2Query(q) ? q.pathsV2Filter : null),
+        ],
+        stickinessFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (isStickinessQuery(q) ? q.stickinessFilter : null),
+        ],
+        lifecycleFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (isLifecycleQuery(q) ? q.lifecycleFilter : null),
+        ],
+        funnelPathsFilter: [
+            (s) => [s.querySource],
+            (
+                q:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => (isPathsQuery(q) ? q.funnelPathsFilter : null),
+        ],
+        vizSpecificOptions: [(s) => [s.query], (q: Node) => (isInsightVizNode(q) ? q.vizSpecificOptions : null)],
+
+        isUsingSessionAnalysis: [
+            (s) => [s.series, s.breakdownFilter, s.properties],
+            (
+                series:
+                    | (
+                          | AnyEntityNode<AnyDataWarehouseNode>
+                          | GroupNode<import('~/queries/schema/schema-general').DataWarehouseNode>
+                      )[]
+                    | null
+                    | undefined,
+                breakdownFilter: BreakdownFilter | null | undefined,
+                properties:
+                    | import('~/types').AnyPropertyFilter[]
+                    | null
+                    | import('~/types').PropertyGroupFilter
+                    | undefined
+            ) => {
+                const using_session_breakdown =
+                    breakdownFilter?.breakdown_type === 'session' ||
+                    breakdownFilter?.breakdowns?.find((breakdown) => breakdown.type === 'session')
+                const using_session_math = series?.some((entity) => entity.math === 'unique_session')
+                const using_session_property_math = series?.some((entity) => {
+                    return entity.math_property === '$session_duration'
+                })
+                const using_entity_session_property_filter = series?.some((entity) => {
+                    return parseProperties(entity.properties).some((property) => property.type === 'session')
+                })
+                const using_global_session_property_filter = parseProperties(properties).some(
+                    (property) => property.type === 'session'
+                )
+                return (
+                    using_session_breakdown ||
+                    using_session_math ||
+                    using_session_property_math ||
+                    using_entity_session_property_filter ||
+                    using_global_session_property_filter
+                )
+            },
+        ],
+        shouldShowSessionAnalysisWarning: [
+            (s) => [s.isUsingSessionAnalysis, s.query],
+            (
+                isUsingSessionAnalysis: boolean | import('~/queries/schema/schema-general').Breakdown,
+                query: Node | null
+            ) => isUsingSessionAnalysis && !(isInsightVizNode(query) && query.suppressSessionAnalysisWarning),
+        ],
+        flagCallsRetentionGap: [
+            (s) => [s.querySource, s.dateRange, s.compareFilter, s.insightData],
+            (
+                querySource: InsightQueryNode | null,
+                dateRange: DateRange | null | undefined,
+                compareFilter: CompareFilter | null | undefined,
+                insightData: Record<string, any>
+            ): FlagCallsRetentionGap | null =>
+                querySource && readsFlagCalls(querySource)
+                    ? flagCallsRetentionGap({ dateFrom: dateRange?.date_from, response: insightData, compareFilter })
+                    : null,
+        ],
+        flagCallsRetentionStartDate: [
+            (s) => [s.insightData],
+            (insightData: Record<string, any>): string => flagEvaluationsRetentionStartDate(insightData),
+        ],
+        isNonTimeSeriesDisplay: [
+            (s) => [s.display],
+            (display: ChartDisplayType | null | undefined) =>
+                !!display && NON_TIME_SERIES_DISPLAY_TYPES.includes(display),
+        ],
+
+        // Whether the insight will produce a single visual output (one line/bar).
+        // Considers breakdowns: a breakdown splits one series into multiple visual outputs.
+        // See also: isSingleSeriesDefinition (which ignores breakdowns).
+        isSingleSeriesOutput: [
+            (s) => [s.isTrends, s.formula, s.formulas, s.formulaNodes, s.series, s.breakdownFilter],
+            (
+                isTrends: boolean,
+                formula: string | undefined,
+                formulas: string[] | undefined,
+                formulaNodes: TrendsFormulaNode[] | undefined,
+                series: any[],
+                breakdownFilter: BreakdownFilter | null
+            ): boolean => {
+                const hasSingleFormula =
+                    (formula && !formulas) ||
+                    (formulas && formulas.length === 1) ||
+                    (formulaNodes && formulaNodes.length === 1)
+                return (
+                    !hasBreakdownFilter(breakdownFilter) &&
+                    ((isTrends && hasSingleFormula) || (series || []).length <= 1)
+                )
+            },
+        ],
+        isBreakdownSeries: [
+            (s) => [s.breakdownFilter],
+            (breakdownFilter: BreakdownFilter | null | undefined): boolean => {
+                return !!breakdownFilter?.breakdown || (breakdownFilter?.breakdowns?.length ?? 0) > 0
+            },
+        ],
+        seriesMathAvailability: [
+            (s) => [s.isFunnels, s.isLifecycle, s.isStickiness, s.display],
+            (
+                isFunnels: boolean,
+                isLifecycle: boolean,
+                isStickiness: boolean,
+                display: ChartDisplayType | null | undefined
+            ): MathAvailability =>
+                isFunnels
+                    ? MathAvailability.FunnelsOnly
+                    : isLifecycle
+                      ? MathAvailability.None
+                      : isStickiness
+                        ? MathAvailability.ActorsOnly
+                        : display === ChartDisplayType.CalendarHeatmap
+                          ? MathAvailability.CalendarHeatmapOnly
+                          : display === ChartDisplayType.BoxPlot
+                            ? MathAvailability.BoxPlotOnly
+                            : MathAvailability.All,
+        ],
+
+        // Whether there's only one event/action series defined in the query.
+        // Ignores breakdowns which create multiple visual outputs from the same series.
+        // See also: isSingleSeriesOutput (which considers breakdowns).
+        isSingleSeriesDefinition: [
+            (s) => [s.isTrends, s.formula, s.formulas, s.formulaNodes, s.series],
+            (
+                isTrends: boolean,
+                formula: string | undefined,
+                formulas: string[] | undefined,
+                formulaNodes: TrendsFormulaNode[] | undefined,
+                series: any[]
+            ): boolean => {
+                const hasSingleFormula =
+                    (formula && !formulas) ||
+                    (formulas && formulas.length === 1) ||
+                    (formulaNodes && formulaNodes.length === 1)
+                return (isTrends && hasSingleFormula) || (series || []).length <= 1
+            },
+        ],
+
+        hasDataWarehouseSeries: [
+            (s) => [s.series],
+            (
+                series:
+                    | (
+                          | AnyEntityNode<AnyDataWarehouseNode>
+                          | GroupNode<import('~/queries/schema/schema-general').DataWarehouseNode>
+                      )[]
+                    | null
+                    | undefined
+            ): boolean => (series || []).length > 0 && !!series?.some((node) => isAnyDataWarehouseNode(node)),
+        ],
+        globalFiltersUnsupported: [
+            (s) => [s.querySource],
+            (querySource: InsightQueryNode | null): boolean =>
+                !!querySource && !everyWarehouseSeriesReadsFlagCalls(querySource),
+        ],
+        hasOnlyDataWarehouseSeries: [
+            (s) => [s.series],
+            (
+                series:
+                    | (
+                          | AnyEntityNode<AnyDataWarehouseNode>
+                          | GroupNode<import('~/queries/schema/schema-general').DataWarehouseNode>
+                      )[]
+                    | null
+                    | undefined
+            ): boolean => {
+                return !!series && series.length > 0 && series.every((node) => isAnyDataWarehouseNode(node))
+            },
+        ],
+
+        dataWarehouseSeriesTableNames: [
+            (s) => [s.series],
+            (
+                series:
+                    | (
+                          | AnyEntityNode<AnyDataWarehouseNode>
+                          | GroupNode<import('~/queries/schema/schema-general').DataWarehouseNode>
+                      )[]
+                    | null
+                    | undefined
+            ): string[] =>
+                Array.from(new Set((series ?? []).filter(isAnyDataWarehouseNode).map((node) => node.table_name))),
+        ],
+
+        currentDataWarehouseSchemaColumns: [
+            (s) => [
+                s.dataWarehouseSeriesTableNames,
+                s.isSingleSeriesOutput,
+                s.isTrends,
+                s.hasDataWarehouseSeries,
+                s.isBreakdownSeries,
+                s.allTablesMap,
+            ],
+            (
+                dataWarehouseSeriesTableNames: string[],
+                isSingleSeriesOutput: boolean,
+                isTrends: boolean,
+                hasDataWarehouseSeries: boolean,
+                isBreakdownSeries: boolean,
+                allTablesMap: Record<string, import('~/queries/schema/schema-general').DatabaseSchemaTable>
+            ): DatabaseSchemaField[] => {
+                if (!hasDataWarehouseSeries || (isTrends && !isSingleSeriesOutput && !isBreakdownSeries)) {
+                    return []
+                }
+
+                // Only the trends backend splits a dotted breakdown value into a field chain, so a
+                // joined column would fail to resolve on a funnel.
+                return dataWarehouseColumnsWithJoins(dataWarehouseSeriesTableNames, allTablesMap, {
+                    includeJoinedColumns: isTrends,
+                })
+            },
+        ],
+
+        valueOnSeries: [
+            (s) => [s.isTrends, s.isStickiness, s.isLifecycle, s.insightFilter],
+            (
+                isTrends: boolean,
+                isStickiness: boolean,
+                isLifecycle: boolean,
+                insightFilter: InsightFilter | null | undefined
+            ): boolean => {
+                return !!(
+                    ((isTrends || isStickiness || isLifecycle) &&
+                        (insightFilter as TrendsFilter)?.showValuesOnSeries) ||
+                    (isTrends &&
+                        PIE_DISPLAY_TYPES.includes((insightFilter as TrendsFilter)?.display as ChartDisplayType) &&
+                        (insightFilter as TrendsFilter)?.showValuesOnSeries === undefined)
+                )
+            },
+        ],
+
+        hasLegend: [
+            (s) => [s.isTrends, s.isStickiness, s.isLifecycle, s.display],
+            (
+                isTrends: boolean,
+                isStickiness: boolean,
+                isLifecycle: boolean,
+                display: ChartDisplayType | null | undefined
+            ) =>
+                (isTrends || isStickiness || isLifecycle) &&
+                !(display && DISPLAY_TYPES_WITHOUT_LEGEND.includes(display)),
+        ],
+
+        // Whether the active chart renders the unified in-chart quill legend (replacing the legacy
+        // side legend) instead of the legacy show/hide checkbox. Single source of truth shared by
+        // InsightDisplayConfig (which control to show) and InsightVizDisplay (suppress side legend).
+        usesInChartLegend: [
+            (s) => [s.isTrends, s.isStickiness, s.isLifecycle, s.display],
+            (
+                isTrends: boolean,
+                isStickiness: boolean,
+                isLifecycle: boolean,
+                display: ChartDisplayType | null | undefined
+            ): boolean => {
+                // Lifecycle always uses config.legend inside TimeSeriesBarChart.
+                if (isLifecycle) {
+                    return true
+                }
+                return (isTrends || isStickiness) && (!display || DISPLAYS_WITH_IN_CHART_LEGEND.includes(display))
+            },
+        ],
+
+        hasDetailedResultsTable: [
+            (s) => [s.isTrends, s.isStickiness, s.display],
+            (isTrends: boolean, isStickiness: boolean, display: ChartDisplayType | undefined) =>
+                (isTrends || isStickiness) && !(display && DISPLAY_TYPES_WITHOUT_DETAILED_RESULTS.includes(display)),
+        ],
+
+        hasFormula: [
+            (s) => [s.formulaNodes, s.isFormulaModeOpenedExplicitly],
+            (formulaNodes: TrendsFormulaNode[], isFormulaModeOpenedExplicitly: boolean): boolean => {
+                if (isFormulaModeOpenedExplicitly) {
+                    return true
+                }
+                return formulaNodes.length > 0
+            },
+        ],
+
+        activeUsersMath: [
+            (s) => [s.series],
+            (
+                series:
+                    | (
+                          | AnyEntityNode<AnyDataWarehouseNode>
+                          | GroupNode<import('~/queries/schema/schema-general').DataWarehouseNode>
+                      )[]
+                    | null
+                    | undefined
+            ): BaseMathType.MonthlyActiveUsers | BaseMathType.WeeklyActiveUsers | null => getActiveUsersMath(series),
+        ],
+        enabledIntervals: [
+            (s) => [s.activeUsersMath, s.isTrends, s.featureFlags],
+            (
+                activeUsersMath: BaseMathType.MonthlyActiveUsers | BaseMathType.WeeklyActiveUsers | null,
+                isTrends: boolean,
+                featureFlags: import('lib/logic/featureFlagLogic').FeatureFlagsSet
+            ): Intervals => {
+                const enabledIntervals: Intervals = { ...intervals }
+
+                if (featureFlags[FEATURE_FLAGS.PRODUCT_ANALYTICS_QUARTER_YEAR_INTERVALS]) {
+                    enabledIntervals.quarter = { ...enabledIntervals.quarter, hidden: false }
+                    enabledIntervals.year = { ...enabledIntervals.year, hidden: false }
+                }
+
+                if (activeUsersMath) {
+                    enabledIntervals.hour = {
+                        ...enabledIntervals.hour,
+                        disabledReason:
+                            'Grouping by hour is not supported on insights with weekly or monthly active users series.',
+                    }
+
+                    if (activeUsersMath === BaseMathType.WeeklyActiveUsers) {
+                        enabledIntervals.month = {
+                            ...enabledIntervals.month,
+                            disabledReason:
+                                'Grouping by month is not supported on insights with weekly active users series.',
+                        }
+                        enabledIntervals.quarter = {
+                            ...enabledIntervals.quarter,
+                            disabledReason:
+                                'Grouping by quarter is not supported on insights with weekly active users series.',
+                        }
+                        enabledIntervals.year = {
+                            ...enabledIntervals.year,
+                            disabledReason:
+                                'Grouping by year is not supported on insights with weekly active users series.',
+                        }
+                    }
+                }
+
+                if (!isTrends) {
+                    enabledIntervals.minute = {
+                        ...enabledIntervals.minute,
+                        hidden: true,
+                    }
+                }
+
+                return enabledIntervals
+            },
+        ],
+
+        erroredQueryId: [
+            (s) => [s.insightDataError],
+            (insightDataError: Record<string, any> | null) => {
+                return insightDataError?.queryId || null
+            },
+        ],
+        validationError: [
+            (s) => [s.insightDataError],
+            (insightDataError: Record<string, any> | null): string | null => extractValidationError(insightDataError),
+        ],
+        validationErrorCode: [
+            (s) => [s.insightDataError],
+            (insightDataError: Record<string, any> | null): string | null =>
+                extractValidationErrorCode(insightDataError),
+        ],
+
+        timezone: [(s) => [s.insightData], (insightData: Record<string, any>) => insightData?.timezone || 'UTC'],
+
+        hasRenderableResults: [
+            (s) => [s.insightData, s.querySource],
+            (
+                insightData: Record<string, any>,
+                querySource: FunnelsQuery | LifecycleQuery | RetentionQuery | StickinessQuery | TrendsQuery | null
+            ): boolean => {
+                const results = insightData?.results ?? insightData?.result
+                if (results == null) {
+                    return false
+                }
+                if (!querySource || !isTrendsQuery(querySource) || !Array.isArray(results)) {
+                    return true
+                }
+                return trendsResultsMatchQuery(results, querySource)
+            },
+        ],
+
+        // all events used in the insight (useful for fetching only relevant property definitions)
+        allEventNames: [
+            // actionsModel is only mounted by the surfaces that read this value. Reading it through
+            // findMounted keeps the shared insight logic from fetching every action on mount.
+            (s) => [s.querySource, () => actionsModel.findMounted()?.values.actions ?? NO_ACTIONS],
+            (
+                querySource:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery,
+                actions: import('~/types').ActionType[]
+            ) => (querySource ? getAllEventNames(querySource, actions) : []),
+        ],
+
+        theme: [
+            (s) => [s.getTheme, s.querySource],
+            (
+                getTheme: (
+                    themeId: number | string | null | undefined
+                ) => null | import('../../lib/colors').DataColorTheme,
+                querySource:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => getTheme(querySource && 'dataColorTheme' in querySource ? querySource.dataColorTheme : undefined),
+        ],
+
+        isAllEventsQuery: [
+            (s) => [s.querySource],
+            (
+                querySource:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => {
+                return (
+                    (querySource?.kind === NodeKind.TrendsQuery || querySource?.kind === NodeKind.FunnelsQuery) &&
+                    querySource?.series?.some((s: { name?: string }) => s.name === 'All events')
+                )
+            },
+        ],
+        isFirstTimeForUserQuery: [
+            (s) => [s.querySource],
+            (
+                querySource:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => {
+                return (
+                    querySource?.kind === NodeKind.TrendsQuery &&
+                    querySource?.series?.some((s: { math?: string }) =>
+                        [
+                            'first_matching_event_for_user',
+                            'first_time_for_user',
+                            'first_matching_event_for_group',
+                            'first_time_for_group',
+                        ].includes(s.math || '')
+                    )
+                )
+            },
+        ],
+        isStrictFunnelQuery: [
+            (s) => [s.querySource],
+            (
+                querySource:
+                    | FunnelsQuery
+                    | LifecycleQuery
+                    | RetentionQuery
+                    | StickinessQuery
+                    | TrendsQuery
+                    | null
+                    | import('~/queries/schema/schema-general').PathsQuery
+                    | import('~/queries/schema/schema-general').WebOverviewQuery
+                    | import('~/queries/schema/schema-general').WebStatsTableQuery
+            ) => {
+                return (
+                    querySource?.kind === NodeKind.FunnelsQuery &&
+                    querySource?.funnelsFilter?.funnelOrderType === 'strict'
+                )
+            },
+        ],
+        slowQueryPossibilities: [
+            (s) => [s.isAllEventsQuery, s.isFirstTimeForUserQuery, s.isStrictFunnelQuery],
+            (
+                isAllEventsQuery: boolean,
+                isFirstTimeForUserQuery: boolean,
+                isStrictFunnelQuery: boolean
+            ): SlowQueryPossibilities[] => {
+                const possibilities: SlowQueryPossibilities[] = []
+                if (isAllEventsQuery) {
+                    possibilities.push('all_events')
+                }
+                if (isFirstTimeForUserQuery) {
+                    possibilities.push('first_time_for_user')
+                }
+                if (isStrictFunnelQuery) {
+                    possibilities.push('strict_funnel')
+                }
+                return possibilities
+            },
+        ],
+    }),
+
+    listeners(({ actions, values, props, cache }) => ({
+        // query
+        setQuery: ({ query }) => {
+            if (values.hasDataWarehouseSeries) {
+                actions.ensureAllTableFields()
+            }
+            if (isInsightVizNode(query)) {
+                if (props.setQuery) {
+                    props.setQuery(query)
+                }
+            }
+            // While a PostHog AI suggestion is under review the query is either the suggestion
+            // itself or, after a reject, the query from before it. Any other query means the
+            // reader edited the suggestion by hand, and a reject from then on would revert
+            // their edit together with the suggestion.
+            const mountedInsightLogic = insightLogic.findMounted(props)
+            if (mountedInsightLogic) {
+                const { previousQuery, suggestedQuery } = mountedInsightLogic.values
+                if (previousQuery && !objectsEqual(query, suggestedQuery) && !objectsEqual(query, previousQuery)) {
+                    mountedInsightLogic.actions.onKeepSuggestedInsight()
+                }
+            }
+        },
+
+        cancelChanges: () => {
+            cache.discardCount = (cache.discardCount ?? 0) + 1
+        },
+
+        // query source
+        updateQuerySource: ({ querySource }) => {
+            actions.setQuery({
+                ...values.query,
+                source: withFlagCallsAggregationTarget({
+                    ...values.querySource,
+                    ...handleQuerySourceUpdateSideEffects(
+                        querySource,
+                        values.querySource as InsightQueryNode,
+                        values.isIntervalManuallySet
+                    ),
+                } as InsightQueryNode),
+            } as Node)
+        },
+        updateSeries: ({ series }) => {
+            actions.updateQuerySource({
+                series: cleanSeriesNodes(series, values.seriesMathAvailability),
+            } as QuerySourceUpdate)
+        },
+
+        zoomDateRange: ({ dateFrom, dateTo }) => {
+            posthog.capture('insight drag to zoomed', { query_kind: values.querySource?.kind })
+            // Charts emit bucket starts — widen the end to the last selected bucket's end, so
+            // e.g. dragging over the "May" bar of a monthly chart zooms to all of May.
+            // Sub-day buckets carry a time component; explicitDate stops the backend from
+            // rounding them back out to whole days.
+            actions.updateDateRange(
+                {
+                    date_from: dateFrom,
+                    date_to: dateRangeZoomEnd(dateTo, values.interval),
+                    explicitDate: hasTimeComponent(dateFrom),
+                },
+                true
+            )
+        },
+
+        // query source properties
+        updateDateRange: async ({ dateRange, ignoreDebounce }, breakpoint) => {
+            const isStale = trackPendingUpdate(cache, () => values.localQuerySource?.kind)
+            if (!ignoreDebounce) {
+                await breakpoint(300)
+            }
+            if (isStale()) {
+                return
+            }
+            posthog.capture('insight date range changed', { query_kind: values.querySource?.kind })
+            const updates = {
+                dateRange: {
+                    ...values.dateRange,
+                    ...dateRange,
+                    explicitDate: dateRange.explicitDate ?? values.dateRange?.explicitDate ?? false,
+                },
+                ...(dateRange.date_from == 'all' ? ({ compareFilter: undefined } as Partial<TrendsQuery>) : {}),
+            } as QuerySourceUpdate
+
+            // Reset selectedInterval for retention insights when date range changes
+            if (values.isRetention && !isWebAnalyticsInsightQuery(values.localQuerySource)) {
+                const filterProperty = filterKeyForQuery(values.localQuerySource)
+                Object.assign(updates, {
+                    [filterProperty]: { ...filterForQuery(values.localQuerySource), selectedInterval: null },
+                })
+            }
+
+            actions.updateQuerySource(updates)
+        },
+        setExplicitDate: ({ explicitDate }) => {
+            actions.updateQuerySource({
+                dateRange: {
+                    ...values.dateRange,
+                    explicitDate,
+                },
+            })
+        },
+        updateBreakdownFilter: async ({ breakdownFilter }, breakpoint) => {
+            const isStale = trackPendingUpdate(cache, () => values.localQuerySource?.kind)
+            await breakpoint(500) // extra debounce time because of number input
+            if (isStale()) {
+                return
+            }
+            posthog.capture('insight breakdown changed', { query_kind: values.querySource?.kind })
+            const update: Partial<TrendsQuery> = { breakdownFilter: { ...values.breakdownFilter, ...breakdownFilter } }
+            actions.updateQuerySource(update)
+        },
+        updateCompareFilter: async ({ compareFilter }, breakpoint) => {
+            const isStale = trackPendingUpdate(cache, () => values.localQuerySource?.kind)
+            await breakpoint(500) // extra debounce time because of number input
+            if (isStale()) {
+                return
+            }
+            posthog.capture('insight compare changed', { query_kind: values.querySource?.kind })
+            const update: Partial<TrendsQuery> = { compareFilter: { ...values.compareFilter, ...compareFilter } }
+            actions.updateQuerySource(update)
+        },
+
+        // insight filter
+        updateInsightFilter: async ({ insightFilter }, breakpoint) => {
+            const isStale = trackPendingUpdate(cache, () => values.localQuerySource?.kind)
+
+            // When an external save handler is wired (dashboard card), skip the debounce so
+            // rapid successive toggle clicks don't cancel each other and lose earlier changes.
+            if (!props.setQuery) {
+                await breakpoint(300)
+            }
+
+            if (isWebAnalyticsInsightQuery(values.localQuerySource)) {
+                return
+            }
+
+            if (isStale()) {
+                return
+            }
+
+            const filterProperty = filterKeyForQuery(values.localQuerySource)
+            actions.updateQuerySource({
+                [filterProperty]: { ...filterForQuery(values.localQuerySource), ...insightFilter },
+            })
+        },
+
+        // insight filter properties
+        updateDisplay: ({ display }) => {
+            actions.updateInsightFilter({ display })
+        },
+
+        setDetailedResultsAggregationType: ({ detailedResultsAggregationType }) => {
+            actions.updateInsightFilter({
+                detailedResultsAggregationType: detailedResultsAggregationType,
+            })
+        },
+
+        updateVizSpecificOptions: ({ vizSpecificOptions }) => {
+            actions.setQuery({
+                ...values.query,
+                vizSpecificOptions: {
+                    ...values.vizSpecificOptions,
+                    ...vizSpecificOptions,
+                },
+            } as Node)
+        },
+
+        // data loading side effects i.e. displaying loading screens for queries with longer duration
+        loadData: async ({ queryId }, breakpoint) => {
+            actions.setTimedOutQueryId(null)
+
+            await breakpoint(SHOW_TIMEOUT_MESSAGE_AFTER) // By timeout we just mean long loading time here
+
+            if (values.insightDataLoading) {
+                actions.setTimedOutQueryId(queryId)
+                const tags = {
+                    kind: values.querySource?.kind,
+                    scene: sceneLogic.isMounted() ? sceneLogic.values.activeSceneId : null,
+                }
+                posthog.capture('insight timeout message shown', tags)
+            }
+        },
+        loadDataSuccess: () => {
+            actions.setTimedOutQueryId(null)
+        },
+        loadDataFailure: () => {
+            actions.setTimedOutQueryId(null)
+        },
+        setFormulaMode: ({ enabled }) => {
+            // Turning the mode off has to clear the query's formulas too, because hasFormula reads
+            // them back and would turn the mode straight on again.
+            if (!enabled && values.formulaNodes.length > 0) {
+                actions.updateInsightFilter({ formula: undefined, formulas: undefined, formulaNodes: [] })
+            }
+        },
+        removeFormulaNode: ({ formulas }) => {
+            if (formulas.length === 0) {
+                actions.setFormulaMode(false)
+                return
+            }
+
+            actions.updateInsightFilter({
+                formula: undefined,
+                formulas: undefined,
+                formulaNodes: formulas.filter((v) => v.formula.trim() !== ''),
+            })
+        },
+    })),
+    afterMount(({ actions, values }) => {
+        if (values.hasDataWarehouseSeries) {
+            actions.ensureAllTableFields()
+        }
+    }),
+])
+
+const getActiveUsersMath = (
+    series: (AnyEntityNode<AnyDataWarehouseNode> | GroupNode<AnyDataWarehouseNode>)[] | null | undefined
+): BaseMathType.WeeklyActiveUsers | BaseMathType.MonthlyActiveUsers | null => {
+    for (const seriesItem of series || []) {
+        if (seriesItem.math === BaseMathType.WeeklyActiveUsers) {
+            return BaseMathType.WeeklyActiveUsers
+        }
+
+        if (seriesItem.math === BaseMathType.MonthlyActiveUsers) {
+            return BaseMathType.MonthlyActiveUsers
+        }
+    }
+
+    return null
+}
+
+/** Whether a date string carries a time of day, e.g. drag-to-zoom on an hourly chart emits
+ *  `2024-06-10 08:00:00`. A bare `YYYY-MM-DD` means "that whole day". */
+export function hasTimeComponent(date: string): boolean {
+    return /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(date)
+}
+
+/** Last moment of the bucket starting at `bucketStart`, so a zoom keeps all the data the user
+ *  selected. Drag-to-zoom emits bucket *starts*, so without widening only the last bucket's first
+ *  day/instant survives — e.g. selecting the "May" bar of a monthly chart must zoom to
+ *  `2026-05-01..2026-05-31`, not `..2026-05-01`. Day buckets need no widening (a bare date
+ *  already means the whole day), and without a known interval the start is returned as-is. */
+export function dateRangeZoomEnd(bucketStart: string, interval: IntervalType | null | undefined): string {
+    if (!interval || interval === 'day') {
+        return bucketStart
+    }
+    const start = dayjs(bucketStart)
+    if (!start.isValid()) {
+        return bucketStart
+    }
+    if (interval === 'second' || interval === 'minute' || interval === 'hour') {
+        return start.add(1, interval).subtract(1, 'second').format('YYYY-MM-DD HH:mm:ss')
+    }
+    return start.add(1, interval).subtract(1, 'day').format('YYYY-MM-DD')
+}
+
+// The only breakdown types the trends backend resolves against a data warehouse series.
+const DATA_WAREHOUSE_SERIES_BREAKDOWN_TYPES = new Set<string>(['data_warehouse', 'hogql'])
+
+function hasEventBasedBreakdown(breakdownFilter: BreakdownFilter | null | undefined): boolean {
+    if (breakdownFilter?.breakdowns?.length) {
+        return breakdownFilter.breakdowns.some(
+            (breakdown) => !DATA_WAREHOUSE_SERIES_BREAKDOWN_TYPES.has(breakdown.type ?? '')
+        )
+    }
+    return (
+        breakdownFilter?.breakdown != null &&
+        !DATA_WAREHOUSE_SERIES_BREAKDOWN_TYPES.has(breakdownFilter.breakdown_type ?? '')
+    )
+}
+
+const handleQuerySourceUpdateSideEffects = (
+    update: QuerySourceUpdate,
+    currentState: InsightQueryNode,
+    isIntervalManuallySet: boolean
+): QuerySourceUpdate => {
+    const mergedUpdate = { ...update } as InsightQueryNode
+
+    const maybeChangedSeries = (update as TrendsQuery | FunnelsQuery | StickinessQuery | LifecycleQuery).series || null
+    const maybeChangedActiveUsersMath = maybeChangedSeries ? getActiveUsersMath(maybeChangedSeries) : null
+    const kind = (update as Partial<InsightQueryNode>).kind || currentState.kind
+    const insightFilter = filterForQuery(currentState as ProductAnalyticsInsightQueryNode) as Partial<InsightFilter>
+    const maybeChangedInsightFilter = (update as Record<string, InsightFilter | undefined>)[
+        (nodeKindToFilterProperty as Record<string, InsightFilterProperty>)[kind]
+    ] as Partial<InsightFilter>
+
+    const interval = (currentState as TrendsQuery).interval
+
+    const oneHourDateRange = {
+        date_from: '-1h',
+    }
+
+    /*
+     * Series change side effects.
+     */
+
+    // If the user just flipped an event action to use WAUs/MAUs math and their
+    // current interval is unsupported by the math type, switch their interval
+    // to an appropriate allowed interval and inform them of the change via a toast
+    if (
+        maybeChangedActiveUsersMath !== null &&
+        (interval === 'hour' ||
+            interval === 'month' ||
+            interval === 'minute' ||
+            interval === 'quarter' ||
+            interval === 'year')
+    ) {
+        if (interval === 'hour' || interval === 'minute') {
+            lemonToast.info(
+                `Switched to grouping by day, because "${BASE_MATH_DEFINITIONS[maybeChangedActiveUsersMath].name}" does not support grouping by ${interval}.`
+            )
+            ;(mergedUpdate as TrendsQuery).interval = 'day'
+        } else if (maybeChangedActiveUsersMath === BaseMathType.WeeklyActiveUsers) {
+            lemonToast.info(
+                `Switched to grouping by week, because "${BASE_MATH_DEFINITIONS[maybeChangedActiveUsersMath].name}" does not support grouping by ${interval}.`
+            )
+            ;(mergedUpdate as TrendsQuery).interval = 'week'
+        }
+    }
+
+    // clamp the funnel conversion window and per-exclusion step ranges against the new series
+    if (maybeChangedSeries && isFunnelsQuery(currentState)) {
+        const funnelsFilter = insightFilter as FunnelsFilter | undefined
+        const hasConversionWindow = funnelsFilter?.funnelFromStep != null || funnelsFilter?.funnelToStep != null
+        const hasExclusions = (funnelsFilter?.exclusions?.length ?? 0) > 0
+
+        if (hasConversionWindow || hasExclusions) {
+            // Filter out GroupNode types as funnels only use AnyEntityNode
+            const funnelSeries: AnyEntityNode<FunnelsDataWarehouseNode>[] = maybeChangedSeries.filter(
+                (node): node is AnyEntityNode<FunnelsDataWarehouseNode> => node.kind !== NodeKind.GroupNode
+            )
+            ;(mergedUpdate as FunnelsQuery).funnelsFilter = {
+                ...funnelsFilter,
+                ...getClampedFunnelStepRange(funnelsFilter ?? {}, funnelSeries),
+                ...(hasExclusions
+                    ? {
+                          exclusions: funnelsFilter?.exclusions?.map((exclusion) => ({
+                              ...exclusion,
+                              ...getClampedFunnelStepRange(exclusion, funnelSeries),
+                          })),
+                      }
+                    : {}),
+            }
+        }
+    }
+
+    if (
+        maybeChangedSeries &&
+        isLifecycleQuery(currentState) &&
+        currentState.customAggregationTarget &&
+        !maybeChangedSeries.some((series) => isLifecycleDataWarehouseNode(series))
+    ) {
+        ;(mergedUpdate as LifecycleQuery).customAggregationTarget = undefined
+    }
+
+    const nextRetentionFilter = isRetentionQuery(currentState)
+        ? (maybeChangedInsightFilter as RetentionFilter | undefined)
+        : undefined
+
+    // Switching a retention entity away from the data warehouse invalidates the "Custom entities"
+    // aggregation target, which the backend rejects for non-warehouse entities.
+    if (
+        nextRetentionFilter?.customAggregationTarget &&
+        (nextRetentionFilter.targetEntity?.type !== 'data_warehouse' ||
+            nextRetentionFilter.returningEntity?.type !== 'data_warehouse')
+    ) {
+        ;(mergedUpdate as RetentionQuery).retentionFilter = {
+            ...nextRetentionFilter,
+            customAggregationTarget: undefined,
+        }
+    }
+
+    // DWH series do not support sampling. They support properties and test account filtering only when every DWH
+    // series reads flag calls. Check the query after the update, so a later edit cannot turn them on again.
+    const nextQuery = { ...currentState, ...mergedUpdate } as InsightQueryNode
+    if (
+        !everyWarehouseSeriesReadsFlagCalls(nextQuery) &&
+        (!!nextQuery.filterTestAccounts || parseProperties(nextQuery.properties).length > 0)
+    ) {
+        lemonToast.info(
+            'Filter groups and test accounts are not supported for Data Warehouse series and have been disabled.'
+        )
+        ;(mergedUpdate as TrendsQuery).properties = undefined
+        ;(mergedUpdate as TrendsQuery).filterTestAccounts = false
+    }
+    if (dataWarehouseSeriesNodes(nextQuery).length > 0 && (nextQuery as TrendsQuery).samplingFactor != null) {
+        ;(mergedUpdate as TrendsQuery).samplingFactor = undefined
+    }
+
+    /*
+     * Date range change side effects.
+     */
+    if (
+        !isRetentionQuery(currentState) &&
+        !isPathsQuery(currentState) && // TODO: Apply side logic more elegantly
+        !isPathsV2Query(currentState) && // PathsV2Query has no interval field, and the backend rejects unknown fields
+        update.dateRange &&
+        update.dateRange.date_from &&
+        (update.dateRange.date_from !== currentState.dateRange?.date_from ||
+            update.dateRange.date_to !== currentState.dateRange?.date_to) &&
+        !isIntervalManuallySet // Only auto-adjust interval if not manually set
+    ) {
+        const { date_from, date_to } = { ...currentState.dateRange, ...update.dateRange }
+
+        if (date_from && date_to && dayjs(date_from).isValid() && dayjs(date_to).isValid()) {
+            const quarterYearEnabled =
+                !!featureFlagLogic.findMounted()?.values.featureFlags[
+                    FEATURE_FLAGS.PRODUCT_ANALYTICS_QUARTER_YEAR_INTERVALS
+                ]
+            const parsedFrom = dayjs(date_from)
+            const parsedTo = dayjs(date_to)
+            const monthDiff = parsedTo.diff(parsedFrom, 'month')
+            // 3 years in months; quarter auto-interval kicks in beyond this threshold
+            const QUARTER_AUTO_INTERVAL_THRESHOLD_MONTHS = 36
+            // A bare date pair like 2024-06-10..2024-06-10 means "that whole day", so only ranges
+            // that carry a time component (e.g. drag-to-zoom on an hourly chart) can go sub-hour.
+            const rangeHasTime = hasTimeComponent(String(date_from)) || hasTimeComponent(String(date_to))
+            if (isTrendsQuery(currentState) && rangeHasTime && parsedTo.diff(parsedFrom, 'hour', true) <= 12) {
+                // Mirrors the is12HoursOrLess rule for relative ranges below.
+                ;(mergedUpdate as TrendsQuery).interval = 'minute'
+            } else if (parsedTo.diff(parsedFrom, 'day') <= 3) {
+                ;(mergedUpdate as TrendsQuery).interval = 'hour'
+            } else if (monthDiff <= 3) {
+                ;(mergedUpdate as TrendsQuery).interval = 'day'
+            } else if (quarterYearEnabled && monthDiff > QUARTER_AUTO_INTERVAL_THRESHOLD_MONTHS) {
+                ;(mergedUpdate as TrendsQuery).interval = 'quarter'
+            } else {
+                ;(mergedUpdate as TrendsQuery).interval = 'month'
+            }
+        } else {
+            // get a defaultInterval for dateOptions that have a default value
+            const selectedDateMapping = dateMapping.find(
+                ({ key, values, defaultInterval }) =>
+                    values[0] === date_from &&
+                    values[1] === (date_to || undefined) &&
+                    key !== 'Custom' &&
+                    defaultInterval
+            )
+
+            if (!selectedDateMapping && isTrendsQuery(currentState) && is12HoursOrLess(date_from)) {
+                ;(mergedUpdate as TrendsQuery).interval = 'minute'
+            } else if (!selectedDateMapping && isLessThan2Days(date_from)) {
+                ;(mergedUpdate as TrendsQuery).interval = 'hour'
+            } else {
+                ;(mergedUpdate as TrendsQuery).interval = selectedDateMapping?.defaultInterval || 'day'
+            }
+        }
+    }
+
+    /*
+     * Display change side effects.
+     */
+    const display = (insightFilter as Partial<TrendsFilter>)?.display || ChartDisplayType.ActionsLineGraph
+    const maybeChangedDisplay =
+        (maybeChangedInsightFilter as Partial<TrendsFilter>)?.display || ChartDisplayType.ActionsLineGraph
+
+    // For the map, make sure we are breaking down by country
+    if (
+        kind === NodeKind.TrendsQuery &&
+        display !== maybeChangedDisplay &&
+        maybeChangedDisplay === ChartDisplayType.WorldMap
+    ) {
+        const math = (maybeChangedSeries || (currentState as TrendsQuery).series)?.[0]?.math
+
+        ;(mergedUpdate as TrendsQuery).breakdownFilter = {
+            breakdown: '$geoip_country_code',
+            breakdown_type: ['dau', 'weekly_active', 'monthly_active'].includes(math || '') ? 'person' : 'event',
+        }
+    }
+
+    let breakdownFilter = (('breakdownFilter' in mergedUpdate ? mergedUpdate : currentState) as TrendsQuery)
+        .breakdownFilter
+    if (
+        kind === NodeKind.TrendsQuery &&
+        maybeChangedSeries?.length &&
+        maybeChangedSeries.every(
+            (series) => isDataWarehouseNode(series) && series.table_name === FLAG_EVALUATIONS_TABLE
+        )
+    ) {
+        const flagCallsBreakdownFilter = flagCallsBreakdownFromEventBreakdown(breakdownFilter)
+        if (flagCallsBreakdownFilter !== breakdownFilter) {
+            breakdownFilter = flagCallsBreakdownFilter
+            ;(mergedUpdate as TrendsQuery).breakdownFilter = flagCallsBreakdownFilter
+        }
+    }
+    // A trends insight that mixes event and data warehouse series cannot have a breakdown.
+    const mixesEventAndDataWarehouseSeries =
+        kind === NodeKind.TrendsQuery &&
+        (mergedUpdate as TrendsQuery).series?.length >= 0 &&
+        (mergedUpdate as TrendsQuery).series.some((series) => isDataWarehouseNode(series)) &&
+        (mergedUpdate as TrendsQuery).series.some((series) => isActionsNode(series) || isEventsNode(series))
+    // The trends backend rejects an event-based breakdown on a data warehouse series.
+    const hasEventBreakdownOnDataWarehouseSeries =
+        kind === NodeKind.TrendsQuery &&
+        !!maybeChangedSeries?.some((series) => isDataWarehouseNode(series)) &&
+        hasEventBasedBreakdown(breakdownFilter)
+    if (mixesEventAndDataWarehouseSeries || hasEventBreakdownOnDataWarehouseSeries) {
+        if (hasBreakdownFilter(breakdownFilter)) {
+            const subject = readsFlagCalls(nextQuery) ? flagCallsSeriesName() : 'A data warehouse series'
+            lemonToast.info(
+                hasEventBreakdownOnDataWarehouseSeries
+                    ? `${subject} doesn't support this breakdown, so it's removed.`
+                    : `${subject} can't share a breakdown with event or action series, so it's removed.`
+            )
+        }
+        ;(mergedUpdate as TrendsQuery).breakdownFilter = undefined
+    }
+
+    // Remove breakdown filter if display type is BoldNumber because it is not supported
+    if (kind === NodeKind.TrendsQuery && maybeChangedDisplay === ChartDisplayType.BoldNumber) {
+        ;(mergedUpdate as TrendsQuery).breakdownFilter = undefined
+    }
+
+    // Remove breakdown filter if display type is Metric because it is single-series
+    if (kind === NodeKind.TrendsQuery && maybeChangedDisplay === ChartDisplayType.Metric) {
+        ;(mergedUpdate as TrendsQuery).breakdownFilter = undefined
+    }
+
+    // Remove breakdown filter if display type is Heatmap because it is not supported
+    if (kind === NodeKind.TrendsQuery && maybeChangedDisplay === ChartDisplayType.CalendarHeatmap) {
+        ;(mergedUpdate as TrendsQuery).breakdownFilter = undefined
+    }
+
+    // Remove formulas for box plot (formulas don't apply to statistical distributions)
+    if (kind === NodeKind.TrendsQuery && maybeChangedDisplay === ChartDisplayType.BoxPlot) {
+        ;(mergedUpdate as TrendsQuery).breakdownFilter = undefined
+        ;(mergedUpdate as TrendsQuery).trendsFilter = {
+            ...(mergedUpdate as TrendsQuery).trendsFilter,
+            formula: undefined,
+            formulas: undefined,
+            formulaNodes: [],
+        }
+    }
+
+    // Don't allow minutes on anything other than Trends
+    if (
+        currentState.kind == NodeKind.TrendsQuery &&
+        kind !== NodeKind.TrendsQuery &&
+        (('interval' in mergedUpdate && mergedUpdate?.interval) || interval) == 'minute'
+    ) {
+        ;(mergedUpdate as TrendsQuery).interval = 'hour'
+    }
+
+    // If the user changes the interval to 'minute' and the date_range is more than 12 hours, reset it to 1 hour
+    if (kind == NodeKind.TrendsQuery && (mergedUpdate as TrendsQuery)?.interval == 'minute' && interval !== 'minute') {
+        const { date_from, date_to } = { ...currentState.dateRange, ...update.dateRange }
+        const isAbsoluteRange = !!date_from && !!date_to && dayjs(date_from).isValid() && dayjs(date_to).isValid()
+
+        if (
+            // When insights are created, they might not have an explicit dateRange set. Change it to an hour if the interval is minute.
+            (!date_from && !date_to) ||
+            // If the interval is set manually to a range greater than 12 hours, change it to an hour
+            (isAbsoluteRange && dayjs(date_to).diff(dayjs(date_from), 'hour') > 12) ||
+            // Relative ranges (e.g. -7d) must be 12 hours or less; an absolute range that reaches
+            // here already passed the >12h check above, so it stays (is12HoursOrLess only parses
+            // relative strings and would wrongly reset it).
+            (!isAbsoluteRange && !is12HoursOrLess(date_from))
+        ) {
+            ;(mergedUpdate as TrendsQuery).dateRange = oneHourDateRange
+        }
+    }
+
+    // If we've changed interval, clear smoothings
+    if (kind == NodeKind.TrendsQuery) {
+        if (
+            (currentState as Partial<TrendsQuery>)?.trendsFilter?.smoothingIntervals !== undefined &&
+            (mergedUpdate as TrendsQuery)?.interval !== undefined &&
+            (mergedUpdate as TrendsQuery).interval !== interval
+        ) {
+            ;(mergedUpdate as TrendsQuery).trendsFilter = {
+                ...(currentState as TrendsQuery).trendsFilter,
+                smoothingIntervals: undefined,
+            }
+        }
+    }
+
+    /*
+     * Retention side effects
+     */
+    if (kind === NodeKind.RetentionQuery) {
+        const retentionFilter = (mergedUpdate as RetentionQuery).retentionFilter
+        if (retentionFilter?.timeWindowMode === '24_hour_windows') {
+            retentionFilter.cumulative = false
+        }
+    }
+
+    return mergedUpdate
+}

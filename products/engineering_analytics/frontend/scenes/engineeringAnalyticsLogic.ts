@@ -1,0 +1,1267 @@
+import {
+    MakeLogicType,
+    LogicWrapper,
+    actions,
+    afterMount,
+    connect,
+    kea,
+    listeners,
+    path,
+    reducers,
+    selectors,
+} from 'kea'
+import { loaders } from 'kea-loaders'
+import { router, urlToAction } from 'kea-router'
+import posthog from 'posthog-js'
+
+import { ApiConfig, ApiError } from 'lib/api'
+import { dayjs } from 'lib/dayjs'
+import { groupBy } from 'lib/utils/arrays'
+import { removeProjectIdIfPresent } from 'lib/utils/kea-router'
+import { objectsEqual } from 'lib/utils/objects'
+import { urls } from 'scenes/urls'
+
+import {
+    engineeringAnalyticsCiCards,
+    engineeringAnalyticsPullRequests,
+    engineeringAnalyticsQuarantine,
+    engineeringAnalyticsTrunkQuarantine,
+    engineeringAnalyticsWorkflowHealth,
+} from '../generated/api'
+import type { GitHubSourceApi, PullRequestListItemApi, PushCISampleApi } from '../generated/api.schemas'
+import { CIStatus, ciStatusOf } from '../lib/ci'
+import { parsePullRequestReference, resolvePullRequestTarget } from '../lib/pullRequestReference'
+import { repoFromPath } from '../lib/repoScope'
+import { type FleetSummary, computeFleetSummary } from '../lib/runHealth'
+import { withCurrentScope, withScope } from '../lib/scope'
+import { engineeringAnalyticsFiltersLogic } from './engineeringAnalyticsFiltersLogic'
+import type { RunScopeParams } from './engineeringAnalyticsFiltersLogic'
+import { repoScopeLogic } from './repoScopeLogic'
+
+// pinned: analytics event name. Renaming it breaks the insights built on it.
+const EVENT_PULL_REQUEST_JUMP_SUBMITTED = 'pull request jump submitted'
+
+// Mirrors the endpoint's server-side limit.
+export const PR_TABLE_LIMIT = 1000
+
+// Mirrors `workflow_health.py` `_LIMIT` (top workflows by run count).
+export const WORKFLOW_HEALTH_LIMIT = 100
+
+const projectId = (): string => String(ApiConfig.getCurrentProjectId())
+
+export type PRState = 'open' | 'closed' | 'merged'
+/** 'draft' narrows open PRs; the other values mirror PRState. */
+export type PRStateFilter = PRState | 'draft' | 'all'
+export type CIStatusFilter = CIStatus | 'all'
+export type CardFilter = 'open' | 'failing' | 'stuck' | 'ready' | 'thrash'
+
+/** Mirrors the ci_cards "stuck" rule: open, non-draft, non-bot, older than 7 days. */
+export const STUCK_AFTER_DAYS = 7
+
+export interface PullRequestRow {
+    number: number
+    title: string
+    repoOwner: string
+    repoName: string
+    authorHandle: string
+    authorAvatarUrl: string
+    isBot: boolean
+    state: PRState
+    isDraft: boolean
+    createdAt: string
+    mergedAt: string | null
+    /** The span from created_at to merged_at, never review or cycle time. Merged PRs only. */
+    openToMergeSeconds: number | null
+    labels: string[]
+    runs: number
+    passing: number
+    failing: number
+    pending: number
+    /** Runs that settled without a verdict: cancelled, skipped, neutral, action required. */
+    inconclusive: number
+    failingWorkflows: string[]
+    /** Distinct head SHAs across the PR's workflow runs. Fork PRs are unattributed. */
+    pushes: number
+    /** Oldest first, capped server-side. */
+    pushHistory: PushCISampleApi[]
+    /** Runs attributed to this PR that were a second or later attempt. */
+    rerunCycles: number
+    /** Null when the job source isn't synced. */
+    estimatedCostUsd: number | null
+    /** Null when the job source isn't synced. */
+    billableMinutes: number | null
+}
+
+export interface CardsData {
+    openPrs: number
+    repos: number
+    stuck: number
+    failingCi: number
+}
+
+/** The server picks the bucket width from the window length. */
+export type WorkflowGranularity = 'hour' | 'day' | 'week'
+
+export interface WorkflowHealthBucket {
+    bucketStart: string
+    runCount: number
+    completed: number
+    successes: number
+    /** Decisive failures only; excludes skipped, cancelled, neutral, and action_required. */
+    failures: number
+}
+
+export interface WorkflowHealthRow {
+    repoOwner: string
+    repoName: string
+    workflowName: string
+    runCount: number
+    /** Over conclusive runs only; null when no run reached a pass-or-fail verdict. */
+    successRate: number | null
+    p50Seconds: number | null
+    p95Seconds: number | null
+    lastFailureAt: string | null
+    /** True when the most recent completed run was a decisive failure. Null when nothing has completed. */
+    latestRunFailed: boolean | null
+    latestRunConclusion: string | null
+    granularity: WorkflowGranularity
+    /** Zero-filled across the whole window, oldest first. */
+    buckets: WorkflowHealthBucket[]
+    /** Undefined when no cost data is loaded. */
+    billableMinutes?: number | null
+    /** Null when nothing was costable. */
+    estimatedCostUsd?: number | null
+    /** Runs in the window that were a second or later attempt. */
+    rerunCycles?: number
+    /** Runs on merge-queue gate branches, counted regardless of the active scope. Above zero marks a
+     *  workflow the queue runs before a merge lands, so the list can rank it first. */
+    mergeQueueRunCount: number
+}
+
+export interface WorkflowFailureSeries {
+    completed: number[]
+    failures: number[]
+    labels: string[]
+}
+
+export function formatBucket(bucketStart: string, granularity: WorkflowGranularity): string {
+    // The server computes buckets on UTC boundaries, so the label reads them in UTC. The browser's
+    // local timezone can shift a midnight bucket to the wrong day.
+    const at = dayjs.utc(bucketStart)
+    if (granularity === 'hour') {
+        return at.format('MMM D, HH:mm')
+    }
+    if (granularity === 'week') {
+        return `Week of ${at.format('MMM D')}`
+    }
+    return at.format('MMM D')
+}
+
+export function workflowFailureSeries(
+    buckets: WorkflowHealthBucket[],
+    granularity: WorkflowGranularity
+): WorkflowFailureSeries {
+    const completed = buckets.map((b) => b.completed)
+    const failures = buckets.map((b) => b.failures)
+    const labels = buckets.map((b) => {
+        const when = formatBucket(b.bucketStart, granularity)
+        return b.completed > 0 ? `${when} · ${b.failures} of ${b.completed} failed` : `${when} · no completed runs`
+    })
+    return { completed, failures, labels }
+}
+
+/** 'failing' and 'passing' key off the latest settled run. A row with nothing completed shows only under 'all'. */
+export type WorkflowStatusFilter = 'all' | 'failing' | 'passing'
+
+export interface WorkflowFilters {
+    search: string
+    status: WorkflowStatusFilter
+}
+
+export const DEFAULT_WORKFLOW_FILTERS: WorkflowFilters = { search: '', status: 'all' }
+
+export function filterWorkflowHealth(rows: WorkflowHealthRow[], filters: WorkflowFilters): WorkflowHealthRow[] {
+    const search = filters.search.trim().toLowerCase()
+    return rows.filter((row) => {
+        if (filters.status === 'failing' && row.latestRunFailed !== true) {
+            return false
+        }
+        if (filters.status === 'passing' && row.latestRunFailed !== false) {
+            return false
+        }
+        return !search || row.workflowName.toLowerCase().includes(search)
+    })
+}
+
+export function prKeyOf(row: Pick<PullRequestRow, 'repoOwner' | 'repoName' | 'number'>): string {
+    return `${row.repoOwner}/${row.repoName}#${row.number}`
+}
+
+/** The ?? fallbacks cover a new frontend that briefly reads an older backend without the cost and push fields. */
+export function toPullRequestRow(it: PullRequestListItemApi): PullRequestRow {
+    return {
+        number: it.number,
+        title: it.title,
+        repoOwner: it.repo.owner,
+        repoName: it.repo.name,
+        authorHandle: it.author.handle,
+        authorAvatarUrl: it.author.avatar_url,
+        isBot: it.author.is_bot,
+        state: it.state as PRState,
+        isDraft: it.is_draft,
+        createdAt: it.created_at,
+        mergedAt: it.merged_at,
+        openToMergeSeconds: it.open_to_merge_seconds,
+        labels: it.labels,
+        runs: it.ci.runs,
+        passing: it.ci.passing,
+        failing: it.ci.failing,
+        pending: it.ci.pending,
+        inconclusive: it.ci.inconclusive,
+        failingWorkflows: it.ci.failing_workflows ?? [],
+        pushes: it.pushes ?? 0,
+        pushHistory: it.push_history ?? [],
+        rerunCycles: it.rerun_cycles ?? 0,
+        estimatedCostUsd: it.estimated_cost_usd ?? null,
+        billableMinutes: it.billable_minutes ?? null,
+    }
+}
+
+export interface PullRequestFilters {
+    state: PRStateFilter
+    author: string | null
+    repo: string | null
+    ciStatus: CIStatusFilter
+    search: string
+    stuckOnly: boolean
+    readyOnly: boolean
+    thrashOnly: boolean
+}
+
+export const DEFAULT_FILTERS: PullRequestFilters = {
+    state: 'open',
+    author: null,
+    repo: null,
+    ciStatus: 'all',
+    search: '',
+    stuckOnly: false,
+    readyOnly: false,
+    thrashOnly: false,
+}
+
+/** Why the jump box could not open what it holds: the text names no pull request, or it is a bare number
+ *  with no repository to open in. */
+export type PullRequestJumpFailure = 'invalid' | 'needs_repository'
+
+export function isStuck(row: PullRequestRow, stuckCutoffMs: number): boolean {
+    return row.state === 'open' && !row.isDraft && !row.isBot && Date.parse(row.createdAt) < stuckCutoffMs
+}
+
+export function isReady(row: PullRequestRow): boolean {
+    return row.state === 'open' && !row.isDraft && ciStatusOf(row) === 'passing'
+}
+
+export function isThrashing(row: PullRequestRow): boolean {
+    return row.state === 'open' && row.rerunCycles > 0
+}
+
+function matchesStateFilter(row: PullRequestRow, state: PRStateFilter): boolean {
+    if (state === 'all') {
+        return true
+    }
+    if (state === 'draft') {
+        return row.state === 'open' && row.isDraft
+    }
+    return row.state === state
+}
+
+export function filterPullRequests(
+    rows: PullRequestRow[],
+    filters: PullRequestFilters,
+    now: dayjs.Dayjs = dayjs()
+): PullRequestRow[] {
+    const search = filters.search.trim().toLowerCase()
+    // Hoisted because the filter reruns per keystroke over up to PR_TABLE_LIMIT rows, so the row loop
+    // must allocate no dayjs.
+    const stuckCutoffMs = filters.stuckOnly ? now.subtract(STUCK_AFTER_DAYS, 'day').valueOf() : 0
+    return rows.filter((row) => {
+        if (!matchesStateFilter(row, filters.state)) {
+            return false
+        }
+        if (filters.stuckOnly && !isStuck(row, stuckCutoffMs)) {
+            return false
+        }
+        if (filters.readyOnly && !isReady(row)) {
+            return false
+        }
+        if (filters.thrashOnly && !isThrashing(row)) {
+            return false
+        }
+        if (filters.author && row.authorHandle !== filters.author) {
+            return false
+        }
+        if (filters.repo && `${row.repoOwner}/${row.repoName}` !== filters.repo) {
+            return false
+        }
+        if (filters.ciStatus !== 'all' && ciStatusOf(row) !== filters.ciStatus) {
+            return false
+        }
+        if (search) {
+            const haystack =
+                `${row.title} ${row.repoOwner}/${row.repoName} ${row.authorHandle} #${row.number}`.toLowerCase()
+            if (!haystack.includes(search)) {
+                return false
+            }
+        }
+        return true
+    })
+}
+
+export type QuarantineMode = 'run' | 'skip'
+export type QuarantineLifecycle = 'active' | 'expiring_soon' | 'in_grace' | 'overdue'
+export type QuarantineSelectorKind = 'product' | 'directory' | 'file' | 'test'
+
+export interface QuarantineEntryRow {
+    id: string
+    runner: string
+    reason: string
+    owner: string
+    /** Tracking issue URL, or '' when none was filed. */
+    issue: string
+    /** ISO date. */
+    added: string
+    /** ISO date. */
+    expires: string
+    mode: QuarantineMode
+    lifecycle: QuarantineLifecycle
+    /** Negative once past expiry. */
+    daysUntilExpiry: number
+    selectorKind: QuarantineSelectorKind
+}
+
+export interface QuarantineData {
+    available: boolean
+    entries: QuarantineEntryRow[]
+    parseErrors: string[]
+    parseWarnings: string[]
+    sourceUrl: string
+    /** owner/name, or null when read from the local checkout in dev. */
+    repoFullName: string | null
+}
+
+export interface TrunkQuarantinedTestRow {
+    runner: string
+    nodeid: string
+    file: string
+    ownerTeam: string
+    status: string
+    quarantinedAt: string
+    ageDays: number
+    overdue: boolean
+    /** The Trunk app's page for this test; null when the source has no org slug or the row no id. */
+    trunkUrl: string | null
+}
+
+export interface TrunkQuarantineTeamRow {
+    ownerTeam: string
+    testCount: number
+    overdueCount: number
+    oldestAgeDays: number
+}
+
+export interface TrunkQuarantineData {
+    /** False when no TrunkIo source has the QuarantinedTests endpoint synced; not an error. */
+    available: boolean
+    /** False when the repository's ownership files could not be read, so every test reads as unowned. */
+    ownersResolved: boolean
+    ttlDays: number
+    /** 'owner/name' the debt was read for; test file paths are relative to it. */
+    repository: string
+    /** The Trunk app's flaky-tests page for this repository; null when the source has no org slug. */
+    trunkUrl: string | null
+    teams: TrunkQuarantineTeamRow[]
+    tests: TrunkQuarantinedTestRow[]
+    /** True when more tests are quarantined than `limit`; `tests` and the team counts are then lower bounds. */
+    truncated: boolean
+    limit: number
+}
+
+/**
+ * Per-loader outcome. A 400 means "no GitHub source" for every scene; any other failure stays scoped
+ * to the loader that hit it, so a 500 on one endpoint doesn't error a scene that doesn't read it.
+ */
+export type LoaderStatus = 'ok' | 'notConnected' | 'error'
+
+/** Whether repoScopeLogic is about to forward the current repo-less URL to a repository. A load waits for
+ *  the forward, which ends in a refresh, so it does not read a repository the page leaves at once. */
+export function awaitsRepoForward(): boolean {
+    const pathname = removeProjectIdIfPresent(router.values.location.pathname)
+    const repoLess = pathname.startsWith('/engineering-analytics/') && repoFromPath(pathname) === null
+    return repoLess && (repoScopeLogic.findMounted()?.values.pendingForward ?? false)
+}
+
+export function loaderStatusFromError(errorObject: unknown): LoaderStatus {
+    return errorObject instanceof ApiError && errorObject.status === 400 ? 'notConnected' : 'error'
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface engineeringAnalyticsLogicValues {
+    dateFrom: string | null // engineeringAnalyticsFiltersLogic
+    dateTo: string | null // engineeringAnalyticsFiltersLogic
+    runScopeParams: RunScopeParams // engineeringAnalyticsFiltersLogic
+    githubSources: GitHubSourceApi[] | null // repoScopeLogic
+    githubSourcesLoading: boolean // repoScopeLogic
+    activeCard: CardFilter | null
+    activeSource: GitHubSourceApi | null
+    anyLoading: boolean
+    author: string | null
+    cards: CardsData | null
+    cardsLoading: boolean
+    cardsStatus: LoaderStatus
+    ciStatusFilter: CIStatusFilter
+    expandedTrunkQuarantineTeams: string[]
+    filteredPullRequests: PullRequestRow[]
+    filteredWorkflowHealth: WorkflowHealthRow[]
+    filters: PullRequestFilters
+    fleetSummary: FleetSummary
+    fleetTruncated: boolean
+    hasActiveFilters: boolean
+    hasActiveWorkflowFilters: boolean
+    notConnected: boolean
+    pullRequestJumpFailure: PullRequestJumpFailure | null
+    pullRequestJumpText: string
+    pullRequests: PullRequestRow[]
+    pullRequestsLoadError: boolean
+    pullRequestsLoading: boolean
+    pullRequestsStatus: LoaderStatus
+    quarantine: QuarantineData | null
+    quarantineLoading: boolean
+    readyCount: number
+    readyOnly: boolean
+    repo: string | null
+    scopeRepo: string | null
+    search: string
+    sourceId: string | null
+    stateFilter: PRStateFilter
+    stuckOnly: boolean
+    tableTruncated: boolean
+    thrashCount: number
+    thrashOnly: boolean
+    trunkQuarantine: TrunkQuarantineData | null
+    trunkQuarantineLoading: boolean
+    trunkQuarantineStatus: LoaderStatus
+    trunkQuarantineTestsByTeam: Record<string, TrunkQuarantinedTestRow[]>
+    workflowCostAvailable: boolean
+    workflowFilters: WorkflowFilters
+    workflowHealth: WorkflowHealthRow[]
+    workflowHealthLoadError: boolean
+    workflowHealthLoading: boolean
+    workflowHealthStatus: LoaderStatus
+    workflowSearch: string
+    workflowStatusFilter: WorkflowStatusFilter
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface engineeringAnalyticsLogicActions {
+    noRepoToForward: () => {
+        value: true
+    } // repoScopeLogic
+    applyCardFilter: (card: CardFilter) => {
+        card: CardFilter
+    }
+    failPullRequestJump: (failure: PullRequestJumpFailure) => {
+        failure: PullRequestJumpFailure
+    }
+    loadCards: () => any
+    loadCardsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadCardsSuccess: (
+        cards: CardsData,
+        payload?: any
+    ) => {
+        cards: CardsData
+        payload?: any
+    }
+    loadPullRequests: () => any
+    loadPullRequestsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadPullRequestsSuccess: (
+        pullRequests: PullRequestRow[],
+        payload?: any
+    ) => {
+        pullRequests: PullRequestRow[]
+        payload?: any
+    }
+    loadQuarantine: () => any
+    loadQuarantineFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadQuarantineSuccess: (
+        quarantine: QuarantineData,
+        payload?: any
+    ) => {
+        quarantine: QuarantineData
+        payload?: any
+    }
+    loadTrunkQuarantine: () => any
+    loadTrunkQuarantineFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadTrunkQuarantineSuccess: (
+        trunkQuarantine: TrunkQuarantineData,
+        payload?: any
+    ) => {
+        trunkQuarantine: TrunkQuarantineData
+        payload?: any
+    }
+    loadWorkflowHealth: () => any
+    loadWorkflowHealthFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadWorkflowHealthSuccess: (
+        workflowHealth: WorkflowHealthRow[],
+        payload?: any
+    ) => {
+        workflowHealth: WorkflowHealthRow[]
+        payload?: any
+    }
+    refresh: () => {
+        value: true
+    }
+    resetFilters: () => {
+        value: true
+    }
+    resetWorkflowFilters: () => {
+        value: true
+    }
+    setAuthor: (author: string | null) => {
+        author: string | null
+    }
+    setCiStatusFilter: (ciStatus: CIStatusFilter) => {
+        ciStatus: CIStatusFilter
+    }
+    setPullRequestJumpText: (text: string) => {
+        text: string
+    }
+    setReadyOnly: (ready: boolean) => {
+        ready: boolean
+    }
+    setRepo: (repo: string | null) => {
+        repo: string | null
+    }
+    setScope: (
+        sourceId: string | null,
+        scopeRepo: string | null
+    ) => {
+        scopeRepo: string | null
+        sourceId: string | null
+    }
+    setSearch: (search: string) => {
+        search: string
+    }
+    setSourceId: (sourceId: string | null) => {
+        sourceId: string | null
+    }
+    setStateFilter: (state: PRStateFilter) => {
+        state: PRStateFilter
+    }
+    setStuckOnly: (stuckOnly: boolean) => {
+        stuckOnly: boolean
+    }
+    setThrashOnly: (thrash: boolean) => {
+        thrash: boolean
+    }
+    setWorkflowSearch: (search: string) => {
+        search: string
+    }
+    setWorkflowStatusFilter: (status: WorkflowStatusFilter) => {
+        status: WorkflowStatusFilter
+    }
+    submitPullRequestJump: () => {
+        value: true
+    }
+    toggleTrunkQuarantineTeam: (team: string) => {
+        team: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface engineeringAnalyticsLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        fleetSummary: (workflowHealth: WorkflowHealthRow[]) => FleetSummary
+        fleetTruncated: (workflowHealth: WorkflowHealthRow[]) => boolean
+        workflowFilters: (workflowSearch: string, workflowStatusFilter: WorkflowStatusFilter) => WorkflowFilters
+        filteredWorkflowHealth: (
+            workflowHealth: WorkflowHealthRow[],
+            workflowFilters: WorkflowFilters
+        ) => WorkflowHealthRow[]
+        hasActiveWorkflowFilters: (workflowFilters: WorkflowFilters) => boolean
+        workflowCostAvailable: (workflowHealth: WorkflowHealthRow[]) => boolean
+        filters: (
+            stateFilter: PRStateFilter,
+            author: string | null,
+            repo: string | null,
+            ciStatusFilter: CIStatusFilter,
+            search: string,
+            stuckOnly: boolean,
+            readyOnly: boolean,
+            thrashOnly: boolean
+        ) => PullRequestFilters
+        activeCard: (
+            stateFilter: PRStateFilter,
+            ciStatusFilter: CIStatusFilter,
+            stuckOnly: boolean,
+            readyOnly: boolean,
+            thrashOnly: boolean
+        ) => CardFilter | null
+        filteredPullRequests: (pullRequests: PullRequestRow[], filters: PullRequestFilters) => PullRequestRow[]
+        hasActiveFilters: (filters: PullRequestFilters) => boolean
+        readyCount: (pullRequests: PullRequestRow[]) => number
+        thrashCount: (pullRequests: PullRequestRow[]) => number
+        anyLoading: (
+            cardsLoading: boolean,
+            pullRequestsLoading: boolean,
+            workflowHealthLoading: boolean,
+            quarantineLoading: boolean
+        ) => boolean
+        notConnected: (
+            cardsStatus: LoaderStatus,
+            pullRequestsStatus: LoaderStatus,
+            workflowHealthStatus: LoaderStatus
+        ) => boolean
+        pullRequestsLoadError: (cardsStatus: LoaderStatus, pullRequestsStatus: LoaderStatus) => boolean
+        workflowHealthLoadError: (workflowHealthStatus: LoaderStatus) => boolean
+        tableTruncated: (pullRequests: PullRequestRow[]) => boolean
+        trunkQuarantineTestsByTeam: (
+            trunkQuarantine: TrunkQuarantineData | null
+        ) => Record<string, TrunkQuarantinedTestRow[]>
+        activeSource: (
+            githubSources: GitHubSourceApi[] | null,
+            sourceId: string | null,
+            scopeRepo: string | null
+        ) => GitHubSourceApi | null
+    }
+}
+
+export type engineeringAnalyticsLogicType = MakeLogicType<
+    engineeringAnalyticsLogicValues,
+    engineeringAnalyticsLogicActions,
+    Record<string, any>,
+    engineeringAnalyticsLogicMeta
+>
+
+export const engineeringAnalyticsLogic: LogicWrapper<engineeringAnalyticsLogicType> =
+    kea<engineeringAnalyticsLogicType>([
+        path(['products', 'engineering_analytics', 'frontend', 'scenes', 'engineeringAnalyticsLogic']),
+
+        connect(() => ({
+            values: [
+                engineeringAnalyticsFiltersLogic,
+                ['dateFrom', 'dateTo', 'runScopeParams'],
+                // One sources list for the product: repoScopeLogic loads it for the switcher and the forward.
+                repoScopeLogic,
+                ['githubSources', 'githubSourcesLoading'],
+            ],
+            actions: [repoScopeLogic, ['noRepoToForward']],
+        })),
+
+        actions({
+            setStateFilter: (state: PRStateFilter) => ({ state }),
+            setAuthor: (author: string | null) => ({ author }),
+            setRepo: (repo: string | null) => ({ repo }),
+            setCiStatusFilter: (ciStatus: CIStatusFilter) => ({ ciStatus }),
+            setSearch: (search: string) => ({ search }),
+            setWorkflowSearch: (search: string) => ({ search }),
+            setWorkflowStatusFilter: (status: WorkflowStatusFilter) => ({ status }),
+            resetWorkflowFilters: true,
+            setStuckOnly: (stuckOnly: boolean) => ({ stuckOnly }),
+            setReadyOnly: (ready: boolean) => ({ ready }),
+            setThrashOnly: (thrash: boolean) => ({ thrash }),
+            applyCardFilter: (card: CardFilter) => ({ card }),
+            setSourceId: (sourceId: string | null) => ({ sourceId }),
+            // The URL names a (source, repo) pair, so both land in one action before a single refresh.
+            setScope: (sourceId: string | null, scopeRepo: string | null) => ({ sourceId, scopeRepo }),
+            setPullRequestJumpText: (text: string) => ({ text }),
+            submitPullRequestJump: true,
+            failPullRequestJump: (failure: PullRequestJumpFailure) => ({ failure }),
+            resetFilters: true,
+            toggleTrunkQuarantineTeam: (team: string) => ({ team }),
+            refresh: true,
+        }),
+
+        loaders(({ values }) => ({
+            cards: [
+                null as CardsData | null,
+                {
+                    loadCards: async (): Promise<CardsData> => {
+                        const data = await engineeringAnalyticsCiCards(projectId(), {
+                            source_id: values.sourceId ?? undefined,
+                            repo: values.scopeRepo ?? undefined,
+                        })
+                        return {
+                            openPrs: data.open_prs,
+                            repos: data.repos,
+                            stuck: data.stuck,
+                            failingCi: data.failing_ci,
+                        }
+                    },
+                },
+            ],
+            pullRequests: [
+                [] as PullRequestRow[],
+                {
+                    loadPullRequests: async (): Promise<PullRequestRow[]> => {
+                        const response = await engineeringAnalyticsPullRequests(projectId(), {
+                            source_id: values.sourceId ?? undefined,
+                            repo: values.scopeRepo ?? undefined,
+                        })
+                        return response.items.map(toPullRequestRow)
+                    },
+                },
+            ],
+            workflowHealth: [
+                [] as WorkflowHealthRow[],
+                {
+                    loadWorkflowHealth: async (): Promise<WorkflowHealthRow[]> => {
+                        const items = await engineeringAnalyticsWorkflowHealth(projectId(), {
+                            date_from: values.dateFrom ?? undefined,
+                            date_to: values.dateTo ?? undefined,
+                            ...values.runScopeParams,
+                            source_id: values.sourceId ?? undefined,
+                            repo: values.scopeRepo ?? undefined,
+                        })
+                        return items.map(
+                            (it): WorkflowHealthRow => ({
+                                repoOwner: it.repo.owner,
+                                repoName: it.repo.name,
+                                workflowName: it.workflow_name,
+                                runCount: it.run_count,
+                                successRate: it.success_rate,
+                                p50Seconds: it.p50_seconds,
+                                p95Seconds: it.p95_seconds,
+                                lastFailureAt: it.last_failure_at,
+                                // The ?? fallbacks cover a new frontend that briefly reads an older backend without these fields.
+                                latestRunFailed: it.latest_run_failed ?? null,
+                                latestRunConclusion: it.latest_run_conclusion ?? null,
+                                granularity: (it.granularity ?? 'day') as WorkflowGranularity,
+                                buckets: (it.buckets ?? []).map((b) => ({
+                                    bucketStart: b.bucket_start,
+                                    runCount: b.run_count,
+                                    completed: b.completed,
+                                    successes: b.successes,
+                                    failures: b.failures ?? 0,
+                                })),
+                                billableMinutes: it.billable_minutes ?? null,
+                                estimatedCostUsd: it.estimated_cost_usd ?? null,
+                                rerunCycles: it.rerun_cycles ?? 0,
+                                mergeQueueRunCount: it.merge_queue_run_count ?? 0,
+                            })
+                        )
+                    },
+                },
+            ],
+            quarantine: [
+                null as QuarantineData | null,
+                {
+                    loadQuarantine: async (): Promise<QuarantineData> => {
+                        const data = await engineeringAnalyticsQuarantine(projectId(), {
+                            source_id: values.sourceId ?? undefined,
+                            repo: values.scopeRepo ?? undefined,
+                        })
+                        return {
+                            available: data.available,
+                            entries: data.entries.map(
+                                (it): QuarantineEntryRow => ({
+                                    id: it.id,
+                                    runner: it.runner,
+                                    reason: it.reason,
+                                    owner: it.owner,
+                                    issue: it.issue,
+                                    added: it.added,
+                                    expires: it.expires,
+                                    mode: it.mode as QuarantineMode,
+                                    lifecycle: it.lifecycle as QuarantineLifecycle,
+                                    daysUntilExpiry: it.days_until_expiry,
+                                    selectorKind: it.selector_kind as QuarantineSelectorKind,
+                                })
+                            ),
+                            parseErrors: data.parse_errors,
+                            parseWarnings: data.parse_warnings,
+                            sourceUrl: data.source_url,
+                            repoFullName: data.repo ? `${data.repo.owner}/${data.repo.name}` : null,
+                        }
+                    },
+                },
+            ],
+            trunkQuarantine: [
+                null as TrunkQuarantineData | null,
+                {
+                    loadTrunkQuarantine: async (): Promise<TrunkQuarantineData> => {
+                        const data = await engineeringAnalyticsTrunkQuarantine(projectId(), {
+                            source_id: values.sourceId ?? undefined,
+                            repo: values.scopeRepo ?? undefined,
+                        })
+                        return {
+                            available: data.available,
+                            ownersResolved: data.owners_resolved,
+                            ttlDays: data.ttl_days,
+                            repository: data.repository,
+                            trunkUrl: data.trunk_url ?? null,
+                            truncated: data.truncated,
+                            limit: data.limit,
+                            teams: data.teams.map(
+                                (it): TrunkQuarantineTeamRow => ({
+                                    ownerTeam: it.owner_team,
+                                    testCount: it.test_count,
+                                    overdueCount: it.overdue_count,
+                                    oldestAgeDays: it.oldest_age_days,
+                                })
+                            ),
+                            tests: data.tests.map(
+                                (it): TrunkQuarantinedTestRow => ({
+                                    runner: it.runner,
+                                    nodeid: it.nodeid,
+                                    file: it.file,
+                                    ownerTeam: it.owner_team,
+                                    status: it.status,
+                                    quarantinedAt: it.quarantined_at,
+                                    ageDays: it.age_days,
+                                    overdue: it.overdue,
+                                    trunkUrl: it.trunk_url ?? null,
+                                })
+                            ),
+                        }
+                    },
+                },
+            ],
+        })),
+
+        reducers({
+            stateFilter: [
+                DEFAULT_FILTERS.state,
+                { setStateFilter: (_, { state }) => state, resetFilters: () => DEFAULT_FILTERS.state },
+            ],
+            author: [
+                DEFAULT_FILTERS.author,
+                { setAuthor: (_, { author }) => author, resetFilters: () => DEFAULT_FILTERS.author },
+            ],
+            repo: [DEFAULT_FILTERS.repo, { setRepo: (_, { repo }) => repo, resetFilters: () => DEFAULT_FILTERS.repo }],
+            ciStatusFilter: [
+                DEFAULT_FILTERS.ciStatus,
+                { setCiStatusFilter: (_, { ciStatus }) => ciStatus, resetFilters: () => DEFAULT_FILTERS.ciStatus },
+            ],
+            search: [
+                DEFAULT_FILTERS.search,
+                { setSearch: (_, { search }) => search, resetFilters: () => DEFAULT_FILTERS.search },
+            ],
+            // Changing the state filter exits stuck-only, because stuck implies open.
+            stuckOnly: [
+                DEFAULT_FILTERS.stuckOnly,
+                {
+                    setStuckOnly: (_, { stuckOnly }) => stuckOnly,
+                    setStateFilter: () => false,
+                    resetFilters: () => DEFAULT_FILTERS.stuckOnly,
+                },
+            ],
+            readyOnly: [
+                DEFAULT_FILTERS.readyOnly,
+                {
+                    setReadyOnly: (_, { ready }) => ready,
+                    setStateFilter: () => false,
+                    resetFilters: () => DEFAULT_FILTERS.readyOnly,
+                },
+            ],
+            thrashOnly: [
+                DEFAULT_FILTERS.thrashOnly,
+                {
+                    setThrashOnly: (_, { thrash }) => thrash,
+                    setStateFilter: () => false,
+                    resetFilters: () => DEFAULT_FILTERS.thrashOnly,
+                },
+            ],
+            workflowSearch: [
+                DEFAULT_WORKFLOW_FILTERS.search,
+                {
+                    setWorkflowSearch: (_, { search }) => search,
+                    resetWorkflowFilters: () => DEFAULT_WORKFLOW_FILTERS.search,
+                },
+            ],
+            workflowStatusFilter: [
+                DEFAULT_WORKFLOW_FILTERS.status,
+                {
+                    setWorkflowStatusFilter: (_, { status }) => status,
+                    resetWorkflowFilters: () => DEFAULT_WORKFLOW_FILTERS.status,
+                },
+            ],
+            // Null selects the backend's default source, the oldest connected. Synced to `?source=`.
+            sourceId: [
+                null as string | null,
+                { setSourceId: (_, { sourceId }) => sourceId, setScope: (_, { sourceId }) => sourceId },
+            ],
+            // Cleared when the source changes on its own, because the old repo belongs to the old source.
+            // The URL sets both together through setScope.
+            scopeRepo: [null as string | null, { setScope: (_, { scopeRepo }) => scopeRepo, setSourceId: () => null }],
+            pullRequestJumpText: ['', { setPullRequestJumpText: (_, { text }) => text }],
+            // A scope change clears the message because picking a repository is one of the fixes it asks for.
+            pullRequestJumpFailure: [
+                null as PullRequestJumpFailure | null,
+                {
+                    failPullRequestJump: (_, { failure }) => failure,
+                    setPullRequestJumpText: () => null,
+                    setScope: () => null,
+                    setSourceId: () => null,
+                },
+            ],
+            cardsStatus: [
+                'ok' as LoaderStatus,
+                {
+                    loadCards: () => 'ok',
+                    loadCardsSuccess: () => 'ok',
+                    loadCardsFailure: (_, { errorObject }) => loaderStatusFromError(errorObject),
+                },
+            ],
+            // A scope switch loads different teams, so open rows reset with it.
+            expandedTrunkQuarantineTeams: [
+                [] as string[],
+                {
+                    toggleTrunkQuarantineTeam: (state, { team }) =>
+                        state.includes(team) ? state.filter((open) => open !== team) : [...state, team],
+                    setSourceId: () => [],
+                    setScope: () => [],
+                },
+            ],
+            // 'notConnected' defers to the tab-level "connect a source" gate. Only 'error' shows the
+            // board's own banner.
+            trunkQuarantineStatus: [
+                'ok' as LoaderStatus,
+                {
+                    loadTrunkQuarantine: () => 'ok',
+                    loadTrunkQuarantineSuccess: () => 'ok',
+                    loadTrunkQuarantineFailure: (_, { errorObject }) => loaderStatusFromError(errorObject),
+                },
+            ],
+            pullRequestsStatus: [
+                'ok' as LoaderStatus,
+                {
+                    loadPullRequests: () => 'ok',
+                    loadPullRequestsSuccess: () => 'ok',
+                    loadPullRequestsFailure: (_, { errorObject }) => loaderStatusFromError(errorObject),
+                },
+            ],
+            workflowHealthStatus: [
+                'ok' as LoaderStatus,
+                {
+                    loadWorkflowHealth: () => 'ok',
+                    loadWorkflowHealthSuccess: () => 'ok',
+                    loadWorkflowHealthFailure: (_, { errorObject }) => loaderStatusFromError(errorObject),
+                },
+            ],
+        }),
+
+        selectors({
+            fleetSummary: [
+                (s) => [s.workflowHealth],
+                (workflowHealth: WorkflowHealthRow[]): FleetSummary => computeFleetSummary(workflowHealth),
+            ],
+            fleetTruncated: [
+                (s) => [s.workflowHealth],
+                (workflowHealth: WorkflowHealthRow[]): boolean => workflowHealth.length >= WORKFLOW_HEALTH_LIMIT,
+            ],
+            workflowFilters: [
+                (s) => [s.workflowSearch, s.workflowStatusFilter],
+                (search: string, status: WorkflowStatusFilter): WorkflowFilters => ({ search, status }),
+            ],
+            filteredWorkflowHealth: [
+                (s) => [s.workflowHealth, s.workflowFilters],
+                (workflowHealth: WorkflowHealthRow[], workflowFilters: WorkflowFilters): WorkflowHealthRow[] =>
+                    filterWorkflowHealth(workflowHealth, workflowFilters),
+            ],
+            hasActiveWorkflowFilters: [
+                (s) => [s.workflowFilters],
+                (workflowFilters: WorkflowFilters): boolean =>
+                    !objectsEqual(
+                        { ...workflowFilters, search: workflowFilters.search.trim() },
+                        DEFAULT_WORKFLOW_FILTERS
+                    ),
+            ],
+            // Every cost field is null until the job-level source syncs, so scenes hide the column.
+            workflowCostAvailable: [
+                (s) => [s.workflowHealth],
+                (workflowHealth: WorkflowHealthRow[]): boolean =>
+                    workflowHealth.some((row) => row.billableMinutes != null || row.estimatedCostUsd != null),
+            ],
+            filters: [
+                (s) => [
+                    s.stateFilter,
+                    s.author,
+                    s.repo,
+                    s.ciStatusFilter,
+                    s.search,
+                    s.stuckOnly,
+                    s.readyOnly,
+                    s.thrashOnly,
+                ],
+                (
+                    stateFilter: PRStateFilter,
+                    author: string | null,
+                    repo: string | null,
+                    ciStatus: CIStatusFilter,
+                    search: string,
+                    stuckOnly: boolean,
+                    readyOnly: boolean,
+                    thrashOnly: boolean
+                ): PullRequestFilters => ({
+                    state: stateFilter,
+                    author,
+                    repo,
+                    ciStatus,
+                    search,
+                    stuckOnly,
+                    readyOnly,
+                    thrashOnly,
+                }),
+            ],
+            activeCard: [
+                (s) => [s.stateFilter, s.ciStatusFilter, s.stuckOnly, s.readyOnly, s.thrashOnly],
+                (
+                    stateFilter: PRStateFilter,
+                    ciStatus: CIStatusFilter,
+                    stuckOnly: boolean,
+                    readyOnly: boolean,
+                    thrashOnly: boolean
+                ): CardFilter | null => {
+                    if (stateFilter !== 'open') {
+                        return null
+                    }
+                    if (stuckOnly) {
+                        return 'stuck'
+                    }
+                    if (readyOnly) {
+                        return 'ready'
+                    }
+                    if (thrashOnly) {
+                        return 'thrash'
+                    }
+                    if (ciStatus === 'failing') {
+                        return 'failing'
+                    }
+                    return ciStatus === 'all' ? 'open' : null
+                },
+            ],
+            filteredPullRequests: [
+                (s) => [s.pullRequests, s.filters],
+                (pullRequests: PullRequestRow[], filters: PullRequestFilters): PullRequestRow[] =>
+                    filterPullRequests(pullRequests, filters),
+            ],
+            hasActiveFilters: [
+                (s) => [s.filters],
+                (filters: PullRequestFilters): boolean =>
+                    !objectsEqual({ ...filters, search: filters.search.trim() }, DEFAULT_FILTERS),
+            ],
+            // Counted over the loaded list, which PR_TABLE_LIMIT caps, not by a backend aggregate like
+            // the ci_cards counts. A larger open backlog undercounts.
+            readyCount: [
+                (s) => [s.pullRequests],
+                (pullRequests: PullRequestRow[]): number => pullRequests.filter(isReady).length,
+            ],
+            thrashCount: [
+                (s) => [s.pullRequests],
+                (pullRequests: PullRequestRow[]): number => pullRequests.filter(isThrashing).length,
+            ],
+            anyLoading: [
+                (s) => [s.cardsLoading, s.pullRequestsLoading, s.workflowHealthLoading, s.quarantineLoading],
+                (
+                    cardsLoading: boolean,
+                    pullRequestsLoading: boolean,
+                    workflowHealthLoading: boolean,
+                    quarantineLoading: boolean
+                ): boolean => cardsLoading || pullRequestsLoading || workflowHealthLoading || quarantineLoading,
+            ],
+            notConnected: [
+                (s) => [s.cardsStatus, s.pullRequestsStatus, s.workflowHealthStatus],
+                (
+                    cardsStatus: LoaderStatus,
+                    pullRequestsStatus: LoaderStatus,
+                    workflowHealthStatus: LoaderStatus
+                ): boolean => [cardsStatus, pullRequestsStatus, workflowHealthStatus].includes('notConnected'),
+            ],
+            // Each scene's error state reacts only to the loaders it renders (see LoaderStatus).
+            pullRequestsLoadError: [
+                (s) => [s.cardsStatus, s.pullRequestsStatus],
+                (cardsStatus: LoaderStatus, pullRequestsStatus: LoaderStatus): boolean =>
+                    cardsStatus === 'error' || pullRequestsStatus === 'error',
+            ],
+            workflowHealthLoadError: [
+                (s) => [s.workflowHealthStatus],
+                (workflowHealthStatus: LoaderStatus): boolean => workflowHealthStatus === 'error',
+            ],
+            tableTruncated: [
+                (s) => [s.pullRequests],
+                (pullRequests: PullRequestRow[]): boolean => pullRequests.length >= PR_TABLE_LIMIT,
+            ],
+            trunkQuarantineTestsByTeam: [
+                (s) => [s.trunkQuarantine],
+                (trunkQuarantine: TrunkQuarantineData | null): Record<string, TrunkQuarantinedTestRow[]> =>
+                    groupBy(trunkQuarantine?.tests ?? [], (test) => test.ownerTeam),
+            ],
+            activeSource: [
+                (s) => [s.githubSources, s.sourceId, s.scopeRepo],
+                (
+                    loadedSources: GitHubSourceApi[] | null,
+                    sourceId: string | null,
+                    scopeRepo: string | null
+                ): GitHubSourceApi | null => {
+                    const githubSources = loadedSources ?? []
+                    // GitHub matches repository names case-insensitively, so the path may differ from the source's spelling.
+                    const isScopeRepo = (source: GitHubSourceApi): boolean =>
+                        source.repo.toLowerCase() === scopeRepo?.toLowerCase()
+                    if (!sourceId) {
+                        // A repo-only scope (?repo with no ?source) resolves across sources, so label that
+                        // repo. Otherwise prefer the first synced repo, which matches the backend's default
+                        // (it skips repos that are still backfilling), else the first entry.
+                        return (
+                            (scopeRepo && githubSources.find(isScopeRepo)) ||
+                            githubSources.find((source) => source.synced) ||
+                            githubSources[0] ||
+                            null
+                        )
+                    }
+                    const ofSource = githubSources.filter((source) => source.id === sourceId)
+                    // An explicit repo wins. Otherwise (a bookmarked `?source=` with no `?repo`) prefer the
+                    // first synced repo of this source, which matches the backend's default. Without that
+                    // the header names an unsynced repo the loaders never read.
+                    return (
+                        (scopeRepo && ofSource.find(isScopeRepo)) ||
+                        ofSource.find((source) => source.synced) ||
+                        ofSource[0] ||
+                        null
+                    )
+                },
+            ],
+        }),
+
+        listeners(({ actions, values }) => ({
+            refresh: () => {
+                actions.loadCards()
+                actions.loadPullRequests()
+                actions.loadWorkflowHealth()
+                actions.loadQuarantine()
+                actions.loadTrunkQuarantine()
+            },
+            setSourceId: () => actions.refresh(),
+            setScope: () => actions.refresh(),
+            noRepoToForward: () => {
+                // A repo-less page takes no scope from urlToAction, so a legacy source's link reads ?source here.
+                const source = router.values.searchParams.source ?? null
+                if (source !== values.sourceId) {
+                    actions.setScope(source, null)
+                } else {
+                    actions.refresh()
+                }
+            },
+            [engineeringAnalyticsFiltersLogic.actionTypes.setDateRange]: () => {
+                actions.loadWorkflowHealth()
+            },
+            [engineeringAnalyticsFiltersLogic.actionTypes.setRunScope]: () => {
+                actions.loadWorkflowHealth()
+            },
+            applyCardFilter: ({ card }) => {
+                // Clicking the already-active card toggles back to the plain open view. setStateFilter('open')
+                // runs first and clears every lens flag, so the explicit sets below leave exactly one active.
+                const target: CardFilter = values.activeCard === card ? 'open' : card
+                actions.setStateFilter('open')
+                actions.setCiStatusFilter(target === 'failing' ? 'failing' : 'all')
+                actions.setStuckOnly(target === 'stuck')
+                actions.setReadyOnly(target === 'ready')
+                actions.setThrashOnly(target === 'thrash')
+            },
+            submitPullRequestJump: () => {
+                // The repository in scope comes from the sources, so do nothing until they load.
+                if (!values.pullRequestJumpText.trim() || values.githubSourcesLoading) {
+                    return
+                }
+                const reference = parsePullRequestReference(values.pullRequestJumpText)
+                const target = reference && resolvePullRequestTarget(reference, values.activeSource?.repo || null)
+                const capture = (outcome: 'opened' | PullRequestJumpFailure): void => {
+                    posthog.capture(EVENT_PULL_REQUEST_JUMP_SUBMITTED, {
+                        outcome,
+                        input_kind: reference?.kind ?? null,
+                    })
+                }
+                if (!target) {
+                    const failure = reference ? 'needs_repository' : 'invalid'
+                    capture(failure)
+                    actions.failPullRequestJump(failure)
+                    return
+                }
+                capture('opened')
+                // The next scene can take a moment to load. An empty box makes a second submit do nothing.
+                actions.setPullRequestJumpText('')
+                const explorerUrl = urls.engineeringAnalyticsCIExplorer(target.owner, target.repo, target.number)
+                router.actions.push(
+                    target.inScope
+                        ? withCurrentScope(explorerUrl, values.sourceId)
+                        : // The source and repo in scope belong to another repository. Without them the
+                          // explorer reads from the source that syncs the pull request's own repository.
+                          withScope(explorerUrl, { ...router.values.searchParams, repo: undefined }, null)
+                )
+            },
+        })),
+
+        urlToAction(({ actions, values }) => {
+            // `?run_scope=` is hydrated by engineeringAnalyticsFiltersLogic, not here. A repo-less path takes
+            // no scope: repoScopeLogic forwards it to a repository first.
+            const applyScope = (
+                { repoOwner, repoName }: Record<string, string | undefined>,
+                searchParams: Record<string, any>
+            ): void => {
+                const nextSource = searchParams.source ?? null
+                const nextRepo = repoOwner && repoName ? `${repoOwner}/${repoName}` : null
+                if (nextSource !== values.sourceId || nextRepo !== values.scopeRepo) {
+                    actions.setScope(nextSource, nextRepo)
+                }
+            }
+            return Object.fromEntries(
+                [
+                    'overview',
+                    'pull-requests',
+                    'workflows',
+                    'tests',
+                    'deploys',
+                    'teams',
+                    'authors',
+                    'teams/:ownerTeam',
+                ].map((rest) => [`/engineering-analytics/repos/:repoOwner/:repoName/${rest}`, applyScope])
+            )
+        }),
+
+        afterMount(({ actions, values }) => {
+            // A scoped URL already refreshed through urlToAction, which runs before this hook. A repo-less
+            // product URL loads once repoScopeLogic forwards it, or once it finds nothing to forward to.
+            if (!awaitsRepoForward() && !values.cardsLoading) {
+                actions.refresh()
+            }
+        }),
+    ])

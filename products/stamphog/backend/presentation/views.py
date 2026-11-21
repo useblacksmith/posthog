@@ -1,0 +1,844 @@
+"""
+DRF views for stamphog.
+
+Validate JSON via serializers, call facade methods,
+return serialized responses. No business logic here.
+"""
+
+from datetime import timedelta
+from functools import cached_property
+from typing import Any, Literal, cast
+from urllib.parse import quote
+from uuid import UUID
+
+from django.conf import settings
+from django.core import signing
+from django.utils import timezone
+
+import structlog
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
+from rest_framework.permissions import BasePermission
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.auth import OAuthAccessTokenAuthentication, PersonalAPIKeyAuthentication
+from posthog.credentials_service.callers import CredentialsCaller
+from posthog.credentials_service.settings_fallback import get_or_settings
+from posthog.models.scoping.manager import resolve_effective_team_id
+from posthog.models.team import Team
+from posthog.models.user import User
+
+# UserAccessControl reaches stamphog through core: the product's tach boundary allows `posthog`
+# but not `products.access_control`, where the class is defined.
+from posthog.permissions import UserAccessControl, is_service_auth
+
+from products.stamphog.backend.facade import (
+    api as facade_api,
+    contracts,
+)
+from products.stamphog.backend.facade.enums import ReviewMode, ReviewRequestRefusal, ReviewTrigger
+
+from ..facade import review_requests
+from ..facade.github import (
+    StamphogGitHubError,
+    exchange_oauth_code_for_user_token,
+    list_user_installations,
+    sync_installation_repositories,
+    user_can_access_installation,
+)
+from ..facade.tasks import create_trigger_label
+from .serializers import (
+    CodeReviewApprovalAddRepositorySerializer,
+    CodeReviewApprovalAvailableRepositoriesQuerySerializer,
+    CodeReviewApprovalAvailableRepositoriesSerializer,
+    CodeReviewApprovalInstallInfoSerializer,
+    CodeReviewApprovalOwnersFileSerializer,
+    CodeReviewApprovalRepositorySerializer,
+    CodeReviewApprovalRepositoryWriteSerializer,
+    CodeReviewApprovalRoutingOwnersQuerySerializer,
+    CodeReviewApprovalRoutingRunsQuerySerializer,
+    CodeReviewApprovalSyncInstallationRequestSerializer,
+    CodeReviewApprovalSyncInstallationResponseSerializer,
+    DigestRunSerializer,
+    PullRequestSerializer,
+    ReviewRequestResponseSerializer,
+    ReviewRequestSerializer,
+    ReviewRunSerializer,
+    RoutingOwnerCountSerializer,
+    RoutingRunDetailSerializer,
+    RoutingRunSerializer,
+)
+
+logger = structlog.get_logger(__name__)
+
+# The install-flow state token binds a GitHub App install callback to the team + user that started it.
+# GitHub round-trips ?state=... through the install redirect; sync_installation only accepts a fresh,
+# validly-signed token for the current team, so a stolen installation_id + code can't be replayed
+# against another team's session.
+_INSTALL_STATE_SALT = "stamphog-install-state"
+_INSTALL_STATE_MAX_AGE_SECONDS = 60 * 60
+
+# These decide when a pull request gets reviewed, so writing either of them takes the manager level.
+# `enabled` is split by direction: turning reviews on takes editor, turning them off takes manager.
+REVIEW_POLICY_FIELDS = ("review_mode", "trigger_label")
+# Reviewer requests decide which teams get asked on every pull request, and turning them off can leave
+# pull requests with no reviewer at all, so both directions take manager. A fork label replaces a
+# team's review request on fork pull requests, so it decides who gets asked too.
+# The clean-review switch starts reviews outside review_mode, so it decides when reviews run as well.
+MANAGER_FIELDS = (*REVIEW_POLICY_FIELDS, "routing_mode", "routing_fork_labels", "review_on_clean_external_review")
+
+# How far back the owner list looks when the caller names no window.
+ROUTING_OWNERS_WINDOW = timedelta(days=90)
+
+ReviewLevel = Literal["editor", "manager"]
+
+
+def _required_review_level(validated_data: dict[str, Any]) -> ReviewLevel | None:
+    """The stamphog level a write needs because of the review fields it names, or None for none.
+
+    A supplied value counts even when it matches the stored one: the view reads the row before the
+    facade refetches and saves it, so a value that looks unchanged can still overwrite a manager's
+    decision made in between. That is why a supplied `enabled=False` always takes manager.
+    """
+    if validated_data.get("enabled") is False or any(field in validated_data for field in MANAGER_FIELDS):
+        return "manager"
+    if validated_data.get("enabled") is True:
+        return "editor"
+    return None
+
+
+class StamphogCanonicalTeamAccessPermission(BasePermission):
+    """Authorize against the canonical (data-owning) team, not just the URL environment team.
+
+    stamphog rows canonicalize to the parent (project-root) team on save, so a request made against a
+    child environment reads and writes the PARENT's data. The default team gate only checks membership
+    of the URL team, so a user with access to the child but not the parent (or the reverse) would be
+    authorized against one team while touching another's rows. Re-anchor the membership check to the
+    canonical team so authorization and data access target the same team. Root teams (no parent) are
+    unaffected — the default checks already cover them.
+    """
+
+    message = "You don't have access to the project that owns this data."
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        if not request.user.is_authenticated:
+            return True  # IsAuthenticated handles the unauthenticated case first
+        assert isinstance(view, _StamphogTeamScopedViewSet)  # only ever attached to the shared base
+        team = view.team
+        # parent_team_id is null (or equals self) for a root team; then canonical == URL team and the
+        # default membership gate already authorized the right team.
+        if team.parent_team_id is None or team.parent_team_id == team.id or team.parent_team is None:
+            return True
+        # A team-scoped token must cover the CANONICAL team too: the default scope check accepted the
+        # URL (child) team, but the rows read and written belong to the parent — a PAK/OAuth token
+        # scoped only to the child must not reach them through the child's URL.
+        authenticator = request.successful_authenticator
+        scoped_teams = None
+        if isinstance(authenticator, OAuthAccessTokenAuthentication):
+            scoped_teams = authenticator.access_token.scoped_teams
+        elif isinstance(authenticator, PersonalAPIKeyAuthentication):
+            scoped_teams = authenticator.personal_api_key.scoped_teams
+        if scoped_teams and team.parent_team_id not in scoped_teams:
+            return False
+        # Same helper the default gate uses (effective_membership_level), just re-pointed at the parent.
+        # It already accounts for a private parent team, so None means genuinely no access -> 403.
+        level = view.user_permissions.team(team.parent_team).effective_membership_level
+        return level is not None
+
+
+class _StamphogTeamScopedViewSet(TeamAndOrgViewSetMixin):
+    """Shared base that exposes the canonical (parent) team id for queryset scoping.
+
+    ProductTeamModel.save() rewrites new rows to the canonical team id (parent when the team is a
+    child environment, else itself). A request made with a child environment's project id must read
+    under that same canonical id — scoping by the raw request team_id would miss rows the parent
+    stored. resolve_effective_team_id is the framework helper the model uses; self.team is already
+    loaded by the permission checks, so this resolves cheaply and is cached for the request.
+
+    StamphogCanonicalTeamAccessPermission keeps authorization pointed at that same canonical team, so a
+    caller can never be authorized against the child environment while reading/writing the parent's rows.
+    """
+
+    # Appended onto the default team/scope permission stack by get_permissions.
+    permission_classes = [StamphogCanonicalTeamAccessPermission]
+    path_parameters = {"pk": UUID}
+
+    @cached_property
+    def canonical_team_id(self) -> int:
+        return resolve_effective_team_id(self.team_id)
+
+    @cached_property
+    def canonical_team(self) -> Team | None:
+        """The team whose rows this request reads and writes, or None when there is no team yet."""
+        try:
+            team = self.team
+        except (Team.DoesNotExist, KeyError):
+            return None
+        if team.parent_team_id is None or team.parent_team_id == team.id or team.parent_team is None:
+            return team
+        return team.parent_team
+
+    @cached_property
+    def user_access_control(self) -> UserAccessControl:
+        """RBAC anchored to the canonical team, so resource levels are read where the rows live.
+
+        Overrides the mixin, which anchors to the URL team. Through a child environment that let the
+        child's stamphog level decide access to the parent's rows, in both directions: a grant on the
+        child alone reached the parent, and a grant on the parent alone was refused.
+
+        An instance only answers for the team it was built with, so this one cannot see the URL
+        team's own project rules. It does not have to: TeamMemberAccessPermission reads those
+        directly through UserPermissions.effective_membership_level, where an explicit "none" is a
+        denial, and that gate runs on every request here.
+        """
+        return UserAccessControl(
+            user=cast(User, self.request.user), team=self.canonical_team, organization_id=self.organization_id
+        )
+
+    @cached_property
+    def stamphog_access_level(self) -> str | None:
+        """The caller's resource-wide stamphog level, resolved once for the whole response."""
+        access = self.user_access_control.access_level_for_resource("code_review_approval")
+        return access.access_level if access else None
+
+    def get_serializer_context(self) -> dict[str, Any]:
+        # The mixin sets context["team_id"] to the RAW url team, but a serializer validating a
+        # team-scoped lookup reads it. stamphog rows canonicalize to the parent team on save, so
+        # those lookups must target the canonical team the row is stored under: a child-environment
+        # request would otherwise validate against the wrong team's rows.
+        context = super().get_serializer_context()
+        context["team_id"] = self.canonical_team_id
+        return context
+
+    def _should_skip_parents_filter(self) -> bool:
+        # safely_get_queryset already scopes every read by canonical_team_id, which resolves a child
+        # environment's id to its parent. The default parent-lookup filter would re-add the RAW url
+        # team_id, ANDing it with the canonical filter and hiding rows stored under the parent. Skip it
+        # and let canonical_team_id be the single source of truth for team scoping.
+        return True
+
+
+class StamphogRepoConfigViewSet(_StamphogTeamScopedViewSet, viewsets.GenericViewSet):
+    """Per-repository auto-approval settings: enable or disable review, GitHub App installation, policy overrides."""
+
+    scope_object = "code_review_approval"
+    serializer_class = CodeReviewApprovalRepositorySerializer
+
+    def _get_or_404(self, pk: UUID) -> contracts.RepoConfigDTO:
+        # A keyed lookup, not a scan: an installation can surface hundreds of repositories.
+        config = facade_api.get_repo_config_by_id(self.canonical_team_id, str(pk))
+        if config is None:
+            raise NotFound()
+        return config
+
+    def _require_review_level(self, request: Request, level: ReviewLevel | None) -> None:
+        """Refuse a review-gating write below `level` on the stamphog resource.
+
+        Service credentials (project secret keys, team secret tokens) are synthetic users the RBAC
+        layer cannot resolve, so they are refused here rather than silently passed through by
+        AccessControlPermission's service-auth shortcut. A review decision needs a person.
+        """
+        if level is None:
+            return
+        if not is_service_auth(request) and self.user_access_control.check_access_level_for_resource(
+            "code_review_approval", level
+        ):
+            return
+        if level == "manager":
+            raise PermissionDenied(
+                "Only a manager of code review auto-approval can turn reviews off, change when they run, or change reviewer requests. "
+                "Ask an organization admin for manager access."
+            )
+        raise PermissionDenied(
+            "Only an editor of code review auto-approval can turn reviews on. Ask an organization admin for editor access."
+        )
+
+    def _queue_trigger_label_creation(self, config: contracts.RepoConfigDTO) -> None:
+        if not (config.enabled and config.review_mode == ReviewMode.LABEL):
+            return
+        # The write already committed, so an unreachable broker must not turn it into a 500.
+        try:
+            create_trigger_label.delay(team_id=self.canonical_team_id, config_id=str(config.id))
+        except Exception:
+            logger.warning("stamphog_trigger_label_queue_failed", repository=config.repository, exc_info=True)
+
+    def _available_count(self) -> int:
+        return facade_api.list_available_repositories(self.canonical_team_id, limit=0).total_count
+
+    def list(self, request: Request, **kwargs) -> Response:
+        configs = facade_api.list_repo_configs(self.canonical_team_id)
+        page = self.paginate_queryset(configs)
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+    def retrieve(self, request: Request, pk: UUID, **kwargs) -> Response:
+        return Response(self.get_serializer(self._get_or_404(pk)).data)
+
+    @extend_schema(
+        request=CodeReviewApprovalRepositoryWriteSerializer, responses={201: CodeReviewApprovalRepositorySerializer}
+    )
+    def create(self, request: Request, **kwargs) -> Response:
+        # Naming a review field takes the same level here as it does on update: a caller spelling out
+        # a review policy is making the review decision, whichever verb carries it. Leaving them out
+        # stays at editor. The row is created without an installation, which binds it disabled at
+        # sync time and keeps it out of the digest candidates, so the defaults reach nothing on their
+        # own. add_repository is the path that binds a repository from a connected installation.
+        serializer = CodeReviewApprovalRepositoryWriteSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        self._require_review_level(request, _required_review_level(serializer.validated_data))
+        try:
+            config = facade_api.create_repo_config(self.canonical_team_id, **serializer.validated_data)
+        except contracts.RepoAlreadyClaimedError:
+            raise ValidationError(
+                {"repository": "This repository is already configured under this GitHub installation by another team."}
+            )
+        return Response(self.get_serializer(config).data, status=201)
+
+    @extend_schema(
+        request=CodeReviewApprovalRepositoryWriteSerializer, responses={200: CodeReviewApprovalRepositorySerializer}
+    )
+    def update(self, request: Request, pk: UUID, **kwargs) -> Response:
+        current = self._get_or_404(pk)
+        serializer = CodeReviewApprovalRepositoryWriteSerializer(
+            data=request.data,
+            partial=kwargs.get("partial", False),
+            partial_update=True,
+            current=current,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        self._require_review_level(request, _required_review_level(serializer.validated_data))
+        config = facade_api.update_repo_config(self.canonical_team_id, str(pk), **serializer.validated_data)
+        if any(field in serializer.validated_data for field in ("enabled", *REVIEW_POLICY_FIELDS)):
+            self._queue_trigger_label_creation(config)
+        return Response(self.get_serializer(config).data)
+
+    @extend_schema(
+        request=CodeReviewApprovalRepositoryWriteSerializer, responses={200: CodeReviewApprovalRepositorySerializer}
+    )
+    def partial_update(self, request: Request, pk: UUID, **kwargs) -> Response:
+        return self.update(request, pk=pk, partial=True, **kwargs)
+
+    def destroy(self, request: Request, pk: UUID, **kwargs) -> Response:
+        self._get_or_404(pk)
+        # A soft delete turns reviews off, so it takes manager like a PATCH to enabled=False.
+        self._require_review_level(request, "manager")
+        facade_api.disable_repo_config(self.canonical_team_id, str(pk))
+        return Response(status=204)
+
+    @extend_schema(
+        description=(
+            "Check whether the repository's default branch has a root owners.yaml. Reviewer requests "
+            "(routing_mode) read the code owners from it. Makes one GitHub call, so ask only when needed."
+        ),
+        responses={200: CodeReviewApprovalOwnersFileSerializer},
+    )
+    @action(detail=True, methods=["GET"], url_path="owners_file", required_scopes=["code_review_approval:read"])
+    def owners_file(self, request: Request, pk: UUID, **kwargs) -> Response:
+        config = self._get_or_404(pk)
+        return Response(
+            CodeReviewApprovalOwnersFileSerializer({"owners_file": facade_api.check_owners_file(config)}).data
+        )
+
+    @extend_schema(
+        description=(
+            "List repositories from the project's connected GitHub installations that are not added to "
+            "auto-approval yet, so they can be added with add_repository."
+        ),
+        parameters=[CodeReviewApprovalAvailableRepositoriesQuerySerializer],
+        responses={200: CodeReviewApprovalAvailableRepositoriesSerializer},
+    )
+    @action(
+        detail=False, methods=["GET"], url_path="available_repositories", required_scopes=["code_review_approval:read"]
+    )
+    def available_repositories(self, request: Request, **kwargs) -> Response:
+        # Reads the snapshots a sync stored and makes no GitHub call, so the page can load it on every visit.
+        query = CodeReviewApprovalAvailableRepositoriesQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        available = facade_api.list_available_repositories(
+            self.canonical_team_id, search=query.validated_data["search"], limit=query.validated_data["limit"]
+        )
+        return Response(CodeReviewApprovalAvailableRepositoriesSerializer(available).data)
+
+    @extend_schema(
+        description=(
+            "Turn reviews on for a repository from the project's connected GitHub installations. Creates "
+            "the repo config, or turns an existing one back on. Needs the editor level on code review auto-approval."
+        ),
+        request=CodeReviewApprovalAddRepositorySerializer,
+        responses={200: CodeReviewApprovalRepositorySerializer, 201: CodeReviewApprovalRepositorySerializer},
+    )
+    @action(detail=False, methods=["POST"], url_path="add_repository", required_scopes=["code_review_approval:write"])
+    def add_repository(self, request: Request, **kwargs) -> Response:
+        # Turning reviews on takes editor. The installation and the connecting user come from the
+        # team's snapshot, never from the request, so an editor can only bind what a member proved.
+        serializer = CodeReviewApprovalAddRepositorySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self._require_review_level(request, "editor")
+        repository = serializer.validated_data["repository"]
+        try:
+            result = facade_api.add_repository(self.canonical_team_id, repository)
+        except contracts.RepositoryNotInstalledError:
+            raise ValidationError(
+                {
+                    "repository": "This repository is not in a connected GitHub installation. "
+                    "Connect GitHub or refresh the repository list, then try again."
+                }
+            )
+        except contracts.RepoAlreadyClaimedError:
+            raise ValidationError(
+                {"repository": "This repository is already configured under this GitHub installation by another team."}
+            )
+        self._queue_trigger_label_creation(result.config)
+        return Response(self.get_serializer(result.config).data, status=201 if result.created else 200)
+
+    @extend_schema(responses={200: CodeReviewApprovalInstallInfoSerializer})
+    @action(detail=False, methods=["GET"], url_path="install_info", required_scopes=["code_review_approval:read"])
+    def install_info(self, request: Request, **kwargs) -> Response:
+        # Deep link into GitHub's install page for the "Connect a repository" button. The state token
+        # binds the eventual callback to THIS team and user: GitHub round-trips ?state=... back to the
+        # Setup URL, and sync_installation rejects any callback whose state isn't a fresh token for the
+        # current team. Without it, an attacker could send a logged-in member a callback carrying the
+        # attacker's own installation and bind it to the victim's team.
+        slug = settings.STAMPHOG_GITHUB_APP_SLUG
+        client_id = get_or_settings("STAMPHOG_GITHUB_APP_CLIENT_ID", CredentialsCaller.STAMPHOG)
+        install_url = ""
+        authorize_url = ""
+        # One state token backs both URLs — either callback (install Setup URL or authorize Callback URL)
+        # round-trips it, and sync_installation binds the result to the team+user encoded here.
+        state = signing.dumps({"team_id": self.team_id, "user_id": request.user.pk}, salt=_INSTALL_STATE_SALT)
+        if slug:
+            install_url = f"https://github.com/apps/{slug}/installations/new?state={quote(state)}"
+        if client_id:
+            # The connect button opens install_url, so the user can choose repositories on GitHub. GitHub's
+            # redirect after "Configure" on an existing installation carries no OAuth code, so the frontend
+            # sends the browser through authorize_url once: an installed App redirects back at once with a
+            # code, and the sync proves ownership from it.
+            authorize_url = (
+                f"https://github.com/login/oauth/authorize?client_id={quote(client_id)}&state={quote(state)}"
+            )
+        data = CodeReviewApprovalInstallInfoSerializer(
+            {"app_slug": slug, "install_url": install_url, "authorize_url": authorize_url}
+        ).data
+        return Response(data)
+
+    @extend_schema(
+        request=CodeReviewApprovalSyncInstallationRequestSerializer,
+        responses={200: CodeReviewApprovalSyncInstallationResponseSerializer},
+    )
+    @action(
+        detail=False, methods=["POST"], url_path="sync_installation", required_scopes=["code_review_approval:write"]
+    )
+    def sync_installation(self, request: Request, **kwargs) -> Response:
+        # Custom action names fall outside the default read/write action classification, so without
+        # explicit required_scopes this write would be reachable with no scope check at all.
+        #
+        # Post-authorize binding. GitHub redirects the browser back with a user-to-server OAuth code and
+        # our state token; installation_id is present only on the fresh-install redirect, absent on the
+        # authorize-first redirect. We exchange the code for the user's token (the ownership proof) and:
+        #   - explicit installation_id → verify the user can reach exactly it, then sync it.
+        #   - no installation_id → discover the user's installations of THIS App from the token. Exactly
+        #     one → sync it (the overwhelmingly common case). Several → bind NOTHING and return them as
+        #     choices: reachability is not intent, and binding foreign orgs' installations here would
+        #     misroute their webhooks (oldest-wins resolution). Zero isn't an error — the App isn't
+        #     installed anywhere the user can see, signalled via app_not_installed.
+        # Either way ownership is proven by the code, never the caller-supplied (forgeable) id. A repo
+        # already owned by another team is skipped, not fatal, so one shared repo can't block the batch.
+        request_serializer = CodeReviewApprovalSyncInstallationRequestSerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+        installation_id = request_serializer.validated_data["installation_id"]
+        code = request_serializer.validated_data["code"]
+        state = request_serializer.validated_data["state"]
+
+        # First gate: the state token must be a fresh, validly-signed token minted for THIS team by
+        # install_info. This binds the callback to the team that started the flow, so a stolen
+        # installation_id + code can't be replayed against another logged-in member's session.
+        try:
+            state_payload = signing.loads(state, salt=_INSTALL_STATE_SALT, max_age=_INSTALL_STATE_MAX_AGE_SECONDS)
+        except signing.BadSignature:
+            raise ValidationError(
+                {"state": "Invalid or expired install session. Restart the installation from PostHog."}
+            )
+        if state_payload.get("team_id") != self.team_id:
+            logger.warning(
+                "stamphog sync_installation: state team mismatch",
+                installation_id=installation_id,
+                team_id=self.team_id,
+            )
+            raise PermissionDenied("This installation link was started for a different project.")
+        connected_by_user_id = request.user.pk
+        if connected_by_user_id is None:
+            raise PermissionDenied("Log in to complete the installation.")
+        # The token also binds the callback to the member who started the flow. Without this, one
+        # project member could hand another the callback and complete an install under the second
+        # member's session (both pass the team check). Same 403 path as the team mismatch.
+        if state_payload.get("user_id") != connected_by_user_id:
+            logger.warning(
+                "stamphog sync_installation: state user mismatch",
+                installation_id=installation_id,
+                team_id=self.team_id,
+            )
+            raise PermissionDenied("This installation link was started by a different user.")
+
+        # Fail closed: no proven ownership, no binding. A missing OAuth token (bad/expired code or unset
+        # Stamphog OAuth creds) is a 400; a valid user who simply can't reach an installation is a 403.
+        user_token = exchange_oauth_code_for_user_token(code)
+        if user_token is None:
+            raise ValidationError({"code": "Could not verify GitHub authorization. Reinstall the app and try again."})
+
+        if installation_id:
+            # Explicit-id path (fresh-install redirect): the id is caller-supplied, so verify the user can
+            # actually reach exactly it before binding — otherwise a caller who learns another org's
+            # installation_id could bind its repos and hijack its webhooks.
+            try:
+                owns_installation = user_can_access_installation(installation_id, user_token)
+            except StamphogGitHubError:
+                logger.warning(
+                    "stamphog sync_installation: installation ownership check failed",
+                    installation_id=installation_id,
+                    team_id=self.team_id,
+                )
+                raise ValidationError({"installation_id": "Failed to verify installation access. Try again."})
+            if not owns_installation:
+                logger.warning(
+                    "stamphog sync_installation: caller does not own installation",
+                    installation_id=installation_id,
+                    team_id=self.team_id,
+                )
+                raise PermissionDenied("You do not have access to this GitHub App installation.")
+            installation_ids = [installation_id]
+        else:
+            # Discovery path (authorize-first redirect): GitHub returns only installations of THIS App the
+            # user can reach, so the list is itself the ownership proof — no per-id verification needed.
+            try:
+                discovered = list_user_installations(user_token)
+            except StamphogGitHubError:
+                logger.warning(
+                    "stamphog sync_installation: discovering user installations failed", team_id=self.team_id
+                )
+                raise ValidationError({"code": "Failed to discover GitHub App installations. Try again."})
+            if not discovered:
+                # The App isn't installed anywhere the user can see. Not an error: the frontend routes them
+                # to the GitHub install page (install_url) off app_not_installed.
+                data = CodeReviewApprovalSyncInstallationResponseSerializer(
+                    {
+                        "synced": [],
+                        "skipped": [],
+                        "available_count": self._available_count(),
+                        "app_not_installed": True,
+                        "installations": [],
+                    },
+                    context=self.get_serializer_context(),
+                ).data
+                return Response(data)
+            if len(discovered) > 1:
+                # Reachability is not intent: a user in several orgs that all carry the App must pick which
+                # installation this team binds — silently binding them all would attach foreign orgs' repos
+                # here, and via the oldest-wins webhook resolution even blackhole another team's future
+                # connect. Bind nothing; the frontend re-runs the flow with an explicit installation_id
+                # (which the explicit path above verifies).
+                data = CodeReviewApprovalSyncInstallationResponseSerializer(
+                    {
+                        "synced": [],
+                        "skipped": [],
+                        "available_count": self._available_count(),
+                        "app_not_installed": False,
+                        "installations": discovered,
+                    },
+                    context=self.get_serializer_context(),
+                ).data
+                return Response(data)
+            installation_ids = [discovered[0]["id"]]
+
+        synced: list[contracts.RepoConfigDTO] = []
+        skipped: list[str] = []
+        for one_installation_id in installation_ids:
+            try:
+                installation_synced, installation_skipped = sync_installation_repositories(
+                    self.canonical_team_id,
+                    installation_id=one_installation_id,
+                    user_token=user_token,
+                    connected_by_user_id=connected_by_user_id,
+                )
+            except StamphogGitHubError:
+                logger.warning(
+                    "stamphog sync_installation: listing user-accessible repositories failed",
+                    installation_id=one_installation_id,
+                    team_id=self.team_id,
+                )
+                raise ValidationError({"installation_id": "Failed to list accessible repositories. Try again."})
+            synced.extend(installation_synced)
+            skipped.extend(installation_skipped)
+
+        # The nested repo config serializer reads user_access_level off the view, and DRF hands the
+        # root's context down to it. Without the context every synced row reports a null level.
+        data = CodeReviewApprovalSyncInstallationResponseSerializer(
+            {
+                "synced": synced,
+                "skipped": skipped,
+                "available_count": self._available_count(),
+                "app_not_installed": False,
+                "installations": [],
+            },
+            context=self.get_serializer_context(),
+        ).data
+        return Response(data)
+
+
+_REFUSAL_STATUS = {
+    ReviewRequestRefusal.NOT_FOUND: 404,
+    ReviewRequestRefusal.NOT_REVIEWABLE: 409,
+    ReviewRequestRefusal.GITHUB_UNAVAILABLE: 503,
+}
+
+
+class ReviewRequestRefused(APIException):
+    """A refused review request, carrying the refusal as the error code so clients can branch on it."""
+
+    def __init__(self, error: contracts.ReviewRequestRefusedError) -> None:
+        super().__init__(detail=error.message, code=error.refusal.value)
+        self.status_code = _REFUSAL_STATUS[error.refusal]
+
+
+class ReviewRunViewSet(_StamphogTeamScopedViewSet, viewsets.GenericViewSet):
+    """History of auto-approval review runs, filterable by repository, PR number, and status, plus manual review requests."""
+
+    scope_object = "code_review_approval"
+    serializer_class = ReviewRunSerializer
+
+    def _runs(self) -> facade_api.LazyDTOList[contracts.ReviewRunDTO] | None:
+        """The team's review runs under the request's filters, or None if a filter is unparseable."""
+        pr_number = self.request.query_params.get("pr_number")
+        if pr_number:
+            try:
+                pr_number_value = int(pr_number)
+            except ValueError:
+                return None
+        else:
+            pr_number_value = None
+        return facade_api.list_review_runs(
+            self.canonical_team_id,
+            repository=self.request.query_params.get("repository"),
+            pr_number=pr_number_value,
+            status=self.request.query_params.get("status"),
+            trigger=self.request.query_params.get("trigger"),
+        )
+
+    def retrieve(self, request: Request, pk: UUID, **kwargs) -> Response:
+        run = facade_api.get_review_run(self.canonical_team_id, str(pk))
+        if run is None:
+            raise NotFound()
+        context = {**self.get_serializer_context(), "reasoning": facade_api.get_review_reasoning(run)}
+        return Response(ReviewRunSerializer(run, context=context).data)
+
+    @extend_schema(
+        request=ReviewRequestSerializer,
+        responses={200: ReviewRequestResponseSerializer, 201: ReviewRequestResponseSerializer},
+    )
+    def create(self, request: Request, **kwargs) -> Response:
+        serializer = ReviewRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = review_requests.request_review(
+                self.canonical_team_id,
+                user_id=request.user.pk,
+                repository=serializer.validated_data["repository"],
+                pr_number=serializer.validated_data["pr_number"],
+            )
+        except contracts.ReviewRequestRefusedError as error:
+            raise ReviewRequestRefused(error)
+        return Response(ReviewRequestResponseSerializer(result).data, status=201 if result.created else 200)
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "repository",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by repository full name, e.g. 'PostHog/posthog'.",
+            ),
+            OpenApiParameter(
+                "pr_number",
+                OpenApiTypes.INT,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by pull request number.",
+            ),
+            OpenApiParameter(
+                "status",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by review run status.",
+            ),
+            OpenApiParameter(
+                "trigger",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                required=False,
+                enum=[t.value for t in ReviewTrigger],
+                description=(
+                    "Filter by what caused the run. Leave it unset to include runs from every trigger. "
+                    "'all' is not a wildcard: it matches only runs in repos that review every pull request "
+                    "event. The other values: 'label' (the repo's trigger label opted the PR in), 'manual' "
+                    "(someone requested the review through the API or MCP), 'reviewhog_clean' (a clean PostHog "
+                    "Review run started a silent review, which posts only an approval), 'self_driving' "
+                    "(auto-approval reviewed a bot-authored PR from the inbox), and 'bot_admission' (the repo "
+                    "policy names the bot that authored the PR)."
+                ),
+            ),
+        ],
+        responses={200: ReviewRunSerializer(many=True)},
+    )
+    def list(self, request: Request, **kwargs) -> Response:
+        runs = self._runs()
+        page = self.paginate_queryset(runs if runs is not None else [])
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+
+class PullRequestViewSet(_StamphogTeamScopedViewSet, viewsets.GenericViewSet):
+    """Read-only pull requests auto-approval knows about, filterable by PR number and merge state."""
+
+    scope_object = "code_review_approval"
+    serializer_class = PullRequestSerializer
+
+    def _pull_requests(self) -> facade_api.LazyDTOList[contracts.PullRequestDTO] | None:
+        """The team's pull requests under the request's filters, or None if a filter is unparseable."""
+        pr_number = self.request.query_params.get("pr_number")
+        if pr_number:
+            try:
+                pr_number_value = int(pr_number)
+            except ValueError:
+                return None
+        else:
+            pr_number_value = None
+        merged = self.request.query_params.get("merged")
+        return facade_api.list_pull_requests(
+            self.canonical_team_id,
+            pr_number=pr_number_value,
+            merged=None if merged is None else merged.lower() in ("true", "1"),
+        )
+
+    def retrieve(self, request: Request, pk: UUID, **kwargs) -> Response:
+        pull_request = facade_api.get_pull_request(self.canonical_team_id, str(pk))
+        if pull_request is None:
+            raise NotFound()
+        return Response(self.get_serializer(pull_request).data)
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "pr_number",
+                OpenApiTypes.INT,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by pull request number.",
+            ),
+            OpenApiParameter(
+                "merged",
+                OpenApiTypes.BOOL,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by merge state: true for merged pull requests, false for unmerged.",
+            ),
+        ],
+        responses={200: PullRequestSerializer(many=True)},
+    )
+    def list(self, request: Request, **kwargs) -> Response:
+        pull_requests = self._pull_requests()
+        page = self.paginate_queryset(pull_requests if pull_requests is not None else [])
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+
+class DigestRunViewSet(_StamphogTeamScopedViewSet, viewsets.GenericViewSet):
+    """Read-only history of posted (or attempted) digests, filterable by Slack channel."""
+
+    scope_object = "code_review_approval"
+    serializer_class = DigestRunSerializer
+
+    def retrieve(self, request: Request, pk: UUID, **kwargs) -> Response:
+        digest_run = facade_api.get_digest_run(self.canonical_team_id, str(pk))
+        if digest_run is None:
+            raise NotFound()
+        return Response(self.get_serializer(digest_run).data)
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "slack_channel_id",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by the Slack channel the digest was posted to, e.g. 'C012AB3CD'.",
+            ),
+        ],
+        responses={200: DigestRunSerializer(many=True)},
+    )
+    def list(self, request: Request, **kwargs) -> Response:
+        slack_channel_id = request.query_params.get("slack_channel_id") or None
+        runs = facade_api.list_digest_runs(self.canonical_team_id, slack_channel_id=slack_channel_id)
+        return self.get_paginated_response(self.get_serializer(self.paginate_queryset(runs), many=True).data)
+
+
+class RoutingRunViewSet(_StamphogTeamScopedViewSet, viewsets.GenericViewSet):
+    """Reviewer routing runs: which owners each run requested, cut or left out, and why."""
+
+    scope_object = "code_review_approval"
+    serializer_class = RoutingRunSerializer
+
+    @extend_schema(
+        description=(
+            "List reviewer routing runs, newest run first by default or newest merge first with ordering=-merged_at. Each run holds its decision for every owner of the "
+            "changed code: requested, cut, or not asked, with the reason, and the pull request it routed. Filter "
+            "by owner to answer why a team or person was or was not asked to review. With latest_per_pr, list "
+            "what landed in an owner's area. Get one run for the files each owner owns."
+        ),
+        parameters=[CodeReviewApprovalRoutingRunsQuerySerializer],
+        responses={200: RoutingRunSerializer(many=True)},
+    )
+    def list(self, request: Request, **kwargs) -> Response:
+        query = CodeReviewApprovalRoutingRunsQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        runs = facade_api.list_routing_runs(self.canonical_team_id, **query.validated_data)
+        page = self.paginate_queryset(runs)
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+    @extend_schema(
+        description=(
+            "List the owners that routing runs decided about, with how many distinct pull requests each one "
+            "touched, most first. Defaults to the last 90 days of runs."
+        ),
+        parameters=[CodeReviewApprovalRoutingOwnersQuerySerializer],
+        responses={200: RoutingOwnerCountSerializer(many=True)},
+    )
+    @action(
+        detail=False,
+        methods=["GET"],
+        url_path="owners",
+        pagination_class=None,
+        required_scopes=["code_review_approval:read"],
+    )
+    def owners(self, request: Request, **kwargs) -> Response:
+        query = CodeReviewApprovalRoutingOwnersQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        created_after = query.validated_data.get("created_after") or timezone.now() - ROUTING_OWNERS_WINDOW
+        owners = facade_api.list_routing_owners(self.canonical_team_id, created_after=created_after)
+        return Response(RoutingOwnerCountSerializer(owners, many=True).data)
+
+    @extend_schema(
+        description="One reviewer routing run, with every changed file each owner owns.",
+        responses={200: RoutingRunDetailSerializer},
+    )
+    def retrieve(self, request: Request, pk: UUID, **kwargs) -> Response:
+        run = facade_api.get_routing_run(self.canonical_team_id, str(pk))
+        if run is None:
+            raise NotFound()
+        return Response(RoutingRunDetailSerializer(run, context=self.get_serializer_context()).data)

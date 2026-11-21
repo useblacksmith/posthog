@@ -1,0 +1,379 @@
+from typing import Any, Literal
+from uuid import UUID
+
+from django.db import connection, transaction
+
+from posthog.dataclasses import frozen
+
+from products.access_control.backend.models.role import RoleMembership
+
+
+def lock_approval_policies(organization_id: UUID, *, shared: bool = False) -> None:
+    """Prevent policy changes between a flag's final policy lookup and its commit.
+
+    FeatureFlagSerializer.update holds a shared lock through lookup and mutation.
+    ApprovalPolicySerializer.create/update hold the exclusive lock, so different flag
+    writes can proceed together while policy creation and enablement wait for them.
+    """
+    # Org scope covers both team policies and the org fallback, including policies not yet created.
+    if not connection.in_atomic_block:
+        raise transaction.TransactionManagementError("Approval policy locks require an atomic block")
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))"
+            if shared
+            else "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            [f"approval-policies:{organization_id}"],
+        )
+
+
+@frozen
+class PolicyDecision:
+    """Result of policy evaluation"""
+
+    result: Literal["ALLOW", "DENY", "REQUIRE_APPROVAL"]
+    reason: str
+    message: str
+    approvers: dict
+    policy_snapshot: dict
+
+
+class PolicyEngine:
+    """Evaluates approval policies"""
+
+    COMPARISON_OPERATORS = {
+        ">": lambda a, b: a > b,
+        "<": lambda a, b: a < b,
+        ">=": lambda a, b: a >= b,
+        "<=": lambda a, b: a <= b,
+        "==": lambda a, b: a == b,
+        "!=": lambda a, b: a != b,
+    }
+
+    def get_policy(self, action_key: str, team, organization):
+        """
+        Get the active policy for an action.
+
+        Lookup order:
+        1. Team-level policy (if team provided)
+        2. Org-level policy
+        """
+        from products.approvals.backend.models import ApprovalPolicy
+
+        policy = None
+
+        if team:
+            policy = (
+                ApprovalPolicy.objects.enabled()
+                .filter(
+                    action_key=action_key,
+                    organization=organization,
+                    team=team,
+                )
+                .first()
+            )
+
+        if not policy:
+            policy = (
+                ApprovalPolicy.objects.enabled()
+                .filter(
+                    action_key=action_key,
+                    organization=organization,
+                    team__isnull=True,
+                )
+                .first()
+            )
+
+        return policy
+
+    def get_policy_for_action(self, action_class, team, organization):
+        """Get the active policy for an action, falling back to its fallback action keys in order."""
+        for action_key in (action_class.key, *action_class.fallback_policy_action_keys_for(organization)):
+            policy = self.get_policy(action_key, team, organization)
+            if policy:
+                return policy
+        return None
+
+    def get_all_matching_policies(self, action_key: str, team, organization, intent: dict):
+        """
+        Get all active policies for an action that match the given intent.
+        Used for conflict detection.
+        """
+        from products.approvals.backend.models import ApprovalPolicy
+
+        policies = []
+
+        if team:
+            team_policies = ApprovalPolicy.objects.enabled().filter(
+                action_key=action_key,
+                organization=organization,
+                team=team,
+            )
+            for policy in team_policies:
+                if self._evaluate_conditions(policy.conditions, intent):
+                    policies.append(policy)
+
+        org_policies = ApprovalPolicy.objects.enabled().filter(
+            action_key=action_key,
+            organization=organization,
+            team__isnull=True,
+        )
+        for policy in org_policies:
+            if self._evaluate_conditions(policy.conditions, intent):
+                policies.append(policy)
+
+        return policies
+
+    def evaluate(self, policy, actor, intent: dict, context: dict, ignore_conditions: bool = False) -> PolicyDecision:
+        """
+        Evaluate if an action requires approval.
+
+        Returns PolicyDecision with:
+        - ALLOW: User can execute immediately (bypass or conditions don't match)
+        - DENY: Action not allowed
+        - REQUIRE_APPROVAL: Must get approvals
+        """
+        bypass_role_ids = [str(r.id) for r in policy.bypass_roles.all()]
+
+        if self._has_bypass(actor, policy, bypass_role_ids, context):
+            return PolicyDecision(
+                result="ALLOW",
+                reason="User has bypass",
+                message="Approved immediately",
+                approvers={},
+                policy_snapshot={},
+            )
+
+        if not ignore_conditions and not self._evaluate_conditions(policy.conditions, intent):
+            return PolicyDecision(
+                result="ALLOW",
+                reason="Conditions not matched",
+                message="Change does not require approval",
+                approvers={},
+                policy_snapshot={},
+            )
+
+        approver_config = policy.approver_config
+
+        if not policy.allow_self_approve and self._actor_is_approver(actor, approver_config, context):
+            message = "A change request has been created and is pending approval from others."
+        else:
+            message = "A change request has been created and is pending approval."
+
+        return PolicyDecision(
+            result="REQUIRE_APPROVAL",
+            reason="Policy matched",
+            message=message,
+            approvers=approver_config,
+            policy_snapshot={
+                "quorum": approver_config["quorum"],
+                "users": approver_config.get("users", []),
+                "roles": approver_config.get("roles", []),
+                "allow_self_approve": policy.allow_self_approve,
+                "conditions": {} if ignore_conditions else (policy.conditions or {}),
+                "bypass_org_membership_levels": policy.bypass_org_membership_levels,
+                "bypass_roles": bypass_role_ids,
+            },
+        )
+
+    def conditions_match(self, conditions: dict[str, Any], intent: dict) -> bool:
+        return self._evaluate_conditions(conditions, intent)
+
+    def _evaluate_conditions(self, conditions: dict[str, Any], intent: dict) -> bool:
+        """
+        Evaluate policy conditions against the intent.
+
+        Returns True if conditions match (gating applies), False otherwise.
+        If conditions is empty/None, returns True (gate all changes for that action).
+
+        Condition types:
+        - before_after: Compare field values before and after change
+        - change_amount: Compare delta between before/after values
+        - any_change: Gate if the field changes at all
+        """
+        if not conditions:
+            return True
+
+        condition_type = conditions.get("type")
+
+        if condition_type == "before_after":
+            return self._evaluate_before_after(conditions, intent)
+        elif condition_type == "change_amount":
+            return self._evaluate_change_amount(conditions, intent)
+        elif condition_type == "any_change":
+            return self._evaluate_any_change(conditions, intent)
+
+        return True
+
+    def _evaluate_before_after(self, conditions: dict[str, Any], intent: dict) -> bool:
+        """
+        Evaluate before_after condition type.
+
+        Structure: {"type": "before_after", "field": "rollout_percentage", "operator": ">", "value": 50}
+        Compares the "after" value against the condition value using the operator.
+        Checks ALL paths where the field appears, returns True if ANY match.
+        """
+        field = conditions.get("field")
+        operator = conditions.get("operator")
+        threshold = conditions.get("value")
+
+        if not field or not operator or threshold is None:
+            return True
+
+        compare_fn = self.COMPARISON_OPERATORS.get(operator)
+        if not compare_fn:
+            return True
+
+        if not self._field_changed(field, intent):
+            return False
+
+        gated_changes = intent.get("gated_changes", {})
+        field_values = gated_changes.get(field, [])
+
+        for item in field_values:
+            after_value = item.get("value")
+            if after_value is not None:
+                try:
+                    if compare_fn(after_value, threshold):
+                        return True
+                except (TypeError, ValueError):
+                    pass
+
+        return False
+
+    def _evaluate_change_amount(self, conditions: dict[str, Any], intent: dict) -> bool:
+        """
+        Evaluate change_amount condition type.
+
+        Structure: {"type": "change_amount", "field": "rollout_percentage", "operator": ">", "value": 10}
+        Calculates delta = after_value - before_value and compares against threshold.
+        Only valid for numeric field types.
+        """
+        field = conditions.get("field")
+        operator = conditions.get("operator")
+        threshold = conditions.get("value")
+
+        if not field or not operator or threshold is None:
+            return True
+
+        compare_fn = self.COMPARISON_OPERATORS.get(operator)
+        if not compare_fn:
+            return True
+
+        if not self._field_changed(field, intent):
+            return False
+
+        before_by_path = self._values_by_path(intent, "current_state", field)
+        after_by_path = self._values_by_path(intent, "gated_changes", field)
+
+        for path in before_by_path.keys() | after_by_path.keys():
+            before_val = before_by_path.get(path)
+            after_val = after_by_path.get(path)
+
+            if before_val is not None and after_val is not None:
+                try:
+                    delta = after_val - before_val
+                    if compare_fn(delta, threshold):
+                        return True
+                except (TypeError, ValueError):
+                    pass
+
+        return False
+
+    def _evaluate_any_change(self, conditions: dict[str, Any], intent: dict) -> bool:
+        """
+        Evaluate any_change condition type.
+
+        Structure: {"type": "any_change", "field": "rollout_percentage"}
+        Returns True if the field value differs between before and after.
+        """
+        field = conditions.get("field")
+
+        if not field:
+            return True
+
+        before_by_path = self._values_by_path(intent, "current_state", field)
+        after_by_path = self._values_by_path(intent, "gated_changes", field)
+        return any(
+            before_by_path.get(path) != after_by_path.get(path) for path in before_by_path.keys() | after_by_path.keys()
+        )
+
+    def _field_changed(self, field: str, intent: dict) -> bool:
+        """Whether the change touches the field that a condition names.
+
+        `before_after` compares every value of the field, changed or not. Without this check, a
+        "rollout > 50" policy would gate a release condition edit on a flag that some condition set
+        already rolls out to more than 50%.
+        """
+        before_values = intent.get("current_state", {}).get(field)
+        after_values = intent.get("gated_changes", {}).get(field)
+        if not isinstance(before_values, list) or not isinstance(after_values, list):
+            # Not the path and value shape this check reads, so the condition decides alone.
+            return True
+
+        return self._evaluate_any_change({"field": field}, intent)
+
+    @staticmethod
+    def _values_by_path(intent: dict, side: str, field: str) -> dict[str, Any]:
+        return {v["path"]: v["value"] for v in intent.get(side, {}).get(field, [])}
+
+    def _has_bypass(self, actor, policy, bypass_role_ids: list[str], context: dict) -> bool:
+        """Check if user can bypass this policy based on org membership level or RBAC role."""
+        org = context.get("organization")
+        if not org:
+            return False
+
+        # Check bypass_org_membership_levels
+        if policy.bypass_org_membership_levels:
+            membership = actor.organization_memberships.filter(organization=org).first()
+            if membership and membership.effective_level in [int(lvl) for lvl in policy.bypass_org_membership_levels]:
+                return True
+
+        # Check bypass_roles (RBAC roles)
+        if bypass_role_ids:
+            user_role_ids = {
+                str(rid)
+                for rid in RoleMembership.objects.filter(
+                    user=actor,
+                    role__organization=org,
+                )
+                .valid_for_authorization()
+                .values_list("role_id", flat=True)
+            }
+            if user_role_ids & set(bypass_role_ids):
+                return True
+
+        return False
+
+    def _actor_is_approver(self, actor, approver_config: dict, context: dict) -> bool:
+        """
+        Check if actor is in the approver set.
+
+        Supports both:
+        - Direct users: {"users": [42, 99]}
+        - Roles: {"roles": ["uuid-1", "uuid-2"]}
+
+        Returns True if actor matches either users OR roles.
+        """
+        if "users" in approver_config and actor.id in approver_config["users"]:
+            return True
+
+        if approver_config.get("roles"):
+            org = context.get("organization")
+            if not org:
+                return False
+
+            actor_roles = {
+                str(rid)
+                for rid in (
+                    RoleMembership.objects.filter(user=actor, role__organization=org)
+                    .valid_for_authorization()
+                    .values_list("role_id", flat=True)
+                )
+            }
+
+            approver_roles = {str(r) for r in approver_config["roles"]}
+            if actor_roles & approver_roles:
+                return True
+
+        return False

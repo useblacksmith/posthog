@@ -1,0 +1,200 @@
+# Testing kea logics
+
+PostHog tests kea logics with [`kea-test-utils`](https://github.com/keajs/kea-test-utils)
+plus jest, MSW for HTTP, and a small `initKeaTests` helper.
+
+## Setup boilerplate
+
+```ts
+import { expectLogic } from 'kea-test-utils'
+
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+
+import { fooLogic } from './fooLogic'
+
+describe('fooLogic', () => {
+  let logic: ReturnType<typeof fooLogic.build>
+
+  beforeEach(() => {
+    useMocks({
+      get: {
+        '/api/projects/:team_id/foos/:id/': (req) => [200, { id: req.params.id, name: 'hello' }],
+      },
+      post: { '/api/projects/:team_id/foos/': { id: 'new', name: 'new' } },
+    })
+    initKeaTests()
+    logic = fooLogic({ fooId: '123' })
+    logic.mount()
+  })
+
+  afterEach(() => {
+    logic.unmount()
+  })
+})
+```
+
+- `initKeaTests()` (in `frontend/src/test/init.ts`) calls `initKea` with an in-memory
+  history and mounts the common logics (`preflightLogic`, `teamLogic`, `projectLogic`,
+  `organizationLogic`). Pass `mountCommonLogic = false` only if your test needs to
+  control those manually.
+- `useMocks(...)` (in `frontend/src/mocks/jest.ts`) is the MSW handler registration. The
+  matcher supports path parameters and HTTP methods. Unhandled requests are silent and
+  get an empty paginated `{ results: [] }`, so count requests in a handler you register.
+- `ReturnType<typeof fooLogic.build>` is the conventional way to type the local variable
+  for both keyed and unkeyed logics.
+
+## `expectLogic` assertions
+
+```ts
+// Synchronous dispatch
+expectLogic(logic, () => {
+  logic.actions.setName('hi')
+})
+  .toDispatchActions(['setName'])
+  .toMatchValues({ name: 'hi' })
+
+// Async — await the whole expectation
+await expectLogic(logic, () => {
+  logic.actions.loadFoo()
+})
+  .toFinishAllListeners()
+  .toMatchValues({
+    foo: { id: '123', name: 'hello' },
+    fooLoading: false,
+  })
+
+// Assert a no-op: no request reached the MSW fake and the values did not change
+let requests = 0
+useMocks({
+  get: {
+    '/api/projects/:team_id/foos/': () => {
+      requests += 1
+      return [200, { results: [] }]
+    },
+  },
+})
+// A real change first, so the counter is proven to watch the path the logic calls
+await expectLogic(logic, () => {
+  logic.actions.setQuery('hello')
+}).toFinishAllListeners()
+expect(requests).toBe(1)
+const { results } = logic.values
+await expectLogic(logic, () => {
+  logic.actions.setQuery('hello') // same value, should be a no-op
+})
+  .toFinishAllListeners()
+  .toMatchValues({ results })
+expect(requests).toBe(1)
+
+// Router-driven action
+import { router } from 'kea-router'
+
+router.actions.push('/foos/123')
+expectLogic(logic).toDispatchActions(['setFooId']).toMatchValues({ fooId: '123' })
+```
+
+Common assertion methods from `kea-test-utils`:
+
+| Method                                | Use                                                           |
+| ------------------------------------- | ------------------------------------------------------------- |
+| `.toDispatchActions([...])`           | Actions fired in order (other actions may interleave).        |
+| `.toDispatchActionsInAnyOrder([...])` | Actions fired but order doesn't matter.                       |
+| `.toNotHaveDispatchedActions([...])`  | None of the listed actions fired.                             |
+| `.toMatchValues({ key: value })`      | Reducer/selector values match (partial matching for objects). |
+| `.toFinishAllListeners(timeoutMs?)`   | Awaits all in-flight async listeners.                         |
+| `.toFinishListener(actionName)`       | Awaits a specific listener.                                   |
+| `partial({ ... })` / `truth(fn)`      | Helpers for value matching.                                   |
+
+## Breakpoint timing in Jest
+
+The frontend Jest setup keeps kea breakpoint cancellation but shortens
+`breakpoint(ms)` to a zero-delay timer task. A bare `breakpoint()` is unchanged. When
+Jest fake timers are active, delayed breakpoints keep their requested duration.
+
+- If the delay itself is behavior, call `jest.useFakeTimers()` before dispatching the
+  action, advance the exact duration, and restore real timers after the test.
+- If the test must observe an API request while it is pending, do not depend on the
+  breakpoint delay. Make the HTTP mock await a test-controlled promise, assert the
+  pending state, then resolve the promise and assert the settled state.
+- If only the settled result matters, await that result with `expectLogic`, `waitFor`,
+  or the matching loader action.
+
+See [writing-tests](../../writing-tests/SKILL.md) for the general async state-transition
+rule. Never add logic-path exceptions to the Jest breakpoint wrapper.
+
+## Parameterise
+
+Per repo convention ([`.agents/code-style.md`](../../../code-style.md)), parameterise variations of the
+same shape rather than copy-pasting describe bodies:
+
+```ts
+describe.each([
+  ['draft', 'editFoo', { editing: true }],
+  ['saved', 'saveFoo', { editing: false }],
+])('after %s', (_, action, expectedValues) => {
+  it('updates editing state', async () => {
+    await expectLogic(logic, () => {
+      logic.actions[action]()
+    })
+      .toFinishAllListeners()
+      .toMatchValues(expectedValues)
+  })
+})
+```
+
+## Loaders behind a helper
+
+Helpers such as `performQuery`, or an `api.foos.bar` helper that wraps several calls, still end in HTTP requests.
+Serve those requests from MSW with the response shape the endpoint returns.
+Don't `jest.mock` the helper: the test then skips the request the logic builds, so it passes when that request is wrong.
+
+```ts
+useMocks({
+  post: {
+    '/api/projects/:team_id/query/:kind': () => [200, { results: [['2026-01-01', 3]], columns: ['day', 'count'] }],
+  },
+})
+```
+
+## Intentional loader failures
+
+If you're testing a loader's failure path, the global `onFailure` toast will fire and
+spam console errors. Silence it for the test:
+
+```ts
+import { resumeKeaLoadersErrors, silenceKeaLoadersErrors } from '~/initKea'
+
+beforeEach(() => silenceKeaLoadersErrors())
+afterEach(() => resumeKeaLoadersErrors())
+```
+
+## Keyed logics
+
+```ts
+logic = fooLogic({ fooId: '123' })
+logic.mount()
+
+expect(logic.key).toEqual('123')
+
+// Asserting required props throw on missing key
+it('requires fooId', () => {
+  expect(() => fooLogic()).toThrow(/must init/i)
+})
+```
+
+## What not to do
+
+- **Don't share a single `logic` instance across `describe` blocks** — kea's redux store
+  is reset by `initKeaTests()` per `beforeEach`. Build and mount inside `beforeEach`.
+- **Don't `await` plain action calls** — actions are synchronous dispatches. Await
+  `expectLogic(...).toFinishAllListeners()` instead.
+- **Don't rely on real HTTP** — every loader hit must be mocked via `useMocks`,
+  otherwise MSW warns and your test depends on the dev server being up.
+
+## Finding examples in the wild
+
+For each pattern (form logic test, loader test with `toFinishAllListeners`, keyed
+logic with `useMocks`, router-driven test with `urlToAction` assertions), grep for
+the relevant builder or matcher inside `**/*.test.ts` — there are plenty of
+current examples and the conventions are stable.

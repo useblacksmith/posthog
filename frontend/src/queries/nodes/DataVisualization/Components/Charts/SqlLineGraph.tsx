@@ -1,0 +1,83 @@
+import clsx from 'clsx'
+import { useCallback } from 'react'
+
+import { TimeSeriesLineChart, type PointClickData, type TooltipContext } from '@posthog/quill-charts'
+
+import { makeChartErrorHandler } from 'lib/charts/chartErrorHandler'
+import { AnnotationsLayer } from 'lib/components/AnnotationsOverlay/AnnotationsLayer'
+
+import { type SqlChartProps } from './SqlChart'
+import { SqlChartTooltip } from './SqlChartTooltip'
+import { SqlLineSeriesMeta, buildLineChartConfig } from './sqlLineGraphAdapter'
+import { useSqlChartModel } from './useSqlChartModel'
+
+const handleChartError = makeChartErrorHandler('sql-line-chart')
+
+/**
+ * SQL line/area graph rendered via @posthog/quill-charts. The default SQL chart renderer (see
+ * {@link sqlChartComponentFor}); bar-only and mixed series route to their own components. Handles
+ * line, area, goal lines, and trend lines. Tooltip content (per-column formatting, total row) is
+ * configured in {@link buildLineChartConfig}.
+ */
+export const SqlLineGraph = (props: SqlChartProps): JSX.Element => {
+    const { onPointClick: onPointClickProp } = props
+    const model = useSqlChartModel(props, buildLineChartConfig)
+
+    const onPointClick = useCallback(
+        (data: PointClickData<SqlLineSeriesMeta>) => {
+            onPointClickProp?.(data.series.key, data.dataIndex, data.label)
+        },
+        [onPointClickProp]
+    )
+
+    // When a click handler is wired, override the config-driven tooltip with a render prop so we
+    // can add the inspect hint and sort by value. We pull the formatters off the built config to
+    // avoid duplicating the per-column formatting logic.
+    const renderTooltip = useCallback(
+        (ctx: TooltipContext<SqlLineSeriesMeta>) => {
+            if (!model || !onPointClickProp) {
+                return null
+            }
+            return (
+                <SqlChartTooltip
+                    context={ctx}
+                    config={model.config.tooltip}
+                    onPointClick={onPointClickProp}
+                    hint={props.pointClickHint ?? 'Click to inspect persons'}
+                />
+            )
+        },
+        [model, onPointClickProp, props.pointClickHint]
+    )
+
+    return (
+        <div
+            className={clsx(
+                props.className,
+                'rounded bg-surface-primary w-full grow relative overflow-hidden flex flex-col',
+                { 'h-[60vh]': props.presetChartHeight, 'h-full': !props.presetChartHeight }
+            )}
+        >
+            {model && (
+                <TimeSeriesLineChart<SqlLineSeriesMeta>
+                    series={model.series}
+                    labels={model.labels}
+                    theme={model.theme}
+                    config={model.config}
+                    tooltip={onPointClickProp ? renderTooltip : undefined}
+                    onPointClick={onPointClickProp ? onPointClick : undefined}
+                    onError={handleChartError}
+                >
+                    {props.children}
+                    {props.showAnnotations && props.insightNumericId && (
+                        <AnnotationsLayer
+                            insightNumericId={props.insightNumericId}
+                            dates={model.labels}
+                            annotationsScope={props.chartSettings.annotationsScope}
+                        />
+                    )}
+                </TimeSeriesLineChart>
+            )}
+        </div>
+    )
+}

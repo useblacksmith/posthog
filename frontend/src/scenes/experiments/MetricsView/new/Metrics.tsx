@@ -1,0 +1,139 @@
+import { useMountedLogic, useValues } from 'kea'
+
+import { IconInfo } from '@posthog/icons'
+import { LemonBanner, Tooltip } from '@posthog/lemon-ui'
+
+import { IconAreaChart } from 'lib/lemon-ui/icons'
+
+import type { ExperimentMetric } from '~/queries/schema/schema-general'
+import { experimentLogic } from '~/scenes/experiments/experimentLogic'
+import { experimentMetricsLogic } from '~/scenes/experiments/experimentMetricsLogic'
+import { AddMetricButton } from '~/scenes/experiments/Metrics/AddMetricButton'
+import { getExperimentVariants, isSavedExperiment, metricResults } from '~/scenes/experiments/utils'
+import { Experiment } from '~/types'
+
+import { SummarizeExperimentButton } from 'products/experiments/frontend/components/SummarizeExperimentButton'
+import { experimentExposuresWindowLogic } from 'products/experiments/frontend/exposures/experimentExposuresWindowLogic'
+import { METRIC_CONTEXTS } from 'products/experiments/frontend/modals/ExperimentMetricModal/experimentMetricModalLogic'
+
+import { HowToReadTooltip } from './HowToReadTooltip'
+import { MetricsTable } from './MetricsTable'
+import { ResultDetails } from './ResultDetails'
+
+export function Metrics({ isSecondary }: { isSecondary?: boolean }): JSX.Element | null {
+    const { experiment } = useValues(experimentLogic)
+
+    const variants = getExperimentVariants(experiment)
+    // Guard here so the child can take a non-null, real experiment and mount keyed child logics safely.
+    if (!variants.length || !isSavedExperiment(experiment)) {
+        return null
+    }
+
+    return <MetricsContent experiment={experiment} isSecondary={isSecondary} />
+}
+
+function MetricsContent({ experiment, isSecondary }: { experiment: Experiment; isSecondary?: boolean }): JSX.Element {
+    useMountedLogic(experimentExposuresWindowLogic({ experiment }))
+    const { hasMinimumExposureForResults } = useValues(experimentLogic)
+    const {
+        primaryMetricsResults,
+        primaryMetricsResultsErrors,
+        secondaryMetricsResults,
+        secondaryMetricsResultsErrors,
+        recalculationRejectionMessage,
+    } = useValues(experimentMetricsLogic({ experiment }))
+
+    const type = isSecondary ? 'secondary' : 'primary'
+
+    const metricsWithResults = metricResults(experiment)(
+        isSecondary ? secondaryMetricsResults : primaryMetricsResults,
+        isSecondary ? secondaryMetricsResultsErrors : primaryMetricsResultsErrors,
+        type
+    )
+
+    const metrics = metricsWithResults.map(({ metric }) => metric)
+    const results = metricsWithResults.map(({ result }) => result)
+    const errors = metricsWithResults.map(({ error }) => error)
+
+    // A single primary metric with a result shows its details inline under the table.
+    const detailResult = metrics.length === 1 && hasMinimumExposureForResults && !isSecondary ? results[0] : undefined
+    const hasSomeResults =
+        results?.some((result) => result?.variant_results && result.variant_results.length > 0) &&
+        hasMinimumExposureForResults
+
+    return (
+        <div className="mb-4 -mt-2" data-attr="experiment-creation-goal-metric">
+            <div className="flex">
+                <div className="w-1/2 pt-5">
+                    <div className="inline-flex items-center deprecated-space-x-2 mb-0">
+                        <h2 className="mb-0 font-semibold text-lg leading-6">
+                            {isSecondary ? 'Secondary metrics' : 'Primary metrics'}
+                        </h2>
+                        {isSecondary && metrics.length > 0 && (
+                            <Tooltip title="Secondary metrics capture additional outcomes or behaviors affected by your experiment. They help you understand broader impacts and potential side effects beyond the primary goal.">
+                                <IconInfo className="text-secondary text-lg" />
+                            </Tooltip>
+                        )}
+                        {!isSecondary && hasMinimumExposureForResults && <SummarizeExperimentButton />}
+                        {hasSomeResults && !isSecondary && <HowToReadTooltip />}
+                    </div>
+                </div>
+
+                <div className="w-1/2 flex flex-col justify-end">
+                    <div className="ml-auto">
+                        {metrics.length > 0 && (
+                            <div className="mb-2 mt-4 justify-end flex items-center gap-2">
+                                <AddMetricButton
+                                    metricContext={isSecondary ? METRIC_CONTEXTS.secondary : METRIC_CONTEXTS.primary}
+                                />
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+            {!isSecondary && recalculationRejectionMessage && (
+                <LemonBanner type="warning" className="mb-2">
+                    {recalculationRejectionMessage}
+                </LemonBanner>
+            )}
+            {metrics.length > 0 ? (
+                detailResult ? (
+                    <div className="rounded-md border bg-surface-primary overflow-hidden divide-y divide-border">
+                        <MetricsTable
+                            metrics={metrics}
+                            results={results}
+                            errors={errors}
+                            isSecondary={!!isSecondary}
+                            showDetailsModal={false}
+                            embedded
+                        />
+                        <ResultDetails
+                            metric={metrics[0] as ExperimentMetric}
+                            result={detailResult}
+                            experiment={experiment}
+                            embedded
+                        />
+                    </div>
+                ) : (
+                    <MetricsTable metrics={metrics} results={results} errors={errors} isSecondary={!!isSecondary} />
+                )
+            ) : (
+                <div className="border rounded bg-surface-primary pt-6 pb-8 text-secondary mt-2">
+                    <div className="flex flex-col items-center mx-auto deprecated-space-y-3">
+                        <IconAreaChart fontSize="30" />
+                        <div className="text-sm text-center text-balance max-w-sm">
+                            <p>
+                                {isSecondary
+                                    ? 'Secondary metrics provide additional context and help detect unintended side effects.'
+                                    : 'Primary metrics represent the main goal of the experiment and directly measure if your hypothesis was successful.'}
+                            </p>
+                        </div>
+                        <AddMetricButton
+                            metricContext={isSecondary ? METRIC_CONTEXTS.secondary : METRIC_CONTEXTS.primary}
+                        />
+                    </div>
+                </div>
+            )}
+        </div>
+    )
+}

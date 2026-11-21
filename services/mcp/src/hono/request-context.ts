@@ -1,0 +1,344 @@
+import { createHash } from 'node:crypto'
+
+import { ApiClient } from '@/api/client'
+import { StateLookupCache } from '@/lib/cache/StateLookupCache'
+import { MCP_ANALYTICS_SOURCE, MCP_SERVER_NAME, MCP_SERVER_VERSION } from '@/lib/constants'
+import { getPostHogClient } from '@/lib/posthog'
+import {
+    AnalyticsEvent,
+    buildMCPAnalyticsGroups,
+    buildMCPContextProperties,
+    type MCPAnalyticsContext,
+} from '@/lib/posthog/analytics'
+import type { RequestProperties } from '@/lib/request-properties'
+import { SessionManager } from '@/lib/SessionManager'
+import { StateManager } from '@/lib/StateManager'
+import type { Context, Env, PinnedActiveContext, SessionScopedState, State } from '@/tools/types'
+
+import { RedisCache, type RedisLike } from './cache/RedisCache'
+import { getClientIpSigningKeys, getCustomApiBaseUrl, getPublicBaseUrl } from './constants'
+import {
+    buildMCPRequestContext,
+    buildMCPSessionAnalyticsProperties,
+    getEffectiveMCPClientContext,
+    getEffectiveMCPClientIdentity,
+    resolveSessionKey,
+    type MCPRequestContext,
+    type MCPSessionContext,
+} from './mcp-context'
+
+// Matches McpSessionRedisStore's idle TTL: every session-scoped store describes
+// the same MCP protocol session, so their lifetimes should agree.
+const SESSION_CACHE_TTL_SECONDS = 24 * 60 * 60
+
+export class RequestContext {
+    private tokenCacheInstance: RedisCache<State> | undefined
+    private sessionScopedCacheInstance: RedisCache<SessionScopedState> | undefined
+    private legacySessionScopedCacheInstance: RedisCache<SessionScopedState> | undefined
+    private apiInstance: ApiClient | undefined
+    private sessionManagerInstance: SessionManager | undefined
+    private stateManagerInstance: StateManager | undefined
+    private distinctIdPromise: Promise<string> | undefined
+    private readonly sessionUuidPromises = new Map<string, Promise<string>>()
+    private readonly redis: RedisLike
+    private readonly env: Env
+    private readonly props: RequestProperties
+    private requestContext: MCPRequestContext
+    private sessionContext: MCPSessionContext | null = null
+    private pinnedContext: PinnedActiveContext | undefined
+
+    constructor(
+        redis: RedisLike,
+        env: Env,
+        props: RequestProperties,
+        requestContext: MCPRequestContext = buildMCPRequestContext(props),
+        readonly lookups = new StateLookupCache()
+    ) {
+        this.redis = redis
+        this.env = env
+        this.props = props
+        this.requestContext = requestContext
+    }
+
+    get tokenCache(): RedisCache<State> {
+        if (!this.props.userHash) {
+            throw new Error('User hash is required to use the token cache')
+        }
+        if (!this.tokenCacheInstance) {
+            this.tokenCacheInstance = new RedisCache<State>(this.props.userHash, this.redis, 'token')
+        }
+        return this.tokenCacheInstance
+    }
+
+    get cache(): RedisCache<State> {
+        return this.tokenCache
+    }
+
+    /**
+     * Selections cannot live in the token cache shared by concurrent connections.
+     * Include the credential because callers choose their session and conversation IDs.
+     */
+    get sessionScopedCache(): RedisCache<SessionScopedState> | undefined {
+        const mcpSessionId = this.requestContext.mcpSessionId
+        const conversationId = this.requestContext.mcpConversationId
+        if (!mcpSessionId && !conversationId) {
+            return undefined
+        }
+        if (!this.sessionScopedCacheInstance) {
+            const scopeId = mcpSessionId ?? `conversation\0${conversationId}`
+            this.sessionScopedCacheInstance = this.sessionCacheFor(`${this.props.userHash ?? ''}\0${scopeId}`)
+        }
+        return this.sessionScopedCacheInstance
+    }
+
+    /**
+     * The session store under its former key, which held only the session id.
+     * Read it only to find a session that started before the key included the
+     * credential. Never restore its values: another credential can send the same id.
+     */
+    get legacySessionScopedCache(): RedisCache<SessionScopedState> | undefined {
+        const mcpSessionId = this.requestContext.mcpSessionId
+        if (!mcpSessionId) {
+            return undefined
+        }
+        if (!this.legacySessionScopedCacheInstance) {
+            this.legacySessionScopedCacheInstance = this.sessionCacheFor(mcpSessionId)
+        }
+        return this.legacySessionScopedCacheInstance
+    }
+
+    private sessionCacheFor(keyMaterial: string): RedisCache<SessionScopedState> {
+        const digest = createHash('sha256').update(keyMaterial).digest()
+        return new RedisCache<SessionScopedState>(
+            digest.subarray(0, 16).toString('base64url'),
+            this.redis,
+            'session',
+            SESSION_CACHE_TTL_SECONDS
+        )
+    }
+
+    /** Set by the resolver before `getContext()`, so every tool reads the pinned context. */
+    setPinnedContext(pinned: PinnedActiveContext | undefined): void {
+        this.pinnedContext = pinned
+    }
+
+    private async readCachedOAuthClientName(): Promise<string | undefined> {
+        if (!this.props.userHash) {
+            return undefined
+        }
+        return (await this.tokenCache.get('clientName')) || undefined
+    }
+
+    private async api(): Promise<ApiClient> {
+        if (!this.apiInstance) {
+            const clientContext = getEffectiveMCPClientContext(this.requestContext, this.sessionContext)
+            const customApiBaseUrl = getCustomApiBaseUrl()
+            let baseUrl: string
+            if (customApiBaseUrl) {
+                baseUrl = customApiBaseUrl
+            } else if (process.env.NODE_ENV === 'production') {
+                throw new Error(
+                    'POSTHOG_API_BASE_URL must be set in production — Hono deployments are regional and do not auto-detect.'
+                )
+            } else {
+                baseUrl = 'http://localhost:8010'
+            }
+            this.apiInstance = new ApiClient({
+                apiToken: this.props.apiToken,
+                baseUrl,
+                publicBaseUrl: getPublicBaseUrl(),
+                clientUserAgent: this.props.clientUserAgent,
+                mcpClientName: clientContext.mcpClientName,
+                mcpClientVersion: clientContext.mcpClientVersion,
+                mcpProtocolVersion: clientContext.mcpProtocolVersion,
+                mcpConsumer: clientContext.mcpConsumer,
+                // Cached from a previous request's token introspection. On a cold cache this is
+                // still unset here, so `StateManager` also stamps it onto the live client's config
+                // the moment introspection resolves it — otherwise a token's first request would
+                // reach the API unattributed.
+                oauthClientName: await this.readCachedOAuthClientName(),
+                taskId: this.props.taskId,
+                clientIp: this.props.clientIp,
+                clientIpSigningKeys: getClientIpSigningKeys(),
+            })
+        }
+        return this.apiInstance
+    }
+
+    get sessionManager(): SessionManager {
+        if (!this.sessionManagerInstance) {
+            this.sessionManagerInstance = new SessionManager(this.tokenCache)
+        }
+        return this.sessionManagerInstance
+    }
+
+    // Memoized per key because a tool call emits several events and each producer resolved
+    // the same id, and because concurrent producers otherwise race to write the same mapping.
+    async getSessionUuid(sessionId: string | undefined): Promise<string | undefined> {
+        if (!sessionId) {
+            return undefined
+        }
+        const cached = this.sessionUuidPromises.get(sessionId)
+        if (cached) {
+            return cached
+        }
+        // Evicted on failure so a later lookup can retry. Three tool-error paths await this
+        // outside a try, so a cached rejection would replace the tool's own error for the rest
+        // of the request.
+        const pending = this.sessionManager.getSessionUuid(sessionId).catch((error: unknown) => {
+            this.sessionUuidPromises.delete(sessionId)
+            throw error
+        })
+        this.sessionUuidPromises.set(sessionId, pending)
+        return pending
+    }
+
+    /**
+     * Resolves the UUID emitted as `$session_id` from the first id the request
+     * carried. The agent's `conversation_id` wins because MCP 2026-07-28 removed
+     * `initialize` and the `Mcp-Session-Id` header, so for those clients the other
+     * two are absent and every tool call would ship with no `$session_id` at all.
+     * Every id here is caller-supplied, so `SessionManager` maps it to a UUID this
+     * server minted instead of emitting it.
+     */
+    async getEffectiveSessionUuid(requestContext: MCPRequestContext): Promise<string | undefined> {
+        return this.getSessionUuid(resolveSessionKey(requestContext))
+    }
+
+    getDistinctId(): Promise<string> {
+        return (this.distinctIdPromise ??= this.getContext().then(({ stateManager }) => stateManager.getDistinctId()))
+    }
+
+    async getContext(): Promise<Context> {
+        const api = await this.api()
+        const stateManager = (this.stateManagerInstance ??= new StateManager(
+            this.tokenCache,
+            api,
+            this.pinnedContext,
+            this.sessionScopedCache,
+            this.lookups
+        ))
+        const partialContext: Omit<Context, 'trackEvent'> = {
+            api,
+            cache: this.tokenCache,
+            env: this.env,
+            stateManager,
+            sessionManager: this.sessionManager,
+            getDistinctId: () => this.getDistinctId(),
+        }
+        const trackEvent: Context['trackEvent'] = async (event, properties = {}) => {
+            const analyticsContext = await this.safelyGetAnalyticsContext(partialContext)
+            const distinctId = await this.getDistinctId()
+            await this.trackEvent(event, properties, analyticsContext, undefined, distinctId)
+        }
+        return { ...partialContext, trackEvent }
+    }
+
+    setMcpContexts(requestContext: MCPRequestContext, sessionContext: MCPSessionContext | null): void {
+        this.requestContext = requestContext
+        this.sessionContext = sessionContext
+        if (this.apiInstance) {
+            const clientContext = getEffectiveMCPClientContext(requestContext, sessionContext)
+            Object.assign(this.apiInstance.config, clientContext)
+        }
+    }
+
+    async safelyGetAnalyticsContext(context: Pick<Context, 'stateManager'>): Promise<MCPAnalyticsContext | undefined> {
+        try {
+            return await context.stateManager.getAnalyticsContext()
+        } catch {
+            return undefined
+        }
+    }
+
+    async trackContextSwitchEvent(
+        toolName: string,
+        context: Context,
+        previousContext: MCPAnalyticsContext | undefined
+    ): Promise<void> {
+        const resolvedContext = await this.safelyGetAnalyticsContext(context)
+        if (!resolvedContext) {
+            return
+        }
+
+        const event =
+            toolName === 'switch-project'
+                ? AnalyticsEvent.MCP_PROJECT_SWITCHED
+                : toolName === 'switch-organization'
+                  ? AnalyticsEvent.MCP_ORGANIZATION_SWITCHED
+                  : undefined
+        if (!event) {
+            return
+        }
+
+        const distinctId = await this.getDistinctId()
+        await this.trackEvent(event, {}, resolvedContext, previousContext, distinctId)
+    }
+
+    buildClientProperties(
+        requestContext: MCPRequestContext = this.requestContext,
+        sessionContext: MCPSessionContext | null = this.sessionContext
+    ): Record<string, unknown> {
+        // `clientInfo` arrives on `initialize` only, so a mid-session call carries none of
+        // it. Resolve live-first with the session-pinned value per field, the way
+        // `buildBaseProperties` does for tool calls, or these events record no client.
+        const clientIdentity = getEffectiveMCPClientIdentity(requestContext, sessionContext)
+        return {
+            $ai_product: 'mcp',
+            $mcp_source: MCP_ANALYTICS_SOURCE,
+            $mcp_server_name: MCP_SERVER_NAME,
+            $mcp_server_version: MCP_SERVER_VERSION,
+            $mcp_client_name: clientIdentity.mcpClientName,
+            $mcp_client_version: clientIdentity.mcpClientVersion,
+            $mcp_client_user_agent: requestContext.clientUserAgent,
+            $mcp_protocol_version: clientIdentity.mcpProtocolVersion,
+            $mcp_transport: requestContext.transport,
+            $mcp_session_id: requestContext.mcpSessionId,
+            $mcp_conversation_id: requestContext.mcpConversationId,
+            $mcp_consumer: clientIdentity.mcpConsumer,
+            $mcp_mode: requestContext.mode,
+            $mcp_region: requestContext.region,
+            mcp_runtime: 'hono',
+            $mcp_vendor_client: clientIdentity.mcpVendorClient,
+            ...buildMCPSessionAnalyticsProperties(sessionContext),
+        }
+    }
+
+    async trackEvent(
+        event: AnalyticsEvent,
+        properties: Record<string, unknown>,
+        analyticsContext?: MCPAnalyticsContext,
+        previousContext?: MCPAnalyticsContext,
+        distinctId?: string
+    ): Promise<void> {
+        try {
+            const resolvedDistinctId = distinctId ?? (await this.getDistinctId())
+            const clientName = await this.tokenCache.get('clientName')
+            const apiKey = await this.tokenCache.get('apiKey').catch(() => undefined)
+            const sessionUuid = await this.getEffectiveSessionUuid(this.requestContext)
+            const contextProperties = analyticsContext ? buildMCPContextProperties(analyticsContext) : {}
+            const previousContextProperties = previousContext
+                ? buildMCPContextProperties(previousContext, { prefix: 'previous_' })
+                : {}
+            const groups = analyticsContext ? buildMCPAnalyticsGroups(analyticsContext) : {}
+
+            getPostHogClient().capture({
+                distinctId: resolvedDistinctId,
+                event,
+                ...(Object.keys(groups).length > 0 ? { groups } : {}),
+                properties: {
+                    ...this.buildClientProperties(),
+                    ...(sessionUuid ? { $session_id: sessionUuid } : {}),
+                    ...(clientName ? { $mcp_oauth_client_name: clientName } : {}),
+                    ...contextProperties,
+                    ...previousContextProperties,
+                    ...properties,
+                    is_impersonated: apiKey?.is_impersonated === true,
+                    suppress_analytics: this.props.suppressAnalytics === true || apiKey?.suppress_analytics === true,
+                },
+            })
+        } catch {
+            // skip
+        }
+    }
+}

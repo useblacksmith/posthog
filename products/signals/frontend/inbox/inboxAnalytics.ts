@@ -1,0 +1,1722 @@
+import posthog from 'posthog-js'
+import type { CaptureOptions } from 'posthog-js'
+
+import { dayjs } from 'lib/dayjs'
+
+import type { TaskRunStatus } from 'products/posthog_ai/frontend/types/taskTypes'
+import type {
+    InboxSummaryApi,
+    PaginatedSignalReportListListApiPersonalRankingStatus,
+} from 'products/signals/frontend/generated/api.schemas'
+
+import type { ReportTaskPurpose } from './components/detail/artefactTypes'
+import type { ReportDiscussionIntent } from './inboxTaskKickoffLogic'
+import {
+    InboxReportSectionKey,
+    SignalAlertScope,
+    SignalReport,
+    SignalReportActionability,
+    SignalReportPriority,
+    SignalRunKind,
+    SignalSourceProduct,
+    SignalSourceType,
+} from './types'
+import type { ReportDecision } from './utils/reportDecisions'
+import { rankingPillLifts } from './utils/reportOrdering'
+import { reportPullRequests } from './utils/reportPullRequests'
+
+/**
+ * Inbox telemetry. Mirrors the desktop "Code" app's inbox analytics (event names + property
+ * shapes from `packages/shared/src/analytics-events.ts`) so the two clients are comparable in
+ * one PostHog project. Every event carries `inbox_client` so funnels and breakdowns can split
+ * cloud from desktop — cloud sends `'cloud'`, the desktop app sends `'desktop'`.
+ */
+export const INBOX_CLIENT = 'cloud' as const
+
+// pinned: analytics event names - dashboards, funnels, and alerts read these strings, and the
+// desktop app sends the same ones, so renaming one splits its series in two.
+export const INBOX_EVENTS = {
+    VIEWED: 'Inbox viewed',
+    WELCOME_VIEWED: 'Inbox welcome viewed',
+    WELCOME_MANUAL_SETUP_CLICKED: 'Inbox welcome manual setup clicked',
+    INTRO_MODAL_VIEWED: 'Inbox intro modal viewed',
+    PANEL_VIEWED: 'Inbox panel viewed',
+    VALUE_SUMMARY_VIEWED: 'Inbox value summary viewed',
+    VALUE_SUMMARY_DISMISSED: 'Inbox value summary dismissed',
+    PANEL_LOAD_TIMED_OUT: 'Inbox panel load timed out',
+    // Sent by the cloud inbox only, because the desktop inbox does not retry a failed list load.
+    REPORT_LIST_RETRY_RECOVERED: 'Inbox report list retry recovered',
+    WRITE_TIMED_OUT: 'Inbox write timed out',
+    QUERY_CHANGED: 'Inbox query changed',
+    REPORTS_IMPRESSED: 'Inbox reports impressed',
+    REPORT_OPENED: 'Inbox report opened',
+    REPORT_CLOSED: 'Inbox report closed',
+    REPORT_SCROLLED: 'Inbox report scrolled',
+    // Sent by the cloud inbox only, because the desktop inbox does not track visible time.
+    REPORT_READ: 'Inbox report read',
+    REPORT_ACTION: 'Inbox report action',
+    REPORT_LINK_STRIP_CLICKED: 'Inbox report link strip clicked',
+    SELECTION_MODE_ENTERED: 'Inbox selection mode entered',
+    REPORT_ACTION_COMPLETED: 'Inbox report action completed',
+    // Cloud-only for now.
+    REPORT_DECISION_CHANGED: 'Inbox report decision changed',
+    REPORT_FEEDBACK: 'Inbox report feedback',
+    REPORT_SOURCE_SUGGESTION_SHOWN: 'Inbox report source suggestion shown',
+    REPORT_SOURCE_SUGGESTION_CLICKED: 'Inbox report source suggestion clicked',
+    // Cloud-only for now: the desktop inbox shows no report tags.
+    REPORT_TAG_CLICKED: 'Inbox report tag clicked',
+    REPORT_FEEDBACK_NOTE: 'Inbox report feedback note',
+    INTERVIEW_INVITE_SHOWN: 'Inbox interview invite shown',
+    INTERVIEW_INVITE_CLICKED: 'Inbox interview invite clicked',
+    INTERVIEW_INVITE_DISMISSED: 'Inbox interview invite dismissed',
+    // Cloud-only for now: the desktop inbox has no model sorts.
+    RANKING_DETAILS_VIEWED: 'Inbox ranking details viewed',
+    SETTINGS_CHANGED: 'Inbox settings changed',
+    SOURCE_CONNECTED: 'Signal source connected',
+    SOURCE_DISABLED: 'Signal source disabled',
+    SOURCE_TOGGLE_FAILED: 'Signal source toggle failed',
+    SOURCE_CONFIGS_LOAD_FAILED: 'Signal source configs load failed',
+    SOURCE_INTEREST: 'signals source interest',
+    SOURCE_CATALOG_OPENED: 'Signal source catalog opened',
+    SOURCE_CATALOG_SOURCE_SELECTED: 'Signal source catalog source selected',
+    SOURCE_STEERING_CHANGED: 'Signal source steering changed',
+    SOURCE_FILTERS_CHANGED: 'Signal source filters changed',
+    SOURCE_FILTER_EDITOR_OPENED: 'Signal source filter editor opened',
+    SOURCE_FILTER_EXPRESSION_CHANGED: 'Signal source filter expression changed',
+    SOURCE_ALERT_SCOPE_CHANGED: 'Signal source alert scope changed',
+    SOURCE_ALERT_PATTERNS_CHANGED: 'Signal source alert patterns changed',
+    // Scout-troop management. Names and property shapes match the desktop app one-for-one so both
+    // clients union in one project; desktop sends no `inbox_client`, so its rows read as null.
+    SCOUT_FLEET_VIEWED: 'Scout fleet viewed',
+    SCOUT_DETAIL_VIEWED: 'Scout detail viewed',
+    SCOUT_CONFIG_CHANGED: 'Scout config changed',
+    SCOUT_ACTION: 'Scout action',
+    SCOUT_CHAT_STARTED: 'Scout chat started',
+    // Cloud-only for now: the server refused a scout chat, or the request failed.
+    SCOUT_CHAT_START_FAILED: 'Scout chat start failed',
+    // The per-scout tool picker. Cloud-only for now, like the suggestions strip below.
+    SCOUT_TOOLS_PICKER_OPENED: 'Scout tools picker opened',
+    SCOUT_TOOLS_SAVED: 'Scout tools saved',
+    SCOUT_TOOLS_SAVE_FAILED: 'Scout tools save failed',
+    // The pre-computed "Suggested for this project" strip. Cloud-only for now — desktop has no
+    // suggestions surface — so these carry `inbox_client: 'cloud'` on every row.
+    SCOUT_SUGGESTIONS_SHOWN: 'Scout suggestions shown',
+    SCOUT_SUGGESTION_CLICKED: 'Scout suggestion clicked',
+    SCOUT_SUGGESTION_CREATED: 'Scout suggestion created',
+    SCOUT_SUGGESTION_DISMISSED: 'Scout suggestion dismissed',
+    SCOUT_SUGGESTIONS_REFRESHED: 'Scout suggestions refreshed',
+    SCOUT_SUGGESTIONS_CHAT_OPENED: 'Scout suggestions chat opened',
+    RUN_OPENED: 'Inbox run opened',
+    RUN_SUMMARY_VIEWED: 'Inbox run summary viewed',
+    ONBOARDING_DECIDED: 'Inbox onboarding decided',
+    // Cloud-only: the desktop app has no Monitoring tab.
+    MONITORING_ROW_EXPANDED: 'Inbox monitoring row expanded',
+    MONITORING_SCOPE_CHANGED: 'Inbox monitoring scope changed',
+    MONITORING_ACTION: 'Inbox monitoring action',
+} as const
+
+type InboxEvent = (typeof INBOX_EVENTS)[keyof typeof INBOX_EVENTS]
+
+export function captureInboxValueSummary(action: 'viewed' | 'dismissed', summary: InboxSummaryApi): void {
+    captureInboxEvent(action === 'viewed' ? INBOX_EVENTS.VALUE_SUMMARY_VIEWED : INBOX_EVENTS.VALUE_SUMMARY_DISMISSED, {
+        merged_pr_count: summary.merged_pr_count,
+        people_count: summary.people_count,
+        participation_complete: summary.participation_complete,
+    })
+}
+
+/**
+ * Action surface an `Inbox report action` fired from. `context_menu` is the right-click menu on a list row.
+ * `today` is a report page on the Today homepage.
+ */
+export type InboxReportActionSurface =
+    | 'detail_pane'
+    | 'detail_footer'
+    | 'list_row'
+    | 'bulk_bar'
+    | 'triage_mode'
+    | 'context_menu'
+    | 'today'
+
+/**
+ * Affordance that put the first report into a multi-select. Tells us which ones people find, so
+ * the ones nobody uses can go.
+ */
+export type InboxSelectionEntryMethod = 'long_press' | 'meta_click' | 'shift_click' | 'checkbox' | 'context_menu'
+
+/** How a report detail was opened. `triage` is the open-report shortcut in triage mode. */
+export type InboxReportOpenMethod = 'click' | 'deeplink' | 'triage' | 'unknown'
+
+/**
+ * The surface that wrote a report link, from its `link_source` query param. Must match
+ * `ReportLinkSource` in `products/signals/backend/report_urls.py`.
+ */
+export const INBOX_REPORT_LINK_SOURCES = [
+    'first_report_email',
+    'mcp',
+    'slack',
+    'slack_scout',
+    'scout',
+    'github_comment',
+    'github_pr',
+    'tracker',
+    'support',
+    'task',
+    'today',
+    'note_mention',
+] as const
+
+/** `other` is a `source` value outside the fixed set, so a typo or a hand-edited link stays countable. */
+export type InboxReportLinkSource = (typeof INBOX_REPORT_LINK_SOURCES)[number] | 'other'
+
+export function parseInboxReportLinkSource(value: unknown): InboxReportLinkSource | null {
+    if (value === undefined || value === null || value === '') {
+        return null
+    }
+    return (INBOX_REPORT_LINK_SOURCES as readonly unknown[]).includes(value)
+        ? (value as InboxReportLinkSource)
+        : 'other'
+}
+
+/**
+ * How a report detail was closed. `page_unload` is a tab close or hard page navigation: the scene
+ * never unmounts, so it flushes on `pagehide` instead of the `unmount` path.
+ */
+export type InboxReportCloseMethod = 'next_report' | 'deselected' | 'unmount' | 'page_unload'
+
+/** Sentiment captured by the report feedback thumbs. */
+export type InboxReportFeedbackSentiment = 'positive' | 'negative'
+
+/**
+ * Report actions cloud actually emits. Names match the desktop enum one-for-one (so the
+ * `action_type` breakdown reads the same across clients), plus cloud-only `restore` (Dismissed
+ * section), `resolve` (marking a report done without an inbox PR), `resume_discussion` (reopening the
+ * last Ask AI run from the report composer), `view_diff`, `show_more` (a list
+ * section widening its window), and the section expand/collapse pair (desktop splits those per
+ * section instead). `expand_preview` is a Today list row opened in place, which no ranking head reads yet.
+ * `select_pull_request` is a pull request line chosen in the Status section of a report with several.
+ * Desktop-only variants we don't fire yet are intentionally omitted.
+ */
+export type InboxReportActionType =
+    | 'dismiss'
+    | 'clear_feedback'
+    | 'resolve'
+    | 'discuss'
+    | 'resume_discussion'
+    | 'restore'
+    | 'create_pr'
+    | 'implementation_button_clicked'
+    | 'monitor'
+    | 'reopen'
+    | 'change_priority'
+    | 'github_access_recovery'
+    | 'copy_implementation_prompt'
+    | 'refund'
+    | 'open_pr'
+    | 'view_diff'
+    | 'show_more'
+    | 'expand_section'
+    | 'collapse_section'
+    | 'add_suggested_reviewer'
+    | 'remove_suggested_reviewer'
+    | 'claim'
+    | 'unclaim'
+    | 'claim_dialog'
+    | 'expand_preview'
+    | 'add_note'
+    | 'select_pull_request'
+
+/**
+ * Where the text of an "Ask AI" question came from. `suggested` is a scout-authored question sent as
+ * written, `edited_suggestion` one the reader changed first, `typed` one written from scratch, and
+ * `preset` a fixed question that a button sends, such as Today's Investigate with PostHog.
+ */
+export type InboxQuestionSource = 'suggested' | 'edited_suggestion' | 'typed' | 'preset'
+
+/**
+ * Extra properties the `discuss` {@link captureInboxReportAction} carries. Without them the event
+ * records that a question was asked and nothing about where it came from, so there is no way to tell
+ * whether the suggestions are worth offering. `suggestion_count` is what makes `question_source`
+ * readable: a `typed` question on a report that offered none is not evidence against suggestions.
+ *
+ * The question text itself is deliberately absent, like the list's search term: it is incidental
+ * typing that can name a customer's own entities.
+ */
+// pinned: analytics property names — renaming breaks dashboards
+export function discussQuestionProperties(params: {
+    source: InboxQuestionSource
+    suggestionCount: number
+    intent?: ReportDiscussionIntent
+}): Record<string, unknown> {
+    return {
+        question_source: params.source,
+        suggestion_count: params.suggestionCount,
+        ...(params.intent ? { question_intent: params.intent } : {}),
+    }
+}
+
+/**
+ * Whether a task-kickoff action (`discuss` / `create_pr`) actually produced a task. The press itself
+ * is already an {@link captureInboxReportAction} event; without the outcome the two are
+ * indistinguishable, so an attempted PR counts the same as a created one. `limited` is a server
+ * limit (the per-report task cap or the per-user creation throttle) refusing an issued request.
+ */
+export type InboxReportActionOutcome = 'success' | 'failure' | 'blocked' | 'limited'
+
+/**
+ * `config` is the Settings tab; the value predates the rename and stays so the panel breakdown
+ * reads continuously. The onboarding panel can appear alongside the report list.
+ */
+export type InboxPanelName =
+    | 'runs'
+    | 'config'
+    | 'sources'
+    | 'scratchpad'
+    | 'findings'
+    | 'triage'
+    | 'onboarding'
+    | 'monitoring'
+
+/** A panel read that carries its own timeout, named so each one's stall rate reads separately. */
+export type InboxPanelLoad = 'scout_notes' | 'scout_memory' | 'report_notes'
+
+/** A report write that carries its own timeout. `state` covers dismiss, resolve, restore, and monitoring. */
+export type InboxWrite = 'actionability' | 'claim' | 'note' | 'priority' | 'repository' | 'retire_note' | 'state'
+
+/** Which control moved the report list to a new query. `url` is a shared/deep link being applied. */
+export type InboxQueryChange =
+    | 'scope'
+    | 'sort'
+    | 'source_product'
+    | 'scout'
+    | 'tags'
+    | 'priority'
+    | 'state'
+    | 'search'
+    | 'clear'
+    | 'url'
+    | 'created_window'
+
+/** Surface a scout-management event fired from. Matches the desktop values. */
+export type ScoutSurface = 'fleet_list' | 'scout_detail' | 'empty_state' | 'replay_vision_scanner' | 'report_detail'
+
+/**
+ * Scout-management actions. The first block matches desktop's enum; the trailing block is
+ * cloud-only, covering affordances desktop doesn't have (creating and deleting scouts, the
+ * scratchpad callout, the roster's on/off filter, owner filter, search, and sort, and opening a folded
+ * run group).
+ */
+export type ScoutActionType =
+    | 'open_settings'
+    | 'close_settings'
+    | 'open_skill_in_posthog'
+    | 'open_helper_skill'
+    | 'open_findings'
+    | 'filter_tags'
+    | 'leave_note'
+    | 'delete_note'
+    | 'run_now'
+    | 'expand_run'
+    | 'collapse_run'
+    | 'filter_runs'
+    | 'expand_emission'
+    | 'collapse_emission'
+    | 'copy_finding_link'
+    | 'open_task_run'
+    | 'open_linked_report'
+    | 'switch_detail_tab'
+    | 'open_detail_tab'
+    | 'open_create_modal'
+    | 'create_scout'
+    | 'delete_scout'
+    | 'open_memory'
+    | 'filter_enabled'
+    | 'filter_owner'
+    | 'search_scouts'
+    | 'expand_run_group'
+    | 'sort_roster'
+    | 'choose_create_path'
+    | 'switch_create_path'
+    | 'test_precheck'
+    | 'focus_ask_ai'
+    | 'click_ask_ai_starter'
+    | 'ask_ai'
+    | 'save_note_from_ai'
+
+/** What a scout chat CTA was asking for. Matches the desktop values. */
+export type ScoutChatType = 'author_scout' | 'fleet_overview' | 'recent_signals'
+
+export function captureInboxEvent(
+    event: InboxEvent,
+    properties: Record<string, unknown>,
+    options?: CaptureOptions
+): void {
+    posthog.capture(event, { inbox_client: INBOX_CLIENT, ...properties }, options)
+}
+
+/** Whole hours since the report was created, rounded to one decimal. Mirrors desktop `report_age_hours`. */
+function reportAgeHours(report: Pick<SignalReport, 'created_at'>): number {
+    if (!report.created_at) {
+        return 0
+    }
+    const hours = dayjs().diff(dayjs(report.created_at), 'hour', true)
+    return Math.max(0, Math.round(hours * 10) / 10)
+}
+
+// The ranker that ordered the Inbox list in view, from the latest list response. Inbox report actions
+// and sort changes read it, so the ranking test can join them to the ranker without each caller
+// passing it. The Inbox scene clears it on unmount.
+let servedInboxRankerId: string | null = null
+// The reports whose pill reached the screen, from impressions. A list response cannot answer this,
+// because the list stays mounted and hidden behind a deep-linked report and still loads a pill arm.
+const seenInboxRankingPillReportIds = new Set<string>()
+
+/** Record the ranker of the latest list response, null when the sort is not Recommended. A list without pills ends pill attribution. */
+export function setInboxServedRanker(rankerId: string | null, rankingPill: boolean = false): void {
+    servedInboxRankerId = rankerId
+    if (!rankingPill) {
+        seenInboxRankingPillReportIds.clear()
+    }
+}
+
+interface RankingPillProperties {
+    pill_shown: boolean
+    pill_open: number | null
+    pill_action: number | null
+    pill_fix: number | null
+}
+
+/** The lifts the person saw on the report's pill. A list without pills, or an unscored report, shows none. */
+function rankingPillProperties(report: SignalReport, rankingPill: boolean): RankingPillProperties {
+    const lifts = rankingPill ? rankingPillLifts(report) : null
+    return {
+        pill_shown: lifts !== null,
+        pill_open: lifts?.open ?? null,
+        pill_action: lifts?.action ?? null,
+        pill_fix: lifts?.fix ?? null,
+    }
+}
+
+interface BaseReportProperties {
+    report_id: string
+    report_age_hours: number
+    priority: SignalReportPriority | null
+    actionability: SignalReportActionability | null
+    has_pr: boolean
+}
+
+/**
+ * Identity + classification for a report. Kept to opaque ids, enums, ages, and counts — it never
+ * includes the agent-generated report title, which can echo proprietary detail from a customer's
+ * own data. User-authored notes (a dismissal reason note, feedback note) are a different case: they
+ * are the actionable signal we want, so the relevant capture calls attach them explicitly.
+ */
+export function baseReportProperties(report: SignalReport): BaseReportProperties {
+    return {
+        report_id: report.id,
+        report_age_hours: reportAgeHours(report),
+        priority: report.priority ?? null,
+        actionability: report.actionability ?? null,
+        has_pr: reportPullRequests(report).length > 0,
+    }
+}
+
+/** Per-priority counts of the visible reports (P0–P4, plus unknown). Mirrors desktop's breakdown. */
+function priorityBreakdown(reports: SignalReport[]): Record<string, number> {
+    const counts = { p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, unknown: 0 }
+    for (const report of reports) {
+        const key = report.priority ? (report.priority.toLowerCase() as 'p0' | 'p1' | 'p2' | 'p3' | 'p4') : 'unknown'
+        counts[key] += 1
+    }
+    return {
+        priority_p0_count: counts.p0,
+        priority_p1_count: counts.p1,
+        priority_p2_count: counts.p2,
+        priority_p3_count: counts.p3,
+        priority_p4_count: counts.p4,
+        priority_unknown_count: counts.unknown,
+    }
+}
+
+/** Per-actionability counts of the visible reports. Mirrors desktop's breakdown. */
+function actionabilityBreakdown(reports: SignalReport[]): Record<string, number> {
+    const counts = { immediately_actionable: 0, requires_human_input: 0, not_actionable: 0, unknown: 0 }
+    for (const report of reports) {
+        const key = report.actionability ?? 'unknown'
+        counts[key] += 1
+    }
+    return {
+        actionability_immediately_actionable_count: counts.immediately_actionable,
+        actionability_requires_human_input_count: counts.requires_human_input,
+        actionability_not_actionable_count: counts.not_actionable,
+        actionability_unknown_count: counts.unknown,
+    }
+}
+
+/**
+ * The self-driving welcome takeover rendered. `Inbox viewed` never fires for un-set-up teams (the
+ * takeover replaces the report list), so this is the top-of-funnel event for setup conversion.
+ */
+export function captureInboxWelcomeViewed(): void {
+    captureInboxEvent(INBOX_EVENTS.WELCOME_VIEWED, {})
+}
+
+/**
+ * The welcome page's "Start manually" link was pressed, the exit from the welcome page that bypasses
+ * quick activation. Without it a manual setup is invisible: the sources and scouts that follow look
+ * like they came from nowhere.
+ */
+export function captureInboxWelcomeManualSetupClicked(): void {
+    captureInboxEvent(INBOX_EVENTS.WELCOME_MANUAL_SETUP_CLICKED, {})
+}
+
+/**
+ * The self-driving intro modal rendered (opened from the Code badge next to PostHog AI). The
+ * click-through to the inbox is recoverable as this event followed by an inbox view in the same
+ * session, so the modal only needs its own top-of-funnel marker.
+ */
+export function captureSelfDrivingIntroModalViewed(): void {
+    captureInboxEvent(INBOX_EVENTS.INTRO_MODAL_VIEWED, {})
+}
+
+/**
+ * The report list settled for the first time in a tab mount. `report_count` / `total_count` describe
+ * the active tab's list only (and `report_count` is capped at the loaded page), so the headline
+ * "how many reports does this user have" numbers are `pulls_tab_count` / `reports_tab_count`: the tab badge
+ * counts, sent on every view regardless of which tab is open (same shape as the desktop event).
+ * A badge count is null only if its request failed.
+ */
+export function captureInboxViewed(params: {
+    tab: string
+    reports: SignalReport[]
+    totalCount: number
+    pullsTabCount: number | null
+    reportsTabCount: number | null
+    hasActiveFilters: boolean
+    sourceProductFilter: string[]
+    priorityFilter: string[]
+    /** Selected report states on the flat Reports list; [] (every state) on other surfaces. */
+    stateFilter?: string[]
+    scope: string
+    /** The user's own stored personal ranking. Null when personal ranking is off or no page loaded. */
+    personalRankingStatus: PaginatedSignalReportListListApiPersonalRankingStatus
+    /** Reports in the For you scope across the counted states. Null when the counts describe another scope or a filtered list. */
+    forYouReportCount: number | null
+    /** The sort and ranker of the served list, as on `Inbox reports impressed`. */
+    sortField: string
+    rankerId: string | null
+}): void {
+    const status = params.personalRankingStatus
+    captureInboxEvent(INBOX_EVENTS.VIEWED, {
+        tab: params.tab,
+        report_count: params.reports.length,
+        total_count: params.totalCount,
+        pulls_tab_count: params.pullsTabCount,
+        reports_tab_count: params.reportsTabCount,
+        is_empty: params.totalCount === 0,
+        has_active_filters: params.hasActiveFilters,
+        source_product_filter: params.sourceProductFilter,
+        priority_filter: params.priorityFilter,
+        state_filter: params.stateFilter ?? [],
+        scope: params.scope,
+        personal_list_state: status?.state ?? null,
+        personal_list_size: status?.size ?? null,
+        personal_list_age_minutes: status?.age_minutes ?? null,
+        personal_list_checked_age_minutes: status?.checked_age_minutes ?? null,
+        personal_list_fallback_reason: status?.fallback_reason ?? null,
+        personal_list_building: status?.building ?? null,
+        for_you_report_count: params.forYouReportCount,
+        sort_field: params.sortField,
+        ranker_id: params.rankerId,
+        ...priorityBreakdown(params.reports),
+        ...actionabilityBreakdown(params.reports),
+    })
+}
+
+/**
+ * Impression log for the report list: which reports were shown, at what rank, with the
+ * classification each carried at render time. This is the negative class (and position record)
+ * for ranking-model training — `Inbox report opened` alone only records the clicked report.
+ * Fired with the newly-shown reports each time the visible list grows (first page, pagination,
+ * refresh), never twice for the same report within a tab mount.
+ */
+export function captureInboxReportsImpressed(params: {
+    tab: string
+    /** Only the newly-impressed reports, in list order. */
+    reports: SignalReport[]
+    /** 1-based rank of each impressed report in the full loaded list, parallel to `reports`. */
+    ranks: number[]
+    listSize: number
+    totalCount: number | null
+    hasActiveFilters: boolean
+    scope: string
+    /** The sort and window the list was requested with, so model-ordered lists can be told apart in training data. */
+    sortField: string
+    sortDirection: string
+    createdWindow: string | null
+    /** The ranker the server used for a Recommended list. Null for other sorts. */
+    rankerId: string | null
+    /** Whether the Recommended list showed score pills. */
+    rankingPill: boolean
+    /** Whether the cards showed link strips. Each impression then carries its strip kind. */
+    linkStrips?: boolean
+    /** How many other reports each card stands for after plan layers collapse, parallel to `reports`. */
+    collapsedCounts?: number[]
+}): void {
+    const rankingSort = params.sortField.startsWith('ranking_')
+    const personalSort = params.rankerId === 'personal'
+    if (params.rankingPill) {
+        params.reports
+            .filter((report) => rankingPillLifts(report) !== null)
+            .forEach((report) => seenInboxRankingPillReportIds.add(report.id))
+    }
+    captureInboxEvent(INBOX_EVENTS.REPORTS_IMPRESSED, {
+        tab: params.tab,
+        list_size: params.listSize,
+        total_count: params.totalCount,
+        has_active_filters: params.hasActiveFilters,
+        scope: params.scope,
+        sort_field: params.sortField,
+        sort_direction: params.sortDirection,
+        created_window: params.createdWindow,
+        ranker_id: params.rankerId,
+        ranking_pill: params.rankingPill,
+        has_pr: params.reports.some((report) => reportPullRequests(report).length > 0),
+        impression_count: params.reports.length,
+        impressions: params.reports.map((report, index) => ({
+            ...baseReportProperties(report),
+            rank: params.ranks[index],
+            status: report.status ?? null,
+            source_products: report.source_products ?? [],
+            signal_count: report.signal_count,
+            total_weight: report.total_weight,
+            is_suggested_reviewer: report.is_suggested_reviewer,
+            ...(rankingSort ? { ranking_served_key: report.ranking?.model ?? null } : {}),
+            ...(personalSort
+                ? { personal_tier: report.personal_tier ?? null, personal_reason_shown: !!report.personal_reason }
+                : {}),
+            ...rankingPillProperties(report, params.rankingPill),
+            ...(params.linkStrips
+                ? {
+                      link_strip_kind: report.link_summary?.kind ?? null,
+                      collapsed_report_count: params.collapsedCounts?.[index] ?? 0,
+                  }
+                : {}),
+        })),
+    })
+}
+
+/**
+ * `section` is the Reports list section the row was opened from, so "opened from Resolved" and
+ * "opened from Needs decision" are one breakdown. Null when the report isn't in a loaded list
+ * (a cold deep-link), in which case `rank` and `list_size` are null too.
+ */
+export function captureInboxReportOpened(
+    params: {
+        report: SignalReport
+        openMethod: InboxReportOpenMethod
+        linkSource: InboxReportLinkSource | null
+        previousReportId: string | null
+        rank: number | null
+        listSize: number | null
+        section: InboxReportSectionKey | null
+        /** The ranker of the list the report was opened from. Null for other sorts and for a cold deep-link. */
+        rankerId: string | null
+        /** The tier the card showed under the personal order. Null for other orders and for a cold deep-link. */
+        personalTier: string | null
+        /** Whether the card showed a personal ranking reason under the personal order. */
+        personalReasonShown: boolean
+    },
+    /** The unload flush passes `{ send_instantly: true }` so the open leaves before the page does. */
+    options?: CaptureOptions
+): void {
+    captureInboxEvent(
+        INBOX_EVENTS.REPORT_OPENED,
+        {
+            ...baseReportProperties(params.report),
+            status: params.report.status ?? null,
+            source_products: params.report.source_products ?? [],
+            open_method: params.openMethod,
+            link_source: params.linkSource,
+            previous_report_id: params.previousReportId,
+            rank: params.rank,
+            list_size: params.listSize,
+            section: params.section,
+            ranker_id: params.rankerId,
+            personal_tier: params.personalTier,
+            personal_reason_shown: params.personalReasonShown,
+            ...rankingPillProperties(params.report, seenInboxRankingPillReportIds.has(params.report.id)),
+        },
+        options
+    )
+}
+
+export function captureInboxReportClosed(
+    params: {
+        report: SignalReport
+        timeSpentMs: number
+        /** The part of `timeSpentMs` with the tab visible. A report left open in a background tab adds nothing. */
+        activeTimeMs: number
+        closeMethod: InboxReportCloseMethod
+    },
+    /** The unload flush passes `{ send_instantly: true }` so the event leaves before the page goes. */
+    options?: CaptureOptions
+): void {
+    captureInboxEvent(
+        INBOX_EVENTS.REPORT_CLOSED,
+        {
+            ...baseReportProperties(params.report),
+            time_spent_ms: params.timeSpentMs,
+            active_time_ms: params.activeTimeMs,
+            close_method: params.closeMethod,
+        },
+        options
+    )
+}
+
+/**
+ * The report detail pane was scrolled, fired once per open on the first scroll. It feeds the dwell
+ * half of the "Inbox engagement" metric, whose second step reads a scroll after at least 5 seconds.
+ * Only the desktop `Inbox report scrolled` event fed that step before, so it was dead for cloud.
+ * `time_since_open_ms` is the dwell before the scroll. Mirrors the desktop event's shape.
+ */
+export function captureInboxReportScrolled(params: {
+    report: SignalReport
+    rank: number | null
+    listSize: number | null
+    timeSinceOpenMs: number
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_SCROLLED, {
+        ...baseReportProperties(params.report),
+        rank: params.rank,
+        list_size: params.listSize,
+        time_since_open_ms: params.timeSinceOpenMs,
+    })
+}
+
+/**
+ * The person read the open report: they scrolled the detail pane, and the report stayed open with the
+ * tab visible for the read threshold. Fired at most once per open, while the report is still open, so
+ * it does not depend on `Inbox report closed`, which a closed tab can drop. Most opens end without an
+ * action or feedback, so this is the signal that separates a read from a bounce.
+ */
+export function captureInboxReportRead(params: {
+    report: SignalReport
+    rank: number | null
+    listSize: number | null
+    activeTimeMs: number
+    timeSinceOpenMs: number
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_READ, {
+        ...baseReportProperties(params.report),
+        rank: params.rank,
+        list_size: params.listSize,
+        active_time_ms: params.activeTimeMs,
+        time_since_open_ms: params.timeSinceOpenMs,
+    })
+}
+
+/**
+ * The hover card on a report's model score opened. `tag` is the single-head tag under a model sort,
+ * and `pill` is the three-score pill on the Recommended sort, which has no active head.
+ */
+export function captureInboxRankingDetailsViewed(params: {
+    report: SignalReport
+    surface: 'tag' | 'pill'
+    head: string | null
+    state: 'scored' | 'stale' | 'unscored'
+    strength: string | null
+    /** The tier the card showed under the personal order. Null for other orders. */
+    personalTier?: string | null
+}): void {
+    captureInboxEvent(INBOX_EVENTS.RANKING_DETAILS_VIEWED, {
+        ...baseReportProperties(params.report),
+        surface: params.surface,
+        ranking_head: params.head,
+        ranking_state: params.state,
+        ranking_strength: params.strength,
+        personal_tier: params.personalTier ?? null,
+    })
+}
+
+export function captureInboxReportAction(params: {
+    /** Omitted for bulk actions, which act on a selection rather than a single report. */
+    report?: SignalReport | null
+    actionType: InboxReportActionType
+    surface: InboxReportActionSurface
+    isBulk?: boolean
+    bulkSize?: number
+    extra?: Record<string, unknown>
+}): void {
+    const base = params.report
+        ? baseReportProperties(params.report)
+        : { report_id: null, report_age_hours: 0, priority: null, actionability: null, has_pr: false }
+    captureInboxEvent(INBOX_EVENTS.REPORT_ACTION, {
+        ...base,
+        action_type: params.actionType,
+        surface: params.surface,
+        is_bulk: params.isBulk ?? false,
+        bulk_size: params.bulkSize ?? 1,
+        // Today lists reports in its own order, so its actions never belong to an Inbox ranker.
+        ranker_id: params.surface === 'today' ? null : servedInboxRankerId,
+        ...(params.report
+            ? rankingPillProperties(
+                  params.report,
+                  params.surface !== 'today' && seenInboxRankingPillReportIds.has(params.report.id)
+              )
+            : {}),
+        ...params.extra,
+    })
+}
+
+/** `previous_set_by` tells a correction of the agent apart from a change to a person's own value. */
+export function captureInboxReportDecisionChanged(params: {
+    report: SignalReport
+    decision: ReportDecision
+    previousValue: string | null
+    newValue: string
+    previousSetBy: 'agent' | 'person' | null
+    surface: InboxReportActionSurface
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_DECISION_CHANGED, {
+        ...baseReportProperties(params.report),
+        decision: params.decision,
+        previous_value: params.previousValue,
+        new_value: params.newValue,
+        previous_set_by: params.previousSetBy,
+        surface: params.surface,
+    })
+}
+
+/**
+ * What the Today home knows about a report it shows. A briefing item carries less than the Inbox's
+ * `SignalReport`, so the fields it cannot fill stay null on the event.
+ */
+export interface TodayReportSnapshot {
+    reportId: string
+    priority: string | null
+    hasPr: boolean
+    signalCount: number | null
+    sourceProducts: string[]
+}
+
+/**
+ * The Today list a report shows in. `briefing` is the top list, which the briefing and the sidebar
+ * both show. `sidebar_more` is the list that "Show more reports" loads.
+ */
+export type TodayReportList = 'briefing' | 'sidebar_more'
+
+function todayReportProperties(report: TodayReportSnapshot): Record<string, unknown> {
+    return {
+        report_id: report.reportId,
+        priority: report.priority,
+        actionability: null,
+        has_pr: report.hasPr,
+        signal_count: report.signalCount,
+        source_products: report.sourceProducts,
+    }
+}
+
+/**
+ * The Today home version of {@link captureInboxReportsImpressed}. The ranking dataset reads both
+ * surfaces from one event, and `surface` and `list` keep them apart for position-bias work.
+ */
+export function captureTodayReportsImpressed(params: {
+    list: TodayReportList
+    /** Only the newly impressed reports, in list order. */
+    reports: TodayReportSnapshot[]
+    /** 1-based rank of each impressed report in its list, parallel to `reports`. */
+    ranks: number[]
+    listSize: number
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORTS_IMPRESSED, {
+        surface: 'today' satisfies InboxReportActionSurface,
+        list: params.list,
+        list_size: params.listSize,
+        impression_count: params.reports.length,
+        impressions: params.reports.map((report, index) => ({
+            ...todayReportProperties(report),
+            rank: params.ranks[index],
+        })),
+    })
+}
+
+/**
+ * The Today home version of {@link captureInboxReportOpened}. `source` is the control the person clicked. A deep-link
+ * has no `list`, `rank`, `list_size` or `source`.
+ */
+export function captureTodayReportOpened(params: {
+    report: TodayReportSnapshot
+    openMethod: InboxReportOpenMethod
+    linkSource: InboxReportLinkSource | null
+    list: TodayReportList | null
+    rank: number | null
+    listSize: number | null
+    source: string | null
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_OPENED, {
+        ...todayReportProperties(params.report),
+        surface: 'today' satisfies InboxReportActionSurface,
+        open_method: params.openMethod,
+        link_source: params.linkSource,
+        list: params.list,
+        rank: params.rank,
+        list_size: params.listSize,
+        source: params.source,
+    })
+}
+
+/**
+ * A report action from the Today home, where only the report id is at hand. `today_surface` is the
+ * Today control the person used.
+ */
+export function captureTodayReportAction(params: {
+    reportId: string
+    actionType: InboxReportActionType
+    todaySurface: string
+    extra?: Record<string, unknown>
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_ACTION, {
+        report_id: params.reportId,
+        action_type: params.actionType,
+        surface: 'today' satisfies InboxReportActionSurface,
+        today_surface: params.todaySurface,
+        is_bulk: false,
+        bulk_size: 1,
+        ...params.extra,
+    })
+}
+
+/**
+ * Feedback on a single report, fired from the thumbs at the end of the report body. Unlike a
+ * dismiss, this is feedback-only: the report stays in the inbox. The sentiment is the label the
+ * ranking work trains against, so it carries the same report classification as the impression and
+ * open events. `note` is optional — the thumbs submit on one click, with no note.
+ */
+/** Fired once per selection, when an empty selection gains its first report. */
+export function captureInboxSelectionModeEntered(params: { method: InboxSelectionEntryMethod }): void {
+    captureInboxEvent(INBOX_EVENTS.SELECTION_MODE_ENTERED, { entry_method: params.method })
+}
+
+export function captureInboxReportFeedback(params: {
+    report: SignalReport
+    sentiment: InboxReportFeedbackSentiment
+    note?: string
+    surface: InboxReportActionSurface
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_FEEDBACK, {
+        ...baseReportProperties(params.report),
+        sentiment: params.sentiment,
+        has_pr: reportPullRequests(params.report).length > 0,
+        ...(params.note ? { note: params.note } : {}),
+        surface: params.surface,
+    })
+}
+
+/** A report's product suggestion rendered under its evidence. */
+export function captureInboxReportSourceSuggestionShown(params: { report: SignalReport; product: string }): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_SOURCE_SUGGESTION_SHOWN, {
+        ...baseReportProperties(params.report),
+        product: params.product,
+    })
+}
+
+/** The suggestion's link to the product was followed. */
+export function captureInboxReportSourceSuggestionClicked(params: { report: SignalReport; product: string }): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_SOURCE_SUGGESTION_CLICKED, {
+        ...baseReportProperties(params.report),
+        product: params.product,
+    })
+}
+
+/** Where a report tag chip was clicked: a list row, or the report detail. */
+export type InboxReportTagSurface = 'card' | 'detail'
+
+/**
+ * A tag chip was clicked, which adds that tag to the Tags filter or removes it. The resulting query
+ * also fires `Inbox query changed`; this event says the chip, not the menu, was the way in.
+ */
+export function captureInboxReportTagClicked(params: {
+    report: SignalReport
+    surface: InboxReportTagSurface
+    added: boolean
+    tagFilterCount: number
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_TAG_CLICKED, {
+        ...baseReportProperties(params.report),
+        surface: params.surface,
+        added: params.added,
+        tag_count: params.report.tags?.length ?? 0,
+        tag_filter_count: params.tagFilterCount,
+    })
+}
+
+/**
+ * Optional free-text note, offered only once a rating is already recorded. It rides on its own
+ * event rather than re-firing {@link captureInboxReportFeedback} so sentiment stays exactly one
+ * event per rating; join back to the rating on `report_id`. Carries `sentiment` too so a note can
+ * be read without that join.
+ */
+export function captureInboxReportFeedbackNote(params: {
+    report: SignalReport
+    sentiment: InboxReportFeedbackSentiment
+    note: string
+    surface: InboxReportActionSurface
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_FEEDBACK_NOTE, {
+        ...baseReportProperties(params.report),
+        sentiment: params.sentiment,
+        has_pr: reportPullRequests(params.report).length > 0,
+        note: params.note,
+        surface: params.surface,
+    })
+}
+
+export function captureInboxInterviewInvite(action: 'shown' | 'clicked' | 'dismissed'): void {
+    const event = {
+        shown: INBOX_EVENTS.INTERVIEW_INVITE_SHOWN,
+        clicked: INBOX_EVENTS.INTERVIEW_INVITE_CLICKED,
+        dismissed: INBOX_EVENTS.INTERVIEW_INVITE_DISMISSED,
+    }[action]
+    captureInboxEvent(event, { surface: 'report_feedback_note' })
+}
+
+export function captureSignalSourceConnected(params: {
+    sourceProduct: string
+    sourceType: string
+    isFirstConnection: boolean
+    viaSetupWizard: boolean
+    setupMode?: 'guided' | 'quick'
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_CONNECTED, {
+        source_product: params.sourceProduct,
+        source_type: params.sourceType,
+        is_first_connection: params.isFirstConnection,
+        via_setup_wizard: params.viaSetupWizard,
+        ...(params.setupMode ? { setup_mode: params.setupMode } : {}),
+    })
+}
+
+/**
+ * A source switched off. Its own event rather than an `enabled` flag on
+ * {@link captureSignalSourceConnected}, so existing connection counts keep meaning connections —
+ * turning a source off is the shape of churn, not a negative connection.
+ */
+export function captureSignalSourceDisabled(params: { sourceProduct: string; sourceType: string }): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_DISABLED, {
+        source_product: params.sourceProduct,
+        source_type: params.sourceType,
+    })
+}
+
+/**
+ * Why a source switch did not save. `configs_unavailable` means the source list never loaded, so the
+ * switch could not tell an existing row from a new one and refused to write.
+ */
+export type SignalSourceToggleFailureReason = 'configs_unavailable' | 'request_failed'
+
+/** A source switch that did not save. Without it, a lost toggle leaves no trace next to the connections. */
+export function captureSignalSourceToggleFailed(params: {
+    sourceProduct: string
+    sourceType: string
+    enabled: boolean
+    reason: SignalSourceToggleFailureReason
+    errorMessage: string
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_TOGGLE_FAILED, {
+        source_product: params.sourceProduct,
+        source_type: params.sourceType,
+        enabled: params.enabled,
+        reason: params.reason,
+        error_message: params.errorMessage,
+    })
+}
+
+/** An automatic retry loaded the report list. Without this event, a recovered list looks like one that never failed. */
+export function captureInboxReportListRetryRecovered(params: {
+    sectionKey: InboxReportSectionKey
+    retryCount: number
+    error: unknown
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_LIST_RETRY_RECOVERED, {
+        section_key: params.sectionKey,
+        retry_count: params.retryCount,
+        error_type: params.error instanceof Error ? params.error.name : null,
+        status: (params.error as { status?: number } | null)?.status ?? null,
+    })
+}
+
+/** The source list failed to load, which blocks every switch that reads it. */
+export function captureSignalSourceConfigsLoadFailed(errorMessage: string): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_CONFIGS_LOAD_FAILED, { error_message: errorMessage })
+}
+
+export function captureSignalSourceInterest(source: string): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_INTEREST, { source })
+}
+
+export type SignalSourceCatalogOrigin = 'catalog' | 'recommendation'
+
+/** Pairs catalog visits with source connections; the event name stays fixed for existing funnels. */
+export function captureSignalSourceCatalogOpened(params: {
+    recommendationCount: number
+    connectedCount: number
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_CATALOG_OPENED, {
+        surface: 'sources_tab',
+        recommendation_count: params.recommendationCount,
+        connected_count: params.connectedCount,
+    })
+}
+
+export function captureSignalSourceCatalogSourceSelected(params: {
+    source: string
+    origin: SignalSourceCatalogOrigin
+    reason: string | null
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_CATALOG_SOURCE_SELECTED, {
+        source: params.source,
+        origin: params.origin,
+        recommendation_reason: params.reason,
+    })
+}
+
+/**
+ * A source's steering rules were saved. Carries only lengths and flags: the rules text names the
+ * customer's own labels, projects, and workflows, so it never leaves their project. Fired once the
+ * request settles, so `success` separates a saved change from a rejected one.
+ */
+export function captureSignalSourceSteeringChanged(params: {
+    sourceProduct: string
+    sourceType: string
+    steeringLength: number
+    success: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_STEERING_CHANGED, {
+        source_product: params.sourceProduct,
+        source_type: params.sourceType,
+        steering_length: params.steeringLength,
+        has_steering: params.steeringLength > 0,
+        success: params.success,
+    })
+}
+
+export function captureSignalSourceFiltersChanged(params: {
+    sourceProduct: string
+    sourceType: string
+    filter: string
+    selectedCount: number
+    success: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_FILTERS_CHANGED, {
+        source_product: params.sourceProduct,
+        source_type: params.sourceType,
+        filter: params.filter,
+        selected_count: params.selectedCount,
+        reads_everything: params.selectedCount === 0,
+        success: params.success,
+    })
+}
+
+/** The expression filter editor opened on a source. Pairs with the changed event to show drop-off. */
+export function captureSignalSourceFilterEditorOpened(params: {
+    sourceProduct: string
+    sourceType: string
+    hasFilter: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_FILTER_EDITOR_OPENED, {
+        source_product: params.sourceProduct,
+        source_type: params.sourceType,
+        has_filter: params.hasFilter,
+    })
+}
+
+/**
+ * A source's expression filter was saved or removed. Carries only the length: the expression names
+ * the customer's own projects and labels, so its text never leaves their project.
+ */
+export function captureSignalSourceFilterExpressionChanged(params: {
+    sourceProduct: string
+    sourceType: string
+    action: 'saved' | 'removed'
+    expressionLength: number
+    success: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_FILTER_EXPRESSION_CHANGED, {
+        source_product: params.sourceProduct,
+        source_type: params.sourceType,
+        action: params.action,
+        expression_length: params.expressionLength,
+        success: params.success,
+    })
+}
+
+/**
+ * The product analytics source switched between investigated alerts only and all firing alerts.
+ * Fired once the request settles, so `success` separates a saved change from a rejected one.
+ */
+export function captureSignalSourceAlertScopeChanged(params: {
+    alertScope: SignalAlertScope
+    previousAlertScope: SignalAlertScope
+    success: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_ALERT_SCOPE_CHANGED, {
+        source_product: SignalSourceProduct.Analytics,
+        source_type: SignalSourceType.AnomalyInvestigation,
+        alert_scope: params.alertScope,
+        previous_alert_scope: params.previousAlertScope,
+        success: params.success,
+    })
+}
+
+/**
+ * The product analytics source's allow or block patterns were saved. Carries only counts: the patterns
+ * name the customer's own alerts and insights, so they never leave their project. `droppedAlertCount`
+ * is how many alerts the preview showed as dropped, or null when the preview had not loaded.
+ */
+export function captureSignalSourceAlertPatternsChanged(params: {
+    allowCount: number
+    blockCount: number
+    droppedAlertCount: number | null
+    success: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SOURCE_ALERT_PATTERNS_CHANGED, {
+        source_product: SignalSourceProduct.Analytics,
+        source_type: SignalSourceType.AnomalyInvestigation,
+        allow_pattern_count: params.allowCount,
+        block_pattern_count: params.blockCount,
+        dropped_alert_count: params.droppedAlertCount,
+        success: params.success,
+    })
+}
+
+/**
+ * Outcome of a task-kickoff action, fired once the request settles. Pairs with the press event on
+ * `report_id` + `action_type`. `blocked` means we never issued the request (no AI consent), which is
+ * a product problem rather than a failure — hence its own bucket. `limited` means the server
+ * refused the request with a usage, billing, or task limit; `limit_code` says which limit.
+ */
+export function captureInboxReportActionCompleted(params: {
+    report: SignalReport
+    actionType: InboxReportActionType
+    outcome: InboxReportActionOutcome
+    /** Only set for `blocked`, and only ever our own consent copy — never a server error body. */
+    blockedReason?: string | null
+    /** Only set for `limited`: the server's error code. */
+    limitCode?: string | null
+    status?: number | null
+    code?: string | null
+}): void {
+    captureInboxEvent(INBOX_EVENTS.REPORT_ACTION_COMPLETED, {
+        ...baseReportProperties(params.report),
+        action_type: params.actionType,
+        outcome: params.outcome,
+        ...(params.blockedReason ? { blocked_reason: params.blockedReason } : {}),
+        ...(params.limitCode ? { limit_code: params.limitCode } : {}),
+        ...(params.status != null ? { status: params.status } : {}),
+        ...(params.code ? { code: params.code } : {}),
+    })
+}
+
+/**
+ * A surface that replaces the report list (Runs, Settings, triage mode, and the two scout panels).
+ * None of them render the Reports sections, so without this they're invisible — `Inbox viewed` only
+ * ever fires for the report views.
+ */
+export function captureInboxPanelViewed(params: { panel: InboxPanelName; itemCount?: number | null }): void {
+    captureInboxEvent(INBOX_EVENTS.PANEL_VIEWED, {
+        panel: params.panel,
+        item_count: params.itemCount ?? null,
+    })
+}
+
+/**
+ * A panel read was aborted for taking too long. A request that never settles is invisible to
+ * `client_request_failure`, which only records a response, so this is the one place a stalled pane
+ * can be counted.
+ */
+export function capturePanelLoadTimedOut(params: { load: InboxPanelLoad; timeoutMs: number }): void {
+    captureInboxEvent(INBOX_EVENTS.PANEL_LOAD_TIMED_OUT, {
+        load: params.load,
+        timeout_ms: params.timeoutMs,
+    })
+}
+
+/** A report write was aborted for taking too long. Like a stalled panel read, it records no `client_request_failure`. */
+export function captureWriteTimedOut(params: { write: InboxWrite; timeoutMs: number }): void {
+    captureInboxEvent(INBOX_EVENTS.WRITE_TIMED_OUT, {
+        write: params.write,
+        timeout_ms: params.timeoutMs,
+    })
+}
+
+/**
+ * The list moved to a new query — a filter, sort, search, or scope change. `Inbox viewed` fires once
+ * per tab mount, so re-querying an already-open inbox left no trace at all: a user working a filtered
+ * list all day and one who arrived and sat still looked identical.
+ *
+ * The search *term* is deliberately not sent (only its length): unlike a dismissal reason, it's
+ * incidental typing that can name a customer's own entities. `change` says which control moved; the
+ * remaining properties are the resulting query, so any single event describes the full view.
+ */
+export function captureInboxQueryChanged(params: {
+    change: InboxQueryChange
+    tab: string | null
+    scope: string
+    sortField: string
+    sortDirection: string
+    sourceProductFilter: string[]
+    scoutFilter: string[]
+    tagFilter: string[]
+    priorityFilter: string[]
+    stateFilter: string[]
+    searchQuery: string
+    hasActiveFilters: boolean
+    createdWindow: string | null
+}): void {
+    const search = params.searchQuery.trim()
+    captureInboxEvent(INBOX_EVENTS.QUERY_CHANGED, {
+        change: params.change,
+        tab: params.tab,
+        scope: params.scope,
+        sort_field: params.sortField,
+        sort_direction: params.sortDirection,
+        source_product_filter: params.sourceProductFilter,
+        scout_filter: params.scoutFilter,
+        // A count, not the tags: like the search term, a tag is written from the report's content and
+        // can name the customer's own entities.
+        tag_filter_count: params.tagFilter.length,
+        priority_filter: params.priorityFilter,
+        state_filter: params.stateFilter,
+        has_search: search.length > 0,
+        search_length: search.length,
+        has_active_filters: params.hasActiveFilters,
+        created_window: params.createdWindow,
+        // The ranker of the list the user changed away from, not of the list the change requests.
+        ranker_id: servedInboxRankerId,
+    })
+}
+
+/**
+ * A team-level inbox setting was changed (self-driving autostart, Slack notifications, base-branch
+ * overrides). Fired once the request settles, so `success` distinguishes a saved change from a
+ * rejected one. `old_value` isn't carried: the patch is applied optimistically before the listener
+ * runs, so the prior value is no longer readable there — the previous event for the same `setting`
+ * is the transition.
+ */
+export function captureInboxSettingsChanged(params: {
+    setting: string
+    newValue: unknown
+    success: boolean
+    /** Whether the setting governs the whole team or just the person changing it. */
+    scope: 'team' | 'user'
+    /** Which kind of target a Slack notification setting points at. The target itself names the
+     * customer's own channel or teammate, so only its kind travels. */
+    targetKind?: 'direct_message' | 'channel' | null
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SETTINGS_CHANGED, {
+        setting: params.setting,
+        ...settingValueProperties('new_value', params.newValue),
+        success: params.success,
+        setting_scope: params.scope,
+        ...(params.targetKind === undefined ? {} : { target_kind: params.targetKind }),
+    })
+}
+
+/**
+ * A setting's value, safe to ship. Scalars go as-is; a structured value is reduced to how many
+ * entries it holds, because those carry the customer's own names — the base-branch overrides are a
+ * map of their repositories, a Slack destination names their channel.
+ */
+function settingValueProperties(key: string, value: unknown): Record<string, unknown> {
+    if (typeof value === 'object' && value !== null) {
+        return { [key]: null, [`${key}_size`]: Object.keys(value).length }
+    }
+    return { [key]: value ?? null, [`${key}_size`]: null }
+}
+
+/**
+ * How the fleet materialization that preceded this view ended. The roster keeps its existing list
+ * when the sync is refused, so without this an `is_empty: true` view from a viewer who cannot write
+ * looks exactly like one from a project whose fleet genuinely failed to arrive.
+ */
+export type ScoutFleetSyncOutcome =
+    /** The sync ran and answered with the fleet. */
+    | 'synced'
+    /** No sync was issued — the roster opened before a project was resolved. */
+    | 'not_attempted'
+    /** 403: a member without `signal_scout:write`. The roster shows whatever the list read returned. */
+    | 'skipped_permission'
+    /** 404: a stale project id, usually left in the URL by a project switch. */
+    | 'not_found'
+    /** Anything else, including a 5xx. */
+    | 'failed'
+
+/** Roster shape at the moment the scout troop list was opened. Mirrors desktop's `Scout fleet viewed`. */
+export function captureScoutFleetViewed(params: {
+    scoutCount: number
+    enabledCount: number
+    customCount: number
+    dryRunCount: number
+    syncOutcome: ScoutFleetSyncOutcome
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_FLEET_VIEWED, {
+        scout_count: params.scoutCount,
+        enabled_count: params.enabledCount,
+        custom_count: params.customCount,
+        dry_run_count: params.dryRunCount,
+        is_empty: params.scoutCount === 0,
+        sync_outcome: params.syncOutcome,
+    })
+}
+
+/** One scout's detail page opened, with its config and recent-window run shape. */
+export function captureScoutDetailViewed(params: {
+    skillName: string
+    scoutOrigin: string | null
+    enabled: boolean
+    emit: boolean
+    runIntervalMinutes: number | null
+    runCount: number
+    failedRunCount: number
+    emittedSignalCount: number
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_DETAIL_VIEWED, {
+        skill_name: params.skillName,
+        scout_origin: params.scoutOrigin,
+        enabled: params.enabled,
+        emit: params.emit,
+        has_config: true,
+        run_interval_minutes: params.runIntervalMinutes,
+        run_count: params.runCount,
+        failed_run_count: params.failedRunCount,
+        emitted_signal_count: params.emittedSignalCount,
+    })
+}
+
+/**
+ * One scout setting saved. Fired per changed field — a schedule switch patches two fields at once,
+ * and rolling them into one event would make the `setting` breakdown lie about which control moved.
+ */
+export function captureScoutConfigChanged(params: {
+    skillName: string
+    scoutOrigin: string | null
+    setting: string
+    oldValue: unknown
+    newValue: unknown
+    success: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_CONFIG_CHANGED, {
+        skill_name: params.skillName,
+        scout_origin: params.scoutOrigin,
+        setting: params.setting,
+        ...settingValueProperties('old_value', params.oldValue),
+        ...settingValueProperties('new_value', params.newValue),
+        success: params.success,
+    })
+}
+
+/** The tool picker opened. `has_tool_list` says whether the scout already had a list. */
+export function captureScoutToolsPickerOpened(params: {
+    skillName: string
+    surface: ScoutSurface
+    hasToolList: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_TOOLS_PICKER_OPENED, {
+        skill_name: params.skillName,
+        surface: params.surface,
+        has_tool_list: params.hasToolList,
+    })
+}
+
+/**
+ * A tool selection save ended. The event carries counts, not tool names. `tool_count` is null for a
+ * preset, which the API expands, and for a return to all tools.
+ */
+export function captureScoutToolsSaveResult(params: {
+    skillName: string
+    allTools: boolean
+    toolPreset: string | null
+    toolCount: number | null
+    success: boolean
+}): void {
+    captureInboxEvent(params.success ? INBOX_EVENTS.SCOUT_TOOLS_SAVED : INBOX_EVENTS.SCOUT_TOOLS_SAVE_FAILED, {
+        skill_name: params.skillName,
+        all_tools: params.allTools,
+        tool_preset: params.toolPreset,
+        tool_count: params.toolCount,
+    })
+}
+
+/** Any non-config interaction on the scout surfaces — expanding a run, copying a link, opening a skill. */
+export function captureScoutAction(params: {
+    actionType: ScoutActionType
+    surface: ScoutSurface
+    skillName?: string | null
+    extra?: Record<string, unknown>
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_ACTION, {
+        action_type: params.actionType,
+        surface: params.surface,
+        skill_name: params.skillName ?? null,
+        ...params.extra,
+    })
+}
+
+/**
+ * A Runs tab row was opened. Nothing was captured here before, so a run that lands on a dead or
+ * unrelated task page left no trace outside a session recording.
+ */
+export function captureInboxRunOpened(params: {
+    kind: SignalRunKind
+    status: string | null
+    hasReport: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.RUN_OPENED, {
+        run_kind: params.kind,
+        run_status: params.status,
+        has_report: params.hasReport,
+    })
+}
+
+/**
+ * A run's own summary was read on a Runs row. The summary is the cheapest account of what a run did,
+ * and it is only reachable on hover, so this is the one signal for whether readers find it.
+ *
+ * The summary text stays out of the event, like the report title: an agent writes it about a
+ * customer's own code and data. `summary_length` is the readable stand-in.
+ */
+export function captureInboxRunSummaryViewed(params: {
+    purpose: ReportTaskPurpose
+    status: TaskRunStatus | null
+    summaryLength: number
+}): void {
+    captureInboxEvent(INBOX_EVENTS.RUN_SUMMARY_VIEWED, {
+        run_purpose: params.purpose,
+        run_status: params.status,
+        summary_length: params.summaryLength,
+    })
+}
+
+/**
+ * What the inbox decided to do about self-driving onboarding, and when it decided nothing, why.
+ *
+ * The takeover and banner are the only prompt to run the wizard, and several inputs can hold them
+ * back — a run already in flight, loaders still settling, a wizard verdict that hasn't landed. None
+ * of that left a trace, so a drop in wizard runs was indistinguishable from a drop in intent: the
+ * inbox pageview fires either way. `reason` separates "we chose not to ask" from "nobody wanted it".
+ */
+export function captureInboxOnboardingDecided(params: {
+    mode: 'takeover' | 'banner' | 'none' | 'pending'
+    reason: string | null
+}): void {
+    captureInboxEvent(INBOX_EVENTS.ONBOARDING_DECIDED, {
+        mode: params.mode,
+        suppression_reason: params.reason,
+    })
+}
+
+/** A scout CTA kicked off a cloud task ("Chat with an agent", the fleet-overview chips). */
+export function captureScoutChatStarted(params: {
+    chatType: ScoutChatType
+    surface: ScoutSurface
+    skillName?: string | null
+    hasUserPrompt?: boolean
+    templateId?: string | null
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_CHAT_STARTED, {
+        chat_type: params.chatType,
+        surface: params.surface,
+        skill_name: params.skillName ?? null,
+        has_user_prompt: params.hasUserPrompt ?? false,
+        template_id: params.templateId ?? null,
+    })
+}
+
+/** A scout chat kickoff failed. `limited` marks a refusal from the daily cap or a usage limit. */
+export function captureScoutChatStartFailed(params: {
+    chatType: ScoutChatType
+    surface: ScoutSurface
+    status: number | null
+    code: string | null
+    limited: boolean
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_CHAT_START_FAILED, {
+        chat_type: params.chatType,
+        surface: params.surface,
+        status: params.status,
+        code: params.code,
+        limited: params.limited,
+    })
+}
+
+/** How a person creates a scout: in a chat with an agent, or in the form. */
+export type ScoutCreatePath = 'chat' | 'form'
+
+/** A person picked a way to create a scout from the "New scout" entry. */
+export function captureScoutCreatePathChosen(params: { path: ScoutCreatePath; surface: ScoutSurface }): void {
+    captureScoutAction({ actionType: 'choose_create_path', surface: params.surface, extra: { path: params.path } })
+}
+
+/** A person left one create modal for the other, taking what they typed with them. */
+export function captureScoutCreatePathSwitched(params: {
+    direction: 'chat_to_form' | 'form_to_chat'
+    surface: ScoutSurface
+}): void {
+    captureScoutAction({
+        actionType: 'switch_create_path',
+        surface: params.surface,
+        extra: { direction: params.direction },
+    })
+}
+
+/** Which link opened the scratchpad, so each entry point's pull reads separately. */
+export type ScratchpadEntryPoint = 'told_tab' | 'learned_tab' | 'roster_stats' | 'roster_footer'
+
+/** A person followed a link to the scratchpad. The panel view itself is captured on open. */
+export function captureScratchpadLinkClicked(params: {
+    entryPoint: ScratchpadEntryPoint
+    surface: ScoutSurface
+    skillName?: string | null
+}): void {
+    captureScoutAction({
+        actionType: 'open_memory',
+        surface: params.surface,
+        skillName: params.skillName,
+        extra: { entry_point: params.entryPoint },
+    })
+}
+
+/** Where a suggestion card was rendered: the strip above the roster, or the empty state's body. */
+export type ScoutSuggestionSurface = 'strip' | 'empty_state' | 'onboarding'
+
+/** Which offer a suggestion card makes. Mirrors the API's `kind`. */
+export type ScoutSuggestionKind = 'canonical' | 'custom'
+
+/** What the person did with a suggestion card, beyond creating or dismissing it. */
+export type ScoutSuggestionClickTarget = 'turn_on' | 'create' | 'refine_with_ai'
+
+/** What the person did with the strip itself. Desktop sends the same values as click targets. */
+export type ScoutSuggestionsStripClickTarget = 'expand' | 'collapse' | 'close'
+
+/** What the person pressed to reach that target: the action row's button, or the card body. */
+export type ScoutSuggestionClickVia = 'button' | 'card'
+
+/** How a suggestion became a scout: the create API in place, or a chat the person drove. */
+export type ScoutSuggestionCreatedVia = 'api' | 'chat'
+
+/** How a refresh ended. All but `resumed` come from the endpoint; a resume sends no request at all. */
+export type ScoutSuggestionsRefreshOutcome = 'accepted' | 'running' | 'capped' | 'failed' | 'resumed'
+
+/** What put the scan on screen. Without it, a client resuming a paid scan reads as a refused duplicate. */
+export type ScoutSuggestionsRefreshSource = 'strip' | 'reload' | 'onboarding'
+
+/**
+ * The suggestion batch as it was first rendered this visit. Without it a batch nobody acts on is
+ * indistinguishable from one nobody was shown, which is exactly the gap that left the producer
+ * running unread.
+ */
+export function captureScoutSuggestionsShown(params: {
+    count: number
+    status: string
+    ageHours: number | null
+    collapsed: boolean
+    surface: ScoutSuggestionSurface
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_SUGGESTIONS_SHOWN, {
+        suggestion_count: params.count,
+        batch_status: params.status,
+        batch_age_hours: params.ageHours,
+        collapsed: params.collapsed,
+        surface: params.surface,
+    })
+}
+
+/** One of a suggestion card's actions was pressed. `via` separates the card body from the button. */
+export function captureScoutSuggestionClicked(params: {
+    suggestionId: string
+    kind: ScoutSuggestionKind
+    skillName: string
+    target: ScoutSuggestionClickTarget
+    via: ScoutSuggestionClickVia
+    surface: ScoutSuggestionSurface
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_SUGGESTION_CLICKED, {
+        suggestion_id: params.suggestionId,
+        suggestion_kind: params.kind,
+        skill_name: params.skillName,
+        click_target: params.target,
+        via: params.via,
+        surface: params.surface,
+    })
+}
+
+/**
+ * The strip was expanded, collapsed or closed. It opens collapsed, so an expand is what shows that
+ * a person saw the cards and their buttons. It names no suggestion, because it acts on all of them.
+ */
+export function captureScoutSuggestionsStripClicked(params: {
+    target: ScoutSuggestionsStripClickTarget
+    count: number
+    status: string
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_SUGGESTION_CLICKED, {
+        click_target: params.target,
+        suggestion_count: params.count,
+        batch_status: params.status,
+        surface: 'strip' satisfies ScoutSuggestionSurface,
+    })
+}
+
+/**
+ * A suggestion turned into a running scout. `via` separates the one-click paths from the chat.
+ * `skillName` is the scout's final name, which a custom draft can change in the form.
+ */
+export function captureScoutSuggestionCreated(params: {
+    suggestionId: string
+    configId: string
+    kind: ScoutSuggestionKind
+    skillName: string
+    via: ScoutSuggestionCreatedVia
+    surface: ScoutSuggestionSurface
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_SUGGESTION_CREATED, {
+        suggestion_id: params.suggestionId,
+        config_id: params.configId,
+        suggestion_kind: params.kind,
+        skill_name: params.skillName,
+        via: params.via,
+        surface: params.surface,
+    })
+}
+
+/** A suggestion was hidden. Dismissals are remembered by skill name, so this is the rejection signal. */
+export function captureScoutSuggestionDismissed(params: {
+    suggestionId: string
+    kind: ScoutSuggestionKind
+    skillName: string
+    surface: ScoutSuggestionSurface
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_SUGGESTION_DISMISSED, {
+        suggestion_id: params.suggestionId,
+        suggestion_kind: params.kind,
+        skill_name: params.skillName,
+        surface: params.surface,
+    })
+}
+
+/** A refresh was asked for, and what the endpoint said. Refreshes cost a scan, so the cap matters. */
+export function captureScoutSuggestionsRefreshed(params: {
+    outcome: ScoutSuggestionsRefreshOutcome
+    source: ScoutSuggestionsRefreshSource
+}): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_SUGGESTIONS_REFRESHED, {
+        outcome: params.outcome,
+        source: params.source,
+    })
+}
+
+/** "Suggest a scout" opened the chat, having no picks to reopen. Separates cold start from refresh. */
+export function captureScoutSuggestionsChatOpened(params: { batchStatus: string }): void {
+    captureInboxEvent(INBOX_EVENTS.SCOUT_SUGGESTIONS_CHAT_OPENED, { batch_status: params.batchStatus })
+}

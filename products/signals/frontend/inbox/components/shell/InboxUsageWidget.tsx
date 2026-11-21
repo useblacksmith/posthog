@@ -1,0 +1,293 @@
+import { useActions, useValues } from 'kea'
+import { Form } from 'kea-forms'
+
+import { LemonButton, LemonInput, LemonModal, LemonSkeleton, LemonTag, Tooltip } from '@posthog/lemon-ui'
+
+import { BillingUpgradeCTA } from 'lib/components/BillingUpgradeCTA'
+import { LemonField } from 'lib/lemon-ui/LemonField'
+import { billingProductLogic } from 'scenes/billing/billingProductLogic'
+import { paymentEntryLogic } from 'scenes/billing/paymentEntryLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { BillingProductV2Type } from '~/types'
+
+import { InboxUsageStatus, inboxUsageLogic } from '../../logics/inboxUsageLogic'
+import { selfDrivingTrialLogic } from '../../logics/selfDrivingTrialLogic'
+import { formatCredits, usdToCredits } from '../../utils/credits'
+import { SelfDrivingTrialUsage } from './SelfDrivingTrialUsage'
+
+// Usage-bar fill colour by status. Main-app semantic Tailwind classes (not quill `--*` tokens —
+// those only resolve inside `[data-quill]` subtrees).
+const FILL_CLASS: Record<InboxUsageStatus, string> = {
+    normal: 'bg-brand-blue',
+    warning: 'bg-warning',
+    limit: 'bg-danger',
+}
+
+/** A single status-coloured fill over a neutral track. Width is runtime-derived, hence inline. */
+function UsageBar({ percentage, status }: { percentage: number; status: InboxUsageStatus }): JSX.Element {
+    return (
+        <div className="relative h-1 w-full overflow-hidden rounded-md bg-fill-tertiary">
+            <div
+                className={`absolute inset-y-0 left-0 ${FILL_CLASS[status]}`}
+                // eslint-disable-next-line react/forbid-dom-props
+                style={{ width: `${percentage}%` }}
+            />
+        </div>
+    )
+}
+
+function UsageCardSkeleton(): JSX.Element {
+    return (
+        <div className="flex flex-col gap-2">
+            <LemonSkeleton className="h-3 w-24" />
+            <LemonSkeleton className="h-2 w-full" />
+            <div className="flex items-center justify-between">
+                <LemonSkeleton className="h-3 w-28" />
+                <LemonSkeleton className="h-3 w-16" />
+            </div>
+        </div>
+    )
+}
+
+/**
+ * Runs the standard billing upgrade in place — same flow the billing page uses. The Stripe payment
+ * modal is mounted globally (GlobalModals), so on click a returning customer is subscribed
+ * immediately and a new one gets the card modal; either way billing reloads and this widget flips
+ * to the editable subscribed state.
+ */
+function UpgradeButton({ product }: { product: BillingProductV2Type }): JSX.Element {
+    const { billingProductLoading } = useValues(billingProductLogic({ product }))
+    const { startPaymentEntryFlow } = useActions(paymentEntryLogic)
+
+    return (
+        <BillingUpgradeCTA
+            type="primary"
+            size="small"
+            fullWidth
+            center
+            disableClientSideRouting
+            loading={!!billingProductLoading}
+            onClick={() => startPaymentEntryFlow(product, window.location.pathname + window.location.search)}
+        >
+            Upgrade to raise limit
+        </BillingUpgradeCTA>
+    )
+}
+
+function EditLimitModal(): JSX.Element {
+    const { isModalOpen, freePrs, pricePerPrUsd, estimatedBudgetUsd, limitForm, isLimitFormSubmitting } =
+        useValues(inboxUsageLogic)
+    const { closeModal, submitLimitForm } = useActions(inboxUsageLogic)
+
+    const billablePrs = Math.max(0, (limitForm.prs ?? 0) - freePrs)
+
+    return (
+        <LemonModal
+            isOpen={isModalOpen}
+            onClose={closeModal}
+            title="PR limit"
+            description="How many pull requests agents can open each month before pausing."
+            width={460}
+            footer={
+                <>
+                    <LemonButton type="secondary" onClick={closeModal}>
+                        Cancel
+                    </LemonButton>
+                    <LemonButton type="primary" onClick={submitLimitForm} loading={isLimitFormSubmitting}>
+                        Save
+                    </LemonButton>
+                </>
+            }
+        >
+            <Form logic={inboxUsageLogic} formKey="limitForm" className="flex flex-col gap-3">
+                <LemonField name="prs" label="Monthly limit (PRs)">
+                    <LemonInput type="number" min={0} step={1} autoFocus />
+                </LemonField>
+                <div className="flex flex-col gap-2 text-xs">
+                    {freePrs > 0 && pricePerPrUsd != null && (
+                        <span className="text-secondary">
+                            The first {freePrs} PRs each month are free, then{' '}
+                            {formatCredits(usdToCredits(pricePerPrUsd))} per PR.
+                        </span>
+                    )}
+                    {estimatedBudgetUsd != null && pricePerPrUsd != null && (
+                        <div className="flex flex-col gap-0.5 rounded bg-surface-secondary px-2 py-1.5">
+                            <div className="flex items-center justify-between">
+                                <span className="text-default">Estimated monthly credits</span>
+                                <span className="font-semibold text-default tabular-nums">
+                                    {formatCredits(usdToCredits(estimatedBudgetUsd))}
+                                </span>
+                            </div>
+                            <span className="text-tertiary">
+                                {billablePrs > 0
+                                    ? `${billablePrs} billable PRs × ${formatCredits(usdToCredits(pricePerPrUsd))}`
+                                    : 'Within the free tier'}
+                            </span>
+                        </div>
+                    )}
+                </div>
+            </Form>
+        </LemonModal>
+    )
+}
+
+/**
+ * Compact PR-usage meter for the inbox agents rail: a status-coloured usage bar with credits used so far
+ * alongside it, then `X / Y PRs used across your organization` on the left and `Resets <date>` on
+ * the right. That count is org-wide, uncapped, and net of refunds, on the same basis as the quota
+ * check. When refunds exist, a line under it names the gross count the billing page shows. On a paid
+ * plan the limit is editable (and the edit affordance escalates to "Increase limit" at the cap); on the
+ * free plan it shows an in-place upgrade instead. Renders nothing until billing has loaded and the
+ * inbox product is present. Deliberately billing-only: the team's daily report cap lives with the
+ * autonomy throttles in SelfDrivingSection, so a self-imposed cap never reads as a plan limit.
+ */
+export function InboxUsageWidget(): JSX.Element | null {
+    const { currentTeamId } = useValues(teamLogic)
+    const { trial, trialEnabled } = useValues(selfDrivingTrialLogic({ teamId: currentTeamId! }))
+    const {
+        product,
+        spendProduct,
+        spendCredits,
+        isLoading,
+        isSubscribed,
+        canAccessBilling,
+        createdPrs,
+        usedPrs,
+        refundedPrs,
+        limitPrs,
+        freePrs,
+        status,
+        quotaLimited,
+        resetDate,
+        spentUsd,
+        percentage,
+    } = useValues(inboxUsageLogic)
+    const { openModal } = useActions(inboxUsageLogic)
+
+    const paidContinuation = trial?.grant_status === 'exhausted' && !!spendProduct?.subscribed
+    if (trialEnabled && trial?.enabled && trial.grant_status !== 'not_claimed' && !paidContinuation) {
+        return <SelfDrivingTrialUsage />
+    }
+
+    // The server-truth pause (quotaLimited) can lead the widget's own usage math (billing data
+    // lags), so the raise-the-limit affordances escalate on either signal.
+    const atLimit = status === 'limit' || quotaLimited
+
+    if (isLoading) {
+        return <UsageCardSkeleton />
+    }
+    if (spendProduct) {
+        return (
+            <>
+                {trialEnabled && trial?.enabled && paidContinuation && <SelfDrivingTrialUsage />}
+                <div className="flex flex-col items-start gap-2">
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                        <span className="text-[13px] font-semibold">AI credits used</span>
+                        {quotaLimited && <LemonTag type="warning">Spending limit reached</LemonTag>}
+                    </div>
+                    {spendCredits != null && (
+                        <span className="text-xs tabular-nums" translate="no">
+                            {formatCredits(spendCredits)}
+                        </span>
+                    )}
+                    {quotaLimited && (
+                        <span className="text-xs text-secondary">
+                            New work is paused. Work already underway will finish.
+                            {!canAccessBilling && ' Ask an organization admin to change the limit.'}
+                        </span>
+                    )}
+                    {canAccessBilling && (
+                        <LemonButton size="small" type="secondary" to={urls.organizationBilling()}>
+                            View usage and limits
+                        </LemonButton>
+                    )}
+                </div>
+            </>
+        )
+    }
+    if (!product) {
+        return null
+    }
+
+    // Only org admins/owners can change billing (canAccessBilling) — others get a read-only view with a hint.
+    return (
+        <>
+            <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-1.5">
+                    <span className="text-[13px] font-semibold text-default">Pull requests</span>
+                    {!isSubscribed ? (
+                        <LemonTag type="muted" size="small">
+                            Free plan
+                        </LemonTag>
+                    ) : canAccessBilling && !atLimit ? (
+                        <button
+                            type="button"
+                            onClick={openModal}
+                            className="text-xs text-link hover:underline cursor-pointer bg-transparent border-0 p-0"
+                        >
+                            Edit
+                        </button>
+                    ) : null}
+                </div>
+                <div className="flex items-center gap-2">
+                    <Tooltip title={freePrs > 0 ? `The first ${freePrs} PRs each month are free` : undefined}>
+                        <div className="flex-1">
+                            <UsageBar percentage={percentage} status={status} />
+                        </div>
+                    </Tooltip>
+                    {spentUsd != null && (
+                        <span className="text-xs font-medium text-default tabular-nums">
+                            {formatCredits(usdToCredits(spentUsd))}
+                        </span>
+                    )}
+                </div>
+                {/* Wraps rather than clips: the scope wording makes this row too wide for a narrow rail. */}
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-xs">
+                    <Tooltip title="PRs agents opened across your organization this billing period, minus refunded PRs. This is the count that goes toward your limit. It can run past the limit before agents pause.">
+                        {/* tabIndex so keyboard users can reach the tooltip */}
+                        <span className="text-secondary tabular-nums" tabIndex={0}>
+                            <span className="font-medium text-default">{usedPrs}</span>
+                            {limitPrs != null ? ` / ${limitPrs}` : ''} PRs used across your organization
+                        </span>
+                    </Tooltip>
+                    {resetDate && (
+                        <span className="text-tertiary tabular-nums">Resets {resetDate.format('MMM D')}</span>
+                    )}
+                </div>
+                {/* Your billing page counts every created PR, so this line explains why it shows more. */}
+                {refundedPrs > 0 && (
+                    <span className="text-xs text-tertiary tabular-nums">
+                        {createdPrs} created, {refundedPrs} refunded. Refunded PRs don't count toward your limit.
+                    </span>
+                )}
+                {quotaLimited && (
+                    <span className="text-xs font-medium text-danger">
+                        New work is paused until the limit is raised or usage resets. Work already underway will finish.
+                    </span>
+                )}
+                {canAccessBilling ? (
+                    !isSubscribed ? (
+                        <UpgradeButton product={product} />
+                    ) : (
+                        atLimit && (
+                            <LemonButton type="primary" size="small" fullWidth center onClick={openModal}>
+                                Increase limit
+                            </LemonButton>
+                        )
+                    )
+                ) : (
+                    (!isSubscribed || atLimit) && (
+                        <span className="text-xs text-muted">
+                            {isSubscribed
+                                ? 'Contact an organization admin to raise the limit.'
+                                : 'Contact an organization admin to upgrade.'}
+                        </span>
+                    )
+                )}
+            </div>
+            {canAccessBilling && <EditLimitModal />}
+        </>
+    )
+}

@@ -1,0 +1,344 @@
+mod common;
+
+use rstest::rstest;
+use uuid::Uuid;
+
+use capture::sinks::producer::MockKafkaProducer;
+use capture::v1::analytics::process::process_batch;
+use capture::v1::analytics::response::BatchResponse;
+use capture::v1::analytics::types::{Batch, EventResult};
+use capture::v1::test_utils::{self, batch_payload, valid_event, TestStateBuilder};
+use capture::v1::Error;
+use limiters::redis::QuotaResource;
+
+fn event_with_name(name: &str) -> capture::v1::analytics::types::Event {
+    let mut e = valid_event();
+    e.event = name.to_string();
+    e.uuid = Uuid::new_v4().to_string();
+    e
+}
+
+async fn run_batch(payload: &[u8], builder: TestStateBuilder) -> Result<BatchResponse, Error> {
+    run_batch_with_state(payload, builder).await.0
+}
+
+async fn run_batch_with_state(
+    payload: &[u8],
+    builder: TestStateBuilder,
+) -> (Result<BatchResponse, Error>, test_utils::TestState) {
+    let batch: Batch = serde_json::from_slice(payload).expect("payload must parse as Batch");
+    let ts = builder.build();
+    let mut ctx = test_utils::test_analytics_context();
+    let result = process_batch(&ts.state, &mut ctx, batch).await;
+    (result, ts)
+}
+
+// -------------------------------------------------------------------------
+// Table 1: Event Type → Destination Routing
+// -------------------------------------------------------------------------
+
+#[rstest]
+#[case::pageview("$pageview", "events_main")]
+#[case::exception("$exception", "error_tracking_events")]
+#[case::heatmap("$$heatmap", "heatmaps_ingestion")]
+#[case::client_warning("$$client_ingestion_warning", "events_plugin_ingestion")]
+#[case::custom("signup_complete", "events_main")]
+#[tokio::test]
+async fn event_type_routes_to_destination(#[case] event_name: &str, #[case] expected_topic: &str) {
+    let events = vec![event_with_name(event_name)];
+    let payload = batch_payload(&events);
+
+    let (result, ts) = run_batch_with_state(&payload, TestStateBuilder::new()).await;
+
+    let resp = result.expect("batch should succeed");
+    assert_eq!(resp.entries().len(), 1);
+    assert_eq!(resp.entries()[0].1.result, EventResult::Ok);
+
+    let records = ts.mock_producer.get_records();
+    assert_eq!(records.len(), 1, "expected exactly 1 Kafka record");
+    assert_eq!(&*records[0].topic, expected_topic);
+}
+
+// -------------------------------------------------------------------------
+// Table 2: Processing Outcomes (Mixed Batches)
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mixed_batch_all_ok() {
+    let events = vec![
+        event_with_name("$pageview"),
+        event_with_name("$identify"),
+        event_with_name("custom_event"),
+    ];
+    let payload = batch_payload(&events);
+
+    let resp = run_batch(&payload, TestStateBuilder::new())
+        .await
+        .expect("batch should succeed");
+
+    assert_eq!(resp.entries().len(), 3);
+    assert!(!resp.has_retry);
+    for (_, status) in resp.entries() {
+        assert_eq!(status.result, EventResult::Ok);
+    }
+}
+
+#[tokio::test]
+async fn sink_ack_error_retries_only_that_event() {
+    let producer = MockKafkaProducer::new_failing_ack_at(1);
+
+    let events = vec![event_with_name("$pageview"), event_with_name("$identify")];
+    let payload = batch_payload(&events);
+
+    let resp = run_batch(
+        &payload,
+        TestStateBuilder::new().with_mock_producer(producer),
+    )
+    .await
+    .expect("batch should succeed");
+
+    let results: Vec<EventResult> = resp
+        .entries()
+        .iter()
+        .map(|(_, status)| status.result)
+        .collect();
+    assert!(resp.has_retry);
+    assert_eq!(results, vec![EventResult::Ok, EventResult::Retry]);
+}
+
+#[tokio::test]
+async fn all_events_quota_dropped() {
+    let events = vec![
+        event_with_name("$pageview"),
+        event_with_name("custom_event"),
+    ];
+    let payload = batch_payload(&events);
+
+    let ts = TestStateBuilder::new().with_quota_limited().build();
+
+    // with_quota_limited() loads a wildcard "*" token into the limiter's
+    // DashMap — use "*" as the api_token so `is_limited("*")` matches.
+    // Poll until the background task populates the cache (avoids flaky fixed sleep).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let batch: Batch = serde_json::from_slice(&payload).expect("payload must parse as Batch");
+        let mut ctx = test_utils::test_analytics_context();
+        ctx.api_token = "*".to_string();
+        let result = process_batch(&ts.state, &mut ctx, batch).await;
+        if result.is_err() {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, Error::BillingLimitExceeded),
+                "expected BillingLimitExceeded, got: {err:?}"
+            );
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "quota limiter cache was not populated within 2s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn events_quota_keeps_events_under_their_own_quota() {
+    let events = vec![
+        event_with_name("$pageview"),
+        event_with_name("$exception"),
+        event_with_name("survey sent"),
+        event_with_name("$ai_generation"),
+    ];
+    let payload = batch_payload(&events);
+    let ts = TestStateBuilder::new()
+        .with_quota_limited_resources(&[QuotaResource::Events])
+        .build();
+
+    // Poll until the limiter cache loads the wildcard "*" token instead of sleeping.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let response = loop {
+        let batch: Batch = serde_json::from_slice(&payload).expect("payload must parse as Batch");
+        let mut ctx = test_utils::test_analytics_context();
+        ctx.api_token = "*".to_string();
+        let response = process_batch(&ts.state, &mut ctx, batch)
+            .await
+            .expect("an events quota must not refuse events under their own quota");
+        if response
+            .entries()
+            .iter()
+            .any(|(_, status)| status.result == EventResult::Drop)
+        {
+            break response;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "quota limiter cache was not populated within 2s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+
+    let by_uuid: std::collections::HashMap<String, _> = response
+        .entries()
+        .iter()
+        .map(|(uuid, status)| (uuid.to_string(), status))
+        .collect();
+    for event in &events {
+        let status = by_uuid[&event.uuid];
+        if event.event == "$pageview" {
+            assert_eq!(status.result, EventResult::Drop);
+            assert_eq!(status.details, Some("events_over_quota"));
+        } else {
+            assert_eq!(
+                status.result,
+                EventResult::Ok,
+                "{} was dropped",
+                event.event
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn historical_rerouting() {
+    let old_ts = chrono::Utc::now() - chrono::Duration::days(60);
+    let mut event = valid_event();
+    event.timestamp = old_ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    event.uuid = Uuid::new_v4().to_string();
+
+    let events = vec![event];
+    let payload = batch_payload(&events);
+
+    let (result, ts) = run_batch_with_state(
+        &payload,
+        TestStateBuilder::new().with_historical_rerouting(30),
+    )
+    .await;
+
+    let resp = result.expect("batch should succeed");
+    assert_eq!(resp.entries().len(), 1);
+    assert_eq!(resp.entries()[0].1.result, EventResult::Ok);
+
+    let records = ts.mock_producer.get_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        &*records[0].topic, "events_hist",
+        "old event should route to historical topic"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Table 3: Compression Round-Trip
+// -------------------------------------------------------------------------
+
+#[rstest]
+#[case::identity(None)]
+#[case::gzip(Some("gzip"))]
+#[case::zstd(Some("zstd"))]
+#[case::deflate(Some("deflate"))]
+#[case::brotli(Some("br"))]
+#[tokio::test]
+async fn compression_round_trip(#[case] encoding: Option<&str>) {
+    let events = vec![
+        event_with_name("$pageview"),
+        event_with_name("$exception"),
+        event_with_name("custom"),
+    ];
+    let raw = batch_payload(&events);
+
+    let payload = match encoding {
+        Some(enc) => common::compress(&raw, enc),
+        None => raw,
+    };
+
+    let batch: Batch = match encoding {
+        Some(enc) => {
+            let decompressed = capture::v1::util::decompress_payload(
+                Some(enc),
+                bytes::Bytes::from(payload),
+                20 * 1024 * 1024,
+                64,
+            )
+            .await
+            .expect("decompression should succeed");
+            serde_json::from_slice(&decompressed).expect("decompressed payload must parse")
+        }
+        None => serde_json::from_slice(&payload).expect("raw payload must parse"),
+    };
+
+    let ts = TestStateBuilder::new().build();
+    let mut ctx = test_utils::test_analytics_context();
+    if encoding.is_some() {
+        ctx.content_encoding = encoding.map(String::from);
+    }
+
+    let resp = process_batch(&ts.state, &mut ctx, batch)
+        .await
+        .expect("batch should succeed");
+
+    assert_eq!(resp.entries().len(), 3);
+    assert!(!resp.has_retry);
+    for (_, status) in resp.entries() {
+        assert_eq!(status.result, EventResult::Ok);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Table 4: Validation Errors
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_batch_error() {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "created_at": "2026-03-19T14:30:00.000Z",
+        "batch": []
+    }))
+    .unwrap();
+
+    let err = run_batch(&payload, TestStateBuilder::new())
+        .await
+        .expect_err("empty batch should fail");
+
+    assert!(
+        matches!(err, Error::EmptyBatch),
+        "expected EmptyBatch, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_uuid_keeps_and_publishes_only_the_first_copy() {
+    let first = event_with_name("$pageview");
+    let mut copy = event_with_name("$exception");
+    copy.uuid = first.uuid.clone();
+    let payload = batch_payload(&[first, copy]);
+
+    let (result, ts) = run_batch_with_state(&payload, TestStateBuilder::new()).await;
+
+    let resp = result.expect("a duplicate uuid no longer rejects the request");
+    assert_eq!(resp.entries().len(), 1);
+    assert_eq!(resp.entries()[0].1.result, EventResult::Ok);
+    assert_eq!(resp.entries()[0].1.duplicates_dropped, 1);
+    let records = ts.mock_producer.get_records();
+    assert_eq!(records.len(), 1, "only the first copy is published");
+    assert_eq!(
+        &*records[0].topic, "events_main",
+        "the $exception copy was dropped"
+    );
+}
+
+#[tokio::test]
+async fn missing_event_name_drops_event() {
+    let mut bad = valid_event();
+    bad.event = String::new();
+    let good = event_with_name("$pageview");
+
+    let payload = batch_payload(&[bad, good]);
+
+    let resp = run_batch(&payload, TestStateBuilder::new())
+        .await
+        .expect("batch with mix of valid and invalid events should succeed");
+
+    assert_eq!(resp.entries().len(), 2);
+    assert_eq!(resp.entries()[0].1.result, EventResult::Drop);
+    assert_eq!(resp.entries()[0].1.details, Some("missing_event_name"));
+    assert_eq!(resp.entries()[1].1.result, EventResult::Ok);
+}

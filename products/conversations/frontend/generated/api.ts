@@ -1,0 +1,892 @@
+import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+import type {
+    AIContextAccountPropertyApi,
+    AIReplyPlaybookApi,
+    AiFeedbackRequestApi,
+    AiHumanOutcomeRequestApi,
+    BulkUpdateStatusRequestApi,
+    BulkUpdateStatusResponseApi,
+    BulkUpdateTagsUUIDRequestApi,
+    BulkUpdateTagsUUIDResponseApi,
+    ComposeTicketApi,
+    ComposeTicketResponseApi,
+    ConversationsMacrosListParams,
+    ConversationsTicketsAttachmentsCreateBody,
+    ConversationsTicketsListParams,
+    ConversationsTicketsMessagesListParams,
+    ConversationsViewsListParams,
+    IntercomImportJobApi,
+    IntercomImportStartApi,
+    PaginatedTicketListApi,
+    PaginatedTicketMacroListApi,
+    PaginatedTicketMessageListApi,
+    PaginatedTicketViewListApi,
+    PatchedTicketMacroApi,
+    PatchedTicketNoteUpdateRequestApi,
+    PatchedTicketUpdateRequestApi,
+    PatchedTicketViewApi,
+    PylonImportJobApi,
+    PylonImportStartApi,
+    SigningSecretApi,
+    TicketApi,
+    TicketAttachmentApi,
+    TicketFullEmailApi,
+    TicketMacroApi,
+    TicketMessageApi,
+    TicketNoteCreateRequestApi,
+    TicketReplyRequestApi,
+    TicketUnreadCountResponseApi,
+    TicketUpdateRequestApi,
+    TicketViewApi,
+    ZendeskImportJobApi,
+    ZendeskImportStartApi,
+} from './api.schemas'
+
+// https://stackoverflow.com/questions/49579094/typescript-conditional-types-filter-out-readonly-properties-pick-only-requir/49579497#49579497
+type IfEquals<X, Y, A = X, B = never> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? A : B
+
+type WritableKeys<T> = {
+    [P in keyof T]-?: IfEquals<{ [Q in P]: T[P] }, { -readonly [Q in P]: T[P] }, P>
+}[keyof T]
+
+type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (k: infer I) => void ? I : never
+type DistributeReadOnlyOverUnions<T> = T extends any ? NonReadonly<T> : never
+
+type Writable<T> = Pick<T, WritableKeys<T>>
+type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
+    ? {
+          [P in keyof Writable<T>]: T[P] extends object ? NonReadonly<NonNullable<T[P]>> : T[P]
+      }
+    : DistributeReadOnlyOverUnions<T>
+
+export const getConversationsAiContextAccountPropertiesListUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/ai_context_account_properties/`
+}
+
+/**
+ * Account-target Customer analytics properties that can be included in AI reply context. Capped at the first 500 properties by name.
+ */
+export const conversationsAiContextAccountPropertiesList = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<AIContextAccountPropertyApi[]> => {
+    return apiMutator<AIContextAccountPropertyApi[]>(getConversationsAiContextAccountPropertiesListUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsAiReplyPlaybookRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/ai_reply_playbook/`
+}
+
+/**
+ * Inherited support-reply playbook for this project, plus the team's custom addendum if any.
+ */
+export const conversationsAiReplyPlaybookRetrieve = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<AIReplyPlaybookApi> => {
+    return apiMutator<AIReplyPlaybookApi>(getConversationsAiReplyPlaybookRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsIntercomImportsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/intercom_imports/`
+}
+
+export const conversationsIntercomImportsCreate = async (
+    projectId: string,
+    intercomImportStartApi: IntercomImportStartApi,
+    options?: RequestInit
+): Promise<IntercomImportJobApi> => {
+    return apiMutator<IntercomImportJobApi>(getConversationsIntercomImportsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(intercomImportStartApi),
+    })
+}
+
+export const getConversationsIntercomImportsStatusRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/intercom_imports/status/`
+}
+
+export const conversationsIntercomImportsStatusRetrieve = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<IntercomImportJobApi> => {
+    return apiMutator<IntercomImportJobApi>(getConversationsIntercomImportsStatusRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsMacrosListUrl = (projectId: string, params?: ConversationsMacrosListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/conversations/macros/?${stringifiedParams}`
+        : `/api/projects/${projectId}/conversations/macros/`
+}
+
+export const conversationsMacrosList = async (
+    projectId: string,
+    params?: ConversationsMacrosListParams,
+    options?: RequestInit
+): Promise<PaginatedTicketMacroListApi> => {
+    return apiMutator<PaginatedTicketMacroListApi>(getConversationsMacrosListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsMacrosCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/macros/`
+}
+
+export const conversationsMacrosCreate = async (
+    projectId: string,
+    ticketMacroApi: NonReadonly<TicketMacroApi>,
+    options?: RequestInit
+): Promise<TicketMacroApi> => {
+    return apiMutator<TicketMacroApi>(getConversationsMacrosCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(ticketMacroApi),
+    })
+}
+
+export const getConversationsMacrosRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/macros/${id}/`
+}
+
+export const conversationsMacrosRetrieve = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<TicketMacroApi> => {
+    return apiMutator<TicketMacroApi>(getConversationsMacrosRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsMacrosPartialUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/macros/${id}/`
+}
+
+export const conversationsMacrosPartialUpdate = async (
+    projectId: string,
+    id: string,
+    patchedTicketMacroApi?: NonReadonly<PatchedTicketMacroApi>,
+    options?: RequestInit
+): Promise<TicketMacroApi> => {
+    return apiMutator<TicketMacroApi>(getConversationsMacrosPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedTicketMacroApi),
+    })
+}
+
+export const getConversationsMacrosDestroyUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/macros/${id}/`
+}
+
+export const conversationsMacrosDestroy = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getConversationsMacrosDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getConversationsMacrosUsedCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/macros/${id}/used/`
+}
+
+export const conversationsMacrosUsedCreate = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<TicketMacroApi> => {
+    return apiMutator<TicketMacroApi>(getConversationsMacrosUsedCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getConversationsPylonImportsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/pylon_imports/`
+}
+
+export const conversationsPylonImportsCreate = async (
+    projectId: string,
+    pylonImportStartApi: PylonImportStartApi,
+    options?: RequestInit
+): Promise<PylonImportJobApi> => {
+    return apiMutator<PylonImportJobApi>(getConversationsPylonImportsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(pylonImportStartApi),
+    })
+}
+
+export const getConversationsPylonImportsStatusRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/pylon_imports/status/`
+}
+
+export const conversationsPylonImportsStatusRetrieve = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<PylonImportJobApi> => {
+    return apiMutator<PylonImportJobApi>(getConversationsPylonImportsStatusRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsSigningSecretRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/signing_secret/`
+}
+
+/**
+ * The signing secret used for widget identity verification in this project.
+ */
+export const conversationsSigningSecretRetrieve = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<SigningSecretApi> => {
+    return apiMutator<SigningSecretApi>(getConversationsSigningSecretRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsSigningSecretExpirePreviousCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/signing_secret/expire_previous/`
+}
+
+/**
+ * End the rotation grace window now: the previous secret stops verifying immediately. Use it when the replaced secret may be compromised, or once every server runs the new one.
+ */
+export const conversationsSigningSecretExpirePreviousCreate = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<SigningSecretApi> => {
+    return apiMutator<SigningSecretApi>(getConversationsSigningSecretExpirePreviousCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getConversationsSigningSecretRotateCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/signing_secret/rotate/`
+}
+
+/**
+ * Generate a new signing secret. The previous secret keeps verifying identity hashes for 48 hours, then expires.
+ */
+export const conversationsSigningSecretRotateCreate = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<SigningSecretApi> => {
+    return apiMutator<SigningSecretApi>(getConversationsSigningSecretRotateCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getConversationsTicketsListUrl = (projectId: string, params?: ConversationsTicketsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/conversations/tickets/?${stringifiedParams}`
+        : `/api/projects/${projectId}/conversations/tickets/`
+}
+
+/**
+ * List tickets with person data attached.
+ */
+export const conversationsTicketsList = async (
+    projectId: string,
+    params?: ConversationsTicketsListParams,
+    options?: RequestInit
+): Promise<PaginatedTicketListApi> => {
+    return apiMutator<PaginatedTicketListApi>(getConversationsTicketsListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsTicketsRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/`
+}
+
+/**
+ * Get single ticket and mark as read by team.
+ */
+export const conversationsTicketsRetrieve = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<TicketApi> => {
+    return apiMutator<TicketApi>(getConversationsTicketsRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsTicketsUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/`
+}
+
+/**
+ * Handle ticket updates including assignee changes.
+ */
+export const conversationsTicketsUpdate = async (
+    projectId: string,
+    id: string,
+    ticketUpdateRequestApi?: TicketUpdateRequestApi,
+    options?: RequestInit
+): Promise<TicketApi> => {
+    return apiMutator<TicketApi>(getConversationsTicketsUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(ticketUpdateRequestApi),
+    })
+}
+
+export const getConversationsTicketsPartialUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/`
+}
+
+export const conversationsTicketsPartialUpdate = async (
+    projectId: string,
+    id: string,
+    patchedTicketUpdateRequestApi?: PatchedTicketUpdateRequestApi,
+    options?: RequestInit
+): Promise<TicketApi> => {
+    return apiMutator<TicketApi>(getConversationsTicketsPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedTicketUpdateRequestApi),
+    })
+}
+
+export const getConversationsTicketsDestroyUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/`
+}
+
+/**
+ * Soft-delete a ticket. A daily sweeper hard-deletes it after the grace window.
+ */
+export const conversationsTicketsDestroy = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getConversationsTicketsDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getConversationsTicketsAiFeedbackCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/ai_feedback/`
+}
+
+/**
+ * Record reviewer feedback on an AI reply, captured to the internal analytics project.
+ */
+export const conversationsTicketsAiFeedbackCreate = async (
+    projectId: string,
+    id: string,
+    aiFeedbackRequestApi: AiFeedbackRequestApi,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getConversationsTicketsAiFeedbackCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(aiFeedbackRequestApi),
+    })
+}
+
+export const getConversationsTicketsAiHumanOutcomeCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/ai_human_outcome/`
+}
+
+/**
+ * Record that a human used or edited the latest AI draft.
+ */
+export const conversationsTicketsAiHumanOutcomeCreate = async (
+    projectId: string,
+    id: string,
+    aiHumanOutcomeRequestApi: AiHumanOutcomeRequestApi,
+    options?: RequestInit
+): Promise<AiHumanOutcomeRequestApi> => {
+    return apiMutator<AiHumanOutcomeRequestApi>(getConversationsTicketsAiHumanOutcomeCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(aiHumanOutcomeRequestApi),
+    })
+}
+
+export const getConversationsTicketsAttachmentsCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/attachments/`
+}
+
+/**
+ * Upload a file to put in a reply to this ticket.
+ *
+ * Images are validated and shown inline. Other files are stored as they are and
+ * served as a download. Widget tickets do not accept file attachments yet.
+ */
+export const conversationsTicketsAttachmentsCreate = async (
+    projectId: string,
+    id: string,
+    conversationsTicketsAttachmentsCreateBody?: ConversationsTicketsAttachmentsCreateBody,
+    options?: RequestInit
+): Promise<TicketAttachmentApi> => {
+    const formData = new FormData()
+    if (conversationsTicketsAttachmentsCreateBody?.file !== undefined) {
+        formData.append(`file`, conversationsTicketsAttachmentsCreateBody.file)
+    }
+
+    return apiMutator<TicketAttachmentApi>(getConversationsTicketsAttachmentsCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        body: formData,
+    })
+}
+
+export const getConversationsTicketsMessagesListUrl = (
+    projectId: string,
+    id: string,
+    params?: ConversationsTicketsMessagesListParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/conversations/tickets/${id}/messages/?${stringifiedParams}`
+        : `/api/projects/${projectId}/conversations/tickets/${id}/messages/`
+}
+
+/**
+ * Return the message thread for a ticket, ordered chronologically (paginated).
+ */
+export const conversationsTicketsMessagesList = async (
+    projectId: string,
+    id: string,
+    params?: ConversationsTicketsMessagesListParams,
+    options?: RequestInit
+): Promise<PaginatedTicketMessageListApi> => {
+    return apiMutator<PaginatedTicketMessageListApi>(getConversationsTicketsMessagesListUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsTicketsMessagesFullEmailRetrieveUrl = (
+    projectId: string,
+    id: string,
+    messageId: string
+) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/messages/${messageId}/full_email/`
+}
+
+/**
+ * Return the full inbound email body in Markdown.
+ */
+export const conversationsTicketsMessagesFullEmailRetrieve = async (
+    projectId: string,
+    id: string,
+    messageId: string,
+    options?: RequestInit
+): Promise<TicketFullEmailApi> => {
+    return apiMutator<TicketFullEmailApi>(
+        getConversationsTicketsMessagesFullEmailRetrieveUrl(projectId, id, messageId),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getConversationsTicketsNotesCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/notes/`
+}
+
+/**
+ * Add a private note to a ticket.
+ *
+ * The note is visible to your team only. The request has no privacy field, so this
+ * endpoint never sends anything to the customer.
+ */
+export const conversationsTicketsNotesCreate = async (
+    projectId: string,
+    id: string,
+    ticketNoteCreateRequestApi: TicketNoteCreateRequestApi,
+    options?: RequestInit
+): Promise<TicketMessageApi> => {
+    return apiMutator<TicketMessageApi>(getConversationsTicketsNotesCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(ticketNoteCreateRequestApi),
+    })
+}
+
+export const getConversationsTicketsNotesPartialUpdateUrl = (projectId: string, id: string, messageId: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/notes/${messageId}/`
+}
+
+/**
+ * Update a private note on a ticket.
+ *
+ * Only the note's author can edit it. Customer-facing replies cannot be
+ * edited (outbound delivery only runs on create).
+ */
+export const conversationsTicketsNotesPartialUpdate = async (
+    projectId: string,
+    id: string,
+    messageId: string,
+    patchedTicketNoteUpdateRequestApi?: PatchedTicketNoteUpdateRequestApi,
+    options?: RequestInit
+): Promise<TicketMessageApi> => {
+    return apiMutator<TicketMessageApi>(getConversationsTicketsNotesPartialUpdateUrl(projectId, id, messageId), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedTicketNoteUpdateRequestApi),
+    })
+}
+
+export const getConversationsTicketsNotesDestroyUrl = (projectId: string, id: string, messageId: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/notes/${messageId}/`
+}
+
+/**
+ * Soft-delete a private note on a ticket.
+ *
+ * Only the note's author can delete it. Customer-facing replies cannot be
+ * deleted via this endpoint.
+ */
+export const conversationsTicketsNotesDestroy = async (
+    projectId: string,
+    id: string,
+    messageId: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getConversationsTicketsNotesDestroyUrl(projectId, id, messageId), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getConversationsTicketsReplyCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/${id}/reply/`
+}
+
+/**
+ * Post a reply or internal note to a ticket.
+ *
+ * With is_private=false, the reply is delivered to the customer via the
+ * ticket's channel (email, Slack, Teams, GitHub). With is_private=true,
+ * the message is stored as an internal note only visible to team members.
+ *
+ * Retrying an identical message from the same author within a short window returns the
+ * original message with a 200 rather than posting it twice, and a 409 while a concurrent
+ * request is still creating it.
+ */
+export const conversationsTicketsReplyCreate = async (
+    projectId: string,
+    id: string,
+    ticketReplyRequestApi: TicketReplyRequestApi,
+    options?: RequestInit
+): Promise<TicketMessageApi> => {
+    return apiMutator<TicketMessageApi>(getConversationsTicketsReplyCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(ticketReplyRequestApi),
+    })
+}
+
+export const getConversationsTicketsBulkUpdateStatusCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/bulk_update_status/`
+}
+
+/**
+ * Update the status of multiple tickets in a single request.
+ *
+ * Only tickets belonging to the current team are affected; other-team UUIDs
+ * are silently ignored. Tickets the caller lacks editor-level access to (denied
+ * or view-only via object-level access control) are silently skipped too, the
+ * same way single-ticket updates enforce object-level access via get_object().
+ * Tickets already in the requested status are skipped.
+ */
+export const conversationsTicketsBulkUpdateStatusCreate = async (
+    projectId: string,
+    bulkUpdateStatusRequestApi: BulkUpdateStatusRequestApi,
+    options?: RequestInit
+): Promise<BulkUpdateStatusResponseApi> => {
+    return apiMutator<BulkUpdateStatusResponseApi>(getConversationsTicketsBulkUpdateStatusCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkUpdateStatusRequestApi),
+    })
+}
+
+export const getConversationsTicketsBulkUpdateTagsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/bulk_update_tags/`
+}
+
+/**
+ * Bulk update tags on multiple objects.
+ *
+ * PAT access: this action has no ``required_scopes=`` on the decorator —
+ * inheriting viewsets must add ``"bulk_update_tags"`` to their
+ * ``scope_object_write_actions`` list to accept personal API keys.
+ * Without that opt-in, ``APIScopePermission`` rejects PAT requests with
+ * "This action does not support personal API key access". Done per-viewset
+ * so granting ``<scope>:write`` for one resource doesn't leak access to
+ * sibling resources that share this mixin.
+ *
+ * Accepts:
+ * - {"ids": [...], "action": "add"|"remove"|"set", "tags": ["tag1", "tag2"]}
+ *
+ * Actions:
+ * - "add": Add tags to existing tags on each object
+ * - "remove": Remove specific tags from each object
+ * - "set": Replace all tags on each object with the provided list
+ */
+export const conversationsTicketsBulkUpdateTagsCreate = async (
+    projectId: string,
+    bulkUpdateTagsUUIDRequestApi: BulkUpdateTagsUUIDRequestApi,
+    options?: RequestInit
+): Promise<BulkUpdateTagsUUIDResponseApi> => {
+    return apiMutator<BulkUpdateTagsUUIDResponseApi>(getConversationsTicketsBulkUpdateTagsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkUpdateTagsUUIDRequestApi),
+    })
+}
+
+export const getConversationsTicketsComposeCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/compose/`
+}
+
+/**
+ * Create a new outbound ticket and send the first message to the customer.
+ *
+ * Idempotent within a short window: an identical compose retried while the first is still
+ * in flight returns 409, and one retried after it committed returns the same ticket with a
+ * 200. Only a genuinely new request creates a ticket and emails the customer.
+ */
+export const conversationsTicketsComposeCreate = async (
+    projectId: string,
+    composeTicketApi: ComposeTicketApi,
+    options?: RequestInit
+): Promise<ComposeTicketResponseApi> => {
+    return apiMutator<ComposeTicketResponseApi>(getConversationsTicketsComposeCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(composeTicketApi),
+    })
+}
+
+export const getConversationsTicketsUnreadCountRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/tickets/unread_count/`
+}
+
+/**
+ * Get total unread ticket count for the team.
+ *
+ * Returns the sum of unread_team_count for all non-resolved tickets visible to the
+ * caller. The team-wide Redis cache (30s TTL, invalidated on changes) is only used for
+ * callers without object-level ticket restrictions, since it holds one unscoped total
+ * per team - serving it to a restricted member would leak counts for tickets they can't
+ * see.
+ * @summary Count unread tickets
+ */
+export const conversationsTicketsUnreadCountRetrieve = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<TicketUnreadCountResponseApi> => {
+    return apiMutator<TicketUnreadCountResponseApi>(getConversationsTicketsUnreadCountRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsViewsListUrl = (projectId: string, params?: ConversationsViewsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/conversations/views/?${stringifiedParams}`
+        : `/api/projects/${projectId}/conversations/views/`
+}
+
+export const conversationsViewsList = async (
+    projectId: string,
+    params?: ConversationsViewsListParams,
+    options?: RequestInit
+): Promise<PaginatedTicketViewListApi> => {
+    return apiMutator<PaginatedTicketViewListApi>(getConversationsViewsListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsViewsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/views/`
+}
+
+export const conversationsViewsCreate = async (
+    projectId: string,
+    ticketViewApi: NonReadonly<TicketViewApi>,
+    options?: RequestInit
+): Promise<TicketViewApi> => {
+    return apiMutator<TicketViewApi>(getConversationsViewsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(ticketViewApi),
+    })
+}
+
+export const getConversationsViewsRetrieveUrl = (projectId: string, shortId: string) => {
+    return `/api/projects/${projectId}/conversations/views/${shortId}/`
+}
+
+export const conversationsViewsRetrieve = async (
+    projectId: string,
+    shortId: string,
+    options?: RequestInit
+): Promise<TicketViewApi> => {
+    return apiMutator<TicketViewApi>(getConversationsViewsRetrieveUrl(projectId, shortId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getConversationsViewsPartialUpdateUrl = (projectId: string, shortId: string) => {
+    return `/api/projects/${projectId}/conversations/views/${shortId}/`
+}
+
+export const conversationsViewsPartialUpdate = async (
+    projectId: string,
+    shortId: string,
+    patchedTicketViewApi?: NonReadonly<PatchedTicketViewApi>,
+    options?: RequestInit
+): Promise<TicketViewApi> => {
+    return apiMutator<TicketViewApi>(getConversationsViewsPartialUpdateUrl(projectId, shortId), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedTicketViewApi),
+    })
+}
+
+export const getConversationsViewsDestroyUrl = (projectId: string, shortId: string) => {
+    return `/api/projects/${projectId}/conversations/views/${shortId}/`
+}
+
+export const conversationsViewsDestroy = async (
+    projectId: string,
+    shortId: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getConversationsViewsDestroyUrl(projectId, shortId), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getConversationsZendeskImportsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/zendesk_imports/`
+}
+
+export const conversationsZendeskImportsCreate = async (
+    projectId: string,
+    zendeskImportStartApi: ZendeskImportStartApi,
+    options?: RequestInit
+): Promise<ZendeskImportJobApi> => {
+    return apiMutator<ZendeskImportJobApi>(getConversationsZendeskImportsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(zendeskImportStartApi),
+    })
+}
+
+export const getConversationsZendeskImportsStatusRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/conversations/zendesk_imports/status/`
+}
+
+export const conversationsZendeskImportsStatusRetrieve = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<ZendeskImportJobApi> => {
+    return apiMutator<ZendeskImportJobApi>(getConversationsZendeskImportsStatusRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}

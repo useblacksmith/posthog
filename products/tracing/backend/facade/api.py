@@ -1,0 +1,289 @@
+"""
+Facade for tracing.
+
+This is the ONLY module other products are allowed to import.
+
+Responsibilities:
+- Accept frozen dataclasses as input parameters
+- Call business logic (logic.py)
+- Convert Django models to frozen dataclasses before returning
+- Enforce transactions where needed
+- Remain thin and stable
+
+Do NOT:
+- Implement business logic here (use logic.py)
+- Import DRF, serializers, or HTTP concerns
+- Return ORM instances or QuerySets
+"""
+
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+
+from posthog.schema import (
+    CachedTraceSpansAttributeBreakdownQueryResponse,
+    CachedTraceSpansQueryResponse,
+    CachedTraceSpansSymbolStatsQueryResponse,
+    CompareFilter,
+    DateRange,
+    PropertyGroupFilter,
+    SourceSymbol,
+    TraceSpanBreakdownOrderBy,
+    TraceSpanBreakdownType,
+    TraceSpansAttributeBreakdownQueryResponse,
+    TraceSpansQueryResponse,
+    TraceSpansSymbolStatsQueryResponse,
+)
+
+from products.tracing.backend.ai_events import (
+    MAX_AI_EVENTS_PER_TRACE as _MAX_AI_EVENTS_PER_TRACE,
+    TraceAiEvents,
+    fetch_trace_ai_events as _fetch_trace_ai_events,
+)
+from products.tracing.backend.attribute_breakdown_query_runner import (
+    FACET_COLUMNS as _FACET_COLUMNS,
+    run_attribute_breakdown_query as _run_attribute_breakdown_query,
+)
+from products.tracing.backend.count_query_runner import run_count_query as _run_count_query
+from products.tracing.backend.duration_histogram_query_runner import (
+    run_duration_histogram_query as _run_duration_histogram_query,
+)
+from products.tracing.backend.error_counts import (
+    MAX_IDS_PER_LOOKUP as _MAX_IDS_PER_LOOKUP,
+    count_session_exceptions as _count_session_exceptions,
+    count_span_exceptions as _count_span_exceptions,
+    count_trace_exceptions as _count_trace_exceptions,
+)
+from products.tracing.backend.impact_query_runner import run_impact_query as _run_impact_query
+from products.tracing.backend.latency_heatmap_query_runner import (
+    run_latency_heatmap_query as _run_latency_heatmap_query,
+)
+from products.tracing.backend.self_time import annotate_self_time as _annotate_self_time
+from products.tracing.backend.service_health_query_runner import (
+    run_service_health_query as _run_service_health_query,
+    service_health_byte_cap_message as _service_health_byte_cap_message,
+)
+from products.tracing.backend.symbol_stats_query_runner import run_symbol_stats_query as _run_symbol_stats_query
+from products.tracing.backend.trace_summary import (
+    DEFAULT_SUMMARY_LIMIT as _DEFAULT_SUMMARY_LIMIT,
+    MAX_SUMMARY_LIMIT as _MAX_SUMMARY_LIMIT,
+    summarize_trace as _summarize_trace,
+)
+
+from .contracts import ServiceHealthParams
+
+if TYPE_CHECKING:
+    from posthog.models import Team, User
+
+
+# Allowlisted top-level span columns for the "span" breakdown type. Re-exported so the
+# presentation layer can validate `breakdownKey` without reaching into the query runner.
+FACET_COLUMNS = _FACET_COLUMNS
+
+# Cap on the ids one error-count request may ask about, per id kind. Re-exported so the
+# presentation layer can bound its request serializer without reaching into the lookup module.
+MAX_IDS_PER_LOOKUP = _MAX_IDS_PER_LOOKUP
+
+# Cap on the AI events one trace lookup returns. Re-exported so the response can state it.
+MAX_AI_EVENTS_PER_TRACE = _MAX_AI_EVENTS_PER_TRACE
+
+# Default and cap on the entries per list of a trace summary. Re-exported so the request
+# serializer can bound `summaryLimit`.
+DEFAULT_SUMMARY_LIMIT = _DEFAULT_SUMMARY_LIMIT
+MAX_SUMMARY_LIMIT = _MAX_SUMMARY_LIMIT
+
+
+# --- Converters (model -> frozen dataclass) ---
+#
+# These look repetitive when fields align 1:1. The value is having ONE place
+# where "internal" becomes "external contract". When models and contracts drift,
+# the mapper absorbs the change instead of it leaking everywhere.
+
+
+def run_count_query(
+    *,
+    team: "Team",
+    date_range: DateRange,
+    service_names: list[str] | None = None,
+    status_codes: list[int] | None = None,
+    filter_group: PropertyGroupFilter | None = None,
+) -> TraceSpansQueryResponse | CachedTraceSpansQueryResponse:
+    """Run a cheap scalar count of trace spans matching the given filters."""
+    return _run_count_query(
+        team=team,
+        date_range=date_range,
+        service_names=service_names,
+        status_codes=status_codes,
+        filter_group=filter_group,
+    )
+
+
+def run_impact_query(
+    *,
+    team: "Team",
+    date_range: DateRange,
+    service_names: list[str] | None = None,
+    status_codes: list[int] | None = None,
+    filter_group: PropertyGroupFilter | None = None,
+) -> TraceSpansQueryResponse | CachedTraceSpansQueryResponse:
+    """Run the sessions/people aggregates for the spans matching the given filters."""
+    return _run_impact_query(
+        team=team,
+        date_range=date_range,
+        service_names=service_names,
+        status_codes=status_codes,
+        filter_group=filter_group,
+    )
+
+
+def run_attribute_breakdown_query(
+    *,
+    team: "Team",
+    date_range: DateRange,
+    breakdown_key: str,
+    breakdown_type: TraceSpanBreakdownType,
+    order_by: TraceSpanBreakdownOrderBy | None = None,
+    compare_filter: CompareFilter | None = None,
+    filter_group: PropertyGroupFilter | None = None,
+    service_names: list[str] | None = None,
+    exclude_breakdown_filter: bool = False,
+    facet_search: str | None = None,
+) -> TraceSpansAttributeBreakdownQueryResponse | CachedTraceSpansAttributeBreakdownQueryResponse:
+    """Run a span breakdown grouped by one attribute's value within a filtered span set."""
+    return _run_attribute_breakdown_query(
+        team=team,
+        date_range=date_range,
+        breakdown_key=breakdown_key,
+        breakdown_type=breakdown_type,
+        order_by=order_by,
+        compare_filter=compare_filter,
+        filter_group=filter_group,
+        service_names=service_names,
+        exclude_breakdown_filter=exclude_breakdown_filter,
+        facet_search=facet_search,
+    )
+
+
+def run_symbol_stats_query(
+    *,
+    team: "Team",
+    file_path: str,
+    date_range: DateRange,
+    symbols: list[SourceSymbol] | None = None,
+) -> TraceSpansSymbolStatsQueryResponse | CachedTraceSpansSymbolStatsQueryResponse:
+    """Run per-line (no symbols) or per-symbol latency stats for one source file, vs the prior period."""
+    return _run_symbol_stats_query(
+        team=team,
+        file_path=file_path,
+        date_range=date_range,
+        symbols=symbols,
+    )
+
+
+def run_duration_histogram_query(
+    *,
+    team: "Team",
+    date_range: DateRange,
+    service_names: list[str] | None = None,
+    status_codes: list[int] | None = None,
+    filter_group: PropertyGroupFilter | None = None,
+    root_spans: bool = True,
+) -> TraceSpansQueryResponse | CachedTraceSpansQueryResponse:
+    """Run the per-bucket duration histogram, stacked by service.
+
+    Root spans by default (a distribution of traces); `root_spans=False` buckets every
+    matching span — pair with a span name filter for operation-scoped distributions.
+    """
+    return _run_duration_histogram_query(
+        team=team,
+        date_range=date_range,
+        service_names=service_names,
+        status_codes=status_codes,
+        filter_group=filter_group,
+        root_spans=root_spans,
+    )
+
+
+def run_latency_heatmap_query(
+    *,
+    team: "Team",
+    date_range: DateRange,
+    service_names: list[str] | None = None,
+    status_codes: list[int] | None = None,
+    filter_group: PropertyGroupFilter | None = None,
+    root_spans: bool = True,
+) -> TraceSpansQueryResponse | CachedTraceSpansQueryResponse:
+    """Run the latency-over-time heatmap: counts per (time bucket, 1-2-5 duration bucket).
+
+    Root spans by default (a distribution of traces); `root_spans=False` buckets every
+    matching span — pair with a span name filter for operation-scoped heatmaps.
+    """
+    return _run_latency_heatmap_query(
+        team=team,
+        date_range=date_range,
+        service_names=service_names,
+        status_codes=status_codes,
+        filter_group=filter_group,
+        root_spans=root_spans,
+    )
+
+
+def annotate_self_time(spans: list[dict]) -> None:
+    """Set `self_time_nano` on every span dict of a full trace, in place."""
+    _annotate_self_time(spans)
+
+
+def summarize_trace(spans: list[dict], *, limit: int = DEFAULT_SUMMARY_LIMIT, truncated: bool = False) -> dict:
+    """Digest a self-time-annotated trace into a compact summary (see `trace_summary`)."""
+    return _summarize_trace(spans, limit=limit, truncated=truncated)
+
+
+def count_trace_exceptions(
+    *, team: "Team", trace_ids: list[str], date_from: datetime, date_to: datetime
+) -> dict[str, int]:
+    """Count the exceptions Error Tracking linked to an issue, per trace, inside the window.
+
+    Keys come back lowercased. A trace with no such exceptions is absent from the result rather
+    than present with a zero.
+    """
+    return _count_trace_exceptions(team=team, trace_ids=trace_ids, date_from=date_from, date_to=date_to)
+
+
+def count_span_exceptions(
+    *, team: "Team", span_ids: list[str], trace_ids: list[str], date_from: datetime, date_to: datetime
+) -> dict[str, int]:
+    """Count the exceptions Error Tracking linked to an issue, per span, inside the window.
+
+    A span id is only unique within its trace, so the traces the spans belong to bound the match
+    as well. Keys come back lowercased.
+    """
+    return _count_span_exceptions(
+        team=team, span_ids=span_ids, trace_ids=trace_ids, date_from=date_from, date_to=date_to
+    )
+
+
+def count_session_exceptions(
+    *, team: "Team", session_ids: list[str], date_from: datetime, date_to: datetime
+) -> dict[str, int]:
+    """Count the exceptions Error Tracking linked to an issue, per session, inside the window.
+
+    A session with no such exceptions is absent from the result rather than present with a zero.
+    """
+    return _count_session_exceptions(team=team, session_ids=session_ids, date_from=date_from, date_to=date_to)
+
+
+def fetch_trace_ai_events(*, team: "Team", user: "User | None", trace_id: str) -> TraceAiEvents:
+    """List the LLM analytics events whose `$ai_trace_id` is the trace id, as lowercase hex or as
+    the hyphenated UUID the LLM gateway writes, earliest start first, capped with `has_more` set
+    past the cap. The events side of the
+    trace-to-AI-events join, which the caller finishes. The user's property access rules apply to
+    the returned columns.
+    """
+    return _fetch_trace_ai_events(team=team, user=user, trace_id=trace_id)
+
+
+def run_service_health_query(*, team: "Team", params: ServiceHealthParams) -> dict[str, Any]:
+    return _run_service_health_query(team=team, params=params)
+
+
+def service_health_byte_cap_message(*, team: "Team", params: ServiceHealthParams) -> str:
+    return _service_health_byte_cap_message(team=team, params=params)

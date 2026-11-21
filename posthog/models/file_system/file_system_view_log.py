@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import heapq
+from collections.abc import Collection, Sequence
+from dataclasses import is_dataclass
+from datetime import date, datetime, timedelta
+from typing import TYPE_CHECKING, Optional, cast
+from zoneinfo import ZoneInfo
+
+from django.contrib.postgres.fields import ArrayField
+from django.db import IntegrityError, models, transaction
+from django.db.models import Exists, OuterRef, Q, QuerySet
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
+from django.utils import timezone
+
+from posthog.models.file_system.constants import DEFAULT_SURFACE, surface_q
+from posthog.models.file_system.file_system import FileSystem
+from posthog.models.file_system.file_system_representation import FileSystemRepresentation
+from posthog.models.team import Team
+from posthog.models.utils import UUIDModel
+
+if TYPE_CHECKING:
+    from posthog.models.user import User
+
+VIEW_DAYS_KEPT = 35
+FRECENCY_HALF_LIFE_DAYS = 14
+
+
+def view_days_score(view_days: Sequence[date], today: date) -> float:
+    return sum(
+        0.5 ** ((today - day).days / FRECENCY_HALF_LIFE_DAYS)
+        for day in set(view_days)
+        if 0 <= (today - day).days < VIEW_DAYS_KEPT
+    )
+
+
+class FileSystemViewLog(UUIDModel):
+    team = models.ForeignKey("Team", on_delete=models.CASCADE)
+    user = models.ForeignKey("User", on_delete=models.CASCADE)
+    type = models.CharField(max_length=150)
+    ref = models.CharField(max_length=200)
+    viewed_at = models.DateTimeField(default=timezone.now)
+    # Product surface this view belongs to (e.g. "web", "desktop"). NULL == DEFAULT_SURFACE.
+    # Not part of the unique constraint below: a (type, ref) item is exclusive to one surface,
+    # so (team, user, type, ref) already identifies a view uniquely. The column only lets us
+    # filter Recents to a single surface without joining back to FileSystem.
+    surface = models.CharField(max_length=100, null=True, blank=True)
+    view_days = ArrayField(models.DateField(), null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["team", "user", "-viewed_at"], name="posthog_fsvl_recent_user_views"),
+            models.Index(fields=["team", "type", "ref", "-viewed_at"], name="posthog_fsvl_recent_item_views"),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=("team", "user", "type", "ref"), name="posthog_fsvl_unique_user_item")
+        ]
+
+
+@receiver(post_delete, sender=FileSystem)
+def _drop_view_logs_when_file_deleted(sender, instance: FileSystem, **kwargs) -> None:
+    # When a file (not a folder or shortcut) is removed, drop the matching view logs so
+    # the Recents sidebar can't surface a dead reference. Shortcuts share (type, ref) with
+    # their canonical file, so we only act when the canonical row is gone.
+    if not instance.ref or instance.type == "folder" or instance.shortcut:
+        return
+    surface = instance.surface or DEFAULT_SURFACE
+    if (
+        FileSystem.objects.filter(surface_q(surface), team_id=instance.team_id, type=instance.type, ref=instance.ref)
+        .exclude(shortcut=True)
+        .exists()
+    ):
+        return
+    FileSystemViewLog.objects.filter(
+        surface_q(surface), team_id=instance.team_id, type=instance.type, ref=instance.ref
+    ).delete()
+
+
+def log_file_system_view(
+    *,
+    user: Optional[User],
+    obj: FileSystemRepresentation | object,
+    team_id: Optional[int] = None,
+    viewed_at: Optional[datetime] = None,
+) -> None:
+    if user is None or not getattr(user, "is_authenticated", False):
+        return
+
+    resolved = resolve_representation(obj, team_id=team_id)
+    if resolved is None:
+        return
+
+    resolved_team_id, representation = resolved
+
+    now = viewed_at or timezone.now()
+
+    # The (team, user, type, ref) unique constraint allows one view-log row per item, so surface
+    # is not part of the lookup. The same (type, ref) can exist in more than one surface, so we
+    # refresh `surface` on every view: the row reflects the most recent view's surface, keeping
+    # Recents (filtered per-surface) and the delete-cleanup signal accurate. Legacy rows are NULL (== web).
+    update_kwargs = {
+        "team_id": resolved_team_id,
+        "user_id": user.id,
+        "type": representation.type,
+        "ref": str(representation.ref),
+    }
+    surface = getattr(representation, "surface", DEFAULT_SURFACE)
+    team_timezone = Team.objects.filter(id=resolved_team_id).values_list("timezone", flat=True).first()
+    day = now.astimezone(ZoneInfo(team_timezone or "UTC")).date()
+
+    if _record_view(update_kwargs, viewed_at=now, surface=surface, day=day):
+        return
+
+    try:
+        with transaction.atomic():
+            FileSystemViewLog.objects.create(viewed_at=now, surface=surface, view_days=[day], **update_kwargs)
+    except IntegrityError:
+        # Another request may have created the row after our update attempt.
+        _record_view(update_kwargs, viewed_at=now, surface=surface, day=day)
+
+
+def _record_view(lookup: dict[str, object], *, viewed_at: datetime, surface: str, day: date) -> bool:
+    with transaction.atomic():
+        row = FileSystemViewLog.objects.select_for_update().filter(**lookup).values_list("id", "view_days").first()
+        if row is None:
+            return False
+        log_id, known_days = row
+        view_days = sorted({d for d in [*(known_days or []), day] if d > day - timedelta(days=VIEW_DAYS_KEPT)})
+        FileSystemViewLog.objects.filter(id=log_id).update(viewed_at=viewed_at, surface=surface, view_days=view_days)
+        return True
+
+
+def recent_view_logs(
+    *,
+    team_id: int,
+    user_id: int,
+    surface: str = DEFAULT_SURFACE,
+    type: Optional[str] = None,
+    exclude_types: Optional[Collection[str]] = None,
+    limit: Optional[int] = None,
+    descending: bool = True,
+) -> QuerySet[FileSystemViewLog]:
+    """A user's view-log rows for one surface, newest first by default.
+
+    Served end-to-end by the ``(team, user, -viewed_at)`` index: no join to FileSystem and no
+    sort on a computed column. This is the single query behind both Recents and the per-scene
+    "last viewed" markers. ``descending=False`` orders oldest-first; the slice then happens at the
+    query level so ``limit`` always returns the globally oldest/newest rows, never a re-sorted page.
+    """
+    queryset = FileSystemViewLog.objects.filter(surface_q(surface), team_id=team_id, user_id=user_id)
+    if type is not None:
+        queryset = queryset.filter(type=type)
+    if exclude_types:
+        queryset = queryset.exclude(type__in=list(exclude_types))
+    queryset = queryset.order_by("-viewed_at" if descending else "viewed_at")
+    if limit is not None:
+        queryset = queryset[:limit]
+    return queryset
+
+
+def get_recent_file_system_items(
+    *,
+    team_id: int,
+    user_id: int,
+    surface: str = DEFAULT_SURFACE,
+    limit: Optional[int] = None,
+    exclude_types: Optional[Sequence[str]] = ("folder",),
+    file_system_queryset: Optional[QuerySet[FileSystem]] = None,
+    descending: bool = True,
+    frequent_on: date | None = None,
+) -> list[FileSystem]:
+    """Recently-viewed FileSystem rows for a user, newest first by default.
+
+    View-log-first: read the recent ``(type, ref)`` keys from the indexed view log, then hydrate
+    the canonical FileSystem rows for exactly those keys. This replaces a left join plus an
+    ``ORDER BY`` on a computed ``last_viewed_at`` column, which forced a full scan and sort of the
+    team's entire tree on every homepage/search load.
+
+    ``file_system_queryset`` lets callers pre-scope the hydration (e.g. apply access control)
+    before the ``(type, ref)`` keys are matched. ``descending`` is threaded down to the view-log
+    query so the ``limit`` slice picks the globally oldest/newest views, not a re-sorted page.
+    """
+    entries = (
+        (
+            file_system_queryset
+            if frequent_on is not None and file_system_queryset is not None
+            else FileSystem.objects.all()
+        )
+        .filter(surface_q(surface), team_id=team_id, type=OuterRef("type"), ref=OuterRef("ref"))
+        .exclude(shortcut=True)
+    )
+    log_queryset = recent_view_logs(
+        team_id=team_id,
+        user_id=user_id,
+        surface=surface,
+        exclude_types=exclude_types,
+        descending=descending,
+    ).filter(Exists(entries))
+    if frequent_on is not None:
+        candidates = (
+            (row_type, row_ref, viewed_at, view_days_score(view_days or [], frequent_on))
+            for row_type, row_ref, viewed_at, view_days in log_queryset.filter(
+                viewed_at__gte=timezone.now() - timedelta(days=VIEW_DAYS_KEPT)
+            )
+            .values_list("type", "ref", "viewed_at", "view_days")
+            .iterator()
+            if len({day for day in view_days or [] if 0 <= (frequent_on - day).days < VIEW_DAYS_KEPT}) >= 2
+        )
+        ranked = heapq.nlargest(limit or 20, candidates, key=lambda row: (row[3], row[2], row[0], row[1]))
+        log_rows = [(row_type, row_ref, viewed_at) for row_type, row_ref, viewed_at, _ in ranked]
+    else:
+        if limit is not None:
+            log_queryset = log_queryset[:limit]
+        log_rows = list(log_queryset.values_list("type", "ref", "viewed_at"))
+    if not log_rows:
+        return []
+
+    # The (team, user, type, ref) unique constraint guarantees one row per key, so no dedup needed.
+    key_filter = Q()
+    for row_type, row_ref, _ in log_rows:
+        key_filter |= Q(type=row_type, ref=row_ref)
+
+    base_queryset = (
+        file_system_queryset
+        if file_system_queryset is not None
+        else FileSystem.objects.filter(surface_q(surface), team_id=team_id)
+    )
+    rows_by_key: dict[tuple[str, Optional[str]], FileSystem] = {
+        (row.type, row.ref): row
+        for row in base_queryset.filter(key_filter).exclude(shortcut=True).select_related("created_by")
+    }
+
+    ordered: list[FileSystem] = []
+    for row_type, row_ref, viewed_at in log_rows:
+        row = rows_by_key.get((row_type, row_ref))
+        if row is not None:
+            row.last_viewed_at = viewed_at  # type: ignore[attr-defined]
+            ordered.append(row)
+    return ordered
+
+
+def resolve_representation(
+    obj: FileSystemRepresentation | object,
+    *,
+    team_id: Optional[int] = None,
+) -> tuple[int, FileSystemRepresentation] | None:
+    if isinstance(obj, FileSystemRepresentation):
+        if team_id is None:
+            raise ValueError("Team id must be provided when using a FileSystemRepresentation directly.")
+        return team_id, obj
+
+    if hasattr(obj, "get_file_system_representation"):
+        team = getattr(obj, "team", None)
+        if team is None:
+            return None
+        representation = cast(FileSystemRepresentation, obj.get_file_system_representation())
+        return team.id, representation
+
+    if is_dataclass(obj) and isinstance(obj, FileSystemRepresentation):
+        if team_id is None:
+            raise ValueError("Team id must be provided when using a FileSystemRepresentation directly.")
+        return team_id, obj
+
+    return None

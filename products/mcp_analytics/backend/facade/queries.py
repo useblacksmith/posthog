@@ -1,0 +1,58 @@
+"""Query runners core dispatches on — the public wiring surface for HogQL queries.
+
+mcp_analytics is tach-isolated to expose only `backend.facade.*`, so core's
+`get_query_runner` dispatch imports the runner from here rather than reaching into
+`backend.hogql_queries` directly.
+"""
+
+from products.mcp_analytics.backend.hogql_queries.dashboard_query import MCPDashboardQueryRunner
+from products.mcp_analytics.backend.hogql_queries.dashboard_series import (
+    MCPToolCallBreakdownQueryRunner,
+    MCPToolCallsAndErrorsQueryRunner,
+)
+from products.mcp_analytics.backend.hogql_queries.harness_breakdown import MCPHarnessBreakdownQueryRunner
+from products.mcp_analytics.backend.hogql_queries.missing_capabilities import MCPMissingCapabilitiesQueryRunner
+from products.mcp_analytics.backend.hogql_queries.model_breakdown import MCPModelBreakdownQueryRunner
+from products.mcp_analytics.backend.hogql_queries.protocol_version_breakdown import (
+    MCPProtocolVersionBreakdownQueryRunner,
+)
+from products.mcp_analytics.backend.hogql_queries.tool_quality_tables import (
+    MCPToolCategoriesQueryRunner,
+    MCPToolCategoryCountsQueryRunner,
+    MCPToolCategoryMapQueryRunner,
+    MCPToolQualityDailyStatsQueryRunner,
+    MCPToolQualityRowsQueryRunner,
+)
+from products.mcp_analytics.backend.hogql_queries.tool_tables import (
+    MCPToolDailyStatsQueryRunner,
+    MCPToolDescriptionsQueryRunner,
+    MCPToolFailureOccurrencesQueryRunner,
+    MCPToolFailuresQueryRunner,
+    MCPToolNeighborsQueryRunner,
+    MCPToolSampleIntentsQueryRunner,
+    MCPToolStatsQueryRunner,
+    MCPToolTopUsersQueryRunner,
+)
+
+__all__ = [
+    "MCPDashboardQueryRunner",
+    "MCPHarnessBreakdownQueryRunner",
+    "MCPModelBreakdownQueryRunner",
+    "MCPProtocolVersionBreakdownQueryRunner",
+    "MCPToolCallBreakdownQueryRunner",
+    "MCPToolCallsAndErrorsQueryRunner",
+    "MCPToolCategoriesQueryRunner",
+    "MCPToolCategoryCountsQueryRunner",
+    "MCPToolCategoryMapQueryRunner",
+    "MCPToolDailyStatsQueryRunner",
+    "MCPToolDescriptionsQueryRunner",
+    "MCPToolFailureOccurrencesQueryRunner",
+    "MCPToolFailuresQueryRunner",
+    "MCPToolNeighborsQueryRunner",
+    "MCPToolQualityDailyStatsQueryRunner",
+    "MCPToolQualityRowsQueryRunner",
+    "MCPToolSampleIntentsQueryRunner",
+    "MCPToolStatsQueryRunner",
+    "MCPToolTopUsersQueryRunner",
+    "MCPMissingCapabilitiesQueryRunner",
+]

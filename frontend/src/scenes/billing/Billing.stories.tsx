@@ -1,0 +1,370 @@
+import { MOCK_DEFAULT_ORGANIZATION } from 'lib/api.mock'
+
+import { Meta, StoryObj } from '@storybook/react'
+
+import { dayjs } from 'lib/dayjs'
+import { GRANDFATHERED_EVENTS_RETENTION_PLAN_KEY } from 'lib/logic/billing/billingLogic'
+
+import { mswDecorator, useStorybookMocks } from '~/mocks/browser'
+import { billingJson } from '~/mocks/fixtures/_billing'
+import { billingUnsubscribedJson } from '~/mocks/fixtures/_billing_unsubscribed'
+import billingJsonWith100PercentDiscount from '~/mocks/fixtures/_billing_with_100_percent_discount.json'
+import billingJsonWithCredits from '~/mocks/fixtures/_billing_with_credits.json'
+import billingJsonWithDiscount from '~/mocks/fixtures/_billing_with_discount.json'
+import preflightJson from '~/mocks/fixtures/_preflight.json'
+import { AvailableFeature, BillingProvider, BillingType, StartupProgramLabel } from '~/types'
+
+import { Billing } from './Billing'
+import { PurchaseCreditsModal } from './PurchaseCreditsModal'
+import { UnsubscribeSurveyModal } from './UnsubscribeSurveyModal'
+
+// Mirrors prod payloads where the billing API omits icon_key — exercises the productType fallback
+// in getProductIcon so each product still renders its own icon.
+const billingJsonWithoutIconKeys: BillingType = {
+    ...billingJson,
+    products: billingJson.products.map((product) => ({
+        ...product,
+        icon_key: null,
+        addons: product.addons.map((addon) => ({ ...addon, icon_key: undefined })),
+    })),
+}
+
+const billingJsonWithGrandfatheredEventsRetention: BillingType = {
+    ...billingJson,
+    products: billingJson.products.map((product) =>
+        product.type === 'product_analytics'
+            ? {
+                  ...product,
+                  plans: product.plans.flatMap((plan) =>
+                      plan.current_plan
+                          ? [
+                                { ...plan, plan_key: GRANDFATHERED_EVENTS_RETENTION_PLAN_KEY },
+                                { ...plan, plan_key: 'paid-20261105', current_plan: false },
+                            ]
+                          : [plan]
+                  ),
+              }
+            : product
+    ),
+}
+
+const VERCEL_INVOICES_URL = 'https://vercel.com/example-team/~/integrations/posthog/icfg_example/invoices'
+
+const meta: Meta = {
+    title: 'Scenes-Other/Billing',
+    parameters: {
+        layout: 'fullscreen',
+        viewMode: 'story',
+        mockDate: '2024-03-10',
+        testOptions: {
+            // Needs a slightly larger width to push the rendered scene away from breakpoint boundary
+            viewport: {
+                width: 1300,
+                height: 720,
+            },
+        },
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                '/_preflight': {
+                    ...preflightJson,
+                    cloud: true,
+                    realm: 'cloud',
+                },
+            },
+        }),
+    ],
+}
+export default meta
+
+type Story = StoryObj<{}>
+
+export const _Billing: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJson,
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingManagedByPartner: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingUnsubscribedJson,
+                    customer_id: '',
+                    billing_managed_by_partner: { partner_name: 'Example Partner' },
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingManagedByVercel: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJson,
+                    billing_provider: BillingProvider.Vercel,
+                    external_billing_provider_invoices_url: VERCEL_INVOICES_URL,
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingManagedByVercelWithoutSubscription: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingUnsubscribedJson,
+                    billing_provider: BillingProvider.Vercel,
+                    external_billing_provider_invoices_url: VERCEL_INVOICES_URL,
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingOnStartupPlan: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJson,
+                    startup_program_label: StartupProgramLabel.Startup,
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+const billingJsonOnYCPlan: BillingType = {
+    ...billingJson,
+    startup_program_label: StartupProgramLabel.YC,
+    discount_amount_usd: '42000.00',
+    // In the middle of the billing period, to show that YC keeps its own expiry date
+    amount_off_expires_at: dayjs('2024-03-20T12:00:00Z'),
+    startup_program_credits_renew: true,
+}
+
+export const BillingOnYCPlan: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': billingJsonOnYCPlan,
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingOnYCPlanWithCreditsUsed: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': { ...billingJsonOnYCPlan, discount_amount_usd: undefined },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingOnYCPlanWithCreditsNotRenewing: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': { ...billingJsonOnYCPlan, startup_program_credits_renew: false },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingWithDiscount: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJsonWithDiscount,
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingWithCredits: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJsonWithCredits,
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingWithCreditCTA: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJson,
+                    account_owner: null,
+                },
+                '/api/billing/credits/overview': {
+                    status: 'none',
+                    eligible: true,
+                    estimated_monthly_credit_amount_usd: 1200,
+                    email: 'test@posthog.com',
+                    cc_last_four: '1234',
+                    cc_brand: 'Visa',
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingWithLimitAnd100PercentDiscount: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJsonWith100PercentDiscount,
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingPurchaseCreditsModal: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJson,
+                },
+                '/api/billing/credits/overview': {
+                    status: 'none',
+                    eligible: true,
+                    estimated_monthly_credit_amount_usd: 1200,
+                    email: 'test@posthog.com',
+                    cc_last_four: '1234',
+                    cc_brand: 'Visa',
+                    credit_brackets: [
+                        { discount: 0.1, annual_credit_from_inclusive: 3333, annual_credit_to_exclusive: 25000 },
+                        { discount: 0.2, annual_credit_from_inclusive: 25000, annual_credit_to_exclusive: 80000 },
+                        { discount: 0.25, annual_credit_from_inclusive: 80000, annual_credit_to_exclusive: 153847 },
+                        { discount: 0.35, annual_credit_from_inclusive: 153847, annual_credit_to_exclusive: null },
+                    ],
+                },
+            },
+        })
+
+        return <PurchaseCreditsModal />
+    },
+}
+
+export const BillingWithoutIconKeys: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJsonWithoutIconKeys,
+                },
+            },
+        })
+
+        return <Billing />
+    },
+}
+
+export const BillingUnsubscribeModal: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': {
+                    ...billingJson,
+                },
+            },
+        })
+
+        return <UnsubscribeSurveyModal product={billingJson.products[0]} />
+    },
+}
+
+export const BillingUnsubscribeModalShorteningEventsRetention: Story = {
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/organizations/@current/': {
+                    ...MOCK_DEFAULT_ORGANIZATION,
+                    available_product_features: [
+                        {
+                            key: AvailableFeature.PRODUCT_ANALYTICS_DATA_RETENTION,
+                            name: 'Data retention',
+                            limit: 7,
+                            unit: 'years',
+                        },
+                    ],
+                },
+                '/api/organizations/:organization_id/events_retention_setting/downgrade_deletion_count/': {
+                    retention_months: 12,
+                    events_deleted: 1234567,
+                },
+            },
+        }),
+    ],
+    parameters: { testOptions: { snapshotBrowsers: [] } },
+    render: () => {
+        useStorybookMocks({ get: { '/api/billing/': billingJson } })
+
+        return <UnsubscribeSurveyModal product={billingJson.products[0]} />
+    },
+}
+
+export const BillingUnsubscribeModalWithGrandfatheredEventsRetention: Story = {
+    render: () => {
+        useStorybookMocks({
+            get: {
+                '/api/billing/': billingJsonWithGrandfatheredEventsRetention,
+                '/api/organizations/:organization_id/events_retention_setting/downgrade_deletion_count/': {
+                    retention_months: 12,
+                    events_deleted: 1234567,
+                },
+            },
+        })
+
+        return <UnsubscribeSurveyModal product={billingJsonWithGrandfatheredEventsRetention.products[0]} />
+    },
+}

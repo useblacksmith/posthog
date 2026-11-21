@@ -1,0 +1,479 @@
+import json
+import uuid
+from typing import Any
+
+import pytest
+from unittest import mock
+
+from django.conf import settings
+
+import psycopg
+import pyarrow as pa
+import aioboto3
+import pytest_asyncio
+import botocore.exceptions
+
+from posthog.models.integration import (
+    AWSRedshiftRoleBasedIntegration,
+    Integration,
+    IntegrationError,
+    RedshiftProvisionedCluster,
+    RedshiftServerlessWorkgroup,
+    parse_redshift_host,
+)
+
+from products.batch_exports.backend.service import AWSCredentials, BatchExportEventsModel, BatchExportInsertInputs
+from products.batch_exports.backend.temporal.destinations.redshift_batch_export import (
+    ClientErrorGroup,
+    CopyParameters,
+    InsufficientS3PermissionsError,
+    RedshiftCopyActivityInputs,
+    RedshiftInsertInputs,
+    RedshiftS3CopyError,
+    S3StageBucketParameters,
+    ServerConnectionParameters,
+    TableParameters,
+    _get_redshift_client_inputs,
+    _get_redshift_credentials_policy_statements,
+    _get_s3_bucket_aws_credentials,
+    _get_table_schemas,
+    _resolve_copy_authorization,
+    check_and_raise_redshift_copy_error,
+    is_s3_read_access_denied,
+    upload_manifest_file,
+)
+from products.batch_exports.backend.temporal.temporary_file import remove_escaped_whitespace_recursive
+from products.batch_exports.backend.tests.temporal.utils.s3 import delete_all_from_s3
+
+TEST_ROOT_BUCKET = "test-batch-exports"
+
+
+@pytest.mark.parametrize("has_person_id", [False, True])
+@pytest.mark.parametrize("properties_data_type", ["varchar", "super"])
+def test_events_table_schemas_match_staged_person_id(has_person_id: bool, properties_data_type: str) -> None:
+    columns = ["uuid", "properties"]
+    if has_person_id:
+        columns.append("person_id")
+    schema = pa.schema([(name, pa.string()) for name in columns])
+
+    table_schemas = _get_table_schemas(BatchExportEventsModel(), schema, properties_data_type)
+
+    for fields in (table_schemas.table_schema, table_schemas.stage_table_schema):
+        assert {name for name, _ in fields} == set(columns)
+        if has_person_id:
+            assert dict(fields)["person_id"] == "VARCHAR(200)"
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ([1, 2, 3], [1, 2, 3]),
+        ("hi\t\n\r\f\bhi", "hi hi"),
+        ([["\t\n\r\f\b"]], [[""]]),
+        (("\t\n\r\f\b",), ("",)),
+        ({"\t\n\r\f\b"}, {""}),
+        ({"key": "\t\n\r\f\b"}, {"key": ""}),
+        ({"key": ["\t\n\r\f\b"]}, {"key": [""]}),
+    ],
+)
+def test_remove_escaped_whitespace_recursive(value, expected):
+    """Test we remove some whitespace values."""
+    assert remove_escaped_whitespace_recursive(value) == expected
+
+
+@pytest.fixture
+def bucket_name(request) -> str:
+    """Name for a test S3 bucket."""
+    try:
+        return request.param
+    except AttributeError:
+        return f"{TEST_ROOT_BUCKET}-{str(uuid.uuid4())}"
+
+
+@pytest_asyncio.fixture
+async def object_storage_client(bucket_name):
+    """Manage an S3 client to interact with a local object storage bucket.
+
+    Yields the client after creating a bucket. Upon resuming, we delete
+    the contents and the bucket itself.
+    """
+    async with aioboto3.Session().client(
+        "s3",
+        aws_access_key_id=settings.OBJECT_STORAGE_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.OBJECT_STORAGE_SECRET_ACCESS_KEY,
+        endpoint_url=settings.OBJECT_STORAGE_ENDPOINT,
+    ) as object_storage_client:
+        await object_storage_client.create_bucket(Bucket=bucket_name)
+
+        yield object_storage_client
+
+        await delete_all_from_s3(object_storage_client, bucket_name, key_prefix="")
+
+        await object_storage_client.delete_bucket(Bucket=bucket_name)
+
+
+async def test_upload_manifest_file(object_storage_client, bucket_name):
+    """Test the a correctly formatted manifest is uploaded with the necessary contents."""
+    test_prefix = uuid.uuid4()
+
+    files_uploaded = []
+    for file_number in range(3):
+        key = f"{test_prefix}/file_{file_number}"
+        await object_storage_client.put_object(
+            Bucket=bucket_name,
+            Key=key,
+            Body=b"0",
+        )
+        files_uploaded.append(key)
+
+    manifest_key = f"/{test_prefix}/manifest.json"
+
+    # Needed for the noisy type checker
+    assert settings.OBJECT_STORAGE_ACCESS_KEY_ID is not None
+    assert settings.OBJECT_STORAGE_SECRET_ACCESS_KEY is not None
+
+    await upload_manifest_file(
+        bucket=bucket_name,
+        region_name="us-east-1",
+        credentials=AWSCredentials(
+            aws_access_key_id=settings.OBJECT_STORAGE_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.OBJECT_STORAGE_SECRET_ACCESS_KEY,
+        ),
+        files_uploaded=files_uploaded,
+        manifest_key=manifest_key,
+    )
+
+    obj = await object_storage_client.get_object(Bucket=bucket_name, Key=manifest_key)
+    body = await obj["Body"].read()
+    loaded = json.loads(body)
+
+    all_file_entries = {entry["url"] for entry in loaded["entries"]}
+    for file_uploaded in files_uploaded:
+        assert f"s3://{bucket_name}/{file_uploaded}" in all_file_entries
+
+    total_content_length = sum(entry["meta"]["content_length"] for entry in loaded["entries"])
+    assert total_content_length == 3
+
+
+async def test_upload_manifest_file_raises_on_client_error(object_storage_client, bucket_name):
+    """Test a ClientErrorGroup is raised when tasks fail."""
+    test_prefix = uuid.uuid4()
+
+    # We don't need to actually upload any files for this, as we will make list_objects_v2 fail.
+    files_uploaded = [f"{test_prefix}/file_{file_number}" for file_number in range(3)]
+
+    manifest_key = f"/{test_prefix}/manifest.json"
+
+    mock_client = mock.MagicMock()
+    mock_client.list_objects_v2.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "Bad user!"}}, "list_objects_v2"
+    )
+
+    mock_context_manager = mock.MagicMock()
+    mock_context_manager.__aenter__.return_value = mock_client
+    mock_context_manager.__aexit__.return_value = None
+
+    mock_session_instance = mock.MagicMock()
+    mock_session_instance.client.return_value = mock_context_manager
+
+    # Needed for the noisy type checker
+    assert settings.OBJECT_STORAGE_ACCESS_KEY_ID is not None
+    assert settings.OBJECT_STORAGE_SECRET_ACCESS_KEY is not None
+
+    with mock.patch("aioboto3.Session") as mock_session_class:
+        mock_session_class.return_value = mock_session_instance
+
+        with pytest.raises(ClientErrorGroup) as exc_info:
+            await upload_manifest_file(
+                bucket=bucket_name,
+                region_name="us-east-1",
+                credentials=AWSCredentials(
+                    aws_access_key_id=settings.OBJECT_STORAGE_ACCESS_KEY_ID,
+                    aws_secret_access_key=settings.OBJECT_STORAGE_SECRET_ACCESS_KEY,
+                ),
+                files_uploaded=files_uploaded,
+                manifest_key=manifest_key,
+            )
+        assert all(isinstance(exc, botocore.exceptions.ClientError) for exc in exc_info.value.exceptions)
+        assert exc_info.value.ops == {"list_objects_v2": {"AccessDenied"}}  # type: ignore
+
+
+def _mock_s3_session_with_head_object(head_object: mock.AsyncMock) -> mock.MagicMock:
+    """Build a mocked aioboto3 Session whose S3 client uses the given head_object mock."""
+    mock_client = mock.MagicMock()
+    mock_client.head_object = head_object
+
+    mock_context_manager = mock.MagicMock()
+    mock_context_manager.__aenter__.return_value = mock_client
+    mock_context_manager.__aexit__.return_value = None
+
+    mock_session_instance = mock.MagicMock()
+    mock_session_instance.client.return_value = mock_context_manager
+    return mock_session_instance
+
+
+@pytest.mark.parametrize(
+    "error_code,status_code,expected",
+    [
+        ("AccessDenied", 403, True),
+        ("403", 403, True),
+        (None, None, False),
+        ("404", 404, False),
+    ],
+)
+async def test_is_s3_read_access_denied(error_code, status_code, expected):
+    """Test we report read access as denied only on a 403/AccessDenied HEAD."""
+    if error_code is None:
+        head_object = mock.AsyncMock(return_value={})
+    else:
+        # Typed as Any to skip the botocore response TypedDict's required-key checks.
+        response: Any = {"Error": {"Code": error_code}, "ResponseMetadata": {"HTTPStatusCode": status_code}}
+        head_object = mock.AsyncMock(side_effect=botocore.exceptions.ClientError(response, "HeadObject"))
+
+    with mock.patch("aioboto3.Session") as mock_session_class:
+        mock_session_class.return_value = _mock_s3_session_with_head_object(head_object)
+
+        denied = await is_s3_read_access_denied(
+            bucket="test-bucket",
+            region_name="us-east-1",
+            credentials=AWSCredentials(aws_access_key_id="key", aws_secret_access_key="secret"),
+            keys=["some/manifest.json", "some/file-0.parquet.zst"],
+        )
+
+    assert denied is expected
+
+
+async def test_is_s3_read_access_denied_swallows_unexpected_error():
+    """An unexpected probe failure (e.g. a connection error) is treated as 'not confirmed' (False)."""
+    head_object = mock.AsyncMock(side_effect=botocore.exceptions.EndpointConnectionError(endpoint_url="https://s3"))
+
+    with mock.patch("aioboto3.Session") as mock_session_class:
+        mock_session_class.return_value = _mock_s3_session_with_head_object(head_object)
+
+        denied = await is_s3_read_access_denied(
+            bucket="test-bucket",
+            region_name="us-east-1",
+            credentials=AWSCredentials(aws_access_key_id="key", aws_secret_access_key="secret"),
+            keys=["some/manifest.json"],
+        )
+
+    assert denied is False
+
+
+class _FakeDiag:
+    def __init__(self, primary: str | None = None, detail: str | None = None):
+        self.message_primary = primary
+        self.message_detail = detail
+
+
+class _FakeInternalError(psycopg.errors.InternalError_):
+    """Stand-in for a Redshift COPY error. psycopg builds `diag` from driver state we can't fake, so
+    we override it to expose the message fields the code inspects."""
+
+    def __init__(self, message: str = "", *, primary: str | None = None, detail: str | None = None):
+        super().__init__(message)
+        self._fake_diag = _FakeDiag(primary, detail)
+
+    @property
+    def diag(self) -> Any:
+        return self._fake_diag
+
+
+@pytest.mark.parametrize("denied", [True, False])
+async def test_check_and_raise_redshift_copy_error_credentials(denied):
+    """With credential auth we probe S3 and only raise the specific error when read is denied."""
+    credentials = AWSCredentials(aws_access_key_id="key", aws_secret_access_key="secret")
+
+    with mock.patch(
+        "products.batch_exports.backend.temporal.destinations.redshift_batch_export.is_s3_read_access_denied",
+        new=mock.AsyncMock(return_value=denied),
+    ):
+        call = check_and_raise_redshift_copy_error(
+            _FakeInternalError("COPY failed"),
+            authorization=credentials,
+            bucket="test-bucket",
+            region_name="us-east-1",
+            manifest_key="prefix/manifest.json",
+            files_uploaded=["prefix/file-0.parquet.zst"],
+        )
+        if denied:
+            with pytest.raises(InsufficientS3PermissionsError):
+                await call
+        else:
+            await call  # should not raise
+
+
+@pytest.mark.parametrize(
+    "error,expected_error",
+    [
+        (
+            _FakeInternalError("COPY with MANIFEST parameter requires full path of an S3 object"),
+            RedshiftS3CopyError,
+        ),
+        (_FakeInternalError("copy failed", detail="S3ServiceException: Access Denied"), RedshiftS3CopyError),
+        (
+            _FakeInternalError('permission denied to create temporary tables in database "my_data"'),
+            psycopg.errors.InsufficientPrivilege,
+        ),
+        (_FakeInternalError("syntax error at or near 'foo'"), None),
+    ],
+)
+async def test_check_and_raise_redshift_copy_error_iam_role(error, expected_error):
+    """IAM role auth can't be probed, so we translate only recognised S3 read/access failures."""
+    call = check_and_raise_redshift_copy_error(
+        error,
+        authorization="arn:aws:iam::123456789012:role/redshift-copy",
+        bucket="test-bucket",
+        region_name="us-east-1",
+        manifest_key="prefix/manifest.json",
+        files_uploaded=["prefix/file-0.parquet.zst"],
+    )
+    if expected_error is not None:
+        with pytest.raises(expected_error):
+            await call
+    else:
+        await call  # should not raise
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        (
+            "examplecluster.abc123xyz789.us-west-2.redshift.amazonaws.com",
+            RedshiftProvisionedCluster(cluster_identifier="examplecluster", region="us-west-2"),
+        ),
+        (
+            "default-wg.123456789012.us-east-1.redshift-serverless.amazonaws.com",
+            RedshiftServerlessWorkgroup(workgroup="default-wg", account_id="123456789012", region="us-east-1"),
+        ),
+    ],
+)
+def test_parse_redshift_host(host, expected):
+    assert parse_redshift_host(host) == expected
+
+
+@pytest.mark.parametrize("host", ["localhost", "my-redshift.example.com", "8.8.8.8", ""])
+def test_parse_redshift_host_rejects_unrecognized_endpoints(host):
+    with pytest.raises(IntegrationError):
+        parse_redshift_host(host)
+
+
+def _aws_redshift_role_integration(**extra_config) -> AWSRedshiftRoleBasedIntegration:
+    integration = Integration(
+        kind=Integration.IntegrationKind.AWS_REDSHIFT,
+        config={
+            "aws_role_arn": "arn:aws:iam::123456789012:role/posthog-batch-exports",
+            "user": "awsuser",
+            **extra_config,
+        },
+    )
+    return AWSRedshiftRoleBasedIntegration(integration)
+
+
+def test_provisioned_cluster_credentials_policy_scopes_to_exact_resources():
+    integration = _aws_redshift_role_integration(groups=["exporters"], auto_create=True)
+    server = RedshiftProvisionedCluster(cluster_identifier="examplecluster", region="us-west-2")
+
+    statements = _get_redshift_credentials_policy_statements(integration, server, "posthog")
+
+    assert statements[0]["Action"] == ["redshift:GetClusterCredentials", "redshift:CreateClusterUser"]
+    assert statements[0]["Resource"] == [
+        "arn:aws:redshift:us-west-2:123456789012:dbuser:examplecluster/awsuser",
+        "arn:aws:redshift:us-west-2:123456789012:dbname:examplecluster/posthog",
+    ]
+    assert statements[1]["Action"] == ["redshift:JoinGroup"]
+    assert statements[1]["Resource"] == [
+        "arn:aws:redshift:us-west-2:123456789012:dbgroup:examplecluster/exporters",
+    ]
+    assert all("*" not in resource for statement in statements for resource in statement["Resource"])
+
+
+def test_serverless_workgroup_credentials_policy_scopes_to_workgroup_arn():
+    workgroup_arn = "arn:aws:redshift-serverless:us-east-1:123456789012:workgroup/abc-123"
+    integration = _aws_redshift_role_integration(workgroup_arn=workgroup_arn)
+    server = RedshiftServerlessWorkgroup(workgroup="default-wg", account_id="123456789012", region="us-east-1")
+
+    statements = _get_redshift_credentials_policy_statements(integration, server, "posthog")
+
+    assert statements == [
+        {
+            "Effect": "Allow",
+            "Action": ["redshift-serverless:GetCredentials"],
+            "Resource": [workgroup_arn],
+        }
+    ]
+
+
+def test_serverless_workgroup_credentials_policy_requires_workgroup_arn():
+    # There must never be a wildcard fallback here: without the exact workgroup ARN
+    # the policy cannot be scoped, so credentials must not be requested at all.
+    integration = _aws_redshift_role_integration()
+    server = RedshiftServerlessWorkgroup(workgroup="default-wg", account_id="123456789012", region="us-east-1")
+
+    with pytest.raises(IntegrationError):
+        _get_redshift_credentials_policy_statements(integration, server, "posthog")
+
+
+@pytest.mark.parametrize(
+    "workgroup_arn",
+    [
+        # Region mismatch.
+        "arn:aws:redshift-serverless:us-west-2:123456789012:workgroup/abc-123",
+        # Account mismatch.
+        "arn:aws:redshift-serverless:us-east-1:999999999999:workgroup/abc-123",
+    ],
+)
+def test_serverless_workgroup_credentials_policy_rejects_mismatched_arn(workgroup_arn):
+    integration = _aws_redshift_role_integration(workgroup_arn=workgroup_arn)
+    server = RedshiftServerlessWorkgroup(workgroup="default-wg", account_id="123456789012", region="us-east-1")
+
+    with pytest.raises(IntegrationError):
+        _get_redshift_credentials_policy_statements(integration, server, "posthog")
+
+
+async def test_client_inputs_require_an_integration():
+    inputs = RedshiftInsertInputs(
+        batch_export=BatchExportInsertInputs(
+            team_id=1,
+            data_interval_start=None,
+            data_interval_end="2024-01-01T00:00:00+00:00",
+            batch_export_id=str(uuid.uuid4()),
+        ),
+        connection=ServerConnectionParameters(database="db", port=5439, host="fake.example.com"),
+        table=TableParameters(schema_name="public", name="events"),
+    )
+
+    with pytest.raises(IntegrationError, match="no linked integration"):
+        await _get_redshift_client_inputs(inputs)
+
+
+@pytest.mark.parametrize("field_name", ["bucket_credentials", "authorization"])
+async def test_copy_rejects_inline_aws_keys(field_name: str):
+    """COPY must not stage or load with inline AWS keys left in `copy_inputs`."""
+    inline_keys = AWSCredentials(aws_access_key_id="key", aws_secret_access_key="secret")
+    integration_id = 1
+    inputs = RedshiftCopyActivityInputs(
+        batch_export=BatchExportInsertInputs(
+            team_id=1,
+            data_interval_start="2024-01-01T00:00:00+00:00",
+            data_interval_end="2024-01-01T01:00:00+00:00",
+        ),
+        connection=ServerConnectionParameters(database="dev", port=5439),
+        table=TableParameters(schema_name="public", name="events", properties_data_type="varchar"),
+        copy=CopyParameters(
+            s3_bucket=S3StageBucketParameters(
+                name="bucket",
+                region_name="us-east-1",
+                credentials=inline_keys if field_name == "bucket_credentials" else integration_id,
+            ),
+            s3_key_prefix="prefix",
+            authorization=inline_keys if field_name == "authorization" else integration_id,
+        ),
+        integration_id=1,
+    )
+    resolve = _get_s3_bucket_aws_credentials if field_name == "bucket_credentials" else _resolve_copy_authorization
+
+    with pytest.raises(IntegrationError, match=f"Inline AWS keys in the Redshift COPY '{field_name}'") as exc_info:
+        await resolve(inputs)
+
+    assert "secret" not in str(exc_info.value)

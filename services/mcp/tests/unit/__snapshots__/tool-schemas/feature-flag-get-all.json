@@ -1,0 +1,76 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "active": {
+            "description": "Filter by flag state. `\"true\"` returns enabled flags, `\"false\"` returns disabled flags, and `\"STALE\"` returns enabled flags that PostHog classifies as stale.",
+            "enum": ["STALE", "false", "true"],
+            "type": "string"
+        },
+        "archived": {
+            "description": "Filter by archived state. When omitted, archived flags are excluded.",
+            "enum": ["false", "true"],
+            "type": "string"
+        },
+        "created_by_id": {
+            "description": "Filter by the user(s) who created the feature flag. Accepts a single user ID, or a JSON-encoded / comma-separated list of user IDs to match any of them.",
+            "type": "string"
+        },
+        "deleted": {
+            "description": "Pass `true` to list only soft-deleted flags, which can be restored, archived or not. When omitted, deleted flags are excluded.",
+            "enum": ["false", "true"],
+            "type": "string"
+        },
+        "eligible_for_experiment": {
+            "description": "When 'true', only return flags that can back an experiment: multivariate with 2-20 variants. Any other value is ignored.",
+            "enum": ["true"],
+            "type": "string"
+        },
+        "evaluation_runtime": {
+            "description": "Filter feature flags by their evaluation runtime.",
+            "enum": ["all", "client", "server"],
+            "type": "string"
+        },
+        "excluded_properties": {
+            "description": "JSON-encoded list of feature flag keys to exclude from the results.",
+            "type": "string"
+        },
+        "excluded_tags": {
+            "description": "JSON-encoded list of tag names to exclude. Flags carrying any of these tags are filtered out.",
+            "type": "string"
+        },
+        "has_evaluation_contexts": {
+            "description": "Filter feature flags by presence of evaluation contexts. 'true' returns only flags with at least one evaluation context, 'false' returns only flags without.",
+            "enum": ["false", "true"],
+            "type": "string"
+        },
+        "ids": {
+            "description": "Comma-separated flag IDs, at most 200. Returns exactly those flags, including archived flags and flags that surveys or product tours own. Other filters are ignored, and soft-deleted flags are left out unless deleted=true.",
+            "type": "string"
+        },
+        "key": {
+            "description": "Filter by exact feature flag key match. Case insensitive.",
+            "type": "string"
+        },
+        "limit": {
+            "description": "Number of results to return per page.",
+            "type": "number"
+        },
+        "offset": {
+            "description": "The initial index from which to return the results.",
+            "type": "number"
+        },
+        "search": {
+            "description": "Search by feature flag key or name (case-insensitive). Spaces, underscores, and hyphens count as the same separator. The words of the term must appear together and in order, so a shorter term matches more flags. Use this to find the flag ID for get/update/delete tools.",
+            "type": "string"
+        },
+        "tags": {
+            "description": "JSON-encoded list of tag names to filter feature flags by.",
+            "type": "string"
+        },
+        "type": {
+            "enum": ["boolean", "experiment", "multivariant", "remote_config"],
+            "type": "string"
+        }
+    },
+    "type": "object"
+}

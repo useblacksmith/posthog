@@ -1,0 +1,121 @@
+import { useActions } from 'kea'
+
+import { resolveFilterTestAccounts } from 'scenes/experiments/exposureContract'
+import { SharedMetric } from 'scenes/experiments/SharedMetrics/sharedMetricLogic'
+
+import type { ExperimentExposureCriteria, ExperimentMetric } from '~/queries/schema/schema-general'
+import { isExperimentMetric } from '~/queries/utils'
+import { ExposureCriteriaModal } from '~/scenes/experiments/ExperimentView/ExposureCriteria'
+import type { Experiment } from '~/types'
+
+import { ExperimentMetricModal } from 'products/experiments/frontend/modals/ExperimentMetricModal/ExperimentMetricModal'
+import {
+    METRIC_CONTEXTS,
+    MetricContext,
+    experimentMetricModalLogic,
+} from 'products/experiments/frontend/modals/ExperimentMetricModal/experimentMetricModalLogic'
+import { MetricSourceModal } from 'products/experiments/frontend/modals/MetricSourceModal/MetricSourceModal'
+import { SharedMetricModal } from 'products/experiments/frontend/modals/SharedMetricModal/SharedMetricModal'
+import { sharedMetricModalLogic } from 'products/experiments/frontend/modals/SharedMetricModal/sharedMetricModalLogic'
+import type { MetricDataSources } from 'products/experiments/frontend/warehouseNative/warehouseNativeSources'
+
+import { EmptyMetricsPanel } from './EmptyMetricsPanel'
+import { MetricList } from './MetricList'
+
+export type MetricsPanelProps = {
+    experiment: Experiment
+    sharedMetrics: { primary: ExperimentMetric[]; secondary: ExperimentMetric[] }
+    onSaveMetric: (metric: ExperimentMetric, context: MetricContext) => void
+    onDeleteMetric: (metric: ExperimentMetric, context: MetricContext) => void
+    onSaveSharedMetrics: (metrics: ExperimentMetric[], context: MetricContext) => void
+    onSaveExposureCriteria: (exposureCriteria: ExperimentExposureCriteria) => void
+    /** Which data sources the metrics read, shared metrics included. */
+    metricDataSources: MetricDataSources
+    compact?: boolean
+}
+
+const convertSharedMetricToExperimentMetric = ({ id, query, name }: SharedMetric): ExperimentMetric =>
+    ({
+        ...query,
+        name,
+        sharedMetricId: id,
+        isSharedMetric: true,
+    }) as ExperimentMetric
+
+export const MetricsPanel = ({
+    experiment,
+    sharedMetrics,
+    onSaveMetric,
+    onDeleteMetric,
+    onSaveSharedMetrics,
+    onSaveExposureCriteria,
+    metricDataSources,
+    compact,
+}: MetricsPanelProps): JSX.Element => {
+    const { closeExperimentMetricModal } = useActions(experimentMetricModalLogic)
+    const { closeSharedMetricModal } = useActions(sharedMetricModalLogic)
+
+    // we need this value to calculate the recent activity on the metrics list
+    const filterTestAccounts = resolveFilterTestAccounts(experiment.exposure_criteria)
+
+    const primaryMetrics = [...(experiment.metrics || []).filter(isExperimentMetric), ...sharedMetrics.primary]
+    const secondaryMetrics = [
+        ...(experiment.metrics_secondary || []).filter(isExperimentMetric),
+        ...sharedMetrics.secondary,
+    ]
+
+    return (
+        <div>
+            {!compact && (
+                <>
+                    <div className="font-semibold mb-2">Metrics</div>
+                    <div className="text-muted mb-4">Add metrics to measure your experiment's impact.</div>
+                </>
+            )}
+
+            {primaryMetrics.length === 0 && secondaryMetrics.length === 0 ? (
+                // In compact mode (the wizard) the step heading's tooltip carries this help text
+                <EmptyMetricsPanel showHelpText={!compact} />
+            ) : (
+                <div className="space-y-6">
+                    <MetricList
+                        metrics={primaryMetrics}
+                        metricContext={METRIC_CONTEXTS.primary}
+                        onDelete={onDeleteMetric}
+                        filterTestAccounts={filterTestAccounts}
+                    />
+                    <MetricList
+                        metrics={secondaryMetrics}
+                        metricContext={METRIC_CONTEXTS.secondary}
+                        onDelete={onDeleteMetric}
+                        filterTestAccounts={filterTestAccounts}
+                    />
+                </div>
+            )}
+
+            <MetricSourceModal experiment={experiment} />
+            <ExperimentMetricModal
+                experiment={experiment}
+                exposureCriteria={experiment.exposure_criteria}
+                onSave={(metric, context) => {
+                    onSaveMetric(metric, context)
+                    closeExperimentMetricModal()
+                }}
+                onDelete={(metric, context) => {
+                    onDeleteMetric(metric, context)
+                    closeExperimentMetricModal()
+                }}
+            />
+            <SharedMetricModal
+                experiment={experiment}
+                onSave={(metrics, context) => {
+                    const sharedMetrics = metrics.map(convertSharedMetricToExperimentMetric)
+
+                    onSaveSharedMetrics(sharedMetrics, context)
+                    closeSharedMetricModal()
+                }}
+            />
+            <ExposureCriteriaModal onSave={onSaveExposureCriteria} metricDataSources={metricDataSources} />
+        </div>
+    )
+}

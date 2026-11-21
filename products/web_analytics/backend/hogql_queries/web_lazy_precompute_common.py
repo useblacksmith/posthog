@@ -1,0 +1,1220 @@
+"""Shared eligibility gate + helpers for web-analytics lazy precompute paths.
+
+Both the web overview lazy precompute and the web stats PATHS lazy precompute
+share the same rollout/safety gate (org feature flag + per-query opt-out,
+whole-hour timezone, no conversion goal, no sampling, no v2 UUID sessions,
+any event/person filter shape, bounded date range) and the same TTL / session-pad
+/ UTC-day helpers. Keeping a single source of truth avoids the paths drifting apart.
+The per-team distinct-shape ceiling (`try_reserve_precompute_shape`) lives here
+too, bounding how many namespaces the loosened filter gate lets a team mint.
+"""
+
+import json
+import time
+import hashlib
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+from django.conf import settings
+from django.utils import timezone as django_timezone
+
+import structlog
+import posthoganalytics
+from prometheus_client import Counter
+
+from posthog.schema import HogQLQueryModifiers, SessionsV2JoinMode, WebAnalyticsPreComputeStrategy
+
+from posthog.hogql import ast
+from posthog.hogql.modifiers import create_default_modifiers_for_team
+from posthog.hogql.property import get_property_key, get_property_type, property_to_expr
+from posthog.hogql.transforms.preaggregated_table_transformation import is_integer_timezone
+
+from posthog import redis
+from posthog.clickhouse.query_tagging import clear_tag, get_query_tag_value, tag_queries
+from posthog.hogql_queries.query_runner import ExecutionMode
+from posthog.models import Team
+from posthog.models.event.new_events_schema import use_new_events_schema
+from posthog.models.team.event_retention import events_retention_months_for_team
+
+from products.access_control.backend.facade.api import team_has_property_access_rules
+from products.analytics_platform.backend.lazy_computation.lazy_computation_executor import (
+    LazyComputationResult,
+    TtlSchedule,
+    ensure_precomputed,
+    parse_ttl_schedule,
+    retention_build_floor,
+)
+from products.analytics_platform.backend.lazy_computation.stale_policy import (
+    is_background_warming_request as shared_is_background_warming_request,
+    resolve_stale_while_revalidate_seconds,
+)
+
+logger = structlog.get_logger(__name__)
+
+# Reactive per-team OOM cap. A very high-cardinality team's wide-window GROUP BY
+# (session, breakdown) can OOM the precompute INSERT. We run uncapped until that happens;
+# on an OOM we pin the team (one Redis key per team, self-healing TTL) so its later requests
+# build their TTL schedule with a 1-day `max_window_days` cap — bounding each insert's GROUP
+# BY by job *width*, at any window age (so a year-over-year compare's old previous period is
+# capped too), while keeping the team's normal TTL grading. The capping lives entirely in the
+# schedule handed to `ensure_precomputed`, so the executor needs no per-team knowledge.
+OOM_PIN_WINDOW_DAYS = 1
+TEAM_OOM_PIN_REDIS_PREFIX = "preagg:oom_pinned:"
+OOM_PIN_TTL_SECONDS = 14 * 24 * 60 * 60
+
+
+def _oom_pin_key(team_id: int) -> str:
+    return f"{TEAM_OOM_PIN_REDIS_PREFIX}{team_id}"
+
+
+# Above-floor team set, refreshed by the hourly demand warmer from a
+# marks-only fleet event count. Reads consult it fail-open: an unpublished or
+# expired set (sentinel absent, or Redis down) keeps current behavior, so the
+# floor can only narrow precompute when the warmer is actively maintaining it.
+VOLUME_FLOOR_TEAMS_KEY = "{web_precompute_volume_floor}:teams"
+VOLUME_FLOOR_READY_KEY = "{web_precompute_volume_floor}:ready"
+VOLUME_FLOOR_TTL_SECONDS = 48 * 3600
+
+
+# One dashboard load passes the gate once per family, so cache the verdict
+# in-process for a short window. 60s is far below the hourly publish cadence,
+# and the dict is bounded per process by web analytics' active-team working set.
+_VOLUME_FLOOR_LOCAL_CACHE: dict[int, tuple[float, bool]] = {}
+_VOLUME_FLOOR_LOCAL_CACHE_SECONDS = 60.0
+_VOLUME_FLOOR_LOCAL_CACHE_MAX_ENTRIES = 50_000
+
+
+def is_team_above_volume_floor(team_id: int) -> bool:
+    if settings.WEB_ANALYTICS_PRECOMPUTE_MIN_WEEKLY_EVENTS <= 0:
+        return True
+    # Explicit env enrollment beats the volume heuristic: those teams were
+    # opted in deliberately (dogfooding, support escalations) regardless of size.
+    if team_id in settings.WEB_ANALYTICS_LAZY_PRECOMPUTE_TEAM_IDS:
+        return True
+    cached = _VOLUME_FLOOR_LOCAL_CACHE.get(team_id)
+    if cached is not None and time.monotonic() - cached[0] < _VOLUME_FLOOR_LOCAL_CACHE_SECONDS:
+        return cached[1]
+    try:
+        client = redis.get_client()
+        # Membership first: above-floor teams (the vast majority of gate
+        # traffic) resolve in one round trip. On a miss, the floor only
+        # enforces when BOTH keys exist: the sentinel alone is not trusted, so
+        # a lost or expired teams set (eviction, TTL drift) fails open instead
+        # of silently disabling precompute fleet-wide. Intentionally-empty
+        # publishes keep the set alive via a placeholder member.
+        # Accepted transient: a reader racing the very first publish can miss
+        # membership then see both keys, reading below-floor for up to the
+        # local cache window — it degrades to the live path, never breaks.
+        if client.sismember(VOLUME_FLOOR_TEAMS_KEY, str(team_id)):
+            result = True
+        else:
+            result = not (client.exists(VOLUME_FLOOR_READY_KEY) and client.exists(VOLUME_FLOOR_TEAMS_KEY))
+    except Exception:
+        logger.exception("web_precompute_volume_floor_check_failed", team_id=team_id)
+        result = True
+    if len(_VOLUME_FLOOR_LOCAL_CACHE) >= _VOLUME_FLOOR_LOCAL_CACHE_MAX_ENTRIES:
+        _VOLUME_FLOOR_LOCAL_CACHE.clear()
+    _VOLUME_FLOOR_LOCAL_CACHE[team_id] = (time.monotonic(), result)
+    return result
+
+
+def publish_volume_floor_teams(above_floor: list[int], above_exit_floor: Optional[list[int]] = None) -> None:
+    """Atomically replace the above-floor set. RENAME keeps readers off a
+    half-written set; the TTLs make a dead warmer fail open within 48h.
+
+    `above_exit_floor` enables hysteresis: teams in it that are already
+    members stay members even when they fell under the entry floor, so a team
+    oscillating around the threshold does not flap in and out hourly (each
+    exit discards warm buckets that re-entry rebuilds from scratch).
+    """
+    client = redis.get_client()
+    members: set[str] = {str(t) for t in above_floor}
+    if above_exit_floor:
+        try:
+            current = {m.decode() if isinstance(m, bytes) else str(m) for m in client.smembers(VOLUME_FLOOR_TEAMS_KEY)}
+        except Exception:
+            # Degrading to no hysteresis evicts every between-floors member
+            # this pass; they re-enter next pass if they recover. Loud so a
+            # persistent Redis problem does not silently churn buckets.
+            logger.exception("web_precompute_volume_floor_hysteresis_read_failed")
+            current = set()
+        members |= {str(t) for t in above_exit_floor if str(t) in current}
+    member_list = sorted(members)
+    if not member_list:
+        # An empty publish is a valid verdict (no team above the floor). A
+        # placeholder member keeps the set alive: RENAME from a never-written
+        # staging key would raise mid-transaction, and the gate reads a
+        # MISSING set as "lost, fail open" rather than "empty, enforce".
+        member_list = ["__none__"]
+    tmp_key = f"{VOLUME_FLOOR_TEAMS_KEY}:staging"
+    pipe = client.pipeline()
+    pipe.delete(tmp_key)
+    for chunk_start in range(0, len(member_list), 5000):
+        pipe.sadd(tmp_key, *member_list[chunk_start : chunk_start + 5000])
+    pipe.rename(tmp_key, VOLUME_FLOOR_TEAMS_KEY)
+    pipe.expire(VOLUME_FLOOR_TEAMS_KEY, VOLUME_FLOOR_TTL_SECONDS)
+    pipe.set(VOLUME_FLOOR_READY_KEY, "1", ex=VOLUME_FLOOR_TTL_SECONDS)
+    pipe.execute()
+
+
+def is_team_oom_pinned(team_id: int) -> bool:
+    """Whether the team has hit an OOM recently and should cap its insert windows.
+
+    Best-effort: a Redis failure reads as not-pinned (uncapped default) — never blocks the insert."""
+    try:
+        return redis.get_client().get(_oom_pin_key(team_id)) is not None
+    except Exception:
+        return False
+
+
+def pin_team_oom(team_id: int) -> None:
+    """Pin (or refresh) a team's OOM cap after an OOM. Best-effort; self-healing TTL."""
+    try:
+        redis.get_client().set(_oom_pin_key(team_id), "1", ex=OOM_PIN_TTL_SECONDS)
+    except Exception:
+        logger.warning("web_precompute.oom_pin_failed", team_id=team_id, exc_info=True)
+
+
+def clear_team_oom_pin(team_id: int) -> bool:
+    """Remove a team's OOM pin so its next inserts run at full window width again.
+
+    Returns whether a pin existed. Unlike the read/write helpers this is NOT
+    best-effort: it is only called from operator tooling, where a Redis failure
+    should surface instead of silently reporting the pin as cleared."""
+    return redis.get_client().delete(_oom_pin_key(team_id)) > 0
+
+
+def list_oom_pinned_team_ids() -> list[int]:
+    """Team ids currently OOM-pinned, via a prefix SCAN (operator tooling only)."""
+    prefix = TEAM_OOM_PIN_REDIS_PREFIX
+    team_ids = []
+    for key in redis.get_client().scan_iter(match=f"{prefix}*"):
+        key_str = key.decode() if isinstance(key, bytes) else key
+        team_ids.append(int(key_str[len(prefix) :]))
+    return sorted(team_ids)
+
+
+# Per-team distinct-shape ceiling. With the filter gate loosened, any filter combination
+# becomes its own precompute namespace, so a pathological team could mint unbounded shapes.
+# This is a coarse backstop, not a quota: a team builds shapes freely until it holds this
+# many distinct ones, after which *new* shapes fall back to the live query (existing shapes
+# keep serving and refreshing). Enforced only on build paths and only here, on the
+# web-analytics side of the framework boundary, so the shared lazy_computation framework —
+# and its other consumers (e.g. experiments) — is never capped. The set's TTL is stamped
+# once when its first shape is added, so the whole counter resets periodically rather than
+# accreting cold shapes forever; a still-exploding team simply refills within the window.
+TEAM_SHAPE_SET_REDIS_PREFIX = "preagg:team_shapes:"
+TEAM_SHAPE_SET_TTL_SECONDS = 30 * 24 * 60 * 60  # matches the warmed -30d depth
+
+
+def _team_shape_set_key(team_id: int) -> str:
+    return f"{TEAM_SHAPE_SET_REDIS_PREFIX}{team_id}"
+
+
+def try_reserve_precompute_shape(team_id: int, shape_hash: str) -> bool:
+    """Reserve a build slot for `shape_hash` under the team's distinct-shape ceiling.
+
+    Returns True when the shape may build — it was already counted, the cap is disabled,
+    or there was room (and it's now counted). Returns False only when the team is at the
+    ceiling AND this shape is new: the one case we drop early. Best-effort: any Redis
+    failure returns True (fail open — a backstop must never block a legitimate build).
+
+    The count is approximate under concurrency (sismember/scard/sadd aren't atomic), which
+    is fine for a coarse ceiling: a few concurrent new shapes may overshoot by a handful."""
+    ceiling = settings.WEB_ANALYTICS_PRECOMPUTE_MAX_SHAPES_PER_TEAM
+    if ceiling <= 0:
+        return True
+    try:
+        client = redis.get_client()
+        key = _team_shape_set_key(team_id)
+        if client.sismember(key, shape_hash):
+            return True
+        count = client.scard(key)
+        if count >= ceiling:
+            return False
+        client.sadd(key, shape_hash)
+        if count == 0:
+            client.expire(key, TEAM_SHAPE_SET_TTL_SECONDS)
+        return True
+    except Exception:
+        logger.warning("web_precompute.shape_cap_check_failed", team_id=team_id, exc_info=True)
+        return True
+
+
+# --- Stale-while-revalidate (RFC 5861) -------------------------------------------------
+#
+# The lazy executor's `stale_while_revalidate_seconds` is the *serve* half: user-facing
+# requests whose windows expired within the grace get their complete-but-stale rows
+# instantly instead of recomputing inline. The helpers below are the *revalidate* half:
+# a stale hit enqueues a Celery task that re-runs the query in the background so the
+# next fetch is fresh, instead of relying solely on the hourly eager warmer (which only
+# covers warmed query shapes). Duplicate enqueues need no dedup layer: the HogQL result
+# cache fronts these queries (stale hits are rare per shape), the framework's PENDING-job
+# unique index collapses concurrent recomputes to one insert, and the ANALYTICS_LIMITED
+# queue plus task `expires` pace and shed anything redundant — the same load profile the
+# pre-serve-stale inline path already tolerated at user-request concurrency.
+
+# The trigger tag the revalidation task runs under. Lives here, next to the trigger set,
+# so the two cannot drift apart.
+REVALIDATION_TRIGGER = "webAnalyticsStaleRevalidation"
+
+# Web's own refreshers. These ARE the refresh mechanism: they must never be served stale
+# (they'd freeze the cache serving stale to themselves) and they keep the framework's full
+# wait budget. Warmers shared across products (e.g. the generic insight cache warmer,
+# trigger "warmingV2") live in SHARED_BACKGROUND_WARMING_TRIGGERS and are unioned in by
+# `is_background_warming_request`. This named set is the belt; the primary gate there is the
+# CACHE_WARMUP feature tag, which classifies refreshers by category — including warmers this
+# module doesn't know by name.
+BACKGROUND_WARMING_TRIGGERS = frozenset(
+    {
+        "webAnalyticsEagerBaselineWarming",
+        "webAnalyticsQueryWarming",
+        REVALIDATION_TRIGGER,
+    }
+)
+
+
+# Stale-while-revalidate window for *user-facing* requests: windows that expired within
+# this grace are served from their existing (complete-but-stale) rows instantly instead
+# of recomputing inline, and a background revalidation is enqueued. Refresh normally
+# arrives within minutes via the revalidation task (plus the hourly eager warmer for
+# warmed shapes) — the grace is the ceiling for revalidation failures and warmer
+# outages. Env-tunable via WEB_ANALYTICS_PRECOMPUTE_STALE_GRACE_SECONDS (see
+# posthog/settings/web.py for the default and the freshness/hit-rate trade-off).
+def stale_while_revalidate_seconds() -> int:
+    return settings.WEB_ANALYTICS_PRECOMPUTE_STALE_GRACE_SECONDS
+
+
+WEB_ANALYTICS_LAZY_PRECOMPUTE_CHECK_MISS = Counter(
+    "web_analytics_lazy_precompute_check_miss_total",
+    "User-facing reads that found no covering READY jobs, fell back to the live query, and enqueued a background warm.",
+    labelnames=["family"],
+)
+
+WEB_ANALYTICS_LAZY_PRECOMPUTE_SHAPE_CAPPED = Counter(
+    "web_analytics_lazy_precompute_shape_capped_total",
+    "Precompute builds skipped because the team was at its distinct-shape ceiling; the query served live instead.",
+    labelnames=["family"],
+)
+
+WEB_ANALYTICS_LAZY_PRECOMPUTE_STALE_SERVED = Counter(
+    "web_analytics_lazy_precompute_stale_served_total",
+    "Reads served from expired-within-grace jobs instead of recomputing inline (stale-while-revalidate).",
+    labelnames=["family"],
+)
+
+WEB_ANALYTICS_LAZY_PRECOMPUTE_REVALIDATION_ENQUEUED = Counter(
+    "web_analytics_lazy_precompute_revalidation_enqueued_total",
+    "Background revalidation tasks enqueued after a stale-served read.",
+    labelnames=["family"],
+)
+
+WEB_ANALYTICS_LAZY_PRECOMPUTE_REVALIDATION_ENQUEUE_FAILED = Counter(
+    "web_analytics_lazy_precompute_revalidation_enqueue_failed_total",
+    "Revalidation enqueues that failed (e.g. broker unavailable); the stale read is still served.",
+    labelnames=["family"],
+)
+
+
+def is_background_warming_request() -> bool:
+    return shared_is_background_warming_request(BACKGROUND_WARMING_TRIGGERS)
+
+
+# Execution modes that mean "the user explicitly asked to recompute, disregard any
+# cache". The frontend's forced reload (`reloadAll`) maps a web-analytics tile to
+# `force_blocking` — web tiles are non-insight nodes, so they never take the async
+# path — but both force_* modes are treated as forced so an async-dispatched force
+# refresh is covered too.
+FORCED_REFRESH_EXECUTION_MODES = frozenset(
+    {ExecutionMode.CALCULATE_BLOCKING_ALWAYS.value, ExecutionMode.CALCULATE_ASYNC_ALWAYS.value}
+)
+
+
+def is_forced_refresh_request() -> bool:
+    """True when this is an explicit user-initiated force refresh.
+
+    Read off the `execution_mode` query tag the query runner stamps before
+    `_calculate`. A forced refresh must bypass the serve-stale grace so it
+    recomputes fresh instead of being handed the very stale row it is clearing.
+    """
+    return get_query_tag_value("execution_mode") in FORCED_REFRESH_EXECUTION_MODES
+
+
+# One revalidation per (team, family, query shape) per window: a dashboard burst — or a
+# user hammering forced refresh, whose reads now fall through to the live query and enqueue
+# a background warm each — fires many enqueues for the same shape and they must collapse to
+# a single background rebuild. Keyed per shape (not per request) so two different stale
+# families in one request each still get their refresh.
+REVALIDATION_DEBOUNCE_SECONDS = 10 * 60
+
+# The shape debounce alone does not bound DISTINCT shapes: filters and date ranges are
+# request-controlled, so a user (or runaway client) could mint arbitrarily many shapes
+# and with them arbitrarily many queued warms. Cap total enqueues per team per debounce
+# window; a full dashboard is ~8 families and a compare-period burst doubles some, so
+# the budget comfortably covers legitimate use while bounding worker-held delayed tasks
+# and background query volume alike.
+#
+# Scope: this budget only ever applies to USER-FACING requests. Both enqueue callers
+# are unreachable from warming traffic — the check-miss enqueue in
+# `web_ensure_precomputed` is gated on `not is_background_warming_request()`, and
+# `handle_stale_served` can only fire for reads that received the stale grace, which
+# warming requests never do. Dagster/celery warmers are unaffected.
+REVALIDATION_TEAM_BUDGET_PER_WINDOW = 25
+
+# Head start for the interactive burst: warms enqueued by a dashboard load run on the
+# same team/cluster query slots as the dashboard's own live queries, so firing them
+# immediately makes the background work contend with the very read it is serving.
+# Dashboard bursts finish in seconds — 20s comfortably outlasts the slowest
+# burst observed while keeping the warm (whose purpose is the NEXT visit)
+# close behind. Celery holds countdown tasks worker-side until runnable, but
+# the per-shape debounce bounds in-flight delayed tasks to at most one per
+# (team, family, shape) per debounce window — a trickle, not a backlog.
+REVALIDATION_START_DELAY_SECONDS = 20
+
+# Sticky warm set: lazy-eligible user reads that check-missed TWICE record their
+# shape here, and the hourly warmer unions the set into its selection. This
+# closes the gap between new demand and the hours-stale cached demand selection,
+# and keeps reactively built namespaces warm instead of letting them expire and
+# re-miss. Two touches are required so a one-off exploration (a filter combo
+# tried once) costs one tiny marker and is never warmed — mirroring the demand
+# selection's own min-2 bar. One Redis hash; the key TTL is refreshed on write,
+# and each entry carries `recorded_at` so the warmer prunes entries older than
+# the max age. Entries are keyed per bucket namespace (`compute_shape_cap_key`),
+# so date-range variants of one shape collapse to a single entry — warming any
+# variant serves them all.
+STICKY_WARM_SHAPES_KEY = "{web_precompute_sticky_shapes}:v1"
+STICKY_SHAPE_KEY_TTL_SECONDS = 48 * 3600
+STICKY_SHAPE_MAX_AGE_SECONDS = 24 * 3600
+# Bounds the hash. Full entries are query JSONs (~1-2 KB); first-touch markers
+# are a few bytes and age out on the warmer's hourly prune. When full, new
+# shapes simply are not recorded — they keep self-healing via check-miss builds.
+STICKY_SHAPE_MAX_ENTRIES = 20_000
+# Per-entry byte ceiling on the stored query. A legitimate filter set serializes to
+# ~1-2 KB; this only rejects an abusively large filter value that would otherwise sit
+# in shared Redis for the entry's lifetime. The shape still self-heals via check-miss.
+STICKY_SHAPE_MAX_QUERY_BYTES = 50_000
+# Per-team admission cap on the shared hash, so one tenant can't fill all
+# STICKY_SHAPE_MAX_ENTRIES and starve every other team's shapes for the TTL.
+# Matches the warmer's per-team union cap: recording more than the warmer will
+# ever replay for one team is wasted. The counter is approximate — the warmer's
+# prune (HDEL) does not decrement it, so it over-counts and only ever refuses a
+# team earlier than strictly needed, resetting on its own TTL.
+STICKY_SHAPE_MAX_PER_TEAM = 100
+
+WEB_ANALYTICS_STICKY_WARM_RECORDED = Counter(
+    "web_analytics_sticky_warm_shapes_recorded_total",
+    "Check-missed shapes recorded into (or refused by) the sticky warm set.",
+    labelnames=["outcome"],  # marked | recorded | full | team_full | oversized | error
+)
+
+
+def _sticky_team_count_key(team_id: int) -> str:
+    # Same hash tag as STICKY_WARM_SHAPES_KEY so the counter and the hash share a
+    # Redis Cluster slot.
+    return f"{{web_precompute_sticky_shapes}}:count:{team_id}"
+
+
+def record_sticky_warm_shape(*, team: Team, runner: Any) -> None:
+    """Record a check-missed shape for the warmer's next pass — on its SECOND
+    miss. The first miss writes a marker; only a repeat miss within the marker's
+    lifetime upgrades it to a full entry the warmer replays. Best-effort: runs
+    on the user-facing read path, so any failure degrades to "not sticky" — the
+    shape still self-heals through the check-miss build, it just is not kept
+    warm until the demand selection picks it up."""
+    try:
+        field = f"{team.id}:{compute_shape_key(runner.query, team.timezone, runner._test_account_filters)}"
+        client = redis.get_client()
+        existing = client.hget(STICKY_WARM_SHAPES_KEY, field)
+        if existing is not None:
+            try:
+                if "query" in json.loads(existing):
+                    return  # already a full sticky entry
+            except Exception:
+                pass  # undecodable marker: treat as a first touch and upgrade
+        if existing is None:
+            # First touch: a marker only. Upgrading an existing marker adds no
+            # field, so only this branch adds an entry and is subject to the caps.
+            if client.hlen(STICKY_WARM_SHAPES_KEY) >= STICKY_SHAPE_MAX_ENTRIES:
+                WEB_ANALYTICS_STICKY_WARM_RECORDED.labels(outcome="full").inc()
+                return
+            count_key = _sticky_team_count_key(team.id)
+            team_count = client.get(count_key)
+            if team_count is not None and int(team_count) >= STICKY_SHAPE_MAX_PER_TEAM:
+                # One tenant must not fill the shared hash and starve other teams.
+                WEB_ANALYTICS_STICKY_WARM_RECORDED.labels(outcome="team_full").inc()
+                return
+            payload = json.dumps({"team_id": team.id, "recorded_at": time.time()})
+            outcome = "marked"
+        else:
+            payload = json.dumps(
+                {
+                    "team_id": team.id,
+                    "recorded_at": time.time(),
+                    "query": runner.query.model_dump(mode="json", exclude_none=True),
+                }
+            )
+            if len(payload) > STICKY_SHAPE_MAX_QUERY_BYTES:
+                # Leave the marker rather than retain an oversized query: the warmer
+                # skips a shape it has no query for, and the shape still self-heals.
+                WEB_ANALYTICS_STICKY_WARM_RECORDED.labels(outcome="oversized").inc()
+                return
+            outcome = "recorded"
+        pipe = client.pipeline()
+        pipe.hset(STICKY_WARM_SHAPES_KEY, field, payload)
+        pipe.expire(STICKY_WARM_SHAPES_KEY, STICKY_SHAPE_KEY_TTL_SECONDS)
+        if existing is None:
+            # A new field was added, so bump the team's admission counter.
+            pipe.incr(_sticky_team_count_key(team.id))
+            pipe.expire(_sticky_team_count_key(team.id), STICKY_SHAPE_KEY_TTL_SECONDS)
+        pipe.execute()
+        WEB_ANALYTICS_STICKY_WARM_RECORDED.labels(outcome=outcome).inc()
+    except Exception:
+        WEB_ANALYTICS_STICKY_WARM_RECORDED.labels(outcome="error").inc()
+        logger.exception("web_precompute.sticky_warm_record_failed", team_id=team.id)
+
+
+def get_sticky_warm_shapes() -> list[dict]:
+    """Full sticky entries for the warmer: `[{team_id, recorded_at, query}]`.
+    First-touch markers (no `query`) are skipped while fresh and pruned once
+    aged, like full entries; entries that do not decode to that shape are
+    pruned too, so one corrupt field can never fail the warm pass that
+    consumes this list. Pruning happens on read. The lazy HDEL can race a
+    concurrent writer: a second miss may upgrade an aged marker between the
+    HGETALL and the HDEL, deleting the fresh entry — bounded loss, the shape
+    re-earns stickiness on its next two misses. Fails open to an empty list —
+    the warmer then runs on the demand selection alone."""
+    try:
+        raw = redis.get_client().hgetall(STICKY_WARM_SHAPES_KEY)
+    except Exception:
+        logger.exception("web_precompute.sticky_warm_read_failed")
+        return []
+    now = time.time()
+    entries: list[dict] = []
+    dead_fields: list = []
+    for hash_field, blob in raw.items():
+        try:
+            entry = json.loads(blob)
+            if now - float(entry["recorded_at"]) > STICKY_SHAPE_MAX_AGE_SECONDS:
+                dead_fields.append(hash_field)
+                continue
+            if "query" in entry:
+                # A missing or non-numeric team_id raises here, routing the
+                # entry into the prune below instead of into the warmer.
+                entry["team_id"] = int(entry["team_id"])
+                entries.append(entry)
+        except Exception:
+            dead_fields.append(hash_field)
+    if dead_fields:
+        try:
+            redis.get_client().hdel(STICKY_WARM_SHAPES_KEY, *dead_fields)
+        except Exception:
+            logger.warning("web_precompute.sticky_warm_prune_failed", exc_info=True)
+    return entries
+
+
+def enqueue_stale_revalidation(*, team: Team, query: Any, family: str, debounce_extra: Optional[str] = None) -> None:
+    """Enqueue a background re-run of `query` so a stale-served read gets fresh data next time.
+
+    Debounced via Redis per (team, family, query shape). Best-effort: this runs on the
+    user-facing read path before the stale rows are read, so a Redis or broker outage
+    must degrade to "serve stale, warmer converges" — never abort the read into the
+    expensive live fallback.
+    """
+    # The task module imports this module (for the trigger constant), so the reverse
+    # import must stay local to avoid a cycle.
+    from products.web_analytics.backend.tasks.lazy_precompute_revalidation import (  # noqa: PLC0415
+        REVALIDATION_EXPIRES_SECONDS,
+        revalidate_web_analytics_precompute,
+    )
+
+    modifiers = (query.modifiers or HogQLQueryModifiers()).model_copy()
+    modifiers.useNewEventsSchema = use_new_events_schema(team.pk, modifiers)
+    query = query.model_copy(update={"modifiers": modifiers})
+    try:
+        client = redis.get_client()
+        shape_part = compute_filters_eligibility_hash(query, team.timezone)[:16]
+        if debounce_extra:
+            shape_part = hashlib.sha256(f"{shape_part}:{debounce_extra}".encode()).hexdigest()[:16]
+        debounce_key = f"web_swr_reval:{team.id}:{family}:{shape_part}"
+        if modifiers.useNewEventsSchema:
+            debounce_key += ":events_json"
+        if not client.set(debounce_key, "1", ex=REVALIDATION_DEBOUNCE_SECONDS, nx=True):
+            return
+        budget_key = f"web_swr_reval_budget:{team.id}"
+        spent = client.incr(budget_key)
+        if spent == 1:
+            client.expire(budget_key, REVALIDATION_DEBOUNCE_SECONDS)
+        if spent > REVALIDATION_TEAM_BUDGET_PER_WINDOW:
+            # Release the shape's debounce claim: no task was enqueued, so leaving
+            # the key would lock the shape out of warming for the whole debounce
+            # window even after the budget resets.
+            client.delete(debounce_key)
+            logger.warning("web_precompute.swr_revalidation_budget_exhausted", team_id=team.id, family=family)
+            return
+        revalidate_web_analytics_precompute.apply_async(
+            kwargs={"team_id": team.id, "query": query.model_dump(mode="json", exclude_none=True)},
+            countdown=REVALIDATION_START_DELAY_SECONDS,
+            # `expires` is measured from publication; extend it by the countdown so
+            # the queue keeps the task's full pickup window despite the head start.
+            expires=REVALIDATION_START_DELAY_SECONDS + REVALIDATION_EXPIRES_SECONDS,
+        )
+    except Exception:
+        WEB_ANALYTICS_LAZY_PRECOMPUTE_REVALIDATION_ENQUEUE_FAILED.labels(family=family).inc()
+        logger.warning("web_precompute.swr_revalidation_enqueue_failed", team_id=team.id, family=family, exc_info=True)
+        return
+    WEB_ANALYTICS_LAZY_PRECOMPUTE_REVALIDATION_ENQUEUED.labels(family=family).inc()
+    logger.info("web_precompute.swr_revalidation_enqueued", team_id=team.id, family=family)
+
+
+def handle_stale_served(*, runner: Any, family: str) -> None:
+    """Everything a read path does when an ensure came back `stale=True`.
+
+    Counts the stale-served read, tags the upcoming read query so query_log can split
+    stale-served vs fresh reads, and enqueues the background revalidation. The enqueue
+    is debounced per (team, family, query shape) in Redis — a compare-period ensure
+    coming back stale after the current-period one collapses to one task (one re-run
+    covers both periods), while a *different* stale family in the same request still
+    gets its own refresh.
+    """
+    WEB_ANALYTICS_LAZY_PRECOMPUTE_STALE_SERVED.labels(family=family).inc()
+    tag_queries(precompute_stale=True)
+    # Channel-filtered shapes are distinct per custom-rules set (the rules join the
+    # job hash), so the debounce identity must carry them too — otherwise one rule
+    # set's miss suppresses revalidating another's for the whole debounce window.
+    debounce_extra = None
+    if any(
+        get_property_type(prop) == "session" and get_property_key(prop) == "$channel_type"
+        for prop in getattr(runner.query, "properties", None) or []
+    ):
+        # Mirror `channel_rules_shape_key` (import would cycle): only the fields
+        # that change what the channel INSERT stores join the debounce identity.
+        dump = runner.modifiers.model_dump(mode="json")
+        debounce_extra = json.dumps(
+            {
+                field: dump.get(field)
+                for field in (
+                    "customChannelTypeRules",
+                    "bounceRateDurationSeconds",
+                    "bounceRatePageViewMode",
+                    "sessionsV2JoinMode",
+                    "sessionTableVersion",
+                )
+            },
+            sort_keys=True,
+        )
+    enqueue_stale_revalidation(team=runner.team, query=runner.query, family=family, debounce_extra=debounce_extra)
+
+
+# "InCohort" also matches NotInCohort. A cohort's criteria are expanded after this check and can
+# classify traffic, so any cohort filter counts, such as a cohort in the test-account filters.
+_TRAFFIC_CLASSIFICATION_NAMES = ("$virt_", "isLikelyBot", "getBot", "getTraffic", "__preview_", "InCohort")
+
+
+def _classifies_traffic(insert_query: Any, placeholders: Optional[dict[str, Any]]) -> bool:
+    text = repr(insert_query) + repr(placeholders)
+    return any(name in text for name in _TRAFFIC_CLASSIFICATION_NAMES)
+
+
+def web_ensure_precomputed(
+    *, team: Team, shape_key_extra: Optional[str] = None, **kwargs: Any
+) -> LazyComputationResult:
+    """`ensure_precomputed` for web analytics, with reactive per-team OOM capping and
+    the web-wide stale-while-revalidate policy.
+
+    A team runs uncapped until one of its precompute inserts OOMs; that pins it so later
+    requests build their TTL schedule with a 1-day `max_window_days` cap (job width bounded
+    at any window age). The request that hits the OOM still fails here and falls back to the
+    live query — the cap only takes effect next time.
+
+    Every user-facing call gets the stale-while-revalidate grace by default; requests
+    tagged with a background warming trigger never do (they are the refresh mechanism
+    and would serve stale to themselves). Callers that see `stale=True` must hand the
+    result to `handle_stale_served` so the background revalidation actually happens.
+    """
+    runner = kwargs.pop("runner", None)
+    family = kwargs.pop("family", None)
+    modifiers = create_default_modifiers_for_team(team, kwargs.get("modifiers"))
+    if runner is not None:
+        # Use the runner's value, which can carry a per-query override, so the INSERT and the job hash match the read.
+        modifiers.cookielessTrafficIsRegular = runner.modifiers.cookielessTrafficIsRegular
+    kwargs["modifiers"] = modifiers
+    # The job hash covers the HogQL text, not what `$virt_*` expands to, so a classification change
+    # needs a new marker. Only queries that classify traffic get it, so other jobs keep their hash.
+    markers = []
+    if modifiers.cookielessTrafficIsRegular:
+        markers.append("cookieless-missing-ua-v1")
+    if _classifies_traffic(kwargs.get("insert_query"), kwargs.get("placeholders")):
+        markers.append("sdk-missing-ua-v1")
+    if markers:
+        kwargs["cache_key_context"] = {
+            **(kwargs.get("cache_key_context") or {}),
+            "traffic_classification": "+".join(markers),
+        }
+    background = is_background_warming_request()
+    forced = is_forced_refresh_request()
+    if "stale_while_revalidate_seconds" not in kwargs:
+        if forced:
+            # An explicit user-initiated force refresh must never be handed a
+            # complete-but-stale row — that is exactly the state the user is trying
+            # to clear (the reported bug: repeated Reload clicks kept serving the
+            # same stale overview tile). Disabling the grace makes the ensure report
+            # a miss for an expired window, so the read falls through to the live
+            # query and recomputes fresh. Applies to every web family (overview +
+            # stats) so a forced refresh can't leave the tile and tables drifting on
+            # different freshness clocks.
+            kwargs["stale_while_revalidate_seconds"] = None
+        else:
+            kwargs["stale_while_revalidate_seconds"] = resolve_stale_while_revalidate_seconds(
+                stale_while_revalidate_seconds(), BACKGROUND_WARMING_TRIGGERS
+            )
+    # User-facing requests never compute inline: they are served from covering
+    # READY jobs (fresh or within the stale grace) or told "miss" immediately so
+    # the caller falls back to the live query. Construction happens only on
+    # background triggers (warmers, the revalidation task) — a cold dashboard
+    # must not pay for its own backfill.
+    if "run_inserts" not in kwargs:
+        kwargs["run_inserts"] = background
+    # No web analytics build is read back in the same request: user reads either hit
+    # covering READY jobs or fall back to the live query, and builders (warmer,
+    # revalidation) run ahead of demand. Replica quorum therefore buys no consistency
+    # here — it only turns a downed aux replica into a total build outage.
+    kwargs.setdefault("read_after_write", False)
+    # Per-team distinct-shape backstop. Only build paths can mint a new namespace, so this
+    # only bites there (a user read is already run_inserts=False). At the ceiling, a *new*
+    # shape drops back to a check-only pass — not ready → the caller serves live — instead
+    # of building; shapes the team already holds are unaffected. Reuses the eligibility hash
+    # so a shape counts the same however it reaches this build path.
+    if kwargs.get("run_inserts") and runner is not None:
+        shape_hash = compute_shape_cap_key(runner.query, team.timezone, getattr(runner, "_test_account_filters", None))
+        if shape_key_extra is not None:
+            shape_hash = hashlib.sha256(f"{shape_hash}:{shape_key_extra}".encode()).hexdigest()
+        if not try_reserve_precompute_shape(team.id, shape_hash):
+            kwargs["run_inserts"] = False
+            WEB_ANALYTICS_LAZY_PRECOMPUTE_SHAPE_CAPPED.labels(family=family or "unknown").inc()
+            logger.info("web_precompute.shape_capped", team_id=team.id, family=family)
+    pinned = is_team_oom_pinned(team.id)
+    if "ttl_seconds" in kwargs:
+        existing = kwargs["ttl_seconds"]
+        # Normalize whatever the caller passed into a TtlSchedule so web-wide policy can be
+        # stamped on: an int/dict gets parsed; an already-built TtlSchedule (also accepted
+        # by ensure_precomputed) gets its fields re-stamped via replace().
+        # Every web schedule settles on the 24h session pad: a job computed before
+        # `window_end + pad` captured still-evolving session metrics and must not sit on
+        # a long band TTL — non-UTC teams' UTC-aligned edge windows can land in a
+        # multi-day band while their sessions are still settling.
+        if isinstance(existing, TtlSchedule):
+            schedule = replace(existing, settling_period_seconds=SESSION_SETTLING_SECONDS)
+        else:
+            schedule = parse_ttl_schedule(existing, team.timezone, settling_period_seconds=SESSION_SETTLING_SECONDS)
+        if pinned:
+            schedule = replace(schedule, max_window_days=OOM_PIN_WINDOW_DAYS)
+        if forced and not background:
+            # A within-TTL current-day bucket can still be hours behind (the
+            # today band is 4h), which on an hourly graph reads as missing
+            # recent data. Disabling the grace above cannot help there because
+            # the bucket is not stale, just coarse. Treat the windows covering
+            # the current team-local day as expired for this read only: the
+            # ensure reports a miss, the read falls through to the live query,
+            # and the SWR enqueue rebuilds the bucket in the background.
+            # Jobs split on UTC day boundaries, so the cutoff is the UTC-day
+            # floor of team-local midnight; a cutoff at local midnight itself
+            # sits after the window start for teams behind UTC and would never
+            # match today's window. Background builds are excluded because the
+            # same schedule sets the insert TTL, and the revalidation task runs
+            # under the forced execution mode, so it would persist the rebuilt
+            # bucket with a 1-second expiry that every ambient read then
+            # misses. `rules` are first-match by descending cutoff, so
+            # prepending wins over the normal today band.
+            today_start_local = (
+                django_timezone.now()
+                .astimezone(ZoneInfo(team.timezone))
+                .replace(hour=0, minute=0, second=0, microsecond=0)
+            )
+            forced_cutoff = floor_utc_day(today_start_local.astimezone(UTC))
+            schedule = replace(schedule, rules=[(forced_cutoff, 1), *schedule.rules])
+        kwargs["ttl_seconds"] = schedule
+    result = ensure_precomputed(team=team, **kwargs)
+    if result.ready and result.computed_at is not None and runner is not None:
+        runner.record_lazy_precompute_computed_at(result.computed_at)
+    if not result.ready and not background and runner is not None and family is not None:
+        # Check-only miss: warm in the background (debounced per team/family/shape)
+        # so the next visit is served from precompute while this one goes live.
+        WEB_ANALYTICS_LAZY_PRECOMPUTE_CHECK_MISS.labels(family=family).inc()
+        enqueue_stale_revalidation(team=team, query=runner.query, family=family)
+        # Sticky: the shape reached this point through the lazy gate, so it is
+        # proven lazy-eligible — record it so the hourly warmer keeps its buckets
+        # warm instead of letting the one-off reactive build expire and re-miss.
+        record_sticky_warm_shape(team=team, runner=runner)
+    if result.memory_exceeded:
+        pin_team_oom(team.id)  # set or refresh the cap so a still-OOMing team stays pinned
+        if not pinned:
+            logger.warning("web_precompute.oom_pinned_team", team_id=team.id, table=str(kwargs.get("table")))
+    return result
+
+
+# Fields stripped from the query payload before hashing.
+# These don't influence which precompute job_id a query would map to —
+# `useWebAnalyticsPrecompute` is just the opt-in toggle, `modifiers` is
+# HogQL execution hints applied after the fact, and the rest are
+# metadata / pagination knobs applied at read time.
+_FILTERS_ELIGIBILITY_HASH_IGNORED_QUERY_FIELDS: frozenset[str] = frozenset(
+    {
+        "useWebAnalyticsPrecompute",
+        "modifiers",
+        "version",
+        "tags",
+        "response",
+        "limit",
+        "offset",
+        "limitBy",
+    }
+)
+
+# Hourly UTC bucketing TTL schedule. Two jobs in one:
+#
+# 1. Freshness — today gets 4h and yesterday 6h. Both must comfortably outlast
+#    the eager warmer's hourly force-refresh cadence: a user read that finds the
+#    window stale pays a synchronous recompute before reading, so a TTL near the
+#    warmer period (yesterday was 1h) races it and hands users multi-second
+#    waits. Recomputing more often buys nothing anyway — the ~6h HogQL result
+#    cache already fronts these queries, so a cache hit never reads the
+#    precompute. Today and yesterday must keep *distinct* TTLs or
+#    `split_ranges_by_ttl` fuses them into one 2-day job and every
+#    today-refresh recomputes yesterday too.
+#    Windows aged 2+ days are *session-final*: sessions cap at 24h (the insert
+#    scans window_end+24h), so bounce/duration can no longer change, and
+#    measured late-event ingestion beyond 49h is ≤0.03% of pageviews on the
+#    worst enrolled team (~0% elsewhere). Their TTLs are therefore generous,
+#    because recomputing an immutable window buys nothing, and bounded in
+#    practice by hash rotations (any AST-affecting deploy rebuilds everything
+#    anyway). The `default` band holds 90 days so that a year-long shape does
+#    not re-scan a year of events every time the band expires.
+# 2. Job sizing — `split_ranges_by_ttl` merges *consecutive days with the same
+#    TTL* into one job. Distinct per-week TTLs therefore force weekly job
+#    boundaries, so a 31-day warm splits into ≤7-day jobs instead of one ~24-day
+#    block. That keeps each per-day INSERT's events↔sessions scan bounded — the
+#    24-day merge is what drove the multi-hundred-million-row scans that OOM the
+#    insert on very high-traffic teams.
+LAZY_TTL_SECONDS: dict[str, int] = {
+    "0d": 4 * 60 * 60,  # today
+    "1d": 6 * 60 * 60,  # yesterday
+    "7d": 5 * 24 * 60 * 60,  # days 2–7   → one ~6d job
+    "14d": 7 * 24 * 60 * 60,  # days 8–14  → one 7d job
+    "21d": 10 * 24 * 60 * 60,  # days 15–21 → one 7d job
+    "28d": 12 * 24 * 60 * 60,  # days 22–28 → one 7d job
+    "35d": 14 * 24 * 60 * 60,  # days 29–35 → one 7d job (covers the tail of a 31d warm)
+    "default": 90 * 24 * 60 * 60,  # days 36+
+}
+
+# Job-width cap. `split_ranges_by_ttl` merges consecutive days sharing one TTL
+# band into a single job, so the `default` band above would put a year-long
+# span's whole tail into ONE insert without this cap. Seven days keeps each
+# insert bounded (a 366-day backfill runs as ~53 jobs) while the reactive OOM
+# pin can still tighten a pathological team to 1-day windows.
+LAZY_MAX_WINDOW_DAYS = 7
+
+
+def lazy_ttl_schedule(team: Team) -> TtlSchedule:
+    """The lazy precompute TTL schedule, with the job-width cap applied."""
+    return parse_ttl_schedule(LAZY_TTL_SECONDS, team.timezone, max_window_days=LAZY_MAX_WINDOW_DAYS)
+
+
+# MVP user-filter allowlist: only an EventPropertyFilter on `$host` with
+# operator `exact` is admitted. Test-account filters are always allowed
+# (their content is hashed into the cache key).
+SUPPORTED_USER_FILTER_KEYS: set[str] = {"$host"}
+
+# Upper bound on the precompute span: a full year plus a leap day, which covers
+# the "this year" and "last 12 months" dashboards these shapes appear on. Span
+# width does not size an insert, because `LAZY_MAX_WINDOW_DAYS` caps job width
+# independently, and cold spans build behind the live fallback, so the first
+# request never burns the slots itself.
+MAX_PRECOMPUTE_DAYS = 366
+
+# Forward pad on the per-job event-scan window. Matches the JS SDK's
+# 24 h hard SESSION_LENGTH_LIMIT and covers ~100% of population sessions.
+# See web_overview_lazy_precompute.py for the full reasoning.
+SESSION_FORWARD_PAD_MINUTES = 24 * 60
+
+# How long after a window ends its session metrics can still change: sessions opened in
+# the window keep evolving (bounce flips, duration grows) until they hit the SDK's 24h
+# session cap — the same bound the insert's forward pad scans. Stamped onto every web
+# TTL schedule as its settling period (see `web_ensure_precomputed`).
+SESSION_SETTLING_SECONDS = SESSION_FORWARD_PAD_MINUTES * 60
+
+# Org-level rollout flag — same one the frontend uses to show the "Allow
+# precompute" toggle.
+ORG_FEATURE_FLAG_KEY = "web-analytics-precompute-toggle"
+
+
+class LazyPrecomputeIneligible(Exception):
+    """Base class for reasons a lazy precompute path is not eligible.
+
+    Subclass names are the canonical identifiers used in logs/metrics —
+    keep them stable across releases.
+    """
+
+
+class OrgFeatureFlagDisabled(LazyPrecomputeIneligible):
+    pass
+
+
+class PerQueryOptedOut(LazyPrecomputeIneligible):
+    """The user explicitly turned the "Allow precompute" toggle off."""
+
+    pass
+
+
+class NonIntegerTimezone(LazyPrecomputeIneligible):
+    pass
+
+
+class BelowVolumeFloor(LazyPrecomputeIneligible):
+    """The team's 7-day event volume is under the precompute floor — its live
+    path is sub-second and always fresh, so the query stays live."""
+
+
+class ConversionGoalUnsupported(LazyPrecomputeIneligible):
+    pass
+
+
+class SamplingEnabled(LazyPrecomputeIneligible):
+    pass
+
+
+class SessionsV2UuidMode(LazyPrecomputeIneligible):
+    pass
+
+
+class TooManyFilters(LazyPrecomputeIneligible):
+    pass
+
+
+class NonEventPropertyFilter(LazyPrecomputeIneligible):
+    pass
+
+
+class UnsupportedFilterKey(LazyPrecomputeIneligible):
+    def __init__(self, key: str):
+        self.key = key
+        super().__init__(f"key={key!r}")
+
+
+class UnsupportedFilterOperator(LazyPrecomputeIneligible):
+    def __init__(self, operator: object):
+        self.operator = operator
+        super().__init__(f"operator={operator!r}")
+
+
+class NonStringOrEmptyFilterValue(LazyPrecomputeIneligible):
+    pass
+
+
+class UnsupportedFilterType(LazyPrecomputeIneligible):
+    """A filter is not an event/person property — precompute only handles those,
+    since session/cohort filters are applied differently on the live path per family."""
+
+    def __init__(self, filter_type: object):
+        self.filter_type = filter_type
+        super().__init__(f"type={filter_type!r}")
+
+
+class PropertyAccessControlled(LazyPrecomputeIneligible):
+    """The team has property-level access controls — userless shared precompute
+    can't honor per-user property restrictions, so the query stays on the live path."""
+
+
+class MissingDateRange(LazyPrecomputeIneligible):
+    pass
+
+
+class DateRangeOverMax(LazyPrecomputeIneligible):
+    def __init__(self, days: int, max_days: int = MAX_PRECOMPUTE_DAYS):
+        self.days = days
+        super().__init__(f"days={days} max={max_days}")
+
+
+class ReachesRetentionFloor(LazyPrecomputeIneligible):
+    """The range starts before the events-retention build floor. The executor builds no
+    windows there, so only the live query can serve it."""
+
+
+def range_reaches_retention_floor(team: Team, start: datetime) -> bool:
+    months = events_retention_months_for_team(team, team.pk)
+    return months is not None and start < retention_build_floor(months)
+
+
+def is_org_feature_flag_enabled(team: Team) -> bool:
+    """Evaluate the rollout flag locally — fails closed on flag-service errors."""
+    return bool(
+        posthoganalytics.feature_enabled(
+            ORG_FEATURE_FLAG_KEY,
+            str(team.uuid),
+            groups={
+                "organization": str(team.organization_id),
+                "project": str(team.id),
+            },
+            group_properties={
+                "organization": {"id": str(team.organization_id)},
+                "project": {"id": str(team.id)},
+            },
+            only_evaluate_locally=True,
+            send_feature_flag_events=False,
+        )
+    )
+
+
+def is_precompute_enabled_for_team(team: Team) -> bool:
+    """Whether a team should take the lazy precompute path.
+
+    Short-circuits on the `WEB_ANALYTICS_LAZY_PRECOMPUTE_TEAM_IDS` env-var
+    setting before evaluating the org rollout flag. The list is the shared
+    source of truth with the eager warmer, and — unlike the flag — does not rely
+    on local flag-definition evaluation, which isn't reliably available outside
+    the Django app (e.g. the Dagster warmer, where `only_evaluate_locally`
+    returned falsy and silently dropped the warmer onto the raw path).
+    """
+    if team.id in settings.WEB_ANALYTICS_LAZY_PRECOMPUTE_TEAM_IDS:
+        return True
+    # Background warmers build buckets for every active team regardless of the
+    # rollout flag: warming precedes read enablement, and flag evaluation is not
+    # reliably available in the Dagster processes the warmers run in. User-facing
+    # reads still require flag enrollment; the per-team shape ceiling keeps the
+    # warmed set bounded.
+    if is_background_warming_request():
+        return True
+    return is_org_feature_flag_enabled(team)
+
+
+def check_common_eligibility(
+    *,
+    team: Team,
+    use_web_analytics_precompute: Optional[bool],
+    conversion_goal: Any,
+    sampling: Any,
+    modifiers: Any,
+    properties: list,
+    resolve_date_range: Callable[[], tuple[Optional[datetime], Optional[datetime]]],
+    allow_channel_type_filter: bool = False,
+    max_days: int = MAX_PRECOMPUTE_DAYS,
+    resolve_compare_date_from: Optional[Callable[[], Optional[datetime]]] = None,
+) -> None:
+    """Run the gate checks shared by all web-analytics lazy precompute paths.
+
+    Raises a `LazyPrecomputeIneligible` subclass on failure; returns None on
+    success. The caller is responsible for any additional per-runner checks
+    (e.g. PATHS requires `breakdownBy=PAGE && includeBounceRate`).
+
+    `resolve_date_range` is called lazily so the gate can reject cheap cases
+    (org flag off, etc.) without touching `QueryDateRange.date_from()` —
+    which can trigger a ClickHouse min-timestamp lookup for `-all` ranges.
+    `resolve_compare_date_from` returns the compare period's start, or None
+    when the query has no compare period.
+    """
+    if not is_precompute_enabled_for_team(team):
+        raise OrgFeatureFlagDisabled()
+
+    # Precompute defaults ON for every enrolled team: an untouched toggle
+    # (`None`) takes the precompute path; only an explicit `False` (the
+    # "Allow precompute" toggle turned off) opts a query out.
+    if use_web_analytics_precompute is False:
+        raise PerQueryOptedOut()
+
+    # After the free local checks (this one costs a Redis round trip on local
+    # cache miss). Deliberately checked for background warming too: the floor
+    # exists to stop building buckets for teams whose live path already
+    # serves them better.
+    if not is_team_above_volume_floor(team.pk):
+        raise BelowVolumeFloor()
+
+    if not is_integer_timezone(team.timezone):
+        raise NonIntegerTimezone()
+
+    if conversion_goal is not None:
+        raise ConversionGoalUnsupported()
+
+    if sampling is not None and getattr(sampling, "enabled", False):
+        raise SamplingEnabled()
+
+    if modifiers and getattr(modifiers, "sessionsV2JoinMode", None) == SessionsV2JoinMode.UUID:
+        raise SessionsV2UuidMode()
+
+    # Any event/person filter shape is accepted (any key, any operator, any number),
+    # translated as a whole via `property_to_expr`; each distinct set becomes its own
+    # cache key, bounded by the per-team shape ceiling in `web_ensure_precomputed`.
+    # Session and cohort filters are refused: the precompute INSERT applies the whole
+    # list userlessly, but the live runners handle those types differently per family
+    # (web vitals drops session filters), so precomputing them would serve a different
+    # population than the live fallback. Those queries fall through to the live path,
+    # which applies them correctly.
+    for prop in properties:
+        if (
+            allow_channel_type_filter
+            and get_property_type(prop) == "session"
+            and get_property_key(prop) == "$channel_type"
+        ):
+            continue
+        if get_property_type(prop) not in ("event", "person"):
+            raise UnsupportedFilterType(get_property_type(prop))
+
+    # Precompute results are built userless and shared across users by a
+    # user-independent cache key, so they cannot honor per-user property
+    # restrictions. If the team has any property-level access controls, skip
+    # precompute entirely and let the live path enforce them per requesting user.
+    if team_has_property_access_rules(team_id=team.id):
+        raise PropertyAccessControlled()
+
+    date_from, date_to = resolve_date_range()
+    if date_from is None or date_to is None:
+        raise MissingDateRange()
+
+    days = (date_to - date_from).days
+    if days > max_days:
+        raise DateRangeOverMax(days, max_days)
+
+    compare_date_from = resolve_compare_date_from() if resolve_compare_date_from is not None else None
+    if range_reaches_retention_floor(team, date_from) or (
+        compare_date_from is not None and range_reaches_retention_floor(team, compare_date_from)
+    ):
+        raise ReachesRetentionFloor()
+
+
+def log_eligibility_outcome(*, log_prefix: str, team_id: int, error: Optional[LazyPrecomputeIneligible]) -> None:
+    """Emit the same `*_rejected` / `*_eligible` info log shape used by every
+    lazy path so a single Loki query can attribute all fall-throughs."""
+    if error is not None:
+        reason = type(error).__name__
+        set_lazy_precompute_ineligible_reason(reason)
+        logger.info(
+            f"{log_prefix}_rejected",
+            team_id=team_id,
+            reason=reason,
+            detail=str(error) or None,
+        )
+    else:
+        set_lazy_precompute_ineligible_reason(None)
+        logger.info(f"{log_prefix}_eligible", team_id=team_id)
+
+
+def set_lazy_precompute_ineligible_reason(reason: Optional[str]) -> None:
+    """Record why a gate refused this read, or clear the tag when a gate admits the query.
+
+    A stats-table read consults several gates in turn, so a rejection from an earlier gate must not
+    survive onto a query that a later gate admits.
+    """
+    if reason is None:
+        clear_tag("web_analytics_precompute_ineligible_reason")
+    else:
+        tag_queries(web_analytics_precompute_ineligible_reason=reason)
+
+
+def lazy_precompute_ineligible_reason(strategy: WebAnalyticsPreComputeStrategy) -> Optional[str]:
+    """Give the reason a gate refused this read, but only for a response the live path served.
+
+    The gates run before the runner selects a strategy. A read the lazy gate rejects can still be
+    served from the pre-aggregated tables, so the tag must not ride out next to a strategy that is
+    not `LIVE`.
+    """
+    if strategy != WebAnalyticsPreComputeStrategy.LIVE:
+        return None
+    return get_query_tag_value("web_analytics_precompute_ineligible_reason")
+
+
+def compute_filters_eligibility_hash(query: Any, team_timezone: str) -> str:
+    """Stable hash over the user-facing inputs that would fragment a precompute cache key.
+
+    Emitted on the `web_analytics_query` and `lazy_computation.executed` structured
+    log lines so the two can be joined and queries-per-distinct-cache-key (`q/key`)
+    can be measured over multi-day windows — including for queries that didn't
+    go through the lazy precompute path (different eligibility gating, different
+    runner) but would have shared a job_id if they had.
+
+    Same hashing mechanic as `compute_query_hash` in lazy_computation_executor
+    (SHA-256 over canonical JSON). It is **not** numerically identical to the
+    precompute job's `query_hash` — that one hashes the post-build INSERT AST —
+    but it fragments along the same logical dimensions: query kind, property
+    filters (with values), date range, breakdown, conversion goal, sampling,
+    interval, compare filter, test-accounts toggle, and team timezone.
+    """
+    return _hash_query_fields(query, team_timezone, _FILTERS_ELIGIBILITY_HASH_IGNORED_QUERY_FIELDS)
+
+
+# The precompute namespace (`compute_query_hash`) sentinelizes its time-window
+# placeholders, so buckets are reused across requested date ranges: different
+# ranges — and a compare query's current vs. previous period — of the same
+# filter/breakdown shape map to ONE namespace. The shape cap therefore drops the
+# range-varying fields on top of the eligibility-hash ignores, so it counts
+# distinct namespaces rather than per-request shapes. Otherwise a user could
+# exhaust the ceiling by replaying one filter with different ISO timestamps until
+# new legitimate shapes are forced onto the live path (veria review).
+SHAPE_CAP_KEY_IGNORED_QUERY_FIELDS: frozenset[str] = _FILTERS_ELIGIBILITY_HASH_IGNORED_QUERY_FIELDS | frozenset(
+    {"dateRange", "compareFilter"}
+)
+
+
+def compute_shape_cap_key(query: Any, team_timezone: str, test_account_filters: Optional[list] = None) -> str:
+    """Namespace-identity key for the per-team shape cap: the eligibility hash with the
+    time-window fields dropped (so date-range variants of one shape share a slot), plus
+    the team's resolved test-account filters. Those resolve from team config into the
+    INSERT AST — part of the namespace but absent from the query payload — so folding them
+    in stops an admin from minting fresh namespaces onto one cap slot by editing the
+    test-account filters (veria review)."""
+    dumped = query.model_dump(mode="json", exclude_none=True, by_alias=False)
+    for key in SHAPE_CAP_KEY_IGNORED_QUERY_FIELDS:
+        dumped.pop(key, None)
+    tafs = [
+        f.model_dump(mode="json", exclude_none=True) if hasattr(f, "model_dump") else f
+        for f in (test_account_filters or [])
+    ]
+    payload = {"query": dumped, "timezone": team_timezone, "test_account_filters": tafs}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def compute_shape_key(query: Any, team_timezone: str, test_account_filters: Optional[list] = None) -> str:
+    return compute_shape_cap_key(query, team_timezone, test_account_filters)[:24]
+
+
+def _hash_query_fields(query: Any, team_timezone: str, ignored_fields: frozenset[str]) -> str:
+    dumped = query.model_dump(mode="json", exclude_none=True, by_alias=False)
+    for key in ignored_fields:
+        dumped.pop(key, None)
+    payload = {"query": dumped, "timezone": team_timezone}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def host_filter_expr(properties: list, *, team: Team) -> ast.Expr:
+    """Translate the user filter list to an AST expression.
+
+    The returned AST is what `ensure_precomputed` hashes into the cache key —
+    different filter values therefore become different precomputed jobs. Any filter
+    list is translated via the general `property_to_expr`; filters the INSERT can't
+    express fail the job and fall back to the live query automatically.
+    """
+    if not properties:
+        return ast.Constant(value=True)
+    return property_to_expr(properties, team=team)
+
+
+def test_account_filter_expr(*, test_account_filters: list, team: Team) -> ast.Expr:
+    """Convert the runner's resolved test-account filters into an AST.
+
+    May return `ast.Constant(value=True)` when `filterTestAccounts=False` or
+    the project has no test accounts configured.
+    """
+    if not test_account_filters:
+        return ast.Constant(value=True)
+    return property_to_expr(test_account_filters, team=team)
+
+
+def floor_utc_day(dt_utc: datetime) -> datetime:
+    return datetime(dt_utc.year, dt_utc.month, dt_utc.day, tzinfo=UTC)
+
+
+def ceil_utc_day(dt_utc: datetime) -> datetime:
+    floor = floor_utc_day(dt_utc)
+    if floor == dt_utc:
+        return floor
+    return floor + timedelta(days=1)

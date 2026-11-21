@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Authenticate with PostHog</title>
+    <link rel="preload" href="/static/fonts/RoundHog.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/static/fonts/RoundHog-Medium.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/static/fonts/RoundHog-SemiBold.woff2" as="font" type="font/woff2" crossorigin>
+
+    <style>
+        /* RoundHog is the app's UI font. The faces are served by this worker from
+           @posthog/brand, so the page needs no third-party font host. Weight mapping follows
+           the app: Regular 400, Medium 500, SemiBold 700. */
+        @font-face {
+            font-family: RoundHog;
+            font-style: normal;
+            font-weight: 400;
+            font-display: swap;
+            src: url('/static/fonts/RoundHog.woff2') format('woff2');
+        }
+
+        @font-face {
+            font-family: RoundHog;
+            font-style: normal;
+            font-weight: 500;
+            font-display: swap;
+            src: url('/static/fonts/RoundHog-Medium.woff2') format('woff2');
+        }
+
+        @font-face {
+            font-family: RoundHog;
+            font-style: normal;
+            font-weight: 700;
+            font-display: swap;
+            src: url('/static/fonts/RoundHog-SemiBold.woff2') format('woff2');
+        }
+
+        /* Values mirror the login scene (frontend/src/scenes/authentication/shared/authScene).
+           This page is served by a Cloudflare Worker, so it cannot import the app's tokens. */
+        :root {
+            --font-sans:
+                RoundHog, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', helvetica, arial,
+                sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+            --font-mono: ui-monospace, 'SFMono-Regular', 'SF Mono', 'Menlo', 'Consolas', 'Liberation Mono', monospace;
+            --text-primary: #111;
+            --text-secondary: #4b5563;
+            --text-footer: #404040;
+            --card-bg: #f6f5f0;
+            --card-border: #e3e0d4;
+            --control-bg: #fff;
+            --control-border: #ccc;
+            --control-border-hover: #aaa;
+            --control-frame: #e1dddd;
+            --accent: #f7a501;
+            --accent-blue: #3280ff;
+            --accent-border: #b17816;
+            --accent-border-hover: #8e5b03;
+            --radius: 6px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 72px 16px;
+            font-family: var(--font-sans);
+            color: var(--text-primary);
+            background-color: #b5cd8f;
+            background-image:
+                radial-gradient(80% 70% at 50% 30%, rgb(255 253 240 / 45%), transparent 70%),
+                linear-gradient(180deg, #cfe0ae 0%, #b5cd8f 55%, #9dbb78 100%);
+            background-repeat: no-repeat;
+            background-attachment: fixed;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Mono notes in the corner of the garden, the same decoration the login scene types out. */
+        #notes {
+            position: absolute;
+            top: clamp(20px, 4vh, 40px);
+            left: clamp(20px, 4vw, 44px);
+            min-height: 2.6em;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            line-height: 19.5px;
+            color: rgb(45 74 22 / 65%);
+        }
+
+        #notes div {
+            white-space: pre;
+        }
+
+        #notes div:first-child {
+            font-weight: 600;
+        }
+
+        #caret {
+            display: inline-block;
+            width: 8px;
+            height: 1.05em;
+            margin-left: 2px;
+            vertical-align: -2px;
+            background: var(--accent);
+            border-radius: 1px;
+            animation: blink 1.05s steps(1) infinite;
+        }
+
+        @media (max-width: 575px) {
+            #notes {
+                display: none;
+            }
+        }
+
+        main {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 27rem;
+            max-width: 100%;
+            margin: 0 auto;
+        }
+
+        #logo {
+            display: block;
+            width: auto;
+            height: 28px;
+            margin-bottom: 16px;
+        }
+
+        @media (min-width: 576px) {
+            #logo {
+                height: 40px;
+            }
+        }
+
+        article {
+            width: 100%;
+            padding: 32px 36px;
+            text-align: center;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            box-shadow: 0 16px 40px rgb(30 50 10 / 25%);
+        }
+
+        h1 {
+            font-size: 20px;
+            font-weight: 700;
+            line-height: 25px;
+            letter-spacing: -0.5px;
+        }
+
+        h1+p {
+            margin-top: 8px;
+            font-size: 14px;
+            line-height: 20px;
+            color: var(--text-secondary);
+        }
+
+        nav {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 24px;
+        }
+
+        /* The 3D frame the app's LemonButton draws under every button. */
+        .btn {
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            min-height: 49px;
+            padding: 8px 16px;
+            font-family: inherit;
+            font-size: 16px;
+            font-weight: 500;
+            color: var(--text-primary);
+            text-decoration: none;
+            cursor: pointer;
+            background: var(--control-bg);
+            border: 1px solid var(--control-border);
+            border-radius: var(--radius);
+            box-shadow: 0 3px 0 0 var(--control-frame);
+            transition: border-color 200ms ease, box-shadow 200ms ease, translate 200ms ease;
+        }
+
+        .btn:hover {
+            border-color: var(--control-border-hover);
+        }
+
+        .btn:active {
+            translate: 0 3px;
+            box-shadow: none;
+        }
+
+        .btn:focus-visible {
+            outline: 2px solid var(--accent-border);
+            outline-offset: 2px;
+        }
+
+        .flag {
+            font-size: 18px;
+            line-height: 1;
+        }
+
+        /* Corner badge on the region the browser was last signed in to. */
+        .last-used {
+            position: absolute;
+            top: 6px;
+            right: 8px;
+            padding: 1px 6px;
+            font-size: 11px;
+            font-weight: 500;
+            line-height: 16px;
+            color: var(--accent-blue);
+            background: rgb(50 128 255 / 10%);
+            border-radius: 4px;
+        }
+
+        /* Too little width left of the badge for the centered region name to clear it, so the
+           badge joins the row instead, and wraps below the name when even that does not fit. */
+        @media (max-width: 575px) {
+            .btn {
+                flex-wrap: wrap;
+            }
+
+            .last-used {
+                position: static;
+            }
+        }
+
+        .btn--primary {
+            background: var(--accent);
+            border-color: var(--accent-border);
+            box-shadow: 0 3px 0 0 var(--accent-border);
+        }
+
+        .btn--primary:hover {
+            border-color: var(--accent-border-hover);
+        }
+
+        .btn--small {
+            min-height: 36px;
+            font-size: 14px;
+        }
+
+        noscript p,
+        #hint-default {
+            margin-top: 24px;
+            font-size: 13px;
+            line-height: 19px;
+            color: var(--text-secondary);
+        }
+
+        noscript p a,
+        #hint-default a {
+            color: var(--text-secondary);
+            text-underline-offset: 2px;
+        }
+
+        noscript p a:hover,
+        #hint-default a:hover {
+            color: var(--text-primary);
+        }
+
+        footer {
+            margin-top: 20px;
+            font-size: 14px;
+            line-height: 20px;
+            color: var(--text-footer);
+        }
+
+        footer a {
+            color: inherit;
+            text-underline-offset: 2px;
+        }
+
+        footer a:hover {
+            color: var(--text-primary);
+        }
+
+        @media (prefers-reduced-motion: no-preference) {
+            main {
+                animation: rise 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+
+            .btn,
+            #caret {
+                transition: none;
+                animation: none;
+            }
+
+            .btn:active {
+                translate: none;
+            }
+        }
+
+        @keyframes blink {
+
+            0%,
+            50% {
+                opacity: 1;
+            }
+
+            50.01%,
+            100% {
+                opacity: 0;
+            }
+        }
+
+        @keyframes rise {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+
+            to {
+                opacity: 1;
+                transform: none;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Decorative, and never translated: an in-page translator replaces the text nodes the
+         typewriter below rewrites on every tick. -->
+    <div aria-hidden="true" id="notes" translate="no">
+        <div>// oauth.posthog.com<span id="caret"></span></div>
+        <div></div>
+    </div>
+
+    <main>
+        <!-- The landscape gradient lockup from @posthog/brand (`<Logo />`), inlined because a
+             Worker cannot render the React component. Re-copy it when the brand package
+             changes the mark. -->
+        <svg aria-hidden="true" fill="none" id="logo" viewBox="0 0 160 28" xmlns="http://www.w3.org/2000/svg">
+            <g clip-path="url(#logo-landscape-color-gradient-clip0_56_1021)">
+                <path fill="#111"
+                    d="M51.66 25.22A1.9 1.9 0 0 0 50 23.33l-.34-.04c-1-.13-1.94-.6-2.65-1.33L33.28 7.75V28H49a2.66 2.66 0 0 0 2.67-2.67zM39.2 23.54h-.09a1.78 1.78 0 1 1 .1 0" />
+                <path fill="url(#logo-landscape-color-gradient-paint0_linear_56_1021)"
+                    d="M21.96 2.67v4.96l11.3 11.6h.02V7.75L26.63.85a2.8 2.8 0 0 0-2-.85 2.67 2.67 0 0 0-2.67 2.67" />
+                <path fill="url(#logo-landscape-color-gradient-paint1_linear_56_1021)"
+                    d="M21.96 7.63v11.05L31.03 28h2.25v-8.75z" />
+                <path fill="url(#logo-landscape-color-gradient-paint2_linear_56_1021)" d="M21.96 28h9.07l-9.07-9.32z" />
+                <path fill="url(#logo-landscape-color-gradient-paint3_linear_56_1021)"
+                    d="M10.74 2.66v4.5l11.22 11.52V7.63L15.3.8a2.66 2.66 0 0 0-4.56 1.86" />
+                <path fill="url(#logo-landscape-color-gradient-paint4_linear_56_1021)" d="M10.74 28h8.96l-8.96-9.32z" />
+                <path fill="url(#logo-landscape-color-gradient-paint5_linear_56_1021)"
+                    d="M10.74 7.16v11.52L19.7 28h2.26v-9.32z" />
+                <path fill="url(#logo-landscape-color-gradient-paint6_linear_56_1021)"
+                    d="M10.74 7.16 4.54.8A2.66 2.66 0 0 0 0 2.66V7.5l10.74 11.18z" />
+                <path fill="url(#logo-landscape-color-gradient-paint7_linear_56_1021)"
+                    d="M9.19 28h1.55v-9.32L0 7.5v10.73z" />
+                <path fill="url(#logo-landscape-color-gradient-paint8_linear_56_1021)"
+                    d="M0 25.41A2.6 2.6 0 0 0 2.58 28H9.2L0 18.23z" />
+            </g>
+            <path fill="#111"
+                d="M64.9 22.88c-.67 0-1.23-.56-1.23-1.24V5.24c0-.69.56-1.24 1.24-1.24h6.55c3.89 0 6.39 2.32 6.39 5.9 0 3.6-2.5 5.91-6.4 5.91h-3.53v5.83c0 .68-.56 1.24-1.24 1.24zm3.02-11.94c0 .68.55 1.23 1.23 1.23h1.88c1.6 0 2.58-.86 2.58-2.26s-.97-2.27-2.58-2.27h-1.88c-.68 0-1.23.55-1.23 1.23zM84.71 23.1c-4.18 0-7.14-2.97-7.14-7.02s2.96-7.01 7.14-7.01c4.14 0 7.14 2.97 7.14 7.01 0 4.05-3 7.01-7.14 7.01m-3.22-7.02c0 2.16 1.3 3.64 3.22 3.64 1.9 0 3.2-1.48 3.2-3.64s-1.3-3.64-3.2-3.64c-1.93 0-3.22 1.48-3.22 3.64m16.34 7.03a6.2 6.2 0 0 1-5.54-3.01c-.34-.57-.01-1.26.6-1.5l.77-.3c.7-.27 1.45.15 1.92.73a2.8 2.8 0 0 0 2.25 1.08c1.05 0 1.75-.51 1.75-1.27 0-2.13-7.17-.7-7.17-5.85 0-2.13 1.85-3.91 4.83-3.91 2.27 0 4.2.9 5.17 2.31.36.53.05 1.2-.54 1.44l-.85.35c-.68.29-1.45-.14-2-.63a2.5 2.5 0 0 0-1.64-.64c-.89 0-1.5.38-1.5.97 0 2.16 7.27.38 7.27 5.88 0 2.35-2.15 4.34-5.32 4.34m14.64-1.31c.04.57-.3 1.1-.86 1.2q-.6.1-1.27.11c-2.92 0-5.15-1.56-5.15-4.85v-5.66h-.91c-.69 0-1.24-.56-1.24-1.24v-.82c0-.68.55-1.23 1.24-1.23h.91v-2.7c0-.69.55-1.24 1.23-1.24h1.48c.68 0 1.24.55 1.24 1.23v2.7h2.04c.68 0 1.23.56 1.23 1.24v.82c0 .68-.55 1.24-1.23 1.24h-2.04v5.15c0 1.2.64 1.91 1.6 1.91.75 0 1.6.5 1.66 1.25zM125.5 5.23c0-.68.55-1.23 1.23-1.23h1.8c.68 0 1.23.55 1.23 1.23v16.41c0 .68-.55 1.24-1.23 1.24h-1.8c-.68 0-1.23-.56-1.23-1.24v-5.43c0-.68-.56-1.23-1.24-1.23h-5c-.67 0-1.23.55-1.23 1.23v5.43c0 .68-.55 1.24-1.23 1.24h-1.77c-.69 0-1.24-.56-1.24-1.24V5.24c0-.69.55-1.24 1.24-1.24h1.77c.68 0 1.23.55 1.23 1.23v4.87c0 .68.56 1.23 1.24 1.23h5c.67 0 1.23-.55 1.23-1.23zm12.87 17.87c-4.19 0-7.14-2.97-7.14-7.02s2.95-7.01 7.14-7.01c4.13 0 7.14 2.97 7.14 7.01 0 4.05-3 7.01-7.14 7.01m-3.22-7.02c0 2.16 1.29 3.64 3.22 3.64 1.9 0 3.2-1.48 3.2-3.64s-1.3-3.64-3.2-3.64c-1.93 0-3.22 1.48-3.22 3.64m17.17 6.37c-3.84 0-6.2-2.58-6.2-6.68s2.36-6.69 6.12-6.69c1.58 0 2.82.54 3.54 1.37 0-.64.52-1.15 1.16-1.15h1.5c.68 0 1.24.55 1.24 1.23V21.9c0 3.64-2.77 6.09-6.93 6.09-2.64 0-4.9-1.2-5.85-3.09-.31-.62.16-1.29.85-1.4l1.14-.17c.67-.11 1.29.4 1.78.85.5.46 1.26.7 2.08.7 1.85 0 3.06-1.04 3.06-2.55v-1.3c-.7.9-2.01 1.4-3.49 1.4m-2.36-6.68c0 2.02 1.18 3.31 3 3.31 1.86 0 3.04-1.29 3.04-3.31s-1.18-3.32-3.03-3.32c-1.83 0-3.01 1.3-3.01 3.32" />
+            <defs>
+                <linearGradient id="logo-landscape-color-gradient-paint0_linear_56_1021" x1="21.96" x2="33.28" y1="9.62"
+                    y2="9.62" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#ffd849" />
+                    <stop offset=".96" stop-color="#fbae01" />
+                </linearGradient>
+                <linearGradient id="logo-landscape-color-gradient-paint1_linear_56_1021" x1="21.96" x2="33.28"
+                    y1="17.81" y2="17.81" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#ffb700" />
+                    <stop offset="1" stop-color="#f9aa01" />
+                </linearGradient>
+                <linearGradient id="logo-landscape-color-gradient-paint2_linear_56_1021" x1="21.96" x2="31.03"
+                    y1="23.34" y2="23.34" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#ff9500" />
+                    <stop offset="1" stop-color="#f8aa00" />
+                </linearGradient>
+                <linearGradient id="logo-landscape-color-gradient-paint3_linear_56_1021" x1="10.74" x2="21.96" y1="9.34"
+                    y2="9.34" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#ff651e" />
+                    <stop offset="1" stop-color="#e4400a" />
+                </linearGradient>
+                <linearGradient id="logo-landscape-color-gradient-paint4_linear_56_1021" x1="10.74" x2="19.7" y1="23.34"
+                    y2="23.34" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#c42c00" />
+                    <stop offset="1" stop-color="#d63600" />
+                </linearGradient>
+                <linearGradient id="logo-landscape-color-gradient-paint5_linear_56_1021" x1="10.74" x2="21.96"
+                    y1="17.58" y2="17.58" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#ef3c00" />
+                    <stop offset="1" stop-color="#d63601" />
+                </linearGradient>
+                <linearGradient id="logo-landscape-color-gradient-paint6_linear_56_1021" x1="0" x2="10.74" y1="9.34"
+                    y2="9.34" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#3f80ff" />
+                    <stop offset="1" stop-color="#084fe0" />
+                </linearGradient>
+                <linearGradient id="logo-landscape-color-gradient-paint7_linear_56_1021" x1="0" x2="10.74" y1="17.75"
+                    y2="17.75" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#0255ff" />
+                    <stop offset="1" stop-color="#0145d2" />
+                </linearGradient>
+                <linearGradient id="logo-landscape-color-gradient-paint8_linear_56_1021" x1="0" x2="9.19" y1="23.11"
+                    y2="23.11" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#0041c6" />
+                    <stop offset="1" stop-color="#0045d0" />
+                </linearGradient>
+                <clipPath id="logo-landscape-color-gradient-clip0_56_1021">
+                    <path fill="#fff" d="M0 0h51.67v28H0z" />
+                </clipPath>
+            </defs>
+        </svg>
+
+        <article>
+            <h1>Authenticate with PostHog</h1>
+
+            <p>Where is your PostHog project hosted?</p>
+
+            <nav aria-label="Select PostHog region">
+                <a class="btn" id="btn-us" href="#">
+                    <span aria-hidden="true" class="flag">&#x1F1FA;&#x1F1F8;</span>
+                    US Cloud
+                    <span class="last-used" hidden>Last used</span>
+                </a>
+                <a class="btn" id="btn-eu" href="#">
+                    <span aria-hidden="true" class="flag">&#x1F1EA;&#x1F1FA;</span>
+                    EU Cloud
+                    <span class="last-used" hidden>Last used</span>
+                </a>
+            </nav>
+
+            <noscript>
+                <p>Enable JavaScript to continue. Your OAuth login parameters are required from this page.</p>
+            </noscript>
+
+            <p id="hint-default">
+                Not sure? Check your PostHog URL. <br />
+                It should be either
+                <a href="https://us.posthog.com" rel="noopener noreferrer" target="_blank">us.posthog.com</a> or
+                <a href="https://eu.posthog.com" rel="noopener noreferrer" target="_blank">eu.posthog.com</a>
+            </p>
+
+        </article>
+
+        <footer>
+            &copy; <span id="year"></span> <a href="https://posthog.com">posthog.com</a>
+        </footer>
+    </main>
+    <script>
+        // Write the current year to the footer
+        document.getElementById('year').textContent = new Date().getFullYear();
+
+        var params = new URLSearchParams(window.location.search);
+        function buildUrl(region) {
+            params.set('_region', region);
+            return '/oauth/authorize/?' + params.toString();
+        }
+        document.getElementById('btn-us').href = buildUrl('us');
+        document.getElementById('btn-eu').href = buildUrl('eu');
+
+        var prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        // Type the second corner note, matching the login scene's typewriter.
+        (function () {
+            var line = '// choose your data region';
+            var target = document.getElementById('notes').lastElementChild;
+            var caret = document.getElementById('caret');
+            if (prefersReducedMotion) {
+                target.textContent = line;
+                target.appendChild(caret);
+                return;
+            }
+            var shown = 0;
+            var id = setInterval(function () {
+                shown++;
+                target.textContent = line.slice(0, shown);
+                target.appendChild(caret);
+                if (shown >= line.length) {
+                    clearInterval(id);
+                }
+            }, 42);
+        })();
+
+        // Mark the region this browser last used. The worker already redirected anyone with a
+        // single live session (see soleLiveRegion in handlers/authorize.ts), so reaching this page
+        // means the answer is genuinely ambiguous and the choice is the visitor's to make.
+        (function () {
+            var cookie = document.cookie.split('; ').find(function (c) { return c.startsWith('ph_current_instance='); });
+            if (!cookie) return;
+            var value = decodeURIComponent(cookie.substring(cookie.indexOf('=') + 1)).replace(/"/g, '');
+            try {
+                var hostname = new URL(value).hostname;
+                var region = hostname === 'us.posthog.com' ? 'us' : hostname === 'eu.posthog.com' ? 'eu' : null;
+                if (region) {
+                    document.querySelector('#btn-' + region + ' .last-used').hidden = false;
+                }
+            } catch (e) { /* not a region we know */ }
+        })();
+
+    </script>
+</body>
+
+</html>

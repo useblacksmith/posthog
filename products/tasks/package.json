@@ -1,0 +1,30 @@
+{
+    "name": "@posthog/products-tasks",
+    "scripts": {
+        "backend:test": "pytest -c ../../pytest.ini --rootdir ../.. backend/tests backend/logic backend/management backend/temporal -v --tb=short"
+    },
+    "dependencies": {
+        "@posthog/products-mcp-store": "workspace:*",
+        "@posthog/quill": "workspace:*",
+        "kea-disposables": "catalog:",
+        "posthog-js": "catalog:"
+    },
+    "devDependencies": {
+        "@testing-library/react": "^16.3.3",
+        "kea-test-utils": "catalog:",
+        "tailwindcss": "4.3.0"
+    },
+    "peerDependencies": {
+        "@posthog/icons": "catalog:",
+        "@storybook/react": "catalog:",
+        "@types/react": "*",
+        "@types/react-dom": "*",
+        "clsx": "*",
+        "kea": "catalog:",
+        "kea-loaders": "catalog:",
+        "kea-router": "catalog:",
+        "kea-subscriptions": "catalog:",
+        "react": "*",
+        "react-dom": "*"
+    }
+}

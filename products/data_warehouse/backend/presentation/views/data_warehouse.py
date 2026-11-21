@@ -1,0 +1,1975 @@
+from datetime import datetime, timedelta
+from typing import cast
+from zoneinfo import ZoneInfo
+
+from django.core.cache import cache
+from django.db import connection
+from django.db.models import Count, OuterRef, Q, QuerySet, Subquery, Sum, TextChoices
+from django.db.models.functions import TruncDate, TruncHour
+
+import structlog
+from dateutil import parser
+from drf_spectacular.utils import OpenApiResponse, extend_schema, inline_serializer
+from opentelemetry import trace
+from rest_framework import serializers, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from posthog.hogql import ast
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.api.documentation import _FallbackSerializer
+from posthog.api.mixins import validated_request
+from posthog.api.property_value_metrics import PROPERTY_VALUES_DURATION
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.clickhouse.query_tagging import Feature, Product, tag_queries
+from posthog.cloud_utils import get_cached_instance_license
+from posthog.helpers.dashboard_templates import create_data_ops_dashboard
+from posthog.models.organization import OrganizationMembership
+from posthog.models.team.extensions import get_or_create_team_extension
+from posthog.models.user import User
+from posthog.permissions import is_service_auth
+from posthog.utils import convert_property_value, flatten
+
+from products.access_control.backend.facade.user_access_control import access_level_satisfied_for_resource
+from products.batch_exports.backend.facade import api as batch_exports_api
+from products.cdp.backend.facade.models import HogFunction, HogFunctionState, HogFunctionType
+from products.data_modeling.backend.facade.models import DataModelingJob, DataModelingJobEngine, DataWarehouseSavedQuery
+from products.data_quality.backend.presentation.serializers import DataQualityGateConfigSerializer
+from products.data_quality.backend.presentation.views import data_quality_gate_response
+from products.data_warehouse.backend.facade.api import get_managed_warehouse_data_status, get_source_schema_statuses
+from products.data_warehouse.backend.facade.models import TeamDataWarehouseConfig
+from products.data_warehouse.backend.presentation.managed_warehouse_data_status import (
+    ManagedWarehouseDataStatusResponseSerializer,
+    ManagedWarehouseSourceSchemasQuerySerializer,
+    ManagedWarehouseSourceSchemasResponseSerializer,
+)
+from products.data_warehouse.backend.presentation.managed_warehouse_monitoring import (
+    ManagedWarehouseMonitoringErrorResponseSerializer,
+    ManagedWarehouseMonitoringSeriesQuerySerializer,
+    ManagedWarehouseMonitoringSeriesResponseSerializer,
+    ManagedWarehouseMonitoringSnapshotResponseSerializer,
+    ManagedWarehouseMonitoringUpstreamError,
+    serialize_monitoring_series,
+    serialize_monitoring_snapshot,
+)
+from products.data_warehouse.backend.presentation.managed_warehouse_trino_monitoring import (
+    ManagedWarehouseTrinoMonitoringSeriesQuerySerializer,
+    ManagedWarehouseTrinoMonitoringSnapshotResponseSerializer,
+    WarehouseTrinoStatusState,
+    serialize_trino_monitoring_series,
+    serialize_trino_monitoring_snapshot,
+)
+from products.data_warehouse.backend.presentation.pipeline_stats import (
+    CompletedActivityQuerySerializer,
+    DataHealthIssuesResponseSerializer,
+    JobStatsQuerySerializer,
+    PipelineActivityResponseSerializer,
+    PipelineErrorSerializer,
+    PipelineJobStatsResponseSerializer,
+    PipelineRowsStatsResponseSerializer,
+    RunningActivityQuerySerializer,
+)
+from products.managed_warehouse.backend.presentation import views as managed_warehouse
+from products.warehouse_sources.backend.facade.hogql import get_view_or_table_by_name
+from products.warehouse_sources.backend.facade.models import ExternalDataJob, ExternalDataSchema, ExternalDataSource
+from products.warehouse_sources.backend.facade.types import (
+    ExternalDataJobStatus,
+    ExternalDataSchemaStatus,
+    ExternalDataSourceStatus,
+)
+
+from ee.billing.billing_manager import BillingManager
+
+logger = structlog.get_logger(__name__)
+tracer = trace.get_tracer(__name__)
+
+
+_MONITORING_ERROR_RESPONSES = {
+    status.HTTP_400_BAD_REQUEST: OpenApiResponse(
+        response=ManagedWarehouseMonitoringErrorResponseSerializer,
+        description="The monitoring query parameters are invalid.",
+    ),
+    status.HTTP_403_FORBIDDEN: OpenApiResponse(
+        response=ManagedWarehouseMonitoringErrorResponseSerializer,
+        description="Managed warehouse monitoring is not available to the caller.",
+    ),
+    status.HTTP_404_NOT_FOUND: OpenApiResponse(
+        response=ManagedWarehouseMonitoringErrorResponseSerializer,
+        description="The organization does not have a managed warehouse, or this endpoint does not match its query engine.",
+    ),
+    status.HTTP_501_NOT_IMPLEMENTED: OpenApiResponse(
+        response=ManagedWarehouseMonitoringErrorResponseSerializer,
+        description="Managed warehouse monitoring is not configured.",
+    ),
+    status.HTTP_502_BAD_GATEWAY: OpenApiResponse(
+        response=ManagedWarehouseMonitoringErrorResponseSerializer,
+        description="The managed warehouse monitoring service returned an invalid response or was unreachable.",
+    ),
+    status.HTTP_504_GATEWAY_TIMEOUT: OpenApiResponse(
+        response=ManagedWarehouseMonitoringErrorResponseSerializer,
+        description="The managed warehouse monitoring service timed out.",
+    ),
+}
+
+
+_TRINO_VARIANT_MONITORING_ERROR = (
+    "This warehouse runs on Trino. Use the Trino monitoring endpoints "
+    "(managed-warehouse-trino-monitoring and managed-warehouse-trino-monitoring-timeseries) instead. "
+    "The matching MCP tools are managed-warehouse-trino-monitoring-get and managed-warehouse-trino-metric-history-get."
+)
+
+_DUCKDB_VARIANT_MONITORING_ERROR = (
+    "This warehouse doesn't run on Trino. Use the managed warehouse monitoring endpoints "
+    "(managed-warehouse-monitoring and managed-warehouse-monitoring-timeseries) instead. "
+    "The matching MCP tools are managed-warehouse-monitoring-get and managed-warehouse-metric-history-get."
+)
+
+
+def _wrong_monitoring_variant_response(message: str) -> Response:
+    return Response({"error": message}, status=status.HTTP_404_NOT_FOUND)
+
+
+def _managed_warehouse_monitoring_error_response(upstream_response: Response) -> Response:
+    upstream_status = upstream_response.status_code
+    if upstream_status == status.HTTP_403_FORBIDDEN:
+        return Response(
+            {"error": "Warehouse monitoring isn't available for this organization."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if (
+        upstream_status == status.HTTP_404_NOT_FOUND
+        and isinstance(upstream_response.data, dict)
+        and upstream_response.data.get("code") == "managed_warehouse_not_found"
+    ):
+        return Response(
+            {"error": "Couldn't find a managed warehouse for this organization. Set one up in Data ops and try again."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    if upstream_status == status.HTTP_501_NOT_IMPLEMENTED:
+        return Response(
+            {"error": "Warehouse monitoring isn't configured. Contact support."},
+            status=status.HTTP_501_NOT_IMPLEMENTED,
+        )
+    if upstream_status == status.HTTP_504_GATEWAY_TIMEOUT:
+        return Response(
+            {"error": "Warehouse monitoring took too long to respond. Try again."},
+            status=status.HTTP_504_GATEWAY_TIMEOUT,
+        )
+    return Response(
+        {
+            "error": "Couldn't load warehouse monitoring data. Refresh the page, and contact support if it keeps happening."
+        },
+        status=status.HTTP_502_BAD_GATEWAY,
+    )
+
+
+# Both aggregates are dashboard reads that fan out across a team's whole sync history, and a
+# dashboard polls. The window they report is coarse enough that a short cache costs the reader
+# nothing. `total_rows_stats` gets the longer one because it also makes a synchronous call out
+# to billing.
+JOB_STATS_CACHE_TTL_SECONDS = 60
+TOTAL_ROWS_STATS_CACHE_TTL_SECONDS = 300
+
+
+def _pipeline_stats_cache_key(name: str, team_id: int, *parts: object) -> str:
+    # team_id is in the key, not a filter applied afterwards, so one team can never be served
+    # another team's cached aggregate.
+    suffix = ":".join(str(part) for part in parts)
+    return f"data_warehouse:{name}:{team_id}" + (f":{suffix}" if suffix else "")
+
+
+# A run counts as failed when it errored or when billing stopped it. Kept in one place
+# because the three aggregates below drifted apart: each listed `BILLING_LIMIT_REACHED`
+# twice and none counted `BILLING_LIMIT_TOO_LOW`, so those runs were reported as neither
+# successful nor failed.
+FAILED_EXTERNAL_JOB_STATUSES = [
+    ExternalDataJobStatus.FAILED,
+    ExternalDataJobStatus.BILLING_LIMIT_REACHED,
+    ExternalDataJobStatus.BILLING_LIMIT_TOO_LOW,
+]
+
+
+# A schema halted by billing reports one of two statuses, and the health list used to name
+# only the first, so a sync stopped by "billing limit too low" appeared nowhere and the user
+# had no way to see why it stopped.
+# `completed_activity` answers "what finished", which a dashboard needs in two flavours: the
+# runs that worked and the runs that did not. They differ only by which statuses to match, so
+# this is one parameter rather than a second near-copy of the union query.
+ACTIVITY_OUTCOME_COMPLETED = "completed"
+ACTIVITY_OUTCOME_FAILED = "failed"
+ACTIVITY_OUTCOME_ALL = "all"
+
+ACTIVITY_KIND_ALL = "all"
+ACTIVITY_KIND_IMPORT = "import"
+ACTIVITY_KIND_MODEL = "model"
+ACTIVITY_KINDS = {ACTIVITY_KIND_ALL, ACTIVITY_KIND_IMPORT, ACTIVITY_KIND_MODEL}
+
+ACTIVITY_OUTCOME_STATUSES: dict[str, tuple[list[str], list[str]]] = {
+    ACTIVITY_OUTCOME_COMPLETED: (
+        [ExternalDataJobStatus.COMPLETED],
+        [DataModelingJob.Status.COMPLETED],
+    ),
+    ACTIVITY_OUTCOME_FAILED: (
+        list(FAILED_EXTERNAL_JOB_STATUSES),
+        [DataModelingJob.Status.FAILED],
+    ),
+    # Every run that finished, however it finished. Running jobs are not here; they come
+    # from `running_activity`.
+    ACTIVITY_OUTCOME_ALL: (
+        [ExternalDataJobStatus.COMPLETED, *FAILED_EXTERNAL_JOB_STATUSES],
+        [DataModelingJob.Status.COMPLETED, DataModelingJob.Status.FAILED],
+    ),
+}
+
+
+BILLING_LIMITED_SCHEMA_STATUSES = [
+    ExternalDataSchemaStatus.BILLING_LIMIT_REACHED,
+    ExternalDataSchemaStatus.BILLING_LIMIT_TOO_LOW,
+]
+
+FAILING_SCHEMA_STATUSES = [ExternalDataSchemaStatus.FAILED, *BILLING_LIMITED_SCHEMA_STATUSES]
+
+
+# Hoglake credentials: OAuth clients for the managed hoglake catalog (hogtower, /oauth/token).
+_HOGLAKE_CREDENTIAL_ID = r"hlc_[0-9a-f]{8,64}"
+
+
+class HoglakeCredentialScope(TextChoices):
+    READ = "read", "Read"
+    WRITE = "write", "Read & write"
+
+
+class HoglakeCredentialCreateRequestSerializer(serializers.Serializer):
+    name = serializers.RegexField(
+        r"^[A-Za-z0-9][A-Za-z0-9 ._:@/-]{0,63}$",
+        help_text="A label for the client using this credential, e.g. 'laptop' or 'airflow'. It appears in "
+        "hoglake's audit log. Letters, digits, spaces and ._:@/- only; at most 64 characters.",
+    )
+    scope = serializers.ChoiceField(
+        choices=HoglakeCredentialScope.choices,
+        help_text="read lists and reads tables; write can also commit to them.",
+    )
+    ttl_seconds = serializers.IntegerField(
+        required=False,
+        min_value=3600,
+        max_value=365 * 24 * 3600,
+        help_text="Lifetime in seconds, from one hour to a year. Defaults to 90 days.",
+    )
+
+
+class HoglakeCredentialSerializer(serializers.Serializer):
+    client_id = serializers.CharField(help_text="The OAuth client_id, hlc_…")
+    name = serializers.CharField()
+    scope = serializers.CharField(help_text="read or write")
+    kind = serializers.CharField(
+        required=False,
+        help_text="org: reaches the whole catalog. team: a member's personal credential, limited to the "
+        "projects in team_ids that its owner can still see.",
+    )
+    owner_user_uuid = serializers.UUIDField(required=False, help_text="A personal credential's owner")
+    owner_email = serializers.CharField(required=False, help_text="The owner's email, while they are a member")
+    owner_name = serializers.CharField(required=False, help_text="The owner's name, while they are a member")
+    team_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, help_text="A personal credential's projects"
+    )
+    created_at = serializers.DateTimeField()
+    last_rotated_at = serializers.DateTimeField()
+    expires_at = serializers.DateTimeField()
+    revoked_at = serializers.DateTimeField(required=False, allow_null=True, help_text="Set once revoked")
+
+
+class HoglakeConnectSerializer(serializers.Serializer):
+    catalog = serializers.CharField(help_text="The hoglake catalog (warehouse) these credentials reach")
+    hoglake_url = serializers.CharField(required=False, help_text="Hoglake's public REST catalog URL")
+    token_url = serializers.CharField(required=False, help_text="OAuth token endpoint (client_credentials grant)")
+
+
+class HoglakeCredentialListResponseSerializer(serializers.Serializer):
+    hoglake_credentials = HoglakeCredentialSerializer(many=True)
+    connect = HoglakeConnectSerializer()
+
+
+class HoglakeCredentialIssuedSerializer(serializers.Serializer):
+    client_id = serializers.CharField(help_text="The OAuth client_id, hlc_…")
+    client_secret = serializers.CharField(help_text="The client secret — returned only here, never again")
+    name = serializers.CharField()
+    scope = serializers.CharField()
+    expires_at = serializers.DateTimeField()
+    kind = serializers.CharField(required=False, help_text="org or team")
+
+
+class HoglakeCredentialRevokedSerializer(serializers.Serializer):
+    revoked = serializers.CharField(help_text="The revoked client_id")
+
+
+class MyHoglakeCredentialCreateRequestSerializer(HoglakeCredentialCreateRequestSerializer):
+    team_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        min_length=1,
+        max_length=200,
+        help_text="The projects this credential reaches, each one you can see. Its tokens get your current "
+        "access on each, so losing a project's access takes it out of the next token.",
+    )
+
+
+class HoglakeProjectSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    access = serializers.CharField(help_text="read or write: the most a credential gets on this project")
+
+
+class MyHoglakeCredentialListResponseSerializer(serializers.Serializer):
+    hoglake_credentials = HoglakeCredentialSerializer(many=True)
+    connect = HoglakeConnectSerializer()
+    projects = HoglakeProjectSerializer(many=True, help_text="The projects you can put in a credential")
+
+
+class DataWarehouseViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
+    """
+    API endpoints for data warehouse aggregate statistics and operations.
+    """
+
+    # warehouse_view inherits from warehouse_objects; reads require viewer access,
+    # write actions (see required_scopes below) require editor access.
+    scope_object = "warehouse_view"
+    requires_resource_level_access = False
+    serializer_class = _FallbackSerializer
+
+    def _readable(self, queryset: QuerySet) -> QuerySet:
+        # Collection actions never call get_object(), so per-object denies only apply here.
+        if is_service_auth(self.request):
+            return queryset
+        return self.user_access_control.filter_queryset_by_access_level(queryset, include_all_if_admin=True)
+
+    def _readable_sources(self) -> QuerySet:
+        return self._readable(ExternalDataSource.objects.filter(team_id=self.team_id))
+
+    def _readable_schema_ids(self, schemas: list[ExternalDataSchema]) -> set:
+        # A schema carries no rules of its own. Its access resolves through the table it syncs, whose
+        # own access falls back to the source, or through the source directly before the first sync.
+        # Same resolution as WarehouseTableAccessPermission and ExternalDataSchemaViewset.
+        if is_service_auth(self.request):
+            return {schema.id for schema in schemas}
+        uac = self.user_access_control
+        uac.preload_object_access_controls([schema.table or schema.source for schema in schemas])
+        return {
+            schema.id
+            for schema in schemas
+            if (level := uac.get_user_access_level(schema.table or schema.source)) is not None
+            and access_level_satisfied_for_resource("warehouse_table", level, "viewer")
+        }
+
+    def _team_schemas(self) -> QuerySet:
+        return ExternalDataSchema.objects.filter(team_id=self.team_id, deleted=False).select_related("source", "table")
+
+    def _readable_team_schema_ids(self) -> list:
+        return list(self._readable_schema_ids(list(self._team_schemas())))
+
+    def _managed_warehouse_disabled_response(self) -> Response | None:
+        if managed_warehouse.is_enabled(self.team.organization_id):
+            return None
+        return Response({"error": "This feature is not enabled"}, status=status.HTTP_403_FORBIDDEN)
+
+    def _require_organization_admin(self, request: Request, action: str) -> Response | None:
+        if not request.user.is_authenticated:
+            return Response(
+                {"error": f"Only organization admins can {action} the managed warehouse"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        membership = OrganizationMembership.objects.filter(
+            organization_id=self.team.organization_id, user=request.user
+        ).first()
+        if membership is None or membership.effective_level < OrganizationMembership.Level.ADMIN:
+            return Response(
+                {"error": f"Only organization admins can {action} the managed warehouse"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return None
+
+    def dangerously_get_required_scopes(self, request: Request, view: viewsets.ViewSet) -> list[str] | None:
+        # GET and POST /hoglake_credentials share one route (see hoglake_credentials), and so do
+        # GET and POST /my_hoglake_credentials.
+        if self.action == "hoglake_credentials":
+            return ["warehouse_view:read"]
+        if self.action == "create_hoglake_credential":
+            return ["warehouse_view:write"]
+        if self.action == "my_hoglake_credentials":
+            return ["warehouse_view:read"]
+        if self.action == "create_my_hoglake_credential":
+            return ["warehouse_view:write"]
+        return None
+
+    def _audit_principal(self, request: Request) -> str:
+        return f"api:{cast(User, request.user).email}"
+
+    @action(methods=["GET"], detail=False, required_scopes=["query:read"])
+    def property_values(self, request: Request, **kwargs) -> Response:
+        with (
+            PROPERTY_VALUES_DURATION.labels(endpoint_type="data_warehouse").time(),
+            tracer.start_as_current_span("data_warehouse_api_property_values") as span,
+        ):
+            key = request.GET.get("key")
+            table_name = request.GET.get("table_name")
+            value = request.GET.get("value")
+
+            span.set_attribute("team_id", self.team.pk)
+            span.set_attribute("property_key", key or "")
+            span.set_attribute("table_name", table_name or "")
+            span.set_attribute("has_value_filter", value is not None)
+
+            if not key:
+                raise serializers.ValidationError("You must provide a key")
+            if not table_name:
+                raise serializers.ValidationError("You must provide a table name")
+
+            table = get_view_or_table_by_name(self.team, table_name)
+            if table is None:
+                return Response(status=status.HTTP_404_NOT_FOUND, data={"error": "Data warehouse table not found"})
+
+            columns = table.columns or table.get_columns()
+            if key not in columns:
+                raise serializers.ValidationError("The provided key does not exist on this table")
+
+            chain: list[str | int] = cast(list[str | int], key.split("."))
+            conditions: list[ast.Expr] = [
+                ast.CompareOperation(
+                    op=ast.CompareOperationOp.NotEq,
+                    left=ast.Field(chain=chain),
+                    right=ast.Constant(value=None),
+                )
+            ]
+
+            if value:
+                conditions.append(
+                    ast.CompareOperation(
+                        op=ast.CompareOperationOp.ILike,
+                        left=ast.Call(name="toString", args=[ast.Field(chain=chain)]),
+                        right=ast.Constant(value=f"%{value}%"),
+                    )
+                )
+
+            order_by = []
+            if value:
+                order_by = [
+                    ast.OrderExpr(
+                        expr=ast.Call(name="length", args=[ast.Call(name="toString", args=[ast.Field(chain=chain)])]),
+                        order="ASC",
+                    )
+                ]
+
+            query = ast.SelectQuery(
+                select=[ast.Field(chain=chain)],
+                distinct=True,
+                select_from=ast.JoinExpr(table=ast.Field(chain=cast(list[str | int], table.name_chain))),
+                where=ast.And(exprs=conditions),
+                order_by=order_by,
+                limit=ast.Constant(value=10),
+            )
+
+            tag_queries(product=Product.WAREHOUSE, feature=Feature.QUERY)
+            result = execute_hogql_query(query, team=self.team, user=request.user)
+
+            values = [row[0] for row in result.results]
+            span.set_attribute("result_count", len(values))
+            resp = Response(
+                {"results": [{"name": convert_property_value(value)} for value in flatten(values)], "refreshing": False}
+            )
+            resp["Cache-Control"] = "max-age=10"
+            return resp
+
+    @extend_schema(
+        responses={
+            200: PipelineRowsStatsResponseSerializer,
+            500: OpenApiResponse(response=PipelineErrorSerializer, description="Billing could not be reached."),
+        }
+    )
+    @action(methods=["GET"], detail=False)
+    def total_rows_stats(self, request: Request, **kwargs) -> Response:
+        """
+        Returns aggregated statistics for the data warehouse total rows processed within the current billing period.
+        Used by the frontend data warehouse scene to display usage information.
+        """
+        # breakdown_of_rows_by_source depends on the caller's readable sources, so it can never be
+        # part of the cached payload: a value cached for a broadly-permissioned caller would leak
+        # source ids and row counts to a teammate whose access is narrower. Everything else in the
+        # payload is team-wide and permission-independent, so only that part is cached.
+        cache_key = _pipeline_stats_cache_key("total_rows_stats", self.team_id)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            payload = dict(cached)
+            payload["breakdown_of_rows_by_source"] = self._breakdown_of_rows_by_source(
+                cached["billing_period_start"], cached["billing_period_end"]
+            )
+            return Response(status=status.HTTP_200_OK, data=payload)
+
+        billing_interval = ""
+        billing_period_start = None
+        billing_period_end = None
+        billing_tracked_rows = 0
+        materialized_rows = 0
+        pending_billing_rows = 0
+        rows_synced = 0
+        billing_available = False
+        breakdown_of_rows_by_source: dict[str, int] = {}
+
+        try:
+            billing_manager = BillingManager(get_cached_instance_license())
+            org_billing = billing_manager.get_billing(organization=self.team.organization)
+
+            if org_billing and org_billing.get("billing_period"):
+                billing_period = org_billing["billing_period"]
+                billing_period_start = parser.parse(billing_period["current_period_start"])
+                billing_period_end = parser.parse(billing_period["current_period_end"])
+                billing_interval = billing_period.get("interval", "month")
+
+                usage_summary = org_billing.get("usage_summary", {})
+                billing_tracked_rows = usage_summary.get("rows_synced", {}).get("usage", 0)
+                billing_available = True
+
+                all_external_jobs = ExternalDataJob.objects.filter(
+                    team_id=self.team_id,
+                    created_at__gte=billing_period_start,
+                    created_at__lt=billing_period_end,
+                    billable=True,
+                )
+                total_db_rows = all_external_jobs.aggregate(total=Sum("rows_synced"))["total"] or 0
+
+                pending_billing_rows = max(0, total_db_rows - billing_tracked_rows)
+
+                rows_synced = billing_tracked_rows + pending_billing_rows
+
+                data_modeling_jobs = DataModelingJob.objects.filter(
+                    team_id=self.team_id,
+                    created_at__gte=billing_period_start,
+                    created_at__lt=billing_period_end,
+                )
+                materialized_rows = data_modeling_jobs.aggregate(total=Sum("rows_materialized"))["total"] or 0
+
+                breakdown_of_rows_by_source = self._breakdown_of_rows_by_source(
+                    billing_period_start, billing_period_end
+                )
+
+            else:
+                logger.info("No billing period information available, using defaults")
+
+        except Exception as e:
+            logger.exception("There was an error retrieving billing information", exc_info=e)
+            return Response(
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                data={"error": "An error occurred retrieving billing information"},
+            )
+
+        payload = {
+            "billing_available": billing_available,
+            "billing_interval": billing_interval,
+            "billing_period_end": billing_period_end,
+            "billing_period_start": billing_period_start,
+            "breakdown_of_rows_by_source": breakdown_of_rows_by_source,
+            "materialized_rows_in_billing_period": materialized_rows,
+            "total_rows": rows_synced,
+            "tracked_billing_rows": billing_tracked_rows,
+            "pending_billing_rows": pending_billing_rows,
+        }
+
+        # Only a complete answer is worth reusing: caching a response assembled while billing was
+        # unreachable would keep serving zeroes long after billing recovered. The cached copy omits
+        # the per-source breakdown; see the comment at the top of this method for why.
+        if billing_available:
+            cacheable_payload = {k: v for k, v in payload.items() if k != "breakdown_of_rows_by_source"}
+            cache.set(cache_key, cacheable_payload, TOTAL_ROWS_STATS_CACHE_TTL_SECONDS)
+        return Response(status=status.HTTP_200_OK, data=payload)
+
+    def _breakdown_of_rows_by_source(
+        self, billing_period_start: datetime, billing_period_end: datetime
+    ) -> dict[str, int]:
+        # Computed fresh on every request (never cached) because it is scoped to the caller's own
+        # readable sources, which differ from one caller to the next on the same team.
+        breakdown: dict[str, int] = {}
+        for source in self._readable_sources().filter(deleted=False):
+            total_rows = (
+                ExternalDataJob.objects.filter(
+                    pipeline=source,
+                    created_at__gte=billing_period_start,
+                    created_at__lt=billing_period_end,
+                ).aggregate(total=Sum("rows_synced"))["total"]
+                or 0
+            )
+            breakdown[str(source.id)] = total_rows
+        return breakdown
+
+    @extend_schema(
+        parameters=[RunningActivityQuerySerializer],
+        responses={
+            200: PipelineActivityResponseSerializer,
+            500: OpenApiResponse(response=PipelineErrorSerializer, description="The activity query failed."),
+        },
+    )
+    @action(methods=["GET"], detail=False)
+    def running_activity(self, request: Request, **kwargs) -> Response:
+        """
+        Returns currently running activities (jobs with status 'Running').
+        Supports pagination and cutoff time filtering.
+        """
+        kind = request.GET.get("kind", ACTIVITY_KIND_ALL)
+        if kind not in ACTIVITY_KINDS:
+            supported = ", ".join(sorted(ACTIVITY_KINDS))
+            return Response(
+                {"error": f"Invalid kind parameter. Must be one of: {supported}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        DEFAULT_LIMIT = 20
+        MAX_LIMIT = 50
+        DEFAULT_CUTOFF_DAYS = 30
+
+        try:
+            limit = min(int(request.GET.get("limit", DEFAULT_LIMIT)), MAX_LIMIT)
+            offset = max(int(request.GET.get("offset", 0)), 0)
+            cutoff_days = int(request.GET.get("cutoff_days", DEFAULT_CUTOFF_DAYS))
+        except (ValueError, TypeError):
+            return Response(
+                {"error": "Invalid limit, offset, or cutoff_days parameter"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        source_ids = list(self._readable_sources().values_list("id", flat=True))
+        schema_ids = self._readable_team_schema_ids()
+        saved_query_ids = list(
+            self._readable(DataWarehouseSavedQuery.objects.filter(team_id=self.team_id)).values_list("id", flat=True)
+        )
+
+        try:
+            cutoff_time = datetime.now(ZoneInfo("UTC")) - timedelta(days=cutoff_days)
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH external_jobs AS (
+                        SELECT edj.id, edsrc.source_type as type, COALESCE(NULLIF(eds.label, ''), eds.name) as name, edj.status,
+                               COALESCE(edj.rows_synced, 0) as rows, edj.created_at,
+                               edj.finished_at, edj.latest_error, edj.workflow_run_id,
+                               null as origin, edj.pipeline_id as source_id
+                        FROM posthog_externaldatajob edj
+                        LEFT JOIN posthog_externaldataschema eds ON edj.schema_id = eds.id
+                        LEFT JOIN posthog_externaldatasource edsrc ON eds.source_id = edsrc.id
+                        WHERE edj.team_id = %s AND edj.status = 'Running' AND edj.created_at >= %s
+                          AND edj.pipeline_id = ANY(%s::uuid[])
+                          AND (edj.schema_id IS NULL OR edj.schema_id = ANY(%s::uuid[]))
+                    ),
+                    modeling_jobs AS (
+                        SELECT dmj.id, 'Materialized view' as type, dwsq.name, dmj.status,
+                               COALESCE(dmj.rows_materialized, 0) as rows, dmj.created_at,
+                               dmj.last_run_at as finished_at, dmj.error as latest_error, dmj.workflow_run_id,
+                               dwsq.origin as origin, null::uuid as source_id
+                        FROM posthog_datamodelingjob dmj
+                        LEFT JOIN posthog_datawarehousesavedquery dwsq ON dmj.saved_query_id = dwsq.id
+                        WHERE dmj.team_id = %s AND dmj.status = 'Running' AND dmj.created_at >= %s
+                          AND (dwsq.id IS NULL OR dwsq.id = ANY(%s::uuid[]))
+                    )
+                    SELECT * FROM external_jobs
+                    WHERE %s IN (%s, %s)
+                    UNION ALL
+                    SELECT * FROM modeling_jobs
+                    WHERE %s IN (%s, %s)
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """,
+                    [
+                        self.team_id,
+                        cutoff_time,
+                        source_ids,
+                        schema_ids,
+                        self.team_id,
+                        cutoff_time,
+                        saved_query_ids,
+                        # Placeholders bind in SQL text order, so both kind filters come after
+                        # every CTE parameter, not next to the CTE they read.
+                        kind,
+                        ACTIVITY_KIND_ALL,
+                        ACTIVITY_KIND_IMPORT,
+                        kind,
+                        ACTIVITY_KIND_ALL,
+                        ACTIVITY_KIND_MODEL,
+                        limit + 1,
+                        offset,
+                    ],
+                )
+
+                columns = [col[0] for col in cursor.description]
+                rows = cursor.fetchmany(limit + 1)
+                has_more = len(rows) > limit
+
+                actual_rows = rows[:limit]
+                results = [dict(zip(columns, row)) for row in actual_rows]
+        except Exception as e:
+            logger.exception("Database error in running_activity", exc_info=e)
+            return Response({"error": "Database error occurred"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        next_url = None
+        prev_url = None
+        if has_more:
+            next_url = f"?limit={limit}&offset={offset + limit}&cutoff_days={cutoff_days}"
+        if offset > 0:
+            prev_url = f"?limit={limit}&offset={max(0, offset - limit)}&cutoff_days={cutoff_days}"
+
+        return Response(
+            {
+                "results": results,
+                "next": next_url,
+                "previous": prev_url,
+            }
+        )
+
+    @extend_schema(
+        parameters=[CompletedActivityQuerySerializer],
+        responses={
+            200: PipelineActivityResponseSerializer,
+            500: OpenApiResponse(response=PipelineErrorSerializer, description="The activity query failed."),
+        },
+    )
+    @action(methods=["GET"], detail=False)
+    def completed_activity(self, request: Request, **kwargs) -> Response:
+        """
+        Returns completed/non-running activities (jobs with status 'Completed').
+        Supports pagination and cutoff time filtering.
+        """
+        DEFAULT_LIMIT = 20
+        MAX_LIMIT = 50
+        DEFAULT_CUTOFF_DAYS = 30
+
+        try:
+            limit = min(int(request.GET.get("limit", DEFAULT_LIMIT)), MAX_LIMIT)
+            offset = max(int(request.GET.get("offset", 0)), 0)
+            cutoff_days = int(request.GET.get("cutoff_days", DEFAULT_CUTOFF_DAYS))
+        except (ValueError, TypeError):
+            return Response(
+                {"error": "Invalid limit, offset, or cutoff_days parameter"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Without this a caller that only wants imports has to over-fetch and drop the rest, and
+        # a team with enough view failures fills every page with them.
+        kind = request.GET.get("kind", ACTIVITY_KIND_ALL)
+        if kind not in ACTIVITY_KINDS:
+            supported = ", ".join(sorted(ACTIVITY_KINDS))
+            return Response(
+                {"error": f"Invalid kind parameter. Must be one of: {supported}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        outcome = request.GET.get("outcome", ACTIVITY_OUTCOME_COMPLETED)
+        if outcome not in ACTIVITY_OUTCOME_STATUSES:
+            supported = ", ".join(sorted(ACTIVITY_OUTCOME_STATUSES))
+            return Response(
+                {"error": f"Invalid outcome parameter. Must be one of: {supported}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        external_statuses, modeling_statuses = ACTIVITY_OUTCOME_STATUSES[outcome]
+
+        source_ids = list(self._readable_sources().values_list("id", flat=True))
+        schema_ids = self._readable_team_schema_ids()
+        saved_query_ids = list(
+            self._readable(DataWarehouseSavedQuery.objects.filter(team_id=self.team_id)).values_list("id", flat=True)
+        )
+
+        try:
+            cutoff_time = datetime.now(ZoneInfo("UTC")) - timedelta(days=cutoff_days)
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH external_jobs AS (
+                        SELECT edj.id, edsrc.source_type as type, COALESCE(NULLIF(eds.label, ''), eds.name) as name, edj.status,
+                               COALESCE(edj.rows_synced, 0) as rows, edj.created_at,
+                               edj.finished_at, edj.latest_error, edj.workflow_run_id,
+                               null as origin, edj.pipeline_id as source_id
+                        FROM posthog_externaldatajob edj
+                        LEFT JOIN posthog_externaldataschema eds ON edj.schema_id = eds.id
+                        LEFT JOIN posthog_externaldatasource edsrc ON eds.source_id = edsrc.id
+                        WHERE edj.team_id = %s AND edj.status = ANY(%s) AND edj.created_at >= %s
+                          AND edj.pipeline_id = ANY(%s::uuid[])
+                          AND (edj.schema_id IS NULL OR edj.schema_id = ANY(%s::uuid[]))
+                    ),
+                    modeling_jobs AS (
+                        SELECT dmj.id, 'Materialized view' as type, dwsq.name, dmj.status,
+                               COALESCE(dmj.rows_materialized, 0) as rows, dmj.created_at,
+                               dmj.last_run_at as finished_at, dmj.error as latest_error, dmj.workflow_run_id,
+                               dwsq.origin, null::uuid as source_id
+                        FROM posthog_datamodelingjob dmj
+                        LEFT JOIN posthog_datawarehousesavedquery dwsq ON dmj.saved_query_id = dwsq.id
+                        WHERE dmj.team_id = %s AND dmj.status = ANY(%s) AND dmj.created_at >= %s
+                          AND (dwsq.id IS NULL OR dwsq.id = ANY(%s::uuid[]))
+                    )
+                    SELECT * FROM external_jobs
+                    WHERE %s IN (%s, %s)
+                    UNION ALL
+                    SELECT * FROM modeling_jobs
+                    WHERE %s IN (%s, %s)
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """,
+                    [
+                        self.team_id,
+                        external_statuses,
+                        cutoff_time,
+                        source_ids,
+                        schema_ids,
+                        self.team_id,
+                        modeling_statuses,
+                        cutoff_time,
+                        saved_query_ids,
+                        # Placeholders bind in SQL text order, so both kind filters come after
+                        # every CTE parameter, not next to the CTE they read.
+                        kind,
+                        ACTIVITY_KIND_ALL,
+                        ACTIVITY_KIND_IMPORT,
+                        kind,
+                        ACTIVITY_KIND_ALL,
+                        ACTIVITY_KIND_MODEL,
+                        limit + 1,
+                        offset,
+                    ],
+                )
+
+                columns = [col[0] for col in cursor.description]
+                rows = cursor.fetchmany(limit + 1)
+                has_more = len(rows) > limit
+
+                actual_rows = rows[:limit]
+                results = [dict(zip(columns, row)) for row in actual_rows]
+        except Exception as e:
+            logger.exception("Database error in completed_activity", exc_info=e)
+            return Response({"error": "Database error occurred"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        next_url = None
+        prev_url = None
+        if has_more:
+            next_url = f"?limit={limit}&offset={offset + limit}&cutoff_days={cutoff_days}&outcome={outcome}&kind={kind}"
+        if offset > 0:
+            prev_url = f"?limit={limit}&offset={max(0, offset - limit)}&cutoff_days={cutoff_days}&outcome={outcome}&kind={kind}"
+
+        return Response(
+            {
+                "results": results,
+                "next": next_url,
+                "previous": prev_url,
+            }
+        )
+
+    @extend_schema(
+        parameters=[JobStatsQuerySerializer],
+        responses={
+            200: PipelineJobStatsResponseSerializer,
+            400: OpenApiResponse(response=PipelineErrorSerializer, description="`days` was not 1, 7 or 30."),
+            500: OpenApiResponse(response=PipelineErrorSerializer, description="The statistics query failed."),
+        },
+    )
+    @action(methods=["GET"], detail=False)
+    def job_stats(self, request: Request, **kwargs) -> Response:
+        """
+        Returns success and failed job statistics for the last 1, 7, or 30 days.
+        Query parameter 'days' can be 1, 7, or 30 (default: 7).
+        """
+
+        try:
+            days = int(request.GET.get("days", 7))
+            if days not in [1, 7, 30]:
+                return Response(
+                    {"error": "Invalid days parameter. Must be 1, 7, or 30."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response({"error": "Invalid days parameter"}, status=status.HTTP_400_BAD_REQUEST)
+
+        cache_key = _pipeline_stats_cache_key("job_stats", self.team_id, days)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
+        try:
+            project_tz = ZoneInfo(self.team.timezone) if self.team.timezone else ZoneInfo("UTC")
+        except Exception:
+            project_tz = ZoneInfo("UTC")
+        now = datetime.now(project_tz)
+        cutoff_time = now - timedelta(days=days)
+
+        try:
+            external_jobs = ExternalDataJob.objects.filter(
+                team_id=self.team_id, finished_at__gte=cutoff_time, billable=True
+            )
+
+            external_stats = external_jobs.aggregate(
+                total=Count("id"),
+                successful=Count("id", filter=Q(status=ExternalDataJobStatus.COMPLETED)),
+                failed=Count(
+                    "id",
+                    filter=Q(status__in=FAILED_EXTERNAL_JOB_STATUSES),
+                ),
+            )
+
+            modeling_jobs = DataModelingJob.objects.filter(team_id=self.team_id, created_at__gte=cutoff_time)
+
+            modeling_stats = modeling_jobs.aggregate(
+                total=Count("id"),
+                successful=Count("id", filter=Q(status=DataModelingJob.Status.COMPLETED)),
+                failed=Count("id", filter=Q(status=DataModelingJob.Status.FAILED)),
+            )
+
+            total_jobs = external_stats["total"] + modeling_stats["total"]
+            total_successful = external_stats["successful"] + modeling_stats["successful"]
+            total_failed = external_stats["failed"] + modeling_stats["failed"]
+
+            breakdown = {}
+            if days == 1:
+                external_by_hour = (
+                    external_jobs.annotate(hour=TruncHour("created_at", tzinfo=project_tz))
+                    .values("hour")
+                    .annotate(
+                        successful=Count("id", filter=Q(status=ExternalDataJobStatus.COMPLETED)),
+                        failed=Count(
+                            "id",
+                            filter=Q(status__in=FAILED_EXTERNAL_JOB_STATUSES),
+                        ),
+                    )
+                )
+
+                modeling_by_hour = (
+                    modeling_jobs.annotate(hour=TruncHour("created_at", tzinfo=project_tz))
+                    .values("hour")
+                    .annotate(
+                        successful=Count("id", filter=Q(status=DataModelingJob.Status.COMPLETED)),
+                        failed=Count("id", filter=Q(status=DataModelingJob.Status.FAILED)),
+                    )
+                )
+
+                external_lookup = {result["hour"]: result for result in external_by_hour}
+                modeling_lookup = {result["hour"]: result for result in modeling_by_hour}
+
+                for i in range(24):
+                    hour_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=i)
+                    external_data = external_lookup.get(hour_start, {"successful": 0, "failed": 0})
+                    modeling_data = modeling_lookup.get(hour_start, {"successful": 0, "failed": 0})
+
+                    breakdown[hour_start.isoformat()] = {
+                        "successful": external_data["successful"] + modeling_data["successful"],
+                        "failed": external_data["failed"] + modeling_data["failed"],
+                    }
+            else:
+                external_by_day = (
+                    external_jobs.annotate(day=TruncDate("created_at", tzinfo=project_tz))
+                    .values("day")
+                    .annotate(
+                        successful=Count("id", filter=Q(status=ExternalDataJobStatus.COMPLETED)),
+                        failed=Count(
+                            "id",
+                            filter=Q(status__in=FAILED_EXTERNAL_JOB_STATUSES),
+                        ),
+                    )
+                )
+
+                modeling_by_day = (
+                    modeling_jobs.annotate(day=TruncDate("created_at", tzinfo=project_tz))
+                    .values("day")
+                    .annotate(
+                        successful=Count("id", filter=Q(status=DataModelingJob.Status.COMPLETED)),
+                        failed=Count("id", filter=Q(status=DataModelingJob.Status.FAILED)),
+                    )
+                )
+
+                external_day_lookup = {result["day"]: result for result in external_by_day}
+                modeling_day_lookup = {result["day"]: result for result in modeling_by_day}
+
+                for i in range(days):
+                    day_date = (now - timedelta(days=i)).date()
+                    external_day = external_day_lookup.get(day_date, {"successful": 0, "failed": 0})
+                    modeling_day = modeling_day_lookup.get(day_date, {"successful": 0, "failed": 0})
+
+                    breakdown[str(day_date)] = {
+                        "successful": external_day["successful"] + modeling_day["successful"],
+                        "failed": external_day["failed"] + modeling_day["failed"],
+                    }
+
+            running_external_data_jobs = ExternalDataJob.objects.filter(
+                team_id=self.team_id, status=ExternalDataJobStatus.RUNNING, billable=True, created_at__gte=cutoff_time
+            ).count()
+            running_modeling_jobs = DataModelingJob.objects.filter(
+                team_id=self.team_id, status=DataModelingJob.Status.RUNNING, created_at__gte=cutoff_time
+            ).count()
+
+            payload = {
+                "days": days,
+                "cutoff_time": cutoff_time,
+                "total_jobs": total_jobs,
+                "successful_jobs": total_successful,
+                "failed_jobs": total_failed,
+                "external_data_jobs": {
+                    "total": external_stats["total"],
+                    "running": running_external_data_jobs,
+                    "successful": external_stats["successful"],
+                    "failed": external_stats["failed"],
+                },
+                "modeling_jobs": {
+                    "total": modeling_stats["total"],
+                    "running": running_modeling_jobs,
+                    "successful": modeling_stats["successful"],
+                    "failed": modeling_stats["failed"],
+                },
+                "breakdown": breakdown,
+            }
+
+            cache.set(cache_key, payload, JOB_STATS_CACHE_TTL_SECONDS)
+            return Response(payload)
+
+        except Exception as e:
+            logger.exception("Error retrieving job statistics", exc_info=e)
+            return Response(
+                {"error": "An error occurred retrieving job statistics"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @extend_schema(
+        responses={
+            200: DataHealthIssuesResponseSerializer,
+            500: OpenApiResponse(response=PipelineErrorSerializer, description="The health query failed."),
+        }
+    )
+    @action(
+        methods=["GET"],
+        detail=False,
+        required_scopes=["warehouse_view:read", "external_data_source:read", "batch_export:read", "hog_function:read"],
+    )
+    def data_health_issues(self, request: Request, **kwargs) -> Response:
+        """
+        Returns failed/disabled data pipeline items for the Pipeline status side panel.
+        Includes: materializations, syncs, sources, destinations, and transformations.
+        """
+        try:
+            results = []
+
+            # A view is failing when its newest ClickHouse serving run failed.
+            serving_run = DataModelingJob.objects.filter(
+                saved_query_id=OuterRef("id"), engine=DataModelingJobEngine.CLICKHOUSE
+            ).order_by("-last_run_at")
+            failed_materializations = self._readable(
+                DataWarehouseSavedQuery.objects.exclude(deleted=True)
+                .filter(team_id=self.team_id, is_materialized=True)
+                .annotate(
+                    latest_run_status=Subquery(serving_run.values("status")[:1]),
+                    latest_run_error=Subquery(serving_run.values("error")[:1]),
+                    latest_run_at=Subquery(serving_run.values("last_run_at")[:1]),
+                )
+                .filter(latest_run_status=DataModelingJob.Status.FAILED)
+            )
+
+            for query in failed_materializations:
+                results.append(
+                    {
+                        "id": str(query.id),
+                        "name": query.name,
+                        "type": "materialized_view",
+                        "status": "failed",
+                        "error": query.latest_run_error,
+                        "failed_at": query.latest_run_at.isoformat() if query.latest_run_at else None,
+                        "url": f"/data-warehouse/view/{query.id}",
+                    }
+                )
+
+            # Get failed syncs from ExternalDataSchema
+            # Only show syncs that are actively enabled but failing
+            readable_sources = self._readable_sources()
+            problem_syncs = list(
+                self._team_schemas().filter(should_sync=True).filter(status__in=FAILING_SCHEMA_STATUSES)
+            )
+            visible_schema_ids = self._readable_schema_ids(problem_syncs)
+
+            for schema in problem_syncs:
+                if schema.id not in visible_schema_ids:
+                    continue
+                sync_status = "failed"
+                if schema.status in BILLING_LIMITED_SCHEMA_STATUSES:
+                    sync_status = "billing_limit"
+
+                results.append(
+                    {
+                        "id": str(schema.id),
+                        # A Slack schema's name is the raw channel id; `label` is the human one.
+                        "name": schema.label or schema.name,
+                        "type": "external_data_sync",
+                        "source_type": schema.source.source_type if schema.source else None,
+                        "status": sync_status,
+                        "error": schema.latest_error,
+                        # A webhook table is pushed to, never pulled on a schedule, so a surface
+                        # about scheduled imports can drop it rather than call it stopped.
+                        "sync_type": schema.sync_type,
+                        "failed_at": schema.last_synced_at.isoformat() if schema.last_synced_at else None,
+                        # The source scene keys on a prefixed id, so a bare UUID renders a
+                        # broken page. Every ExternalDataSource uses the `managed-` prefix,
+                        # direct-connect ones included.
+                        "url": f"/data-warehouse/sources/managed-{schema.source_id}" if schema.source_id else None,
+                    }
+                )
+
+            # Get sources with Error status
+            error_sources = readable_sources.filter(deleted=False, status=ExternalDataSourceStatus.ERROR)
+
+            for source in error_sources:
+                results.append(
+                    {
+                        "id": str(source.id),
+                        "name": source.source_type,
+                        "type": "source",
+                        "source_type": source.source_type,
+                        "status": "failed",
+                        "error": None,
+                        "failed_at": source.updated_at.isoformat() if source.updated_at else None,
+                        "url": f"/data-warehouse/sources/managed-{source.id}",
+                    }
+                )
+
+            for failed_run in batch_exports_api.list_latest_failed_runs(self.team_id):
+                results.append(
+                    {
+                        "id": str(failed_run.export_id),
+                        "name": failed_run.export_name,
+                        "type": "destination",
+                        "status": "failed",
+                        "error": failed_run.error,
+                        "failed_at": failed_run.failed_at.isoformat() if failed_run.failed_at else None,
+                        "url": f"/pipeline/batch-exports/{failed_run.export_id}",
+                    }
+                )
+
+            # Get transformations with issues
+            transformations = HogFunction.objects.filter(
+                team_id=self.team_id,
+                deleted=False,
+                type=HogFunctionType.TRANSFORMATION,
+                enabled=True,
+            )
+
+            for transformation in transformations:
+                try:
+                    status_data = transformation.status
+                    state = status_data.get("state", 0)
+                    if state in [
+                        HogFunctionState.DISABLED.value,
+                        HogFunctionState.DEGRADED.value,
+                        HogFunctionState.FORCEFULLY_DISABLED.value,
+                        HogFunctionState.FORCEFULLY_DEGRADED.value,
+                    ]:
+                        status_label = (
+                            "disabled"
+                            if state
+                            in [
+                                HogFunctionState.DISABLED.value,
+                                HogFunctionState.FORCEFULLY_DISABLED.value,
+                            ]
+                            else "degraded"
+                        )
+                        error_msg = status_data.get("error") or "Transformation experiencing issues"
+                        results.append(
+                            {
+                                "id": str(transformation.id),
+                                "name": transformation.name or "Untitled",
+                                "type": "transformation",
+                                "status": status_label,
+                                "error": error_msg,
+                                "failed_at": transformation.updated_at.isoformat()
+                                if transformation.updated_at
+                                else None,
+                                "url": f"/pipeline/transformations/hog-{transformation.id}/configuration",
+                            }
+                        )
+                except Exception as e:
+                    logger.warning(f"Error processing transformation {transformation.id}", exc_info=e)
+
+            # Get destinations with issues
+            hog_destinations = HogFunction.objects.filter(
+                team_id=self.team_id,
+                deleted=False,
+                type__in=[HogFunctionType.DESTINATION, HogFunctionType.SITE_DESTINATION],
+                enabled=True,
+            )
+
+            for destination in hog_destinations:
+                try:
+                    status_data = destination.status
+                    state = status_data.get("state", 0)
+                    if state in [
+                        HogFunctionState.DISABLED.value,
+                        HogFunctionState.DEGRADED.value,
+                        HogFunctionState.FORCEFULLY_DISABLED.value,
+                        HogFunctionState.FORCEFULLY_DEGRADED.value,
+                    ]:
+                        status_label = (
+                            "disabled"
+                            if state
+                            in [
+                                HogFunctionState.DISABLED.value,
+                                HogFunctionState.FORCEFULLY_DISABLED.value,
+                            ]
+                            else "degraded"
+                        )
+                        error_msg = status_data.get("error") or "Destination experiencing issues"
+                        results.append(
+                            {
+                                "id": str(destination.id),
+                                "name": destination.name or "Untitled",
+                                "type": "destination",
+                                "status": status_label,
+                                "error": error_msg,
+                                "failed_at": destination.updated_at.isoformat() if destination.updated_at else None,
+                                "url": f"/pipeline/destinations/hog-{destination.id}/configuration",
+                            }
+                        )
+                except Exception as e:
+                    logger.warning("Error processing destination", destination_id=destination.id, exc_info=e)
+
+            # Sort by failed_at descending with None values last
+            results.sort(key=lambda x: (x["failed_at"] is not None, x["failed_at"] or ""), reverse=True)
+
+            return Response(
+                {
+                    "results": results,
+                    "count": len(results),
+                }
+            )
+
+        except Exception as e:
+            logger.exception("Error retrieving data health issues", exc_info=e)
+            return Response(
+                {"error": "An error occurred retrieving data health issues"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(methods=["GET"], detail=False, required_scopes=["warehouse_view:write"])
+    def data_ops_dashboard(self, request: Request, **kwargs) -> Response:
+        """
+        Returns the data ops overview dashboard ID for this team, creating it if it doesn't exist yet.
+        """
+        from django.db import transaction
+
+        config = get_or_create_team_extension(self.team, TeamDataWarehouseConfig)
+
+        if not config.overview_dashboards.exists():
+            with transaction.atomic():
+                config = TeamDataWarehouseConfig.objects.select_for_update().get(team=self.team)
+                if not config.overview_dashboards.exists():
+                    dashboard = create_data_ops_dashboard(self.team, request.user)
+                    config.overview_dashboards.add(dashboard)
+
+        # TODO: In the future this endpoint will return multiple dashboards (one per use-case).
+        # For now we only expose the first one (by creation order) to keep the UI simple.
+        first_dashboard = config.overview_dashboards.order_by("id").first()
+        return Response({"dashboard_id": first_dashboard.id if first_dashboard else None})
+
+    @extend_schema(
+        description="Read or update the team's data quality gate: whether a materialization whose "
+        "error-severity checks fail is published.",
+        request=DataQualityGateConfigSerializer,
+        responses={200: DataQualityGateConfigSerializer},
+    )
+    @action(methods=["GET", "PATCH"], detail=False, required_scopes=["warehouse_view:write"])
+    def data_quality_gate(self, request: Request, **kwargs) -> Response:
+        # This is a project-wide setting, so writing it needs project-wide warehouse editor access.
+        # The generic warehouse_view:write permission is otherwise satisfied by an object-level editor
+        # grant on a single view, which must not be enough to flip a team-wide gate.
+        if request.method == "PATCH" and not self.user_access_control.check_access_level_for_resource(
+            "warehouse_view", "editor"
+        ):
+            raise PermissionDenied("You need editor access to data warehouse views to change this setting.")
+        # Owned by the data_quality product; this viewset only lends it the warehouse surface.
+        return data_quality_gate_response(self.team, request)
+
+    # --- Managed warehouse provisioning (proxied to duckgres, see managed_warehouse.py) ---
+
+    @extend_schema(
+        request=inline_serializer(
+            "ProvisionWarehouseRequest",
+            fields={
+                "database_name": serializers.CharField(help_text="Name for the new database"),
+                "schema_name": serializers.CharField(
+                    help_text="Schema name for the provisioning project's data in the warehouse. Lowercase "
+                    "letters, numbers, and underscores only, max 63 characters. Cannot be changed later. "
+                    "Required — the first project gets its own schema, and other projects pick theirs when "
+                    "they join."
+                ),
+            },
+        ),
+        responses={
+            202: inline_serializer(
+                "ProvisionWarehouseResponse",
+                fields={
+                    "status": serializers.CharField(
+                        help_text="Provisioning lifecycle message, e.g. 'provisioning started'"
+                    ),
+                    "org": serializers.CharField(help_text="duckgres org identifier (the PostHog organization id)"),
+                    "username": serializers.CharField(help_text="Root database username"),
+                    "password": serializers.CharField(
+                        help_text="Root database password — returned only here at provision time and on reset-password"
+                    ),
+                },
+            )
+        },
+    )
+    @action(methods=["POST"], detail=False, required_scopes=["warehouse_view:write"])
+    def provision(self, request: Request, **kwargs) -> Response:
+        """Start provisioning a managed warehouse for this organization (shared by all its teams)."""
+        admin_error = self._require_organization_admin(request, "provision")
+        if admin_error is not None:
+            return admin_error
+        return managed_warehouse.provision(
+            self.team.organization_id,
+            request.data.get("database_name"),
+            self.team_id,
+            request.data.get("schema_name"),
+            triggered_by=self._audit_principal(request),
+        )
+
+    @extend_schema(
+        request=inline_serializer(
+            "OnboardWarehouseTeamRequest",
+            fields={
+                "schema_name": serializers.CharField(
+                    help_text="Schema name for this project's data in the organization's warehouse. Lowercase "
+                    "letters, numbers, and underscores only, max 63 characters. Must be unique within the "
+                    "organization and cannot be changed later."
+                )
+            },
+        ),
+        responses={
+            200: inline_serializer(
+                "OnboardWarehouseTeamResponse",
+                fields={
+                    "onboarded": serializers.BooleanField(
+                        help_text="Whether this project is now onboarded onto the managed warehouse"
+                    ),
+                    "schema_name": serializers.CharField(help_text="Schema this project's data lands in"),
+                },
+            )
+        },
+    )
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(methods=["POST"], detail=False, url_path="onboard-team", required_scopes=["warehouse_view:write"])
+    def onboard_team(self, request: Request, **kwargs) -> Response:
+        """Onboard this project onto the organization's existing managed warehouse.
+
+        Requires a schema name and records the project's membership in the Duckgres control plane.
+        Restricted to organization admins.
+        """
+        admin_error = self._require_organization_admin(request, "onboard this project for")
+        if admin_error is not None:
+            return admin_error
+        return managed_warehouse.onboard_team(
+            self.team.organization_id,
+            self.team.id,
+            request.data.get("schema_name"),
+            triggered_by=self._audit_principal(request),
+        )
+
+    @extend_schema(
+        responses={
+            202: inline_serializer(
+                "DeprovisionWarehouseResponse",
+                fields={
+                    "status": serializers.CharField(
+                        help_text="Deprovisioning lifecycle message, e.g. 'deprovisioning started'"
+                    ),
+                    "org": serializers.CharField(help_text="duckgres org identifier (the PostHog organization id)"),
+                },
+            )
+        },
+    )
+    @action(methods=["POST"], detail=False, required_scopes=["warehouse_view:write"])
+    def deprovision(self, request: Request, **kwargs) -> Response:
+        """Start deprovisioning the organization's managed warehouse. Restricted to organization admins."""
+        admin_error = self._require_organization_admin(request, "deprovision")
+        if admin_error is not None:
+            return admin_error
+        return managed_warehouse.deprovision(self.team.organization_id, triggered_by=self._audit_principal(request))
+
+    @extend_schema(
+        responses={
+            200: inline_serializer(
+                "DeleteWarehouseOrgResponse",
+                fields={
+                    "status": serializers.CharField(
+                        required=False, help_text="Deletion lifecycle message from the provisioner"
+                    ),
+                    "org": serializers.CharField(
+                        required=False,
+                        help_text="duckgres org identifier (the PostHog organization id)",
+                    ),
+                },
+            )
+        },
+    )
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(methods=["DELETE"], detail=False, url_path="delete-org", required_scopes=["warehouse_view:write"])
+    def delete_org(self, request: Request, **kwargs) -> Response:
+        """Remove the organization's provisioning record after teardown, freeing its warehouse name.
+
+        Called once the warehouse status reports `deleted`: deprovision tears the warehouse
+        down, this removes the now-empty org row so the database_name can be reused. Restricted
+        to organization admins.
+        """
+        admin_error = self._require_organization_admin(request, "delete the provisioning record for")
+        if admin_error is not None:
+            return admin_error
+        return managed_warehouse.delete_org(self.team.organization_id, triggered_by=self._audit_principal(request))
+
+    @extend_schema(
+        responses={
+            200: inline_serializer(
+                "WarehouseStatusResponse",
+                fields={
+                    "org_id": serializers.CharField(help_text="duckgres org identifier (the PostHog organization id)"),
+                    "state": serializers.ChoiceField(
+                        choices=["pending", "provisioning", "ready", "failed", "deleting", "deleted"],
+                        help_text="Overall provisioning lifecycle state",
+                    ),
+                    "status_message": serializers.CharField(help_text="Human-readable detail for the current state"),
+                    "s3_state": serializers.CharField(help_text="Object-store sub-resource provisioning state"),
+                    "metadata_store_state": serializers.CharField(
+                        help_text="Metadata-store sub-resource provisioning state"
+                    ),
+                    "identity_state": serializers.CharField(
+                        help_text="Worker identity sub-resource provisioning state"
+                    ),
+                    "secrets_state": serializers.CharField(help_text="Credentials sub-resource provisioning state"),
+                    "ready_at": serializers.DateTimeField(allow_null=True, help_text="When the warehouse became ready"),
+                    "failed_at": serializers.DateTimeField(allow_null=True, help_text="When provisioning failed"),
+                    "connection": inline_serializer(
+                        "WarehouseConnection",
+                        fields={
+                            "host": serializers.CharField(
+                                help_text="Postgres connection host. The warehouse name is the SNI subdomain, e.g. my-warehouse.dw.us.postwh.com"
+                            ),
+                            "port": serializers.IntegerField(help_text="Postgres wire-protocol port"),
+                            "database": serializers.CharField(help_text="Database to connect to — always 'ducklake'"),
+                            "username": serializers.CharField(help_text="Root database username"),
+                        },
+                        required=False,
+                        allow_null=True,
+                        help_text="Postgres connection target. Null for organizations on the Trino Data ops variant.",
+                    ),
+                    "trino": inline_serializer(
+                        "WarehouseTrinoStatus",
+                        fields={
+                            "state": serializers.ChoiceField(
+                                choices=WarehouseTrinoStatusState.choices,
+                                help_text="Trino lifecycle state for the organization. `unavailable` means the "
+                                "state could not be read.",
+                            ),
+                            "ready_at": serializers.DateTimeField(
+                                allow_null=True, help_text="When Trino became ready for the organization"
+                            ),
+                            "hoglake": serializers.BooleanField(
+                                help_text="Whether the organization's Trino catalog is backed by hoglake. "
+                                "Hoglake credentials reach nothing otherwise."
+                            ),
+                            "connection": inline_serializer(
+                                "WarehouseTrinoConnection",
+                                fields={
+                                    "host": serializers.CharField(help_text="Trino host to connect to over HTTPS"),
+                                    "port": serializers.IntegerField(help_text="Trino HTTPS port"),
+                                    "catalog": serializers.CharField(
+                                        help_text="Trino catalog that holds the organization's data"
+                                    ),
+                                    "username": serializers.CharField(help_text="Root username"),
+                                },
+                                allow_null=True,
+                                help_text="Trino connection target. Null until Trino is ready and reachable.",
+                            ),
+                        },
+                        required=False,
+                        allow_null=True,
+                        help_text="Trino status for organizations on the Trino Data ops variant, once the warehouse is ready. Null otherwise.",
+                    ),
+                    "has_backfill": serializers.BooleanField(
+                        help_text="Whether this project already has a warehouse backfill configured. When true, its "
+                        "table name is fixed and the enable form should not be shown."
+                    ),
+                    "table_suffix": serializers.CharField(
+                        allow_null=True,
+                        help_text="This project's per-environment table suffix (events_<suffix>). Null when the "
+                        "project still writes to the shared tables.",
+                    ),
+                    "team_onboarded": serializers.BooleanField(
+                        help_text="Whether this project is onboarded onto the managed warehouse. False when the "
+                        "warehouse exists but this project has not picked a schema yet — show the onboarding "
+                        "screen in that case."
+                    ),
+                    "schema_name": serializers.CharField(
+                        allow_null=True,
+                        help_text="Schema this project's data lands in. Null when the project is not onboarded.",
+                    ),
+                },
+            )
+        },
+    )
+    @action(methods=["GET"], detail=False)
+    def warehouse_status(self, request: Request, **kwargs) -> Response:
+        """Get the current provisioning status of the managed warehouse, with this project's onboarding state."""
+        resp = managed_warehouse.status_for(self.team.organization_id)
+        if resp.status_code == 200 and isinstance(resp.data, dict):
+            resp.data.update(managed_warehouse.team_backfill_state(self.team_id))
+            onboarding_state = managed_warehouse.team_onboarding_state(self.team.organization_id, self.team_id)
+            resp.data.update(onboarding_state)
+            # Once the warehouse is reachable, surface its tables as a queryable direct
+            # connection for enrolled projects. Best-effort scheduling coalesces repeated scene loads.
+            if resp.data.get("state") == "ready" and onboarding_state["team_onboarded"]:
+                managed_warehouse.ensure_direct_connection_tables(self.team_id, self.team.organization_id)
+            if managed_warehouse.data_ops_variant(self.team.organization_id) == "trino":
+                # Users of a Trino organization connect only through Trino.
+                resp.data["connection"] = None
+                # Trino's state only matters once the warehouse is ready, and the scene polls while it is not.
+                resp.data["trino"] = (
+                    managed_warehouse.trino_status_for(self.team.organization_id)
+                    if resp.data.get("state") == "ready"
+                    else None
+                )
+            else:
+                resp.data["trino"] = None
+        return resp
+
+    @extend_schema(
+        responses={
+            status.HTTP_200_OK: OpenApiResponse(
+                response=ManagedWarehouseMonitoringSnapshotResponseSerializer,
+                description="Current organization-scoped worker and query activity.",
+            ),
+            **_MONITORING_ERROR_RESPONSES,
+        },
+        summary="Get managed warehouse monitoring snapshot",
+        description="Get tenant-safe live worker, session, queue, and capacity data for the current organization.",
+    )
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path="managed-warehouse-monitoring",
+        required_scopes=["warehouse_view:read"],
+        requires_resource_level_access=True,
+    )
+    def managed_warehouse_monitoring(self, request: Request, **kwargs) -> Response:
+        organization_id = str(self.team.organization_id)
+        # Workers still run a Trino organization's internal writes. That data is not for its users.
+        if managed_warehouse.data_ops_variant(organization_id) == "trino":
+            return _wrong_monitoring_variant_response(_TRINO_VARIANT_MONITORING_ERROR)
+        upstream_response = managed_warehouse.monitoring_snapshot_for(organization_id)
+        if upstream_response.status_code != status.HTTP_200_OK:
+            return _managed_warehouse_monitoring_error_response(upstream_response)
+
+        try:
+            data = serialize_monitoring_snapshot(
+                upstream_response.data,
+                expected_organization_id=organization_id,
+            )
+        except ManagedWarehouseMonitoringUpstreamError:
+            logger.warning(
+                "Managed warehouse monitoring snapshot response failed validation",
+                organization_id=organization_id,
+            )
+            return _managed_warehouse_monitoring_error_response(Response(status=status.HTTP_502_BAD_GATEWAY))
+        return Response(data)
+
+    @validated_request(
+        query_serializer=ManagedWarehouseMonitoringSeriesQuerySerializer,
+        responses={
+            status.HTTP_200_OK: OpenApiResponse(
+                response=ManagedWarehouseMonitoringSeriesResponseSerializer,
+                description="One organization-scoped monitoring metric over time.",
+            ),
+            **_MONITORING_ERROR_RESPONSES,
+        },
+        summary="Get managed warehouse monitoring time series",
+        description="Get one allow-listed monitoring metric for the current organization and trailing time window.",
+    )
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path="managed-warehouse-monitoring-timeseries",
+        required_scopes=["warehouse_view:read"],
+        requires_resource_level_access=True,
+    )
+    def managed_warehouse_monitoring_timeseries(self, request: Request, **kwargs) -> Response:
+        organization_id = str(self.team.organization_id)
+        if managed_warehouse.data_ops_variant(organization_id) == "trino":
+            return _wrong_monitoring_variant_response(_TRINO_VARIANT_MONITORING_ERROR)
+        metric = cast(
+            managed_warehouse.ManagedWarehouseMonitoringMetric,
+            request.validated_query_data["metric"],
+        )
+        window = cast(
+            managed_warehouse.ManagedWarehouseMonitoringWindow,
+            request.validated_query_data["window"],
+        )
+        upstream_response = managed_warehouse.monitoring_series_for(organization_id, metric, window)
+        if upstream_response.status_code != status.HTTP_200_OK:
+            return _managed_warehouse_monitoring_error_response(upstream_response)
+
+        try:
+            data = serialize_monitoring_series(
+                upstream_response.data,
+                expected_organization_id=organization_id,
+                expected_metric=metric,
+            )
+        except ManagedWarehouseMonitoringUpstreamError:
+            logger.warning(
+                "Managed warehouse monitoring series response failed validation",
+                organization_id=organization_id,
+                metric=metric,
+            )
+            return _managed_warehouse_monitoring_error_response(Response(status=status.HTTP_502_BAD_GATEWAY))
+        return Response(data)
+
+    @extend_schema(
+        responses={
+            status.HTTP_200_OK: OpenApiResponse(
+                response=ManagedWarehouseTrinoMonitoringSnapshotResponseSerializer,
+                description="Current organization-scoped Trino query activity.",
+            ),
+            **_MONITORING_ERROR_RESPONSES,
+        },
+        summary="Get managed warehouse Trino monitoring snapshot",
+        description="Get tenant-safe live Trino query totals, limits, and in-flight queries for the current organization.",
+    )
+    # nosemgrep: api-path-underscore -- sits under the shipped data_warehouse prefix, a rename breaks clients
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path="managed-warehouse-trino-monitoring",
+        required_scopes=["warehouse_view:read"],
+        requires_resource_level_access=True,
+    )
+    def managed_warehouse_trino_monitoring(self, request: Request, **kwargs) -> Response:
+        organization_id = str(self.team.organization_id)
+        if managed_warehouse.data_ops_variant(organization_id) == "duckdb":
+            return _wrong_monitoring_variant_response(_DUCKDB_VARIANT_MONITORING_ERROR)
+        upstream_response = managed_warehouse.trino_monitoring_snapshot_for(organization_id)
+        if upstream_response.status_code != status.HTTP_200_OK:
+            return _managed_warehouse_monitoring_error_response(upstream_response)
+
+        try:
+            data = serialize_trino_monitoring_snapshot(
+                upstream_response.data,
+                expected_organization_id=organization_id,
+            )
+        except ManagedWarehouseMonitoringUpstreamError:
+            logger.warning(
+                "Managed warehouse Trino monitoring snapshot response failed validation",
+                organization_id=organization_id,
+            )
+            return _managed_warehouse_monitoring_error_response(Response(status=status.HTTP_502_BAD_GATEWAY))
+        return Response(data)
+
+    @validated_request(
+        query_serializer=ManagedWarehouseTrinoMonitoringSeriesQuerySerializer,
+        responses={
+            status.HTTP_200_OK: OpenApiResponse(
+                response=ManagedWarehouseMonitoringSeriesResponseSerializer,
+                description="One organization-scoped Trino monitoring metric over time.",
+            ),
+            **_MONITORING_ERROR_RESPONSES,
+        },
+        summary="Get managed warehouse Trino monitoring time series",
+        description="Get one allow-listed Trino monitoring metric for the current organization and trailing time window.",
+    )
+    # nosemgrep: api-path-underscore -- sits under the shipped data_warehouse prefix, a rename breaks clients
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path="managed-warehouse-trino-monitoring-timeseries",
+        required_scopes=["warehouse_view:read"],
+        requires_resource_level_access=True,
+    )
+    def managed_warehouse_trino_monitoring_timeseries(self, request: Request, **kwargs) -> Response:
+        organization_id = str(self.team.organization_id)
+        if managed_warehouse.data_ops_variant(organization_id) == "duckdb":
+            return _wrong_monitoring_variant_response(_DUCKDB_VARIANT_MONITORING_ERROR)
+        metric = cast(
+            managed_warehouse.ManagedWarehouseTrinoMonitoringMetric,
+            request.validated_query_data["metric"],
+        )
+        window = cast(
+            managed_warehouse.ManagedWarehouseMonitoringWindow,
+            request.validated_query_data["window"],
+        )
+        upstream_response = managed_warehouse.trino_monitoring_series_for(organization_id, metric, window)
+        if upstream_response.status_code != status.HTTP_200_OK:
+            return _managed_warehouse_monitoring_error_response(upstream_response)
+
+        try:
+            data = serialize_trino_monitoring_series(
+                upstream_response.data,
+                expected_organization_id=organization_id,
+                expected_metric=metric,
+            )
+        except ManagedWarehouseMonitoringUpstreamError:
+            logger.warning(
+                "Managed warehouse Trino monitoring series response failed validation",
+                organization_id=organization_id,
+                metric=metric,
+            )
+            return _managed_warehouse_monitoring_error_response(Response(status=status.HTTP_502_BAD_GATEWAY))
+        return Response(data)
+
+    @extend_schema(responses={200: ManagedWarehouseDataStatusResponseSerializer})
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path="managed-warehouse-data-status",
+        required_scopes=["warehouse_view:read", "external_data_source:read"],
+    )
+    def managed_warehouse_data_status(self, request: Request, **kwargs) -> Response:
+        """Get events, persons, and imported source readiness for the managed warehouse."""
+        if (disabled := self._managed_warehouse_disabled_response()) is not None:
+            return disabled
+        return Response(get_managed_warehouse_data_status(self.team_id, user_access_control=self.user_access_control))
+
+    @validated_request(
+        query_serializer=ManagedWarehouseSourceSchemasQuerySerializer,
+        responses={200: OpenApiResponse(response=ManagedWarehouseSourceSchemasResponseSerializer)},
+        summary="Get per-schema detail for one imported source",
+        description="Per-schema backfill and live import status for one source, for the Overview tab's "
+        "drill-down modal — the main status endpoint only returns a per-source rollup.",
+    )
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(
+        methods=["GET"],
+        detail=False,
+        url_path="managed-warehouse-source-schemas",
+        required_scopes=["warehouse_view:read", "external_data_source:read"],
+    )
+    def managed_warehouse_source_schemas(self, request: Request, **kwargs) -> Response:
+        if (disabled := self._managed_warehouse_disabled_response()) is not None:
+            return disabled
+        source_id = str(request.validated_query_data["source_id"])
+        return Response(
+            {
+                "schemas": get_source_schema_statuses(
+                    self.team_id, source_id, user_access_control=self.user_access_control
+                )
+            }
+        )
+
+    @extend_schema(
+        responses={
+            200: inline_serializer(
+                "ResetPasswordResponse",
+                fields={
+                    "username": serializers.CharField(),
+                    "password": serializers.CharField(),
+                },
+            )
+        },
+    )
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(methods=["POST"], detail=False, url_path="reset-password", required_scopes=["warehouse_view:write"])
+    def reset_password(self, request: Request, **kwargs) -> Response:
+        """Reset the root password for the managed warehouse."""
+        admin_error = self._require_organization_admin(request, "reset the root password for")
+        if admin_error is not None:
+            return admin_error
+        return managed_warehouse.reset_password(self.team.organization_id, triggered_by=self._audit_principal(request))
+
+    @extend_schema(
+        responses={200: HoglakeCredentialListResponseSerializer},
+        summary="List hoglake credentials",
+        description="The organization's live hoglake OAuth credentials (never their secrets), and where to use them.",
+    )
+    # No required_scopes here: DRF gives a .mapping.post the action's kwargs, so the GET's
+    # read scope would also admit the POST. dangerously_get_required_scopes splits them.
+    @action(methods=["GET"], detail=False, url_path="hoglake_credentials")
+    def hoglake_credentials(self, request: Request, **kwargs) -> Response:
+        admin_error = self._require_organization_admin(request, "view the hoglake credentials of")
+        if admin_error is not None:
+            return admin_error
+        return managed_warehouse.list_hoglake_credentials(self.team.organization_id)
+
+    @extend_schema(
+        request=HoglakeCredentialCreateRequestSerializer,
+        responses={201: HoglakeCredentialIssuedSerializer},
+        summary="Create a hoglake credential",
+        description="Create an OAuth client credential for the managed hoglake catalog. The secret is in this "
+        "response only.",
+    )
+    @hoglake_credentials.mapping.post
+    def create_hoglake_credential(self, request: Request, **kwargs) -> Response:
+        admin_error = self._require_organization_admin(request, "create hoglake credentials for")
+        if admin_error is not None:
+            return admin_error
+        body = HoglakeCredentialCreateRequestSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        return managed_warehouse.create_hoglake_credential(
+            self.team.organization_id,
+            name=body.validated_data["name"],
+            scope=body.validated_data["scope"],
+            ttl_seconds=body.validated_data.get("ttl_seconds"),
+            triggered_by=self._audit_principal(request),
+        )
+
+    @extend_schema(
+        request=None,
+        responses={200: HoglakeCredentialIssuedSerializer},
+        summary="Rotate a hoglake credential's secret",
+        description="Replace the credential's secret; the old one stops working. The new secret is in this "
+        "response only.",
+    )
+    @action(
+        methods=["POST"],
+        detail=False,
+        url_path=rf"hoglake_credentials/(?P<credential_id>{_HOGLAKE_CREDENTIAL_ID})/rotate",
+        required_scopes=["warehouse_view:write"],
+    )
+    def rotate_hoglake_credential(self, request: Request, credential_id: str, **kwargs) -> Response:
+        admin_error = self._require_organization_admin(request, "rotate hoglake credentials for")
+        if admin_error is not None:
+            return admin_error
+        return managed_warehouse.rotate_hoglake_credential(
+            self.team.organization_id, credential_id, triggered_by=self._audit_principal(request)
+        )
+
+    @extend_schema(
+        request=None,
+        responses={200: HoglakeCredentialRevokedSerializer},
+        summary="Revoke a hoglake credential",
+        description="Revoke the credential now: new tokens are refused and its S3 vends stop.",
+    )
+    @action(
+        methods=["DELETE"],
+        detail=False,
+        url_path=rf"hoglake_credentials/(?P<credential_id>{_HOGLAKE_CREDENTIAL_ID})",
+        required_scopes=["warehouse_view:write"],
+    )
+    def revoke_hoglake_credential(self, request: Request, credential_id: str, **kwargs) -> Response:
+        admin_error = self._require_organization_admin(request, "revoke hoglake credentials for")
+        if admin_error is not None:
+            return admin_error
+        return managed_warehouse.revoke_hoglake_credential(
+            self.team.organization_id, credential_id, triggered_by=self._audit_principal(request)
+        )
+
+    @extend_schema(
+        responses={200: MyHoglakeCredentialListResponseSerializer},
+        summary="List your hoglake credentials",
+        description="Your own live hoglake OAuth credentials (never their secrets), the projects you can put "
+        "in one, and where to use them.",
+    )
+    # Scopes split by dangerously_get_required_scopes, as for hoglake_credentials.
+    @action(methods=["GET"], detail=False, url_path="my_hoglake_credentials")
+    def my_hoglake_credentials(self, request: Request, **kwargs) -> Response:
+        return managed_warehouse.list_my_hoglake_credentials(self.team.organization, cast(User, request.user))
+
+    @extend_schema(
+        request=MyHoglakeCredentialCreateRequestSerializer,
+        responses={201: HoglakeCredentialIssuedSerializer},
+        summary="Create a hoglake credential of your own",
+        description="Create an OAuth client credential owned by you and limited to the projects you name. "
+        "Each token it gets carries your current access on each project. The secret is in this response only.",
+    )
+    @my_hoglake_credentials.mapping.post
+    def create_my_hoglake_credential(self, request: Request, **kwargs) -> Response:
+        body = MyHoglakeCredentialCreateRequestSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        return managed_warehouse.create_my_hoglake_credential(
+            self.team.organization,
+            cast(User, request.user),
+            name=body.validated_data["name"],
+            scope=body.validated_data["scope"],
+            team_ids=body.validated_data["team_ids"],
+            ttl_seconds=body.validated_data.get("ttl_seconds"),
+            triggered_by=self._audit_principal(request),
+        )
+
+    @extend_schema(
+        request=None,
+        responses={200: HoglakeCredentialIssuedSerializer},
+        summary="Rotate one of your hoglake credentials",
+        description="Replace your credential's secret; the old one stops working. The new secret is in this "
+        "response only.",
+    )
+    @action(
+        methods=["POST"],
+        detail=False,
+        url_path=rf"my_hoglake_credentials/(?P<credential_id>{_HOGLAKE_CREDENTIAL_ID})/rotate",
+        required_scopes=["warehouse_view:write"],
+    )
+    def rotate_my_hoglake_credential(self, request: Request, credential_id: str, **kwargs) -> Response:
+        return managed_warehouse.rotate_my_hoglake_credential(
+            self.team.organization, cast(User, request.user), credential_id, triggered_by=self._audit_principal(request)
+        )
+
+    @extend_schema(
+        request=None,
+        responses={200: HoglakeCredentialRevokedSerializer},
+        summary="Revoke one of your hoglake credentials",
+        description="Revoke your credential now: new tokens are refused and its S3 vends stop.",
+    )
+    @action(
+        methods=["DELETE"],
+        detail=False,
+        url_path=rf"my_hoglake_credentials/(?P<credential_id>{_HOGLAKE_CREDENTIAL_ID})",
+        required_scopes=["warehouse_view:write"],
+    )
+    def revoke_my_hoglake_credential(self, request: Request, credential_id: str, **kwargs) -> Response:
+        return managed_warehouse.revoke_my_hoglake_credential(
+            self.team.organization, cast(User, request.user), credential_id, triggered_by=self._audit_principal(request)
+        )
+
+    @extend_schema(
+        parameters=[
+            inline_serializer(
+                "CheckDatabaseNameRequest",
+                fields={"name": serializers.CharField(help_text="Database name to check")},
+            )
+        ],
+        responses={
+            200: inline_serializer(
+                "CheckDatabaseNameResponse",
+                fields={
+                    "name": serializers.CharField(),
+                    "available": serializers.BooleanField(),
+                },
+            )
+        },
+    )
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(methods=["GET"], detail=False, url_path="check-database-name")
+    def check_database_name(self, request: Request, **kwargs) -> Response:
+        """Check if a database name is available."""
+        return managed_warehouse.check_name(self.team.organization_id, request.query_params.get("name"))
+
+    @extend_schema(
+        parameters=[
+            inline_serializer(
+                "CheckSchemaNameRequest",
+                fields={"name": serializers.CharField(help_text="Schema name to check")},
+            )
+        ],
+        responses={
+            200: inline_serializer(
+                "CheckSchemaNameResponse",
+                fields={
+                    "name": serializers.CharField(help_text="The schema name that was checked"),
+                    "available": serializers.BooleanField(
+                        help_text="Whether the schema name is free within the organization's warehouse"
+                    ),
+                },
+            )
+        },
+    )
+    # nosemgrep: api-path-underscore -- shipped public API path, a rename breaks clients
+    @action(methods=["GET"], detail=False, url_path="check-schema-name")
+    def check_schema_name(self, request: Request, **kwargs) -> Response:
+        """Check if a schema name is free within the organization's managed warehouse."""
+        # Same gate as onboard_team: the check scans every project's schema in the org, so a
+        # non-admin could otherwise probe names and learn what inaccessible projects use.
+        admin_error = self._require_organization_admin(request, "check schema names for")
+        if admin_error:
+            return admin_error
+        return managed_warehouse.check_schema_name(self.team.organization_id, request.query_params.get("name"))

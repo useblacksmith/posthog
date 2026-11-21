@@ -1,0 +1,1131 @@
+import { match } from 'ts-pattern'
+
+import { getSeriesColor } from 'lib/colors'
+import { MAX_EXPERIMENT_VARIANTS } from 'lib/constants'
+import { uuid } from 'lib/utils/dom'
+import { MathAvailability } from 'scenes/insights/filters/ActionFilter/ActionFilterRow/types'
+import { SeriesNode, isActionsSeriesNode, isEventsSeriesNode } from 'scenes/insights/filters/ActionFilter/seriesNode'
+
+import { isFunnelsQuery, isNodeWithSource, isTrendsQuery } from '~/queries/schema/node-guards'
+import {
+    ActionsNode,
+    AnyEntityNode,
+    Breakdown,
+    CachedNewExperimentQueryResponse,
+    ExperimentEventExposureConfig,
+    ExperimentExposureConfig,
+    ExperimentFunnelMetricStep,
+    ExperimentFunnelsQuery,
+    ExperimentMetric,
+    ExperimentMetricSource,
+    ExperimentMetricType,
+    ExperimentTrendsQuery,
+    NodeKind,
+    ProductKey,
+    TrendsQuery,
+    isExperimentFunnelMetric,
+    isExperimentMeanMetric,
+    isExperimentQuantileMetric,
+    isExperimentRatioMetric,
+    isExperimentExposureNode,
+    isExperimentRetentionMetric,
+} from '~/queries/schema/schema-general'
+import { isValidQueryForExperiment } from '~/queries/utils'
+import {
+    AnyPropertyFilter,
+    BreakdownAttributionType,
+    ChartDisplayType,
+    Experiment,
+    ExperimentMetricGoal,
+    ExperimentMetricMathType,
+    FeatureFlagBasicType,
+    FeatureFlagType,
+    FunnelConversionWindowTimeUnit,
+    MultivariateFlagVariant,
+    PropertyFilterType,
+    type InsightModel,
+    UniversalFiltersGroupValue,
+} from '~/types'
+
+import { EXPERIMENT_VARIANT_MULTIPLE } from 'products/experiments/frontend/constants'
+import type {
+    ExperimentFeatureFlagFiltersApi,
+    ExperimentFeatureFlagInputApi,
+    ExperimentToSavedMetricApi,
+} from 'products/experiments/frontend/generated/api.schemas'
+
+import { EXPOSURE_DEFAULT_EVENT, resolvedExposureEvent } from './exposureContract'
+import { SharedMetric } from './SharedMetrics/sharedMetricLogic'
+
+const MULTIPLE_VARIANT_WARNING_THRESHOLD = 0.5 // on the 0-100 scale (0.5 = 0.5%)
+
+export function filterLowMultipleVariant<T extends { variant: string; percentage: number }>(variants: T[]): T[] {
+    return variants.filter(
+        (v) => v.variant !== EXPERIMENT_VARIANT_MULTIPLE || v.percentage > MULTIPLE_VARIANT_WARNING_THRESHOLD
+    )
+}
+
+/**
+ * Resolves the effective multi-variant handling, applying the backend default when unset.
+ * See products/experiments/backend/hogql_queries/exposure_query_logic.py (default = `EXCLUDE`).
+ */
+export function resolveMultipleVariantHandling(
+    handling: 'exclude' | 'first_seen' | undefined
+): 'exclude' | 'first_seen' {
+    return handling ?? 'exclude'
+}
+
+export function isEventExposureConfig(config: ExperimentExposureConfig): config is ExperimentEventExposureConfig {
+    return config.kind === NodeKind.ExperimentEventExposureConfig || 'event' in config
+}
+
+export function getExposureConfigDisplayName(config: ExperimentExposureConfig): string {
+    if (isEventExposureConfig(config)) {
+        return config.event || 'Unknown Event'
+    }
+    if (config.kind === NodeKind.ExperimentWarehouseNativeExposureConfig) {
+        return 'Warehouse-native query'
+    }
+    return config.name || `Action ${config.id}`
+}
+
+export function getVariantColor(variantKey: string, featureFlagVariants: MultivariateFlagVariant[]): string {
+    const variantIndex = featureFlagVariants.findIndex((v) => v.key === variantKey)
+    return variantIndex !== -1 ? getSeriesColor(variantIndex) : 'var(--muted)'
+}
+
+/**
+ * Variants for an experiment. Saved experiments resolve from the linked feature flag (the source
+ * of truth); an unsaved draft has no flag yet, so it resolves from the draft flag config instead.
+ */
+export function getExperimentVariants(experiment: Partial<Experiment> | null | undefined): MultivariateFlagVariant[] {
+    return (
+        experiment?.feature_flag?.filters?.multivariate?.variants ??
+        experiment?.feature_flag_config?.filters?.multivariate?.variants ??
+        []
+    )
+}
+
+/**
+ * Variants for a standalone feature flag (no experiment in hand). Reads the flag's saved config only.
+ */
+export function getFlagVariants(
+    flag: FeatureFlagBasicType | FeatureFlagType | null | undefined
+): MultivariateFlagVariant[] {
+    return flag?.filters?.multivariate?.variants ?? []
+}
+
+/**
+ * The effective baseline variant, mirroring the backend rule (get_baseline_variant_key):
+ * the configured stats_config.baseline_variant_key, else 'control' when the flag has one,
+ * else the flag's first variant. A control-less draft can lack the configured key until
+ * launch pins it, so callers must not assume 'control' exists.
+ */
+export function getBaselineVariantKey(experiment: Partial<Experiment> | null | undefined): string {
+    const configured = experiment?.stats_config?.baseline_variant_key
+    if (configured) {
+        return configured
+    }
+    const variants = getExperimentVariants(experiment)
+    if (variants.length === 0 || variants.some((variant) => variant.key === 'control')) {
+        return 'control'
+    }
+    return variants[0].key
+}
+
+export function formatUnitByQuantity(value: number, unit: string): string {
+    return value === 1 ? unit : unit + 's'
+}
+
+export function ensureIsPercent(value: string | number | undefined): number {
+    const parsedNum = typeof value === 'string' ? parseInt(value, 10) : (value ?? 0)
+    const num = isNaN(parsedNum) ? 0 : parsedNum
+    return Math.min(100, Math.max(0, num))
+}
+
+export function percentageDistribution(variantCount: number): number[] {
+    const basePercentage = Math.floor(100 / variantCount)
+    const percentages = Array.from<number>({ length: variantCount }).fill(basePercentage)
+    let remaining = 100 - basePercentage * variantCount
+    for (let i = 0; remaining > 0; i++, remaining--) {
+        // try to equally distribute `remaining` across variants
+        percentages[i] += 1
+    }
+    return percentages
+}
+
+export function isEvenlyDistributed(variants: MultivariateFlagVariant[]): boolean {
+    const evenPercentages = percentageDistribution(variants.length)
+    return variants.every((variant, index) => variant.rollout_percentage === evenPercentages[index])
+}
+
+// The experiments backend replaces these HogQL filter keys with the team's current evaluation pass rules. Other query
+// kinds cannot resolve them, so queries outside the experiment results drop them.
+const EVALUATION_PASS_MARKERS = new Set(['aiEvaluationGraded()', 'aiEvaluationPassed()'])
+
+function withoutEvaluationPassMarkers(properties: AnyPropertyFilter[]): AnyPropertyFilter[] {
+    return properties.filter((p) => !(p.type === PropertyFilterType.HogQL && EVALUATION_PASS_MARKERS.has(p.key)))
+}
+
+function seriesToFilter(series: AnyEntityNode | ExperimentMetricSource): UniversalFiltersGroupValue | null {
+    if (series.kind === NodeKind.EventsNode) {
+        return {
+            id: series.event ?? null,
+            name: series.event as string,
+            type: 'events',
+            properties: withoutEvaluationPassMarkers(series.properties ?? []),
+        }
+    }
+
+    if (series.kind === NodeKind.ActionsNode) {
+        return {
+            id: series.id,
+            name: series.name,
+            type: 'actions',
+        }
+    }
+
+    if (series.kind === NodeKind.ExperimentDataWarehouseNode) {
+        return {
+            id: series.table_name,
+            name: series.name,
+            type: 'data_warehouse',
+        }
+    }
+
+    return null
+}
+
+/**
+ * Event/action filters for one metric's sources — the "session reached this metric" part of a
+ * recordings query. Data-warehouse sources have no session events and are skipped, so a metric
+ * whose every source is a data-warehouse node (or a retention metric, whose steps the recordings
+ * surfaces don't enumerate) yields no filters.
+ */
+export function getMetricSessionFilters(metric: ExperimentMetric): UniversalFiltersGroupValue[] {
+    const sources: (ExperimentMetricSource | ExperimentFunnelMetricStep)[] =
+        isExperimentMeanMetric(metric) || isExperimentQuantileMetric(metric)
+            ? [metric.source]
+            : isExperimentFunnelMetric(metric)
+              ? metric.series
+              : isExperimentRatioMetric(metric)
+                ? [metric.numerator, metric.denominator]
+                : []
+    return sources
+        .filter((source) => source.kind === NodeKind.EventsNode || source.kind === NodeKind.ActionsNode)
+        .map((source) => seriesToFilter(source))
+        .filter((filter): filter is UniversalFiltersGroupValue => filter !== null)
+}
+
+/**
+ * The distinct events a metric counts. A metric's name is free text ("Rageclicks per user"), so
+ * on its own it doesn't say what a session has to have fired to match.
+ */
+export function getMetricSourceEventNames(metric: ExperimentMetric): string[] {
+    const names = getMetricSessionFilters(metric)
+        // Only entity filters name an event; a nested filter group (which the type allows) doesn't.
+        .flatMap((filter) => ('id' in filter ? [String(filter.name ?? filter.id ?? '')] : []))
+        .filter(Boolean)
+    return [...new Set(names)]
+}
+
+export const NOT_A_FUNNEL_REASON = "This filter reads a funnel's last step, so it needs a funnel metric."
+
+export const FUNNEL_SERVER_SIDE_COMPLETION_REASON =
+    "This filter reads a funnel's last step. This one is captured server-side without a session ID, so recordings can't be matched."
+
+export const FUNNEL_DATA_WAREHOUSE_COMPLETION_REASON =
+    "This filter reads a funnel's last step. This one is measured in the data warehouse, which has no session events to match recordings on."
+
+/**
+ * Why drop-off can't be asked of this metric, or null when it can. An experiment funnel's first
+ * step is always the exposure event (the analysis prepends it), so drop-off reads only the
+ * funnel's last step, and that step alone has to be matchable. The whole-metric linkability
+ * check can't stand in for this, since a funnel stays matchable on its other steps. Mirrors the
+ * `session_buckets` endpoint, which refuses the same shapes rather than counting a completion no
+ * recording can show as zero in every session.
+ */
+export function getFunnelDropoffReason(metric: ExperimentMetric, unlinkableEventNames: Set<string>): string | null {
+    if (!isExperimentFunnelMetric(metric) || metric.series.length === 0) {
+        return NOT_A_FUNNEL_REASON
+    }
+    const completion = metric.series[metric.series.length - 1]
+    if (completion.kind === NodeKind.ExperimentDataWarehouseNode) {
+        return FUNNEL_DATA_WAREHOUSE_COMPLETION_REASON
+    }
+    if (completion.kind === NodeKind.EventsNode && completion.event && unlinkableEventNames.has(completion.event)) {
+        return FUNNEL_SERVER_SIDE_COMPLETION_REASON
+    }
+    return null
+}
+
+/**
+ * Whether a recordings event filter can only match zero sessions: the project has never seen the
+ * event with a `$session_id` (e.g. it is captured server-side). Action and data warehouse filters
+ * pass through unchecked, matching the replay playlist's own posture.
+ */
+export function isUnlinkableEventFilter(
+    filter: UniversalFiltersGroupValue,
+    unlinkableEventNames: Set<string>
+): boolean {
+    return (
+        'type' in filter &&
+        filter.type === 'events' &&
+        'name' in filter &&
+        typeof filter.name === 'string' &&
+        unlinkableEventNames.has(filter.name)
+    )
+}
+
+export const METRIC_UNLINKABLE_REASON =
+    "This metric's events are captured server-side without a session ID, so recordings can't be matched."
+
+export const RETENTION_UNLINKABLE_REASON =
+    'Retention metrics measure a return visit, which happens in a later session than the one that starts it. No single recording can show both, so these metrics are left out of the filter.'
+
+export const DATA_WAREHOUSE_UNLINKABLE_REASON =
+    'This metric is measured entirely in the data warehouse, which has no session events to match recordings on.'
+
+/**
+ * Why a metric cannot narrow a recordings list, as a value telemetry can count. The prose the
+ * viewer reads is derived from this, so a copy change can never shift what a report measures.
+ */
+export type ExperimentMetricUnlinkableCode = 'server_side_events' | 'retention' | 'data_warehouse'
+
+/**
+ * Why a metric can't narrow a recordings list, or null when it can. A metric is unlinkable when
+ * every one of its sources is a never-session-linked event, or when it yields no session filter at
+ * all (a retention metric, or one measured only in the data warehouse). Either way its filter could
+ * only match zero sessions. Pass an empty `unlinkableEventNames` while the linkability check loads,
+ * which fails open, the posture every linkability consumer shares.
+ */
+export function getMetricUnlinkableCode(
+    metric: ExperimentMetric,
+    unlinkableEventNames: Set<string>
+): ExperimentMetricUnlinkableCode | null {
+    const filters = getMetricSessionFilters(metric)
+    if (filters.length === 0) {
+        return isExperimentRetentionMetric(metric) ? 'retention' : 'data_warehouse'
+    }
+    return filters.every((filter) => isUnlinkableEventFilter(filter, unlinkableEventNames))
+        ? 'server_side_events'
+        : null
+}
+
+const METRIC_UNLINKABLE_REASONS: Record<ExperimentMetricUnlinkableCode, string> = {
+    server_side_events: METRIC_UNLINKABLE_REASON,
+    retention: RETENTION_UNLINKABLE_REASON,
+    data_warehouse: DATA_WAREHOUSE_UNLINKABLE_REASON,
+}
+
+/** The prose for `getMetricUnlinkableCode`, as the tab's own metric dropdown reads it. */
+export function getMetricUnlinkableReason(metric: ExperimentMetric, unlinkableEventNames: Set<string>): string | null {
+    const code = getMetricUnlinkableCode(metric, unlinkableEventNames)
+    return code === null ? null : METRIC_UNLINKABLE_REASONS[code]
+}
+
+/**
+ * The single event an experiment's exposure is counted on, for the session-linkability check.
+ * Null for an action exposure config, which can match several events, so no one name applies.
+ */
+export function getExposureLinkabilityEventName(experiment: Experiment): string | null {
+    const exposureConfig = experiment.exposure_criteria?.exposure_config
+    if (exposureConfig && !(isEventExposureConfig(exposureConfig) && exposureConfig.event === EXPOSURE_DEFAULT_EVENT)) {
+        return isEventExposureConfig(exposureConfig) && exposureConfig.event ? exposureConfig.event : null
+    }
+    return resolvedExposureEvent(experiment)
+}
+
+/**
+ * Event names whose session-linkability must be checked before building "View recordings" links:
+ * the exposure event plus every plain-event metric step across primary, secondary and shared
+ * metrics. Action and data warehouse steps pass through unchecked (same as the replay playlist's
+ * own check), as do "all events" steps, which have no event name.
+ */
+export function getSessionLinkabilityEventNames(experiment: Experiment): string[] {
+    const eventNames = new Set<string>()
+
+    const exposureEventName = getExposureLinkabilityEventName(experiment)
+    if (exposureEventName) {
+        eventNames.add(exposureEventName)
+    }
+
+    const metrics = [
+        ...(experiment.metrics || []),
+        ...(experiment.metrics_secondary || []),
+        ...(experiment.saved_metrics || []).map((savedMetric: { query?: ExperimentMetric }) => savedMetric?.query),
+    ].filter((metric): metric is ExperimentMetric => metric?.kind === NodeKind.ExperimentMetric)
+
+    for (const metric of metrics) {
+        const sources: (ExperimentMetricSource | ExperimentFunnelMetricStep)[] =
+            isExperimentMeanMetric(metric) || isExperimentQuantileMetric(metric)
+                ? [metric.source]
+                : isExperimentFunnelMetric(metric)
+                  ? metric.series
+                  : isExperimentRatioMetric(metric)
+                    ? [metric.numerator, metric.denominator]
+                    : []
+        for (const source of sources) {
+            if (source.kind === NodeKind.EventsNode && source.event) {
+                eventNames.add(source.event)
+            }
+        }
+    }
+
+    return Array.from(eventNames)
+}
+
+// Mirrors the backend eligibility rule (experiment_eligibility_error): multivariate with 2-20 variants
+export function featureFlagEligibleForExperiment(featureFlag: FeatureFlagType): true {
+    const variants = getFlagVariants(featureFlag)
+    if (variants.length < 2) {
+        throw new Error('Feature flag must have at least 2 variants (a baseline and at least one test variant).')
+    }
+    if (variants.length > MAX_EXPERIMENT_VARIANTS) {
+        throw new Error(`Feature flag must have at most ${MAX_EXPERIMENT_VARIANTS} variants.`)
+    }
+    return true
+}
+
+/**
+ * TODO: review. Probably deprecated
+ */
+export function getDefaultFunnelMetric(): ExperimentMetric {
+    return {
+        kind: NodeKind.ExperimentMetric,
+        uuid: uuid(),
+        metric_type: ExperimentMetricType.FUNNEL,
+        goal: ExperimentMetricGoal.Increase,
+        series: [
+            {
+                kind: NodeKind.EventsNode,
+                event: '$pageview',
+                name: '$pageview',
+            },
+        ],
+    }
+}
+
+/**
+ * @deprecated
+ */
+export function getDefaultCountMetric(): ExperimentMetric {
+    return {
+        kind: NodeKind.ExperimentMetric,
+        uuid: uuid(),
+        metric_type: ExperimentMetricType.MEAN,
+        goal: ExperimentMetricGoal.Increase,
+        source: {
+            kind: NodeKind.EventsNode,
+            event: '$pageview',
+            math: ExperimentMetricMathType.TotalCount,
+        },
+    }
+}
+
+export function getDefaultRatioMetric(): ExperimentMetric {
+    return {
+        kind: NodeKind.ExperimentMetric,
+        uuid: uuid(),
+        metric_type: ExperimentMetricType.RATIO,
+        goal: ExperimentMetricGoal.Increase,
+        numerator: {
+            kind: NodeKind.EventsNode,
+            event: '$pageview',
+            name: '$pageview',
+            math: ExperimentMetricMathType.TotalCount,
+        },
+        denominator: {
+            kind: NodeKind.EventsNode,
+            event: '$pageview',
+            name: '$pageview',
+            math: ExperimentMetricMathType.TotalCount,
+        },
+    }
+}
+
+export function getDefaultRetentionMetric(): ExperimentMetric {
+    return {
+        kind: NodeKind.ExperimentMetric,
+        uuid: uuid(),
+        metric_type: ExperimentMetricType.RETENTION,
+        goal: ExperimentMetricGoal.Increase,
+        start_event: {
+            kind: NodeKind.EventsNode,
+            event: '$pageview',
+            name: '$pageview',
+            math: ExperimentMetricMathType.TotalCount,
+        },
+        completion_event: {
+            kind: NodeKind.EventsNode,
+            event: '$pageview',
+            name: '$pageview',
+            math: ExperimentMetricMathType.TotalCount,
+        },
+        retention_window_start: 1,
+        retention_window_end: 1,
+        retention_window_unit: FunnelConversionWindowTimeUnit.Day,
+        start_handling: 'first_seen',
+    }
+}
+
+export const DEFAULT_METRIC_QUANTILE = 0.9
+
+export function getDefaultQuantileMetric(): ExperimentMetric {
+    return {
+        kind: NodeKind.ExperimentMetric,
+        uuid: uuid(),
+        metric_type: ExperimentMetricType.QUANTILE,
+        // Percentile metrics usually measure durations such as load time, where lower is better
+        goal: ExperimentMetricGoal.Decrease,
+        quantile: DEFAULT_METRIC_QUANTILE,
+        source: {
+            kind: NodeKind.EventsNode,
+            event: '$pageview',
+            name: '$pageview',
+        },
+    }
+}
+
+export function getDefaultExperimentMetric(metricType: ExperimentMetricType): ExperimentMetric {
+    switch (metricType) {
+        case ExperimentMetricType.QUANTILE:
+            return getDefaultQuantileMetric()
+        case ExperimentMetricType.FUNNEL:
+            return getDefaultFunnelMetric()
+        case ExperimentMetricType.RATIO:
+            return getDefaultRatioMetric()
+        case ExperimentMetricType.RETENTION:
+            return getDefaultRetentionMetric()
+        default:
+            return getDefaultCountMetric()
+    }
+}
+
+export function getExperimentMetricFromInsight(insight: InsightModel | null): ExperimentMetric | undefined {
+    if (!insight?.query || !isValidQueryForExperiment(insight?.query) || !isNodeWithSource(insight.query)) {
+        return undefined
+    }
+
+    const metricName = (insight?.name || insight?.derived_name) ?? undefined
+
+    if (isFunnelsQuery(insight.query.source)) {
+        return {
+            kind: NodeKind.ExperimentMetric,
+            uuid: uuid(),
+            metric_type: ExperimentMetricType.FUNNEL,
+            goal: ExperimentMetricGoal.Increase,
+            name: metricName,
+            series: insight.query.source.series.map((series) => ({
+                ...series,
+                // Ensure we have proper node structure
+                kind: series.kind || NodeKind.EventsNode,
+                event: series.kind === NodeKind.EventsNode ? series.event : undefined,
+                name: series.name || (series.kind === NodeKind.EventsNode ? series.event : undefined),
+            })) as ExperimentFunnelMetricStep[],
+        }
+    }
+
+    /**
+     * TODO: add support for trends queries. IsValidQueryForExperiment
+     * has a isFunnelsQuery check, so this is never called. Trend queries
+     * get undefined.
+     */
+    if (isTrendsQuery(insight.query.source)) {
+        // For trends queries, convert the first series to a mean metric
+        const firstSeries = insight.query.source.series?.[0]
+        if (!firstSeries) {
+            return undefined
+        }
+
+        return {
+            kind: NodeKind.ExperimentMetric,
+            uuid: uuid(),
+            metric_type: ExperimentMetricType.MEAN,
+            goal: ExperimentMetricGoal.Increase,
+            name: metricName,
+            source: {
+                ...firstSeries,
+                kind: NodeKind.EventsNode,
+                event: firstSeries.name,
+                name: firstSeries.name,
+                math: firstSeries.math || ExperimentMetricMathType.TotalCount,
+            },
+        }
+    }
+
+    return undefined
+}
+
+export function exposureConfigToSeries(exposureConfig: ExperimentExposureConfig): SeriesNode[] {
+    if (exposureConfig.kind === NodeKind.ExperimentEventExposureConfig) {
+        return [
+            {
+                kind: NodeKind.EventsNode,
+                event: exposureConfig.event,
+                name: exposureConfig.event,
+                properties: exposureConfig.properties,
+            },
+        ]
+    }
+    if (exposureConfig.kind === NodeKind.ActionsNode) {
+        return [exposureConfig]
+    }
+    return []
+}
+
+/**
+ * Only an event or an action can mark exposure, so any other series gives no config.
+ */
+export function seriesToExposureConfig(series: SeriesNode[]): ExperimentEventExposureConfig | ActionsNode | undefined {
+    const [node] = series
+    if (isEventsSeriesNode(node)) {
+        return {
+            kind: NodeKind.ExperimentEventExposureConfig,
+            // "All events" leaves `event` null, which the API rejects as an exposure event.
+            event: node.event as string,
+            properties: node.properties ?? [],
+        }
+    }
+    if (isActionsSeriesNode(node)) {
+        return {
+            kind: NodeKind.ActionsNode,
+            id: node.id,
+            name: node.name,
+            properties: node.properties,
+        }
+    }
+    return undefined
+}
+
+// The backend accepts quantile levels from 0.01 to 0.99.
+export const MIN_PERCENTILE = 1
+export const MAX_PERCENTILE = 99
+
+/** Why a percentile level can't be saved, or undefined when it can. */
+export function getPercentileError(percentile: number | undefined): string | undefined {
+    const hasAtMostOneDecimal =
+        percentile !== undefined && Math.abs(Math.round(percentile * 10) - percentile * 10) < 1e-6
+    if (
+        percentile === undefined ||
+        !Number.isFinite(percentile) ||
+        percentile < MIN_PERCENTILE ||
+        percentile > MAX_PERCENTILE ||
+        !hasAtMostOneDecimal
+    ) {
+        return `Enter a percentile from ${MIN_PERCENTILE} to ${MAX_PERCENTILE}, with up to one decimal place`
+    }
+    return undefined
+}
+
+/** The backend rejects an incomplete metric too, but this lets the save button say what is missing first. */
+export function getMetricIncompleteReason(metric: ExperimentMetric): string | undefined {
+    if (isExperimentQuantileMetric(metric)) {
+        if (!metric.source.math_property) {
+            return 'Select a numeric property for the percentile'
+        }
+        return getPercentileError(metric.quantile * 100)
+    }
+    return undefined
+}
+
+/**
+ * returns the math availability for a metric type
+ */
+export function getMathAvailability(metricType: ExperimentMetricType): MathAvailability {
+    switch (metricType) {
+        case ExperimentMetricType.MEAN:
+        case ExperimentMetricType.RATIO:
+            return MathAvailability.All
+        default:
+            return MathAvailability.None
+    }
+}
+
+/**
+ * returns the allowed math types that can be used when creating a metric
+ */
+export function getAllowedMathTypes(metricType: ExperimentMetricType): ExperimentMetricMathType[] {
+    switch (metricType) {
+        case ExperimentMetricType.MEAN:
+            return [
+                ExperimentMetricMathType.TotalCount,
+                ExperimentMetricMathType.Sum,
+                ExperimentMetricMathType.UniqueUsers,
+                ExperimentMetricMathType.UniqueGroup,
+                ExperimentMetricMathType.Avg,
+                ExperimentMetricMathType.Min,
+                ExperimentMetricMathType.Max,
+                ExperimentMetricMathType.UniqueSessions,
+                ExperimentMetricMathType.HogQL,
+            ]
+        case ExperimentMetricType.RATIO:
+            return [
+                ExperimentMetricMathType.TotalCount,
+                ExperimentMetricMathType.Sum,
+                ExperimentMetricMathType.UniqueUsers,
+                ExperimentMetricMathType.UniqueGroup,
+                ExperimentMetricMathType.UniqueSessions,
+                ExperimentMetricMathType.Avg,
+                ExperimentMetricMathType.Min,
+                ExperimentMetricMathType.Max,
+            ]
+        default:
+            return [ExperimentMetricMathType.TotalCount]
+    }
+}
+
+/**
+ * Check if a query is a legacy experiment metric.
+ *
+ * We use `unknown` here because in some cases, the query is not typed.
+ */
+export const isLegacyExperimentQuery = (query: unknown): query is ExperimentTrendsQuery | ExperimentFunnelsQuery => {
+    /**
+     * since query could be an object literal type, we need to check for the kind property
+     */
+    return (
+        !!query &&
+        typeof query === 'object' &&
+        'kind' in query &&
+        (query.kind === NodeKind.ExperimentTrendsQuery || query.kind === NodeKind.ExperimentFunnelsQuery)
+    )
+}
+
+/**
+ * True when an inline or shared metric of the experiment still uses the legacy ExperimentTrendsQuery or
+ * ExperimentFunnelsQuery shape. The app shows no results for such an experiment until it is migrated.
+ */
+export const isLegacyExperiment = (experiment?: Experiment | null): boolean => {
+    if (!experiment) {
+        return false
+    }
+    const { metrics, metrics_secondary, saved_metrics } = experiment
+    // saved_metrics has a different structure and so we need to check for it separately
+    if ((saved_metrics ?? []).some(isLegacySharedMetric)) {
+        return true
+    }
+    return [...(metrics ?? []), ...(metrics_secondary ?? [])].some(isLegacyExperimentQuery)
+}
+
+export const isLegacySharedMetric = ({ query }: SharedMetric): boolean => isLegacyExperimentQuery(query)
+
+const getEventCountSeries = (metric: ExperimentMetric): AnyEntityNode[] => {
+    /**
+     * we short circuit for funnel metrics
+     */
+    if (isExperimentFunnelMetric(metric)) {
+        const lastStep = metric.series[metric.series.length - 1]
+        if (lastStep) {
+            if (lastStep.kind === NodeKind.EventsNode) {
+                return [
+                    {
+                        kind: NodeKind.EventsNode,
+                        name: lastStep.event || undefined,
+                        event: lastStep.event,
+                        math: ExperimentMetricMathType.TotalCount,
+                        ...(lastStep.properties &&
+                            lastStep.properties.length > 0 && {
+                                properties: withoutEvaluationPassMarkers(lastStep.properties),
+                            }),
+                    },
+                ]
+            } else if (lastStep.kind === NodeKind.ActionsNode) {
+                return [
+                    {
+                        kind: NodeKind.ActionsNode,
+                        id: lastStep.id,
+                        name: lastStep.name,
+                        math: ExperimentMetricMathType.TotalCount,
+                        ...(lastStep.properties &&
+                            lastStep.properties.length > 0 && { properties: lastStep.properties }),
+                    },
+                ]
+            }
+        }
+    }
+
+    const source: ExperimentMetricSource | null = match(metric)
+        .when(isExperimentRatioMetric, (ratioMetric) => ratioMetric.numerator)
+        // An exposure-anchored start has no literal event to preview, so show completion-event activity
+        .when(isExperimentRetentionMetric, (retentionMetric) =>
+            isExperimentExposureNode(retentionMetric.start_event)
+                ? retentionMetric.completion_event
+                : retentionMetric.start_event
+        )
+        .when(isExperimentMeanMetric, (meanMetric) => meanMetric.source)
+        .when(isExperimentQuantileMetric, (quantileMetric) => quantileMetric.source)
+        .otherwise(() => null)
+
+    if (!source) {
+        return []
+    }
+
+    const series: AnyEntityNode[] = match(source)
+        .with({ kind: NodeKind.EventsNode }, (eventsNode) => [
+            {
+                kind: NodeKind.EventsNode as const,
+                name: eventsNode.event || undefined,
+                event: eventsNode.event || undefined,
+                math: ExperimentMetricMathType.TotalCount,
+                ...(eventsNode.properties &&
+                    eventsNode.properties.length > 0 && {
+                        properties: withoutEvaluationPassMarkers(eventsNode.properties),
+                    }),
+            },
+        ])
+        .with({ kind: NodeKind.ActionsNode }, (actionsNode) => [
+            {
+                kind: NodeKind.ActionsNode as const,
+                id: actionsNode.id,
+                name: actionsNode.name,
+                math: ExperimentMetricMathType.TotalCount,
+                ...(actionsNode.properties &&
+                    actionsNode.properties.length > 0 && { properties: actionsNode.properties }),
+            },
+        ])
+        .with({ kind: NodeKind.ExperimentDataWarehouseNode }, (dataWarehouseNode) => [
+            {
+                kind: NodeKind.DataWarehouseNode as const,
+                id: dataWarehouseNode.table_name,
+                id_field: dataWarehouseNode.data_warehouse_join_key,
+                table_name: dataWarehouseNode.table_name,
+                timestamp_field: dataWarehouseNode.timestamp_field,
+                distinct_id_field: dataWarehouseNode.events_join_key,
+                name: dataWarehouseNode.name,
+                math: ExperimentMetricMathType.TotalCount,
+                ...(dataWarehouseNode.properties &&
+                    dataWarehouseNode.properties.length > 0 && { properties: dataWarehouseNode.properties }),
+            },
+        ])
+        // PostHog holds no rows of a warehouse-native source, so it has no recent activity to count.
+        .with({ kind: NodeKind.ExperimentWarehouseNativeNode }, () => [])
+        .exhaustive()
+
+    return series
+}
+
+/**
+ * Builds a TrendsQuery for counting events in the last 14 days for experiment metric preview
+ */
+export function getEventCountQuery(metric: ExperimentMetric, filterTestAccounts: boolean): TrendsQuery | null {
+    const series = getEventCountSeries(metric)
+
+    if (series.length === 0) {
+        return null
+    }
+
+    // Data warehouse tables don't support test account filters — those filters
+    // reference the events table (e.g. events.properties.*), which doesn't exist
+    // on a DW table and causes "Unable to resolve field: events". This matches
+    // product analytics behavior, where the toggle is disabled for DW sources.
+    const isDWQuery = series.some((s) => s.kind === NodeKind.DataWarehouseNode)
+
+    return {
+        kind: NodeKind.TrendsQuery,
+        series,
+        trendsFilter: {
+            formulaNodes: [],
+            display: ChartDisplayType.BoldNumber,
+        },
+        dateRange: {
+            date_from: '-14d',
+            date_to: null,
+            explicitDate: false,
+        },
+        interval: 'day',
+        filterTestAccounts: isDWQuery ? false : filterTestAccounts,
+        tags: {
+            productKey: ProductKey.PRODUCT_ANALYTICS,
+        },
+    }
+}
+
+/**
+ * Returns metric indices in display order. Metrics whose UUID appears in
+ * orderedUuids come first (in that order), followed by any remaining metrics
+ * in their original array position. Each entry is the original index into the
+ * metrics array so callers can write results to the correct positional slot.
+ *
+ * The ordering array is a display hint, not a membership list. An entry that matches no
+ * metric is ignored, and a metric the array does not list still renders after the listed
+ * ones. Filtering by the array instead would hide any metric whose uuid never reached it.
+ */
+export function getDisplayOrderedIndices(
+    metrics: { uuid?: string }[],
+    orderedUuids: string[] | null | undefined
+): number[] {
+    if (!orderedUuids || orderedUuids.length === 0) {
+        return metrics.map((_, i) => i)
+    }
+
+    const uuidToIndex = new Map<string, number>()
+    for (let i = 0; i < metrics.length; i++) {
+        const uuid = metrics[i].uuid
+        if (uuid) {
+            uuidToIndex.set(uuid, i)
+        }
+    }
+
+    const ordered: number[] = []
+    const seen = new Set<number>()
+
+    for (const uuid of orderedUuids) {
+        const idx = uuidToIndex.get(uuid)
+        if (idx !== undefined && !seen.has(idx)) {
+            ordered.push(idx)
+            seen.add(idx)
+        }
+    }
+
+    for (let i = 0; i < metrics.length; i++) {
+        if (!seen.has(i)) {
+            ordered.push(i)
+        }
+    }
+
+    return ordered
+}
+
+/**
+ * A shared metric's link to an experiment, as the experiment API returns it. The generated type leaves
+ * `query` and `metadata` untyped, so this narrows them to the shapes the experiment scene reads and edits.
+ */
+export type ExperimentSavedMetric = Omit<ExperimentToSavedMetricApi, 'metadata' | 'query' | 'effective_query'> & {
+    metadata: {
+        type: 'primary' | 'secondary'
+        breakdowns?: Breakdown[]
+        breakdownAttributionType?: BreakdownAttributionType
+        breakdownAttributionValue?: number
+        breakdown_limit?: number
+    }
+    query: ExperimentMetric
+    // Optional because a new frontend can briefly receive a response from an API server that predates the field.
+    effective_query?: ExperimentMetric | null
+}
+
+/**
+ * The backend applies the link overrides to the saved query and serves the result as `effective_query`.
+ * A legacy shared metric takes no overrides and has no effective query, so its saved query applies as is.
+ * A link that carries no query gets an empty metric. Results map to metrics by position, and the callers
+ * read fields of every metric, so the link must keep its position.
+ */
+export const sharedMetricEffectiveQuery = ({
+    query,
+    effective_query,
+}: Pick<ExperimentSavedMetric, 'query' | 'effective_query'>): ExperimentMetric =>
+    effective_query ?? query ?? ({} as ExperimentMetric)
+
+export const sharedMetricsToExperimentMetrics = (
+    sharedMetrics: ExperimentSavedMetric[] | undefined,
+    type: 'primary' | 'secondary'
+): ExperimentMetric[] =>
+    (sharedMetrics || []).filter(({ metadata }) => metadata.type === type).map(sharedMetricEffectiveQuery)
+
+function enrichSharedMetric(sharedMetric: ExperimentSavedMetric): ExperimentMetric {
+    return {
+        ...sharedMetricEffectiveQuery(sharedMetric),
+        name: sharedMetric.name,
+        sharedMetricId: sharedMetric.saved_metric,
+        isSharedMetric: true,
+    } as ExperimentMetric
+}
+
+export type MetricWithResult = {
+    metric: ExperimentMetric
+    result: CachedNewExperimentQueryResponse | undefined
+    error: unknown
+    displayIndex: number
+    metricIndex: number
+}
+
+/**
+ * Narrows to a real, saved experiment: present and not the "new"/draft sentinel id. Used by the
+ * recalculation-flow component wrappers before mounting experiment-keyed child logics.
+ */
+export const isSavedExperiment = (experiment: Experiment | null | undefined): experiment is Experiment =>
+    experiment?.id != null && experiment.id !== 'new'
+
+export type ExperimentWritePayload<T> = Omit<T, 'feature_flag' | 'feature_flag_config'> & {
+    feature_flag?: ExperimentFeatureFlagInputApi
+}
+
+/** Update payload for the experiment API: flag config travels in the write shape. An echoed
+ * read-only flag is also accepted — the backend ignores flag objects carrying a non-null id. */
+export type ExperimentUpdatePayload = Omit<Partial<Experiment>, 'feature_flag'> & {
+    feature_flag?: ExperimentFeatureFlagInputApi | Experiment['feature_flag']
+    update_feature_flag_params?: boolean
+    original_experiment?: Record<string, any>
+}
+
+export type ExperimentUpdateRequest = ExperimentUpdatePayload & {
+    /**
+     * After a 409 conflict, show the server's copy of the sent fields instead of keeping the rejected values for
+     * review. A control that applies its value at once sets this. A kept value would look saved there, and the
+     * next save would send it over the change that caused the conflict.
+     */
+    discardOnConflict?: boolean
+}
+
+/** The scalar fields experiment surfaces PATCH, sent as base values so the server can three-way
+ * merge them per field: a stale write only conflicts when the same field changed on both sides. */
+const CONCURRENCY_SCALAR_BASE_FIELDS = [
+    'name',
+    'description',
+    'start_date',
+    'end_date',
+    'exposure_criteria',
+    'stats_config',
+    'running_time_calculation',
+    'holdout_id',
+    'conclusion',
+    'conclusion_comment',
+    'excluded_variants',
+    'only_count_matured_users',
+    'parameters',
+] as const
+
+/** Concurrency context for experiment PATCHes: the version last read plus the state that version
+ * belongs to (metric collections and scalar bases), so the server can merge concurrent edits per
+ * metric uuid / per field and reject only true same-field conflicts with a 409, instead of letting
+ * a stale write clobber them. */
+export function toConcurrencyPayload(
+    unmodified: Experiment | null
+): Pick<ExperimentUpdatePayload, 'version' | 'original_experiment'> {
+    if (!unmodified || typeof unmodified.id !== 'number') {
+        return {}
+    }
+    return {
+        version: unmodified.version ?? 0,
+        original_experiment: {
+            metrics: unmodified.metrics,
+            metrics_secondary: unmodified.metrics_secondary,
+            saved_metrics_ids: (unmodified.saved_metrics || []).map((sharedMetric) => ({
+                id: sharedMetric.saved_metric,
+                metadata: sharedMetric.metadata,
+            })),
+            // Explicit null over undefined: a missing base key makes the server fall back to
+            // rejecting any change to that field, while null means "the field was empty".
+            ...Object.fromEntries(CONCURRENCY_SCALAR_BASE_FIELDS.map((field) => [field, unmodified[field] ?? null])),
+        },
+    }
+}
+
+/** Whether an API error is the experiment concurrency conflict (as opposed to any other 409,
+ * e.g. an approval-required response, which carries no `current_version`). */
+export function isExperimentConflictError(error: any): boolean {
+    return error?.status === 409 && error?.data?.current_version !== undefined
+}
+
+const CONFLICT_UNPRESERVABLE_KEYS = new Set([
+    'metrics',
+    'metrics_secondary',
+    'saved_metrics_ids',
+    'primary_metrics_ordered_uuids',
+    'secondary_metrics_ordered_uuids',
+    'version',
+    'original_experiment',
+    'update_feature_flag_params',
+    'feature_flag',
+])
+
+/** The fields of a 409-rejected update worth keeping in local state: the user's scalar edits.
+ * Collection and bookkeeping fields are dropped — re-applying a stale metric array over the
+ * fresh state would reintroduce exactly the clobbering the conflict prevented. */
+export function conflictPreservedFields(payload: ExperimentUpdatePayload): Partial<Experiment> {
+    return Object.fromEntries(Object.entries(payload).filter(([key]) => !CONFLICT_UNPRESERVABLE_KEYS.has(key)))
+}
+
+/** Flag config the API projects into `parameters` on read. The linked flag owns these keys, so they
+ * are absent from the type but present at runtime on every response. */
+const PROJECTED_FLAG_CONFIG_KEYS = new Set([
+    'feature_flag_variants',
+    'rollout_percentage',
+    'aggregation_group_type_index',
+    'feature_flag_payloads',
+    'ensure_experience_continuity',
+])
+
+/** Drops the projected flag config, so updating an experiment-owned key does not echo the
+ * deprecated flag dialect back to the API. The `feature_flag` sibling of this is
+ * {@link toExperimentWritePayload}. */
+export function withoutProjectedFlagConfig(parameters: Experiment['parameters'] | undefined): Experiment['parameters'] {
+    return Object.fromEntries(
+        Object.entries(parameters ?? {}).filter(([key]) => !PROJECTED_FLAG_CONFIG_KEYS.has(key))
+    ) as Experiment['parameters']
+}
+
+/** Maps UI variants to the flag's write shape, dropping null names the generated type disallows. */
+export function toFlagVariantsInput(
+    variants: MultivariateFlagVariant[]
+): NonNullable<ExperimentFeatureFlagFiltersApi['multivariate']>['variants'] {
+    return variants.map(({ key, name, rollout_percentage }) => ({
+        key,
+        ...(name != null ? { name } : {}),
+        rollout_percentage,
+    }))
+}
+
+/**
+ * Builds an experiment write payload. Draft flag config lives on `feature_flag_config` in the
+ * flag's own input shape; it moves to the `feature_flag` write field. The read-only `feature_flag`
+ * echoed by a GET response is dropped, and `feature_flag_config` never travels literally.
+ *
+ * Pass `omitFlagConfig` when the experiment links to a pre-existing flag: the flag is linked
+ * as-is, and the API rejects explicit config for it.
+ */
+export function toExperimentWritePayload<T extends Pick<Experiment, 'feature_flag_config'>>(
+    experiment: T,
+    { omitFlagConfig = false }: { omitFlagConfig?: boolean } = {}
+): ExperimentWritePayload<T> {
+    const {
+        feature_flag: _echoedFlag,
+        feature_flag_config,
+        ...rest
+    } = experiment as T & { feature_flag?: unknown; feature_flag_config?: ExperimentFeatureFlagInputApi }
+    const payload = { ...rest } as ExperimentWritePayload<T>
+
+    if (!omitFlagConfig && feature_flag_config) {
+        payload.feature_flag = feature_flag_config
+    }
+    return payload
+}
+
+/**
+ * Pure zip of one metric type (`primary` | `secondary`) with its results and errors, in display order.
+ * Curried over the experiment, so a caller can bind it once per experiment instance and reuse it for
+ * both primary and secondary:
+ *
+ *   const zip = metricResults(experiment)
+ *   const primary = zip(primaryResults, primaryErrors, 'primary')
+ *   const secondary = zip(secondaryResults, secondaryErrors, 'secondary')
+ *
+ * Results and errors are positional over `[...inline, ...shared]`, the layout the loaders write to.
+ */
+export const metricResults =
+    (experiment: Experiment) =>
+    (
+        results: CachedNewExperimentQueryResponse[],
+        errors: unknown[],
+        type: 'primary' | 'secondary'
+    ): MetricWithResult[] => {
+        const regularMetrics = (
+            type === 'secondary' ? experiment.metrics_secondary || [] : experiment.metrics || []
+        ) as ExperimentMetric[]
+
+        const sharedMetrics = (experiment.saved_metrics || [])
+            .filter((sharedMetric) => sharedMetric.metadata?.type === type)
+            .map(enrichSharedMetric)
+
+        const allMetrics = [...regularMetrics, ...sharedMetrics]
+        const orderedUuids =
+            type === 'secondary' ? experiment.secondary_metrics_ordered_uuids : experiment.primary_metrics_ordered_uuids
+
+        return getDisplayOrderedIndices(allMetrics, orderedUuids).map((index, displayIndex) => ({
+            metric: allMetrics[index],
+            result: results[index],
+            error: errors[index],
+            displayIndex,
+            metricIndex: index,
+        }))
+    }

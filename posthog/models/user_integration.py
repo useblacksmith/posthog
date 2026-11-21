@@ -1,0 +1,1114 @@
+import time
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
+from uuid import UUID, uuid4
+
+from django.core.cache import cache
+from django.db import models, transaction
+from django.utils.functional import Promise
+
+import requests
+import structlog
+
+from posthog.egress.github.transport import github_request, raise_if_github_rate_limited
+from posthog.egress.limiter.policies import Priority
+from posthog.egress.slack.client import SlackWebClient
+from posthog.helpers.encrypted_fields import EncryptedJSONField
+from posthog.models.github_integration_base import (
+    _GITHUB_REPO_PATH_RE,
+    GitHubIntegrationBase,
+    GitHubIntegrationError,
+    ReauthorizationRequired,
+    _jsonb_merge,
+    github_app_oauth_credentials,
+)
+from posthog.models.integration import github_account_type, invalidate_github_repository_caches_for_installation
+from posthog.models.integration.github_audit import GitHubAudit
+from posthog.models.utils import UUIDModel
+
+if TYPE_CHECKING:
+    from posthog.models.integration import GitHubInstallationAccess, GitHubUserAuthorization
+    from posthog.models.user import User
+
+logger = structlog.get_logger(__name__)
+
+
+# GitHub rejects a refresh token with one of these error codes when it's no longer valid and the user can remediate this
+# We then force the user to re-authorize through the install flow, by flagging the bad integration
+_GITHUB_UNRECOVERABLE_REFRESH_ERRORS = {
+    "bad_refresh_token",
+    "refresh_token_expired",
+    "unauthorized_client",
+}
+
+NEEDS_REAUTHORIZATION_AT_CONFIG_KEY = "needs_reauthorization_at"
+# A flagged GitHub row keeps its installation token, so `.exclude(sensitive_config={})` does not filter it out.
+NEEDS_REAUTHORIZATION_Q = models.Q(config__has_key=NEEDS_REAUTHORIZATION_AT_CONFIG_KEY)
+
+USER_SCOPED_ACCESS_TOKEN_CACHE_TTL_SECONDS = 10 * 60
+MAX_SCOPED_TOKEN_REPOSITORIES = 500
+_USER_REPOSITORIES_PAGE_SIZE = 100
+_TRANSIENT_STATUS_CODES = {502, 503, 504}
+USER_SCOPED_REPOSITORY_CACHE_AT_CONFIG_KEY = "user_scoped_repository_cache_at"
+
+
+class NoAccessibleRepositories(GitHubIntegrationError):
+    pass
+
+
+def user_integration_kind_choices() -> list[tuple[str, str | Promise]]:
+    return list(UserIntegration.IntegrationKind.choices)
+
+
+class UserIntegration(UUIDModel):
+    """User-scoped integration with an external service.
+
+    Contents for GitHub:
+    - `integration_id` holds the GitHub App installation_id
+    - `config` holds installation metadata + user identity (login, id)
+    - `sensitive_config` holds installation access token + user-to-server tokens
+
+    Contents for Slack (user identity link):
+    - `integration_id` holds the Slack user id (e.g. "U123ABC"), workspace-scoped
+    - `config` holds {slack_team_id, slack_team_name, slack_email_at_link, scope,
+      linked_at}; `scope` is the user scopes Slack granted, space-delimited as OIDC
+      returns them (the workspace row's `Integration.config["scope"]` is Slack's
+      comma-separated bot list, so don't parse the two the same way)
+    - `sensitive_config` holds {user_access_token, user_refresh_token?} — the
+      Slack user-to-server token plus, when the Slack app has
+      `token_rotation_enabled`, a refresh token used to rotate it. Today's
+      manifest has rotation off, so `user_refresh_token` is absent and
+      `user_access_token` is long-lived; the capture is defensive so flipping
+      rotation on later requires no schema or callback-shape change.
+
+    Cardinality (Slack):
+    - One PostHog user → many rows, one per Slack workspace they've linked
+      (Slack assigns a distinct user id per workspace, so the rows have
+      different `integration_id` values).
+    - One Slack identity (workspace × Slack user id) → may have multiple
+      PostHog rows when the same Slack account is linked to more than one
+      PostHog account (e.g. personal + work). The inbound resolver picks
+      the most-recently-linked accessible row and warns when it sees more
+      than one match — see `find_linked_posthog_user`.
+
+    Contents for Codex (ChatGPT plan for cloud tasks):
+    - `integration_id` holds the ChatGPT account id from the access token claims
+    - `config` holds {plan_type, email, status, connected_at}; `status` is
+      "connected" or "reauth_required"
+    - `sensitive_config` holds {access_token, refresh_token,
+      access_token_expires_at}. The refresh token is single use, so every refresh
+      stores the rotated token under a row lock. See `posthog.models.integration.codex`.
+    - One row per user: Desktop replaces it on reconnect.
+
+    The `unique_together = ("user", "kind", "integration_id")` constraint only
+    forbids the same PostHog user linking the same Slack workspace identity
+    twice (which would have to be a re-OAuth that `update_or_create` already
+    folds into an in-place refresh). It does NOT forbid two PostHog users
+    sharing a Slack identity — that's a deliberate allowance the resolver
+    handles deterministically.
+    """
+
+    class IntegrationKind(models.TextChoices):
+        GITHUB = "github"
+        SLACK = "slack"
+        CODEX = "codex"
+
+    user = models.ForeignKey(
+        "posthog.User",
+        on_delete=models.CASCADE,
+        related_name="integrations",
+    )
+    kind = models.CharField(max_length=32, choices=user_integration_kind_choices)
+    # The ID of the integration in the external system, same as on Integration
+    integration_id = models.TextField()
+    config = models.JSONField(default=dict)
+    sensitive_config = EncryptedJSONField(default=dict)
+    repository_cache = models.JSONField(default=list, blank=True)
+    repository_cache_updated_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "posthog_user_integration"
+        unique_together = [("user", "kind", "integration_id")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user"], condition=models.Q(kind="codex"), name="unique_codex_user_integration"
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["kind", "integration_id"], name="user_integration_kind_extid"),
+        ]
+
+
+class GitHubInstallRequest(UUIDModel):
+    """Durable record of a personal GitHub App install that an org owner must approve.
+
+    GitHub sends the user back with ``setup_action=request`` (no ``installation_id``) when the
+    installing account isn't an org owner. That wait can take hours to days, so unlike the
+    in-flight connect state machine it needs server-side state the desktop can poll instead of a
+    client-held marker: a row here is the fact of "approval requested"; the
+    ``installation.created`` webhook (see ``posthog.api.github_callback.installation_events``)
+    flips it to ``approved`` once an owner acts. User-scoped like ``UserIntegration``, not
+    team-scoped, because the request predates any team's Integration row.
+
+    ``github_user_id`` is what the webhook matches on, because a pending row can outlive the login
+    it was created under: GitHub logins are renameable and a freed one can be claimed by someone
+    else. ``github_login`` is display data only. A request whose requester we could not resolve at
+    all is ``unidentified`` rather than ``pending``, since no webhook can ever match it.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        APPROVED = "approved"
+        UNIDENTIFIED = "unidentified"
+
+    # db_constraint=False: posthog_user is a hot table, see safe-django-migrations.md.
+    user = models.ForeignKey(
+        "posthog.User",
+        on_delete=models.CASCADE,
+        db_constraint=False,
+        related_name="github_install_requests",
+    )
+    github_user_id = models.BigIntegerField(null=True, blank=True)
+    github_login = models.CharField(max_length=255, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    installation_id = models.CharField(max_length=64, null=True, blank=True)
+    # The GitHub org or user the approved installation landed on, from the installation.created
+    # payload. Only known once approved; the request itself doesn't say which org was targeted.
+    account_login = models.CharField(max_length=255, null=True, blank=True)
+    account_type = models.CharField(max_length=32, null=True, blank=True)
+    requested_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "posthog_github_install_request"
+        indexes = [
+            models.Index(fields=["github_user_id", "status"], name="github_install_req_ghuser_idx"),
+        ]
+
+
+class UserGitHubIntegration(GitHubIntegrationBase):
+    """Helper for operating on a GitHub `UserIntegration`.
+
+    Manages two token types:
+    - Installation access token (sensitive_config["access_token"]):
+      app-level token for the whole installation, refreshed via the GitHub App JWT, same as
+      team-level `GitHubIntegration`. Repo operations do not send it as is: `get_access_token`
+      mints a short-lived copy limited to the repositories the GitHub user can open.
+    - User-to-server token (sensitive_config["user_access_token"]):
+      acts as the user in repos covered by the installation. Used for creating PRs, commits, etc.
+        Refreshed via the OAuth refresh-token flow.
+
+    `config` layout:
+
+        {
+            "installation_id": "12345",
+            "expires_in": 3600,              # installation token TTL
+            "refreshed_at": <unix>,          # installation token refresh time
+            "repository_selection": "selected",
+            "account": {"type": "User", "name": "octocat"},
+            "github_user": {"login": "octocat", "id": 123},
+            "user_token_refreshed_at": <unix>,
+            "user_access_token_expires_at": <unix>,
+            "user_refresh_token_expires_at": <unix>,
+        }
+
+    `sensitive_config` layout:
+
+        {
+            "access_token": "<installation token>",
+            "user_access_token": "<user-to-server token>",
+            "user_refresh_token": "<user-to-server refresh token>",
+        }
+    """
+
+    integration: UserIntegration
+    is_user_integration = True
+
+    def __init__(self, integration: UserIntegration, *, source: str, priority: Priority) -> None:
+        if integration.kind != "github":
+            raise Exception("UserGitHubIntegration initialized with non-github integration")
+        self.integration = integration
+        self.source = source
+        self.priority = priority
+
+    # --- Token refresh hooks ---
+
+    def _on_token_refresh_failed(self, response: requests.Response) -> None:
+        logger.warning(
+            "UserGitHubIntegration: installation token refresh failed",
+            user_id=self.integration.user_id,
+            status_code=response.status_code,
+        )
+        if self._disarm_proactive_refresh_if_installation_gone(response):
+            self.integration.save(update_fields=["config"])
+
+    def _on_token_refreshed(self) -> None:
+        logger.info(
+            "UserGitHubIntegration: refreshed installation access token",
+            user_id=self.integration.user_id,
+        )
+
+    # --- Identity ---
+
+    @property
+    def github_login(self) -> str | None:
+        github_user = self.integration.config.get("github_user")
+        if isinstance(github_user, dict):
+            login = github_user.get("login")
+            return str(login) if login else None
+        return None
+
+    @property
+    def github_id(self) -> int | None:
+        github_user = self.integration.config.get("github_user")
+        if isinstance(github_user, dict):
+            gh_id = github_user.get("id")
+            return int(gh_id) if gh_id is not None else None
+        return None
+
+    @property
+    def coauthor_trailer(self) -> str | None:
+        """`Co-authored-by` trailer for git commits attributed to this GitHub user.
+
+        Uses GitHub's `<id>+<login>@users.noreply.github.com` format so attribution
+        works regardless of the user's email privacy settings. Returns None if the
+        stored identity is incomplete or malformed — co-author attribution is
+        optional and must not abort the caller.
+        """
+        login = self.github_login
+        github_user = self.integration.config.get("github_user")
+        raw_id = github_user.get("id") if isinstance(github_user, dict) else None
+        try:
+            gh_id = int(raw_id) if raw_id is not None else None
+        except (TypeError, ValueError):
+            return None
+        if not login or gh_id is None:
+            return None
+        return f"Co-authored-by: {login} <{gh_id}+{login}@users.noreply.github.com>"
+
+    # --- User-to-server token ---
+
+    @property
+    def user_access_token(self) -> str | None:
+        return self.integration.sensitive_config.get("user_access_token") if self.integration.sensitive_config else None
+
+    @property
+    def user_refresh_token(self) -> str | None:
+        return (
+            self.integration.sensitive_config.get("user_refresh_token") if self.integration.sensitive_config else None
+        )
+
+    def user_access_token_expired(self) -> bool:
+        expires_at = self.integration.config.get("user_access_token_expires_at")
+        if not expires_at:
+            return False
+        refreshed_at = self.integration.config.get("user_token_refreshed_at") or self.integration.created_at.timestamp()
+        threshold = max(1, int((expires_at - refreshed_at) // 2))
+        return time.time() > expires_at - threshold
+
+    def user_refresh_token_expired(self) -> bool:
+        expires_at = self.integration.config.get("user_refresh_token_expires_at")
+        if not expires_at:
+            return False
+        return time.time() > expires_at
+
+    @property
+    def needs_reauthorization(self) -> bool:
+        """Whether the stored user tokens were stripped and the person has to reconnect."""
+        return bool((self.integration.config or {}).get(NEEDS_REAUTHORIZATION_AT_CONFIG_KEY))
+
+    @property
+    def needs_reauthorization_at(self) -> datetime | None:
+        flagged_at = (self.integration.config or {}).get(NEEDS_REAUTHORIZATION_AT_CONFIG_KEY)
+        if not isinstance(flagged_at, int | float):
+            return None
+        return datetime.fromtimestamp(flagged_at, tz=UTC)
+
+    def refresh_user_access_token(self) -> None:
+        """Exchange the refresh token for a fresh user-to-server access token.
+
+        Strips the stored tokens and raises :class:`ReauthorizationRequired` when GitHub
+        signals the refresh token can't produce a new access token.
+        """
+        credentials = github_app_oauth_credentials()
+        client_id = credentials.client_id
+        client_secret = credentials.client_secret
+        refresh_token = self.user_refresh_token
+        if not client_id or not client_secret:
+            raise Exception("GITHUB_APP_CLIENT_ID / GITHUB_APP_CLIENT_SECRET not configured, cannot refresh user token")
+        if not refresh_token:
+            self._mark_needs_reauthorization("no user refresh token stored")
+            raise ReauthorizationRequired("No refresh token stored for this GitHub integration.")
+
+        response = requests.post(
+            "https://github.com/login/oauth/access_token",
+            json={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        access_token = payload.get("access_token")
+        if not access_token:
+            error = payload.get("error")
+            if error in _GITHUB_UNRECOVERABLE_REFRESH_ERRORS:
+                self._mark_needs_reauthorization(f"refresh rejected by GitHub: {error}")
+                raise ReauthorizationRequired(f"GitHub refused the stored refresh token ({error}).")
+            raise Exception(f"Unexpected refresh failure from GitHub: {error or response.status_code}")
+
+        self._apply_user_token_payload(payload)
+
+    def get_usable_user_access_token(self) -> str:
+        """Return a non-expired user-to-server access token, refreshing on demand.
+
+        Raises :class:`ReauthorizationRequired` if the row lacks tokens, the refresh token is
+        expired, or GitHub rejects a refresh attempt. The row is kept and flagged in those cases.
+        """
+        if not self.user_access_token:
+            self._mark_needs_reauthorization("no user access token stored")
+            raise ReauthorizationRequired("No user access token stored for this GitHub integration.")
+        if self.user_refresh_token_expired():
+            self._mark_needs_reauthorization("user refresh token expired")
+            raise ReauthorizationRequired("The stored GitHub user refresh token has expired.")
+        if self.user_access_token_expired():
+            self.refresh_user_access_token()
+        token = self.user_access_token
+        assert token is not None, "user_access_token cleared unexpectedly after refresh"
+        return token
+
+    # --- Installation token scoped to the user's repositories ---
+
+    def _scoped_access_token_cache_key(self) -> str:
+        credential_version = (self.integration.config or {}).get("credential_version")
+        return f"github_user_integration:scoped_access_token:{self.integration.id}:{credential_version}"
+
+    def get_access_token(self) -> str:
+        return self._scoped_access()[0]
+
+    def user_can_open_repository(self, repository: str) -> bool:
+        return self.resolve_user_repository(repository) is not None
+
+    def resolve_user_repository(self, repository: str) -> str | None:
+        repo_path = repository if "/" in repository else f"{self.organization()}/{repository}"
+        if not _GITHUB_REPO_PATH_RE.fullmatch(repo_path) or any(part in (".", "..") for part in repo_path.split("/")):
+            return None
+        credential_version = (self.integration.config or {}).get("credential_version")
+        cache_key = (
+            f"github_user_integration:repository_access:{self.integration.id}:{credential_version}:{repo_path.lower()}"
+        )
+        cached = cache.get(cache_key)
+        if isinstance(cached, str):
+            return cached or None
+
+        response = self._user_repository_response(repo_path, self._unexpired_user_access_token())
+        if response.status_code == 401:
+            self.refresh_user_access_token()
+            response = self._user_repository_response(repo_path, self.get_usable_user_access_token())
+        if response.status_code == 401:
+            self._mark_needs_reauthorization("user token rejected by GitHub")
+            raise ReauthorizationRequired("GitHub rejected the stored user token.")
+        if response.status_code in (403, 404):
+            full_name = ""
+        elif response.status_code == 200:
+            full_name = str(response.json().get("full_name") or "")
+        else:
+            raise GitHubIntegrationError(
+                f"Failed to check the user's repository access: HTTP {response.status_code}",
+                status_code=response.status_code,
+            )
+        cache.set(cache_key, full_name, timeout=USER_SCOPED_ACCESS_TOKEN_CACHE_TTL_SECONDS)
+        return full_name or None
+
+    def _user_repository_response(self, repo_path: str, user_access_token: str) -> requests.Response:
+        return self._github_get(
+            f"https://api.github.com/repos/{repo_path}",
+            token=user_access_token,
+            endpoint="/repos/{owner}/{repo}",
+            params={},
+        )
+
+    def list_all_repositories(self, *, priority: Priority | None = None) -> list[dict]:
+        cache.delete(self._scoped_access_token_cache_key())
+        try:
+            return super().list_all_repositories(priority=priority)
+        except NoAccessibleRepositories:
+            return []
+
+    def _get_stored_repository_list(self) -> list[dict] | None:
+        updated_at = self.integration.repository_cache_updated_at
+        scoped_at = (self.integration.config or {}).get(USER_SCOPED_REPOSITORY_CACHE_AT_CONFIG_KEY)
+        if updated_at is None or scoped_at != updated_at.isoformat():
+            return None
+        return super()._get_stored_repository_list()
+
+    def sync_repository_cache(
+        self, min_refresh_interval_seconds: int | None = None, *, priority: Priority | None = None
+    ) -> list[dict]:
+        repositories = super().sync_repository_cache(min_refresh_interval_seconds, priority=priority)
+        updated_at = self.integration.repository_cache_updated_at
+        if updated_at is not None:
+            patch = {USER_SCOPED_REPOSITORY_CACHE_AT_CONFIG_KEY: updated_at.isoformat()}
+            UserIntegration.objects.filter(pk=self.integration.pk).update(config=_jsonb_merge("config", patch))
+            self.integration.config = {**(self.integration.config or {}), **patch}
+        return repositories
+
+    def installation_can_access_repository(self, repository: str, *, raise_on_transient: bool = False) -> bool:
+        try:
+            if not self.user_can_open_repository(repository):
+                return False
+            return super().installation_can_access_repository(repository, raise_on_transient=raise_on_transient)
+        except (ReauthorizationRequired, NoAccessibleRepositories):
+            return False
+        except GitHubIntegrationError:
+            if raise_on_transient:
+                raise
+            return False
+
+    def refresh_access_token(self) -> None:
+        super().refresh_access_token()
+        cache.delete(self._scoped_access_token_cache_key())
+
+    def _scoped_access(self) -> tuple[str, list[str] | None]:
+        cached = cache.get(self._scoped_access_token_cache_key())
+        if isinstance(cached, dict) and isinstance(cached.get("token"), str) and cached["token"]:
+            return cached["token"], cached.get("repositories")
+
+        listing = self._user_installation_repositories(self._unexpired_user_access_token())
+        if listing is None:
+            self.refresh_user_access_token()
+            listing = self._user_installation_repositories(self.get_usable_user_access_token())
+        if listing is None:
+            self._mark_needs_reauthorization("user token rejected by GitHub")
+            raise ReauthorizationRequired("GitHub rejected the stored user token.")
+
+        names, total_count = listing
+        repositories: list[str] | None
+        if total_count == 0 or (total_count <= MAX_SCOPED_TOKEN_REPOSITORIES and not names):
+            raise NoAccessibleRepositories("The GitHub user cannot access any repository in this installation.")
+        if total_count > MAX_SCOPED_TOKEN_REPOSITORIES:
+            token = self._installation_token_if_user_sees_every_repository(total_count)
+            repositories = None
+        else:
+            token = self.mint_scoped_installation_token(None, repositories=names)
+            repositories = names
+        cache.set(
+            self._scoped_access_token_cache_key(),
+            {"token": token, "repositories": repositories},
+            timeout=USER_SCOPED_ACCESS_TOKEN_CACHE_TTL_SECONDS,
+        )
+        return token, repositories
+
+    def _unexpired_user_access_token(self) -> str:
+        token = self.user_access_token
+        expires_at = (self.integration.config or {}).get("user_access_token_expires_at")
+        if token and not self.user_refresh_token_expired() and (not expires_at or time.time() < expires_at):
+            return token
+        return self.get_usable_user_access_token()
+
+    def _github_get(
+        self, url: str, *, token: str, endpoint: str, params: dict[str, int], installation_id: str | None = None
+    ) -> requests.Response:
+        for attempt in range(2):
+            try:
+                response = github_request(
+                    "GET",
+                    url,
+                    source=self.source,
+                    headers={"Authorization": f"Bearer {token}"},
+                    installation_id=installation_id,
+                    endpoint=endpoint,
+                    params=params,
+                    timeout=10,
+                    priority=self.priority,
+                )
+            except requests.RequestException as exc:
+                if attempt == 0:
+                    continue
+                raise GitHubIntegrationError(f"Network error on {endpoint}") from exc
+            raise_if_github_rate_limited(response)
+            if response.status_code in _TRANSIENT_STATUS_CODES and attempt == 0:
+                continue
+            return response
+        raise GitHubIntegrationError(f"Retries exhausted on {endpoint}")
+
+    def _user_installation_repositories(self, user_access_token: str) -> tuple[list[str], int] | None:
+        names: list[str] = []
+        total_count = 0
+        for page in range(1, MAX_SCOPED_TOKEN_REPOSITORIES // _USER_REPOSITORIES_PAGE_SIZE + 2):
+            response = self._github_get(
+                f"https://api.github.com/user/installations/{self.github_installation_id}/repositories",
+                token=user_access_token,
+                endpoint="/user/installations/{installation_id}/repositories",
+                params={"per_page": _USER_REPOSITORIES_PAGE_SIZE, "page": page},
+            )
+            if response.status_code == 401:
+                return None
+            if response.status_code == 404:
+                raise NoAccessibleRepositories("The GitHub user cannot access this installation.")
+            if response.status_code != 200:
+                raise GitHubIntegrationError(
+                    f"Failed to list the user's installation repositories: HTTP {response.status_code}",
+                    status_code=response.status_code,
+                )
+            data = response.json()
+            total_count = int(data.get("total_count") or 0)
+            if total_count > MAX_SCOPED_TOKEN_REPOSITORIES:
+                return names, total_count
+            repositories = data.get("repositories") or []
+            names.extend(repo["name"] for repo in repositories if isinstance(repo, dict) and repo.get("name"))
+            if len(repositories) < _USER_REPOSITORIES_PAGE_SIZE or len(names) >= total_count:
+                break
+        return names, total_count
+
+    def _installation_token_if_user_sees_every_repository(self, user_repository_count: int) -> str:
+        token = super().get_access_token()
+        response = self._github_get(
+            "https://api.github.com/installation/repositories",
+            token=token,
+            installation_id=self.github_installation_id,
+            endpoint="/installation/repositories",
+            params={"per_page": 1},
+        )
+        if response.status_code != 200:
+            raise GitHubIntegrationError(
+                f"Failed to count the installation repositories: HTTP {response.status_code}",
+                status_code=response.status_code,
+            )
+        if user_repository_count < int(response.json().get("total_count") or 0):
+            raise GitHubIntegrationError(
+                f"The GitHub user can access more than {MAX_SCOPED_TOKEN_REPOSITORIES} repositories but not all "
+                "repositories in this installation, so PostHog cannot limit a token to them."
+            )
+        return token
+
+    def create_pull_request_review_comment(
+        self,
+        repository: str,
+        pr_number: int,
+        body: str,
+        *,
+        in_reply_to: str | None = None,
+        commit_id: str | None = None,
+        path: str | None = None,
+        line: int | None = None,
+        side: str | None = None,
+    ) -> dict[str, Any]:
+        """Post an inline PR review comment as the user (user-to-server token).
+
+        Two shapes, matching GitHub's API: a reply to an existing thread needs only
+        ``in_reply_to`` (the thread root comment id); a new thread needs ``commit_id``
+        (the PR head SHA) + ``path`` + ``line`` (+ ``side``). The comment is attributed
+        to the user's GitHub identity, not the app.
+
+        Raises :class:`ReauthorizationRequired` when the stored user token is unusable
+        and :class:`GitHubRateLimitError` on rate limits; other failures return
+        ``{"success": False, "error": ...}``.
+        """
+        token = self.get_usable_user_access_token()
+        repo_path = repository if "/" in repository else f"{self.organization()}/{repository}"
+
+        payload: dict[str, Any]
+        if in_reply_to is not None:
+            url = f"https://api.github.com/repos/{repo_path}/pulls/{pr_number}/comments/{in_reply_to}/replies"
+            endpoint = "/repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies"
+            payload = {"body": body}
+        else:
+            if not (commit_id and path and line):
+                return {"success": False, "error": "New comment threads need commit_id, path, and line"}
+            url = f"https://api.github.com/repos/{repo_path}/pulls/{pr_number}/comments"
+            endpoint = "/repos/{owner}/{repo}/pulls/{pull_number}/comments"
+            payload = {"body": body, "commit_id": commit_id, "path": path, "line": line, "side": side or "RIGHT"}
+
+        response = github_request(
+            "POST",
+            url,
+            source="signals_pr_review_comment",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            installation_id=self.github_installation_id,
+            priority=Priority.CRITICAL,
+            endpoint=endpoint,
+            json=payload,
+            timeout=15,
+        )
+        raise_if_github_rate_limited(response)
+        if response.status_code not in (200, 201):
+            logger.warning(
+                "UserGitHubIntegration: review comment post failed",
+                status_code=response.status_code,
+                repository=repo_path,
+                pr_number=pr_number,
+            )
+            return {
+                "success": False,
+                "error": f"GitHub rejected the comment (HTTP {response.status_code})",
+                "status_code": response.status_code,
+            }
+        return {"success": True, "comment": response.json()}
+
+    def _user_review_comment_request(
+        self,
+        method: str,
+        repository: str,
+        path_suffix: str,
+        *,
+        source: str,
+        json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Shared transport for user-authored reads and edits of a review comment (fetch/edit/delete/react).
+
+        ``path_suffix`` is appended to ``/repos/{repo}/pulls/comments`` — e.g. ``/{id}`` for a
+        comment or ``/{id}/reactions`` for its reactions. Returns ``{"success", ...}``; raises
+        :class:`ReauthorizationRequired`/:class:`GitHubRateLimitError` like the create path.
+        """
+        token = self.get_usable_user_access_token()
+        repo_path = repository if "/" in repository else f"{self.organization()}/{repository}"
+        response = github_request(
+            method,
+            f"https://api.github.com/repos/{repo_path}/pulls/comments{path_suffix}",
+            source=source,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            installation_id=self.github_installation_id,
+            priority=Priority.CRITICAL,
+            json=json,
+            timeout=15,
+        )
+        raise_if_github_rate_limited(response)
+        if response.status_code not in (200, 201, 204):
+            logger.warning(
+                "UserGitHubIntegration: review comment request failed",
+                method=method,
+                status_code=response.status_code,
+                repository=repo_path,
+            )
+            return {
+                "success": False,
+                "error": f"GitHub rejected the change (HTTP {response.status_code})",
+                "status_code": response.status_code,
+            }
+        body = response.json() if response.status_code != 204 and response.content else None
+        return {"success": True, "result": body}
+
+    def get_pull_request_review_comment(self, repository: str, comment_id: str) -> dict[str, Any]:
+        """Fetch a single review comment as the user, so callers can check what it hangs off before
+        writing to it. ``comment`` is None when GitHub says there is no such comment this user can
+        see, which callers should treat the same as a comment that isn't theirs to touch.
+        """
+        result = self._user_review_comment_request(
+            "GET", repository, f"/{comment_id}", source="signals_pr_review_comment_fetch"
+        )
+        if result.get("success"):
+            return {"success": True, "comment": result.get("result")}
+        if result.get("status_code") == 404:
+            return {"success": True, "comment": None}
+        return result
+
+    def update_pull_request_review_comment(self, repository: str, comment_id: str, body: str) -> dict[str, Any]:
+        """Edit an existing review comment's body as the user."""
+        result = self._user_review_comment_request(
+            "PATCH", repository, f"/{comment_id}", source="signals_pr_review_comment_edit", json={"body": body}
+        )
+        if result.get("success"):
+            return {"success": True, "comment": result.get("result")}
+        return result
+
+    def delete_pull_request_review_comment(self, repository: str, comment_id: str) -> dict[str, Any]:
+        """Delete a review comment as the user."""
+        return self._user_review_comment_request(
+            "DELETE", repository, f"/{comment_id}", source="signals_pr_review_comment_delete"
+        )
+
+    def add_pull_request_review_comment_reaction(
+        self, repository: str, comment_id: str, content: str
+    ) -> dict[str, Any]:
+        """Add an emoji reaction to a review comment as the user. ``content`` is a GitHub reaction
+        key (``+1``, ``-1``, ``laugh``, ``hooray``, ``confused``, ``heart``, ``rocket``, ``eyes``)."""
+        result = self._user_review_comment_request(
+            "POST",
+            repository,
+            f"/{comment_id}/reactions",
+            source="signals_pr_review_comment_reaction",
+            json={"content": content},
+        )
+        if result.get("success"):
+            return {"success": True, "reaction": result.get("result")}
+        return result
+
+    def delete_pull_request_review_comment_reaction(
+        self, repository: str, comment_id: str, reaction_id: str
+    ) -> dict[str, Any]:
+        """Remove one of the user's own reactions from a review comment."""
+        return self._user_review_comment_request(
+            "DELETE",
+            repository,
+            f"/{comment_id}/reactions/{reaction_id}",
+            source="signals_pr_review_comment_reaction_delete",
+        )
+
+    def _apply_user_token_payload(self, payload: dict[str, Any]) -> None:
+        """Write a fresh user token pair + expirations onto the integration row."""
+        now = int(time.time())
+        access_token = payload.get("access_token")
+        rotated_refresh_token = payload.get("refresh_token")
+        refresh_token = rotated_refresh_token or self.user_refresh_token
+        access_expires_in = payload.get("expires_in")
+        refresh_expires_in = payload.get("refresh_token_expires_in")
+
+        self.integration.sensitive_config = {
+            **(self.integration.sensitive_config or {}),
+            "user_access_token": access_token,
+            "user_refresh_token": refresh_token,
+        }
+        config = dict(self.integration.config or {})
+        config["user_token_refreshed_at"] = now
+        config["credential_version"] = str(uuid4())
+        # When GitHub disables user-token expiration, refresh responses omit expiry fields.
+        # Clear stored expiries so we do not treat a non-expiring token as perpetually expired.
+        if access_expires_in is not None:
+            config["user_access_token_expires_at"] = now + int(access_expires_in)
+        else:
+            config.pop("user_access_token_expires_at", None)
+        if refresh_expires_in is not None:
+            config["user_refresh_token_expires_at"] = now + int(refresh_expires_in)
+        else:
+            config.pop("user_refresh_token_expires_at", None)
+        self.integration.config = config
+        self.integration.save(update_fields=["sensitive_config", "config", "updated_at"])
+        GitHubAudit.personal(self.integration).record(
+            "credential_refreshed",
+            after_commit=True,
+            reason="oauth_refresh",
+            refresh_token_rotated=bool(rotated_refresh_token),
+        )
+
+    def _user_token_age_seconds(self) -> int | None:
+        """Seconds since the stored user token pair was last written, or None when the row holds no
+        refresh timestamp. It tells a token GitHub invalidated moments ago from one that sat stale
+        for hours, which is the difference between a refresh race and a bad stored token.
+        """
+        refreshed_at = (self.integration.config or {}).get("user_token_refreshed_at")
+        if not isinstance(refreshed_at, (int, float)):
+            return None
+        return int(time.time()) - int(refreshed_at)
+
+    def _mark_needs_reauthorization(self, reason: str) -> None:
+        """Strip the unusable tokens and flag the row for reconnection, keeping the row itself.
+
+        Every caller raises :class:`ReauthorizationRequired` straight after. The kept row gives the
+        person a connection to repair and records why it stopped working. A real disconnection is
+        a different path: the views delete the row themselves.
+        """
+        token_age_seconds = self._user_token_age_seconds()
+        failed_credential_version = (self.integration.config or {}).get("credential_version")
+        logger.info(
+            "UserGitHubIntegration: marking integration for reauthorization",
+            user_id=self.integration.user_id,
+            reason=reason,
+        )
+        audit = GitHubAudit.personal(self.integration)
+        try:
+            with transaction.atomic():
+                try:
+                    row = UserIntegration.objects.select_for_update().get(pk=self.integration.pk)
+                except UserIntegration.DoesNotExist:
+                    # A disconnect deleted the row after this wrapper read it, so there is nothing to flag.
+                    return
+                config = row.config or {}
+                # Another writer changed the row after this wrapper read it. A new credential version
+                # means a reconnect or a refresh stored working tokens, and an existing flag holds the
+                # first failure's reason. Writing the stale copy would erase either one.
+                if (
+                    config.get("credential_version") != failed_credential_version
+                    or NEEDS_REAUTHORIZATION_AT_CONFIG_KEY in config
+                ):
+                    self.integration = row
+                    return
+                sensitive_config = dict(row.sensitive_config or {})
+                sensitive_config.pop("user_access_token", None)
+                sensitive_config.pop("user_refresh_token", None)
+                row.sensitive_config = sensitive_config
+                row.config = {
+                    **config,
+                    "needs_reauthorization_reason": reason,
+                    NEEDS_REAUTHORIZATION_AT_CONFIG_KEY: int(time.time()),
+                }
+                row.save(update_fields=["sensitive_config", "config", "updated_at"])
+            self.integration = row
+            audit.record(
+                "credential_reauthorization_required",
+                after_commit=True,
+                reason=reason,
+                token_age_seconds=token_age_seconds,
+            )
+        except Exception as exc:
+            audit.record("credential_mark_failed", failure_type=type(exc).__name__)
+            logger.warning("UserGitHubIntegration: failed to mark integration for reauthorization", exc_info=True)
+
+
+def user_github_integration_from_installation(
+    user: "User",
+    installation: "GitHubInstallationAccess",
+    authorization: "GitHubUserAuthorization",
+    *,
+    create_only: bool = False,
+    originating_organization_id: UUID | None = None,
+) -> UserIntegration:
+    """Create or update a UserIntegration from a GitHub App installation + user authorization.
+
+    Called when a user installs the GitHub App and authorizes it in one flow.
+    Writes both installation-level and user-level credentials atomically.
+
+    When ``create_only=True`` the row is created only if one does not already exist
+    (using ``get_or_create``). This is the correct mode for the auto-create path on
+    team App installation, where an existing personal integration must not be overwritten.
+    The default (``False``) performs ``update_or_create`` — appropriate for the explicit
+    Linked Accounts connect flow where the user is intentionally replacing credentials.
+    """
+    now = int(time.time())
+    try:
+        expires_in = int(datetime.fromisoformat(installation.token_expires_at).timestamp() - now)
+    except (ValueError, AttributeError):
+        expires_in = 3600
+
+    # A re-link without organization context keeps the stored one, so later diagnostics stay durable.
+    stored_organization_id = (
+        None
+        if originating_organization_id
+        else UserIntegration.objects.filter(
+            user=user, kind=UserIntegration.IntegrationKind.GITHUB, integration_id=installation.installation_id
+        )
+        .values_list("config__originating_organization_id", flat=True)
+        .first()
+    )
+    config: dict[str, Any] = {
+        "installation_id": installation.installation_id,
+        "expires_in": expires_in,
+        "refreshed_at": now,
+        "repository_selection": installation.repository_selection,
+        "account": {
+            "type": (installation.installation_info.get("account") or {}).get("type"),
+            "name": (installation.installation_info.get("account") or {}).get("login", installation.installation_id),
+        },
+        "github_user": {"login": authorization.gh_login, "id": authorization.gh_id},
+        "user_token_refreshed_at": now,
+        "credential_version": str(uuid4()),
+        "identity_verified_at": authorization.identity_verified_at,
+        "originating_organization_id": str(originating_organization_id)
+        if originating_organization_id
+        else stored_organization_id,
+    }
+    if authorization.access_token_expires_in is not None:
+        config["user_access_token_expires_at"] = now + authorization.access_token_expires_in
+    if authorization.refresh_token_expires_in is not None:
+        config["user_refresh_token_expires_at"] = now + authorization.refresh_token_expires_in
+
+    sensitive_config = {
+        "access_token": installation.access_token,
+        "user_access_token": authorization.access_token,
+        "user_refresh_token": authorization.refresh_token,
+    }
+
+    if create_only:
+        integration, created = UserIntegration.objects.get_or_create(
+            user=user,
+            kind=UserIntegration.IntegrationKind.GITHUB,
+            integration_id=installation.installation_id,
+            defaults={
+                "config": config,
+                "sensitive_config": sensitive_config,
+            },
+        )
+    else:
+        integration, created = UserIntegration.objects.update_or_create(
+            user=user,
+            kind=UserIntegration.IntegrationKind.GITHUB,
+            integration_id=installation.installation_id,
+            defaults={
+                "config": config,
+                "sensitive_config": sensitive_config,
+            },
+        )
+        invalidate_github_repository_caches_for_installation(installation.installation_id)
+
+    if created or not create_only:
+        GitHubAudit.personal(integration, user).record(
+            "credential_created" if created else "credential_replaced",
+            after_commit=True,
+            reason="team_connect" if create_only else "personal_connect",
+        )
+
+    if created:
+        _report_personal_integration_created(user, config, auto_created=create_only)
+
+    return integration
+
+
+def _report_personal_integration_created(user: "User", config: dict[str, Any], *, auto_created: bool) -> None:
+    """Personal integrations live in their own table and never pass through the team integration
+    path, so ``integration created`` cannot see them. They get their own event rather than a scope
+    property on the team one, because saved insights already count ``integration created`` unfiltered
+    and would silently start including personal links.
+    """
+    from posthog.event_usage import report_user_action  # noqa: PLC0415 — posthog.event_usage imports posthog.models
+
+    owner_type = (config.get("account") or {}).get("type")
+    try:
+        report_user_action(
+            user,
+            "personal integration created",
+            {
+                "integration_kind": "github",
+                "repo_owner_type": owner_type,
+                "account_type": github_account_type(owner_type),
+                # True when the row rode along with a team App install rather than the user
+                # deliberately linking their account under Personal integrations.
+                "auto_created": auto_created,
+            },
+        )
+    except Exception:
+        # The row is already committed. Raising here would report a link that actually succeeded as
+        # a failure, and on the team install path it would take the team connect down with it.
+        logger.exception("user_github_integration: failed to report personal integration created")
+
+
+def refresh_user_github_installation_access(
+    integration: UserIntegration,
+    installation: "GitHubInstallationAccess",
+) -> UserIntegration:
+    """Refresh installation token metadata without overwriting stored user OAuth credentials."""
+    now = int(time.time())
+    try:
+        expires_in = int(datetime.fromisoformat(installation.token_expires_at).timestamp() - now)
+    except (ValueError, AttributeError):
+        expires_in = 3600
+
+    config = dict(integration.config)
+    config.update(
+        {
+            "expires_in": expires_in,
+            "refreshed_at": now,
+            "repository_selection": installation.repository_selection,
+            "account": {
+                "type": (installation.installation_info.get("account") or {}).get("type"),
+                "name": (installation.installation_info.get("account") or {}).get(
+                    "login", installation.installation_id
+                ),
+            },
+        }
+    )
+
+    sensitive_config = dict(integration.sensitive_config)
+    sensitive_config["access_token"] = installation.access_token
+
+    integration.config = config
+    integration.sensitive_config = sensitive_config
+    integration.save(update_fields=["config", "sensitive_config"])
+    invalidate_github_repository_caches_for_installation(installation.installation_id)
+    return integration
+
+
+def user_slack_integration_from_identity(
+    user: "User",
+    *,
+    slack_user_id: str,
+    slack_team_id: str,
+    slack_team_name: str | None,
+    slack_email_at_link: str | None,
+    user_access_token: str,
+    user_refresh_token: str | None = None,
+    user_scopes: str = "",
+) -> UserIntegration:
+    """Create or refresh a Slack ``UserIntegration`` from a Sign-in-with-Slack
+    identity.
+
+    Persists the Slack user-to-server token in ``sensitive_config`` in symmetry
+    with the GitHub personal integration. ``user_refresh_token`` is captured
+    defensively — Slack only returns it when the app has
+    `token_rotation_enabled`, which today is off, so it's typically ``None``.
+    Storing both fields now means flipping rotation on later requires no
+    schema or callback-shape change. ``slack_email_at_link`` is stored for
+    support diagnostics and is not consulted at resolve time.
+
+    ``user_scopes`` records what Slack granted this link. Nothing gates on it today
+    — the OIDC consent screen grants ``OIDC_SCOPES`` all-or-nothing, so the row
+    existing already implies them — but it's what tells you, after the fact, which
+    scopes an older link was created with.
+    """
+    config: dict[str, Any] = {
+        "slack_team_id": slack_team_id,
+        "slack_team_name": slack_team_name,
+        "slack_email_at_link": slack_email_at_link,
+        "scope": user_scopes,
+        "linked_at": int(time.time()),
+    }
+    sensitive_config: dict[str, Any] = {
+        "user_access_token": user_access_token,
+    }
+    if user_refresh_token is not None:
+        sensitive_config["user_refresh_token"] = user_refresh_token
+    integration, _created = UserIntegration.objects.update_or_create(
+        user=user,
+        kind=UserIntegration.IntegrationKind.SLACK,
+        integration_id=slack_user_id,
+        defaults={
+            "config": config,
+            "sensitive_config": sensitive_config,
+        },
+    )
+    return integration
+
+
+# The Slack app manifest lists these under `user_optional`, so each person chooses them on the consent screen.
+SLACK_OPTIONAL_USER_SCOPES = frozenset({"search:read.private", "search:read.im", "search:read.mpim"})
+
+
+def slack_link_scopes(integration: UserIntegration) -> frozenset[str]:
+    """The user scopes Slack granted the link. Stored space-delimited, as OIDC returns them."""
+    return frozenset(str((integration.config or {}).get("scope") or "").replace(",", " ").split())
+
+
+def slack_link_for(integration_id: str, *, user_id: int) -> UserIntegration | None:
+    """The person's Slack link with this id. None when the id belongs to another person or another kind."""
+    return UserIntegration.objects.filter(
+        id=integration_id, user_id=user_id, kind=UserIntegration.IntegrationKind.SLACK
+    ).first()
+
+
+def slack_link_fits(integration: UserIntegration, allowlist: Iterable[str]) -> bool:
+    """The link grants nothing outside ``allowlist`` and every scope in it that the person cannot clear on the
+    consent screen. The MCP store sends the link's token upstream, so the allowlist is a ceiling: a link that can
+    read more than the server may read does not connect it. A link without an optional search scope still connects,
+    because Slack's MCP server then only leaves out the matching search."""
+    allowed = set(allowlist)
+    required = allowed - SLACK_OPTIONAL_USER_SCOPES
+    return bool(required) and required <= slack_link_scopes(integration) <= allowed
+
+
+def revoke_slack_user_token(integration: UserIntegration) -> None:
+    """Revoke the link's token at Slack before the link is deleted. Never raises, so a person can always unlink."""
+    token = (integration.sensitive_config or {}).get("user_access_token")
+    if not token:
+        return
+    client = SlackWebClient(
+        token,
+        source="user_slack_unlink",
+        workspace_id=(integration.config or {}).get("slack_team_id"),
+        app_id="posthog",
+        # Slack's App Home unlink runs this before it answers Slack, which allows three seconds.
+        timeout=2,
+    )
+    try:
+        client.auth_revoke()
+    except Exception:
+        logger.warning("user_slack_integration_revoke_failed", integration_id=str(integration.id), exc_info=True)

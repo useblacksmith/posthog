@@ -1,0 +1,52 @@
+import { lemonToast } from '@posthog/lemon-ui'
+
+import api, { CountedPaginatedResponse } from 'lib/api'
+
+import { InsightModel } from '~/types'
+
+import { insightUsesVariable } from './utils'
+
+/**
+ * Fetches all insights that use a specific variable.
+ *
+ * Note: This currently fetches all insights and filters client-side.
+ * TODO: Add backend API endpoint with ?uses_variable_id=xxx parameter
+ * to improve performance for teams with many insights.
+ *
+ * @param teamId - The team ID to fetch insights for
+ * @param variableId - The ID of the variable to search for
+ * @returns Array of insights that use the variable
+ * @throws Error if the fetch fails
+ */
+export async function fetchInsightsUsingVariable(teamId: number, variableId: string): Promise<InsightModel[]> {
+    try {
+        const matchingInsights: InsightModel[] = []
+        let offset = 0
+        const limit = 100
+
+        // Paginate through all insights
+        while (true) {
+            // nosemgrep: prefer-codegen-api -- Legacy raw API call with a hand-written URL and an unchecked response type. Use insightsList() from 'products/product_analytics/frontend/generated/api' instead.
+            const response: CountedPaginatedResponse<InsightModel> = await api.get(
+                `api/projects/${teamId}/insights/?basic=true&limit=${limit}&offset=${offset}`
+            )
+
+            // Filter insights that use this variable
+            const filtered = response.results.filter((insight) => insightUsesVariable(insight, variableId))
+
+            matchingInsights.push(...filtered)
+
+            // Stop if we've fetched all insights
+            if (response.results.length < limit || !response.next) {
+                break
+            }
+
+            offset += limit
+        }
+
+        return matchingInsights
+    } catch (error) {
+        lemonToast.error('Failed to load insights using this variable')
+        throw error
+    }
+}

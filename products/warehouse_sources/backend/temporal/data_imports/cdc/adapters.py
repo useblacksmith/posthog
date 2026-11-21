@@ -1,0 +1,267 @@
+"""Source-type adapters for CDC.
+
+Each database engine needs its own adapter that knows how to:
+- Create a stream reader (WAL / binlog / change stream)
+- Open a management connection (for slot/publication lifecycle)
+- Validate prerequisites (wal_level, permissions, PKs)
+- Clean up resources (drop slot, drop publication)
+- Check replication lag
+
+Postgres (and Supabase, which is Postgres on the wire) are implemented. When adding
+MySQL or another engine, create an adapter in ``sources/<engine>/cdc/adapter.py`` and
+register it in ``_cdc_adapters`` below.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
+
+from posthog.exceptions_capture import capture_exception
+
+from products.warehouse_sources.backend.temporal.data_imports.cdc.types import CDCConfig, CDCLag
+from products.warehouse_sources.backend.temporal.data_imports.sources.postgres.cdc.adapter import PostgresCDCAdapter
+from products.warehouse_sources.backend.types import CDCEngine, ExternalDataSourceType
+
+if TYPE_CHECKING:
+    from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+    from products.warehouse_sources.backend.temporal.data_imports.cdc.errors import CDCErrorInfo
+    from products.warehouse_sources.backend.temporal.data_imports.cdc.types import CDCStreamReader
+
+
+CDCConfigT_co = TypeVar("CDCConfigT_co", bound=CDCConfig, covariant=True)
+
+
+class CDCSourceAdapter(Protocol[CDCConfigT_co]):
+    """Interface that each CDC-capable database engine must implement.
+
+    Generic over the engine's concrete CDC config type so that ``parse_cdc_config``
+    is typed precisely without forcing callers to do ``isinstance`` checks.
+    """
+
+    # The catalog serves it as `cdcEngine`. Engines that are the same database on the wire share one.
+    engine: CDCEngine
+
+    def create_reader(self, source: ExternalDataSource) -> CDCStreamReader: ...
+
+    def position_to_seq(self, position_serialized: str) -> int:
+        """Convert an event's serialized position to the engine-neutral monotonic
+        integer used for `_ph_cdc_seq` and buffer-file position ranges (PG: the
+        LSN's 64-bit value). Must be strictly order-preserving within one source."""
+        ...
+
+    def current_position(self, conn: Any) -> str:
+        """The source's log position, serialized as `position_to_seq` reads it. Every change at or below
+        it is visible to any read that starts after the call returns. Raises when that cannot be
+        established (PG: the current WAL LSN, once the transactions running then have ended)."""
+        ...
+
+    @contextmanager
+    def management_connection(self, source: ExternalDataSource, connect_timeout: int = 15) -> Iterator[Any]: ...
+
+    def validate_prerequisites(
+        self,
+        source: ExternalDataSource,
+        management_mode: Literal["posthog", "self_managed"],
+        tables: list[str],
+        schema: str,
+        setup: Mapping[str, Any],
+    ) -> list[str]:
+        """Check the source database against the engine's CDC prerequisites. ``setup`` holds the
+        engine's own ``cdc_*`` setup fields from the request (PG: the slot and publication names)."""
+        ...
+
+    def drop_stream(self, conn: Any, source: ExternalDataSource) -> None:
+        """Best-effort drop of the source's engine-side change stream and the resources PostHog owns
+        with it (PG: the slot and the publication). Logs a refused drop instead of raising."""
+        ...
+
+    def stream_exists(self, conn: Any, source: ExternalDataSource) -> bool:
+        """Whether the change-stream resource still exists on the source database. Callers use it to
+        confirm a best-effort drop actually removed it before acting as if it were gone."""
+        ...
+
+    def get_lag(self, conn: Any, source: ExternalDataSource) -> CDCLag | None:
+        """How far capture is behind the change stream, or None when the stream is missing or reports
+        no position."""
+        ...
+
+    def is_slot_invalidation_error(self, exc: BaseException) -> bool:
+        """Whether the exception means the engine invalidated or dropped the
+        change-stream resource (PG: replication slot lost to max_slot_wal_keep_size)
+        such that it cannot be resumed and must be recreated."""
+        ...
+
+    def is_connection_error(self, exc: BaseException) -> bool:
+        """Whether the exception is an expected failure to reach the source DB (unreachable
+        host, connect timeout, refused, dropped, or a tunnel that can't be established) rather
+        than a bug in PostHog's own code. Callers use it to avoid capturing expected
+        customer/upstream connection failures as error-tracking noise."""
+        ...
+
+    def customer_fixable_error_message(self, exc: BaseException) -> str | None:
+        """A user-facing explanation when the exception reports something the customer can fix on
+        their own database (PG: ownership of a published table, a missing replication grant, a
+        connection that points at a read replica), or None for anything else. Callers surface the
+        message as a 400 without capturing it, because the fix is not a code change."""
+        ...
+
+    def classify_error(self, exc: BaseException) -> CDCErrorInfo | None:
+        """Interpret a single engine-specific exception as a CDC error category, or None
+        when unrecognized (the caller falls back to the engine-agnostic default). Mirrors
+        ``is_slot_invalidation_error``: keeps psycopg/engine specifics out of the shared layer."""
+        ...
+
+    def recreate_stream(self, source: ExternalDataSource, tables: list[str]) -> dict[str, Any]:
+        """Drop and recreate the change-stream resource after invalidation, against the
+        existing capture definition (recreating it when PostHog owns it). ``tables`` is
+        the schema-qualified (``schema.table``) capture set used if the definition must be
+        recreated. Returns ``cdc_*`` job_inputs updates (e.g. the new consistent point).
+        Raises when recreation isn't possible (e.g. a customer-owned publication is
+        missing)."""
+        ...
+
+    def parse_cdc_config(self, source: ExternalDataSource) -> CDCConfigT_co: ...
+
+    def setup_resources(
+        self,
+        source: ExternalDataSource,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], str | None]:
+        """Provision engine-side CDC resources for the source.
+
+        Reads management mode, identifiers (slot/publication, binlog channel, …),
+        and any engine-specific knobs from ``payload``. Returns either
+        ``(resource_dict, None)`` where ``resource_dict`` contains the CDC
+        identifiers + metadata to merge into ``source.job_inputs`` (already keyed
+        with ``cdc_*`` prefixes), or ``({}, error_message)`` describing what
+        failed. On failure the adapter best-effort rolls back partial state.
+        """
+        ...
+
+    def cleanup_resources(self, source: ExternalDataSource) -> None:
+        """Drop engine-side CDC resources owned by PostHog for the source.
+
+        Best-effort: logs and continues on errors. Must NOT touch resources owned
+        by the customer (e.g. self-managed publications). No-op when the source
+        has no CDC config or no PostHog-owned resources to drop.
+        """
+        ...
+
+    def get_status(self, source: ExternalDataSource) -> dict[str, Any]:
+        """Live engine-side CDC health for the source, read from the source DB.
+
+        Opens a short management connection and returns the engine's fields of the CDC status
+        payload: its stored stream identifiers, whether each engine-side resource exists, and the
+        lag. Raises on connection failure — the caller surfaces that as a 400 / unreachable state.
+        """
+        ...
+
+    def capture_resources_present(self, status: Mapping[str, Any]) -> bool:
+        """Whether a ``get_status`` result shows every engine-side resource capture reads from.
+
+        False is the evidence that lets Repair CDC run, and that stops Resume CDC from unpausing a
+        source that would only fail again.
+        """
+        ...
+
+    def add_table(self, source: ExternalDataSource, schema: str, table: str) -> None:
+        """Include a table in the change-capture set (PG: ALTER PUBLICATION ADD TABLE).
+        No-op when PostHog doesn't own the capture definition (e.g. self-managed).
+
+        Raises when the table can't be added. A CDC table outside the capture set never receives
+        a change, so every sync of it repeats the full snapshot. Callers refuse the switch instead."""
+        ...
+
+    def remove_table(self, source: ExternalDataSource, schema: str, table: str) -> None:
+        """Best-effort exclude a table from the change-capture set. Inverse of ``add_table``."""
+        ...
+
+    def manages_capture_set(self, source: ExternalDataSource) -> bool:
+        """Whether PostHog owns the source's change-capture set (PG: a PostHog-managed publication),
+        so ``add_table`` and ``remove_table`` change it."""
+        ...
+
+
+def _cdc_adapters() -> dict[ExternalDataSourceType, CDCSourceAdapter[CDCConfig]]:
+    """Registry of CDC adapters keyed by source type. Adding a new CDC-capable source
+    is a single entry here — everything else derives from this map."""
+    # Supabase and Neon are Postgres on the wire, so they reuse the Postgres adapter verbatim.
+    postgres_adapter = PostgresCDCAdapter()
+    return {
+        ExternalDataSourceType.POSTGRES: postgres_adapter,
+        ExternalDataSourceType.SUPABASE: postgres_adapter,
+        ExternalDataSourceType.NEON: postgres_adapter,
+    }
+
+
+class CDCUnsupportedSourceTypeError(ValueError):
+    """The source's type has no entry in the adapter registry, so it has no change stream to read.
+
+    Non-retryable: the type is a property of the source, so every retry fails the same way. A
+    scheduled caller that hits this must stop being scheduled, because the alternative is one
+    report of the same failure per interval for as long as the source lives.
+
+    Subclasses ``ValueError`` because the API handlers that answer an unsupported type with a 400
+    catch that, while the name lets a caller tell this apart from any other bad value.
+    """
+
+
+def get_cdc_adapter(source: ExternalDataSource) -> CDCSourceAdapter[CDCConfig]:
+    """Return the CDC adapter for the given source's type.
+
+    Raises ``CDCUnsupportedSourceTypeError`` if the source type doesn't support CDC. Use
+    ``source_type_supports_cdc`` to ask the same question without an exception.
+    """
+    try:
+        source_type = ExternalDataSourceType(source.source_type)
+    except ValueError as e:
+        raise CDCUnsupportedSourceTypeError(f"CDC is not supported for source type: {source.source_type}") from e
+
+    adapter = _cdc_adapters().get(source_type)
+    if adapter is None:
+        raise CDCUnsupportedSourceTypeError(f"CDC is not supported for source type: {source.source_type}")
+    return adapter
+
+
+def cdc_supported_source_types() -> list[ExternalDataSourceType]:
+    """Source types that support CDC. Use for queries (e.g. ``source_type__in=...``)."""
+    return list(_cdc_adapters().keys())
+
+
+def cdc_engine(source_type: ExternalDataSourceType) -> CDCEngine | None:
+    """The engine name of the source type's CDC adapter, or None when it has no change stream."""
+    adapter = _cdc_adapters().get(source_type)
+    return adapter.engine if adapter is not None else None
+
+
+def source_type_supports_cdc(source_type: ExternalDataSourceType | str | None) -> bool:
+    """Whether the given source type (enum or raw string) supports CDC."""
+    if source_type is None:
+        return False
+    try:
+        resolved = ExternalDataSourceType(source_type)
+    except ValueError:
+        return False
+    return resolved in _cdc_adapters()
+
+
+def add_table_failure_message(
+    adapter: CDCSourceAdapter[CDCConfig],
+    exc: BaseException,
+    source: ExternalDataSource,
+    schema: str,
+    table: str,
+) -> str:
+    """User-facing message for an ``add_table`` failure. Captures only the failures that
+    point at a PostHog bug, because the customer fixes ownership, grants and reachability."""
+    if fixable := adapter.customer_fixable_error_message(exc):
+        return fixable
+    if adapter.is_connection_error(exc):
+        return f"Couldn't connect to your database to add {schema}.{table} to change data capture: {exc}"
+    capture_exception(exc, {"source_id": str(source.id), "team_id": source.team_id})
+    return (
+        f"Couldn't add {schema}.{table} to change data capture: {exc} "
+        "Try again, or switch this table to Incremental sync instead."
+    )

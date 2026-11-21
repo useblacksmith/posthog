@@ -1,0 +1,126 @@
+import { IconCursorClick } from '@posthog/icons'
+
+import { LemonTag } from 'lib/lemon-ui/LemonTag'
+import { humanFriendlyNumber } from 'lib/utils/numbers'
+import { VariantTag } from 'scenes/experiments/ExperimentView/VariantTag'
+
+import { CurrencyCode, ExperimentMetric, isExperimentQuantileMetric } from '~/queries/schema/schema-general'
+
+import {
+    type ExperimentVariantResult,
+    formatChanceToWinForGoal,
+    formatDeltaPercent,
+    formatIntervalPercent,
+    formatMetricValue,
+    formatPValue,
+    formatQuantileLevel,
+    getIntervalLabel,
+    isBayesianResult,
+    isSignificant,
+    isWinning,
+    metricSupportsTimeseries,
+} from '../shared/utils'
+
+const renderValueRows = (
+    variantResult: ExperimentVariantResult,
+    metric: ExperimentMetric,
+    baseCurrency: CurrencyCode
+): JSX.Element =>
+    isExperimentQuantileMetric(metric) ? (
+        <>
+            <div className="flex justify-between items-center">
+                <span className="text-muted-alt font-semibold">{formatQuantileLevel(metric.quantile)}:</span>
+                <span className="font-semibold">{formatMetricValue(variantResult, metric, baseCurrency)}</span>
+            </div>
+            <div className="flex justify-between items-center">
+                <span className="text-muted-alt font-semibold">Events:</span>
+                <span className="font-semibold">
+                    {variantResult.denominator_sum != null ? humanFriendlyNumber(variantResult.denominator_sum) : '—'}
+                </span>
+            </div>
+        </>
+    ) : (
+        <div className="flex justify-between items-center">
+            <span className="text-muted-alt font-semibold">Total value:</span>
+            <span className="font-semibold">
+                {variantResult.sum != null ? humanFriendlyNumber(variantResult.sum) : '—'}
+            </span>
+        </div>
+    )
+
+export const renderTooltipContent = (
+    variantResult: ExperimentVariantResult,
+    metric: ExperimentMetric,
+    baselineKey: string,
+    baseCurrency: CurrencyCode
+): JSX.Element => {
+    const intervalPercent = formatIntervalPercent(variantResult)
+    const intervalLabel = getIntervalLabel(variantResult)
+    const significant = isSignificant(variantResult)
+
+    const winning = isWinning(variantResult, metric.goal)
+    const isBaseline = variantResult.key === baselineKey
+
+    return (
+        <div className="flex flex-col gap-1">
+            <div className="flex justify-between items-center">
+                <VariantTag variantKey={variantResult.key} />
+                {!isBaseline && (
+                    <LemonTag type={!significant ? 'muted' : winning ? 'success' : 'danger'} size="medium">
+                        {!significant ? 'Not significant' : winning ? 'Won' : 'Lost'}
+                    </LemonTag>
+                )}
+            </div>
+
+            {renderValueRows(variantResult, metric, baseCurrency)}
+
+            <div className="flex justify-between items-center">
+                <span className="text-muted-alt font-semibold">Exposures:</span>
+                <span className="font-semibold">
+                    {variantResult.number_of_samples != null
+                        ? humanFriendlyNumber(variantResult.number_of_samples)
+                        : '—'}
+                </span>
+            </div>
+
+            {isBayesianResult(variantResult) ? (
+                <>
+                    <div className="flex justify-between items-center">
+                        <span className="text-muted-alt font-semibold">Chance to win:</span>
+                        <span className="font-semibold">{formatChanceToWinForGoal(variantResult, metric.goal)}</span>
+                    </div>
+                </>
+            ) : (
+                <div className="flex justify-between items-center">
+                    <span className="text-muted-alt font-semibold">p-value:</span>
+                    <span className="font-semibold">{formatPValue(variantResult.p_value)}</span>
+                </div>
+            )}
+
+            <div className="flex justify-between items-center">
+                <span className="text-muted-alt font-semibold">Delta:</span>
+                <span className="font-semibold">
+                    {isBaseline ? (
+                        <em className="text-muted-alt">Baseline</em>
+                    ) : (
+                        <span className={winning === undefined ? undefined : winning ? 'text-success' : 'text-danger'}>
+                            {formatDeltaPercent(variantResult)}
+                        </span>
+                    )}
+                </span>
+            </div>
+
+            <div className="flex justify-between items-center">
+                <span className="text-muted-alt font-semibold">{intervalLabel}:</span>
+                <span className="font-semibold">{intervalPercent}</span>
+            </div>
+
+            {metricSupportsTimeseries(metric) && (
+                <div className="text-muted-alt text-xs mt-1 text-center flex items-center justify-center gap-1">
+                    <IconCursorClick className="text-sm" />
+                    Click to view timeseries
+                </div>
+            )}
+        </div>
+    )
+}

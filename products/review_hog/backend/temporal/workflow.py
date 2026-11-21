@@ -1,0 +1,1335 @@
+"""Single-turn ReviewHog PR review as a Temporal workflow.
+
+`ReviewPRWorkflow` is pure orchestration mirroring the former `run.py main()`: setup activities →
+two fan-out child workflows (perspective review / validate) → finishing activities. Only small,
+serializable values cross boundaries — `report_id` + `head_sha` + unit keys / issue ids — and every
+consumer reloads its inputs from the persisted artefact rows (`pr_snapshot`, findings), so no
+unbounded payload hits Temporal's ~2 MiB cap. Stage progress is logged via `workflow.logger` so it
+streams in the worker log (the former stdout banners).
+
+The fan-out children dispatch per-unit sandbox activities (each retried unless the agent reports a
+non-retryable failure) under a fresh `asyncio.Semaphore` and `gather(return_exceptions=True)`, so a
+minority of failed units degrade best-effort; a near-total wipeout (> `FAN_OUT_FAILURE_FLOOR`) fails
+the run loudly instead of finalizing an empty review as success. Publishing is per-run: the final
+stage posts to GitHub only when `inputs.publish` is set (the cloud label trigger), and is skipped for
+eval / CLI runs.
+"""
+
+import json
+import asyncio
+from dataclasses import dataclass
+from datetime import timedelta
+
+import temporalio
+from temporalio import workflow
+from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    TimeoutError as ActivityTimeoutError,
+)
+from temporalio.workflow import ParentClosePolicy
+
+from products.review_hog.backend.reviewer.constants import (
+    BLIND_SPOT_PASS_NUMBER,
+    DEVEX_LENS_NAME,
+    FAN_OUT_FAILURE_FLOOR,
+    FLASH_LENS_SESSION_TIMEOUT,
+    FLASH_LENSES,
+    MAX_CONCURRENT_SANDBOXES,
+    REVIEW_MODE_FLASH,
+    VALIDATION_MAX_ATTEMPTS,
+)
+from products.review_hog.backend.reviewer.fingerprint import ReviewHogMarker
+from products.review_hog.backend.reviewer.models.issues_review import IssuePriority
+from products.review_hog.backend.reviewer.push_gate import PushGateDecision
+from products.review_hog.backend.reviewer.review_design import REVIEW_DESIGN_PIPELINE, REVIEW_DESIGN_SINGLE_AGENT
+from products.review_hog.backend.reviewer.status_comment import FinalizeStatusCommentInput
+from products.review_hog.backend.reviewer.tools.select_perspectives import PerspectiveSelectionDTO, apply_selection
+from products.review_hog.backend.temporal.activities import (
+    AppendCodeReviewArtefactInput,
+    BuildBodyInput,
+    CoordinatorReviewInput,
+    CoordinatorReviewResult,
+    DedupResult,
+    FetchPRDataInput,
+    FlashSessionStats,
+    GatePushInput,
+    GenerateSchemasInput,
+    LensReviewInput,
+    LoadBlindSpotsInput,
+    LoadedBlindSpotsSkillDTO,
+    LoadedPerspectiveDTO,
+    LoadedValidationSkillDTO,
+    LoadPerspectivesInput,
+    LoadValidationInput,
+    PublishInput,
+    PublishResult,
+    RecordTurnMarkerInput,
+    RemoveTriggerLabelInput,
+    ResolveActingUserInput,
+    ReviewChunkInput,
+    ReviewMeta,
+    ReviewReactionInput,
+    SandboxStageInput,
+    SelectPerspectivesInput,
+    StatusCommentInput,
+    SyncReviewSkillsInput,
+    TrackReviewCompletedInput,
+    TrackReviewFailedInput,
+    TrackReviewStartedInput,
+    TurnEndedInput,
+    ValidateChunkInput,
+    ValidateChunkResult,
+    ValidateIntegrationInput,
+    add_review_reaction_activity,
+    append_code_review_artefact_activity,
+    build_body_activity,
+    coordinator_review_activity,
+    dedup_activity,
+    fail_status_comment_activity,
+    fetch_pr_data_activity,
+    finalize_status_comment_activity,
+    finish_standard_automatic_turn_activity,
+    gate_push_activity,
+    generate_schemas_activity,
+    lens_review_activity,
+    load_blind_spots_skill_activity,
+    load_perspectives_activity,
+    load_validation_skill_activity,
+    nudge_stamphog_activity,
+    post_status_comment_activity,
+    publish_review_activity,
+    record_turn_marker_activity,
+    remove_review_reaction_activity,
+    remove_trigger_label_activity,
+    resolve_acting_user_activity,
+    review_chunk_activity,
+    select_perspectives_activity,
+    single_agent_review_activity,
+    split_chunks_activity,
+    sync_review_skills_activity,
+    track_review_completed_activity,
+    track_review_failed_activity,
+    track_review_started_activity,
+    validate_chunk_activity,
+    validate_github_integration_activity,
+)
+from products.review_hog.backend.temporal.scheduling import (
+    SILENT_STAMPHOG_PATCH,
+    ReviewPRQueueWorkflow,
+    ReviewRequestQueue,
+    request_silent_stamphog,
+)
+from products.review_hog.backend.temporal.types import (
+    TRIGGER_AUTOMATIC,
+    TRIGGER_INBOX,
+    TRIGGER_LABEL,
+    FinishedStandardAutomaticTurn,
+    ResolvePRWorkflowInputs,
+    ReviewPRQueueInputs,
+    ReviewPRWorkflowInputs,
+    resolve_pr_workflow_id,
+)
+
+# Timeouts: sandbox turns can legitimately run long (a heavy validation chunk measured 34m — one
+# opus verdict per issue), so 60m start-to-close; the 5m heartbeat still catches dead sandboxes
+# fast, start-to-close is only the ceiling for live work. Local (non-sandbox) activities are quick.
+_SANDBOX_TIMEOUT = timedelta(minutes=60)
+_SANDBOX_HEARTBEAT = timedelta(minutes=5)
+_QUICK_TIMEOUT = timedelta(minutes=2)
+_FETCH_TIMEOUT = timedelta(minutes=5)
+_RETRY = RetryPolicy(maximum_attempts=2)
+# The validate activity's final-attempt fallback keys off the same constant — don't let them drift.
+_VALIDATE_RETRY = RetryPolicy(maximum_attempts=VALIDATION_MAX_ATTEMPTS)
+# The one-shot LLM stages (chunking, selection, dedup): provider overload (529) spells last
+# minutes, so back-to-back attempts all land inside the same spell and the run dies in ~2 minutes
+# flat (observed). Spaced escalating attempts ride the spell out — waits total ~7.5m per run, ~2×
+# that with the parent retry. Overload-failed attempts are cheap (the provider call dies before
+# anything persists; a rare failure after persistence redoes the LLM call, superseded latest-wins
+# per issue_key). Non-retryable failures (4xx, max_tokens truncation) still fail fast.
+_ONESHOT_RETRY = RetryPolicy(
+    maximum_attempts=5,
+    initial_interval=timedelta(seconds=30),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=4),
+    # Truncated sandbox output stays retryable: the error proves only an unclosed object, not the
+    # output limit — a killed sandbox or half-flushed log tail raises the same type and recovers on
+    # retry. Only the one-shot path can read stop_reason == "max_tokens" and fail fast on it.
+)
+# The GitHub writes that carry the result to the PR. Another caller can exhaust the shared
+# installation budget for a minute or two, and GitHub returns 5xx in short spells, so the waits
+# (30s, 60s, 120s) outlast both. A retry never double-posts, because publish checks its marker first.
+_GITHUB_POST_RETRY = RetryPolicy(
+    maximum_attempts=4,
+    initial_interval=timedelta(seconds=30),
+    backoff_coefficient=2.0,
+)
+
+
+def _enforce_failure_floor(stage: str, failed: int, total: int) -> None:
+    """Fail the run when more than `FAN_OUT_FAILURE_FLOOR` of a fan-out stage's units failed.
+
+    A few flaky units degrade best-effort; a near-total wipeout (e.g. the sandbox layer down) must
+    surface loudly instead of letting the pipeline finalize an empty review as success.
+    """
+    if total and failed / total > FAN_OUT_FAILURE_FLOOR:
+        raise ApplicationError(
+            f"{stage}: {failed}/{total} units failed (> {FAN_OUT_FAILURE_FLOOR:.0%}); failing the run",
+            non_retryable=True,
+        )
+
+
+def _non_retryable_cause(exc: BaseException | None) -> ApplicationError | None:
+    while exc is not None:
+        if isinstance(exc, ApplicationError) and exc.non_retryable:
+            return exc
+        exc = exc.__cause__
+    return None
+
+
+def _out_of_attempts() -> bool:
+    info = workflow.info()
+    retry = info.retry_policy
+    return retry is None or (retry.maximum_attempts > 0 and info.attempt >= retry.maximum_attempts)
+
+
+@dataclass
+class ReviewPerspectivesInputs(SandboxStageInput):
+    chunk_ids: list[int]
+    # The user whose enabled perspectives this review fans out over (the PR author, or the CLI override).
+    acting_user_id: int
+
+
+@dataclass
+class ValidateIssuesInputs(SandboxStageInput):
+    # The survivors' issue ids (`DedupResult.issue_ids`); the chunk activities reload the content
+    # from the finding rows, so only ids cross the child-workflow payload boundary.
+    issue_ids: list[str]
+    # The user whose selected validator validates this review (the PR author, or the CLI override).
+    acting_user_id: int
+
+
+@temporalio.workflow.defn(name="review-perspectives")
+class ReviewPerspectivesWorkflow:
+    """Select lenses per chunk, fan out the wave, then one blind-spot check per chunk (best-effort).
+
+    Perspectives are resolved (and version-pinned) once via an activity; a cheap one-shot selection
+    then decides which lenses each chunk actually needs, and only the selected (perspective, chunk)
+    pairs run concurrently with no cross-perspective context — overlap is resolved by the downstream
+    dedup stage. Selection is fail-open: any failure means the dense product (every perspective on
+    every chunk). After the wave, the blind-spot check (a customizable single-active skill, like the
+    validator) runs once per EVERY chunk — selection never touches it, so a chunk with zero selected
+    lenses still gets reviewed: it reads its chunk's wave findings (told which lenses ran on that
+    chunk) and hunts for what they missed, under the reserved `BLIND_SPOT_PASS_NUMBER`.
+    """
+
+    @temporalio.workflow.run
+    async def run(self, inputs: ReviewPerspectivesInputs) -> int:
+        perspectives: list[LoadedPerspectiveDTO] = await workflow.execute_activity(
+            load_perspectives_activity,
+            LoadPerspectivesInput(team_id=inputs.team_id, acting_user_id=inputs.acting_user_id),
+            start_to_close_timeout=_QUICK_TIMEOUT,
+            retry_policy=_RETRY,
+        )
+        # Ascending pass_number keeps the blind-spot check's injected lens list deterministic; it's a
+        # no-op ordering for the parallel fan-out itself.
+        ordered = sorted(perspectives, key=lambda p: p.pass_number)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_SANDBOXES)
+
+        selection: PerspectiveSelectionDTO | None = None
+        if inputs.chunk_ids:
+            try:
+                selection = await workflow.execute_activity(
+                    select_perspectives_activity,
+                    SelectPerspectivesInput(
+                        team_id=inputs.team_id,
+                        user_id=inputs.user_id,
+                        report_id=inputs.report_id,
+                        head_sha=inputs.head_sha,
+                        repository=inputs.repository,
+                        branch=inputs.branch,
+                        run_index=inputs.run_index,
+                        review_mode=inputs.review_mode,
+                        flash_reasoning_effort=inputs.flash_reasoning_effort,
+                        perspectives=ordered,
+                    ),
+                    start_to_close_timeout=_SANDBOX_TIMEOUT,
+                    heartbeat_timeout=_SANDBOX_HEARTBEAT,
+                    retry_policy=_ONESHOT_RETRY,
+                )
+            except ActivityError:
+                # Selection is an optimization; failing it must never cost the review.
+                workflow.logger.warning("Perspective selection failed; running all perspectives on all chunks")
+
+        async def _review(
+            pass_number: int,
+            skill_name: str,
+            skill_version: int,
+            chunk_id: int,
+            blind_spot_check: bool,
+            wave_perspectives: list[LoadedPerspectiveDTO],
+        ) -> bool:
+            async with semaphore:
+                return await workflow.execute_activity(
+                    review_chunk_activity,
+                    ReviewChunkInput(
+                        team_id=inputs.team_id,
+                        user_id=inputs.user_id,
+                        report_id=inputs.report_id,
+                        head_sha=inputs.head_sha,
+                        repository=inputs.repository,
+                        branch=inputs.branch,
+                        run_index=inputs.run_index,
+                        review_mode=inputs.review_mode,
+                        flash_reasoning_effort=inputs.flash_reasoning_effort,
+                        chunk_id=chunk_id,
+                        pass_number=pass_number,
+                        skill_name=skill_name,
+                        skill_version=skill_version,
+                        blind_spot_check=blind_spot_check,
+                        wave_perspectives=wave_perspectives,
+                    ),
+                    start_to_close_timeout=_SANDBOX_TIMEOUT,
+                    heartbeat_timeout=_SANDBOX_HEARTBEAT,
+                    retry_policy=_RETRY,
+                )
+
+        units = apply_selection(ordered, inputs.chunk_ids, selection, blind_spot_runs=True)
+        dense_total = len(ordered) * len(inputs.chunk_ids)
+        if len(units) < dense_total:
+            workflow.logger.info(f"Perspective selection kept {len(units)}/{dense_total} (perspective, chunk) pair(s)")
+        results = await asyncio.gather(
+            *(_review(p.pass_number, p.skill_name, p.version, c, False, []) for p, c in units),
+            return_exceptions=True,
+        )
+
+        total = len(units)
+        failed = sum(1 for r in results if isinstance(r, BaseException))
+        _enforce_failure_floor("Review", failed, total)
+        reviewed = total - failed
+        if failed:
+            workflow.logger.warning(
+                f"Reviewed {reviewed}/{total} (perspective, chunk) pair(s); {failed} failed best-effort"
+            )
+        # The lenses that actually SUCCEEDED per chunk — built from the gather results, not the plan,
+        # so a failed perspective's ground isn't reported to the blind-spot sweep as spoken for.
+        ran_by_chunk: dict[int, list[LoadedPerspectiveDTO]] = {c: [] for c in inputs.chunk_ids}
+        for (p, c), result in zip(units, results):
+            if not isinstance(result, BaseException):
+                ran_by_chunk[c].append(p)
+
+        # Blind-spot check: after the perspective wave, one broad "what did everyone miss?" unit per
+        # chunk reads every wave finding and sweeps for what none of the lenses surfaced.
+        blind_spots: LoadedBlindSpotsSkillDTO = await workflow.execute_activity(
+            load_blind_spots_skill_activity,
+            LoadBlindSpotsInput(team_id=inputs.team_id, acting_user_id=inputs.acting_user_id),
+            start_to_close_timeout=_QUICK_TIMEOUT,
+            retry_policy=_RETRY,
+        )
+        spot_results = await asyncio.gather(
+            *(
+                _review(BLIND_SPOT_PASS_NUMBER, blind_spots.skill_name, blind_spots.version, c, True, ran_by_chunk[c])
+                for c in inputs.chunk_ids
+            ),
+            return_exceptions=True,
+        )
+        spot_total = len(inputs.chunk_ids)
+        spot_failed = sum(1 for r in spot_results if isinstance(r, BaseException))
+        _enforce_failure_floor("Blind spots", spot_failed, spot_total)
+        reviewed += spot_total - spot_failed
+        if spot_failed:
+            workflow.logger.warning(
+                f"Blind-spot check reviewed {spot_total - spot_failed}/{spot_total} chunk(s); {spot_failed} failed"
+            )
+
+        return reviewed
+
+
+def _chunk_id_of(issue_id: str) -> int | None:
+    """The chunk id encoded in an issue's id (`{pass}-{chunk}-{issue}`), or None if malformed."""
+    parts = issue_id.split("-")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+@temporalio.workflow.defn(name="review-validate-issues")
+class ValidateIssuesWorkflow:
+    """Fan out one warm validation session per chunk (bounded, concurrent); return the validated count.
+
+    Survivors are grouped by chunk; each chunk's session validates its issues (one verdict per turn).
+    Verdicts persist per issue, so body + publish read them from the DB — this return is informational
+    (logging / failure floor only).
+    """
+
+    @temporalio.workflow.run
+    async def run(self, inputs: ValidateIssuesInputs) -> int:
+        if not inputs.issue_ids:
+            return 0
+        skill: LoadedValidationSkillDTO = await workflow.execute_activity(
+            load_validation_skill_activity,
+            LoadValidationInput(team_id=inputs.team_id, acting_user_id=inputs.acting_user_id),
+            start_to_close_timeout=_QUICK_TIMEOUT,
+            retry_policy=_RETRY,
+        )
+        # Group survivors by their chunk so one warm session validates each chunk's issues together.
+        by_chunk: dict[int, list[str]] = {}
+        for issue_id in inputs.issue_ids:
+            chunk_id = _chunk_id_of(issue_id)
+            if chunk_id is None:
+                workflow.logger.warning(f"Skipping validation for an issue with a malformed id: {issue_id}")
+                continue
+            by_chunk.setdefault(chunk_id, []).append(issue_id)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_SANDBOXES)
+
+        async def _validate(chunk_id: int, chunk_issue_ids: list[str]) -> ValidateChunkResult:
+            async with semaphore:
+                return await workflow.execute_activity(
+                    validate_chunk_activity,
+                    ValidateChunkInput(
+                        team_id=inputs.team_id,
+                        user_id=inputs.user_id,
+                        report_id=inputs.report_id,
+                        head_sha=inputs.head_sha,
+                        repository=inputs.repository,
+                        branch=inputs.branch,
+                        run_index=inputs.run_index,
+                        review_mode=inputs.review_mode,
+                        flash_reasoning_effort=inputs.flash_reasoning_effort,
+                        chunk_id=chunk_id,
+                        issue_ids=chunk_issue_ids,
+                        skill_name=skill.skill_name,
+                        skill_version=skill.version,
+                    ),
+                    start_to_close_timeout=_SANDBOX_TIMEOUT,
+                    heartbeat_timeout=_SANDBOX_HEARTBEAT,
+                    retry_policy=_VALIDATE_RETRY,
+                )
+
+        results = await asyncio.gather(*(_validate(c, ids) for c, ids in by_chunk.items()), return_exceptions=True)
+        total = len(by_chunk)
+        failed = sum(1 for r in results if isinstance(r, BaseException))
+        _enforce_failure_floor("Validate", failed, total)
+        validated = sum(r.validated_count for r in results if isinstance(r, ValidateChunkResult))
+        if failed:
+            workflow.logger.warning(f"Validated {total - failed}/{total} chunk(s); {failed} failed best-effort")
+        return validated
+
+
+@temporalio.workflow.defn(name="review-pr")
+class ReviewPRWorkflow:
+    """Single-turn PR review: setup → split → review → dedup (incl. combine) → validate → build → publish."""
+
+    @workflow.init
+    def __init__(self, inputs: ReviewPRWorkflowInputs) -> None:
+        self._requests = ReviewRequestQueue(active=inputs)
+
+    @workflow.signal
+    def request_review(self, request: ReviewPRWorkflowInputs) -> None:
+        self._requests.add(request)
+
+    @staticmethod
+    def parse_inputs(inputs: list[str]) -> ReviewPRWorkflowInputs:
+        return ReviewPRWorkflowInputs(**json.loads(inputs[0]))
+
+    @temporalio.workflow.run
+    async def run(self, inputs: ReviewPRWorkflowInputs) -> str:
+        completed = False
+        non_retryable = False
+        try:
+            result = await self._run(inputs)
+            completed = True
+            return result
+        except Exception as e:
+            cause = _non_retryable_cause(e)
+            if cause is None:
+                raise
+            non_retryable = True
+            raise ApplicationError(str(e), non_retryable=True, type=cause.type) from e
+        finally:
+            terminal = completed or non_retryable or _out_of_attempts()
+            # Label run histories from before the deploy can hold a scheduled label removal; delete once they drain.
+            if (
+                workflow.patched("remove-reviewhog-trigger-label-2026-08")
+                and terminal
+                and inputs.trigger_source == TRIGGER_LABEL
+                and inputs.pr_number is not None
+            ):
+                try:
+                    await workflow.execute_activity(
+                        remove_trigger_label_activity,
+                        RemoveTriggerLabelInput(
+                            team_id=inputs.team_id,
+                            owner=inputs.owner,
+                            repo=inputs.repo,
+                            pr_number=inputs.pr_number,
+                        ),
+                        start_to_close_timeout=_QUICK_TIMEOUT,
+                        retry_policy=_RETRY,
+                    )
+                except Exception:
+                    workflow.logger.warning("Could not remove the ReviewHog trigger label")
+            if self._requests.pending:
+                requests = list(self._requests.pending.values())
+                if not completed and not terminal:
+                    requests.insert(0, inputs)
+                workflow.continue_as_new(ReviewPRQueueInputs(requests=requests), workflow=ReviewPRQueueWorkflow.run)
+
+    async def _run(self, inputs: ReviewPRWorkflowInputs) -> str:
+        repository = inputs.repository
+        target = f"PR #{inputs.pr_number}" if inputs.pr_number is not None else f"branch '{inputs.head_branch}'"
+        workflow.logger.info(f"ReviewHog · reviewing {target} · {repository}")
+
+        await workflow.execute_activity(
+            validate_github_integration_activity,
+            ValidateIntegrationInput(team_id=inputs.team_id),
+            start_to_close_timeout=_QUICK_TIMEOUT,
+            retry_policy=_RETRY,
+        )
+
+        workflow.logger.info("STAGE 1/7 · Fetch PR data")
+        meta: ReviewMeta = await workflow.execute_activity(
+            fetch_pr_data_activity,
+            FetchPRDataInput(
+                team_id=inputs.team_id,
+                user_id=inputs.user_id,
+                repository=repository,
+                owner=inputs.owner,
+                repo=inputs.repo,
+                pr_number=inputs.pr_number,
+                pr_url=inputs.pr_url,
+                head_branch=inputs.head_branch,
+                signal_report_id=inputs.signal_report_id,
+                trigger_source=inputs.trigger_source,
+                signal_priority=inputs.signal_priority,
+                review_mode=inputs.review_mode,
+            ),
+            start_to_close_timeout=_FETCH_TIMEOUT,
+            retry_policy=_RETRY,
+        )
+        report_id, head_sha, branch = meta.report_id, meta.head_sha, meta.branch
+        workflow.logger.info(
+            "Captured point-in-time diff snapshot" if meta.snapshotted else "No new diff snapshot this turn"
+        )
+
+        # Early-exits: nothing to do this turn — no receipt is appended for these (nothing was done).
+        # `already_published` means this exact head was already reviewed AND posted, so re-running the
+        # pipeline would recompute the same review and publish would self-skip — burning sandbox cost
+        # for no output. New inline comments do NOT force a turn yet (logged in fetch); reacting to
+        # comments lands with the "fix the issues" capability — see DECISIONS.md (Stage 5b / Action
+        # plane). A no-publish eval run is never gated here (it has no published head), so the
+        # frozen-PR eval loop still recomputes to measure reviewer changes. `empty_diff` is the
+        # "pushed nothing → do nothing" rule for branch targets.
+        if meta.already_published:
+            workflow.logger.info(
+                f"Review already published for {repository} {target} at {head_sha[:12]}; "
+                f"nothing changed this turn ({meta.new_comment_count} new comment(s), not yet acted on) — skipping"
+            )
+            return report_id
+        if meta.empty_diff:
+            workflow.logger.info(
+                f"Branch '{branch}' has no reviewable diff against its base (pushed nothing); skipping"
+            )
+            return report_id
+        if inputs.trigger_source == TRIGGER_AUTOMATIC and (meta.already_completed or not meta.pr_open):
+            workflow.logger.info("Automatic review skipped: the PR is closed or this head is already complete")
+            # A draft marked ready without a push gets no new turn, so the head's earlier automatic turn answers.
+            # The queue answers the event once the turn ends, also for this early exit.
+            if (
+                not inputs.answered_by_queue
+                and workflow.patched(SILENT_STAMPHOG_PATCH)
+                and meta.already_completed
+                and meta.pr_open
+                and inputs.marks_ready
+                and inputs.requested_head_sha == head_sha
+            ):
+                await request_silent_stamphog(inputs, head_sha)
+            return report_id
+        # The patch keeps a history written before the label check on its old command sequence.
+        if workflow.patched("reviewhog-skip-agent-review-label-2026-10") and meta.skip_agent_review:
+            workflow.logger.info("Automatic review skipped: the PR has the skip-agent-review label")
+            return report_id
+
+        # Resolve the acting user whose enabled perspectives apply: the PR author, or the explicit
+        # override the CLI and inbox triggers set. The label trigger falls back to the default run
+        # user on an unmapped author (someone explicitly asked for this review); other triggers keep
+        # the author-only contract, so an unmapped author still skips there. Gate before sandbox spend.
+        acting = await workflow.execute_activity(
+            resolve_acting_user_activity,
+            ResolveActingUserInput(
+                team_id=inputs.team_id,
+                author_login=meta.author_login,
+                override_user_id=inputs.acting_user_id,
+                report_id=report_id,
+                trigger_source=inputs.trigger_source,
+                default_user_id=inputs.user_id,
+                repository=repository,
+                installation_id=inputs.installation_id,
+                github_repo_id=inputs.github_repo_id,
+                draft=meta.draft,
+                pr_number=meta.pr_number,
+                head_branch=branch,
+                review_mode=inputs.review_mode,
+            ),
+            start_to_close_timeout=_QUICK_TIMEOUT,
+            retry_policy=_RETRY,
+        )
+        if acting.acting_user_id is None:
+            workflow.logger.info(
+                f"PR author '{meta.author_login}' is not a PostHog org user on team {inputs.team_id}; "
+                "skipping review (no perspectives to apply)"
+            )
+            return report_id
+        # Trigger-aware opt-outs, read off the resolve-time settings snapshot (mid-run edits can't
+        # flip gates). Inbox re-checks the receiver-side gate here for snapshot-at-resolve
+        # consistency. A Stamphog handoff and manual stay ungated.
+        # Histories that carry the patch marker replay with deprecate_patch; delete it once those runs drain.
+        workflow.deprecate_patch("reviewhog-label-always-runs-2026-10")
+        if inputs.trigger_source == TRIGGER_INBOX and not acting.review_inbox_prs:
+            workflow.logger.info(f"Acting user {acting.acting_user_id} has inbox reviews turned off; skipping review")
+            return report_id
+        if inputs.trigger_source == TRIGGER_AUTOMATIC and not acting.review_authored_prs:
+            workflow.logger.info("Automatic reviews are disabled for the author; skipping review")
+            return report_id
+        acting_user_id = acting.acting_user_id
+        # Flash publishes every kept finding: the threshold is a Full review setting. Recording
+        # "consider" keeps the outcome classification of a Flash turn truthful.
+        urgency_threshold = (
+            IssuePriority.CONSIDER.value if inputs.review_mode == REVIEW_MODE_FLASH else acting.urgency_threshold
+        )
+
+        # Only an automatic follow-up is gated. The first automatic review of a PR and every human
+        # trigger always run. The gate fails open: an activity failure reviews the push.
+        gate: PushGateDecision | None = None
+        if (
+            workflow.patched("reviewhog-push-gate-2026-10")
+            and inputs.trigger_source == TRIGGER_AUTOMATIC
+            and meta.automatic_reviewed_head_sha is not None
+        ):
+            try:
+                gate = await workflow.execute_activity(
+                    gate_push_activity,
+                    GatePushInput(
+                        team_id=inputs.team_id,
+                        report_id=report_id,
+                        repository=repository,
+                        previous_head_sha=meta.automatic_reviewed_head_sha,
+                        head_sha=head_sha,
+                        run_index=meta.run_index,
+                        review_mode=inputs.review_mode,
+                        zero_change_skip=meta.zero_change_skip,
+                        delta_band=meta.delta_band,
+                        coordinator=meta.coordinator,
+                    ),
+                    start_to_close_timeout=_QUICK_TIMEOUT,
+                    retry_policy=_RETRY,
+                )
+                if gate.skip:
+                    workflow.logger.info(f"Automatic review skipped by the push gate ({gate.reason})")
+                    return report_id
+            except ActivityError:
+                workflow.logger.warning("The push gate failed; reviewing the push")
+        # A gate that failed or never ran leaves the whole PR to review. The patch keeps older histories on full turns.
+        delta_since_head_sha = (
+            meta.automatic_reviewed_head_sha
+            if gate is not None and gate.delta_review and workflow.patched("reviewhog-p1-lite-delta-2026-10")
+            else None
+        )
+
+        # The design comes off the recorded fetch result. The patch keeps a history that reached this
+        # point before the single-agent design existed on the pipeline when it replays.
+        review_design = (
+            REVIEW_DESIGN_SINGLE_AGENT
+            if meta.review_design == REVIEW_DESIGN_SINGLE_AGENT and workflow.patched("flash-single-agent-2026-10")
+            else REVIEW_DESIGN_PIPELINE
+        )
+
+        # The turn passed every gate and is about to spend sandboxes: one started event per turn,
+        # the counterpart of the completed/failed pair below. Best-effort like both of them.
+        if workflow.patched("track-review-started-2026-09"):
+            try:
+                await workflow.execute_activity(
+                    track_review_started_activity,
+                    TrackReviewStartedInput(
+                        team_id=inputs.team_id,
+                        report_id=report_id,
+                        head_sha=head_sha,
+                        run_index=meta.run_index,
+                        turn_trigger_source=inputs.trigger_source,
+                        turn_trigger_action=inputs.trigger_action,
+                        review_mode=inputs.review_mode,
+                        flash_reasoning_effort=acting.flash_reasoning_effort,
+                        review_design=review_design,
+                        review_design_reason=meta.review_design_reason,
+                        coordinator=review_design == REVIEW_DESIGN_SINGLE_AGENT and meta.coordinator,
+                        arm_set=meta.arm_set,
+                        zero_change_skip_arm=meta.zero_change_skip,
+                        delta_band_arm=meta.delta_band,
+                        devex_lens_routed=meta.devex_lens_routed,
+                        devex_lens_arm=meta.devex_lens,
+                    ),
+                    start_to_close_timeout=_QUICK_TIMEOUT,
+                    retry_policy=_RETRY,
+                )
+            except ActivityError:
+                workflow.logger.warning("Could not capture the review-started analytics event")
+
+        # One gate, three consumers: the status comment, finalize's deferred idle write, and the
+        # stage-7 publish dispatch all key off "this run publishes to a PR".
+        publishes_to_pr = inputs.publish and meta.pr_number is not None
+        # The patch keeps a history from before the reactions on its old command sequence.
+        reacts = workflow.patched("reviewhog-pr-reactions-2026-10")
+        # The PR's live status comment: posted once every gate has passed, refreshed by the pipeline
+        # activities as they persist progress, and rewritten with the outcome below. Publish-path
+        # only — eval / CLI / branch-target runs keep zero GitHub footprint. Best-effort throughout:
+        # a status comment must never cost a review. A Standard turn has none: its 👀 shows that it
+        # runs, and its review, 👍, or failure comment shows the outcome.
+        status_comment = publishes_to_pr and not (reacts and inputs.review_mode == REVIEW_MODE_FLASH)
+        if status_comment:
+            try:
+                await workflow.execute_activity(
+                    post_status_comment_activity,
+                    StatusCommentInput(
+                        team_id=inputs.team_id,
+                        report_id=report_id,
+                        review_mode=inputs.review_mode,
+                        review_design=review_design,
+                    ),
+                    start_to_close_timeout=_QUICK_TIMEOUT,
+                    retry_policy=_RETRY,
+                )
+            except ActivityError:
+                workflow.logger.warning("Could not post the status comment; continuing without it")
+
+        eyes_reaction_id: int | None = None
+        if reacts and publishes_to_pr and meta.pr_number is not None:
+            eyes_reaction_id = await self._add_eyes_reaction(inputs.team_id, repository, meta.pr_number)
+        publish_result: PublishResult | None = None
+        marker: ReviewHogMarker | None = None
+        flash_sessions: FlashSessionStats | None = None
+        dedup: DedupResult | None = None
+        try:
+            await workflow.execute_activity(
+                sync_review_skills_activity,
+                SyncReviewSkillsInput(team_id=inputs.team_id),
+                start_to_close_timeout=_FETCH_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+            await workflow.execute_activity(
+                generate_schemas_activity,
+                GenerateSchemasInput(),
+                start_to_close_timeout=_QUICK_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+            # The patch goes before the recorded value, so an older history keeps its sessions on replay.
+            devex_lens = (
+                review_design == REVIEW_DESIGN_SINGLE_AGENT
+                and workflow.patched("flash-devex-lens-2026-11")
+                and meta.devex_lens
+                and delta_since_head_sha is None
+            )
+            # After the skill sync and schema generation, so the fingerprint hashes what the stages use.
+            if workflow.patched("record-turn-marker-2026-10"):
+                try:
+                    marker = await workflow.execute_activity(
+                        record_turn_marker_activity,
+                        RecordTurnMarkerInput(
+                            team_id=inputs.team_id,
+                            report_id=report_id,
+                            head_sha=head_sha,
+                            run_index=meta.run_index,
+                            acting_user_id=acting_user_id,
+                            review_mode=inputs.review_mode,
+                            flash_reasoning_effort=acting.flash_reasoning_effort,
+                            review_design=review_design,
+                            coordinator=review_design == REVIEW_DESIGN_SINGLE_AGENT and meta.coordinator,
+                            publishes=publishes_to_pr,
+                            arm_set=meta.arm_set,
+                            devex_lens=devex_lens,
+                        ),
+                        start_to_close_timeout=_QUICK_TIMEOUT,
+                        retry_policy=_RETRY,
+                    )
+                except ActivityError:
+                    workflow.logger.warning("Could not record the turn marker; continuing without it")
+
+            stage = SandboxStageInput(
+                team_id=inputs.team_id,
+                user_id=inputs.user_id,
+                report_id=report_id,
+                head_sha=head_sha,
+                repository=repository,
+                branch=branch,
+                run_index=meta.run_index,
+                review_mode=inputs.review_mode,
+                flash_reasoning_effort=acting.flash_reasoning_effort,
+                review_design=review_design,
+                trigger_source=inputs.trigger_source,
+                delta_since_head_sha=delta_since_head_sha,
+                arm_set=meta.arm_set,
+                devex_lens=devex_lens,
+            )
+
+            # The patch keeps a history from before the coordinator existed on separate sessions when it replays.
+            if (
+                review_design == REVIEW_DESIGN_SINGLE_AGENT
+                and workflow.patched("flash-coordinator-2026-10")
+                and meta.coordinator
+            ):
+                flash_sessions = await self._review_with_coordinator(stage, meta.lens_chunk_count)
+            elif review_design == REVIEW_DESIGN_SINGLE_AGENT:
+                lens_parts = 1 if delta_since_head_sha is not None else meta.lens_chunk_count
+                flash_sessions = await self._review_with_single_agent(stage, lens_parts)
+            else:
+                await self._review_with_pipeline(stage, acting_user_id)
+
+            # Combine + scope-clean run inside the dedup activity (local flatten over the persisted
+            # perspective results) — only the survivors' ids come back, never the issue JSON.
+            workflow.logger.info("STAGE 4/7 · Combine, scope-clean & deduplicate issues")
+            dedup = await workflow.execute_activity(
+                dedup_activity,
+                stage,
+                start_to_close_timeout=_SANDBOX_TIMEOUT,
+                heartbeat_timeout=_SANDBOX_HEARTBEAT,
+                retry_policy=_ONESHOT_RETRY,
+            )
+            workflow.logger.info(f"Persisted {len(dedup.issue_ids)} finding(s) to the review report")
+
+            if review_design != REVIEW_DESIGN_SINGLE_AGENT:
+                workflow.logger.info("STAGE 5/7 · Validate issues")
+                await workflow.execute_child_workflow(
+                    ValidateIssuesWorkflow.run,
+                    ValidateIssuesInputs(
+                        team_id=stage.team_id,
+                        user_id=stage.user_id,
+                        report_id=stage.report_id,
+                        head_sha=stage.head_sha,
+                        repository=stage.repository,
+                        branch=stage.branch,
+                        run_index=stage.run_index,
+                        review_mode=stage.review_mode,
+                        flash_reasoning_effort=stage.flash_reasoning_effort,
+                        issue_ids=dedup.issue_ids,
+                        acting_user_id=acting_user_id,
+                    ),
+                    id=f"{workflow.info().workflow_id}/validate",
+                    retry_policy=_RETRY,
+                )
+
+            workflow.logger.info("STAGE 6/7 · Build report")
+            await workflow.execute_activity(
+                build_body_activity,
+                BuildBodyInput(
+                    team_id=inputs.team_id,
+                    report_id=report_id,
+                    head_sha=head_sha,
+                    run_index=stage.run_index,
+                    issue_ids=dedup.issue_ids,
+                    urgency_threshold=urgency_threshold,
+                    # Publishing runs stay ACTIVE through stage 7; publish/failure return them to rest.
+                    will_publish=publishes_to_pr,
+                ),
+                start_to_close_timeout=_QUICK_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+
+            workflow.logger.info("STAGE 7/7 · Publish review")
+            # The pr_number check is implied by the gate; restated so mypy narrows it to int.
+            if publishes_to_pr and meta.pr_number is not None:
+                publish_result = await workflow.execute_activity(
+                    publish_review_activity,
+                    PublishInput(
+                        team_id=inputs.team_id,
+                        report_id=report_id,
+                        head_sha=head_sha,
+                        run_index=stage.run_index,
+                        owner=inputs.owner,
+                        repo=inputs.repo,
+                        # The resolved destination: the input PR, or the open PR fetch discovered
+                        # for a branch target.
+                        pr_number=meta.pr_number,
+                        urgency_threshold=urgency_threshold,
+                        review_mode=inputs.review_mode,
+                        trigger_source=inputs.trigger_source,
+                        capped_lens_parts=meta.lens_chunk_count if meta.lens_chunks_capped else None,
+                    ),
+                    start_to_close_timeout=_QUICK_TIMEOUT,
+                    retry_policy=_GITHUB_POST_RETRY,
+                )
+            elif inputs.publish:
+                workflow.logger.info("No PR to publish to (branch target); the review is stored only")
+            else:
+                workflow.logger.info("Publishing disabled for this run (publish=False)")
+        except Exception as e:
+            # A dead run must not read as forever in progress on the PR or in the Code review UI
+            # (the activity also returns the report to rest, covering a publish that died with the
+            # idle write still deferred); best-effort so the edit can never mask the original error.
+            # A Standard turn without a status comment still needs the idle write and its failure comment.
+            if publishes_to_pr:
+                try:
+                    await workflow.execute_activity(
+                        fail_status_comment_activity,
+                        StatusCommentInput(
+                            team_id=inputs.team_id,
+                            report_id=report_id,
+                            review_mode=inputs.review_mode,
+                            review_design=review_design,
+                            run_index=meta.run_index,
+                            last_attempt=_non_retryable_cause(e) is not None or _out_of_attempts(),
+                            uses_status_comment=status_comment,
+                        ),
+                        start_to_close_timeout=_QUICK_TIMEOUT,
+                        retry_policy=_RETRY,
+                    )
+                except Exception:
+                    workflow.logger.warning("Could not mark the status comment as failed")
+                # After the failure is recorded, so a stamphog re-run reads this head as failed.
+                if workflow.patched("reviewhog-nudge-stamphog-2026-10") and meta.pr_number is not None:
+                    await self._nudge_stamphog(repository, meta.pr_number, head_sha)
+            # The signal report's log records a failed turn too (a receipt per executed turn,
+            # completion or failure); best-effort so it can never mask the original error.
+            await self._append_code_review_receipt(
+                inputs, report_id=report_id, run_index=meta.run_index, outcome="failed", best_effort=True
+            )
+            # The completed event's other half: without a failed event, a run that dies drops out of
+            # every per-review metric, so a reviewer-model arm that crashes on its hardest PRs would
+            # read as cheaper and more precise than it is. Best-effort like the receipt above.
+            if workflow.patched("track-review-failed-2026-07"):
+                try:
+                    await workflow.execute_activity(
+                        track_review_failed_activity,
+                        TrackReviewFailedInput(
+                            team_id=inputs.team_id,
+                            report_id=report_id,
+                            run_index=meta.run_index,
+                            turn_trigger_source=inputs.trigger_source,
+                            turn_trigger_action=inputs.trigger_action,
+                            review_mode=inputs.review_mode,
+                            flash_reasoning_effort=acting.flash_reasoning_effort,
+                            review_design=review_design,
+                            last_attempt=_non_retryable_cause(e) is not None or _out_of_attempts(),
+                            arm_set=meta.arm_set,
+                            zero_change_skip_arm=meta.zero_change_skip,
+                            delta_band_arm=meta.delta_band,
+                            coordinator=review_design == REVIEW_DESIGN_SINGLE_AGENT and meta.coordinator,
+                        ),
+                        start_to_close_timeout=_QUICK_TIMEOUT,
+                        retry_policy=_RETRY,
+                    )
+                except Exception:
+                    workflow.logger.exception("Could not capture the review-failed analytics event")
+            raise
+        finally:
+            # Also on cancellation, which is not an Exception, so a stopped turn leaves no 👀 behind.
+            if eyes_reaction_id is not None and meta.pr_number is not None:
+                await self._remove_eyes_reaction(inputs.team_id, repository, meta.pr_number, eyes_reaction_id)
+
+        posted = publish_result is not None and publish_result.posted
+        # After publish, so a stamphog re-run finds this turn's findings on the PR.
+        if workflow.patched("reviewhog-nudge-stamphog-2026-10") and publishes_to_pr and meta.pr_number is not None:
+            await self._nudge_stamphog(repository, meta.pr_number, head_sha)
+        if (
+            workflow.patched(SILENT_STAMPHOG_PATCH)
+            and publishes_to_pr
+            and meta.pr_number is not None
+            and inputs.trigger_source == TRIGGER_AUTOMATIC
+            and inputs.review_mode == REVIEW_MODE_FLASH
+        ):
+            await self._finish_standard_automatic_turn(
+                FinishedStandardAutomaticTurn(
+                    team_id=inputs.team_id,
+                    report_id=report_id,
+                    repository=repository,
+                    pr_number=meta.pr_number,
+                    head_sha=head_sha,
+                    run_index=meta.run_index,
+                    lens_chunks_capped=meta.lens_chunks_capped,
+                    delta_review=delta_since_head_sha is not None,
+                    # The event names its head, and the turn reviews the live head, which can be newer.
+                    marks_ready=not inputs.answered_by_queue
+                    and inputs.marks_ready
+                    and inputs.requested_head_sha == head_sha,
+                )
+            )
+        # One analytics event per finalized turn (the review-level count dashboards aggregate);
+        # best-effort — a review must never fail over its own telemetry.
+        try:
+            await workflow.execute_activity(
+                track_review_completed_activity,
+                TrackReviewCompletedInput(
+                    team_id=inputs.team_id,
+                    report_id=report_id,
+                    head_sha=head_sha,
+                    run_index=meta.run_index,
+                    published=posted,
+                    workflow_started_at=workflow.info().start_time.isoformat(),
+                    turn_trigger_source=inputs.trigger_source,
+                    turn_trigger_action=inputs.trigger_action,
+                    review_mode=inputs.review_mode,
+                    flash_reasoning_effort=acting.flash_reasoning_effort,
+                    marker=marker,
+                    review_design=review_design,
+                    flash_turn=dedup.flash_stats if dedup is not None else None,
+                    flash_sessions=flash_sessions,
+                    zero_change_skip_arm=meta.zero_change_skip,
+                    delta_band_arm=meta.delta_band,
+                    delta_review=delta_since_head_sha is not None,
+                    arm_set=meta.arm_set,
+                ),
+                start_to_close_timeout=_QUICK_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning("Could not capture the review-completed analytics event")
+        # The outcome edit: the full found-vs-published counts land on the status comment, so a PR
+        # with two inline comments never reads as "the review only found two things" — and a
+        # zero-publishable run gets explicit closure instead of silence. Best-effort like the receipt.
+        if status_comment:
+            try:
+                await workflow.execute_activity(
+                    finalize_status_comment_activity,
+                    FinalizeStatusCommentInput(
+                        team_id=inputs.team_id,
+                        report_id=report_id,
+                        run_index=meta.run_index,
+                        urgency_threshold=urgency_threshold,
+                        review_url=publish_result.review_url if publish_result is not None else None,
+                        resolved_from=acting.resolved_from,
+                        review_mode=inputs.review_mode,
+                        celebrate_clean_reviews=acting.celebrate_clean_reviews,
+                        marker=marker,
+                        capped_lens_parts=meta.lens_chunk_count if meta.lens_chunks_capped else None,
+                        raised_elsewhere=dedup.raised_elsewhere if dedup is not None else [],
+                        raised_elsewhere_count=dedup.raised_elsewhere_count if dedup is not None else 0,
+                    ),
+                    start_to_close_timeout=_QUICK_TIMEOUT,
+                    retry_policy=_GITHUB_POST_RETRY,
+                )
+            except Exception:
+                workflow.logger.warning("Could not finalize the status comment")
+        # Best-effort like the failed path: the receipt is bookkeeping, and failing (+ retrying) an
+        # already-published review over it buys nothing — the retry's already-published early-exit
+        # returns before this append anyway, so the receipt would stay lost either way.
+        await self._append_code_review_receipt(
+            inputs,
+            report_id=report_id,
+            run_index=meta.run_index,
+            outcome="published" if posted else "stored",
+            review_url=publish_result.review_url if publish_result is not None else None,
+            best_effort=True,
+        )
+
+        # Reviewing includes resolving: hand the PR to the resolution stage once this turn's comments
+        # are on it. The PR owner's opt-in decides, whoever triggered (the resolve-time snapshot,
+        # publishing runs only: an unpublished eval/CLI review must not write to the PR).
+        # `inputs.resolve_comments=False` turns it off for one run (the UI's "review without
+        # resolving"); no input turns it on. Fire-and-forget (ABANDON), because the resolution run
+        # outlives this workflow, and best-effort: a dispatch failure must never fail a finished
+        # review. Deterministic under replay: both operands come from recorded history, and the
+        # patch keeps older histories on the rule they ran with.
+        if workflow.patched("reviewhog-owner-resolution-2026-10"):
+            resolve_after = inputs.publish and acting.resolve_comments and inputs.resolve_comments is not False
+            resolution_acting_user_id = acting.owner_user_id
+        else:
+            resolve_after = (
+                inputs.resolve_comments
+                if inputs.resolve_comments is not None
+                else (inputs.publish and acting.resolve_comments)
+            )
+            resolution_acting_user_id = acting_user_id
+        # A flash turn never writes code, whatever the override or the setting says: the trigger pins
+        # the override off, and this is the guarantee for any other producer of a flash input.
+        if resolve_after and inputs.review_mode == REVIEW_MODE_FLASH:
+            workflow.logger.info("Flash review: the resolution stage is never chained")
+            resolve_after = False
+        if resolve_after and meta.pr_number is not None:
+            workflow.logger.info("Dispatching the resolution stage for this PR")
+            try:
+                await workflow.start_child_workflow(
+                    "resolve-pr",
+                    ResolvePRWorkflowInputs(
+                        team_id=inputs.team_id,
+                        user_id=inputs.user_id,
+                        owner=inputs.owner,
+                        repo=inputs.repo,
+                        pr_number=meta.pr_number,
+                        pr_url=meta.pr_url or "",
+                        acting_user_id=resolution_acting_user_id,
+                        trigger_source=inputs.trigger_source,
+                    ),
+                    id=resolve_pr_workflow_id(
+                        team_id=inputs.team_id, owner=inputs.owner, repo=inputs.repo, pr_number=meta.pr_number
+                    ),
+                    parent_close_policy=ParentClosePolicy.ABANDON,
+                    # A resolution run already in flight for this PR wins; this dispatch just no-ops.
+                    id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                )
+            except Exception as e:
+                # Broad by design (best-effort — a dispatch failure must never fail a finished review);
+                # log the detail so a real failure is distinguishable from the benign already-running race.
+                workflow.logger.warning(f"Could not dispatch the resolution stage; the review is unaffected: {e!r}")
+
+        workflow.logger.info(f"ReviewHog complete · report stored on ReviewReport {report_id}")
+        return report_id
+
+    @staticmethod
+    async def _review_with_single_agent(stage: SandboxStageInput, lens_chunk_count: int) -> FlashSessionStats | None:
+        """Stages 2 and 3 of the single-agent design: the main session and every lens session in parallel.
+
+        A failed lens session costs only its own findings. A failed main session fails the turn. Returns
+        how the sessions went, for the completed event.
+        """
+        if not workflow.patched("flash-lens-sessions-2026-10"):
+            workflow.logger.info("STAGE 2-3/7 · Single-agent review of the whole PR")
+            await workflow.execute_activity(
+                single_agent_review_activity,
+                stage,
+                start_to_close_timeout=_SANDBOX_TIMEOUT,
+                heartbeat_timeout=_SANDBOX_HEARTBEAT,
+                retry_policy=_RETRY,
+            )
+            return None
+
+        lens_units = [(lens, chunk_id) for lens in FLASH_LENSES for chunk_id in range(1, lens_chunk_count + 1)]
+        if stage.devex_lens:
+            lens_units.append((DEVEX_LENS_NAME, 1))
+        workflow.logger.info(
+            f"STAGE 2-3/7 · Single-agent review: the main session and {len(lens_units)} lens session(s)"
+        )
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_SANDBOXES)
+        # Workflow time, so a replay measures the same durations.
+        session_seconds: list[float] = []
+        devex_seconds: list[float] = []
+
+        # Each session returns whether it fell back to the control arm, or None in a history from before the result.
+        async def _main_session() -> bool | None:
+            async with semaphore:
+                started = workflow.now()
+                try:
+                    return await workflow.execute_activity(
+                        single_agent_review_activity,
+                        stage,
+                        start_to_close_timeout=_SANDBOX_TIMEOUT,
+                        heartbeat_timeout=_SANDBOX_HEARTBEAT,
+                        retry_policy=_RETRY,
+                    )
+                finally:
+                    session_seconds.append((workflow.now() - started).total_seconds())
+
+        async def _lens_session(lens: str, chunk_id: int) -> bool | None:
+            async with semaphore:
+                started = workflow.now()
+                try:
+                    return await workflow.execute_activity(
+                        lens_review_activity,
+                        LensReviewInput(
+                            team_id=stage.team_id,
+                            user_id=stage.user_id,
+                            report_id=stage.report_id,
+                            head_sha=stage.head_sha,
+                            repository=stage.repository,
+                            branch=stage.branch,
+                            run_index=stage.run_index,
+                            review_mode=stage.review_mode,
+                            flash_reasoning_effort=stage.flash_reasoning_effort,
+                            review_design=stage.review_design,
+                            trigger_source=stage.trigger_source,
+                            delta_since_head_sha=stage.delta_since_head_sha,
+                            arm_set=stage.arm_set,
+                            lens=lens,
+                            chunk_id=chunk_id,
+                        ),
+                        # Schedule-to-close bounds the retry too, so a timed-out lens session gets no second full window.
+                        schedule_to_close_timeout=FLASH_LENS_SESSION_TIMEOUT,
+                        heartbeat_timeout=_SANDBOX_HEARTBEAT,
+                        retry_policy=_RETRY,
+                    )
+                finally:
+                    elapsed = (workflow.now() - started).total_seconds()
+                    (devex_seconds if lens == DEVEX_LENS_NAME else session_seconds).append(elapsed)
+
+        # The main session goes first, so it never waits for a semaphore slot behind a lens session.
+        main_result, *lens_results = await asyncio.gather(
+            _main_session(), *(_lens_session(lens, chunk_id) for lens, chunk_id in lens_units), return_exceptions=True
+        )
+        if isinstance(main_result, BaseException):
+            raise main_result
+        lens_failures = lens_timeouts = 0
+        devex_failed = devex_timed_out = False
+        for (lens, chunk_id), result in zip(lens_units, lens_results):
+            if isinstance(result, BaseException):
+                workflow.logger.warning(
+                    f"Lens session {lens} part {chunk_id} failed or timed out; its findings are missing: {result!r}"
+                )
+                timed_out = isinstance(result, ActivityError) and isinstance(result.cause, ActivityTimeoutError)
+                if lens == DEVEX_LENS_NAME:
+                    devex_timed_out = timed_out
+                    devex_failed = not timed_out
+                elif timed_out:
+                    lens_timeouts += 1
+                else:
+                    lens_failures += 1
+        return FlashSessionStats(
+            lens_failures=lens_failures,
+            lens_timeouts=lens_timeouts,
+            slowest_session_seconds=round(max(session_seconds, default=0.0), 1),
+            arm_fallbacks=sum(
+                result is True
+                for (lens, _), result in [(("main", 1), main_result), *zip(lens_units, lens_results)]
+                if lens != DEVEX_LENS_NAME
+            ),
+            devex_failed=devex_failed if stage.devex_lens else None,
+            devex_timed_out=devex_timed_out if stage.devex_lens else None,
+            devex_session_seconds=round(devex_seconds[0], 1) if devex_seconds else None,
+        )
+
+    @staticmethod
+    async def _review_with_coordinator(stage: SandboxStageInput, lens_chunk_count: int) -> FlashSessionStats:
+        """Stages 2 and 3 of the single-agent design, with every session a sub-agent of one coordinator session."""
+        workflow.logger.info(f"STAGE 2-3/7 · Coordinated review: the main review and {lens_chunk_count} lens part(s)")
+        started = workflow.now()
+        result: CoordinatorReviewResult = await workflow.execute_activity(
+            coordinator_review_activity,
+            CoordinatorReviewInput(
+                team_id=stage.team_id,
+                user_id=stage.user_id,
+                report_id=stage.report_id,
+                head_sha=stage.head_sha,
+                repository=stage.repository,
+                branch=stage.branch,
+                run_index=stage.run_index,
+                review_mode=stage.review_mode,
+                flash_reasoning_effort=stage.flash_reasoning_effort,
+                review_design=stage.review_design,
+                trigger_source=stage.trigger_source,
+                lens_chunk_count=lens_chunk_count,
+            ),
+            start_to_close_timeout=_SANDBOX_TIMEOUT,
+            heartbeat_timeout=_SANDBOX_HEARTBEAT,
+            retry_policy=_RETRY,
+        )
+        return FlashSessionStats(
+            lens_failures=result.lens_failures,
+            lens_timeouts=0,
+            slowest_session_seconds=round((workflow.now() - started).total_seconds(), 1),
+            coordinator=True,
+        )
+
+    @staticmethod
+    async def _review_with_pipeline(stage: SandboxStageInput, acting_user_id: int) -> None:
+        """Stages 2 and 3 of the pipeline design: split into chunks, then the perspective wave."""
+        workflow.logger.info("STAGE 2/7 · Split into chunks")
+        chunk_ids: list[int] = await workflow.execute_activity(
+            split_chunks_activity,
+            stage,
+            start_to_close_timeout=_SANDBOX_TIMEOUT,
+            heartbeat_timeout=_SANDBOX_HEARTBEAT,
+            retry_policy=_ONESHOT_RETRY,
+        )
+
+        workflow.logger.info("STAGE 3/7 · Review chunks (perspective wave + blind-spot check)")
+        await workflow.execute_child_workflow(
+            ReviewPerspectivesWorkflow.run,
+            ReviewPerspectivesInputs(
+                team_id=stage.team_id,
+                user_id=stage.user_id,
+                report_id=stage.report_id,
+                head_sha=stage.head_sha,
+                repository=stage.repository,
+                branch=stage.branch,
+                run_index=stage.run_index,
+                review_mode=stage.review_mode,
+                flash_reasoning_effort=stage.flash_reasoning_effort,
+                chunk_ids=chunk_ids,
+                acting_user_id=acting_user_id,
+            ),
+            id=f"{workflow.info().workflow_id}/review",
+            retry_policy=_RETRY,
+        )
+
+    @staticmethod
+    async def _add_eyes_reaction(team_id: int, repository: str, pr_number: int) -> int | None:
+        try:
+            return await workflow.execute_activity(
+                add_review_reaction_activity,
+                ReviewReactionInput(team_id=team_id, repository=repository, pr_number=pr_number),
+                start_to_close_timeout=_QUICK_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning("Could not add the review reaction; continuing without it")
+            return None
+
+    @staticmethod
+    async def _nudge_stamphog(repository: str, pr_number: int, head_sha: str) -> None:
+        try:
+            await workflow.execute_activity(
+                nudge_stamphog_activity,
+                TurnEndedInput(repository=repository, pr_number=pr_number, head_sha=head_sha),
+                start_to_close_timeout=_QUICK_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning("Could not ask stamphog to re-review")
+
+    @staticmethod
+    async def _finish_standard_automatic_turn(turn: FinishedStandardAutomaticTurn) -> None:
+        try:
+            await workflow.execute_activity(
+                finish_standard_automatic_turn_activity,
+                turn,
+                start_to_close_timeout=_QUICK_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning("Could not record the turn coverage or start a silent stamphog review")
+
+    @staticmethod
+    async def _remove_eyes_reaction(team_id: int, repository: str, pr_number: int, reaction_id: int) -> None:
+        try:
+            await workflow.execute_activity(
+                remove_review_reaction_activity,
+                ReviewReactionInput(
+                    team_id=team_id, repository=repository, pr_number=pr_number, reaction_id=reaction_id
+                ),
+                start_to_close_timeout=_QUICK_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning("Could not remove the review reaction")
+
+    @staticmethod
+    async def _append_code_review_receipt(
+        inputs: ReviewPRWorkflowInputs,
+        *,
+        report_id: str,
+        run_index: int,
+        outcome: str,
+        review_url: str | None = None,
+        best_effort: bool = False,
+    ) -> None:
+        """Append the turn's `code_review` receipt to the signal report's artefact log, when linked."""
+        if inputs.signal_report_id is None:
+            return
+        try:
+            await workflow.execute_activity(
+                append_code_review_artefact_activity,
+                AppendCodeReviewArtefactInput(
+                    team_id=inputs.team_id,
+                    signal_report_id=inputs.signal_report_id,
+                    review_report_id=report_id,
+                    run_index=run_index,
+                    outcome=outcome,
+                    review_url=review_url,
+                ),
+                start_to_close_timeout=_QUICK_TIMEOUT,
+                retry_policy=_RETRY,
+            )
+        except Exception:
+            if not best_effort:
+                raise
+            workflow.logger.warning("Could not append the code_review receipt; continuing without it")

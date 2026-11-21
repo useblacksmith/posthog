@@ -1,0 +1,641 @@
+@layer components {
+    /* =========================================================================
+       Base
+       ========================================================================= */
+
+    /* The ring on a highlighted row of any menu. It is set on the row so that `--ring` resolves in the row's theme. */
+    :is(.quill-button, .quill-select__item) {
+        --quill-row-ring-color: color-mix(in oklab, var(--ring) 30%, transparent);
+        --quill-row-ring: 0 0 0 1px var(--card), 0 0 0 3px var(--quill-row-ring-color);
+    }
+
+    .quill-button {
+        font-size: var(--text-ui, 0.8125rem);
+        font-weight: 500;
+        line-height: 1.625;
+        cursor: pointer;
+        user-select: none;
+        background-clip: padding-box;
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        outline: none;
+    }
+
+    /*
+     * When a quill button is rendered as an <a> (e.g. `render={<LinkPrimitive />}`),
+     * the consumer's global `a { color: … }` reset would otherwise paint the label.
+     * `:where(a)` neutralizes that with zero added specificity — being in the
+     * `components` layer is enough to beat a `base`-layer `a {}` rule, while the
+     * (0,1,0) specificity still lets colored variants (link, primary, …) win.
+     */
+    :where(a).quill-button {
+        color: var(--foreground);
+        text-decoration: none;
+    }
+
+    .quill-button:focus-visible {
+        border-color: var(--ring);
+        box-shadow: 0 0 0 2px color-mix(in oklab, var(--ring) 30%, transparent);
+    }
+
+    /*
+     * Press feedback — the button dips 1px under the cursor. Excluded are the
+     * variants/components that own their own press motion: `primary` sinks its
+     * face into its shelf, `toggle` dips 2px, and tabs stay put (a tab that jumps
+     * would drag the whole strip's baseline with it).
+     */
+    .quill-button:not(
+        :disabled,
+        [aria-disabled='true'],
+        .quill-button--variant-primary,
+        .quill-tabs__trigger,
+        .quill-toggle
+    ):active {
+        translate: 0 1px;
+    }
+
+    /* Disabled covers both paths: native :disabled (focusableWhenDisabled=false)
+       and the focusable aria-disabled="true" path (the default). Loading is
+       excluded — it's busy, not unavailable, so it keeps full-strength visuals
+       under the spinner. cursor: not-allowed signals the button is unavailable;
+       native :disabled set it for free, but aria-disabled does not. */
+    .quill-button:disabled,
+    .quill-button[aria-disabled='true']:not([data-loading]) {
+        cursor: not-allowed;
+        opacity: 0.5;
+    }
+
+    .quill-button[aria-invalid='true'] {
+        border-color: var(--destructive);
+        box-shadow: 0 0 0 2px color-mix(in oklab, var(--destructive) 20%, transparent);
+    }
+
+    :is(.dark, [theme='dark']) .quill-button[aria-invalid='true'] {
+        border-color: color-mix(in oklab, var(--destructive) 50%, transparent);
+        box-shadow: 0 0 0 2px color-mix(in oklab, var(--destructive) 40%, transparent);
+    }
+
+    .quill-button svg {
+        flex-shrink: 0;
+        pointer-events: none;
+    }
+
+    .quill-button svg:not([class*='size-']) {
+        width: 1rem;
+        height: 1rem;
+    }
+
+    .quill-button kbd {
+        margin-right: -0.25rem;
+    }
+
+    .quill-button:has([data-slot='dot']) {
+        padding-inline-start: 0.375rem;
+    }
+
+    /* =========================================================================
+       Variant: default (menu-style — used in popovers/dropdowns/comboboxes)
+       ========================================================================= */
+    .quill-button--variant-default {
+        border: none;
+        transition: border-radius 0.1s;
+    }
+
+    .quill-button--variant-default:not(:disabled, [aria-disabled='true']):hover {
+        color: var(--foreground);
+        background-color: var(--fill-hover);
+    }
+
+    .quill-button--variant-default[aria-expanded='true'] {
+        color: var(--foreground);
+        background-color: var(--fill-expanded);
+    }
+
+    .quill-button--variant-default[data-popup-open] {
+        background-color: var(--fill-selected);
+    }
+
+    .quill-button--variant-default:not(:hover, [data-highlighted])[aria-selected='true'],
+    .quill-button--variant-default:not(:hover, [data-highlighted])[aria-checked='true'] {
+        background-color: var(--fill-selected);
+    }
+
+    /* The row keyboard input or a filter would act on takes the ring. A row under the pointer stays a plain hover. */
+    .quill-button--variant-default[data-highlighted] {
+        background-color: var(--fill-hover);
+        border-color: var(--ring);
+        box-shadow: var(--quill-row-ring);
+    }
+
+    /* Consecutive selected items collapse corners for a seamless stack */
+    .quill-button--variant-default:is([aria-selected='true'], [aria-checked='true']):has(
+        + :is([aria-selected='true'], [aria-checked='true'])
+    ) {
+        border-bottom-right-radius: 0;
+        border-bottom-left-radius: 0;
+    }
+
+    :is([aria-selected='true'], [aria-checked='true'])
+        + .quill-button--variant-default:is([aria-selected='true'], [aria-checked='true']) {
+        border-top-left-radius: 0;
+        border-top-right-radius: 0;
+    }
+
+    /* =========================================================================
+       Variant: primary
+       ========================================================================= */
+
+    /*
+     * A raised face on a shelf, drawn by two layers inside the button's own box, so
+     * the button keeps its size and lines up with its neighbors in a row:
+     * - `::before` is the shelf, in a mid shade of the brand color.
+     * - `::after` is the face, which stops `--quill-button-lift` above the shelf's bottom.
+     * Both take the dark edge as their outline. `--quill-button-shelf` is the shelf's height
+     * at rest. A press drops the lift to 0: the face and the label move down by the whole
+     * shelf, compressing it to a plain 1px bottom edge, and nothing shows above the face.
+     */
+    .quill-button--variant-primary {
+        --quill-button-edge: color-mix(in oklab, var(--primary) 70%, black);
+        --quill-button-side: color-mix(in oklab, var(--primary) 84%, black);
+        --quill-button-face: var(--primary);
+        --quill-button-shelf: 2px;
+        --quill-button-lift: var(--quill-button-shelf);
+        --quill-button-sink: calc(var(--quill-button-shelf) - var(--quill-button-lift));
+
+        position: relative;
+        padding-block: var(--quill-button-sink) var(--quill-button-lift);
+        color: var(--primary-foreground);
+        background-color: transparent;
+        isolation: isolate;
+        border-color: transparent;
+    }
+
+    :is(.dark, [theme='dark']) .quill-button--variant-primary {
+        --quill-button-edge: color-mix(in oklab, var(--primary) 62%, black);
+        --quill-button-side: color-mix(in oklab, var(--primary) 78%, black);
+    }
+
+    .quill-button--variant-primary::before,
+    .quill-button--variant-primary::after {
+        position: absolute;
+        inset: -1px;
+        z-index: -1;
+        pointer-events: none;
+        content: '';
+        border: 1px solid var(--quill-button-edge);
+
+        /* Follow the button's own corners: squared ones inside a ButtonGroup, a pill or a circle from a consumer. */
+        border-radius: inherit;
+    }
+
+    .quill-button--variant-primary::before {
+        inset-block-start: calc(var(--quill-button-sink) - 1px);
+        background-color: var(--quill-button-side);
+    }
+
+    .quill-button--variant-primary::after {
+        inset-block: calc(var(--quill-button-sink) - 1px) calc(var(--quill-button-lift) - 1px);
+        background-color: var(--quill-button-face);
+    }
+
+    .quill-button--variant-primary:focus-visible {
+        border-color: transparent;
+        box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 30%, transparent);
+    }
+
+    .quill-button--variant-primary:not(:disabled, [aria-disabled='true']):hover {
+        --quill-button-face: color-mix(in oklab, var(--primary) 98%, black 5%);
+    }
+
+    .quill-button--variant-primary:not(:disabled, [aria-disabled='true']):active {
+        --quill-button-lift: 0px;
+    }
+
+    /* Disabled sits flat, with no shelf that reads as pressable. */
+    .quill-button--variant-primary:disabled,
+    .quill-button--variant-primary[aria-disabled='true']:not([data-loading]) {
+        --quill-button-shelf: 0px;
+    }
+
+    /* =========================================================================
+       Variant: secondary
+       ========================================================================= */
+    .quill-button--variant-secondary {
+        background-color: var(--fill-hover);
+    }
+
+    /* One rung above the resting fill. Written out rather than tokenized: no
+       other surface needs an elevated hover over `--fill-hover`. */
+    .quill-button--variant-secondary:not(:disabled, [aria-disabled='true']):hover {
+        background-color: color-mix(in oklab, var(--foreground) 6%, transparent);
+    }
+
+    :is(.dark, [theme='dark']) .quill-button--variant-secondary:not(:disabled, [aria-disabled='true']):hover {
+        background-color: color-mix(in oklab, var(--foreground) 10%, transparent);
+    }
+
+    .quill-button--variant-secondary[aria-expanded='true'],
+    .quill-button--variant-secondary[data-popup-open] {
+        background-color: var(--fill-expanded);
+    }
+
+    /* =========================================================================
+       Variant: outline
+       ========================================================================= */
+    .quill-button--variant-outline {
+        background-color: color-mix(in oklab, var(--muted) 30%, transparent);
+        border-color: color-mix(in oklab, var(--foreground) 10%, transparent);
+    }
+
+    :is(.dark, [theme='dark']) .quill-button--variant-outline {
+        border-color: color-mix(in oklab, var(--foreground) 15%, transparent);
+    }
+
+    .quill-button--variant-outline:not(:disabled, [aria-disabled='true']):hover {
+        color: var(--foreground);
+        background-color: var(--fill-hover);
+    }
+
+    .quill-button--variant-outline[aria-expanded='true'] {
+        color: var(--foreground);
+        background-color: var(--fill-expanded);
+    }
+
+    .quill-button--variant-outline[data-popup-open] {
+        background-color: color-mix(in oklab, var(--input) 50%, transparent);
+    }
+
+    /* =========================================================================
+       Variant: destructive / destructive outline
+       ========================================================================= */
+
+    /* One fill ladder for both. The outline is that ladder under a red border,
+       so the two can never drift apart. */
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline) {
+        color: var(--destructive-foreground);
+        background-color: color-mix(in oklab, var(--destructive) 50%, transparent);
+    }
+
+    .quill-button--variant-destructive-outline {
+        border-color: color-mix(in oklab, var(--destructive-foreground) 30%, transparent);
+    }
+
+    /* `data-highlighted` is the keyboard equivalent of hover inside a menu —
+       both land on the same brighter fill so navigating by arrow keys reads
+       the same as pointing at the row. */
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline):not(
+        :disabled,
+        [aria-disabled='true']
+    ):hover,
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline):not(
+        :disabled,
+        [aria-disabled='true']
+    )[data-highlighted] {
+        background-color: var(--destructive);
+    }
+
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline):not(
+        :disabled,
+        [aria-disabled='true']
+    ):active {
+        background-color: color-mix(in oklab, var(--destructive) 88%, var(--destructive-foreground) 12%);
+    }
+
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline)[aria-expanded='true'],
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline)[data-popup-open] {
+        background-color: var(--destructive);
+    }
+
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline):focus-visible {
+        border-color: currentColor;
+        box-shadow: 0 0 0 2px color-mix(in oklab, var(--destructive-foreground) 60%, transparent);
+    }
+
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline)[data-highlighted] {
+        --quill-row-ring-color: color-mix(in oklab, var(--destructive-foreground) 60%, transparent);
+
+        border-color: currentColor;
+        box-shadow: var(--quill-row-ring);
+    }
+
+    :is(
+        .quill-button--variant-default,
+        .quill-button--variant-destructive,
+        .quill-button--variant-destructive-outline
+    )[data-highlighted]:hover {
+        border-color: transparent;
+        box-shadow: none;
+    }
+
+    /* =========================================================================
+       Variant: link / link-foreground / link-muted
+       ========================================================================= */
+    .quill-button--variant-link {
+        color: var(--primary);
+        text-underline-offset: 4px;
+    }
+
+    .quill-button--variant-link:not(:disabled, [aria-disabled='true']):hover,
+    .quill-button--variant-link[data-popup-open] {
+        text-decoration: underline;
+    }
+
+    .quill-button--variant-link-foreground {
+        color: var(--foreground);
+    }
+
+    .quill-button--variant-link-foreground:not(:disabled, [aria-disabled='true']):hover,
+    .quill-button--variant-link-foreground[data-popup-open] {
+        background-color: var(--fill-hover);
+    }
+
+    .quill-button--variant-link-muted {
+        color: var(--muted-foreground);
+        text-underline-offset: 4px;
+    }
+
+    .quill-button--variant-link-muted:not(:disabled, [aria-disabled='true']):hover,
+    .quill-button--variant-link-muted[data-popup-open] {
+        text-decoration: underline;
+    }
+
+    /* =========================================================================
+       Sizes — height/width/padding/gap/font-size + icon-child size
+       ========================================================================= */
+
+    .quill-button--size-default,
+    .quill-button--size-row {
+        gap: 0.5rem;
+        height: 1.75rem;
+        padding-inline: 0.5rem;
+        font-size: var(--text-ui, 0.8125rem);
+        line-height: 1.625;
+    }
+
+    /* A list row (menu, combobox and autocomplete items, empty messages): default metrics, full width, regular weight. */
+    .quill-button--size-row {
+        width: 100%;
+        font-weight: 400;
+    }
+
+    .quill-button--size-default:has([data-icon='inline-end']),
+    .quill-button--size-row:has([data-icon='inline-end']) {
+        padding-inline-end: 0.375rem;
+    }
+
+    .quill-button--size-default:has([data-icon='inline-start']),
+    .quill-button--size-row:has([data-icon='inline-start']) {
+        padding-inline-start: 0.375rem;
+    }
+
+    .quill-button--size-default svg:not([class*='size-']),
+    .quill-button--size-row svg:not([class*='size-']) {
+        width: 0.875rem;
+        height: 0.875rem;
+    }
+
+    .quill-button--size-xs {
+        gap: 0.25rem;
+        height: 1.25rem;
+        padding-inline: 0.5rem;
+        font-size: 0.625rem;
+        border-radius: var(--radius-sm);
+    }
+
+    .quill-button--size-xs:has([data-icon='inline-end']) {
+        padding-inline-end: 0.375rem;
+    }
+
+    .quill-button--size-xs:has([data-icon='inline-start']) {
+        padding-inline-start: 0.375rem;
+    }
+
+    .quill-button--size-xs svg:not([class*='size-']) {
+        width: 0.625rem;
+        height: 0.625rem;
+    }
+
+    .quill-button--size-sm {
+        gap: 0.25rem;
+        height: 1.5rem;
+        padding-inline: 0.5rem;
+        font-size: var(--text-xs, 0.75rem);
+        line-height: 1.625;
+    }
+
+    .quill-button--size-sm:has([data-icon='inline-end']) {
+        padding-inline-end: 0.375rem;
+    }
+
+    .quill-button--size-sm:has([data-icon='inline-start']) {
+        padding-inline-start: 0.375rem;
+    }
+
+    .quill-button--size-sm svg:not([class*='size-']) {
+        width: 0.75rem;
+        height: 0.75rem;
+    }
+
+    /* A link inside a sentence takes the sentence's type, because the other sizes set a control height and font size. */
+    .quill-button--size-inline {
+        gap: 0.25em;
+        height: auto;
+        padding: 0;
+        font-size: inherit;
+        line-height: inherit;
+        vertical-align: baseline;
+    }
+
+    .quill-button--size-inline svg:not([class*='size-']) {
+        width: 1em;
+        height: 1em;
+    }
+
+    .quill-button--size-lg {
+        gap: 0.5rem;
+        height: 2rem;
+        padding-inline: 0.625rem;
+        font-size: var(--text-ui, 0.8125rem);
+        line-height: 1.625;
+    }
+
+    .quill-button--size-lg:has([data-icon='inline-end']) {
+        padding-inline-end: 0.5rem;
+    }
+
+    .quill-button--size-lg:has([data-icon='inline-start']) {
+        padding-inline-start: 0.5rem;
+    }
+
+    .quill-button--size-lg svg:not([class*='size-']) {
+        width: 1rem;
+        height: 1rem;
+    }
+
+    /* Icon sizes — square */
+    .quill-button--size-icon {
+        width: 1.75rem;
+        height: 1.75rem;
+    }
+
+    .quill-button--size-icon svg:not([class*='size-']) {
+        width: 0.875rem;
+        height: 0.875rem;
+    }
+
+    .quill-button--size-icon-xs {
+        width: 1.25rem;
+        height: 1.25rem;
+        border-radius: var(--radius-sm);
+    }
+
+    .quill-button--size-icon-xs svg:not([class*='size-']) {
+        width: 0.625rem;
+        height: 0.625rem;
+    }
+
+    .quill-button--size-icon-sm {
+        width: 1.5rem;
+        height: 1.5rem;
+    }
+
+    .quill-button--size-icon-sm svg:not([class*='size-']) {
+        width: 0.75rem;
+        height: 0.75rem;
+    }
+
+    .quill-button--size-icon-lg {
+        width: 2rem;
+        height: 2rem;
+    }
+
+    .quill-button--size-icon-lg svg:not([class*='size-']) {
+        width: 1rem;
+        height: 1rem;
+    }
+
+    /* =========================================================================
+       Modifiers
+       ========================================================================= */
+    .quill-button--not-focusable-when-disabled:disabled {
+        pointer-events: none;
+    }
+
+    .quill-button--inert {
+        cursor: default;
+    }
+
+    .quill-button--inert:not(:disabled, [aria-disabled='true']):hover {
+        background-color: transparent;
+    }
+
+    /* =========================================================================
+       Indicator
+       ========================================================================= */
+
+    /* The dot sits on the corner, outside the icon. The ring cuts it out of the
+       button border, so it defaults to the app background; set
+       `--quill-button-indicator-ring` when the button sits on another surface. */
+    .quill-button[data-indicator] {
+        position: relative;
+    }
+
+    .quill-button__indicator {
+        position: absolute;
+        inset-inline-end: -0.125rem;
+        top: -0.125rem;
+        width: 0.5rem;
+        height: 0.5rem;
+        pointer-events: none;
+        background-color: var(--primary);
+        border-radius: 9999px;
+        box-shadow: 0 0 0 2px var(--quill-button-indicator-ring, var(--background));
+    }
+
+    .quill-button__indicator[data-variant='warning'] {
+        background-color: var(--warning-foreground);
+    }
+
+    .quill-button__indicator[data-variant='destructive'] {
+        background-color: var(--destructive-foreground);
+    }
+
+    /* =========================================================================
+       Loading
+       ========================================================================= */
+
+    /* The label stays in the DOM at full width — text fades to transparent and
+       element children (icons, kbd) fade out — so the button never resizes.
+       The spinner overlays the center. */
+    .quill-button[data-loading] {
+        position: relative;
+        color: transparent;
+        transition: color 150ms ease;
+    }
+
+    /* Loading is busy, not unavailable: the button is focusable-while-disabled
+       (aria-disabled, no native disabled attribute), so the dimmed :disabled
+       look never applies — full-strength visuals under the spinner. */
+    .quill-button[data-loading] > :not(.quill-spinner) {
+        opacity: 0;
+        transition: opacity 150ms ease;
+    }
+
+    .quill-button--variant-destructive-outline[data-loading] {
+        border-color: var(--destructive-foreground);
+    }
+
+    .quill-button[data-loading] > .quill-spinner {
+        position: absolute;
+        inset: 0;
+        margin: auto;
+        color: var(--foreground);
+        animation:
+            var(--animate-spin, spin 1s linear infinite),
+            quill-button__spinner-in 150ms cubic-bezier(0.215, 0.61, 0.355, 1);
+    }
+
+    .quill-button--variant-primary[data-loading] > .quill-spinner {
+        color: var(--primary-foreground);
+    }
+
+    :is(.quill-button--variant-destructive, .quill-button--variant-destructive-outline)[data-loading] > .quill-spinner {
+        color: var(--destructive-foreground);
+    }
+
+    .quill-button--variant-link[data-loading] > .quill-spinner {
+        color: var(--primary);
+    }
+
+    .quill-button--variant-link-foreground[data-loading] > .quill-spinner {
+        color: var(--foreground);
+    }
+
+    .quill-button--variant-link-muted[data-loading] > .quill-spinner {
+        color: var(--muted-foreground);
+    }
+
+    @keyframes quill-button__spinner-in {
+        from {
+            opacity: 0;
+            scale: 0.9;
+        }
+
+        to {
+            opacity: 1;
+            scale: 1;
+        }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .quill-button[data-loading],
+        .quill-button[data-loading] > :not(.quill-spinner) {
+            transition: none;
+        }
+
+        /* Keep the rotation — it is the status indicator — but drop the entrance. */
+        .quill-button[data-loading] > .quill-spinner {
+            animation: var(--animate-spin, spin 1s linear infinite);
+        }
+    }
+}

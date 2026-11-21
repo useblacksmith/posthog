@@ -1,0 +1,2132 @@
+import hmac
+import hashlib
+from datetime import timedelta
+from ipaddress import ip_network
+from typing import cast
+from uuid import uuid4
+
+from posthog.test.base import APIBaseTest
+from unittest.mock import ANY, patch
+
+from django.core.cache import cache
+from django.db import connection
+from django.test import SimpleTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
+
+from parameterized import parameterized
+from rest_framework import status
+from rest_framework.exceptions import ValidationError
+from rest_framework.test import APIRequestFactory
+
+from posthog.api.organization import (
+    OrganizationMemberNoticeSerializer,
+    OrganizationSerializer,
+    _fetch_member_count,
+    _org_serializer_cache_version,
+)
+from posthog.constants import AvailableFeature
+from posthog.models import Organization, OrganizationMembership, Team, User
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.oauth import OAuthAccessToken, OAuthApplication
+from posthog.models.organization_domain import OrganizationDomain
+from posthog.models.organization_ip_restrictions import OrganizationIPRestrictions
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.uploaded_media import UploadedMedia
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+from posthog.user_permissions import UserPermissions
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.access_control.backend.models.feature_flag_role_access import FeatureFlagRoleAccess
+from products.access_control.backend.models.role import Role, RoleMembership
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
+from ee.models.explicit_team_membership import ExplicitTeamMembership
+
+
+class TestOrganizationAPI(APIBaseTest):
+    # Retrieving organization
+
+    def test_get_current_organization(self):
+        response = self.client.get("/api/organizations/@current")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response_data = response.json()
+        self.assertEqual(response_data["id"], str(self.organization.id))
+        # By default, no product features are available (can be None or [])
+        self.assertFalse(response_data["available_product_features"])
+
+        # DEPRECATED attributes
+        self.assertNotIn("personalization", response_data)
+        self.assertNotIn("setup", response_data)
+
+    @parameterized.expand(["not-a-uuid", "123"])
+    def test_retrieve_organization_with_non_uuid_id_returns_404(self, organization_id: str) -> None:
+        response = self.client.get(f"/api/organizations/{organization_id}/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_project_group_tags_are_visible_in_organization_projects(self) -> None:
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.client.get("/api/organizations/@current")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            updated = self.client.patch(
+                f"/api/projects/{self.project.id}/",
+                {"tags": ["project-group:production-apps"]},
+                format="json",
+            )
+        self.assertEqual(updated.status_code, status.HTTP_200_OK, updated.json())
+
+        organization = self.client.get("/api/organizations/@current")
+        self.assertEqual(organization.status_code, status.HTTP_200_OK, organization.json())
+        teams = {team["id"]: team for team in organization.json()["teams"]}
+        self.assertEqual(teams[self.team.id]["project_group"], "production-apps")
+
+    def test_project_logo_changes_show_in_organization_projects(self) -> None:
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        media = UploadedMedia.objects.create(
+            team=self.team,
+            created_by=self.user,
+            media_location="http://example.com/logo.png",
+            content_type="image/png",
+            file_name="logo.png",
+        )
+        # Fills the per-user cache of the org's project list before the logo exists.
+        self.client.get("/api/organizations/@current")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            updated = self.client.patch(
+                f"/api/projects/{self.project.id}/",
+                {"logo_media_id": str(media.id)},
+                format="json",
+            )
+        self.assertEqual(updated.status_code, status.HTTP_200_OK, updated.json())
+
+        organization = self.client.get("/api/organizations/@current")
+        self.assertEqual(organization.status_code, status.HTTP_200_OK, organization.json())
+        projects = {project["id"]: project for project in organization.json()["projects"]}
+        self.assertEqual(projects[self.project.id]["logo_media_id"], str(media.id))
+
+    def test_get_current_team_fields(self):
+        self.organization.setup_section_2_completed = False
+        self.organization.save()
+        Team.objects.create(organization=self.organization, is_demo=True, ingested_event=True)
+        Team.objects.create(organization=self.organization, completed_snippet_onboarding=True)
+        self.team.is_demo = True
+        self.team.save()
+
+        response_data = self.client.get("/api/organizations/@current").json()
+
+        self.assertEqual(response_data["id"], str(self.organization.id))
+
+    # Creating organizations
+
+    def test_cant_create_organization_without_valid_license_on_self_hosted(self):
+        with self.is_cloud(False):
+            response = self.client.post("/api/organizations/", {"name": "Test"})
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertEqual(
+                response.json(),
+                {
+                    "attr": None,
+                    "code": "permission_denied",
+                    "detail": "You must upgrade your PostHog plan to be able to create and manage multiple organizations.",
+                    "type": "authentication_error",
+                },
+            )
+            self.assertEqual(Organization.objects.count(), 1)
+            response = self.client.post("/api/organizations/", {"name": "Test"})
+            self.assertEqual(Organization.objects.count(), 1)
+
+    def test_cant_create_organization_with_custom_plugin_level(self):
+        with self.is_cloud(True):
+            response = self.client.post("/api/organizations/", {"name": "Test", "plugins_access_level": 6})
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(Organization.objects.count(), 2)
+            self.assertEqual(response.json()["plugins_access_level"], 3)
+
+    @parameterized.expand(
+        [
+            ("posthog_staff", "hedgehog@posthog.com", True),
+            ("customer", "owner@example.com", False),
+        ]
+    )
+    @patch("posthog.event_usage.posthoganalytics.group_identify")
+    def test_organizations_created_by_posthog_staff_are_excluded_from_crm(
+        self, _name, email, expect_flagged, mock_group_identify
+    ):
+        user = self._create_user(email)
+        self.client.force_login(user)
+
+        with self.is_cloud(True):
+            response = self.client.post("/api/organizations/", {"name": "New org"})
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        if expect_flagged:
+            mock_group_identify.assert_called_once_with(
+                "organization",
+                response.json()["id"],
+                properties={"exclude_from_crm": True},
+            )
+        else:
+            mock_group_identify.assert_not_called()
+
+    def test_cannot_create_organization_with_default_role(self):
+        role = Role.objects.create(name="Existing organization role", organization=self.organization)
+
+        with self.is_cloud(True):
+            response = self.client.post("/api/organizations/", {"name": "New org", "default_role_id": str(role.id)})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Organization.objects.count(), 1)
+
+    # Updating organizations
+
+    def test_update_organization_default_role(self):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+        role = Role.objects.create(name="Default role", organization=self.organization)
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}", {"default_role_id": str(role.id)})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.default_role, role)
+
+    def test_cannot_update_organization_with_role_from_another_organization(self):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+        other_organization = Organization.objects.create(name="Other organization")
+        role = Role.objects.create(name="Other organization role", organization=other_organization)
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}", {"default_role_id": str(role.id)})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.organization.refresh_from_db()
+        self.assertIsNone(self.organization.default_role)
+
+    def test_update_organization_if_admin(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.name = self.CONFIG_ORGANIZATION_NAME
+        self.organization.save()
+
+        response_rename = self.client.patch(f"/api/organizations/{self.organization.id}", {"name": "QWERTY"})
+
+        self.assertEqual(response_rename.status_code, status.HTTP_200_OK)
+        self.assertEqual(response_rename.json()["slug"], "qwerty")
+
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.name, "QWERTY")
+        self.assertEqual(self.organization.slug, "qwerty")
+
+        response_slug = self.client.patch(f"/api/organizations/{self.organization.id}", {"slug": "hijacked"})
+
+        self.assertEqual(response_slug.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.slug, "qwerty")
+
+    def test_update_organization_if_owner(self):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+        self.organization.name = self.CONFIG_ORGANIZATION_NAME
+        self.organization.save()
+
+        response_rename = self.client.patch(f"/api/organizations/{self.organization.id}", {"name": "QWERTY"})
+
+        self.assertEqual(response_rename.status_code, status.HTTP_200_OK)
+
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.name, "QWERTY")
+
+    def test_admin_can_set_and_clear_member_notice(self) -> None:
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        notice = {
+            "message": "Read how we handle your data.",
+            "action": {"label": "Read the policy", "url": "https://intranet.example.com/policy"},
+        }
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}", {"member_notice": notice}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["member_notice"], notice)
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}",
+            {"member_notice": {"message": "Hi", "action": {"label": "Open", "url": "javascript:alert(1)"}}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.member_notice, notice)
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}", {"member_notice": None}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertIsNone(self.organization.member_notice)
+
+    def test_cannot_update_organization_if_not_owner_or_admin(self):
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        response_rename = self.client.patch(f"/api/organizations/{self.organization.id}", {"name": "ASDFG"})
+        self.assertEqual(response_rename.status_code, status.HTTP_403_FORBIDDEN)
+        self.organization.refresh_from_db()
+        self.assertNotEqual(self.organization.name, "ASDFG")
+
+    def test_cannot_opt_into_ai_training_with_a_signed_baa(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.is_ai_training_opted_in = False
+        self.organization.save()
+
+        with patch("posthog.api.organization.has_signed_baa", return_value=True):
+            response = self.client.patch(
+                f"/api/organizations/{self.organization.id}/", {"is_ai_training_opted_in": True}
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], "locked")
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.is_ai_training_opted_in, False)
+
+    def test_listing_organizations_reads_the_baa_once_regardless_of_count(self):
+        Organization.objects.bootstrap(self.user)
+        Organization.objects.bootstrap(self.user)
+
+        with CaptureQueriesContext(connection) as context:
+            response = self.client.get("/api/organizations/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(response.json()["results"]), 3)
+        legal_document_queries = [q for q in context.captured_queries if "legal_documents_legaldocument" in q["sql"]]
+        self.assertEqual(len(legal_document_queries), 1)
+
+    def test_cant_update_plugins_access_level(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.plugins_access_level = 3
+        self.organization.save()
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}", {"plugins_access_level": 9})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.plugins_access_level, 3)
+
+    def test_is_active_fields_are_read_only(self):
+        """Test that is_active and is_not_active_reason are returned but cannot be updated via API."""
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        # Verify fields are returned in GET response
+        response = self.client.get(f"/api/organizations/{self.organization.id}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("is_active", response.json())
+        self.assertIn("is_not_active_reason", response.json())
+        self.assertEqual(response.json()["is_active"], True)
+        self.assertIsNone(response.json()["is_not_active_reason"])
+
+        # Attempt to update is_active - should be ignored
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}",
+            {"is_active": False, "is_not_active_reason": "Test reason"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Verify fields were not updated
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.is_active, True)
+        self.assertIsNone(self.organization.is_not_active_reason)
+
+    @patch("posthoganalytics.capture")
+    def test_enforce_2fa_for_everyone(self, mock_capture):
+        # Only admins should be able to enforce 2fa
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_2fa": True})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        self.organization.available_product_features = [{"key": "2fa_enforcement", "name": "2FA Enforcement"}]
+        self.organization.save()
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_2fa": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.enforce_2fa, True)
+
+        # Verify the capture event was called correctly
+        mock_capture.assert_any_call(
+            "organization 2fa enforcement toggled",
+            distinct_id=self.user.distinct_id,
+            properties={
+                "enabled": True,
+                "organization_id": str(self.organization.id),
+                "organization_name": self.organization.name,
+                "user_role": OrganizationMembership.Level.ADMIN,
+            },
+            groups={"instance": ANY, "organization": str(self.organization.id)},
+        )
+
+    @patch("posthoganalytics.capture")
+    def test_ai_data_processing_consent_capture_event(self, mock_capture):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/", {"is_ai_data_processing_approved": True}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.is_ai_data_processing_approved, True)
+
+        mock_capture.assert_any_call(
+            "organization ai data processing consent toggled",
+            distinct_id=self.user.distinct_id,
+            properties={
+                "enabled": True,
+                "organization_id": str(self.organization.id),
+                "organization_name": self.organization.name,
+                "user_role": OrganizationMembership.Level.ADMIN,
+            },
+            groups={"instance": ANY, "organization": str(self.organization.id)},
+        )
+
+    def test_cannot_update_members_can_invite_without_feature(self):
+        """Test that members_can_invite cannot be updated without ORGANIZATION_INVITE_SETTINGS feature."""
+        # Ensure user is admin (passes permission checks)
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        # Ensure feature is NOT available
+        self.organization.available_product_features = []
+        self.organization.save()
+
+        # Try to update members_can_invite - should fail
+        current_value = self.organization.members_can_invite
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/", {"members_can_invite": not current_value}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        error_data = response.json()
+        self.assertIn("payment_required", error_data.get("code", ""))
+
+        # Verify the value didn't change
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.members_can_invite, current_value)
+
+    def test_cannot_update_members_can_create_projects_without_feature(self):
+        """members_can_create_projects is gated behind the ORGANIZATION_INVITE_SETTINGS entitlement for now."""
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = []
+        self.organization.save()
+
+        current_value = self.organization.members_can_create_projects
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/", {"members_can_create_projects": not current_value}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        error_data = response.json()
+        self.assertIn("payment_required", error_data.get("code", ""))
+
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.members_can_create_projects, current_value)
+
+    def test_can_update_members_can_create_projects_with_feature(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ORGANIZATION_INVITE_SETTINGS, "name": "Org invite settings"}
+        ]
+        self.organization.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/", {"members_can_create_projects": True}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertTrue(self.organization.members_can_create_projects)
+
+    def test_cannot_update_enforce_2fa_without_feature(self):
+        """Test that enforce_2fa cannot be updated without TWO_FACTOR_ENFORCEMENT feature."""
+        # Ensure user is admin
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        # Ensure feature is NOT available
+        self.organization.available_product_features = []
+        self.organization.save()
+
+        # Try to update enforce_2fa - should fail
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_2fa": True})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        error_data = response.json()
+        self.assertIn("payment_required", error_data.get("code", ""))
+        self.assertIn("upgrade your plan", error_data.get("detail", ""))
+
+        # Verify the value didn't change
+        self.organization.refresh_from_db()
+        self.assertNotEqual(self.organization.enforce_2fa, True)
+
+    def test_cannot_enable_enforce_verified_domains_when_it_would_block_the_admin(self):
+        # The setting denies access rather than prompting for setup, so an admin outside the verified
+        # domains enabling it would be locked out with no self-service recovery.
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = [{"key": AvailableFeature.AUTOMATIC_PROVISIONING}]
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_verified_domains": True})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], "would_block_self")
+        self.organization.refresh_from_db()
+        self.assertNotEqual(self.organization.enforce_verified_domains, True)
+
+        # Verifying the admin's own domain unblocks it, which also covers the empty allow-list case.
+        OrganizationDomain.objects.create(
+            domain=self.user.email.split("@")[1], organization=self.organization, verified_at=timezone.now()
+        )
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_verified_domains": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertTrue(self.organization.enforce_verified_domains)
+
+    def test_blocked_admin_can_disable_enforcement_but_change_nothing_else(self):
+        # The escape hatch: an admin who became blocked (email changed, domain deleted) must still be
+        # able to turn the setting off — and only that — or the organization is wedged permanently.
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.enforce_verified_domains = True
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
+        # Any other change through the hatch is rejected, alone or alongside the disable.
+        for payload in [{"name": "New name"}, {"enforce_verified_domains": False, "name": "New name"}]:
+            response = self.client.patch(f"/api/organizations/{self.organization.id}/", payload)
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, payload)
+            self.assertEqual(response.json()["code"], "verified_domain_required")
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_verified_domains": False})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertFalse(self.organization.enforce_verified_domains)
+
+    def test_blocked_member_cannot_use_the_enforcement_escape_hatch(self):
+        # The hatch only bypasses the domain gates; the admin-write requirement on the organization
+        # endpoint still applies to members.
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        self.organization.enforce_verified_domains = True
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_verified_domains": False})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.organization.refresh_from_db()
+        self.assertTrue(self.organization.enforce_verified_domains)
+
+    def test_enabling_enforcement_removes_blocked_members_but_never_the_owner(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = [{"key": AvailableFeature.AUTOMATIC_PROVISIONING}]
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="posthog.com", organization=self.organization, verified_at=timezone.now()
+        )
+        admitted = User.objects.create_and_join(self.organization, "admitted@posthog.com", None)
+        blocked = User.objects.create_and_join(self.organization, "blocked@hedgebox.net", None)
+        owner = User.objects.create_and_join(
+            self.organization, "owner@hedgebox.net", None, level=OrganizationMembership.Level.OWNER
+        )
+
+        # The modal previews the removals with these filters, so the two must agree — an owner shown
+        # there would promise a removal that never happens.
+        preview = self.client.get(
+            "/api/organizations/@current/members/",
+            {
+                "outside_verified_domains": "true",
+                "levels": f"{OrganizationMembership.Level.MEMBER},{OrganizationMembership.Level.ADMIN}",
+            },
+        )
+        self.assertEqual(
+            {member["user"]["email"] for member in preview.json()["results"]},
+            {blocked.email},
+        )
+
+        response = self.client.post(
+            f"/api/organizations/{self.organization.id}/remove_blocked_members_and_enforce_verified_domains/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), {"success": True, "removed_members": 1})
+        self.organization.refresh_from_db()
+        self.assertTrue(self.organization.enforce_verified_domains)
+        self.assertCountEqual(
+            self.organization.memberships.values_list("user__email", flat=True),
+            [self.user.email, admitted.email, owner.email],
+        )
+        self.assertFalse(blocked.organization_memberships.exists())
+
+    def test_members_cannot_enable_enforcement_through_the_removal_action(self):
+        self.organization.available_product_features = [{"key": AvailableFeature.AUTOMATIC_PROVISIONING}]
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="posthog.com", organization=self.organization, verified_at=timezone.now()
+        )
+        User.objects.create_and_join(self.organization, "blocked@hedgebox.net", None)
+
+        response = self.client.post(
+            f"/api/organizations/{self.organization.id}/remove_blocked_members_and_enforce_verified_domains/"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.organization.refresh_from_db()
+        self.assertNotEqual(self.organization.enforce_verified_domains, True)
+        self.assertEqual(self.organization.memberships.count(), 2)
+
+    def test_cannot_update_allow_publicly_shared_resources_without_feature(self):
+        """Test that allow_publicly_shared_resources cannot be updated without ORGANIZATION_SECURITY_SETTINGS feature."""
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        self.organization.available_product_features = []
+        self.organization.save()
+
+        current_value = self.organization.allow_publicly_shared_resources
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/", {"allow_publicly_shared_resources": not current_value}
+        )
+
+        # Try to update allow_publicly_shared_resources - should fail
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        error_data = response.json()
+        self.assertIn("payment_required", error_data.get("code", ""))
+
+        # Verify the value didn't change
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.allow_publicly_shared_resources, current_value)
+
+    def test_can_update_ip_restrictions_with_feature(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = [{"key": AvailableFeature.IP_RESTRICTIONS}]
+        self.organization.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"ip_restrictions": ["203.0.113.4", "10.0.0.0/8"]},
+            format="json",
+            REMOTE_ADDR="203.0.113.4",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["ip_restrictions"], ["203.0.113.4", "10.0.0.0/8"])
+        self.assertEqual(
+            OrganizationIPRestrictions.objects.get(organization=self.organization).ip_restrictions,
+            ["203.0.113.4", "10.0.0.0/8"],
+        )
+
+        created = ActivityLog.objects.get(scope="OrganizationIPRestrictions", activity="created")
+        assert created.user_id == self.user.id
+        assert created.organization_id == self.organization.id
+        assert created.detail is not None
+        assert created.detail["changes"] == [
+            {
+                "type": "OrganizationIPRestrictions",
+                "field": "IP allowlist",
+                "action": "created",
+                "before": None,
+                "after": ["203.0.113.4", "10.0.0.0/8"],
+            },
+            {
+                "type": "OrganizationIPRestrictions",
+                "field": "IP restrictions enabled",
+                "action": "created",
+                "before": None,
+                "after": True,
+            },
+        ]
+        updated_response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"ip_restrictions": ["203.0.113.0/24"], "ip_restrictions_enabled": False},
+            format="json",
+            REMOTE_ADDR="203.0.113.4",
+        )
+        assert updated_response.status_code == status.HTTP_200_OK
+        updated = ActivityLog.objects.get(scope="OrganizationIPRestrictions", activity="updated")
+        assert updated.user_id == self.user.id
+        assert updated.organization_id == self.organization.id
+        assert updated.detail is not None
+        assert {change["field"]: (change["before"], change["after"]) for change in updated.detail["changes"]} == {
+            "IP allowlist": (["203.0.113.4", "10.0.0.0/8"], ["203.0.113.0/24"]),
+            "IP restrictions enabled": (True, False),
+        }
+
+    @parameterized.expand(
+        [
+            (False, None, status.HTTP_403_FORBIDDEN),
+            (True, None, status.HTTP_403_FORBIDDEN),
+            (True, "198.51.100.7", status.HTTP_403_FORBIDDEN),
+            (True, "203.0.113.4", status.HTTP_200_OK),
+        ]
+    )
+    @override_settings(MCP_CLIENT_IP_SIGNING_KEYS=["ip-restriction-test-key"])
+    def test_oauth_token_ip_restrictions(
+        self, sandbox_bound: bool, forwarded_ip: str | None, expected_status: int
+    ) -> None:
+        self.organization.available_product_features = [{"key": AvailableFeature.IP_RESTRICTIONS}]
+        self.organization.save()
+        OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["203.0.113.0/24"], enabled=True
+        )
+        oauth_app = OAuthApplication.objects.create(
+            name="IP Restriction Test App",
+            client_id="ip-restriction-test-client",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            user=self.user,
+            is_first_party=True,
+        )
+        token = OAuthAccessToken.objects.create(
+            application=oauth_app,
+            user=self.user,
+            token="pha_ip_restriction_test_token",
+            scope="organization:read",
+            expires=timezone.now() + timedelta(hours=1),
+            scoped_organizations=[str(self.organization.id)],
+            sandbox_task_id=uuid4() if sandbox_bound else None,
+        )
+        self.client.logout()
+        headers = {"authorization": f"Bearer {token.token}"}
+        if forwarded_ip is not None:
+            timestamp = str(int(timezone.now().timestamp()))
+            headers.update(
+                {
+                    "x-posthog-mcp-client-ip": forwarded_ip,
+                    "x-posthog-mcp-client-ip-timestamp": timestamp,
+                    "x-posthog-mcp-client-ip-signature": hmac.new(
+                        b"ip-restriction-test-key", f"{forwarded_ip}:{timestamp}".encode(), hashlib.sha256
+                    ).hexdigest(),
+                }
+            )
+
+        response = self.client.get(
+            "/api/organizations/@current/",
+            REMOTE_ADDR="198.51.100.7",
+            headers=headers,
+        )
+
+        self.assertEqual(response.status_code, expected_status)
+        if expected_status == status.HTTP_403_FORBIDDEN:
+            self.assertEqual(response.json()["code"], "ip_not_allowed")
+
+    @parameterized.expand([({"ip_restrictions_enabled": False},), ({"ip_restrictions": []},)])
+    def test_can_remove_ip_restrictions_after_entitlement_loss(self, payload: dict[str, object]) -> None:
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = []
+        self.organization.save()
+        config = OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["127.0.0.1"], enabled=True
+        )
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        config.refresh_from_db()
+        self.assertFalse(config.enabled and config.ip_restrictions)
+
+    def test_ip_restrictions_apply_to_every_organization_the_user_belongs_to(self):
+        other_org, _, _ = Organization.objects.bootstrap(self.user, name="Other", slug="other")
+        self.user.current_organization = self.organization
+        self.user.save(update_fields=["current_organization"])
+        OrganizationIPRestrictions.objects.create(
+            organization=other_org, ip_restrictions=["203.0.113.0/24"], enabled=True
+        )
+
+        response = self.client.get(f"/api/organizations/{other_org.id}/", REMOTE_ADDR="198.51.100.7")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @parameterized.expand([(selected, api_key) for selected in (False, True) for api_key in (False, True)])
+    @override_settings(IS_BEHIND_PROXY=False, TRUST_ALL_PROXIES=False)
+    def test_recovery_responses_limit_blocked_organizations(self, selected_is_blocked: bool, api_key: bool) -> None:
+        other_org, _, other_team = Organization.objects.bootstrap(self.user, name="Available organization")
+        selected_org = self.organization if selected_is_blocked else other_org
+        selected_team = self.team if selected_is_blocked else other_team
+        OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["203.0.113.0/24"], enabled=True
+        )
+        for name in ("Restricted example one", "Restricted example two"):
+            restricted_org, _, _ = Organization.objects.bootstrap(self.user, name=name)
+            OrganizationIPRestrictions.objects.create(
+                organization=restricted_org, ip_restrictions=["203.0.113.0/24"], enabled=True
+            )
+        self.user.current_organization = selected_org
+        self.user.current_team = selected_team
+        self.user.save(update_fields=["current_organization", "current_team"])
+        if api_key:
+            token = generate_random_token_personal()
+            PersonalAPIKey.objects.create(
+                user=self.user, label="Recovery response test", secure_value=hash_key_value(token), scopes=["*"]
+            )
+            self.client.logout()
+            self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        # Populate the serializer caches from an allowed request before reading from another IP.
+        allowed = self.client.get("/api/organizations/", REMOTE_ADDR="203.0.113.7")
+        self.assertEqual(allowed.status_code, 200)
+        full_org = next(org for org in allowed.json()["results"] if org["id"] == str(self.organization.id))
+        self.assertEqual(full_org["teams"][0]["api_token"], self.team.api_token)
+
+        recovery_fields = {"id", "name", "slug", "membership_level"}
+        response = self.client.get("/api/organizations/", REMOTE_ADDR="198.51.100.7")
+        self.assertEqual(response.status_code, 200)
+        orgs = {org["id"]: org for org in response.json()["results"]}
+        self.assertEqual(set(orgs[str(self.organization.id)]), recovery_fields | {"teams", "projects"})
+        self.assertEqual(orgs[str(self.organization.id)]["teams"], [])
+        self.assertEqual(orgs[str(self.organization.id)]["projects"], [])
+        self.assertEqual(orgs[str(other_org.id)]["teams"][0]["api_token"], other_team.api_token)
+
+        with patch("posthog.ip_restrictions.ip_network", wraps=ip_network) as parse_network:
+            response = self.client.get("/api/users/@me/", REMOTE_ADDR="198.51.100.7")
+        self.assertEqual(parse_network.call_count, 3)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        nested_org = next(org for org in data["organizations"] if org["id"] == str(self.organization.id))
+        self.assertEqual(set(nested_org), recovery_fields)
+        if selected_is_blocked:
+            self.assertEqual(set(data["organization"]), recovery_fields | {"teams", "projects"})
+            self.assertEqual(data["organization"]["teams"], [])
+            self.assertEqual(data["organization"]["projects"], [])
+            self.assertIsNone(data["team"])
+            self.assertNotIn(self.team.api_token, response.content.decode())
+        else:
+            self.assertEqual(data["team"]["api_token"], other_team.api_token)
+
+        response = self.client.patch(
+            "/api/users/@me/", {"set_current_organization": str(other_org.id)}, REMOTE_ADDR="198.51.100.7"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["organization"]["id"], str(other_org.id))
+
+    @parameterized.expand([(False,), (True,)])
+    @override_settings(IS_BEHIND_PROXY=False, TRUST_ALL_PROXIES=False)
+    def test_policy_updates_revalidate_after_another_save(self, enable_first: bool) -> None:
+        self.organization.available_product_features = [{"key": AvailableFeature.IP_RESTRICTIONS}]
+        self.organization.save()
+        config = OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["203.0.113.7"], enabled=False
+        )
+        request = APIRequestFactory().patch("/", REMOTE_ADDR="203.0.113.7")
+        request.user = self.user
+        enable = OrganizationSerializer(
+            Organization.objects.get(pk=self.organization.pk),
+            data={"ip_restrictions_enabled": True},
+            partial=True,
+            context={"request": request},
+        )
+        replace = OrganizationSerializer(
+            Organization.objects.get(pk=self.organization.pk),
+            data={"ip_restrictions": ["198.51.100.7"]},
+            partial=True,
+            context={"request": request},
+        )
+        self.assertTrue(enable.is_valid(), enable.errors)
+        self.assertTrue(replace.is_valid(), replace.errors)
+
+        first, second = (enable, replace) if enable_first else (replace, enable)
+        first.save()
+        with self.assertRaises(ValidationError) as error:
+            second.save()
+        self.assertIn("would_block_self", str(error.exception.get_codes()))
+        config.refresh_from_db()
+        self.assertEqual(config.enabled, enable_first)
+        self.assertEqual(config.ip_restrictions, ["203.0.113.7"] if enable_first else ["198.51.100.7"])
+
+    @parameterized.expand(
+        [
+            (None, "127.0.0.1", True),
+            (None, "203.0.113.4", False),
+            ("203.0.113.4", "198.51.100.7", False),
+            ("198.51.100.7", "203.0.113.4", True),
+        ]
+    )
+    @override_settings(MCP_CLIENT_IP_SIGNING_KEYS=["ip-restriction-test-key"])
+    def test_rejects_restrictions_that_would_lock_out_current_session(
+        self, forwarded_ip: str | None, peer_ip: str, blocks: bool
+    ) -> None:
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = [{"key": AvailableFeature.IP_RESTRICTIONS}]
+        self.organization.save()
+
+        original_name = self.organization.name
+        headers = {}
+        if forwarded_ip is not None:
+            timestamp = str(int(timezone.now().timestamp()))
+            headers = {
+                "x-posthog-mcp-client-ip": forwarded_ip,
+                "x-posthog-mcp-client-ip-timestamp": timestamp,
+                "x-posthog-mcp-client-ip-signature": hmac.new(
+                    b"ip-restriction-test-key", f"{forwarded_ip}:{timestamp}".encode(), hashlib.sha256
+                ).hexdigest(),
+            }
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"name": "Example organization", "ip_restrictions": ["203.0.113.4"]},
+            format="json",
+            REMOTE_ADDR=peer_ip,
+            headers=headers,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST if blocks else status.HTTP_200_OK)
+        if blocks:
+            self.assertEqual(response.json()["code"], "would_block_self")
+            self.assertIn(forwarded_ip or peer_ip, response.json()["detail"])
+            self.assertFalse(OrganizationIPRestrictions.objects.filter(organization=self.organization).exists())
+            self.organization.refresh_from_db()
+            self.assertEqual(self.organization.name, original_name)
+        else:
+            self.assertIsNone(response.json()["ip_restrictions_warning"])
+        self.assertEqual(
+            self.client.get(
+                f"/api/organizations/{self.organization.id}/", REMOTE_ADDR=peer_ip, headers=headers
+            ).status_code,
+            status.HTTP_200_OK,
+        )
+
+    def test_can_toggle_ip_restrictions_with_feature(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = [{"key": AvailableFeature.IP_RESTRICTIONS}]
+        self.organization.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"ip_restrictions_enabled": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.json()["ip_restrictions_enabled"])
+        self.assertTrue(OrganizationIPRestrictions.objects.get(organization=self.organization).enabled)
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"ip_restrictions_enabled": False},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.json()["ip_restrictions_enabled"])
+        self.assertFalse(OrganizationIPRestrictions.objects.get(organization=self.organization).enabled)
+
+    @parameterized.expand([(["not-an-ip"],), ([f"10.0.0.{i}" for i in range(101)],)])
+    def test_rejects_invalid_ip_restrictions(self, restrictions: list[str]) -> None:
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = [{"key": AvailableFeature.IP_RESTRICTIONS}]
+        self.organization.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"ip_restrictions": restrictions},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(OrganizationIPRestrictions.objects.filter(organization=self.organization).exists())
+
+    def test_cannot_update_ip_restrictions_without_feature(self):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.organization.available_product_features = []
+        self.organization.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"ip_restrictions": ["203.0.113.4"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("payment_required", response.json().get("code", ""))
+
+    def test_cannot_update_members_can_use_personal_api_keys_without_feature(self):
+        """Test that members_can_use_personal_api_keys cannot be updated without ORGANIZATION_SECURITY_SETTINGS feature."""
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        self.organization.available_product_features = []
+        self.organization.save()
+
+        current_value = self.organization.members_can_use_personal_api_keys
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/", {"members_can_use_personal_api_keys": not current_value}
+        )
+
+        # Try to update members_can_use_personal_api_keys - should fail
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        error_data = response.json()
+        self.assertIn("payment_required", error_data.get("code", ""))
+
+        # Verify the value didn't change
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.members_can_use_personal_api_keys, current_value)
+
+    def test_projects_outside_personal_api_key_scoped_organizations_not_listed(self):
+        other_org, _, _ = Organization.objects.bootstrap(self.user)
+        personal_api_key = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="X",
+            user=self.user,
+            last_used_at="2021-08-25T21:09:14",
+            secure_value=hash_key_value(personal_api_key),
+            scoped_organizations=[other_org.id],
+            scopes=["*"],
+        )
+
+        response = self.client.get("/api/organizations/", headers={"authorization": f"Bearer {personal_api_key}"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {org["id"] for org in response.json()["results"]},
+            {str(other_org.id)},
+            "Only the scoped organization should be listed, the other one should be excluded",
+        )
+
+    def test_projects_outside_oauth_scoped_organizations_causes_401(self):
+        # TODO: This should filter out the organizations to the scoped organizations, but it causes a 401 due to a bug in APIScopePermission for list endpoints.
+        other_org, _, _ = Organization.objects.bootstrap(self.user)
+
+        oauth_app = OAuthApplication.objects.create(
+            name="Test OAuth App",
+            client_id="test_client_id",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            user=self.user,
+        )
+
+        access_token = OAuthAccessToken.objects.create(
+            application=oauth_app,
+            user=self.user,
+            token="test_oauth_token",
+            scope="organization:read",
+            expires=timezone.now() + timedelta(hours=1),
+            scoped_organizations=[str(other_org.id)],
+        )
+
+        response = self.client.get("/api/organizations/", headers={"authorization": f"Bearer {access_token.token}"})
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @parameterized.expand(
+        [
+            ("is_ai_data_processing_approved",),
+            ("is_ai_training_opted_in",),
+        ]
+    )
+    def test_org_scoped_oauth_token_can_patch_current_organization(self, field: str):
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        oauth_app = OAuthApplication.objects.create(
+            name="First Party Test App",
+            client_id=f"test_first_party_client_{field}",
+            client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://example.com/callback",
+            algorithm="RS256",
+            user=self.user,
+            is_first_party=True,
+        )
+
+        access_token = OAuthAccessToken.objects.create(
+            application=oauth_app,
+            user=self.user,
+            token=f"pha_test_first_party_token_{field}",
+            scope="organization:write",
+            expires=timezone.now() + timedelta(hours=1),
+            scoped_organizations=[str(self.organization.id)],
+        )
+
+        bearer = {"authorization": f"Bearer {access_token.token}"}
+
+        get_response = self.client.get("/api/organizations/@current/", headers=bearer)
+        self.assertEqual(get_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(get_response.json()["id"], str(self.organization.id))
+
+        patch_response = self.client.patch(
+            "/api/organizations/@current/",
+            {field: True},
+            content_type="application/json",
+            headers=bearer,
+        )
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK, patch_response.content)
+
+        self.organization.refresh_from_db()
+        self.assertTrue(getattr(self.organization, field))
+
+    @patch("posthog.temporal.delete_teams.dispatch.start_delete_organization_workflow")
+    def test_delete_organizations_and_verify_list(self, mock_delete_task):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        # Create two additional organizations
+        org2 = Organization.objects.bootstrap(self.user)[0]
+        org3 = Organization.objects.bootstrap(self.user)[0]
+
+        self.user.current_organization_id = self.organization.id
+        self.user.save()
+
+        # Verify we start with 3 organizations
+        response = self.client.get("/api/organizations/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()["results"]), 3)
+
+        # Delete first org — it stays in the list but marked as pending deletion
+        response = self.client.delete(f"/api/organizations/{org2.id}")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        org2.refresh_from_db()
+        self.assertTrue(org2.is_pending_deletion)
+
+        # Delete second org
+        response = self.client.delete(f"/api/organizations/{org3.id}")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        org3.refresh_from_db()
+        self.assertTrue(org3.is_pending_deletion)
+
+        # All orgs still in the list (pending deletion ones included)
+        response = self.client.get("/api/organizations/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()["results"]), 3)
+
+        # Delete last org
+        response = self.client.delete(f"/api/organizations/{self.organization.id}")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.organization.refresh_from_db()
+        self.assertTrue(self.organization.is_pending_deletion)
+
+    @patch("ee.billing.billing_manager.BillingManager.get_billing")
+    @patch("posthog.api.organization.get_cached_instance_license")
+    def test_cannot_delete_organization_with_active_subscription(self, mock_get_license, mock_get_billing):
+        mock_get_license.return_value = True
+        mock_get_billing.return_value = {"has_active_subscription": True}
+
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        with self.is_cloud(True):
+            response = self.client.delete(f"/api/organizations/{self.organization.id}")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("active subscription", response.json()["detail"])
+        self.assertTrue(Organization.objects.filter(id=self.organization.id).exists())
+
+    @patch("posthog.temporal.delete_teams.dispatch.start_delete_organization_workflow")
+    @patch("ee.billing.billing_manager.BillingManager.get_billing")
+    @patch("posthog.api.organization.get_cached_instance_license")
+    def test_can_delete_organization_without_active_subscription(
+        self, mock_get_license, mock_get_billing, mock_start_deletion
+    ):
+        mock_get_license.return_value = True
+        mock_get_billing.return_value = {"has_active_subscription": False}
+
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        org_id = self.organization.id
+        with self.is_cloud(True):
+            response = self.client.delete(f"/api/organizations/{org_id}")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        # Deletion runs asynchronously on Temporal, so the org is marked pending, not removed synchronously
+        self.assertTrue(Organization.objects.get(id=org_id).is_pending_deletion)
+        mock_start_deletion.assert_called_once()
+
+    @patch("posthog.temporal.delete_teams.dispatch.start_delete_organization_workflow")
+    def test_delete_organization_sets_pending_deletion_flag(self, mock_delete_task):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        response = self.client.delete(f"/api/organizations/{self.organization.id}")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        self.organization.refresh_from_db()
+        self.assertTrue(self.organization.is_pending_deletion)
+        mock_delete_task.assert_called_once()
+
+    @patch("posthog.temporal.delete_teams.dispatch.start_delete_organization_workflow")
+    def test_delete_organization_preserves_memberships(self, mock_delete_task):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        response = self.client.delete(f"/api/organizations/{self.organization.id}")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        self.assertTrue(OrganizationMembership.objects.filter(organization=self.organization, user=self.user).exists())
+
+    @patch("posthog.temporal.delete_teams.dispatch.start_delete_organization_workflow")
+    def test_delete_organization_returns_pending_deletion_in_api(self, mock_delete_task):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        self.client.delete(f"/api/organizations/{self.organization.id}")
+
+        response = self.client.get(f"/api/organizations/{self.organization.id}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.json()["is_pending_deletion"])
+
+    @patch("posthog.temporal.delete_teams.dispatch.start_delete_organization_workflow")
+    def test_delete_organization_already_pending_deletion_returns_400(self, mock_delete_task):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        self.organization.is_pending_deletion = True
+        self.organization.save(update_fields=["is_pending_deletion"])
+
+        response = self.client.delete(f"/api/organizations/{self.organization.id}")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already being deleted", response.json()["detail"])
+        mock_delete_task.assert_not_called()
+
+    @patch("posthog.temporal.delete_teams.dispatch.start_delete_organization_workflow")
+    @patch("posthog.event_usage.posthoganalytics.capture")
+    def test_delete_organization_fires_initiated_event(self, mock_capture, mock_delete_task):
+        self.organization_membership.level = OrganizationMembership.Level.OWNER
+        self.organization_membership.save()
+
+        response = self.client.delete(f"/api/organizations/{self.organization.id}")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        event_names = [call.kwargs.get("event") for call in mock_capture.call_args_list]
+        self.assertIn("organization deletion initiated", event_names)
+
+
+def create_organization(name: str) -> Organization:
+    """
+    Helper that just creates an organization. It currently uses the orm, but we
+    could use either the api, or django admin to create, to get better parity
+    with real world scenarios.
+    """
+    return Organization.objects.create(name=name)
+
+
+class TestOrganizationPutPatchPermissions(APIBaseTest):
+    """Test that PUT and PATCH methods have consistent permission behavior."""
+
+    def test_put_organization_as_member_forbidden(self):
+        """Test that members cannot update organization using PUT method."""
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        response = self.client.put(
+            f"/api/organizations/{self.organization.id}",
+            {"name": "Updated Name PUT"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_patch_organization_as_member_forbidden(self):
+        """Test that members cannot update organization using PATCH method."""
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}",
+            {"name": "Updated Name PATCH"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_patch_consistency_admin(self):
+        """Test that PATCH method works consistently for admins."""
+        # Test as admin - PATCH should work
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        # Test PATCH - only need to provide the fields we're updating
+        response_patch = self.client.patch(
+            f"/api/organizations/{self.organization.id}",
+            {"name": "Admin Updated Name PATCH"},
+        )
+        self.assertEqual(response_patch.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.name, "Admin Updated Name PATCH")
+
+    def test_cannot_set_logo_media_from_another_organization(self):
+        other_org = Organization.objects.create(name="Other Org")
+        other_team = Team.objects.create(organization=other_org, name="Other Team")
+        other_media = UploadedMedia.objects.create(
+            team=other_team,
+            created_by=self.user,
+            media_location="http://example.com/other.png",
+            content_type="image/png",
+            file_name="other.png",
+        )
+
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"logo_media_id": str(other_media.id)},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["attr"], "logo_media_id")
+
+    def test_can_set_logo_media_from_own_organization(self):
+        media = UploadedMedia.objects.create(
+            team=self.team,
+            created_by=self.user,
+            media_location="http://example.com/own.png",
+            content_type="image/png",
+            file_name="own.png",
+        )
+
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        response = self.client.patch(
+            f"/api/organizations/{self.organization.id}/",
+            {"logo_media_id": str(media.id)},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertEqual(self.organization.logo_media_id, media.id)
+
+    def test_idor_protection_patch(self):
+        """Test that users cannot modify organizations they don't belong to using PATCH."""
+        # Create another organization with a different owner
+        other_org, _, other_user = Organization.objects.bootstrap(self._create_user("other_user@posthog.com"))
+
+        # Make current user an admin of their own org
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+        # Try to modify other organization using PATCH - should fail
+        # The exact status code (403 or 404) depends on permission implementation
+        response_patch = self.client.patch(
+            f"/api/organizations/{other_org.id}",
+            {"name": "Hacked Name PATCH"},
+        )
+        # Should be either forbidden or not found - both indicate access is properly restricted
+        self.assertIn(response_patch.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
+
+        # Verify the other organization wasn't modified
+        other_org.refresh_from_db()
+        self.assertNotEqual(other_org.name, "Hacked Name PATCH")
+
+
+class TestOrganizationSerializer(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+        self.factory = APIRequestFactory()
+        self.request = self.factory.get("/")
+        self.request.user = self.user
+
+        # Create a mock view with user_permissions
+        class MockView:
+            def __init__(self, user_permissions):
+                self.user_permissions = user_permissions
+
+        self.view = MockView(UserPermissions(self.user))
+        self.context = {"request": self.request, "view": self.view}
+
+    def _fresh_context_for(self, user):
+        request = self.factory.get("/")
+        request.user = user
+
+        class MockView:
+            def __init__(self, user_permissions):
+                self.user_permissions = user_permissions
+
+        return {"request": request, "view": MockView(UserPermissions(user))}
+
+    def test_get_teams_with_no_org(self):
+        # Clear current_team reference before deleting organization
+        self.user.current_team = None
+        self.user.current_organization = None
+        self.user.save()
+
+        self.organization.delete()
+
+        serializer = OrganizationSerializer(context=self.context)
+        self.assertEqual(serializer.user_permissions.team_ids_visible_for_user, [])
+
+    def test_get_teams_with_single_org_no_teams(self):
+        # Delete default team created by APIBaseTest
+        self.team.delete()
+
+        serializer = OrganizationSerializer(self.organization, context=self.context)
+        self.assertEqual(serializer.get_teams(self.organization), [])
+
+    def test_get_teams_with_single_org_multiple_teams(self):
+        team2 = Team.objects.create(organization=self.organization, name="Test Team 2")
+        team3 = Team.objects.create(organization=self.organization, name="Test Team 3")
+
+        serializer = OrganizationSerializer(self.organization, context=self.context)
+        teams = serializer.get_teams(self.organization)
+
+        self.assertEqual(len(teams), 3)
+        team_names = {team["name"] for team in teams}
+        self.assertEqual(team_names, {self.team.name, team2.name, team3.name})
+
+    def test_get_teams_with_multiple_orgs(self):
+        org2, _, _ = Organization.objects.bootstrap(self.user)
+        team2 = Team.objects.create(organization=org2, name="Org 2 Team")
+
+        serializer = OrganizationSerializer(self.organization, context=self.context)
+        teams1 = serializer.get_teams(self.organization)
+        teams2 = serializer.get_teams(org2)
+
+        self.assertEqual(len(teams1), 1)
+        self.assertEqual(teams1[0]["name"], self.team.name)
+
+        self.assertEqual(len(teams2), 2)
+        self.assertEqual(
+            sorted([team["name"] for team in teams2]),
+            sorted(["Default project", team2.name]),
+        )
+
+    def test_get_teams_caches_per_user_org(self):
+        serializer = OrganizationSerializer(self.organization, context=self.context)
+        with patch.object(serializer, "_fetch_visible_teams", wraps=serializer._fetch_visible_teams) as spy:
+            first = serializer.get_teams(self.organization)
+            second = serializer.get_teams(self.organization)
+        assert spy.call_count == 1
+        assert first == second
+
+    def test_get_teams_invalidates_on_team_save(self):
+        OrganizationSerializer(self.organization, context=self.context).get_teams(self.organization)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            Team.objects.create(organization=self.organization, name="New Team")
+
+        fresh_serializer = OrganizationSerializer(self.organization, context=self._fresh_context_for(self.user))
+        with patch.object(fresh_serializer, "_fetch_visible_teams", wraps=fresh_serializer._fetch_visible_teams) as spy:
+            after = fresh_serializer.get_teams(self.organization)
+        assert spy.call_count == 1
+        assert len(after) == 2
+
+    def test_get_teams_invalidates_on_team_delete(self):
+        team2 = Team.objects.create(organization=self.organization, name="Will Be Deleted")
+        OrganizationSerializer(self.organization, context=self.context).get_teams(self.organization)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            team2.delete()
+
+        fresh_serializer = OrganizationSerializer(self.organization, context=self._fresh_context_for(self.user))
+        with patch.object(fresh_serializer, "_fetch_visible_teams", wraps=fresh_serializer._fetch_visible_teams) as spy:
+            after = fresh_serializer.get_teams(self.organization)
+        assert spy.call_count == 1
+        assert len(after) == 1
+
+    def test_get_teams_separate_cache_per_user(self):
+        other_user = self._create_user("other@posthog.com")
+        other_context = self._fresh_context_for(other_user)
+
+        serializer_a = OrganizationSerializer(self.organization, context=self.context)
+        serializer_b = OrganizationSerializer(self.organization, context=other_context)
+
+        with patch.object(serializer_a, "_fetch_visible_teams", wraps=serializer_a._fetch_visible_teams) as spy_a:
+            serializer_a.get_teams(self.organization)
+            serializer_a.get_teams(self.organization)
+        assert spy_a.call_count == 1
+
+        with patch.object(serializer_b, "_fetch_visible_teams", wraps=serializer_b._fetch_visible_teams) as spy_b:
+            serializer_b.get_teams(self.organization)
+        assert spy_b.call_count == 1
+
+    def test_get_projects_caches_and_invalidates_on_project_change(self):
+        serializer = OrganizationSerializer(self.organization, context=self.context)
+        with patch.object(serializer, "_fetch_visible_projects", wraps=serializer._fetch_visible_projects) as spy:
+            first = serializer.get_projects(self.organization)
+            second = serializer.get_projects(self.organization)
+        assert spy.call_count == 1
+        assert first == second
+
+        existing_project = self.team.project
+        existing_project.name = "Renamed Project"
+        with self.captureOnCommitCallbacks(execute=True):
+            existing_project.save()
+
+        fresh_serializer = OrganizationSerializer(self.organization, context=self._fresh_context_for(self.user))
+        with patch.object(
+            fresh_serializer, "_fetch_visible_projects", wraps=fresh_serializer._fetch_visible_projects
+        ) as spy:
+            fresh_serializer.get_projects(self.organization)
+        assert spy.call_count == 1
+
+    @parameterized.expand(
+        [
+            (
+                "access_control",
+                lambda self: AccessControl.objects.create(
+                    team=self.team, access_level="member", resource="project", resource_id=str(self.team.id)
+                ),
+            ),
+            (
+                "explicit_team_membership",
+                lambda self: ExplicitTeamMembership.objects.create(
+                    team=self.team,
+                    parent_membership=OrganizationMembership.objects.get(
+                        organization=self.organization, user=self.user
+                    ),
+                ),
+            ),
+            (
+                "role_membership",
+                lambda self: RoleMembership.objects.create(
+                    role=Role.objects.create(name=f"role-{uuid4().hex}", organization=self.organization),
+                    user=self.user,
+                ),
+            ),
+            (
+                "organization_membership",
+                lambda self: self._create_user("rbac+invalidation@posthog.com"),
+            ),
+            (
+                "organization",
+                lambda self: self.organization.save(),
+            ),
+        ]
+    )
+    def test_rbac_change_invalidates_org_cache(self, _name, mutate):
+        OrganizationSerializer(self.organization, context=self.context).get_teams(self.organization)
+        initial_version = _org_serializer_cache_version(str(self.organization.id))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            mutate(self)
+
+        after_version = _org_serializer_cache_version(str(self.organization.id))
+        assert after_version > initial_version
+
+    def test_serializer_without_request_bypasses_the_cache(self):
+        no_request_context = {"view": type("MockView", (), {"user_permissions": UserPermissions(self.user)})()}
+        serializer = OrganizationSerializer(self.organization, context=no_request_context)
+        with patch.object(serializer, "_fetch_visible_teams", wraps=serializer._fetch_visible_teams) as spy:
+            serializer.get_teams(self.organization)
+            serializer.get_teams(self.organization)
+        assert spy.call_count == 2
+
+    def test_get_member_count_caches_per_org(self):
+        serializer = OrganizationSerializer(self.organization, context=self.context)
+        with patch("posthog.api.organization._fetch_member_count", wraps=_fetch_member_count) as spy:
+            first = serializer.get_member_count(self.organization)
+            second = serializer.get_member_count(self.organization)
+        assert spy.call_count == 1
+        assert first == second == 1
+
+    @parameterized.expand(
+        [
+            (
+                "membership_create",
+                lambda self: self._create_user("invalidates-create@posthog.com"),
+                3,
+            ),
+            (
+                "membership_delete",
+                lambda self: OrganizationMembership.objects.filter(user=self._seeded_user).delete(),
+                1,
+            ),
+        ]
+    )
+    def test_get_member_count_invalidates_on_membership_change(self, _name, mutate, expected_after):
+        # Seed a second member so the delete path has something to remove and the
+        # baseline count is the same for both parameter cases.
+        self._seeded_user = self._create_user("invalidates-seed@posthog.com")
+        cache.clear()
+        baseline = OrganizationSerializer(self.organization, context=self.context).get_member_count(self.organization)
+        assert baseline == 2
+
+        with self.captureOnCommitCallbacks(execute=True):
+            mutate(self)
+
+        with patch("posthog.api.organization._fetch_member_count", wraps=_fetch_member_count) as spy:
+            after = OrganizationSerializer(
+                self.organization, context=self._fresh_context_for(self.user)
+            ).get_member_count(self.organization)
+        assert spy.call_count == 1
+        assert after == expected_after
+
+
+class TestOrganizationRbacMigrations(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        # Create some roles
+        self.admin_role = Role.objects.create(
+            name="Admin Role",
+            organization=self.organization,
+            feature_flags_access_level=37,
+        )
+        self.basic_role = Role.objects.create(
+            name="Basic Role",
+            organization=self.organization,
+            feature_flags_access_level=21,
+        )
+
+        # Create test users with different permissions
+        self.admin_user = self._create_user("rbac_admin+1@posthog.com", level=OrganizationMembership.Level.ADMIN)
+        self.member_user = self._create_user("rbac_member+1@posthog.com")
+
+        # Bind admin role to admin user
+        RoleMembership.objects.create(
+            role=self.admin_role,
+            user=self.admin_user,
+            organization_member=self.admin_user.organization_memberships.first(),
+        )
+
+    @patch("posthog.api.organization.report_organization_action")
+    def test_migrate_feature_flags_rbac_as_admin(self, mock_report_action):
+        self.client.force_login(self.admin_user)
+
+        # Create a test feature flag
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team, created_by=self.admin_user, key="test-flag", name="Test Flag"
+        )
+        FeatureFlagRoleAccess.objects.create(
+            feature_flag=feature_flag,
+            role=self.admin_role,
+        )
+
+        response = self.client.post(f"/api/organizations/{self.organization.id}/migrate_access_control/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["status"], True)
+
+        feature_flag_access = FeatureFlagRoleAccess.objects.first()
+        self.assertIsNone(feature_flag_access)
+
+        access_control = AccessControl.objects.get(resource="feature_flag")
+        self.assertEqual(access_control.access_level, "editor")
+        self.assertEqual(access_control.role, self.admin_role)
+        self.assertEqual(access_control.resource, "feature_flag")
+        self.assertEqual(access_control.resource_id, str(feature_flag.id))
+
+        # Verify reporting calls
+        mock_report_action.assert_any_call(
+            self.organization, "rbac_team_migration_started", {"user": self.admin_user.distinct_id}
+        )
+        mock_report_action.assert_any_call(
+            self.organization, "rbac_team_migration_completed", {"user": self.admin_user.distinct_id}
+        )
+
+    @patch("posthog.api.organization.report_organization_action")
+    def test_migrate_feature_flags_rbac_with_specific_role_access(self, mock_report_action):
+        self.client.force_login(self.admin_user)
+
+        # Create a test feature flag
+        feature_flag = FeatureFlag.objects.create(
+            team=self.team, created_by=self.admin_user, key="test-flag", name="Test Flag"
+        )
+
+        # Create specific role access
+        FeatureFlagRoleAccess.objects.create(
+            feature_flag=feature_flag,
+            role=self.admin_role,
+        )
+
+        response = self.client.post(f"/api/organizations/{self.organization.id}/migrate_access_control/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["status"], True)
+
+        # Verify specific role access was migrated
+        self.assertEqual(FeatureFlagRoleAccess.objects.count(), 0)
+        access_control = AccessControl.objects.get(
+            resource="feature_flag",
+            resource_id=str(feature_flag.id),
+            role=self.admin_role,
+        )
+        self.assertEqual(access_control.access_level, "editor")
+
+        # Add verification of reporting calls at the end
+        mock_report_action.assert_any_call(
+            self.organization, "rbac_team_migration_started", {"user": self.admin_user.distinct_id}
+        )
+        mock_report_action.assert_any_call(
+            self.organization, "rbac_team_migration_completed", {"user": self.admin_user.distinct_id}
+        )
+
+    @patch("posthog.api.organization.report_organization_action")
+    def test_migrate_team_rbac_as_admin(self, mock_report_action):
+        # Create a new team with access control enabled
+        team_with_access_control = Team.objects.create(
+            organization=self.organization, name="Team with Access Control", access_control=True
+        )
+
+        # Create inactive user
+        self.inactive_user = self._create_user("rbac_inactive@posthog.com")
+        self.inactive_user.is_active = False
+        self.inactive_user.save()
+
+        # Create users with different org membership levels
+        self.org_admin = self._create_user("rbac_org_admin@posthog.com", level=OrganizationMembership.Level.ADMIN)
+        self.org_member = self._create_user("rbac_org_member@posthog.com", level=OrganizationMembership.Level.MEMBER)
+
+        self.client.force_login(self.admin_user)
+
+        # Create explicit team memberships
+        ExplicitTeamMembership.objects.create(
+            team=team_with_access_control,
+            parent_membership=cast(OrganizationMembership, self.inactive_user.organization_memberships.first()),
+            level=ExplicitTeamMembership.Level.MEMBER,
+        )
+        ExplicitTeamMembership.objects.create(
+            team=team_with_access_control,
+            parent_membership=cast(OrganizationMembership, self.org_admin.organization_memberships.first()),
+            level=ExplicitTeamMembership.Level.ADMIN,
+        )
+        ExplicitTeamMembership.objects.create(
+            team=team_with_access_control,
+            parent_membership=cast(OrganizationMembership, self.org_member.organization_memberships.first()),
+            level=ExplicitTeamMembership.Level.MEMBER,
+        )
+
+        response = self.client.post(f"/api/organizations/{self.organization.id}/migrate_access_control/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["status"], True)
+
+        # Verify that inactive user's access was not migrated
+        with self.assertRaises(AccessControl.DoesNotExist):
+            AccessControl.objects.get(
+                organization_member=cast(OrganizationMembership, self.inactive_user.organization_memberships.first())
+            )
+
+        # Verify that org admin's explicit team membership was not migrated
+        with self.assertRaises(AccessControl.DoesNotExist):
+            AccessControl.objects.get(
+                organization_member=cast(OrganizationMembership, self.org_admin.organization_memberships.first())
+            )
+
+        # Verify that org member's access was migrated
+        member_access = AccessControl.objects.get(
+            organization_member=cast(OrganizationMembership, self.org_member.organization_memberships.first())
+        )
+        self.assertEqual(member_access.access_level, "member")
+        self.assertEqual(member_access.resource, "project")
+        self.assertEqual(member_access.resource_id, str(team_with_access_control.id))
+
+        # Verify base team access control was created
+        base_access = AccessControl.objects.get(team=team_with_access_control, organization_member__isnull=True)
+        self.assertEqual(base_access.access_level, "none")
+        self.assertEqual(base_access.resource, "project")
+        self.assertEqual(base_access.resource_id, str(team_with_access_control.id))
+
+        # Verify admin access control was created
+        admin_access = AccessControl.objects.filter(
+            team=team_with_access_control,
+            organization_member=cast(OrganizationMembership, self.org_admin.organization_memberships.first()),
+            access_level="admin",
+            resource="project",
+            resource_id=str(team_with_access_control.id),
+        )
+        self.assertEqual(admin_access.count(), 0)
+
+        # Verify member access control was created
+        member_access = AccessControl.objects.get(
+            team=team_with_access_control,
+            organization_member=cast(OrganizationMembership, self.org_member.organization_memberships.first()),
+            access_level="member",
+            resource="project",
+            resource_id=str(team_with_access_control.id),
+        )
+        self.assertIsNotNone(member_access)
+
+        # Check that the team access control has been disabled
+        team_with_access_control.refresh_from_db()
+        self.assertFalse(team_with_access_control.access_control)
+
+        # Add verification of reporting calls at the end
+        mock_report_action.assert_any_call(
+            self.organization, "rbac_team_migration_started", {"user": self.admin_user.distinct_id}
+        )
+        mock_report_action.assert_any_call(
+            self.organization, "rbac_team_migration_completed", {"user": self.admin_user.distinct_id}
+        )
+
+    def test_migrate_team_rbac_as_member_without_permissions(self):
+        self.member_user = self._create_user("rbac_member+3@posthog.com")
+        self.client.force_login(self.member_user)
+
+        response = self.client.post(f"/api/organizations/{self.organization.id}/migrate_access_control/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_migrate_team_rbac_wrong_organization(self):
+        self.admin_user = self._create_user("rbac_admin+4@posthog.com", level=OrganizationMembership.Level.ADMIN)
+        self.client.force_login(self.admin_user)
+
+        other_org = Organization.objects.create(name="Other Org")
+
+        response = self.client.post(f"/api/organizations/{other_org.id}/migrate_access_control/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch("posthog.api.organization.report_organization_action")
+    def test_migrate_both_feature_flags_and_team_rbac(self, mock_report_action):
+        """Test that both feature flag and team RBAC migrations can be performed in a single call."""
+        # Create a new team with access control enabled
+        team_with_access_control = Team.objects.create(
+            organization=self.organization, name="Team with Access Control", access_control=True
+        )
+
+        # Set up users
+        self.admin_user = self._create_user("rbac_admin+5@posthog.com", level=OrganizationMembership.Level.ADMIN)
+        self.member_user = self._create_user("rbac_member+5@posthog.com")
+
+        self.client.force_login(self.admin_user)
+
+        # Create explicit team memberships
+        ExplicitTeamMembership.objects.create(
+            team=team_with_access_control,
+            parent_membership=cast(OrganizationMembership, self.admin_user.organization_memberships.first()),
+            level=ExplicitTeamMembership.Level.ADMIN,
+        )
+        ExplicitTeamMembership.objects.create(
+            team=team_with_access_control,
+            parent_membership=cast(OrganizationMembership, self.member_user.organization_memberships.first()),
+            level=ExplicitTeamMembership.Level.MEMBER,
+        )
+
+        # Create feature flags with role access
+        feature_flags = []
+        for i in range(2):
+            feature_flag = FeatureFlag.objects.create(
+                team=team_with_access_control,
+                created_by=self.admin_user,
+                key=f"test-flag-{i}",
+                name=f"Test Flag {i}",
+            )
+            feature_flags.append(feature_flag)
+            FeatureFlagRoleAccess.objects.create(
+                feature_flag=feature_flag,
+                role=self.admin_role,
+            )
+
+        # Perform migration
+        response = self.client.post(f"/api/organizations/{self.organization.id}/migrate_access_control/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["status"], True)
+
+        # Verify feature flag access controls
+        self.assertEqual(FeatureFlagRoleAccess.objects.count(), 0)
+        self.assertEqual(AccessControl.objects.filter(resource="feature_flag").count(), 2)
+
+        for feature_flag in feature_flags:
+            access_control = AccessControl.objects.get(resource="feature_flag", resource_id=str(feature_flag.id))
+            self.assertEqual(access_control.access_level, "editor")
+            self.assertEqual(access_control.role, self.admin_role)
+
+        # Verify team access controls
+        self.assertEqual(ExplicitTeamMembership.objects.count(), 0)
+        base_access = AccessControl.objects.get(
+            team=team_with_access_control,
+            organization_member__isnull=True,
+            access_level="none",
+            resource="project",
+            resource_id=str(team_with_access_control.id),
+        )
+        self.assertIsNotNone(base_access)
+
+        admin_access = AccessControl.objects.filter(
+            team=team_with_access_control,
+            organization_member=cast(OrganizationMembership, self.admin_user.organization_memberships.first()),
+            access_level="admin",
+            resource="project",
+            resource_id=str(team_with_access_control.id),
+        )
+        # Shouldn't exist
+        self.assertEqual(admin_access.count(), 0)
+
+        member_access = AccessControl.objects.get(
+            team=team_with_access_control,
+            organization_member=cast(OrganizationMembership, self.member_user.organization_memberships.first()),
+            access_level="member",
+            resource="project",
+            resource_id=str(team_with_access_control.id),
+        )
+        self.assertIsNotNone(member_access)
+
+        # Verify total number of access controls
+        # 2 feature flags + 2 team access controls (base + member)
+        self.assertEqual(AccessControl.objects.count(), 4)
+
+        # Add verification of reporting calls at the end
+        mock_report_action.assert_any_call(
+            self.organization, "rbac_team_migration_started", {"user": self.admin_user.distinct_id}
+        )
+        mock_report_action.assert_any_call(
+            self.organization, "rbac_team_migration_completed", {"user": self.admin_user.distinct_id}
+        )
+
+    @patch("posthog.api.organization.report_organization_action")
+    def test_migrate_team_rbac_fails_with_error(self, mock_report_action):
+        """Test that errors during migration are properly handled and reported."""
+        self.client.force_login(self.admin_user)
+
+        with patch("posthog.api.organization.rbac_team_access_control_migration", side_effect=Exception("Test error")):
+            response = self.client.post(f"/api/organizations/{self.organization.id}/migrate_access_control/")
+
+            self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+            self.assertEqual(response.json(), {"status": False, "error": "An internal error has occurred."})
+
+            # Verify error was reported
+            mock_report_action.assert_any_call(
+                self.organization, "rbac_team_migration_started", {"user": self.admin_user.distinct_id}
+            )
+            mock_report_action.assert_any_call(
+                self.organization,
+                "rbac_team_migration_failed",
+                {"user": self.admin_user.distinct_id, "error": "Test error"},
+            )
+
+
+class TestOrganizationRequestAIAccessAPI(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        # The endpoint is members-only, so default the requester to a plain member.
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        # AI is requestable only while it's disabled.
+        self.organization.is_ai_data_processing_approved = False
+        self.organization.save()
+        # Throttles key off the django cache, which persists across tests.
+        cache.clear()
+
+    def _url(self) -> str:
+        return f"/api/organizations/{self.organization.id}/request_ai_access/"
+
+    @patch("posthog.api.organization.send_posthog_ai_access_request")
+    def test_member_can_request_ai_access(self, mock_task):
+        response = self.client.post(self._url())
+
+        assert response.status_code == status.HTTP_200_OK, response.content
+        assert response.json() == {"success": True}
+        mock_task.delay.assert_called_once_with(
+            organization_id=str(self.organization.id),
+            requesting_user_id=self.user.id,
+        )
+
+    @parameterized.expand(
+        [
+            ("admin", OrganizationMembership.Level.ADMIN),
+            ("owner", OrganizationMembership.Level.OWNER),
+        ]
+    )
+    @patch("posthog.api.organization.send_posthog_ai_access_request")
+    def test_admins_cannot_request_ai_access(self, _name, level, mock_task):
+        self.organization_membership.level = level
+        self.organization_membership.save()
+
+        response = self.client.post(self._url())
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN, response.content
+        mock_task.delay.assert_not_called()
+
+    @patch("posthog.api.organization.send_posthog_ai_access_request")
+    def test_cannot_request_ai_access_when_already_enabled(self, mock_task):
+        self.organization.is_ai_data_processing_approved = True
+        self.organization.save()
+
+        response = self.client.post(self._url())
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST, response.content
+        mock_task.delay.assert_not_called()
+
+    @patch("posthog.api.organization.send_posthog_ai_access_request")
+    def test_request_ai_access_is_rate_limited(self, mock_task):
+        first = self.client.post(self._url())
+        assert first.status_code == status.HTTP_200_OK, first.content
+
+        second = self.client.post(self._url())
+        assert second.status_code == status.HTTP_429_TOO_MANY_REQUESTS, second.content
+        # Only the first request reached the task.
+        mock_task.delay.assert_called_once()
+
+
+class TestOrganizationDataFreshnessAPI(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+        self.other_organization = Organization.objects.create(name="Other org")
+        self.other_team = Team.objects.create(organization=self.other_organization, name="Other team")
+        self.user.join(organization=self.other_organization, level=OrganizationMembership.Level.MEMBER)
+        # Joining recomputes available features, so grant access control only once the user is in
+        self.other_organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL}
+        ]
+        self.other_organization.save()
+
+    @patch("posthog.api.organization.get_organization_data_freshness")
+    def test_access_control_applies_to_the_requested_organization_not_the_current_one(self, mock_freshness):
+        mock_freshness.return_value = []
+        # Admin here, plain member in the organization actually being requested
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        AccessControl.objects.create(
+            team=self.other_team, resource="project", resource_id=str(self.other_team.id), access_level="none"
+        )
+
+        response = self.client.get(f"/api/organizations/{self.other_organization.id}/teams/data_freshness")
+
+        assert response.status_code == status.HTTP_200_OK, response.content
+        mock_freshness.assert_called_once()
+        assert [team.id for team in mock_freshness.call_args.args[1]] == []
+
+
+class TestOrganizationIPRestrictionsValidation(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("initial_excludes_client", None, True, {"ip_restrictions": ["198.51.100.7"]}, "203.0.113.4", False),
+            ("initial_includes_client", None, True, {"ip_restrictions": ["203.0.113.0/24"]}, "203.0.113.4", True),
+            (
+                "add_another_rule",
+                ["203.0.113.0/24"],
+                True,
+                {"ip_restrictions": ["203.0.113.0/24", "198.51.100.7"]},
+                "203.0.113.4",
+                True,
+            ),
+            (
+                "remove_covering_rule",
+                ["203.0.113.4"],
+                True,
+                {"ip_restrictions": ["198.51.100.7"]},
+                "203.0.113.4",
+                False,
+            ),
+            ("enable_excluding_list", ["198.51.100.7"], False, {"ip_restrictions_enabled": True}, "203.0.113.4", False),
+            ("enable_covering_list", ["203.0.113.0/24"], False, {"ip_restrictions_enabled": True}, "203.0.113.4", True),
+            (
+                "enable_with_replacement",
+                ["198.51.100.7"],
+                False,
+                {"ip_restrictions": ["203.0.113.4"], "ip_restrictions_enabled": True},
+                "203.0.113.4",
+                True,
+            ),
+            (
+                "disable_with_replacement",
+                ["203.0.113.4"],
+                True,
+                {"ip_restrictions": ["198.51.100.7"], "ip_restrictions_enabled": False},
+                "203.0.113.4",
+                True,
+            ),
+            ("edit_disabled_list", ["198.51.100.7"], False, {"ip_restrictions": ["192.0.2.1"]}, "203.0.113.4", True),
+            ("clear_list", ["203.0.113.4"], True, {"ip_restrictions": []}, "203.0.113.4", True),
+            ("unrelated_edit", ["198.51.100.7"], True, {"name": "Example organization"}, "203.0.113.4", True),
+            ("unknown_client", None, True, {"ip_restrictions": ["203.0.113.4"]}, None, False),
+            ("ipv6_client", None, True, {"ip_restrictions": ["2001:db8::/32"]}, "2001:db8::4", True),
+        ]
+    )
+    @override_settings(IS_BEHIND_PROXY=False, TRUST_ALL_PROXIES=False)
+    def test_resulting_policy_keeps_client_access(
+        self,
+        _name: str,
+        saved_restrictions: list[str] | None,
+        enabled: bool,
+        payload: dict[str, object],
+        client_ip: str | None,
+        is_valid: bool,
+    ) -> None:
+        organization = Organization(available_product_features=[{"key": AvailableFeature.IP_RESTRICTIONS}])
+        organization._state.fields_cache["ip_restrictions_config"] = (
+            OrganizationIPRestrictions(organization=organization, ip_restrictions=saved_restrictions, enabled=enabled)
+            if saved_restrictions is not None
+            else None
+        )
+        request = APIRequestFactory().patch("/", REMOTE_ADDR=client_ip or "")
+        request.user = User(email="admin@example.com")
+        serializer = OrganizationSerializer(organization, data=payload, partial=True, context={"request": request})
+
+        self.assertEqual(serializer.is_valid(), is_valid, serializer.errors)
+        if not is_valid:
+            field = "ip_restrictions" if "ip_restrictions" in payload else "ip_restrictions_enabled"
+            self.assertEqual(serializer.errors[field][0].code, "would_block_self")
+
+
+class TestOrganizationMemberNoticeValidation(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("message_only", {"message": "Read the policy."}, True),
+            (
+                "with_action",
+                {"message": "Read the policy.", "action": {"label": "Open", "url": "http://intranet.local/policy"}},
+                True,
+            ),
+            ("null_action", {"message": "Read the policy.", "action": None}, True),
+            ("missing_message", {"action": {"label": "Open", "url": "https://example.com"}}, False),
+            ("blank_message", {"message": ""}, False),
+            ("message_too_long", {"message": "a" * 1001}, False),
+            ("only_unsupported_html", {"message": "<style>body{display:none}</style><script>x()</script>"}, False),
+            ("javascript_url", {"message": "Hi", "action": {"label": "Open", "url": "javascript:alert(1)"}}, False),
+            ("ftp_url", {"message": "Hi", "action": {"label": "Open", "url": "ftp://example.com/policy"}}, False),
+            ("missing_label", {"message": "Hi", "action": {"url": "https://example.com"}}, False),
+            ("not_an_object", "Read the policy.", False),
+        ]
+    )
+    def test_member_notice_validation(self, _name: str, notice: object, is_valid: bool) -> None:
+        serializer = OrganizationMemberNoticeSerializer(data=notice)
+        self.assertEqual(serializer.is_valid(), is_valid, serializer.errors)
+
+    @parameterized.expand(
+        [
+            (
+                "keeps_bold_and_links",
+                'Read <b>how</b> we use data. <a href="https://intranet.example.com/policy">Policy</a>',
+                'Read <b>how</b> we use data. <a href="https://intranet.example.com/policy" target="_blank" rel="noopener noreferrer">Policy</a>',
+            ),
+            (
+                "strips_link_tags_and_css",
+                '<link rel="stylesheet" href="https://example.com/x.css"><style>body{display:none}</style><span style="color:red" class="hidden">Hi</span>',
+                "<span>Hi</span>",
+            ),
+            (
+                "strips_scripts_handlers_and_javascript_urls",
+                '<a href="javascript:alert(1)" onclick="x()">Hi</a><script>alert(1)</script><img src="x" onerror="alert(1)">',
+                '<a target="_blank" rel="noopener noreferrer">Hi</a>',
+            ),
+        ]
+    )
+    def test_member_notice_message_is_sanitized(self, _name: str, message: str, expected: str) -> None:
+        serializer = OrganizationMemberNoticeSerializer(data={"message": message})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["message"], expected)
+
+    @parameterized.expand(
+        [
+            ("fits_after_sanitizing", 950, True),
+            ("too_long_after_sanitizing", 980, False),
+        ]
+    )
+    def test_member_notice_length_counts_sanitized_links(self, _name: str, raw_length: int, is_valid: bool) -> None:
+        link = '<a href="https://example.com">policy</a>'
+        message = "a" * (raw_length - len(link)) + link
+        serializer = OrganizationMemberNoticeSerializer(data={"message": message})
+        self.assertEqual(serializer.is_valid(), is_valid, serializer.errors)
+        if is_valid:
+            resaved = OrganizationMemberNoticeSerializer(data={"message": serializer.validated_data["message"]})
+            self.assertTrue(resaved.is_valid(), resaved.errors)
+            self.assertEqual(resaved.validated_data["message"], serializer.validated_data["message"])

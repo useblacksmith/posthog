@@ -1,0 +1,169 @@
+import { describe, expect, it, vi } from 'vitest'
+
+import setActiveProjectTool from '@/tools/projects/setActive'
+import type { Context, PinnedActiveContext } from '@/tools/types'
+
+const ACTIVE_ORG = 'org-active'
+const OTHER_ORG = 'org-other'
+
+function createMockContext(overrides: {
+    projectGet: ReturnType<typeof vi.fn>
+    getOrgID?: ReturnType<typeof vi.fn>
+    getCachedOrFetchOrg?: ReturnType<typeof vi.fn>
+    pinnedContext?: PinnedActiveContext
+}): {
+    context: Context
+    cache: Map<string, unknown>
+    getCachedOrFetchOrg: ReturnType<typeof vi.fn>
+} {
+    const cache = new Map<string, unknown>()
+    const getCachedOrFetchOrg = overrides.getCachedOrFetchOrg ?? vi.fn().mockResolvedValue(undefined)
+    const context = {
+        api: {
+            publicBaseUrl: 'https://us.posthog.com',
+            projects: () => ({ get: overrides.projectGet }),
+        },
+        cache: {
+            get: async (key: string) => cache.get(key),
+            set: async (key: string, value: unknown) => {
+                cache.set(key, value)
+            },
+        },
+        stateManager: {
+            getOrgID: overrides.getOrgID ?? vi.fn().mockResolvedValue(ACTIVE_ORG),
+            getCachedOrFetchOrg,
+            getOrFetchIntegrationKinds: vi.fn().mockResolvedValue(undefined),
+            pinnedContext: overrides.pinnedContext,
+            setActiveContext: async (updates: { orgId?: string; projectId?: string }) => {
+                if (updates.orgId) {
+                    cache.set('orgId', updates.orgId)
+                }
+                if (updates.projectId) {
+                    cache.set('projectId', updates.projectId)
+                }
+            },
+        },
+        env: {},
+        sessionManager: {},
+        getDistinctId: async () => 'test-distinct-id',
+        trackEvent: async () => {},
+    } as unknown as Context
+    return { context, cache, getCachedOrFetchOrg }
+}
+
+describe('switch-project', () => {
+    const tool = setActiveProjectTool()
+
+    it('does not commit the session, preserves the error cause, and guides the agent when the project is unreachable', async () => {
+        const apiError = new Error('404')
+        const projectGet = vi.fn().mockResolvedValue({ success: false, error: apiError })
+        const { context, cache } = createMockContext({ projectGet })
+
+        let caught: (Error & { cause?: unknown }) | undefined
+        try {
+            await tool.handler(context, { projectId: 999 })
+        } catch (e) {
+            caught = e as Error & { cause?: unknown }
+        }
+
+        expect(caught?.message).toMatch(
+            /Could not switch to project 999.*active organization \(org-active\).*organizations-get.*switch-organization/s
+        )
+        // Keeping the typed error as cause keeps recoverable not-found/no-access
+        // failures out of exception tracking.
+        expect(caught?.cause).toBe(apiError)
+        // A failed switch must not strand the session on an unreachable project.
+        expect(cache.get('projectId')).toBeUndefined()
+    })
+
+    it.each([
+        ['projectId', { projectId: 42 }],
+        ['project_id', { project_id: 42 }],
+        ['new_project_id', { new_project_id: 42 }],
+        ['projectId over aliases', { projectId: 42, project_id: 77, new_project_id: 99 }],
+        ['project_id over new_project_id', { project_id: 42, new_project_id: 77 }],
+    ])('switches via %s within the active organization without touching org state', async (_label, input) => {
+        const projectGet = vi.fn().mockResolvedValue({
+            success: true,
+            data: { id: 42, name: 'My project', organization: ACTIVE_ORG },
+        })
+        const { context, cache, getCachedOrFetchOrg } = createMockContext({ projectGet })
+
+        const result = await tool.handler(context, tool.schema.parse(input))
+
+        expect(result.content[0]!.text).toContain('Switched to project 42')
+        expect(result.content[0]!.text).not.toContain('also switched the active organization')
+        expect(cache.get('projectId')).toBe('42')
+        expect(getCachedOrFetchOrg).not.toHaveBeenCalled()
+    })
+
+    it.each(['projectId', 'project_id', 'new_project_id'])('rejects invalid identifiers supplied via %s', (key) => {
+        for (const value of [undefined, null, true, '42', 0, -1, 1.5]) {
+            expect(tool.schema.safeParse({ [key]: value }).success).toBe(false)
+        }
+    })
+
+    it('never exposes the project API token in the switch response', async () => {
+        const projectGet = vi.fn().mockResolvedValue({
+            success: true,
+            data: { id: 42, name: 'My project', organization: ACTIVE_ORG, api_token: 'phc_secret_token' },
+        })
+        const { context } = createMockContext({ projectGet })
+
+        const result = await tool.handler(context, { projectId: 42 })
+
+        expect(result.content[0]!.text).not.toContain('phc_secret_token')
+    })
+
+    it('syncs the active organization via the shared resolver when the project is in another org', async () => {
+        const projectGet = vi.fn().mockResolvedValue({
+            success: true,
+            data: { id: 77, name: 'Cross-org project', organization: OTHER_ORG },
+        })
+        const getCachedOrFetchOrg = vi.fn().mockResolvedValue({ id: OTHER_ORG, name: 'Other org' })
+        const { context, cache } = createMockContext({ projectGet, getCachedOrFetchOrg })
+
+        const result = await tool.handler(context, { projectId: 77 })
+
+        expect(result.content[0]!.text).toContain('also switched the active organization to org-other')
+        expect(cache.get('projectId')).toBe('77')
+        expect(cache.get('orgId')).toBe(OTHER_ORG)
+        // Reuses the resolver (with its scoped-token guard) instead of calling the
+        // org endpoint directly, which the backend rejects for project-scoped keys.
+        expect(getCachedOrFetchOrg).toHaveBeenCalledTimes(1)
+    })
+
+    it('establishes org context without claiming a switch when no active org was resolved', async () => {
+        const projectGet = vi.fn().mockResolvedValue({
+            success: true,
+            data: { id: 55, name: 'Scoped project', organization: OTHER_ORG },
+        })
+        // Team-scoped keys resolve no org on the first call, and getCachedOrFetchOrg
+        // returns undefined for them (the org endpoint is rejected for such tokens).
+        const getOrgID = vi.fn().mockRejectedValue(new Error('no org'))
+        const { context, cache } = createMockContext({ projectGet, getOrgID })
+
+        const result = await tool.handler(context, { projectId: 55 })
+
+        expect(result.content[0]!.text).toContain('Switched to project 55')
+        expect(result.content[0]!.text).not.toContain('also switched the active organization')
+        expect(cache.get('orgId')).toBe(OTHER_ORG)
+    })
+
+    it.each<[string, PinnedActiveContext['pin'], number, string]>([
+        ['a project pin', { projectId: '1' }, 42, ACTIVE_ORG],
+        ['an org pin, to a project in another org', { organizationId: ACTIVE_ORG }, 77, OTHER_ORG],
+    ])('refuses a switch that %s would revert when there is no MCP session', async (_label, pin, projectId, org) => {
+        const projectGet = vi.fn().mockResolvedValue({
+            success: true,
+            data: { id: projectId, name: 'Project', organization: org },
+        })
+        const { context, cache } = createMockContext({
+            projectGet,
+            pinnedContext: { pin, sessionScoped: false, orgId: pin.organizationId, projectId: pin.projectId },
+        })
+
+        await expect(tool.handler(context, { projectId })).rejects.toThrow(/sends no MCP session id/)
+        expect(cache.get('projectId')).toBeUndefined()
+    })
+})

@@ -1,0 +1,749 @@
+"""DRF serializers for data_catalog.
+
+These are the source of truth for the generated frontend/MCP types, so every field carries
+help_text. ``status`` is exposed as a plain read-only string (not a ChoiceField) to keep it out of
+the drf-spectacular enum namespace, where a component named ``Status`` collides across the API.
+"""
+
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field, extend_schema_serializer
+from rest_framework import serializers
+
+from posthog.api.shared import UserBasicSerializer
+from posthog.models import User
+from posthog.schema_enums import IntervalType
+
+from ..facade import api
+from ..facade.api import (
+    DESCRIPTION_TOO_LONG_MESSAGE,
+    MAX_DESCRIPTION_LENGTH,
+    MAX_METRIC_RUN_PAGES,
+    METRIC_NAME_MAX_LENGTH,
+)
+from ..facade.enums import CreatedSource, JudgeRelation, ShapeOutcome, UsageSection, UsageSnapshotStatus
+from ..facade.models import Metric, RelationshipProposal, TableCertification
+
+
+@extend_schema_field(OpenApiTypes.OBJECT)
+class MetricDefinitionField(serializers.JSONField):
+    """A machine-readable query (HogQLQuery, TrendsQuery, event node, ...). Typed as a free object."""
+
+
+@extend_schema_field(OpenApiTypes.ANY)
+class _FreeJSONField(serializers.JSONField):
+    """A free-form JSON value (query results / query status shapes)."""
+
+
+class MetricOwnerField(serializers.EmailField):
+    def get_attribute(self, instance: Metric) -> str | None:
+        return instance.owner.email if instance.owner else None
+
+    def run_validation(self, data: object = serializers.empty) -> User | None:
+        email = super().run_validation(data)
+        if email is None:
+            return None
+        team = self.context["view"].team
+        owner = User.objects.filter(
+            email__iexact=email, organization_membership__organization_id=team.organization_id
+        ).first()
+        if owner is None:
+            raise serializers.ValidationError("No member of this organization has this email.")
+        return owner
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricRun")
+class MetricRunResponseSerializer(serializers.Serializer):
+    """Normalized envelope returned by the metric-run endpoint."""
+
+    status = serializers.CharField(help_text="Lifecycle state of the metric that produced these results.")
+    is_drifted = serializers.BooleanField(
+        help_text="True when the definition has drifted from its linked source insight (or the insight is gone). "
+        "Only status 'approved' with is_drifted false is canonical."
+    )
+    unit = serializers.CharField(allow_null=True, help_text="Unit of the result, e.g. usd, percent.")
+    kind = serializers.CharField(allow_null=True, help_text="Query kind that was executed.")
+    results = _FreeJSONField(
+        allow_null=True, help_text="The query results, for an executable metric. Null for a markdown metric."
+    )
+    columns = serializers.ListField(
+        child=serializers.CharField(),
+        allow_null=True,
+        help_text="Names of the result columns, in the order of the values in each positional result row. "
+        "Null when the results are already labeled, or the query kind returns no column names.",
+    )
+    compiled_query = serializers.CharField(allow_null=True, help_text="The compiled HogQL, when available.")
+    query_status = _FreeJSONField(allow_null=True, help_text="Async query status, when the run is not blocking.")
+    has_more = serializers.BooleanField(
+        help_text="True when the query hit its row limit and more rows exist. Run the metric again with "
+        "offset set to next_offset, and repeat until has_more is false. Do not re-derive the rows by hand. "
+        "False whenever row_limit is null, because no row cap was reported for that run."
+    )
+    row_limit = serializers.IntegerField(
+        allow_null=True,
+        help_text="Row limit applied to this run. Null when no row cap was reported: a markdown metric, an "
+        "insight or trends query, or a HogQL metric that sets its own LIMIT or uses a UNION. This field "
+        "cannot verify the completeness of those runs.",
+    )
+    next_offset = serializers.IntegerField(
+        allow_null=True,
+        help_text="Offset that returns the next page of rows. Null when has_more is false, or when the run "
+        "reached the page limit (see paging_stopped_reason). Pages follow the definition's ORDER BY, so rows that "
+        "tie on every ORDER BY column can move between pages.",
+    )
+    paging_stopped_reason = serializers.CharField(
+        allow_null=True,
+        help_text=f"Why paging stopped while has_more is still true: a metric run returns at most "
+        f"{MAX_METRIC_RUN_PAGES} pages. Report the result as partial. Null when paging can continue or the rows "
+        "are complete.",
+    )
+    posthog_url = serializers.CharField(
+        allow_null=True, help_text="Deep link to open the query in the app (SQL editor or insight)."
+    )
+    instructions = serializers.CharField(
+        allow_null=True,
+        help_text="For a markdown (agent-calculated) metric, the steps to follow to compute it. Null for an executable metric.",
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricRunRequest")
+class MetricRunRequestSerializer(serializers.Serializer):
+    """Optional run-time overrides. The whole body may be omitted; a metric runs by its URL name."""
+
+    date_from = serializers.CharField(
+        required=False,
+        help_text="Override the start of the query window (e.g. '-7d'). Rejected for HogQLQuery metrics, whose window is fixed in SQL.",
+    )
+    date_to = serializers.CharField(required=False, help_text="Override the end of the query window.")
+    interval = serializers.ChoiceField(
+        choices=[t.value for t in IntervalType],
+        required=False,
+        help_text="Override the bucket interval. Rejected for HogQLQuery metrics.",
+    )
+    offset = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        help_text="Rows to skip, to read the page after a run that returned has_more. Pass next_offset from "
+        "that run. Only HogQLQuery metrics accept it. Runs made with a personal or project API key are rejected.",
+    )
+    query_id = serializers.CharField(required=False, help_text="Client-supplied id to correlate or cancel the run.")
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricRunQuery")
+class MetricRunQuerySerializer(serializers.Serializer):
+    """Query params for the metric-run endpoint."""
+
+    refresh = serializers.ChoiceField(
+        choices=["blocking", "async", "lazy_async", "force_blocking", "force_async", "force_cache"],
+        required=False,
+        help_text="Cache/execution behavior, same semantics as /query/. Omit to serve a fresh cache "
+        "hit and calculate blocking when stale.",
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetric")
+class MetricSerializer(serializers.ModelSerializer):
+    definition = MetricDefinitionField(
+        required=False,
+        allow_null=True,
+        help_text="Machine-readable query. Omit for a name+description-only stub. Stored upgrade-canonical.",
+    )
+    definition_kind = serializers.CharField(
+        read_only=True,
+        allow_null=True,
+        help_text="Query kind of the definition (HogQLQuery, TrendsQuery, ...), or null for a stub.",
+    )
+    status = serializers.CharField(
+        read_only=True,
+        help_text="Persisted lifecycle state: 'proposed' or 'approved'. Drift is reported separately.",
+    )
+    is_drifted = serializers.SerializerMethodField(
+        help_text="True when the definition has drifted from its linked source insight (or the insight is gone).",
+    )
+    match_reason = serializers.SerializerMethodField(
+        help_text="Why the metric matched the search, best match first, e.g. 'name match', 'acronym of the name', "
+        "'all words in the description', 'some words in the description'. Null when the list has no search.",
+    )
+    created_source = serializers.ChoiceField(
+        choices=[(s.value, s.value) for s in CreatedSource],
+        required=False,
+        help_text="Whether a human ('user') or an agent ('ai_generated') authored this metric.",
+    )
+    owner = MetricOwnerField(
+        required=False,
+        allow_null=True,
+        help_text="Email of the human accountable for this metric, or null. Set it to the email of a member of "
+        "this organization to reassign the metric, or to null to clear it. Changing the owner keeps the metric's "
+        "approval.",
+    )
+    created_by = UserBasicSerializer(read_only=True, help_text="User who first created this metric.")
+    approved_by = UserBasicSerializer(
+        read_only=True, allow_null=True, help_text="User who approved this metric as canonical, or null."
+    )
+
+    class Meta:
+        model = Metric
+        fields = [
+            "id",
+            "name",
+            "display_name",
+            "description",
+            "unit",
+            "owner",
+            "definition",
+            "definition_kind",
+            "referenced_table_names",
+            "status",
+            "is_drifted",
+            "match_reason",
+            "approved_at",
+            "approved_by",
+            "source_insight_short_id",
+            "last_run_at",
+            "created_source",
+            "ai_model",
+            "reasoning",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "approved_at",
+            "approved_by",
+            "referenced_table_names",
+            "last_run_at",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]
+        extra_kwargs = {
+            "name": {
+                "help_text": "Identifier-safe run handle, unique among the team's live metrics. Renaming or "
+                "deleting a metric frees its name for reuse, and anything referencing the old name (SQL over "
+                "information_schema.metrics, run URLs, links) stops resolving."
+            },
+            "source_insight_short_id": {
+                "required": False,
+                "help_text": "Create the metric from this insight's query (snapshotted server-side). "
+                "Set to null to unlink. Mutually exclusive with definition.",
+            },
+            "display_name": {"help_text": "Human-friendly label. Mutable, unlike name."},
+            "description": {
+                "help_text": "What the number is, in 1-2 short sentences under 300 characters: its meaning and "
+                "grain plus any inclusion or exclusion that changes it. Leave out source tables or views, lineage, "
+                "column lists, and comparisons with other metrics. Never narrate the query - the definition carries "
+                "the mechanics; put the query's design decisions in 'reasoning'.",
+                "max_length": MAX_DESCRIPTION_LENGTH,
+                "error_messages": {"max_length": DESCRIPTION_TOO_LONG_MESSAGE},
+            },
+            "unit": {"help_text": "Unit of the result, e.g. usd, percent, cents."},
+            "ai_model": {"help_text": "Model that generated the metric, if AI-authored."},
+            "reasoning": {
+                "help_text": "Why the definition is shaped this way, in 1-3 short sentences. Name the main design "
+                "decisions and trade-offs: the source table or view, a filter or exclusion, the grain, an "
+                "approximation. Leave out the use case, who asked, run results, validation figures, and edit "
+                "history."
+            },
+        }
+
+    @extend_schema_field(OpenApiTypes.BOOL)
+    def get_is_drifted(self, obj: Metric) -> bool:
+        # The list view precomputes drift for the whole page into ``drift_map`` (one bulk query);
+        # single-object paths (retrieve, create, approve, ...) fall back to a bounded per-object query.
+        drift_map = self.context.get("drift_map")
+        if drift_map is not None and obj.id in drift_map:
+            return drift_map[obj.id]
+        return api.compute_drift([obj])[obj.id]
+
+    @extend_schema_field({"type": "string", "nullable": True})
+    def get_match_reason(self, obj: Metric) -> str | None:
+        return self.context.get("match_reasons", {}).get(obj.id)
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricCreate")
+class MetricCreateSerializer(MetricSerializer):
+    """Create input. ``overwrite`` exists only here, because PATCH addresses an existing metric by its URL name."""
+
+    overwrite = serializers.BooleanField(
+        required=False,
+        default=False,
+        write_only=True,
+        help_text="Replace the fields of the live metric that already holds this name. When false, a taken name "
+        "returns 409 with code 'metric_name_taken' and the existing metric stays unchanged. Overwriting an "
+        "approved metric with a changed name, description, unit, or definition resets it to 'proposed'.",
+    )
+
+    class Meta(MetricSerializer.Meta):
+        fields = [*MetricSerializer.Meta.fields, "overwrite"]
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricNameConflictExisting")
+class MetricNameConflictExistingSerializer(serializers.Serializer):
+    """The live metric that holds the name a create was sent with."""
+
+    name = serializers.CharField(help_text="Name of the existing metric.")
+    status = serializers.CharField(help_text="Lifecycle state of the existing metric: 'proposed' or 'approved'.")
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricNameConflictExtra")
+class MetricNameConflictExtraSerializer(serializers.Serializer):
+    existing_metric = MetricNameConflictExistingSerializer(
+        help_text="The metric that holds the name. Send overwrite true to replace it."
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricNameConflict")
+class MetricNameConflictSerializer(serializers.Serializer):
+    """The 409 body of a create whose name a live metric already holds."""
+
+    type = serializers.CharField(help_text="Error class the API attaches to every error body.")
+    code = serializers.CharField(help_text="Always 'metric_name_taken'.")
+    detail = serializers.CharField(help_text="Human-readable reason, safe to show as is.")
+    attr = serializers.CharField(allow_null=True, help_text="Always null: the conflict is not tied to one field.")
+    extra = MetricNameConflictExtraSerializer(
+        required=False,
+        help_text="Absent when the existing metric is hidden from the caller because it reads a table they cannot access.",
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricApproveRequest")
+class MetricApproveRequestSerializer(serializers.Serializer):
+    """Input for approving one metric."""
+
+    expected_updated_at = serializers.DateTimeField(
+        required=False,
+        help_text="The metric's `updated_at` as last seen by the approver. When the metric changed since then, the API returns 409 and leaves it proposed. Omit to approve the current version.",
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricBulkNamesRequest")
+class MetricBulkNamesRequestSerializer(serializers.Serializer):
+    """Input for the bulk metric actions: the metric names to act on."""
+
+    names = serializers.ListField(
+        child=serializers.CharField(max_length=METRIC_NAME_MAX_LENGTH),
+        allow_empty=False,
+        # `allow_empty` alone doesn't reach the OpenAPI schema; `min_length` emits `minItems: 1`
+        # so generated MCP/Zod clients can't construct an empty batch the API would 400.
+        min_length=1,
+        max_length=api.METRIC_BULK_MAX,
+        help_text=f"Names of the metrics to act on, at most {api.METRIC_BULK_MAX}. Duplicates are collapsed.",
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricBulkChangeOwnerRequest")
+class MetricBulkChangeOwnerRequestSerializer(MetricBulkNamesRequestSerializer):
+    """Input for giving many metrics one owner."""
+
+    owner = MetricOwnerField(
+        allow_null=True,
+        help_text="Email of the member of this organization who becomes the owner of every named metric, or null "
+        "to clear the owner. Changing the owner keeps each metric's approval.",
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricBulkSkip")
+class MetricBulkSkipSerializer(serializers.Serializer):
+    """A metric the bulk action did not act on, and why."""
+
+    name = serializers.CharField(help_text="Name of the metric that was skipped.")
+    reason = serializers.CharField(
+        help_text="Why it was skipped, e.g. 'Not found', 'Already approved', 'Drifted from its source insight'."
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricBulkApprove")
+class MetricBulkApproveResponseSerializer(serializers.Serializer):
+    """Outcome of a bulk approve: what changed, and what was left alone."""
+
+    approved = MetricSerializer(many=True, help_text="The metrics that are now approved, freshly serialized.")
+    skipped = MetricBulkSkipSerializer(many=True, help_text="Requested metrics that were not approved, with reasons.")
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricBulkChangeOwner")
+class MetricBulkChangeOwnerResponseSerializer(serializers.Serializer):
+    """Outcome of a bulk owner change: what changed, and what was left alone."""
+
+    updated = MetricSerializer(many=True, help_text="The metrics that now have the new owner, freshly serialized.")
+    skipped = MetricBulkSkipSerializer(
+        many=True, help_text="Requested metrics whose owner did not change, with reasons."
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogMetricBulkDelete")
+class MetricBulkDeleteResponseSerializer(serializers.Serializer):
+    """Outcome of a bulk delete: which names are gone, and what was left alone."""
+
+    deleted = serializers.ListField(
+        child=serializers.CharField(), help_text="Names of the metrics that were deleted, now free for reuse."
+    )
+    skipped = MetricBulkSkipSerializer(many=True, help_text="Requested metrics that were not deleted, with reasons.")
+
+
+@extend_schema_serializer(component_name="DataCatalogCertification")
+class CertificationSerializer(serializers.ModelSerializer):
+    status = serializers.CharField(
+        read_only=True, help_text="proposed, certified (prefer this source), or deprecated (avoid this source)."
+    )
+    proposed_status = serializers.CharField(
+        read_only=True,
+        help_text="The mark the proposal asks for: 'certified' (trust this source) or 'deprecated' "
+        "(avoid this source). Informational once the mark is settled.",
+    )
+    target_type = serializers.SerializerMethodField(help_text="Whether the marked target is a 'table' or a 'view'.")
+    target_name = serializers.SerializerMethodField(help_text="Queryable HogQL name of the marked table or view.")
+    certified_by = UserBasicSerializer(
+        read_only=True, allow_null=True, help_text="User who last set certified/deprecated, or null."
+    )
+
+    class Meta:
+        model = TableCertification
+        fields = [
+            "id",
+            "table",
+            "saved_query",
+            "target_type",
+            "target_name",
+            "status",
+            "proposed_status",
+            "notes",
+            "certified_by",
+            "certified_at",
+            "created_by",
+            "created_at",
+        ]
+        read_only_fields = [
+            "id",
+            "table",
+            "saved_query",
+            "status",
+            "proposed_status",
+            "certified_by",
+            "certified_at",
+            "created_by",
+            "created_at",
+        ]
+        extra_kwargs = {"notes": {"help_text": "Why this mark exists, e.g. 'canonical MRR source'."}}
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_target_type(self, obj: TableCertification) -> str:
+        return "table" if obj.table_id else "view"
+
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_target_name(self, obj: TableCertification) -> str:
+        return api.certification_target_name(obj)
+
+
+class CertificationCreateSerializer(serializers.Serializer):
+    """Input for proposing a certification: address the target by id or (convenience) by name."""
+
+    table_id = serializers.UUIDField(required=False, help_text="Warehouse table id to certify (XOR the other targets).")
+    saved_query_id = serializers.UUIDField(required=False, help_text="Warehouse view (saved query) id to certify.")
+    table_name = serializers.CharField(
+        required=False, help_text="Queryable HogQL table name; 409 with candidates if ambiguous."
+    )
+    view_name = serializers.CharField(
+        required=False, help_text="Queryable HogQL view name; 409 with candidates if ambiguous."
+    )
+    notes = serializers.CharField(required=False, allow_blank=True, help_text="Why this mark exists.")
+    proposed_status = serializers.ChoiceField(
+        choices=["certified", "deprecated"],
+        required=False,
+        default="certified",
+        help_text="Intent of the proposal: 'certified' to propose trusting this source, "
+        "'deprecated' to propose avoiding it (e.g. a stale or wrong source).",
+    )
+
+
+@extend_schema_serializer(component_name="DataCatalogRelationshipProposal")
+class RelationshipProposalSerializer(serializers.ModelSerializer):
+    status = serializers.CharField(
+        read_only=True, help_text="proposed, accepted (promoted to a real join), or rejected (never re-proposed)."
+    )
+    configuration = _FreeJSONField(required=False, help_text="Extra join configuration, e.g. a field mapping.")
+    evidence = _FreeJSONField(required=False, help_text="Sampling evidence: match rates, sample values.")
+    reviewed_by = UserBasicSerializer(
+        read_only=True, allow_null=True, help_text="User who accepted or rejected the proposal."
+    )
+
+    class Meta:
+        model = RelationshipProposal
+        fields = [
+            "id",
+            "source_table_name",
+            "source_table_key",
+            "joining_table_name",
+            "joining_table_key",
+            "field_name",
+            "configuration",
+            "confidence",
+            "reasoning",
+            "evidence",
+            "status",
+            "reviewed_by",
+            "reviewed_at",
+            "rejection_reason",
+            "created_join",
+            "created_by",
+            "created_at",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "reviewed_by",
+            "reviewed_at",
+            "rejection_reason",
+            "created_join",
+            "created_by",
+            "created_at",
+        ]
+        extra_kwargs = {
+            "source_table_name": {"help_text": "Name of the table the join starts from."},
+            "source_table_key": {"help_text": "HogQL key expression on the source table (casts allowed)."},
+            "joining_table_name": {"help_text": "Name of the table being joined in."},
+            "joining_table_key": {"help_text": "HogQL key expression on the joining table (casts allowed)."},
+            "field_name": {"help_text": "Accessor the join adds to the source table."},
+            "confidence": {"help_text": "Discovery confidence in this join, 0-1."},
+            "reasoning": {"help_text": "Why this join is proposed."},
+        }
+
+
+class RelationshipRejectSerializer(serializers.Serializer):
+    rejection_reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Why the proposal is rejected. Persisted so it is never re-proposed.",
+    )
+
+
+class MetricRunCountsSerializer(serializers.Serializer):
+    metric_id = serializers.UUIDField(help_text="ID of the catalog metric.")
+    direct_runs = serializers.DictField(
+        child=serializers.IntegerField(),
+        help_text="Direct runs of the metric in the window, keyed by the surface that ran it: web, api, mcp, "
+        "slack, posthog_ai, or posthog_code. Scout runs are not included.",
+    )
+    direct_people = serializers.IntegerField(help_text="Distinct people who ran the metric directly, without scouts.")
+    scout_runs = serializers.IntegerField(
+        help_text="Direct runs by scouts (scheduled agents), kept apart because one scout can run a metric many "
+        "times a day."
+    )
+
+
+class AdjustedRunSerializer(serializers.Serializer):
+    metric_id = serializers.UUIDField(help_text="ID of the catalog metric the agent query re-derived.")
+    read_metric_first = serializers.BooleanField(
+        help_text="True when the agent read this metric in the catalog before it wrote the query."
+    )
+    relation = serializers.ChoiceField(
+        choices=JudgeRelation.choices,
+        help_text="serves: the query computes the metric. slice: it computes the metric with an extra filter. "
+        "Never different: the scan drops the queries the judge marks different.",
+    )
+    intent = serializers.CharField(help_text="What the agent said it was trying to answer.")
+    sql = serializers.CharField(help_text="The SQL the agent ran.")
+    reasoning = serializers.CharField(help_text="Why the judge matched the query to the metric.")
+    occurred_at = serializers.DateTimeField(help_text="When the agent ran the query.")
+    session_id = serializers.CharField(
+        allow_null=True,
+        help_text="Agent conversation of the query, when known: the session id of the conversation's first piece. "
+        "Every query in one conversation carries the same id.",
+    )
+    is_scout = serializers.BooleanField(help_text="True when a scout (scheduled agent) ran the query.")
+
+
+class TopicCoverageSerializer(serializers.Serializer):
+    metric = serializers.IntegerField(help_text="Sessions that asked for a metric and found one that fits.")
+    table = serializers.IntegerField(
+        help_text="Sessions that asked for a metric, found none, and found a table or view description that fits."
+    )
+    nothing = serializers.IntegerField(help_text="Sessions that asked for a metric and found neither.")
+
+
+class TopicClusterSerializer(serializers.Serializer):
+    title = serializers.CharField(help_text="Short name of the subject. 'Other' holds the sessions that fit no topic.")
+    description = serializers.CharField(allow_blank=True, help_text="One sentence on what the topic covers.")
+    session_count = serializers.IntegerField(help_text="Agent sessions in the topic. Scout sessions are not included.")
+    people = serializers.IntegerField(help_text="Distinct people behind the topic's sessions.")
+    coverage = TopicCoverageSerializer(help_text="What the sessions that asked for a metric ended up with.")
+
+
+class TopicDefinitionSerializer(serializers.Serializer):
+    title = serializers.CharField(help_text="Short name of the subject.")
+    description = serializers.CharField(allow_blank=True, help_text="One sentence on what the topic covers.")
+
+
+class TableSourceSerializer(serializers.Serializer):
+    name = serializers.CharField(help_text="Name of the table or view, as the agent's search returned it.")
+    sessions = serializers.IntegerField(
+        help_text="Sessions in the window that found its description and then queried it."
+    )
+    people = serializers.IntegerField(help_text="Distinct people behind those sessions.")
+
+
+class TopicSessionCountsSerializer(serializers.Serializer):
+    analysis = serializers.IntegerField(help_text="Sampled sessions that calculated or compared data.")
+    lookup = serializers.IntegerField(help_text="Sampled sessions that read or checked specific things.")
+    automation = serializers.IntegerField(help_text="Sampled sessions from a scheduled or repeated job.")
+    unclear = serializers.IntegerField(help_text="Sampled sessions whose intents did not show what they did with data.")
+    unread = serializers.IntegerField(help_text="Sampled sessions that the model failed to read.")
+    coverage_unchecked = serializers.IntegerField(
+        help_text="Analysis sessions whose coverage check failed. They count as a metric only after a direct run."
+    )
+
+
+class UncoveredGroupSerializer(serializers.Serializer):
+    fingerprint_digest = serializers.CharField(help_text="Stable ID of the measure the queries compute.")
+    measure = serializers.CharField(help_text="Readable description of the measure.")
+    outcome = serializers.ChoiceField(
+        choices=ShapeOutcome.choices,
+        help_text="covered: a catalog metric computes it. slice: a catalog metric computes it without the "
+        "extra filters. uncovered: no catalog metric computes it.",
+    )
+    matched_metric_id = serializers.UUIDField(
+        allow_null=True, help_text="The matching catalog metric, for covered and slice."
+    )
+    distinct_people = serializers.IntegerField(
+        help_text="People who wrote the measure or created a chart of it, directly or through an agent. Without scouts."
+    )
+    views = serializers.IntegerField(
+        help_text="Runs of the measure that a person saw, in the web app or an agent session. At least the built count."
+    )
+    built = serializers.IntegerField(
+        help_text="Times a person or an agent wrote the measure, plus one per chart, notebook query or canvas query."
+    )
+    sample_sql = serializers.CharField(help_text="One query that computes the measure.")
+    draft_name = serializers.CharField(allow_null=True, help_text="Proposed metric name, when one was drafted.")
+    draft_description = serializers.CharField(
+        allow_null=True, help_text="Proposed metric description, when one was drafted."
+    )
+    draft_definition = serializers.CharField(
+        allow_null=True, help_text="Proposed HogQL definition, when one was drafted."
+    )
+    complexity = serializers.IntegerField(
+        help_text="How hard the query is to write by hand: 1 low, 2 medium, 3 high, 0 when it does not parse."
+    )
+
+
+class ChartSourceSerializer(serializers.Serializer):
+    insight_short_id = serializers.CharField(help_text="Short ID of the saved chart, for a link to it.")
+    insight_name = serializers.CharField(help_text="Name of the saved chart.")
+    dashboard_id = serializers.IntegerField(allow_null=True, help_text="The dashboard that ran the chart, if any.")
+    dashboard_name = serializers.CharField(allow_null=True, help_text="Name of the dashboard, if any.")
+    people = serializers.IntegerField(help_text="Distinct people whose visit ran the chart. Viewers count.")
+
+
+class SurfaceSourceSerializer(serializers.Serializer):
+    product = serializers.CharField(help_text="The web app area that ran the query. Empty when it is unknown.")
+    people = serializers.IntegerField(help_text="Distinct people who ran the query there.")
+    runs = serializers.IntegerField(help_text="Query runs from that area.")
+
+
+class AgentSourceSerializer(serializers.Serializer):
+    people = serializers.IntegerField(help_text="Distinct people whose agents ran the query, without scouts.")
+    sessions = serializers.IntegerField(help_text="Agent sessions that ran the query, without scouts.")
+    runs = serializers.IntegerField(help_text="Query runs by agents, without scouts.")
+
+
+class ProposedMetricSerializer(serializers.Serializer):
+    name = serializers.CharField(help_text="Proposed metric name.")
+    description = serializers.CharField(help_text="What the proposed metric counts.")
+    definition = serializers.CharField(allow_blank=True, help_text="Proposed HogQL definition.")
+    measures = serializers.IntegerField(help_text="Recurring measures that this proposal merges.")
+    people = serializers.IntegerField(help_text="Distinct people across the measures, without scouts.")
+    views = serializers.IntegerField(
+        help_text="Runs of the measure that a person saw, in the web app or an agent session. At least the built count."
+    )
+    built = serializers.IntegerField(
+        help_text="Times a person or an agent wrote the most-built measure in the proposal, as on a measure."
+    )
+    charts = ChartSourceSerializer(many=True, help_text="The saved charts with the most people.")
+    other_charts = serializers.IntegerField(help_text="Saved charts that are not listed in charts.")
+    surfaces = SurfaceSourceSerializer(many=True, help_text="Web app areas that ran it outside a saved chart.")
+    agents = AgentSourceSerializer(allow_null=True, help_text="Agent use, or null when no agent ran it.")
+    complexity = serializers.IntegerField(
+        help_text="How hard the query is to write by hand: 1 low, 2 medium, 3 high, 0 when it does not parse."
+    )
+
+
+class SectionFailureSerializer(serializers.Serializer):
+    section = serializers.ChoiceField(choices=UsageSection.choices, help_text="The payload section whose step failed.")
+    reason = serializers.CharField(help_text="Why the scan step failed.")
+
+
+class UsageSnapshotPayloadSerializer(serializers.Serializer):
+    metric_runs = MetricRunCountsSerializer(
+        many=True, allow_null=True, help_text="Run counts per metric. Null until the scan counts runs."
+    )
+    adjusted_runs = AdjustedRunSerializer(
+        many=True, allow_null=True, help_text="Agent queries that re-derived a metric. Null until judged."
+    )
+    topics = TopicClusterSerializer(many=True, allow_null=True, help_text="Agent session topics. Null until grouped.")
+    topic_definitions = TopicDefinitionSerializer(
+        many=True,
+        allow_null=True,
+        help_text="The whole topic list that the next scan keeps, including topics with no sessions in this scan. "
+        "Null until grouped.",
+    )
+    topic_sessions = TopicSessionCountsSerializer(
+        allow_null=True, help_text="What the sampled sessions were about, by kind. Null until grouped."
+    )
+    table_sources = TableSourceSerializer(
+        many=True,
+        allow_null=True,
+        help_text="Tables and views that agents found by description and then queried. Null until counted.",
+    )
+    uncovered = UncoveredGroupSerializer(
+        many=True, allow_null=True, help_text="Recurring query shapes and their catalog outcome. Null until grouped."
+    )
+    proposed_metrics = ProposedMetricSerializer(
+        many=True, allow_null=True, help_text="Proposed metrics with their sources. Null until drafted."
+    )
+    failed_sections = SectionFailureSerializer(
+        many=True, help_text="Sections whose scan step failed. Each one stays null, and the others keep their results."
+    )
+
+
+class UsageSnapshotSummarySerializer(serializers.Serializer):
+    id = serializers.UUIDField(help_text="ID of the usage scan.")
+    status = serializers.ChoiceField(
+        choices=UsageSnapshotStatus.choices, help_text="computing while the scan runs, then done or error."
+    )
+    error_message = serializers.CharField(help_text="Why the scan failed, when status is error.")
+    window_start = serializers.DateTimeField(help_text="Start of the scanned window.")
+    window_end = serializers.DateTimeField(help_text="End of the scanned window.")
+    judge_model = serializers.CharField(help_text="Model that judged adjusted runs in this scan.")
+    computed_at = serializers.DateTimeField(allow_null=True, help_text="When the scan finished.")
+    created_at = serializers.DateTimeField(help_text="When the scan started.")
+
+
+class UsageSnapshotSerializer(UsageSnapshotSummarySerializer):
+    payload = UsageSnapshotPayloadSerializer(help_text="The scan result, one key per section.")
+
+
+class MetricUsageSerializer(serializers.Serializer):
+    metric_id = serializers.UUIDField(help_text="ID of the catalog metric.")
+    snapshot_id = serializers.UUIDField(help_text="The usage scan these numbers come from.")
+    window_start = serializers.DateTimeField(help_text="Start of the scanned window.")
+    window_end = serializers.DateTimeField(help_text="End of the scanned window.")
+    computed_at = serializers.DateTimeField(allow_null=True, help_text="When the scan finished.")
+    runs = MetricRunCountsSerializer(allow_null=True, help_text="Run counts. Null when the metric had no runs.")
+    adjusted_runs = AdjustedRunSerializer(
+        many=True, help_text="Agent queries that re-derived the metric. is_scout marks the ones a scout ran."
+    )
+    failed_sections = SectionFailureSerializer(
+        many=True, help_text="Failed sections that these numbers read, so a missing count is not a zero."
+    )
+
+
+class MetricAvailabilitySerializer(serializers.Serializer):
+    has_metrics = serializers.BooleanField(
+        help_text="Whether the project has any live metric, counted before per-table access checks."
+    )
+
+
+class PendingReviewCountsSerializer(serializers.Serializer):
+    metrics = serializers.IntegerField(help_text="Proposed metrics you can see that wait for approval.")
+    relationships = serializers.IntegerField(help_text="Proposed joins that wait to be accepted or rejected.")
+    certifications = serializers.IntegerField(help_text="Proposed certifications that wait for review.")

@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+rm celerybeat.pid || echo "celerybeat.pid not found, proceeding"
+# exec makes Celery beat the process that receives SIGTERM. docker-worker-celery
+# sends SIGTERM to this script when the worker stops. Without exec, only this
+# shell exits, and beat keeps the RedBeat lock until the container exits.
+exec celery -A posthog beat -S redbeat.RedBeatScheduler

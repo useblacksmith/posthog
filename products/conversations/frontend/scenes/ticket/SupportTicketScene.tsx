@@ -1,0 +1,680 @@
+import { useActions, useValues } from 'kea'
+import { combineUrl, router } from 'kea-router'
+import { useMemo, useRef } from 'react'
+
+import { IconChevronDown, IconEllipsis, IconTrash } from '@posthog/icons'
+import { LemonButton, LemonCard, LemonMenu, LemonModal, LemonSelect, LemonTag, Link, Spinner } from '@posthog/lemon-ui'
+
+import { TZLabel } from 'lib/components/TZLabel'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { LemonCalendarSelectInput } from 'lib/lemon-ui/LemonCalendar/LemonCalendarSelect'
+import { Resizer } from 'lib/lemon-ui/Resizer/Resizer'
+import { ResizerLogicProps, resizerLogic } from 'lib/lemon-ui/Resizer/resizerLogic'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { getAccessControlDisabledReason, accessLevelSatisfied } from 'lib/utils/accessControlUtils'
+import { getCurrentTeamId } from 'lib/utils/getAppContext'
+import { newInternalTab } from 'lib/utils/newInternalTab'
+import { SceneExport } from 'scenes/sceneTypes'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { useTodayPeopleTitle } from '~/layout/today/todayPeopleRows'
+import { TodayScenePinButton } from '~/layout/today/TodayScenePinButton'
+import { ProductKey } from '~/queries/schema/schema-general'
+import { AccessControlLevel, AccessControlResourceType, Breadcrumb } from '~/types'
+
+import { conversationsTicketsAttachmentsCreate } from 'products/conversations/frontend/generated/api'
+import { PersonDisplay } from 'products/persons/frontend/components/PersonDisplay'
+
+import { AssigneeIconDisplay, AssigneeLabelDisplay, AssigneeSelect } from '../../components/Assignee'
+import { ChannelsTag, getChannelThreadUrl } from '../../components/Channels/ChannelsTag'
+import { ChatView } from '../../components/Chat/ChatView'
+import type { SimplifiedRepliesProps } from '../../components/ComposerHeader/ComposerHeader'
+import { SupportMarkdown } from '../../components/Editor'
+import { IdentityBadge } from '../../components/IdentityBadge/IdentityBadge'
+import { MacroPicker } from '../../components/Macros/MacroPicker'
+import { SlaDisplay } from '../../components/SlaDisplay/SlaDisplay'
+import { SupportTicketSidebarWidgets } from '../../components/SupportTicketSidebarWidgets/SupportTicketSidebarWidgets'
+import { TicketTags } from '../../components/TicketTags'
+import {
+    type Ticket,
+    type TicketPriority,
+    type TicketStatus,
+    priorityOptions,
+    statusOptionsWithoutAll,
+} from '../../types'
+import { supportTicketSceneLogic } from './supportTicketSceneLogic'
+import { SupportTicketSceneMenuBar } from './SupportTicketSceneMenuBar'
+import { useDiscussionTimelineExtras } from './ThreadDiscussions'
+import { reportTimelineExtras } from './ThreadReports'
+
+// The list's filters / saved view ride along in the ticket page's query string
+// (the ticket row carries them through on navigation). Rebuild the list URL from
+// them so the back arrow returns to the view the user came from rather than the
+// unfiltered ticket list.
+export function ticketListBackTo(searchParams: Record<string, any>, name: string = 'Ticket list'): Breadcrumb {
+    return {
+        name,
+        path: combineUrl(urls.supportTickets(), searchParams).url,
+        key: 'supportTickets',
+    }
+}
+
+export const scene: SceneExport<{ ticketId: string; id: string }> = {
+    component: SupportTicketScene,
+    logic: supportTicketSceneLogic,
+    productKey: ProductKey.CONVERSATIONS,
+    // `id` must match supportTicketSceneLogic's `key((props) => props.id)` so the logic instance
+    // App.tsx binds via BindLogic (and that the side panel context reads) is the same keyed
+    // instance the component builds directly — otherwise the side panel reads a never-populated
+    // logic instance and the access control tab never appears.
+    paramsToProps: ({ params: { ticketId } }) => ({ ticketId: ticketId || 'new', id: ticketId || 'new' }),
+}
+
+// The rendered label is "<Send|Attach> and set <statusLabel>", depending on the private note checkbox
+const SEND_AND_SET_STATUS_OPTIONS: { value: TicketStatus; statusLabel: string }[] = [
+    { value: 'pending', statusLabel: 'pending' },
+    { value: 'on_hold', statusLabel: 'on hold' },
+    { value: 'resolved', statusLabel: 'resolved' },
+]
+
+export function simplifiedRepliesFor(ticket: Ticket, emailRecipients: string): SimplifiedRepliesProps {
+    const customer =
+        ticket.person?.properties?.name ||
+        ticket.person?.properties?.email ||
+        ticket.anonymous_traits?.name ||
+        ticket.anonymous_traits?.email ||
+        null
+    // Person properties and traits can hold any JSON value, and React cannot render an object.
+    const customerText = customer === null || typeof customer === 'string' ? customer : JSON.stringify(customer)
+    return {
+        recipient: ticket.channel_source === 'email' ? emailRecipients : customerText,
+        statusLabel: statusOptionsWithoutAll.find((option) => option.value === ticket.status)?.label,
+    }
+}
+
+export function SupportTicketScene({ ticketId }: { ticketId: string }): JSX.Element {
+    const logic = supportTicketSceneLogic({ id: ticketId || 'new' })
+    const {
+        ticket,
+        ticketLoading,
+        status,
+        priority,
+        assignee,
+        tags,
+        chatMessages,
+        deliveryStatusByMessageId,
+        messagesLoading,
+        messageSending,
+        hasMoreMessages,
+        olderMessagesLoading,
+        linkedReports,
+        chatPanelWidth,
+        unsavedTicketChanges,
+        ticketUpdating,
+        ticketDeleting,
+        deleteDisabledReason,
+        draftContent,
+        draftIsPrivate,
+        draftModeEnabled,
+        replyRecipientDescription,
+        snoozedUntil,
+        emailReplyBlockedReason,
+        latestAiMessage,
+        latestAiDraftId,
+        feedbackByMessageId,
+        editingMessageId,
+        discussionsEnabled,
+        fullEmailContent,
+        fullEmailContentLoading,
+        fullEmailMessageId,
+        composerPrefillAt,
+        composerInsertAt,
+        pendingComposerInsert,
+        aiDraftApplying,
+    } = useValues(logic)
+    // The list's filters / saved view ride along in this page's query string
+    // (the ticket row carries them through on navigation). Preserve them on the
+    // back arrow so it returns to the view the user came from rather than the
+    // unfiltered ticket list (see ticketListBackTo).
+    const { searchParams } = useValues(router)
+    const {
+        setStatus,
+        setPriority,
+        setAssignee,
+        setTags,
+        setSnoozedUntil,
+        sendMessage,
+        loadOlderMessages,
+        setDraftContent,
+        setDraftIsPrivate,
+        setDraftModeEnabled,
+        submitAiReplyFeedback,
+        startEditingMessage,
+        cancelEditingMessage,
+        deleteMessage,
+        deleteTicket,
+        loadFullEmail,
+        closeFullEmail,
+        applyAiDraft,
+        insertMacro,
+    } = useActions(logic)
+
+    const { user } = useValues(userLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const ticketsTitle = useTodayPeopleTitle('support')
+    const simplifiedReplies = !!featureFlags[FEATURE_FLAGS.PRODUCT_SUPPORT_SIMPLIFIED_REPLIES]
+    // Widget tickets stay images only until the widget can render file links.
+    const canAttachFiles =
+        !!featureFlags[FEATURE_FLAGS.PRODUCT_SUPPORT_REPLY_FILE_ATTACHMENTS] &&
+        !!ticket &&
+        ticket.channel_source !== 'widget'
+    const { currentTeam } = useValues(teamLogic)
+    const aiSuggestionsEnabled = !!currentTeam?.conversations_settings?.ai_suggestions_enabled
+
+    const conversationsSettingsUrl = urls.settings('environment-conversations', 'conversations-general')
+    const replyDisabledReason: JSX.Element | undefined = emailReplyBlockedReason
+        ? {
+              email_disabled: (
+                  <>
+                      Replies can't be emailed because this project has no connected email channel.{' '}
+                      <Link to={conversationsSettingsUrl}>Connect an email address</Link> to reply to this customer.
+                  </>
+              ),
+              no_recipient: (
+                  <>
+                      This ticket has no customer email address, so a reply can't be delivered. You can still attach a
+                      private note.
+                  </>
+              ),
+              no_channel: (
+                  <>
+                      This ticket isn't linked to any of your email channels, so replies can't be sent.{' '}
+                      <Link to={conversationsSettingsUrl}>Manage email channels</Link>
+                  </>
+              ),
+          }[emailReplyBlockedReason]
+        : undefined
+
+    const canEditTicket = accessLevelSatisfied(
+        AccessControlResourceType.Ticket,
+        ticket?.user_access_level ?? AccessControlLevel.None,
+        AccessControlLevel.Editor
+    )
+
+    const sendDisabledReason =
+        getAccessControlDisabledReason(
+            AccessControlResourceType.Ticket,
+            AccessControlLevel.Editor,
+            ticket?.user_access_level
+        ) ?? undefined
+
+    const chatPanelRef = useRef<HTMLDivElement>(null)
+
+    const resizerLogicProps: ResizerLogicProps = {
+        containerRef: chatPanelRef,
+        logicKey: 'support-ticket-resizer',
+        persistent: true,
+        placement: 'right',
+    }
+
+    const { desiredSize } = useValues(resizerLogic(resizerLogicProps))
+
+    // Above the early returns below: this scene renders a spinner and a not-found state before the
+    // thread, and a hook can't be called on only some of those paths.
+    const discussionExtras = useDiscussionTimelineExtras(ticket?.id, discussionsEnabled)
+    const threadExtras = useMemo(
+        () => [...reportTimelineExtras(linkedReports), ...discussionExtras],
+        [discussionExtras, linkedReports]
+    )
+
+    if (ticketLoading) {
+        return (
+            <SceneContent>
+                <div className="flex items-center justify-center h-96">
+                    <Spinner className="text-4xl" />
+                </div>
+            </SceneContent>
+        )
+    }
+
+    const isNewTicket = ticketId === 'new'
+
+    if (!ticket && !isNewTicket) {
+        return (
+            <SceneContent>
+                <div className="flex items-center justify-center h-96">
+                    <div className="text-center">
+                        <h2 className="text-xl font-semibold mb-2">Ticket not found</h2>
+                        <LemonButton type="primary" to={urls.supportTickets()}>
+                            Back to tickets
+                        </LemonButton>
+                    </div>
+                </div>
+            </SceneContent>
+        )
+    }
+
+    return (
+        <SceneContent className="flex-1 min-h-0 pb-4">
+            <SupportTicketSceneMenuBar ticketId={ticketId} />
+            <SceneTitleSection
+                nameAction={<TodayScenePinButton />}
+                name={`Ticket: ${ticket?.ticket_number?.toString() || ticket?.id || ''}`}
+                nameSuffix={
+                    ticket && ticket.identity_verified !== true ? (
+                        <IdentityBadge verified={ticket.identity_verified} />
+                    ) : undefined
+                }
+                description=""
+                resourceType={ticketsTitle?.resourceType ?? { type: 'conversation' }}
+                forceBackTo={ticketListBackTo(searchParams, ticketsTitle?.name ?? undefined)}
+            />
+            <LemonModal title="Full email" isOpen={fullEmailMessageId !== null} onClose={closeFullEmail}>
+                {fullEmailContentLoading ? (
+                    <div className="flex h-40 items-center justify-center">
+                        <Spinner />
+                    </div>
+                ) : (
+                    <div className="max-h-96 overflow-y-auto break-words text-sm">
+                        <SupportMarkdown disableImages>{fullEmailContent ?? ''}</SupportMarkdown>
+                    </div>
+                )}
+            </LemonModal>
+
+            {/* Overflow clipping is only safe side-by-side, where the thread has a bounded height.
+                Stacked, the thread is content-sized; clipping here would collapse it. */}
+            <div className="flex flex-col gap-y-4 @min-[48rem]/main-content:flex-row @min-[48rem]/main-content:flex-1 @min-[48rem]/main-content:min-h-0 @min-[48rem]/main-content:overflow-hidden">
+                <div
+                    style={{ width: chatPanelWidth(desiredSize) }}
+                    className="relative shrink-0 max-w-full min-h-80  @min-[48rem]/main-content:pr-2 @min-[48rem]/main-content:max-w-[calc(100%-300px)] @min-[48rem]/main-content:h-full @min-[48rem]/main-content:min-h-0 @min-[48rem]/main-content:flex @min-[48rem]/main-content:flex-col"
+                    ref={chatPanelRef}
+                >
+                    {/* Main conversation area */}
+                    <ChatView
+                        fillParent
+                        collapseUntilActive
+                        threadId={ticketId}
+                        threadExtras={threadExtras}
+                        messages={chatMessages}
+                        messagesLoading={messagesLoading}
+                        messageSending={messageSending}
+                        hasMoreMessages={hasMoreMessages}
+                        olderMessagesLoading={olderMessagesLoading}
+                        onSendMessage={sendMessage}
+                        onLoadOlderMessages={loadOlderMessages}
+                        channel={ticket?.channel_source}
+                        showPrivateOption
+                        deliveryStatusByMessageId={deliveryStatusByMessageId}
+                        draftContent={draftContent}
+                        onDraftChange={setDraftContent}
+                        isPrivate={draftIsPrivate}
+                        onPrivateChange={setDraftIsPrivate}
+                        draftMode={draftModeEnabled}
+                        onDraftModeChange={setDraftModeEnabled}
+                        sendConfirmationMessage={`This will send to ${replyRecipientDescription}`}
+                        sendAndSetStatusOptions={ticket ? SEND_AND_SET_STATUS_OPTIONS : undefined}
+                        simplifiedReplies={
+                            simplifiedReplies && ticket
+                                ? simplifiedRepliesFor(ticket, replyRecipientDescription)
+                                : undefined
+                        }
+                        unsavedTicketChanges={unsavedTicketChanges}
+                        replyDisabledReason={replyDisabledReason}
+                        sendDisabledReason={sendDisabledReason}
+                        latestAiMessageId={latestAiMessage?.id ?? null}
+                        latestAiDraftId={latestAiDraftId}
+                        feedbackByMessageId={feedbackByMessageId}
+                        showAiReplyFeedback={aiSuggestionsEnabled}
+                        aiReplyFeedbackDisabledReason={sendDisabledReason}
+                        onSubmitAiReplyFeedback={submitAiReplyFeedback}
+                        currentUserId={user?.id ?? null}
+                        canEditTicket={canEditTicket}
+                        editingMessageId={editingMessageId}
+                        onEditMessage={startEditingMessage}
+                        onDeleteMessage={deleteMessage}
+                        onCancelEdit={cancelEditingMessage}
+                        fullEmailLoadingMessageId={fullEmailContentLoading ? fullEmailMessageId : null}
+                        onViewFullEmail={loadFullEmail}
+                        composerPrefillAt={composerPrefillAt}
+                        composerInsertAt={composerInsertAt}
+                        composerInsertContent={pendingComposerInsert}
+                        enableMacros
+                        onAttachFile={
+                            canAttachFiles
+                                ? (file) =>
+                                      conversationsTicketsAttachmentsCreate(String(getCurrentTeamId()), ticketId, {
+                                          file,
+                                      })
+                                : undefined
+                        }
+                        onInsertMacro={(macro) => insertMacro(macro, 'slash')}
+                        macroPicker={
+                            <MacroPicker
+                                disabledReason={sendDisabledReason}
+                                onInsert={(macro) => insertMacro(macro, 'button')}
+                            />
+                        }
+                        aiSources={ticket?.ai_triage?.sources}
+                        aiDraftApplying={aiDraftApplying}
+                        onApplyAiDraft={applyAiDraft}
+                    />
+                    <div className="hidden @min-[48rem]/main-content:block">
+                        <Resizer {...resizerLogicProps} className="z-20" />
+                    </div>
+                </div>
+
+                {/* Sidebar with all metadata */}
+                <div className="space-y-4 flex-1 min-w-[300px] @min-[48rem]/main-content:h-full @min-[48rem]/main-content:pl-2 @min-[48rem]/main-content:min-h-0 @min-[48rem]/main-content:overflow-y-auto">
+                    <LemonCard hoverEffect={false} className="p-3">
+                        {/* Customer */}
+                        {ticket?.distinct_id && (
+                            <>
+                                <div className="flex items-center justify-between mb-3">
+                                    <h3 className="text-sm font-semibold">Customer</h3>
+                                    <LemonButton
+                                        size="small"
+                                        type="secondary"
+                                        onClick={(e) => {
+                                            e.stopPropagation()
+                                            newInternalTab(urls.personByDistinctId(ticket.distinct_id))
+                                        }}
+                                    >
+                                        View person
+                                    </LemonButton>
+                                </div>
+                                <div className="flex items-center flex-wrap gap-2">
+                                    <PersonDisplay
+                                        person={
+                                            ticket.person
+                                                ? {
+                                                      id: ticket.person.id,
+                                                      distinct_id: ticket.distinct_id,
+                                                      distinct_ids: ticket.person.distinct_ids,
+                                                      // Merge anonymous_traits as fallback for missing person properties
+                                                      properties: {
+                                                          ...ticket.anonymous_traits,
+                                                          ...ticket.person.properties,
+                                                      },
+                                                  }
+                                                : {
+                                                      distinct_id: ticket.distinct_id,
+                                                      properties: ticket.anonymous_traits || {},
+                                                  }
+                                        }
+                                        withIcon
+                                        withCopyEmailButton
+                                        withComposeTicketButton
+                                    />
+                                    <IdentityBadge verified={ticket.identity_verified} />
+                                </div>
+                                <div className="my-3 border-t" />
+                            </>
+                        )}
+
+                        {/* Ticket info */}
+                        <div className="flex items-center justify-between gap-2 mb-2">
+                            <div className="flex items-center gap-1">
+                                <h3 className="text-sm font-semibold">Ticket info</h3>
+                                {ticketUpdating && <Spinner className="text-muted-alt" />}
+                            </div>
+                            <LemonMenu
+                                items={[
+                                    {
+                                        label: 'Delete ticket',
+                                        icon: <IconTrash />,
+                                        status: 'danger',
+                                        onClick: () => deleteTicket(),
+                                        disabledReason:
+                                            deleteDisabledReason ?? (ticketDeleting ? 'Deleting ticket…' : undefined),
+                                        'data-attr': 'ticket-delete',
+                                    },
+                                ]}
+                                placement="bottom-end"
+                            >
+                                <LemonButton
+                                    size="xsmall"
+                                    icon={<IconEllipsis />}
+                                    tooltip="More ticket actions"
+                                    aria-label="More ticket actions"
+                                    data-attr="ticket-more-menu"
+                                />
+                            </LemonMenu>
+                        </div>
+                        <div className="space-y-2 text-xs">
+                            {ticket?.created_at && (
+                                <div className="flex justify-between">
+                                    <span className="text-muted-alt">Created</span>
+                                    <span>
+                                        <TZLabel time={ticket.created_at} />
+                                    </span>
+                                </div>
+                            )}
+                            {ticket?.updated_at && (
+                                <div className="flex justify-between">
+                                    <span className="text-muted-alt">Updated</span>
+                                    <span>
+                                        <TZLabel time={ticket.updated_at} />
+                                    </span>
+                                </div>
+                            )}
+                            {ticket?.channel_source && (
+                                <div className="flex justify-between">
+                                    <span className="text-muted-alt">Channel</span>
+                                    <span className="capitalize">
+                                        <ChannelsTag
+                                            channel={ticket.channel_source}
+                                            detail={ticket.channel_detail}
+                                            to={getChannelThreadUrl(ticket)}
+                                        />
+                                    </span>
+                                </div>
+                            )}
+                            {ticket?.channel_source === 'email' && ticket?.email_subject && (
+                                <div className="flex justify-between items-start gap-2">
+                                    <span className="text-muted-alt shrink-0">Subject</span>
+                                    <span className="text-xs truncate text-right" title={ticket.email_subject}>
+                                        {ticket.email_subject}
+                                    </span>
+                                </div>
+                            )}
+                            {ticket?.channel_source === 'email' && ticket?.email_from && (
+                                <div className="flex justify-between items-start gap-2">
+                                    <span className="text-muted-alt shrink-0">From</span>
+                                    <span className="text-xs truncate text-right" title={ticket.email_from}>
+                                        {ticket.email_from}
+                                    </span>
+                                </div>
+                            )}
+                            {ticket?.channel_source === 'email' && ticket?.email_to && (
+                                <div className="flex justify-between items-start gap-2">
+                                    <span className="text-muted-alt shrink-0">To</span>
+                                    <span className="text-xs truncate text-right" title={ticket.email_to}>
+                                        {ticket.email_to}
+                                    </span>
+                                </div>
+                            )}
+                            {ticket?.channel_source === 'email' &&
+                                ticket?.cc_participants &&
+                                ticket.cc_participants.length > 0 && (
+                                    <div className="flex justify-between items-start gap-2">
+                                        <span className="text-muted-alt shrink-0">CC</span>
+                                        <span
+                                            className="text-xs truncate text-right"
+                                            title={ticket.cc_participants.join(', ')}
+                                        >
+                                            {ticket.cc_participants.join(', ')}
+                                        </span>
+                                    </div>
+                                )}
+                            {ticket?.channel_source === 'email' && ticket?.email_to && (
+                                <div className="flex justify-between items-start gap-2">
+                                    <span className="text-muted-alt shrink-0">To</span>
+                                    <span className="text-xs truncate text-right" title={ticket.email_to}>
+                                        {ticket.email_to}
+                                    </span>
+                                </div>
+                            )}
+                            {ticket?.channel_source === 'github' &&
+                                ticket?.github_repo &&
+                                ticket?.github_issue_number && (
+                                    <div className="flex justify-between items-center">
+                                        <span className="text-muted-alt">GitHub issue</span>
+                                        <Link
+                                            to={`https://github.com/${ticket.github_repo}/issues/${ticket.github_issue_number}`}
+                                            target="_blank"
+                                            className="text-xs"
+                                        >
+                                            <LemonTag type="highlight">
+                                                {ticket.github_repo}#{ticket.github_issue_number}
+                                            </LemonTag>
+                                        </Link>
+                                    </div>
+                                )}
+                            {ticket?.zendesk_ticket_id && (
+                                <div className="flex justify-between items-center">
+                                    <span className="text-muted-alt">Zendesk ID</span>
+                                    <LemonTag type="highlight">#{ticket.zendesk_ticket_id}</LemonTag>
+                                </div>
+                            )}
+                            {ticket?.intercom_conversation_id && (
+                                <div className="flex justify-between items-center">
+                                    <span className="text-muted-alt">Intercom ID</span>
+                                    <LemonTag type="highlight">#{ticket.intercom_conversation_id}</LemonTag>
+                                </div>
+                            )}
+                            {ticket?.pylon_issue_id && (
+                                <div className="flex justify-between items-center gap-2">
+                                    <span className="text-muted-alt shrink-0">Pylon ID</span>
+                                    <LemonTag type="highlight" className="truncate" title={ticket.pylon_issue_id}>
+                                        {ticket.pylon_issue_id}
+                                    </LemonTag>
+                                </div>
+                            )}
+                            {ticket?.session_context?.current_url && (
+                                <div className="flex justify-between items-start gap-2">
+                                    <span className="text-muted-alt shrink-0">Page URL</span>
+                                    <Link
+                                        to={ticket.session_context.current_url}
+                                        target="_blank"
+                                        className="text-xs truncate text-right"
+                                        title={ticket.session_context.current_url}
+                                    >
+                                        {ticket.session_context.current_url}
+                                    </Link>
+                                </div>
+                            )}
+                            <div className="flex justify-between items-center">
+                                <span className="text-muted-alt">Status</span>
+                                <LemonSelect
+                                    size="small"
+                                    value={status}
+                                    options={statusOptionsWithoutAll}
+                                    onChange={(value: TicketStatus | null) => value && setStatus(value)}
+                                    dropdownMatchSelectWidth={false}
+                                    disabledReason={sendDisabledReason}
+                                />
+                            </div>
+                            <div className="flex justify-between items-center">
+                                <span className="text-muted-alt">Priority</span>
+                                <LemonSelect
+                                    size="small"
+                                    value={priority}
+                                    options={priorityOptions}
+                                    onChange={(value: TicketPriority | null) => value && setPriority(value)}
+                                    dropdownMatchSelectWidth={false}
+                                    disabledReason={sendDisabledReason}
+                                />
+                            </div>
+                            <div className="flex justify-between items-start">
+                                <span className="text-muted-alt">Assignee</span>
+                                <div className="flex flex-col items-end gap-1">
+                                    {user?.id != null &&
+                                        !(assignee?.type === 'user' && String(assignee.id) === String(user.id)) && (
+                                            <LemonButton
+                                                size="xxsmall"
+                                                type="tertiary"
+                                                onClick={() => setAssignee({ type: 'user', id: user.id })}
+                                                disabledReason={sendDisabledReason}
+                                            >
+                                                <span className="text-accent">Assign to me</span>
+                                            </LemonButton>
+                                        )}
+                                    <AssigneeSelect
+                                        assignee={assignee}
+                                        onChange={setAssignee}
+                                        disabledReason={sendDisabledReason}
+                                    >
+                                        {(resolvedAssignee, isOpen) => (
+                                            <LemonButton
+                                                size="small"
+                                                type="secondary"
+                                                active={isOpen}
+                                                sideIcon={<IconChevronDown />}
+                                                disabledReason={sendDisabledReason}
+                                            >
+                                                <span className="flex items-center gap-1">
+                                                    <AssigneeIconDisplay assignee={resolvedAssignee} size="small" />
+                                                    <AssigneeLabelDisplay assignee={resolvedAssignee} size="small" />
+                                                </span>
+                                            </LemonButton>
+                                        )}
+                                    </AssigneeSelect>
+                                </div>
+                            </div>
+                            {ticket?.sla_due_at && (
+                                <div className="flex justify-between items-center">
+                                    <span className="text-muted-alt">SLA</span>
+                                    <SlaDisplay slaDueAt={ticket.sla_due_at} />
+                                </div>
+                            )}
+                            <div className="flex justify-between items-center">
+                                <span className="text-muted-alt">Snooze</span>
+                                <LemonCalendarSelectInput
+                                    value={snoozedUntil ? dayjs(snoozedUntil) : null}
+                                    onChange={(date) =>
+                                        setSnoozedUntil(date ? date.startOf('minute').toISOString() : null)
+                                    }
+                                    granularity="minute"
+                                    selectionPeriod="upcoming"
+                                    clearable
+                                    placeholder="Not snoozed"
+                                    applyActions={[
+                                        {
+                                            label: 'Apply and set to on hold',
+                                            onClick: (date) => {
+                                                setSnoozedUntil(date.startOf('minute').toISOString())
+                                                setStatus('on_hold')
+                                            },
+                                        },
+                                    ]}
+                                    buttonProps={{
+                                        size: 'small',
+                                        type: 'secondary',
+                                        fullWidth: false,
+                                        disabledReason: sendDisabledReason,
+                                    }}
+                                />
+                            </div>
+                            <div className="flex justify-between items-start gap-2">
+                                <span className="text-muted-alt shrink-0">Tags</span>
+                                <TicketTags
+                                    tags={tags}
+                                    onChange={setTags}
+                                    saving={false}
+                                    disabledReason={sendDisabledReason}
+                                />
+                            </div>
+                        </div>
+                    </LemonCard>
+
+                    <SupportTicketSidebarWidgets ticketId={ticketId || 'new'} />
+                </div>
+            </div>
+        </SceneContent>
+    )
+}

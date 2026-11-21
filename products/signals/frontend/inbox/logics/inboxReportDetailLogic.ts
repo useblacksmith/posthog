@@ -1,0 +1,2590 @@
+import {
+    MakeLogicType,
+    actions,
+    afterMount,
+    connect,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    propsChanged,
+    reducers,
+    selectors,
+} from 'kea'
+import { loaders } from 'kea-loaders'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import api, { ApiConfig } from 'lib/api'
+import { ApiError } from 'lib/api-error'
+import { dayjs } from 'lib/dayjs'
+import { addProjectIdIfMissing } from 'lib/utils/kea-router'
+import { SignalNode } from 'scenes/debug/signals/types'
+import { personalIntegrationsLogic } from 'scenes/settings/user/personalIntegrationsLogic'
+import type { PersonalGitHubIntegration } from 'scenes/settings/user/personalIntegrationsLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { REPORT_AI_PANEL } from '~/layout/ai/aiPanelIds'
+import { sidePanelStateLogic } from '~/layout/navigation-3000/sidepanel/sidePanelStateLogic'
+import { SidePanelTab } from '~/types'
+
+import { Task, TaskRunStatus } from 'products/posthog_ai/frontend/types/taskTypes'
+import {
+    signalsReportArtefactsDiff,
+    signalsReportArtefactsList,
+    signalsReportChecksApproveCreate,
+    signalsReportChecksDestroy,
+    signalsReportChecksList,
+    signalsReportPrChecks,
+    signalsReportPrComments,
+    signalsReportPrReviewCommentDestroy,
+    signalsReportPrReviewCommentReactionDestroy,
+    signalsReportPrReviewCommentReactionsCreate,
+    signalsReportPrReviewCommentsCreate,
+    signalsReportPrReviewCommentUpdate,
+    signalsReportsActionabilityUpdate,
+    signalsReportsFeedbackCreate,
+    signalsReportsFeedbackStateRetrieve,
+    signalsReportsSignalsRetrieve,
+    signalsReportsPriorityUpdate,
+    signalsReportsRepositoryUpdate,
+    signalsReportsStateCreate,
+    signalsReportsReviewersUpdate,
+} from 'products/signals/frontend/generated/api'
+import type {
+    CommitDiffResponseApi,
+    PaginatedSignalReportArtefactListApi,
+    ReviewerEditActionEnumApi,
+    PullRequestCheckApi,
+    PullRequestCommentApi,
+    PullRequestCommentReactionApi,
+    ReportChartApi,
+    ReportPriorityApi,
+    SignalReportCheckApi,
+    SignalReportFeedbackStateApi,
+    SignalReportApi,
+    SignalReportStateRequestApi,
+    _UserApi,
+} from 'products/signals/frontend/generated/api.schemas'
+import type { SignalNodeApi } from 'products/signals/frontend/generated/api.schemas'
+
+import type { SignalReportFeedbackSentimentEnumApi } from '../../generated/api.schemas'
+import type { SignalReportStateEnumApi } from '../../generated/api.schemas'
+import type { SignalReportAssigneeApi } from '../../generated/api.schemas'
+import { deriveTaskPurpose, ReportTaskPurpose, TaskRunArtefactContent } from '../components/detail/artefactTypes'
+import {
+    AvailableReviewerOption,
+    buildAddReviewerOptions,
+    CurrentReviewerUser,
+} from '../components/detail/reviewerDisplay'
+import {
+    captureInboxReportAction,
+    captureInboxReportDecisionChanged,
+    captureInboxReportFeedback,
+    captureInboxReportFeedbackNote,
+    InboxReportActionSurface,
+    InboxReportFeedbackSentiment,
+} from '../inboxAnalytics'
+import { inboxSceneLogic } from '../inboxSceneLogic'
+import { ReportDiscussionIntent, inboxTaskKickoffLogic } from '../inboxTaskKickoffLogic'
+import { EnrichedReviewer, ReviewerRemoval, SignalReport, SignalReportArtefact, SignalReportStatus } from '../types'
+import { ChartPlacements, resolveChartPlacements } from '../utils/chartPlacement'
+import { implementationClaimDisabledReason } from '../utils/reportActions'
+import { isReportClaimable, reportClaimant, requestReportClaim, teammateClaimHolder } from '../utils/reportClaim'
+import {
+    ReportActionabilityChange,
+    ReportDecisionAttributions,
+    reportActionabilityRequest,
+    reportDecisionAttributions,
+} from '../utils/reportDecisions'
+import { reportPullRequests, primaryReportPullRequest, type ReportPullRequest } from '../utils/reportPullRequests'
+import { withInboxWriteTimeout } from '../utils/writeTimeout'
+import { inboxBulkActionsLogic } from './inboxBulkActionsLogic'
+import { reportSpendLogic } from './reportSpendLogic'
+
+/** Run statuses that count as terminal. Mirrors desktop `isTerminalStatus` / `ReportTasksSection`. */
+export const TERMINAL_RUN_STATUSES: TaskRunStatus[] = [
+    TaskRunStatus.COMPLETED,
+    TaskRunStatus.FAILED,
+    TaskRunStatus.CANCELLED,
+]
+
+/** Why the report's one implementation slot is still claimed. Mirrors the server's `_ImplementationSlotClaim`. */
+export type ImplementationSlotClaim = 'in_flight' | 'shipped_pr'
+
+const SLOT_CLAIM_DISABLED_REASON: Record<ImplementationSlotClaim, string> = {
+    in_flight: 'A pull request run is already in progress for this report. Open it in the task log to follow it.',
+    shipped_pr: 'This report already has a pull request. Open it in the task log to continue it.',
+}
+
+export type GitHubLoadError = {
+    message: string
+    remediationUrl: string | null
+    code: string | null
+}
+
+export const GITHUB_REPOSITORY_INACCESSIBLE_CODE = 'github_repository_inaccessible'
+// Errors a project admin fixes in the GitHub integration settings, so the server sends a link there.
+const GITHUB_REMEDIABLE_ERROR_CODES = ['github_checks_permission_missing', GITHUB_REPOSITORY_INACCESSIBLE_CODE]
+
+function githubLoadErrorFrom(error: unknown, fallbackMessage: string): GitHubLoadError {
+    if (error instanceof ApiError && error.code && GITHUB_REMEDIABLE_ERROR_CODES.includes(error.code)) {
+        const remediationUrl = (error.data as { remediation_url?: unknown } | null)?.remediation_url
+        return {
+            message: error.message,
+            remediationUrl: typeof remediationUrl === 'string' ? remediationUrl : null,
+            code: error.code,
+        }
+    }
+    return { message: fallbackMessage, remediationUrl: null, code: null }
+}
+
+// The task↔report association is the `task_run` artefact log now (the legacy `/tasks/` endpoint is
+// gone), and the activity timeline renders the whole log. Pull a generous page so early entries
+// (the first task runs, repo selection) stay visible on reports with many findings — matching the
+// limit the kickoff flow already uses to find the repo-selection artefact.
+const ARTEFACT_FETCH_LIMIT = 1000
+
+/** The report column's tabs on a PR-bearing report: the summary, or the branch diff. */
+export type ReportDetailTab = 'summary' | 'files'
+
+export interface InboxReportDetailLogicProps {
+    reportId: string
+    /** The selected report, fed in by the shell so task polling can stop once it reaches a terminal status. */
+    report?: SignalReport | null
+}
+
+/** A linked task plus its derived purpose and when the association was first recorded. Mirrors desktop `ReportTaskData`. */
+export interface ReportTaskEntry {
+    task: Task
+    purpose: ReportTaskPurpose
+    purposeLabel: string
+    startedAt: string
+}
+
+/**
+ * Why an implementation task still holds this report's single implementation slot, or `null` when
+ * the slot is free. A claim makes a manual "Create PR" fail with a `signal_report_task_cap` 429.
+ *
+ * Mirrors `_implementation_slot_claim` in products/signals/backend/task_run_artefacts.py: a run
+ * that has not settled holds the slot while it works, a run that shipped a PR holds it for good,
+ * and a run that ended with no PR hands it back. Approximates the server with what the client has,
+ * which is only `latest_run` rather than every run. Unloaded tasks read as no claim, so a cold load
+ * leaves the action enabled and the 429 stays the backstop rather than blocking a legitimate first
+ * press.
+ */
+export function implementationSlotClaim(reportTasks: ReportTaskEntry[] | null): ImplementationSlotClaim | null {
+    let claim: ImplementationSlotClaim | null = null
+    for (const entry of reportTasks ?? []) {
+        if (entry.purpose !== 'implementation') {
+            continue
+        }
+        // A shipped PR is the better answer when one task shipped and another is still working.
+        if (getTaskPrUrl(entry.task)) {
+            return 'shipped_pr'
+        }
+        if (!TERMINAL_RUN_STATUSES.includes(entry.task.latest_run?.status ?? TaskRunStatus.NOT_STARTED)) {
+            claim = 'in_flight'
+        }
+    }
+    return claim
+}
+
+/**
+ * Whether an implementation run is still moving, which is what the Create PR gate waits on.
+ *
+ * Unlike `implementationSlotClaim` this ignores the PR a settled run shipped, because a shipped PR
+ * is not going to change on its own. Reusing the slot predicate here would leave the poll running
+ * forever on a finished implementation.
+ */
+export function implementationRunInFlight(reportTasks: ReportTaskEntry[] | null): boolean {
+    return (reportTasks ?? []).some(
+        (entry) =>
+            entry.purpose === 'implementation' &&
+            !TERMINAL_RUN_STATUSES.includes(entry.task.latest_run?.status ?? TaskRunStatus.NOT_STARTED)
+    )
+}
+
+/**
+ * Whether any linked run is still moving, which is what the View task button waits on.
+ *
+ * A task with no run yet does not count: the button only opens a task that already has a run, so a
+ * task that never gets one would hold the poll open for nothing. That is the opposite of the Create
+ * PR gate above, where the task itself claims the slot before its run exists.
+ */
+export function openableRunInFlight(reportTasks: ReportTaskEntry[] | null): boolean {
+    return (reportTasks ?? []).some((entry) => {
+        const status = entry.task.latest_run?.status
+        return !!status && !TERMINAL_RUN_STATUSES.includes(status)
+    })
+}
+
+// While the report is still being worked, poll linked tasks every 5s. Mirrors desktop.
+const ACTIVE_STATUSES: SignalReportStatus[] = [
+    SignalReportStatus.CANDIDATE,
+    SignalReportStatus.IN_PROGRESS,
+    SignalReportStatus.PENDING_INPUT,
+]
+
+const REPORT_TASKS_POLL_INTERVAL_MS = 5000
+const TERMINAL_TASK_CACHE_TTL_MS = 60000
+const REPORT_CHECK_TIMING_POLL_INTERVAL_MS = 60000
+
+function refreshSelectedReport(reportId: string): void {
+    const scene = inboxSceneLogic.findMounted()
+    if (scene?.values.selectedReportId === reportId && !scene.values.selectedReportLoading) {
+        scene.actions.loadSelectedReport({ id: reportId })
+    }
+}
+
+// PR CI checks refresh cadence while the detail is open — a running build's status stays current
+// without hammering GitHub. Mirrors the desktop PR-review view's 15s poll.
+const PR_CHECKS_POLL_INTERVAL_MS = 15000
+
+// Back off the checks poll after this many consecutive failures: a PR GitHub can't return
+// checks for (deleted branch, lost integration access) re-fails on every 15s tick for nothing.
+const PR_CHECKS_MAX_CONSECUTIVE_FAILURES = 3
+
+// Check conclusions that mean the check failed. Matches the failure bucket of `PrChecksSection`.
+const FAILED_CHECK_CONCLUSIONS = ['failure', 'timed_out', 'action_required', 'startup_failure']
+
+// While backed off, still retry every Nth tick (20 × 15s = 5 min) so a transient GitHub outage
+// heals the section without the report having to be closed and reopened.
+const PR_CHECKS_FAILURE_BACKOFF_TICKS = 20
+
+/** Extract the PR url from a task's latest run output, if present. Mirrors desktop `getTaskPrUrl`. */
+export function getTaskPrUrl(task: Task): string | null {
+    const prUrl = task.latest_run?.output?.pr_url
+    return typeof prUrl === 'string' && prUrl.length > 0 ? prUrl : null
+}
+
+/**
+ * A PR comment plus client-only state layered on top of the generated shape: `pending` marks an
+ * optimistic create/edit still in flight (or failed), so the UI can show it immediately instead of
+ * letting it vanish during the request.
+ */
+export interface ClientPullRequestComment extends PullRequestCommentApi {
+    pending?: 'sending' | 'failed'
+}
+
+/** An inline review-comment thread anchored to a diff line: the root comment plus its replies, in order. */
+export interface ReviewThread {
+    /** Root comment id — the id GitHub reply calls target. */
+    rootId: string
+    path: string
+    /** Anchor line in the diff (the end line for multi-line comments). */
+    line: number
+    /** GitHub diff side: 'RIGHT' = additions, 'LEFT' = deletions. */
+    side: 'LEFT' | 'RIGHT'
+    comments: ClientPullRequestComment[]
+}
+
+/** A not-yet-posted thread the user opened on a diff line. */
+export interface DraftThread {
+    path: string
+    line: number
+    side: 'LEFT' | 'RIGHT'
+}
+
+/** Stable key for a thread or draft anchor, used for posting state and annotation metadata. */
+export function threadKey(anchor: { path: string; line: number; side: string }): string {
+    return `${anchor.path}:${anchor.side}:${anchor.line}`
+}
+
+/** Pull the most specific message out of a review-comment API error, falling back to `fallback`. */
+function reviewCommentError(error: any, fallback: string): string {
+    return error?.data?.error || error?.detail || error?.message || fallback
+}
+
+/**
+ * Replace one comment in `comments`, leaving every other entry untouched. Optimistic updates and their
+ * rollbacks both run against the current list, so a slow request finishing can't undo a delete, edit or
+ * reaction that landed while it was in flight.
+ */
+function patchComment(
+    comments: readonly PullRequestCommentApi[] | null,
+    commentId: string,
+    patch: (comment: ClientPullRequestComment) => ClientPullRequestComment
+): PullRequestCommentApi[] {
+    return (comments ?? []).map((c) => (c.id === commentId ? patch(c) : c))
+}
+
+/**
+ * `explanation` text from the latest judgment artefact of `type`, or null. The priority/actionability
+ * judgment artefacts already carry the agent's rationale — surfaced in the detail view without any extra fetch.
+ */
+function latestJudgmentExplanation(
+    artefacts: SignalReportArtefact[] | null,
+    type: 'priority_judgment' | 'actionability_judgment'
+): string | null {
+    const matching = (artefacts ?? []).filter((a) => a.type === type)
+    if (matching.length === 0) {
+        return null
+    }
+    const latest = matching.reduce((a, b) => (b.created_at > a.created_at ? b : a))
+    const explanation = latest.content?.explanation
+    return typeof explanation === 'string' && explanation.trim() ? explanation : null
+}
+
+function preferredReportTask(reportTasks: ReportTaskEntry[]): ReportTaskEntry | null {
+    return (
+        [...reportTasks].sort((a, b) => {
+            const aInMotion = !TERMINAL_RUN_STATUSES.includes(a.task.latest_run?.status ?? TaskRunStatus.NOT_STARTED)
+            const bInMotion = !TERMINAL_RUN_STATUSES.includes(b.task.latest_run?.status ?? TaskRunStatus.NOT_STARTED)
+            if (aInMotion !== bInMotion) {
+                return aInMotion ? -1 : 1
+            }
+            return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+        })[0] ?? null
+    )
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface inboxReportDetailLogicValues {
+    personalIntegrations: PersonalGitHubIntegration[] // personalIntegrationsLogic
+    selectedTab: SidePanelTab | null // sidePanelStateLogic
+    selectedTabOptions: string | null // sidePanelStateLogic
+    actionabilityExplanation: string | null
+    actionabilitySaving: boolean
+    addReviewerOptions: AvailableReviewerOption[]
+    approvingCheckIds: string[]
+    availableReviewers: AvailableReviewerOption[] | null
+    availableReviewersLoading: boolean
+    cancellingCheckIds: string[]
+    chartIdsKey: string
+    chartPlacements: ChartPlacements
+    chartsById: Map<string, ReportChartApi>
+    claimSaving: boolean
+    currentUserGithubLogin: string | null
+    decisionAttributions: ReportDecisionAttributions | null
+    detailTab: ReportDetailTab
+    diffArtefactId: string | null
+    displayReviewers: EnrichedReviewer[] | null
+    draftThread: DraftThread | null
+    editingCommentId: string | null
+    evidenceExpanded: boolean
+    expandedTaskIds: string[]
+    feedbackDisabledReason:
+        | 'Could not load feedback. Refresh the page to try again.'
+        | 'Loading feedback'
+        | 'Saving feedback'
+        | undefined
+    feedbackNoteDraft: string
+    feedbackNoteSent: boolean
+    feedbackNoteSubmitting: boolean
+    feedbackSentNote: string | null
+    feedbackSentiment: SignalReportFeedbackSentimentEnumApi | null
+    feedbackSubmitting: boolean
+    hasImplementationPr: boolean
+    hasPersonalGithub: boolean
+    implementationDisabledReason: string | null
+    implementationSlotClaim: ImplementationSlotClaim | null
+    inlineThreadCount: number
+    inlineThreadsByFile: Record<string, ReviewThread[]>
+    isClaimedByMe: boolean
+    isReResearch: boolean
+    isReportActive: boolean
+    isReportClaimable: boolean
+    isUpdatingReviewers: boolean
+    latestCommitArtefact: SignalReportArtefact | null
+    optimisticReviewers: EnrichedReviewer[] | null
+    postingThreadKey: string | null
+    prChecks: readonly PullRequestCheckApi[] | null
+    prChecksBackedOff: boolean
+    prChecksConsecutiveFailures: number
+    prChecksError: GitHubLoadError | null
+    prChecksFailing: boolean
+    prChecksLoading: boolean
+    prComments: readonly PullRequestCommentApi[] | null
+    prCommentsError: GitHubLoadError | null
+    prCommentsLoading: boolean
+    prConflictReported: boolean
+    prHasConflict: boolean
+    primaryTask: ReportTaskEntry | null
+    priorityExplanation: string | null
+    prioritySaving: boolean
+    report: SignalReport | null
+    reportArtefacts: SignalReportArtefact[] | null
+    reportArtefactsLoading: boolean
+    reportCharts: ReportChartApi[]
+    reportChecks: SignalReportCheckApi[] | null
+    reportChecksError: string | null
+    reportChecksLoading: boolean
+    reportClaimant: _UserApi | null
+    reportDiff: CommitDiffResponseApi | null
+    reportDiffError: GitHubLoadError | null
+    reportDiffLoading: boolean
+    reportReviewers: EnrichedReviewer[] | null
+    reportSignals: SignalNode[] | null
+    reportSignalsLoading: boolean
+    reportStateSaving: boolean
+    reportSummary: string | null
+    reportTaskToOpen: ReportTaskEntry | null
+    reportTasks: ReportTaskEntry[] | null
+    reportTasksLoading: boolean
+    repositorySaving: boolean
+    savedFeedback: SignalReportFeedbackStateApi | null
+    savedFeedbackLoading: boolean
+    selectedPullRequest: ReportPullRequest
+    selectedPullRequestUrl: string | null
+    selectedTask: ReportTaskEntry | null
+    selectedTaskId: string | null
+    shouldPollReportTasks: boolean
+    teammateClaimHolder: _UserApi | null
+    trailingCharts: ReportChartApi[]
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface inboxReportDetailLogicActions {
+    alignReportDiscussion: (
+        report: SignalReport,
+        reportUrl: string
+    ) => {
+        report: SignalReport
+        reportUrl: string
+    } // inboxTaskKickoffLogic
+    createPrSuccess: () => {
+        value: true
+    } // inboxTaskKickoffLogic
+    discussReport: (
+        report: SignalReport,
+        reportUrl: string,
+        question: string,
+        agentQuestion?: string | undefined,
+        intent?: ReportDiscussionIntent | undefined,
+        pullRequestUrl?: string | undefined,
+        background?: boolean | undefined
+    ) => {
+        agentQuestion: string | undefined
+        background: boolean | undefined
+        intent: ReportDiscussionIntent | undefined
+        pullRequestUrl: string | undefined
+        question: string
+        report: SignalReport
+        reportUrl: string
+    } // inboxTaskKickoffLogic
+    discussReportSuccess: () => {
+        value: true
+    } // inboxTaskKickoffLogic
+    openReportDiscussion: (
+        report: SignalReport,
+        reportUrl: string
+    ) => {
+        report: SignalReport
+        reportUrl: string
+    } // inboxTaskKickoffLogic
+    openReportTask: (
+        report: SignalReport,
+        taskId: string,
+        runId: string,
+        streamKey?: string | undefined
+    ) => {
+        report: SignalReport
+        runId: string
+        streamKey: string | undefined
+        taskId: string
+    } // inboxTaskKickoffLogic
+    warmReportDiscussion: (report: SignalReport) => {
+        report: SignalReport
+    } // inboxTaskKickoffLogic
+    approveReportCheck: (checkId: string) => {
+        checkId: string
+    }
+    approveReportCheckDone: (checkId: string) => {
+        checkId: string
+    }
+    cancelReportCheck: (checkId: string) => {
+        checkId: string
+    }
+    cancelReportCheckDone: (checkId: string) => {
+        checkId: string
+    }
+    changeReportState: (state: SignalReportStateRequestApi['state']) => {
+        state: SignalReportStateEnumApi
+    }
+    closeDraftThread: () => {
+        value: true
+    }
+    collapseEvidence: () => {
+        value: true
+    }
+    deleteReviewComment: (commentId: string) => {
+        commentId: string
+    }
+    editReviewComment: (
+        commentId: string,
+        body: string
+    ) => {
+        body: string
+        commentId: string
+    }
+    expandEvidence: () => {
+        value: true
+    }
+    feedbackSaved: (feedback: SignalReportFeedbackStateApi) => {
+        feedback: SignalReportFeedbackStateApi
+    }
+    loadAvailableReviewers: ({ query }?: { query?: string }) => {
+        query?: string
+    }
+    loadAvailableReviewersFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadAvailableReviewersSuccess: (
+        availableReviewers: {
+            email: string
+            name: string
+            user_uuid: string
+        }[],
+        payload?: {
+            query?: string
+        }
+    ) => {
+        availableReviewers: {
+            email: string
+            name: string
+            user_uuid: string
+        }[]
+        payload?: {
+            query?: string
+        }
+    }
+    loadFeedback: () => any
+    loadFeedbackFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadFeedbackSuccess: (
+        savedFeedback: SignalReportFeedbackStateApi,
+        payload?: any
+    ) => {
+        savedFeedback: SignalReportFeedbackStateApi
+        payload?: any
+    }
+    loadPrChecks: (_: void) => void
+    loadPrChecksFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadPrChecksSuccess: (
+        prChecks: readonly PullRequestCheckApi[] | null,
+        payload?: void
+    ) => {
+        prChecks: readonly PullRequestCheckApi[] | null
+        payload?: void
+    }
+    loadPrComments: (_: void) => void
+    loadPrCommentsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadPrCommentsSuccess: (
+        prComments: readonly PullRequestCommentApi[] | null,
+        payload?: void
+    ) => {
+        prComments: readonly PullRequestCommentApi[] | null
+        payload?: void
+    }
+    loadReportArtefacts: (_: void) => void
+    loadReportArtefactsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadReportArtefactsSuccess: (
+        reportArtefacts: SignalReportArtefact[],
+        payload?: void
+    ) => {
+        reportArtefacts: SignalReportArtefact[]
+        payload?: void
+    }
+    loadReportChecks: (_: void) => void
+    loadReportChecksFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadReportChecksSuccess: (
+        reportChecks: SignalReportCheckApi[],
+        payload?: void
+    ) => {
+        reportChecks: SignalReportCheckApi[]
+        payload?: void
+    }
+    loadReportDiff: ({ artefactId }: { artefactId: string }) => {
+        artefactId: string
+    }
+    loadReportDiffFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadReportDiffSuccess: (
+        reportDiff: CommitDiffResponseApi | null,
+        payload?: {
+            artefactId: string
+        }
+    ) => {
+        reportDiff: CommitDiffResponseApi | null
+        payload?: {
+            artefactId: string
+        }
+    }
+    loadReportSignals: () => any
+    loadReportSignalsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadReportSignalsSuccess: (
+        reportSignals: SignalNodeApi[],
+        payload?: any
+    ) => {
+        reportSignals: SignalNodeApi[]
+        payload?: any
+    }
+    loadReportTasks: () => any
+    loadReportTasksFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadReportTasksSuccess: (
+        reportTasks: ReportTaskEntry[],
+        payload?: any
+    ) => {
+        reportTasks: ReportTaskEntry[]
+        payload?: any
+    }
+    openDraftThread: (draft: DraftThread) => {
+        draft: DraftThread
+    }
+    postReviewComment: (payload: {
+        body: string
+        inReplyTo?: string
+        /** Thread/draft key the composer belongs to, for per-thread posting state. */
+        key: string
+        line?: number
+        path?: string
+        side?: 'LEFT' | 'RIGHT'
+    }) => {
+        payload: {
+            body: string
+            inReplyTo?: string | undefined
+            key: string
+            line?: number | undefined
+            path?: string | undefined
+            side?: 'LEFT' | 'RIGHT' | undefined
+        }
+    }
+    postReviewCommentFinished: () => {
+        value: true
+    }
+    rateReport: (
+        sentiment: InboxReportFeedbackSentiment | null,
+        surface?: InboxReportActionSurface,
+        onSuccess?: () => void
+    ) => {
+        onSuccess: (() => void) | undefined
+        sentiment: InboxReportFeedbackSentiment | null
+        surface: InboxReportActionSurface
+    }
+    searchAvailableReviewers: (query: string) => {
+        query: string
+    }
+    selectPullRequest: (url: string) => {
+        url: string
+    }
+    setActionabilitySaving: (saving: boolean) => {
+        saving: boolean
+    }
+    setClaimSaving: (saving: boolean) => {
+        saving: boolean
+    }
+    setDetailTab: (tab: ReportDetailTab) => {
+        tab: ReportDetailTab
+    }
+    setEditingCommentId: (commentId: string | null) => {
+        commentId: string | null
+    }
+    setFeedbackNoteDraft: (draft: string) => {
+        draft: string
+    }
+    setFeedbackNoteSubmitting: (submitting: boolean) => {
+        submitting: boolean
+    }
+    setFeedbackSubmitting: (submitting: boolean) => {
+        submitting: boolean
+    }
+    setOptimisticReviewers: (reviewers: EnrichedReviewer[] | null) => {
+        reviewers: EnrichedReviewer[] | null
+    }
+    setPrConflictReported: (hasConflict: boolean) => {
+        hasConflict: boolean
+    }
+    setPrioritySaving: (saving: boolean) => {
+        saving: boolean
+    }
+    setReport: (report: SignalReport | null) => {
+        report: SignalReport | null
+    }
+    setReportClaimed: (
+        claimed: boolean,
+        takeover?: boolean,
+        shownAssignee?: SignalReport['assignee']
+    ) => {
+        claimed: boolean
+        shownAssignee: SignalReportAssigneeApi | null | undefined
+        takeover: boolean
+    }
+    setReportStateSaving: (saving: boolean) => {
+        saving: boolean
+    }
+    setRepositorySaving: (saving: boolean) => {
+        saving: boolean
+    }
+    setSelectedTaskId: (taskId: string | null) => {
+        taskId: string | null
+    }
+    submitFeedbackNote: (
+        note: string,
+        surface?: InboxReportActionSurface
+    ) => {
+        note: string
+        surface: InboxReportActionSurface
+    }
+    toggleExpandedTask: (taskId: string) => {
+        taskId: string
+    }
+    toggleReviewCommentReaction: (
+        commentId: string,
+        content: string
+    ) => {
+        commentId: string
+        content: string
+    }
+    updateActionability: (change: ReportActionabilityChange) => {
+        change: ReportActionabilityChange
+    }
+    updatePriority: (priority: ReportPriorityApi) => {
+        priority: ReportPriorityApi
+    }
+    updateRepository: (repository: string) => {
+        repository: string
+    }
+    updateReviewers: (
+        content: Record<string, string>[],
+        optimistic: EnrichedReviewer[],
+        action: Extract<ReviewerEditActionEnumApi, 'add' | 'remove'>,
+        removal?: ReviewerRemoval
+    ) => {
+        action: 'add' | 'remove'
+        content: Record<string, string>[]
+        optimistic: EnrichedReviewer[]
+        removal: ReviewerRemoval | undefined
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface inboxReportDetailLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        feedbackSentiment: (
+            savedFeedback: SignalReportFeedbackStateApi | null
+        ) => SignalReportFeedbackSentimentEnumApi | null
+        feedbackSentNote: (savedFeedback: SignalReportFeedbackStateApi | null) => string | null
+        feedbackNoteSent: (feedbackSentNote: string | null) => boolean
+        feedbackDisabledReason: (
+            savedFeedback: SignalReportFeedbackStateApi | null,
+            savedFeedbackLoading: boolean,
+            feedbackSubmitting: boolean,
+            feedbackNoteSubmitting: boolean
+        ) =>
+            | 'Could not load feedback. Refresh the page to try again.'
+            | 'Loading feedback'
+            | 'Saving feedback'
+            | undefined
+        isUpdatingReviewers: (optimisticReviewers: EnrichedReviewer[] | null) => boolean
+        reportReviewers: (reportArtefacts: SignalReportArtefact[] | null) => EnrichedReviewer[] | null
+        isReportActive: (report: SignalReport | null) => boolean
+        shouldPollReportTasks: (isReportActive: boolean, reportTasks: ReportTaskEntry[] | null) => boolean
+        selectedPullRequest: (report: SignalReport | null, selectedPullRequestUrl: string | null) => ReportPullRequest
+        hasImplementationPr: (report: SignalReport | null) => boolean
+        prChecksFailing: (
+            selectedPullRequest: ReportPullRequest,
+            prChecks: readonly PullRequestCheckApi[] | null
+        ) => boolean
+        prHasConflict: (selectedPullRequest: ReportPullRequest, prConflictReported: boolean) => boolean
+        prChecksBackedOff: (prChecksConsecutiveFailures: number) => boolean
+        hasPersonalGithub: (personalIntegrations: PersonalGitHubIntegration[]) => boolean
+        currentUserGithubLogin: (personalIntegrations: PersonalGitHubIntegration[]) => string | null
+        inlineThreadsByFile: (prComments: readonly PullRequestCommentApi[] | null) => Record<string, ReviewThread[]>
+        inlineThreadCount: (inlineThreadsByFile: Record<string, ReviewThread[]>) => number
+        latestCommitArtefact: (reportArtefacts: SignalReportArtefact[] | null) => SignalReportArtefact | null
+        reportCharts: (report: SignalReport | null) => ReportChartApi[]
+        chartsById: (reportCharts: ReportChartApi[]) => Map<string, ReportChartApi>
+        chartIdsKey: (reportCharts: ReportChartApi[]) => string
+        reportSummary: (report: SignalReport | null) => string | null
+        chartPlacements: (reportSummary: string | null, chartIdsKey: string) => ChartPlacements
+        trailingCharts: (reportCharts: ReportChartApi[], chartPlacements: ChartPlacements) => ReportChartApi[]
+        priorityExplanation: (reportArtefacts: SignalReportArtefact[] | null) => string | null
+        actionabilityExplanation: (reportArtefacts: SignalReportArtefact[] | null) => string | null
+        decisionAttributions: (
+            report: SignalReport | null,
+            reportArtefacts: SignalReportArtefact[] | null
+        ) => ReportDecisionAttributions | null
+        displayReviewers: (
+            reportReviewers: EnrichedReviewer[] | null,
+            optimisticReviewers: EnrichedReviewer[] | null,
+            user: null | import('~/types').UserType
+        ) => EnrichedReviewer[] | null
+        addReviewerOptions: (
+            availableReviewers: AvailableReviewerOption[] | null,
+            user: null | import('~/types').UserType
+        ) => AvailableReviewerOption[]
+        isReResearch: (reportTasks: ReportTaskEntry[] | null) => boolean
+        reportClaimant: (report: SignalReport | null) => _UserApi | null
+        isClaimedByMe: (reportClaimant: _UserApi | null, user: null | import('~/types').UserType) => boolean
+        teammateClaimHolder: (report: SignalReport | null, user: null | import('~/types').UserType) => _UserApi | null
+        isReportClaimable: (report: SignalReport | null, user: null | import('~/types').UserType) => boolean
+        implementationSlotClaim: (reportTasks: ReportTaskEntry[] | null) => ImplementationSlotClaim | null
+        implementationDisabledReason: (
+            implementationSlotClaim: ImplementationSlotClaim | null,
+            report: SignalReport | null,
+            user: null | import('~/types').UserType
+        ) => string | null
+        primaryTask: (reportTasks: ReportTaskEntry[] | null) => ReportTaskEntry | null
+        reportTaskToOpen: (reportTasks: ReportTaskEntry[] | null) => ReportTaskEntry | null
+        selectedTask: (
+            reportTasks: ReportTaskEntry[] | null,
+            selectedTaskId: string | null,
+            primaryTask: ReportTaskEntry | null
+        ) => ReportTaskEntry | null
+    }
+}
+
+export type inboxReportDetailLogicType = MakeLogicType<
+    inboxReportDetailLogicValues,
+    inboxReportDetailLogicActions,
+    InboxReportDetailLogicProps,
+    inboxReportDetailLogicMeta
+>
+
+/**
+ * Per-selected-report detail logic: artefacts, contributing signals, suggested reviewers, and linked tasks.
+ * Keyed by `reportId` so each open report gets its own mounted instance.
+ */
+export const inboxReportDetailLogic = kea<inboxReportDetailLogicType>([
+    path(['scenes', 'inbox', 'logics', 'inboxReportDetailLogic']),
+    props({} as InboxReportDetailLogicProps),
+    key((props) => props.reportId),
+
+    connect(() => ({
+        // Personal GitHub connection state gates the inline comment composer (comments post as the user).
+        values: [
+            personalIntegrationsLogic,
+            ['integrations as personalIntegrations'],
+            sidePanelStateLogic,
+            ['selectedTab', 'selectedTabOptions'],
+        ],
+        // Starting a PR task writes to the artefact log, which is where the Create PR gate reads from.
+        actions: [
+            inboxTaskKickoffLogic,
+            [
+                'alignReportDiscussion',
+                'createPrSuccess',
+                'discussReport',
+                'discussReportSuccess',
+                'openReportDiscussion',
+                'openReportTask',
+                'warmReportDiscussion',
+            ],
+        ],
+    })),
+
+    actions({
+        expandEvidence: true,
+        collapseEvidence: true,
+        // Open a not-yet-posted comment thread on a diff line (one draft at a time).
+        openDraftThread: (draft: DraftThread) => ({ draft }),
+        closeDraftThread: true,
+        // Post an inline review comment: a reply when `inReplyTo` is set, else a new thread on the draft anchor.
+        postReviewComment: (payload: {
+            body: string
+            inReplyTo?: string
+            path?: string
+            line?: number
+            side?: 'LEFT' | 'RIGHT'
+            /** Thread/draft key the composer belongs to, for per-thread posting state. */
+            key: string
+        }) => ({ payload }),
+        postReviewCommentFinished: true,
+        // Edit / delete one of the user's own review comments (optimistic, reverts on failure).
+        editReviewComment: (commentId: string, body: string) => ({ commentId, body }),
+        deleteReviewComment: (commentId: string) => ({ commentId }),
+        // Add or remove the user's own reaction of `content` on a review comment (optimistic toggle).
+        toggleReviewCommentReaction: (commentId: string, content: string) => ({ commentId, content }),
+        // Which comment is being edited inline (null = none).
+        setEditingCommentId: (commentId: string | null) => ({ commentId }),
+        selectPullRequest: (url: string) => ({ url }),
+        setPrConflictReported: (hasConflict: boolean) => ({ hasConflict }),
+        setReport: (report: SignalReport | null) => ({ report }),
+        updatePriority: (priority: ReportPriorityApi) => ({ priority }),
+        setPrioritySaving: (saving: boolean) => ({ saving }),
+        updateRepository: (repository: string) => ({ repository }),
+        setRepositorySaving: (saving: boolean) => ({ saving }),
+        updateActionability: (change: ReportActionabilityChange) => ({ change }),
+        setActionabilitySaving: (saving: boolean) => ({ saving }),
+        changeReportState: (state: SignalReportStateRequestApi['state']) => ({ state }),
+        setReportStateSaving: (saving: boolean) => ({ saving }),
+        setReportClaimed: (claimed: boolean, takeover: boolean = false, shownAssignee?: SignalReport['assignee']) => ({
+            claimed,
+            takeover,
+            shownAssignee,
+        }),
+        setClaimSaving: (saving: boolean) => ({ saving }),
+        // Optimistically replace the reviewer list while the PUT is in flight, then reload from the server.
+        // Addressed by report (not artefact) so a report with no reviewers yet can still be assigned one.
+        // Mirrors desktop `useUpdateSuggestedReviewers` optimistic behavior.
+        updateReviewers: (
+            content: Record<string, string>[],
+            optimistic: EnrichedReviewer[],
+            action: Extract<ReviewerEditActionEnumApi, 'add' | 'remove'>,
+            // Why the person removed these reviewers, if they said. Research reads it on later reports.
+            removal?: ReviewerRemoval
+        ) => ({
+            content,
+            optimistic,
+            action,
+            removal,
+        }),
+        setOptimisticReviewers: (reviewers: EnrichedReviewer[] | null) => ({ reviewers }),
+        // Debounced server-side org-member search for the add-reviewer picker.
+        searchAvailableReviewers: (query: string) => ({ query }),
+        // Which linked task's run log the detail view shows; null falls back to `primaryTask`.
+        setSelectedTaskId: (taskId: string | null) => ({ taskId }),
+        // Summary or Files changed in the report column (PR-bearing reports only).
+        setDetailTab: (tab: ReportDetailTab) => ({ tab }),
+        // Inline-expand a linked task's run log within the report detail's Runs section.
+        toggleExpandedTask: (taskId: string) => ({ taskId }),
+        // Thumbs feedback at the end of the report body. Recorded server-side as a report action
+        // (consumption evidence) – nothing about the report's state changes.
+        rateReport: (
+            sentiment: InboxReportFeedbackSentiment | null,
+            surface: InboxReportActionSurface = 'detail_footer',
+            onSuccess?: () => void
+        ) => ({
+            sentiment,
+            surface,
+            onSuccess,
+        }),
+        // Optional note, offered only after a rating is in. The rating is never held up waiting for it.
+        setFeedbackNoteDraft: (draft: string) => ({ draft }),
+        // The note rides on the payload: the reducers below clear the draft, and listeners run after them.
+        submitFeedbackNote: (note: string, surface: InboxReportActionSurface = 'detail_footer') => ({ note, surface }),
+        cancelReportCheck: (checkId: string) => ({ checkId }),
+        // Fired whether the cancel succeeded or failed, so the row's button always comes back.
+        cancelReportCheckDone: (checkId: string) => ({ checkId }),
+        approveReportCheck: (checkId: string) => ({ checkId }),
+        approveReportCheckDone: (checkId: string) => ({ checkId }),
+        // Driven by the submit listener only, so the re-entrancy guard and the Send button's
+        // loading state read the same flag.
+        setFeedbackNoteSubmitting: (submitting: boolean) => ({ submitting }),
+        setFeedbackSubmitting: (submitting: boolean) => ({ submitting }),
+        feedbackSaved: (feedback: SignalReportFeedbackStateApi) => ({ feedback }),
+    }),
+
+    loaders(({ actions, props, values, cache }) => ({
+        savedFeedback: [
+            null as SignalReportFeedbackStateApi | null,
+            {
+                loadFeedback: async () =>
+                    await signalsReportsFeedbackStateRetrieve(String(teamLogic.values.currentTeamId), props.reportId),
+            },
+        ],
+        reportArtefacts: [
+            null as SignalReportArtefact[] | null,
+            {
+                loadReportArtefacts: async (_: void, breakpoint): Promise<SignalReportArtefact[]> => {
+                    let response = await signalsReportArtefactsList(
+                        String(ApiConfig.getCurrentProjectId()),
+                        props.reportId,
+                        {
+                            limit: ARTEFACT_FETCH_LIMIT,
+                        }
+                    )
+                    await breakpoint()
+                    const artefacts = [...response.results]
+                    while (response.next) {
+                        // nosemgrep: prefer-codegen-api -- follows the server-provided pagination next link.
+                        response = await api.get<PaginatedSignalReportArtefactListApi>(response.next)
+                        await breakpoint()
+                        artefacts.push(...response.results)
+                    }
+                    return artefacts as SignalReportArtefact[]
+                },
+            },
+        ],
+        reportSignals: [
+            null as SignalNode[] | null,
+            {
+                loadReportSignals: async () => {
+                    const response = await signalsReportsSignalsRetrieve(
+                        String(teamLogic.values.currentTeamId),
+                        props.reportId
+                    )
+                    return response.signals
+                },
+            },
+        ],
+        reportChecks: [
+            null as SignalReportCheckApi[] | null,
+            {
+                loadReportChecks: async (_: void, breakpoint): Promise<SignalReportCheckApi[]> => {
+                    const response = await signalsReportChecksList(
+                        String(teamLogic.values.currentTeamId),
+                        props.reportId
+                    )
+                    await breakpoint()
+                    return response.results.map((check) => {
+                        const current = values.reportChecks?.find((row) => row.id === check.id)
+                        // A response requested before a mutation must not undo its newer result.
+                        return current && dayjs(current.updated_at).isAfter(dayjs(check.updated_at)) ? current : check
+                    })
+                },
+            },
+        ],
+        reportTasks: [
+            null as ReportTaskEntry[] | null,
+            {
+                // The task↔report association lives in the `task_run` artefact log: each artefact's
+                // `(product, type)` derives the task's purpose. We group by task id (earliest
+                // association wins for `startedAt`), drop `repo_selection` (pipeline plumbing), then
+                // resolve each task. Mirrors desktop `useReportTasks`. Derives from the already-loaded
+                // `reportArtefacts` (re-run after each artefact load) rather than re-fetching them.
+                loadReportTasks: async () => {
+                    const snapshots: Map<string, { fetchedAt: number; artefactRunId?: string | null }> =
+                        (cache.reportTaskSnapshots ??= new Map())
+                    const artefacts = values.reportArtefacts ?? []
+                    const associations = new Map<
+                        string,
+                        {
+                            purpose: ReportTaskPurpose
+                            purposeLabel: string
+                            startedAt: string
+                            latestRunId?: string | null
+                            latestRunAt: string
+                        }
+                    >()
+                    for (const artefact of artefacts) {
+                        if (artefact.type !== 'task_run') {
+                            continue
+                        }
+                        const content = artefact.content as TaskRunArtefactContent
+                        if (!content?.task_id) {
+                            continue
+                        }
+                        const derived = deriveTaskPurpose(content)
+                        if (!derived) {
+                            continue
+                        }
+                        const existing = associations.get(content.task_id)
+                        if (!existing) {
+                            associations.set(content.task_id, {
+                                ...derived,
+                                startedAt: artefact.created_at,
+                                latestRunId: content.run_id,
+                                latestRunAt: artefact.created_at,
+                            })
+                        } else if (artefact.created_at < existing.startedAt) {
+                            // Keep the earliest association's timestamp + purpose for this task.
+                            associations.set(content.task_id, {
+                                ...existing,
+                                ...derived,
+                                startedAt: artefact.created_at,
+                            })
+                        } else if (artefact.created_at > existing.latestRunAt) {
+                            associations.set(content.task_id, {
+                                ...existing,
+                                latestRunId: content.run_id,
+                                latestRunAt: artefact.created_at,
+                            })
+                        }
+                    }
+                    let incomplete = false
+                    const entries = await Promise.all(
+                        [...associations.entries()].map(async ([taskId, meta]): Promise<ReportTaskEntry | null> => {
+                            const cached = values.reportTasks?.find((entry) => entry.task.id === taskId)
+                            const snapshot = snapshots.get(taskId)
+                            if (
+                                values.report?.status === SignalReportStatus.MONITORING &&
+                                cached?.task.latest_run &&
+                                TERMINAL_RUN_STATUSES.includes(cached.task.latest_run.status) &&
+                                snapshot?.artefactRunId === meta.latestRunId &&
+                                Date.now() - (snapshot?.fetchedAt ?? -Infinity) < TERMINAL_TASK_CACHE_TTL_MS
+                            ) {
+                                return { task: cached.task, ...meta }
+                            }
+                            try {
+                                const task = await api.tasks.get(taskId)
+                                snapshots.set(taskId, { fetchedAt: Date.now(), artefactRunId: meta.latestRunId })
+                                return { task, ...meta }
+                            } catch (error) {
+                                // A deleted/inaccessible task drops out of the list rather than failing the load.
+                                if (!(error instanceof ApiError && (error.status === 403 || error.status === 404))) {
+                                    incomplete = true
+                                }
+                                return null
+                            }
+                        })
+                    )
+                    // Other failures can be transient. Sidebar alignment waits for a load that has every task.
+                    cache.reportTasksIncomplete = incomplete
+                    return entries
+                        .filter((entry): entry is ReportTaskEntry => entry !== null)
+                        .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
+                },
+            },
+        ],
+        availableReviewers: [
+            null as AvailableReviewerOption[] | null,
+            {
+                // Org members with a linked GitHub identity who can be added as reviewers.
+                // Filtered server-side via `query` (the backend ranks + caps at 100) so the picker
+                // isn't limited to the alphabetical first page. Empty query loads the default page.
+                loadAvailableReviewers: async ({ query }: { query?: string } = {}, breakpoint) => {
+                    const reviewers = await api.signalReports.availableReviewers(query)
+                    // Discard this result if a newer search superseded it while the request was in
+                    // flight, so a slower earlier response cannot overwrite the newer rows.
+                    breakpoint()
+                    return reviewers
+                },
+            },
+        ],
+        // The report's pull request or pre-PR branch diff, rendered in the "Files changed" section. Loaded
+        // here rather than in the component so the fetch is keyed to the report and cascades off the
+        // artefact load — once artefacts resolve we know the latest commit artefact, and re-fetch only when
+        // a *new* commit lands (not on every 5s activity poll).
+        reportDiff: [
+            null as CommitDiffResponseApi | null,
+            {
+                loadReportDiff: async ({ artefactId }: { artefactId: string }) => {
+                    const teamId = teamLogic.values.currentTeamId
+                    if (!teamId) {
+                        return null
+                    }
+                    const response = await signalsReportArtefactsDiff(String(teamId), props.reportId, artefactId)
+                    if (typeof response?.diff !== 'string') {
+                        throw new Error('Invalid diff response')
+                    }
+                    return response
+                },
+            },
+        ],
+        // CI checks on the report's implementation PR. Only fetched when the report has one; polled
+        // every 15s while the detail is mounted (see the `setReport` listener) so a running build's
+        // status stays current, mirroring the desktop PR-review view.
+        prChecks: [
+            null as readonly PullRequestCheckApi[] | null,
+            {
+                loadPrChecks: async (_: void, breakpoint) => {
+                    const teamId = teamLogic.values.currentTeamId
+                    if (!teamId) {
+                        return null
+                    }
+                    const pr = values.selectedPullRequest
+                    const response = await signalsReportPrChecks(String(teamId), props.reportId, {
+                        pull_request_id: pr.id ?? undefined,
+                    }).catch((error: unknown) => {
+                        breakpoint()
+                        throw error
+                    })
+                    breakpoint()
+                    if (values.selectedPullRequest.url !== pr.url) {
+                        return null
+                    }
+                    // A backend from before this field omits it, and kea rejects an undefined reducer value.
+                    actions.setPrConflictReported(response.has_conflict === true)
+                    return response.checks
+                },
+            },
+        ],
+        // Conversation + review comments on the report's implementation PR, merged chronologically.
+        prComments: [
+            null as readonly PullRequestCommentApi[] | null,
+            {
+                loadPrComments: async (_: void, breakpoint) => {
+                    const teamId = teamLogic.values.currentTeamId
+                    if (!teamId) {
+                        return null
+                    }
+                    const pr = values.selectedPullRequest
+                    const response = await signalsReportPrComments(String(teamId), props.reportId, {
+                        pull_request_id: pr.id ?? undefined,
+                    }).catch((error: unknown) => {
+                        breakpoint()
+                        throw error
+                    })
+                    breakpoint()
+                    if (values.selectedPullRequest.url !== pr.url) {
+                        return null
+                    }
+                    return response.comments
+                },
+            },
+        ],
+    })),
+
+    reducers(({ props }) => ({
+        selectedPullRequestUrl: [null as string | null, { selectPullRequest: (_, { url }) => url }],
+        // Checks whose cancel request is in flight, so each row's Stop button disables itself
+        // without blocking a second row.
+        cancellingCheckIds: [
+            [] as string[],
+            {
+                cancelReportCheck: (state: string[], { checkId }: { checkId: string }) =>
+                    state.includes(checkId) ? state : [...state, checkId],
+                cancelReportCheckDone: (state: string[], { checkId }: { checkId: string }) =>
+                    state.filter((id) => id !== checkId),
+            },
+        ],
+        approvingCheckIds: [
+            [] as string[],
+            {
+                approveReportCheck: (state: string[], { checkId }: { checkId: string }) =>
+                    state.includes(checkId) ? state : [...state, checkId],
+                approveReportCheckDone: (state: string[], { checkId }: { checkId: string }) =>
+                    state.filter((id) => id !== checkId),
+            },
+        ],
+        evidenceExpanded: [false, { expandEvidence: () => true, collapseEvidence: () => false }],
+        prioritySaving: [false, { setPrioritySaving: (_, { saving }) => saving }],
+        repositorySaving: [false, { setRepositorySaving: (_, { saving }) => saving }],
+        actionabilitySaving: [false, { setActionabilitySaving: (_, { saving }) => saving }],
+        reportStateSaving: [false, { setReportStateSaving: (_, { saving }) => saving }],
+        claimSaving: [false, { setClaimSaving: (_, { saving }) => saving }],
+        report: [
+            null as SignalReport | null,
+            {
+                setReport: (_, { report }) => report,
+            },
+        ],
+        // While a reviewer update is in flight, this overrides the artefact-derived list so the UI
+        // reflects the change immediately. Cleared once the reload lands (or the update fails).
+        optimisticReviewers: [
+            null as EnrichedReviewer[] | null,
+            {
+                updateReviewers: (_, { optimistic }) => optimistic,
+                setOptimisticReviewers: (_, { reviewers }) => reviewers,
+            },
+        ],
+        // Explicit task selection for the run-log viewer. Reset when the report changes so a freshly
+        // opened run starts on its `primaryTask`.
+        selectedTaskId: [
+            null as string | null,
+            {
+                setSelectedTaskId: (_, { taskId }) => taskId,
+                setReport: () => null,
+            },
+        ],
+        // Linked tasks whose run log is expanded inline in the Runs section. Reset when the report
+        // changes so a freshly opened report starts with everything collapsed.
+        expandedTaskIds: [
+            [] as string[],
+            {
+                toggleExpandedTask: (state, { taskId }) =>
+                    state.includes(taskId) ? state.filter((id) => id !== taskId) : [...state, taskId],
+                setReport: (state, { report }) => (report?.id === props.reportId ? state : []),
+            },
+        ],
+        // Which tab the report column shows. The logic is keyed by report id, so each report keeps its
+        // own tab while open and a freshly opened report starts on the summary.
+        detailTab: [
+            'summary' as ReportDetailTab,
+            {
+                setDetailTab: (_, { tab }) => tab,
+            },
+        ],
+        savedFeedback: {
+            feedbackSaved: (_, { feedback }) => feedback,
+        },
+        feedbackSubmitting: [false, { setFeedbackSubmitting: (_, { submitting }) => submitting }],
+        feedbackNoteDraft: [
+            '',
+            {
+                setFeedbackNoteDraft: (_, { draft }) => draft,
+                feedbackSaved: () => '',
+            },
+        ],
+        feedbackNoteSubmitting: [
+            false,
+            {
+                setFeedbackNoteSubmitting: (_, { submitting }) => submitting,
+            },
+        ],
+        // Human-readable diff-load failure (kea-loaders only exposes a boolean loading flag).
+        reportDiffError: [
+            null as GitHubLoadError | null,
+            {
+                loadReportDiff: () => null,
+                loadReportDiffSuccess: () => null,
+                loadReportDiffFailure: (_, { errorObject }) =>
+                    githubLoadErrorFrom(
+                        errorObject,
+                        "Couldn't load the diff. Try again, or open the pull request on GitHub."
+                    ),
+            },
+        ],
+        // The commit artefact the current `reportDiff` was loaded for, so the artefact poll re-fetches
+        // the diff only when a new commit lands rather than on every tick.
+        diffArtefactId: [
+            null as string | null,
+            {
+                loadReportDiff: (_, { artefactId }) => artefactId,
+            },
+        ],
+        // Human-readable PR checks/comments load failures (kea-loaders only exposes a boolean flag).
+        // A failure usually means the branch/PR was deleted or the GitHub integration lost access.
+        // Cleared only on success (not on load start), so the section keeps showing the error while
+        // a backed-off retry is in flight instead of flashing back to the loading skeleton.
+        prChecksError: [
+            null as GitHubLoadError | null,
+            {
+                loadPrChecksSuccess: () => null,
+                loadPrChecksFailure: (_, { errorObject }) =>
+                    githubLoadErrorFrom(errorObject, "Couldn't load the PR checks from GitHub."),
+            },
+        ],
+        // What the last checks response said about conflicts on the selected PR. It arrives with the
+        // checks, so it adds no GitHub call. A failed poll keeps the last answer, as `prChecks` does.
+        prConflictReported: [
+            false,
+            {
+                setPrConflictReported: (_, { hasConflict }) => hasConflict,
+                selectPullRequest: () => false,
+            },
+        ],
+        // Consecutive failed checks fetches — feeds `prChecksBackedOff`.
+        prChecksConsecutiveFailures: [
+            0,
+            {
+                loadPrChecksSuccess: () => 0,
+                loadPrChecksFailure: (state: number) => state + 1,
+            },
+        ],
+        prCommentsError: [
+            null as GitHubLoadError | null,
+            {
+                loadPrComments: () => null,
+                loadPrCommentsSuccess: () => null,
+                loadPrCommentsFailure: (_, { errorObject }) =>
+                    githubLoadErrorFrom(errorObject, "Couldn't load the PR comments from GitHub."),
+            },
+        ],
+        // Cleared only on success, so the error and its retry button stay visible while the retry runs.
+        reportChecksError: [
+            null as string | null,
+            {
+                loadReportChecksSuccess: () => null,
+                loadReportChecksFailure: () => "Couldn't load the measurements.",
+            },
+        ],
+        // The one in-progress draft thread on a diff line. Reset when the report changes.
+        draftThread: [
+            null as DraftThread | null,
+            {
+                openDraftThread: (_, { draft }) => draft,
+                closeDraftThread: () => null,
+                setReport: (state, { report }) => (report?.id === props.reportId ? state : null),
+            },
+        ],
+        // Which thread's composer has a post in flight — gates its submit button and textarea.
+        postingThreadKey: [
+            null as string | null,
+            {
+                postReviewComment: (_, { payload }) => payload.key,
+                postReviewCommentFinished: () => null,
+            },
+        ],
+        // Which comment is open for inline editing. Cleared on a successful edit or when the report changes.
+        editingCommentId: [
+            null as string | null,
+            {
+                setEditingCommentId: (_, { commentId }) => commentId,
+                setReport: (state, { report }) => (report?.id === props.reportId ? state : null),
+            },
+        ],
+    })),
+
+    selectors({
+        feedbackSentiment: [
+            (s) => [s.savedFeedback],
+            (feedback: SignalReportFeedbackStateApi | null) => feedback?.sentiment ?? null,
+        ],
+        feedbackSentNote: [
+            (s) => [s.savedFeedback],
+            (feedback: SignalReportFeedbackStateApi | null) => feedback?.note || null,
+        ],
+        feedbackNoteSent: [(s) => [s.feedbackSentNote], (note: string | null) => !!note],
+        feedbackDisabledReason: [
+            (s) => [s.savedFeedback, s.savedFeedbackLoading, s.feedbackSubmitting, s.feedbackNoteSubmitting],
+            (
+                feedback: SignalReportFeedbackStateApi | null,
+                loading: boolean,
+                submitting: boolean,
+                noteSubmitting: boolean
+            ) =>
+                loading
+                    ? 'Loading feedback'
+                    : submitting || noteSubmitting
+                      ? 'Saving feedback'
+                      : !feedback
+                        ? 'Could not load feedback. Refresh the page to try again.'
+                        : undefined,
+        ],
+        // Mirrors the optimistic override lifecycle: an update is in flight exactly while the
+        // optimistic list is set (cleared once the reload lands or the update fails).
+        isUpdatingReviewers: [
+            (s) => [s.optimisticReviewers],
+            (optimisticReviewers: EnrichedReviewer[] | null) => optimisticReviewers !== null,
+        ],
+        reportReviewers: [
+            (s) => [s.reportArtefacts],
+            (reportArtefacts: SignalReportArtefact[] | null): EnrichedReviewer[] | null => {
+                if (!reportArtefacts) {
+                    return null
+                }
+                const reviewersArtefact = reportArtefacts.find((a) => a.type === 'suggested_reviewers')
+                if (!reviewersArtefact) {
+                    return null
+                }
+                return reviewersArtefact.content as unknown as EnrichedReviewer[]
+            },
+        ],
+        isReportActive: [
+            (s) => [s.report],
+            (report: SignalReport | null): boolean => (report ? ACTIVE_STATUSES.includes(report.status) : false),
+        ],
+        // Poll the artefact log while something can still change it. A report being worked is the usual
+        // case, but a `ready` report can hold an implementation run too, and that run settling is what
+        // hands the Create PR slot back. Without this clause the action stays disabled on a ready report
+        // until the pane is reopened, and the server's 429 cannot correct it because the failure runs the
+        // other way: the press is refused in the UI that the server would now accept.
+        // Discussion and research runs hold it open too so their status in the Runs section settles
+        // without requiring the reader to reopen the report.
+        shouldPollReportTasks: [
+            (s) => [s.isReportActive, s.reportTasks],
+            (isReportActive: boolean, reportTasks: ReportTaskEntry[] | null): boolean =>
+                isReportActive || implementationRunInFlight(reportTasks) || openableRunInFlight(reportTasks),
+        ],
+        // Whether the report has a shipped implementation PR — gates the PR checks/comments fetch + poll.
+        selectedPullRequest: [
+            (s) => [s.report, s.selectedPullRequestUrl],
+            (report: SignalReport | null, url: string | null): ReportPullRequest =>
+                reportPullRequests(report).find((pr) => pr.url === url) ?? primaryReportPullRequest(report),
+        ],
+        hasImplementationPr: [
+            (s) => [s.report],
+            (report: SignalReport | null): boolean => reportPullRequests(report).length > 0,
+        ],
+        // Whether a check fails on the selected PR while it is still open, so CI there is worth fixing.
+        prChecksFailing: [
+            (s) => [s.selectedPullRequest, s.prChecks],
+            (pr: ReportPullRequest, prChecks: readonly PullRequestCheckApi[] | null): boolean =>
+                !pr.merged &&
+                pr.state !== 'closed' &&
+                pr.state !== 'merged' &&
+                (prChecks ?? []).some(
+                    (check) => check.status === 'completed' && FAILED_CHECK_CONCLUSIONS.includes(check.conclusion ?? '')
+                ),
+        ],
+        // Whether the selected PR conflicts with its base while it is still open, so it is worth updating.
+        prHasConflict: [
+            (s) => [s.selectedPullRequest, s.prConflictReported],
+            (pr: ReportPullRequest, prConflictReported: boolean): boolean =>
+                !pr.merged && pr.state !== 'closed' && pr.state !== 'merged' && prConflictReported,
+        ],
+        // True once GitHub has failed enough consecutive times that the 15s cadence stops being worth
+        // it — the poll tick then drops to a slow retry (see PR_CHECKS_FAILURE_BACKOFF_TICKS).
+        prChecksBackedOff: [
+            (s) => [s.prChecksConsecutiveFailures],
+            (prChecksConsecutiveFailures: number): boolean =>
+                prChecksConsecutiveFailures >= PR_CHECKS_MAX_CONSECUTIVE_FAILURES,
+        ],
+        // Whether the current user has a personal GitHub connection — required to post review comments
+        // (they're attributed to the user's own GitHub identity, not the app's).
+        hasPersonalGithub: [
+            (s) => [s.personalIntegrations],
+            (personalIntegrations: PersonalGitHubIntegration[]): boolean => (personalIntegrations ?? []).length > 0,
+        ],
+        // The current user's GitHub login (from their personal connection) — used to attribute optimistic
+        // comments and to tell which comments/reactions are the user's own (editable/removable). Note this
+        // is `github_login`, NOT `account.name` (which is the installation's org/user, e.g. "PostHog").
+        currentUserGithubLogin: [
+            (s) => [s.personalIntegrations],
+            (personalIntegrations: PersonalGitHubIntegration[]): string | null =>
+                personalIntegrations?.[0]?.github_login ?? null,
+        ],
+        // Inline review threads grouped by file path: thread roots (review comments with a line anchor
+        // and no in_reply_to) plus their replies, in chronological order. Outdated comments (null line)
+        // are excluded here — they still show in the Comments section.
+        inlineThreadsByFile: [
+            (s) => [s.prComments],
+            (prComments: readonly PullRequestCommentApi[] | null): Record<string, ReviewThread[]> => {
+                if (!prComments) {
+                    return {}
+                }
+                const threads = new Map<string, ReviewThread>()
+                for (const comment of prComments) {
+                    if (comment.comment_type !== 'review' || !comment.path || comment.in_reply_to_id) {
+                        continue
+                    }
+                    if (comment.line == null) {
+                        continue
+                    }
+                    threads.set(comment.id, {
+                        rootId: comment.id,
+                        path: comment.path,
+                        line: comment.line,
+                        side: comment.side === 'LEFT' ? 'LEFT' : 'RIGHT',
+                        comments: [comment],
+                    })
+                }
+                for (const comment of prComments) {
+                    if (comment.comment_type !== 'review' || !comment.in_reply_to_id) {
+                        continue
+                    }
+                    threads.get(comment.in_reply_to_id)?.comments.push(comment)
+                }
+                const byFile: Record<string, ReviewThread[]> = {}
+                for (const thread of threads.values()) {
+                    ;(byFile[thread.path] ??= []).push(thread)
+                }
+                return byFile
+            },
+        ],
+        // Total inline threads, for the Files changed toolbar summary.
+        inlineThreadCount: [
+            (s) => [s.inlineThreadsByFile],
+            (inlineThreadsByFile: Record<string, ReviewThread[]>): number =>
+                Object.values(inlineThreadsByFile).reduce((sum, threads) => sum + threads.length, 0),
+        ],
+        // The most recent `commit` artefact — its branch is treated as the report's branch to diff
+        // against the repository default branch. A report's code work may span several pushes; the
+        // latest commit's branch tip is the current state worth inspecting.
+        latestCommitArtefact: [
+            (s) => [s.reportArtefacts],
+            (reportArtefacts: SignalReportArtefact[] | null): SignalReportArtefact | null => {
+                const commits = (reportArtefacts ?? []).filter((a) => a.type === 'commit')
+                if (commits.length === 0) {
+                    return null
+                }
+                return commits.reduce((latest, a) => (a.created_at > latest.created_at ? a : latest))
+            },
+        ],
+        reportCharts: [(s) => [s.report], (report: SignalReport | null): ReportChartApi[] => report?.charts ?? []],
+        chartsById: [
+            (s) => [s.reportCharts],
+            (reportCharts: ReportChartApi[]): Map<string, ReportChartApi> =>
+                new Map(reportCharts.map((chart) => [chart.chart_id, chart])),
+        ],
+        // A string rather than the id array, so the selectors below hold their identity while a report
+        // polls. Artefacts reload on a timer and hand back a fresh array whether or not anything
+        // changed, and the same is true of a refresh that appends a new version of one chart — but
+        // placement only ever depends on *which* charts exist, so an equal key means an equal answer.
+        chartIdsKey: [
+            (s) => [s.reportCharts],
+            (reportCharts: ReportChartApi[]): string => reportCharts.map((chart) => chart.chart_id).join('\n'),
+        ],
+        // Where each chart is drawn: a `chart:` link places its chart at that point in the prose, and
+        // every chart the summary doesn't place follows it. A reference the placement pass rejected (a
+        // repeat, one inside a table cell) still reads as its label — the reference decides where a
+        // chart goes, not whether it shows at all.
+        // Taken off `report` as its own value for the same reason: the shell hands the detail a fresh
+        // report object as it polls, and the summary is the only part of it placement reads.
+        reportSummary: [(s) => [s.report], (report: SignalReport | null): string | null => report?.summary ?? null],
+        chartPlacements: [
+            (s) => [s.reportSummary, s.chartIdsKey],
+            (reportSummary: string | null, chartIdsKey: string): ChartPlacements =>
+                resolveChartPlacements(reportSummary, chartIdsKey ? chartIdsKey.split('\n') : []),
+        ],
+        trailingCharts: [
+            (s) => [s.reportCharts, s.chartPlacements],
+            (reportCharts: ReportChartApi[], chartPlacements: ChartPlacements): ReportChartApi[] =>
+                reportCharts.filter((chart) => !chartPlacements.inlineIds.has(chart.chart_id)),
+        ],
+        // Rationale behind the priority / actionability judgments, pulled from the already-loaded artefacts.
+        priorityExplanation: [
+            (s) => [s.reportArtefacts],
+            (reportArtefacts: SignalReportArtefact[] | null): string | null =>
+                latestJudgmentExplanation(reportArtefacts, 'priority_judgment'),
+        ],
+        actionabilityExplanation: [
+            (s) => [s.reportArtefacts],
+            (reportArtefacts: SignalReportArtefact[] | null): string | null =>
+                latestJudgmentExplanation(reportArtefacts, 'actionability_judgment'),
+        ],
+        decisionAttributions: [
+            (s) => [s.report, s.reportArtefacts],
+            (
+                report: SignalReport | null,
+                reportArtefacts: SignalReportArtefact[] | null
+            ): ReportDecisionAttributions | null => reportDecisionAttributions(report?.decisions, reportArtefacts),
+        ],
+        // The reviewer list to render: optimistic override (if any) wins over the artefact-derived list,
+        // then the current user is pinned to the top. Mirrors desktop `displayReviewers`.
+        displayReviewers: [
+            (s) => [s.reportReviewers, s.optimisticReviewers, userLogic.selectors.user],
+            (
+                reportReviewers: EnrichedReviewer[] | null,
+                optimisticReviewers: EnrichedReviewer[] | null,
+                user: { uuid: string } | null
+            ): EnrichedReviewer[] | null => {
+                const reviewers = optimisticReviewers ?? reportReviewers
+                if (!reviewers) {
+                    return null
+                }
+                const meUuid = user?.uuid
+                if (!meUuid) {
+                    return reviewers
+                }
+                const meIndex = reviewers.findIndex((r) => r.user?.uuid === meUuid)
+                if (meIndex <= 0) {
+                    return reviewers
+                }
+                return [reviewers[meIndex], ...reviewers.filter((_, i) => i !== meIndex)]
+            },
+        ],
+        // Add-reviewer options: org members with GitHub, current user pinned first ("Me"). Mirrors desktop.
+        addReviewerOptions: [
+            (s) => [s.availableReviewers, userLogic.selectors.user],
+            (
+                availableReviewers: AvailableReviewerOption[] | null,
+                currentUser: { uuid: string; first_name?: string; last_name?: string; email?: string } | null
+            ): AvailableReviewerOption[] => {
+                const me: CurrentReviewerUser | null = currentUser
+                    ? {
+                          uuid: currentUser.uuid,
+                          first_name: currentUser.first_name,
+                          last_name: currentUser.last_name,
+                          email: currentUser.email,
+                      }
+                    : null
+                return buildAddReviewerOptions(availableReviewers ?? [], me)
+            },
+        ],
+        // True when a re-research is under way: ≥2 research tasks, one currently in-flight while a prior
+        // attempt already reached a terminal state. Mirrors desktop `AgentRunDetail`'s `isReResearch`.
+        isReResearch: [
+            (s) => [s.reportTasks],
+            (reportTasks: ReportTaskEntry[] | null): boolean => {
+                if (!reportTasks) {
+                    return false
+                }
+                const researchTasks = reportTasks.filter((rt) => rt.purpose === 'research')
+                if (researchTasks.length < 2) {
+                    return false
+                }
+                const hasInFlight = researchTasks.some((rt) => {
+                    const status = rt.task.latest_run?.status
+                    return !!status && !TERMINAL_RUN_STATUSES.includes(status)
+                })
+                const hasPriorTerminal = researchTasks.some((rt) => {
+                    const status = rt.task.latest_run?.status
+                    return !!status && TERMINAL_RUN_STATUSES.includes(status)
+                })
+                return hasInFlight && hasPriorTerminal
+            },
+        ],
+        reportClaimant: [
+            (s) => [s.report],
+            (report: SignalReport | null): _UserApi | null => (report ? reportClaimant(report) : null),
+        ],
+        isClaimedByMe: [
+            (s) => [s.reportClaimant, userLogic.selectors.user],
+            (claimant: _UserApi | null, user: { uuid: string } | null): boolean =>
+                !!claimant && !!user && claimant.uuid === user.uuid,
+        ],
+        teammateClaimHolder: [
+            (s) => [s.report, userLogic.selectors.user],
+            (report: SignalReport | null, user: { uuid: string } | null): _UserApi | null =>
+                report ? teammateClaimHolder(report, user?.uuid ?? null) : null,
+        ],
+        isReportClaimable: [
+            (s) => [s.report, userLogic.selectors.user],
+            (report: SignalReport | null, user: { uuid: string } | null): boolean =>
+                report ? isReportClaimable(report, user?.uuid ?? null) : false,
+        ],
+        implementationSlotClaim: [
+            (s) => [s.reportTasks],
+            (reportTasks: ReportTaskEntry[] | null): ImplementationSlotClaim | null =>
+                implementationSlotClaim(reportTasks),
+        ],
+        implementationDisabledReason: [
+            (s) => [s.implementationSlotClaim, s.report, userLogic.selectors.user],
+            (
+                slotClaim: ImplementationSlotClaim | null,
+                report: SignalReport | null,
+                user: { uuid: string } | null
+            ): string | null =>
+                slotClaim
+                    ? SLOT_CLAIM_DISABLED_REASON[slotClaim]
+                    : report
+                      ? implementationClaimDisabledReason(report, user?.uuid)
+                      : null,
+        ],
+        // The default task whose run log is shown: prefer one still in motion, tie-break by most-recent
+        // link. Mirrors desktop `AgentRunDetail`'s `pickPrimaryTask`.
+        primaryTask: [
+            (s) => [s.reportTasks],
+            (reportTasks: ReportTaskEntry[] | null): ReportTaskEntry | null => preferredReportTask(reportTasks ?? []),
+        ],
+        reportTaskToOpen: [
+            (s) => [s.reportTasks],
+            (reportTasks: ReportTaskEntry[] | null): ReportTaskEntry | null => {
+                const activeImplementation = (reportTasks ?? [])
+                    .filter(
+                        (entry) =>
+                            entry.purpose === 'implementation' &&
+                            entry.task.latest_run &&
+                            !TERMINAL_RUN_STATUSES.includes(entry.task.latest_run.status)
+                    )
+                    .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())[0]
+                if (activeImplementation) {
+                    return activeImplementation
+                }
+                return (
+                    reportTasks?.find((entry) => entry.purpose === 'implementation' && getTaskPrUrl(entry.task)) ?? null
+                )
+            },
+        ],
+        // The linked task the viewer renders: the explicit selection if it still exists, else `primaryTask`.
+        selectedTask: [
+            (s) => [s.reportTasks, s.selectedTaskId, s.primaryTask],
+            (
+                reportTasks: ReportTaskEntry[] | null,
+                selectedTaskId: string | null,
+                primaryTask: ReportTaskEntry | null
+            ): ReportTaskEntry | null => reportTasks?.find((rt) => rt.task.id === selectedTaskId) ?? primaryTask,
+        ],
+    }),
+
+    listeners(({ actions, asyncActions, values, props, selectors, cache }) => ({
+        // A claim from the report's list row writes a work-log entry, and a ready report without a running task
+        // does not poll its artefacts. The pane's own claim reloads them itself, so skip it while that claim saves.
+        [inboxBulkActionsLogic.actionTypes.reportClaimChanged]: ({ reportId }: { reportId: string }) => {
+            if (reportId === props.reportId && !values.claimSaving) {
+                actions.loadReportArtefacts()
+            }
+        },
+        changeReportState: async ({ state }) => {
+            if (values.reportStateSaving) {
+                return
+            }
+            actions.setReportStateSaving(true)
+            try {
+                await withInboxWriteTimeout('state', (options) =>
+                    signalsReportsStateCreate(
+                        String(ApiConfig.getCurrentProjectId()),
+                        props.reportId,
+                        { state },
+                        options
+                    )
+                )
+                inboxBulkActionsLogic.findMounted()?.actions.reportStateChanged()
+                const scene = inboxSceneLogic.findMounted()
+                if (scene?.values.selectedReportId === props.reportId) {
+                    scene.actions.loadSelectedReport({ id: props.reportId })
+                }
+            } catch {
+                lemonToast.error("Couldn't update this report. Refresh it and try again.")
+                inboxBulkActionsLogic.findMounted()?.actions.reportWriteFailed([props.reportId])
+            } finally {
+                actions.setReportStateSaving(false)
+            }
+        },
+        updatePriority: async ({ priority }) => {
+            const teamId = teamLogic.values.currentTeamId
+            const currentReport = values.report
+            if (!teamId || !currentReport || values.prioritySaving || currentReport.priority === priority) {
+                return
+            }
+            const previousAttribution = values.decisionAttributions?.priority ?? null
+            actions.setPrioritySaving(true)
+            let updated: SignalReportApi
+            try {
+                updated = await withInboxWriteTimeout('priority', (options) =>
+                    signalsReportsPriorityUpdate(String(teamId), props.reportId, { priority }, options)
+                )
+            } catch {
+                inboxBulkActionsLogic.findMounted()?.actions.reportWriteFailed([props.reportId])
+                if (inboxReportDetailLogic.isMounted(props)) {
+                    actions.setPrioritySaving(false)
+                    lemonToast.error("Couldn't save the priority. Try again.")
+                }
+                return
+            }
+            captureInboxReportDecisionChanged({
+                report: currentReport,
+                decision: 'priority',
+                previousValue: currentReport.priority ?? null,
+                newValue: priority,
+                previousSetBy: previousAttribution ? (previousAttribution.person ? 'person' : 'agent') : null,
+                surface: 'detail_pane',
+            })
+            inboxBulkActionsLogic.findMounted()?.actions.reportStateChanged()
+            if (!inboxReportDetailLogic.isMounted(props)) {
+                return
+            }
+            const report: SignalReport = {
+                ...(values.report ?? currentReport),
+                priority,
+                decisions: updated.decisions,
+                updated_at: updated.updated_at,
+            }
+            actions.setReport(report)
+            const scene = inboxSceneLogic.findMounted()
+            if (scene?.values.selectedReportId === props.reportId) {
+                scene.actions.seedSelectedReport(report)
+            }
+            actions.loadReportArtefacts()
+            actions.setPrioritySaving(false)
+        },
+        updateRepository: async ({ repository }) => {
+            const teamId = teamLogic.values.currentTeamId
+            const currentReport = values.report
+            if (!teamId || !currentReport || values.repositorySaving || currentReport.repo_slug === repository) {
+                return
+            }
+            const previousAttribution = values.decisionAttributions?.repository ?? null
+            actions.setRepositorySaving(true)
+            let updated: SignalReportApi
+            try {
+                updated = await withInboxWriteTimeout('repository', (options) =>
+                    signalsReportsRepositoryUpdate(String(teamId), props.reportId, { repository }, options)
+                )
+            } catch {
+                inboxBulkActionsLogic.findMounted()?.actions.reportWriteFailed([props.reportId])
+                if (inboxReportDetailLogic.isMounted(props)) {
+                    actions.setRepositorySaving(false)
+                    lemonToast.error("Couldn't save the repository. Try again.")
+                }
+                return
+            }
+            captureInboxReportDecisionChanged({
+                report: currentReport,
+                decision: 'repository',
+                previousValue: currentReport.repo_slug ?? null,
+                newValue: repository,
+                previousSetBy: previousAttribution ? (previousAttribution.person ? 'person' : 'agent') : null,
+                surface: 'detail_pane',
+            })
+            inboxBulkActionsLogic.findMounted()?.actions.reportStateChanged()
+            if (!inboxReportDetailLogic.isMounted(props)) {
+                return
+            }
+            const report: SignalReport = {
+                ...(values.report ?? currentReport),
+                repo_slug: updated.repo_slug ?? repository,
+                research_context: updated.research_context,
+                decisions: updated.decisions,
+                updated_at: updated.updated_at,
+            }
+            actions.setReport(report)
+            const scene = inboxSceneLogic.findMounted()
+            if (scene?.values.selectedReportId === props.reportId) {
+                scene.actions.seedSelectedReport(report)
+            }
+            actions.loadReportArtefacts()
+            actions.setRepositorySaving(false)
+        },
+        updateActionability: async ({ change }) => {
+            const teamId = teamLogic.values.currentTeamId
+            const currentReport = values.report
+            if (!teamId || !currentReport || values.actionabilitySaving) {
+                return
+            }
+            const request = reportActionabilityRequest(currentReport, change)
+            if (!request) {
+                return
+            }
+            const { decision, previousValue, newValue, body } = request
+            const previousAttribution = values.decisionAttributions?.[decision] ?? null
+            actions.setActionabilitySaving(true)
+            let updated: SignalReportApi
+            try {
+                updated = await withInboxWriteTimeout('actionability', (options) =>
+                    signalsReportsActionabilityUpdate(String(teamId), props.reportId, body, options)
+                )
+            } catch {
+                inboxBulkActionsLogic.findMounted()?.actions.reportWriteFailed([props.reportId])
+                if (inboxReportDetailLogic.isMounted(props)) {
+                    actions.setActionabilitySaving(false)
+                    lemonToast.error(
+                        decision === 'actionability'
+                            ? "Couldn't save the actionability. Try again."
+                            : "Couldn't save whether this is already addressed. Try again."
+                    )
+                }
+                return
+            }
+            captureInboxReportDecisionChanged({
+                report: currentReport,
+                decision,
+                previousValue,
+                newValue,
+                previousSetBy: previousAttribution ? (previousAttribution.person ? 'person' : 'agent') : null,
+                surface: 'detail_pane',
+            })
+            inboxBulkActionsLogic.findMounted()?.actions.reportStateChanged()
+            if (!inboxReportDetailLogic.isMounted(props)) {
+                return
+            }
+            // A new actionability can move the report between Ready and Needs input, so the status comes from the response.
+            const report: SignalReport = {
+                ...(values.report ?? currentReport),
+                actionability: updated.actionability as SignalReport['actionability'],
+                already_addressed: updated.already_addressed,
+                status: updated.status as SignalReport['status'],
+                decisions: updated.decisions,
+                updated_at: updated.updated_at,
+            }
+            actions.setReport(report)
+            const scene = inboxSceneLogic.findMounted()
+            if (scene?.values.selectedReportId === props.reportId) {
+                scene.actions.seedSelectedReport(report)
+            }
+            actions.loadReportArtefacts()
+            actions.setActionabilitySaving(false)
+        },
+        setReportClaimed: async ({ claimed, takeover, shownAssignee }) => {
+            const teamId = teamLogic.values.currentTeamId
+            const currentReport = values.report
+            if (!teamId || !currentReport || values.claimSaving) {
+                return
+            }
+            actions.setClaimSaving(true)
+            captureInboxReportAction({
+                report: currentReport,
+                actionType: claimed ? 'claim' : 'unclaim',
+                surface: 'detail_pane',
+                extra: takeover ? { takeover: true } : undefined,
+            })
+            const scene = inboxSceneLogic.findMounted()
+            const outcome = await requestReportClaim(
+                String(teamId),
+                // A confirmed takeover names the claim the dialog showed, so a claim that changed since is refused.
+                { id: props.reportId, assignee: shownAssignee !== undefined ? shownAssignee : currentReport.assignee },
+                claimed,
+                { currentUserUuid: userLogic.values.user?.uuid ?? null, takeover }
+            )
+            if (!outcome.ok) {
+                if (inboxReportDetailLogic.isMounted(props)) {
+                    actions.setClaimSaving(false)
+                    lemonToast.error(outcome.message)
+                }
+                inboxBulkActionsLogic.findMounted()?.actions.reportWriteFailed([props.reportId])
+                return
+            }
+            const updated = outcome.updated
+            if (!inboxReportDetailLogic.isMounted(props)) {
+                return
+            }
+            const report: SignalReport = {
+                ...(values.report ?? currentReport),
+                assignee: updated.assignee,
+                updated_at: updated.updated_at,
+            }
+            actions.setReport(report)
+            if (scene?.values.selectedReportId === props.reportId) {
+                scene.actions.seedSelectedReport(report)
+            }
+            inboxBulkActionsLogic.findMounted()?.actions.reportClaimChanged(props.reportId, updated.assignee)
+            actions.loadReportArtefacts()
+            actions.setClaimSaving(false)
+        },
+        approveReportCheck: async ({ checkId }) => {
+            const teamId = teamLogic.values.currentTeamId
+            if (!teamId) {
+                actions.approveReportCheckDone(checkId)
+                return
+            }
+            try {
+                const approved = await signalsReportChecksApproveCreate(String(teamId), props.reportId, checkId)
+                actions.loadReportChecksSuccess(
+                    (values.reportChecks ?? []).map((check) => (check.id === checkId ? approved : check))
+                )
+            } catch {
+                lemonToast.error('Could not approve this check. Please try again.')
+            } finally {
+                actions.approveReportCheckDone(checkId)
+            }
+        },
+        // The endpoint answers with the cancelled row, so the list is patched in place rather than
+        // refetched: the section keeps its scroll position and the other rows never flicker.
+        cancelReportCheck: async ({ checkId }) => {
+            const teamId = teamLogic.values.currentTeamId
+            if (!teamId) {
+                actions.cancelReportCheckDone(checkId)
+                return
+            }
+            try {
+                const cancelled = await signalsReportChecksDestroy(String(teamId), props.reportId, checkId)
+                actions.loadReportChecksSuccess(
+                    (values.reportChecks ?? []).map((check) => (check.id === checkId ? cancelled : check))
+                )
+            } catch (error: any) {
+                lemonToast.error(error?.detail || "Couldn't stop this check. Try again in a moment.")
+            } finally {
+                actions.cancelReportCheckDone(checkId)
+            }
+        },
+        setDetailTab: ({ tab }) => {
+            // Reviewing the diff is the deepest engagement a report gets short of acting on it.
+            if (tab === 'files' && values.report) {
+                captureInboxReportAction({ report: values.report, actionType: 'view_diff', surface: 'detail_pane' })
+            }
+        },
+        expandEvidence: () => {
+            // The two-card default is a guess. This is the only signal for how often a reader wants
+            // the rest of the evidence, so it carries how much there was to reach for.
+            if (values.report) {
+                captureInboxReportAction({
+                    report: values.report,
+                    actionType: 'show_more',
+                    surface: 'detail_pane',
+                    extra: { section: 'evidence', signal_count: values.reportSignals?.length ?? 0 },
+                })
+            }
+        },
+        rateReport: async ({ sentiment, surface, onSuccess }) => {
+            if (!values.report || !values.savedFeedback || values.feedbackSubmitting || values.feedbackNoteSubmitting) {
+                return
+            }
+            actions.setFeedbackSubmitting(true)
+            try {
+                await signalsReportsFeedbackCreate(String(teamLogic.values.currentTeamId), props.reportId, {
+                    sentiment,
+                })
+                actions.feedbackSaved({ sentiment, note: '' })
+                onSuccess?.()
+                if (sentiment) {
+                    captureInboxReportFeedback({ report: values.report, sentiment, surface })
+                } else {
+                    captureInboxReportAction({ report: values.report, actionType: 'clear_feedback', surface })
+                }
+            } catch {
+                lemonToast.error('Could not save your feedback. Please try again.')
+            } finally {
+                actions.setFeedbackSubmitting(false)
+            }
+        },
+        submitFeedbackNote: async ({ note, surface }) => {
+            const trimmed = note.trim()
+            if (
+                !values.report ||
+                !values.feedbackSentiment ||
+                !trimmed ||
+                values.feedbackSubmitting ||
+                values.feedbackNoteSubmitting
+            ) {
+                return
+            }
+            actions.setFeedbackNoteSubmitting(true)
+            const sentiment = values.feedbackSentiment
+            try {
+                await signalsReportsFeedbackCreate(String(teamLogic.values.currentTeamId), props.reportId, {
+                    sentiment,
+                    note: trimmed,
+                })
+                actions.feedbackSaved({ sentiment, note: trimmed })
+                captureInboxReportFeedbackNote({ report: values.report, sentiment, note: trimmed, surface })
+            } catch {
+                lemonToast.error('Could not save your note. Please try again.')
+            } finally {
+                actions.setFeedbackNoteSubmitting(false)
+            }
+        },
+        searchAvailableReviewers: async ({ query }, breakpoint) => {
+            await breakpoint(300)
+            actions.loadAvailableReviewers({ query: query.trim() || undefined })
+        },
+        updateReviewers: async ({ content, optimistic, action, removal }) => {
+            if (cache.reviewerWriteInFlight) {
+                return
+            }
+            cache.reviewerWriteInFlight = true
+            // The context menu picker unmounts this logic when the menu closes, which can happen while
+            // the request is in flight. Kea throws on `values` read through an unmounted logic, so take
+            // the saved reviewers from the response and touch local state only while still mounted.
+            let savedReviewerUuids: string[] | null = null
+            try {
+                const artefact = await signalsReportsReviewersUpdate(
+                    String(ApiConfig.getCurrentProjectId()),
+                    props.reportId,
+                    {
+                        content: optimistic.map((reviewer) => ({
+                            github_login: reviewer.github_login ?? undefined,
+                            user_uuid: reviewer.user?.uuid ?? reviewer.user_uuid ?? undefined,
+                        })),
+                        targets: content,
+                        action,
+                        ...(removal?.reason ? { removal_reason: removal.reason } : {}),
+                        ...(removal?.note?.trim() ? { removal_note: removal.note.trim() } : {}),
+                    }
+                )
+                savedReviewerUuids = ((artefact.content ?? []) as unknown as EnrichedReviewer[])
+                    .map((reviewer) => reviewer.user?.uuid ?? reviewer.user_uuid)
+                    .filter((uuid): uuid is string => !!uuid)
+                if (inboxReportDetailLogic.isMounted(props)) {
+                    actions.loadReportArtefactsSuccess([
+                        ...(values.reportArtefacts ?? []).filter((existing) => existing.id !== artefact.id),
+                        artefact as SignalReportArtefact,
+                    ])
+                    await asyncActions.loadReportArtefacts()
+                }
+            } catch (error: any) {
+                // After a successful save, an error from an unmounted logic is not a failed edit.
+                if (!savedReviewerUuids || inboxReportDetailLogic.isMounted(props)) {
+                    lemonToast.error(error?.detail || error?.message || 'Failed to update reviewers')
+                }
+            } finally {
+                cache.reviewerWriteInFlight = false
+                if (inboxReportDetailLogic.isMounted(props)) {
+                    actions.setOptimisticReviewers(null)
+                }
+            }
+            // Broadcast last: the list can drop the row that hosts this logic (the context menu picker),
+            // which unmounts it, and kea throws on an action dispatched through an unmounted logic.
+            if (savedReviewerUuids) {
+                inboxBulkActionsLogic.findMounted()?.actions.reportReviewersChanged(props.reportId, savedReviewerUuids)
+            }
+        },
+        // Post an inline review comment as the user. The comment is inserted optimistically (marked
+        // `pending: 'sending'`) and the composer/draft closes immediately, so nothing vanishes during
+        // the request. On success the optimistic entry is replaced by the real comment; on failure it's
+        // flagged `pending: 'failed'` (kept visible so the text isn't lost) and a toast explains why.
+        postReviewComment: async ({ payload }) => {
+            const requestPrUrl = values.selectedPullRequest.url
+            const teamId = teamLogic.values.currentTeamId
+            const tempId = `optimistic-${payload.key}-${values.prComments?.length ?? 0}-${payload.body.length}`
+            const login = values.currentUserGithubLogin
+            const optimistic: ClientPullRequestComment = {
+                id: tempId,
+                pending: 'sending',
+                author: login,
+                author_avatar_url: login ? `https://github.com/${login}.png` : null,
+                body: payload.body,
+                created_at: new Date().toISOString(),
+                url: null,
+                comment_type: 'review',
+                path: payload.path ?? null,
+                line: payload.line ?? null,
+                start_line: null,
+                side: payload.side ?? 'RIGHT',
+                diff_hunk: null,
+                in_reply_to_id: payload.inReplyTo ?? null,
+                commit_id: null,
+                reactions: [],
+            }
+            if (values.selectedPullRequest.url === requestPrUrl) {
+                actions.loadPrCommentsSuccess([...(values.prComments ?? []), optimistic])
+            }
+            actions.closeDraftThread()
+            try {
+                const response = await signalsReportPrReviewCommentsCreate(
+                    String(teamId),
+                    props.reportId,
+                    {
+                        body: payload.body,
+                        in_reply_to: payload.inReplyTo ?? null,
+                        path: payload.path ?? null,
+                        line: payload.line ?? null,
+                        side: payload.side ?? null,
+                    },
+                    { pull_request_id: values.selectedPullRequest.id ?? undefined }
+                )
+                if (values.selectedPullRequest.url === requestPrUrl) {
+                    actions.loadPrCommentsSuccess(
+                        (values.prComments ?? []).map((c) => (c.id === tempId ? response.comment : c))
+                    )
+                }
+            } catch (error: any) {
+                if (values.selectedPullRequest.url === requestPrUrl) {
+                    actions.loadPrCommentsSuccess(
+                        (values.prComments ?? []).map((c) =>
+                            c.id === tempId ? { ...(c as ClientPullRequestComment), pending: 'failed' } : c
+                        )
+                    )
+                }
+                lemonToast.error(reviewCommentError(error, "Couldn't post the comment to GitHub"))
+            } finally {
+                actions.postReviewCommentFinished()
+            }
+        },
+        // Edit one of the user's own review comments. Optimistically swaps the body in; a failure puts
+        // back only that comment's body.
+        editReviewComment: async ({ commentId, body }) => {
+            const requestPrUrl = values.selectedPullRequest.url
+            const teamId = teamLogic.values.currentTeamId
+            const previous = (values.prComments ?? []).find((c) => c.id === commentId)
+            actions.setEditingCommentId(null)
+            if (!teamId || !previous) {
+                return
+            }
+            if (values.selectedPullRequest.url === requestPrUrl) {
+                actions.loadPrCommentsSuccess(
+                    patchComment(values.prComments, commentId, (c) => ({ ...c, body, pending: 'sending' }))
+                )
+            }
+            try {
+                const response = await signalsReportPrReviewCommentUpdate(
+                    String(teamId),
+                    props.reportId,
+                    commentId,
+                    {
+                        body,
+                    },
+                    { pull_request_id: values.selectedPullRequest.id ?? undefined }
+                )
+                if (values.selectedPullRequest.url === requestPrUrl) {
+                    actions.loadPrCommentsSuccess(patchComment(values.prComments, commentId, () => response.comment))
+                }
+            } catch (error: any) {
+                if (values.selectedPullRequest.url === requestPrUrl) {
+                    actions.loadPrCommentsSuccess(
+                        patchComment(values.prComments, commentId, (c) => ({
+                            ...c,
+                            body: previous.body,
+                            pending: undefined,
+                        }))
+                    )
+                }
+                lemonToast.error(reviewCommentError(error, "Couldn't save the edit"))
+            }
+        },
+        // Delete one of the user's own review comments. Optimistically removes it; a failure slots it
+        // back at its old index in the list as it stands now.
+        deleteReviewComment: async ({ commentId }) => {
+            const requestPrUrl = values.selectedPullRequest.url
+            const teamId = teamLogic.values.currentTeamId
+            const index = (values.prComments ?? []).findIndex((c) => c.id === commentId)
+            if (!teamId || index === -1) {
+                return
+            }
+            const removed = (values.prComments ?? [])[index]
+            if (values.selectedPullRequest.url === requestPrUrl) {
+                actions.loadPrCommentsSuccess((values.prComments ?? []).filter((c) => c.id !== commentId))
+            }
+            try {
+                await signalsReportPrReviewCommentDestroy(String(teamId), props.reportId, commentId, {
+                    pull_request_id: values.selectedPullRequest.id ?? undefined,
+                })
+            } catch (error: any) {
+                const current = (values.prComments ?? []).filter((c) => c.id !== commentId)
+                if (values.selectedPullRequest.url === requestPrUrl) {
+                    actions.loadPrCommentsSuccess([...current.slice(0, index), removed, ...current.slice(index)])
+                }
+                lemonToast.error(reviewCommentError(error, "Couldn't delete the comment"))
+            }
+        },
+        // Toggle the user's own reaction of `content` on a comment. Optimistically adds/removes the
+        // reaction, then confirms with the server (add returns the real reaction id). A failure puts back
+        // only that one reaction, so a reaction toggled concurrently on the same comment isn't clobbered.
+        toggleReviewCommentReaction: async ({ commentId, content }) => {
+            const requestPrUrl = values.selectedPullRequest.url
+            const teamId = teamLogic.values.currentTeamId
+            const login = values.currentUserGithubLogin
+            if (!teamId || !login) {
+                return
+            }
+            const comment = (values.prComments ?? []).find((c) => c.id === commentId)
+            const mine = comment?.reactions?.find((r) => r.content === content && r.user_login === login)
+
+            if (mine) {
+                if (values.selectedPullRequest.url === requestPrUrl) {
+                    actions.loadPrCommentsSuccess(
+                        patchComment(values.prComments, commentId, (c) => ({
+                            ...c,
+                            reactions: (c.reactions ?? []).filter((r) => r.id !== mine.id),
+                        }))
+                    )
+                }
+                try {
+                    await signalsReportPrReviewCommentReactionDestroy(
+                        String(teamId),
+                        props.reportId,
+                        commentId,
+                        mine.id,
+                        { pull_request_id: values.selectedPullRequest.id ?? undefined }
+                    )
+                } catch (error: any) {
+                    if (values.selectedPullRequest.url === requestPrUrl) {
+                        actions.loadPrCommentsSuccess(
+                            patchComment(values.prComments, commentId, (c) => ({
+                                ...c,
+                                reactions: [...(c.reactions ?? []).filter((r) => r.id !== mine.id), mine],
+                            }))
+                        )
+                    }
+                    lemonToast.error(reviewCommentError(error, "Couldn't remove the reaction"))
+                }
+                return
+            }
+
+            const tempId = `optimistic-rx-${commentId}-${content}`
+            const optimisticReaction: PullRequestCommentReactionApi = { id: tempId, content, user_login: login }
+            if (values.selectedPullRequest.url === requestPrUrl) {
+                actions.loadPrCommentsSuccess(
+                    patchComment(values.prComments, commentId, (c) => ({
+                        ...c,
+                        reactions: [...(c.reactions ?? []), optimisticReaction],
+                    }))
+                )
+            }
+            try {
+                const response = await signalsReportPrReviewCommentReactionsCreate(
+                    String(teamId),
+                    props.reportId,
+                    commentId,
+                    { content: content as any },
+                    { pull_request_id: values.selectedPullRequest.id ?? undefined }
+                )
+                if (values.selectedPullRequest.url === requestPrUrl) {
+                    actions.loadPrCommentsSuccess(
+                        patchComment(values.prComments, commentId, (c) => ({
+                            ...c,
+                            reactions: (c.reactions ?? []).map((r) => (r.id === tempId ? response.reaction : r)),
+                        }))
+                    )
+                }
+            } catch (error: any) {
+                if (values.selectedPullRequest.url === requestPrUrl) {
+                    actions.loadPrCommentsSuccess(
+                        patchComment(values.prComments, commentId, (c) => ({
+                            ...c,
+                            reactions: (c.reactions ?? []).filter((r) => r.id !== tempId),
+                        }))
+                    )
+                }
+                lemonToast.error(reviewCommentError(error, "Couldn't add the reaction"))
+            }
+        },
+        // The artefact log is the single source for the activity timeline AND the task associations,
+        // so deriving the linked tasks hangs off each successful artefact load rather than issuing a
+        // second identical fetch. The branch diff also cascades from here (once artefacts resolve we
+        // know the latest commit artefact), but only re-fetches when a *new* commit lands.
+        loadReportArtefactsSuccess: () => {
+            actions.loadReportTasks()
+            const commit = values.latestCommitArtefact
+            if (commit && commit.id !== values.diffArtefactId) {
+                actions.loadReportDiff({ artefactId: commit.id })
+            }
+        },
+        // A run or chat the user opens owns the sidebar, so a later task load must not replace it.
+        discussReport: ({ background }) => {
+            if (!background) {
+                cache.sidebarAlignmentPending = false
+            }
+        },
+        openReportDiscussion: () => {
+            cache.sidebarAlignmentPending = false
+        },
+        openReportTask: () => {
+            cache.sidebarAlignmentPending = false
+        },
+        loadReportTasksSuccess: (_, __, ___, previousState) => {
+            const previousTasks = selectors.reportTasks(previousState)
+            const spendLogic = reportSpendLogic({
+                teamId: teamLogic.values.currentTeamId ?? 0,
+                reportId: props.reportId,
+            })
+            if (previousTasks !== null && spendLogic.isMounted()) {
+                spendLogic.actions.refreshSpend()
+            }
+            if (
+                cache.sidebarAlignmentPending &&
+                values.selectedTab === SidePanelTab.Max &&
+                values.selectedTabOptions === REPORT_AI_PANEL &&
+                values.report
+            ) {
+                // Task creation links a task before its run starts, so a runless task has nothing to open yet.
+                const task = cache.reportTasksIncomplete
+                    ? null
+                    : preferredReportTask((values.reportTasks ?? []).filter((entry) => entry.task.latest_run))
+                if (!cache.reportTasksIncomplete) {
+                    cache.sidebarAlignmentPending = false
+                }
+                if (task?.task.latest_run) {
+                    actions.openReportTask(values.report, task.task.id, task.task.latest_run.id)
+                } else {
+                    actions.warmReportDiscussion(values.report)
+                }
+            }
+            const before = previousTasks ?? []
+            const settled = (values.reportTasks ?? []).some((entry) => {
+                const run = entry.task.latest_run
+                const prior = before.find((row) => row.task.id === entry.task.id)?.task.latest_run
+                return (
+                    !!run &&
+                    TERMINAL_RUN_STATUSES.includes(run.status) &&
+                    (prior?.id !== run.id || prior?.status !== run.status)
+                )
+            })
+            if (settled) {
+                actions.loadReportChecks()
+                refreshSelectedReport(props.reportId)
+            }
+        },
+        // A PR task started from this pane is not in the artefact log the gate was computed from, so
+        // refresh it. This is also what starts the task poll for a ready report, whose status alone
+        // never gets one going.
+        createPrSuccess: () => {
+            actions.loadReportArtefacts()
+            // The task claims the report for the person who pressed Create PR, so reload the claimant.
+            refreshSelectedReport(props.reportId)
+        },
+        discussReportSuccess: () => {
+            actions.loadReportArtefacts()
+        },
+        selectPullRequest: () => {
+            actions.loadPrChecksSuccess(null)
+            actions.loadPrCommentsSuccess(null)
+            actions.closeDraftThread()
+            actions.setEditingCommentId(null)
+            actions.loadPrChecks()
+            actions.loadPrComments()
+        },
+        setReport: () => {
+            // Load the PR checks/comments once the report has a shipped PR. The recurring checks poll
+            // is registered once in `afterMount` (not here) so it isn't torn down and restarted every
+            // time the shell hands us a fresh `report` prop — which would starve the 15s cadence.
+            // A failed load leaves the value null, so gate on the error too: without it every prop
+            // churn from the shell's list poll would re-fetch (and re-fail) a PR GitHub can't serve.
+            if (values.hasImplementationPr && values.selectedPullRequestUrl !== values.selectedPullRequest.url) {
+                actions.selectPullRequest(values.selectedPullRequest.url)
+                return
+            }
+            if (values.hasImplementationPr) {
+                if (values.prChecks === null && !values.prChecksLoading && values.prChecksError === null) {
+                    actions.loadPrChecks()
+                }
+                if (values.prComments === null && !values.prCommentsLoading && values.prCommentsError === null) {
+                    actions.loadPrComments()
+                }
+            }
+        },
+    })),
+
+    propsChanged(({ actions, props }, oldProps) => {
+        // The shell re-renders the detail with a refreshed `selectedReport`; re-gate polling on the new status.
+        if (props.report !== oldProps.report) {
+            actions.setReport(props.report ?? null)
+            if (props.report?.status !== oldProps.report?.status) {
+                actions.loadReportChecks()
+                if (oldProps.report?.status === SignalReportStatus.MONITORING) {
+                    actions.loadReportArtefacts()
+                }
+            }
+        }
+    }),
+
+    afterMount(({ actions, props, values, cache }) => {
+        // `loadReportTasks` is cascaded from `loadReportArtefactsSuccess`, so it isn't called here.
+        actions.loadFeedback()
+        actions.loadReportArtefacts()
+        actions.loadReportSignals()
+        actions.loadAvailableReviewers()
+        actions.loadReportChecks()
+        // Seed the report from props so polling is gated on its status from the first tick.
+        actions.setReport(props.report ?? null)
+        if (props.report && values.selectedTab === SidePanelTab.Max && values.selectedTabOptions === REPORT_AI_PANEL) {
+            cache.sidebarAlignmentPending = true
+            actions.alignReportDiscussion(
+                props.report,
+                `${window.location.origin}${addProjectIdIfMissing(urls.inboxReport('reports', props.report.id))}`
+            )
+        }
+        cache.disposables.add(() => {
+            const interval = setInterval(() => {
+                if (values.report?.status === SignalReportStatus.MONITORING) {
+                    if (!values.reportArtefactsLoading) {
+                        actions.loadReportArtefacts()
+                    }
+                    refreshSelectedReport(props.reportId)
+                }
+                if (
+                    values.report?.status !== SignalReportStatus.RESOLVED &&
+                    values.report?.status !== SignalReportStatus.CLOSED &&
+                    values.report?.status !== SignalReportStatus.SUPPRESSED &&
+                    values.report?.status !== SignalReportStatus.DELETED &&
+                    !values.reportChecksLoading &&
+                    values.reportChecks?.some((check) => check.monitoring_timing)
+                ) {
+                    actions.loadReportChecks()
+                }
+            }, REPORT_CHECK_TIMING_POLL_INTERVAL_MS)
+            return () => clearInterval(interval)
+        }, 'reportCheckTimingPoll')
+        // Register the artefact-log poll once for the lifetime of the mount and let each tick decide
+        // whether to fetch. Re-arming it from `setReport` instead would reset the 5s cadence on every
+        // report prop the shell hands down, which is the starvation the PR-checks poll below avoids.
+        // Auto-disposed on unmount / hidden tab.
+        cache.disposables.add(() => {
+            const interval = setInterval(() => {
+                if (!values.shouldPollReportTasks || values.reportArtefactsLoading) {
+                    return
+                }
+                actions.loadReportArtefacts()
+            }, REPORT_TASKS_POLL_INTERVAL_MS)
+            return () => clearInterval(interval)
+        }, 'reportTasksPoll')
+        // Register the PR-checks poll once for the lifetime of the mount — the tick re-checks whether
+        // the report has a PR (and whether GitHub keeps failing), so it stays correct as the report
+        // prop churns without the interval ever being torn down and restarted (which would keep
+        // resetting the 15s cadence). Auto-disposed on unmount / hidden tab.
+        cache.disposables.add(() => {
+            let tick = 0
+            const interval = setInterval(() => {
+                tick += 1
+                // Polling can't fix a repository the GitHub connection can't reach. Only an admin can.
+                if (!values.hasImplementationPr || values.prChecksError?.code === GITHUB_REPOSITORY_INACCESSIBLE_CODE) {
+                    return
+                }
+                // While backed off, only every Nth tick retries — enough for a transient GitHub
+                // outage to heal the section without hammering a permanently broken PR.
+                if (values.prChecksBackedOff && tick % PR_CHECKS_FAILURE_BACKOFF_TICKS !== 0) {
+                    return
+                }
+                actions.loadPrChecks()
+            }, PR_CHECKS_POLL_INTERVAL_MS)
+            return () => clearInterval(interval)
+        }, 'prChecksPoll')
+    }),
+])

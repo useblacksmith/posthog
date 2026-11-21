@@ -1,0 +1,926 @@
+import type { ApiClient, GroupType } from '@/api/client'
+import type { Schemas } from '@/api/generated'
+import { hasScope } from '@/lib/api'
+import { classifyAuthFailure } from '@/lib/auth-errors'
+import { classifyAuthMethod } from '@/lib/auth-method'
+import type { ScopedCache } from '@/lib/cache/ScopedCache'
+import { StateLookupCache } from '@/lib/cache/StateLookupCache'
+import {
+    ErrorCode,
+    findPostHogPermissionError,
+    findTransportError,
+    hasTimeoutCause,
+    MissingOrganizationContextError,
+    MissingProjectContextError,
+    PostHogApiError,
+    PostHogPermissionError,
+    wrapError,
+} from '@/lib/errors'
+import { getPostHogClient } from '@/lib/posthog'
+import {
+    isProjectSecretKey,
+    PROJECT_SECRET_KEY_SCOPES,
+    PROJECT_SECRET_KEY_TOOLS,
+    PROJECT_SECRET_KEY_ACCESS_PATH,
+    PROJECT_SECRET_KEY_REMEDIATION,
+} from '@/lib/project-secret-key'
+import { sanitizeHeaderValue } from '@/lib/utils'
+import type { ApiRedactedPersonalApiKey, ApiUser } from '@/schema/api'
+import type {
+    BusinessKnowledgeContent,
+    CachedOrg,
+    CachedProject,
+    CachedUser,
+    MetricCatalogContent,
+    PinnedActiveContext,
+    SessionScopedState,
+    State,
+} from '@/tools/types'
+
+const CACHE_TTL_MS = 10 * 60 * 1000 // 10 minutes
+// A personal API key keeps its value when its scopes change, and the cache is keyed by token, so
+// its scopes are read again after this delay. Reconnecting the client does not help: same token.
+export const API_KEY_CACHE_TTL_MS = 2 * 60 * 1000 // 2 minutes
+const GATEWAY_TOOLS_CACHE_TTL_MS = 2 * 60 * 1000 // 2 minutes
+// An empty answer is re-read sooner so that newly added data shows up within a minute.
+const NO_DATA_CACHE_TTL_MS = 60 * 1000 // 1 minute
+// The integration list only adds a line to the environment prompt, so a slow response must not
+// hold `switch-project` for the full default request deadline. The caller serves the cached list.
+const INTEGRATION_KINDS_TIMEOUT_MS = 10 * 1000
+const BUSINESS_KNOWLEDGE_CONTENT_TIMEOUT_MS = 3 * 1000
+const METRIC_CATALOG_TIMEOUT_MS = 1000
+
+// Entitlement-related fields shared by both org shapes we read from — the
+// standalone org endpoint and the org embedded in `/api/users/@me/`.
+type OrgEntitlementFields = {
+    is_ai_data_processing_approved?: boolean | null
+    available_product_features?: Array<{ key: string }> | null
+}
+
+export class StateManager {
+    private _pinnedOrgProject: Promise<string> | undefined
+
+    constructor(
+        private readonly _cache: ScopedCache<State>,
+        private readonly _api: ApiClient,
+        private readonly _pinned?: PinnedActiveContext,
+        private readonly _sessionCache?: ScopedCache<SessionScopedState>,
+        private readonly lookups = new StateLookupCache()
+    ) {}
+
+    get pinnedContext(): PinnedActiveContext | undefined {
+        return this._pinned
+    }
+
+    /**
+     * Session selections never enter the token cache because other sessions on
+     * the credential share it. Sessionless pins persist only the keys they leave open.
+     */
+    async setActiveContext(updates: { orgId?: string; projectId?: string }): Promise<void> {
+        const pinned = this._pinned
+        if (!pinned) {
+            await this._cache.setMany({
+                ...(updates.orgId ? { orgId: updates.orgId } : {}),
+                ...(updates.projectId ? { projectId: updates.projectId } : {}),
+            })
+            return
+        }
+        if (updates.orgId) {
+            if (updates.orgId !== pinned.orgId && !updates.projectId) {
+                pinned.projectId = undefined
+            }
+            pinned.orgId = updates.orgId
+        }
+        if (updates.projectId) {
+            pinned.projectId = updates.projectId
+        }
+        this._pinnedOrgProject = undefined
+        if (pinned.sessionScoped) {
+            await this._sessionCache?.setMany({
+                activeOrgId: pinned.orgId ?? null,
+                activeProjectId: pinned.projectId ?? null,
+            })
+        } else {
+            await this._cache.setMany({
+                ...(updates.orgId && !pinned.pin.organizationId && !pinned.pin.projectId
+                    ? { orgId: updates.orgId }
+                    : {}),
+                ...(updates.projectId && !pinned.pin.projectId ? { projectId: updates.projectId } : {}),
+            })
+        }
+    }
+
+    private async _fetchUser(): Promise<ApiUser> {
+        const userResult = await this._api.users().me()
+        if (!userResult.success) {
+            throw wrapError(`Failed to get user: ${userResult.error.message}`, userResult.error)
+        }
+        return userResult.data
+    }
+
+    async getUser(): Promise<ApiUser> {
+        return this.lookups.get(this._cache.scope, 'user', () => this._fetchUser())
+    }
+
+    private get _usesProjectSecretKey(): boolean {
+        return isProjectSecretKey(this._api.config?.apiToken)
+    }
+
+    private async _fetchProjectSecretKey(): Promise<NonNullable<State['apiKey']>> {
+        const projectId = this._pinned?.pin.projectId
+        if (!projectId) {
+            throw new MissingProjectContextError()
+        }
+        try {
+            await this._api.request({ method: 'GET', path: PROJECT_SECRET_KEY_ACCESS_PATH })
+        } catch (error) {
+            const denied = findPostHogPermissionError(error)
+            // The API answers 404 for a project ID that does not exist, which is the same mistake
+            // as naming a project the key does not belong to.
+            const refused = error instanceof PostHogApiError && (error.status === 403 || error.status === 404)
+            if (!denied && !refused) {
+                throw error
+            }
+            throw new PostHogPermissionError({
+                detail: denied?.detail ?? 'The project secret API key cannot read this project.',
+                missingScope: denied?.missingScope,
+                url: denied?.url ?? '',
+                method: denied?.method ?? '',
+                remediation: PROJECT_SECRET_KEY_REMEDIATION,
+            })
+        }
+        return {
+            scopes: [...PROJECT_SECRET_KEY_SCOPES],
+            scoped_teams: [Number(projectId)],
+            scoped_organizations: [],
+            is_impersonated: false,
+            suppress_analytics: false,
+            mcp_allowed_tools: [...PROJECT_SECRET_KEY_TOOLS],
+            user_distinct_id: `psak-${projectId}-${this._cache.scope.slice(0, 16)}`,
+            current_organization_id: null,
+            current_team_id: Number(projectId),
+        }
+    }
+
+    private async _fetchApiKey(): Promise<NonNullable<State['apiKey']>> {
+        if (this._usesProjectSecretKey) {
+            return this._fetchProjectSecretKey()
+        }
+        const apiKeyResult = await this._api.apiKeys().current()
+        if (apiKeyResult.success) {
+            const { scopes, scoped_teams, scoped_organizations } = apiKeyResult.data
+            // The DRF serializer returns `null` (not `[]`) for unscoped keys, so
+            // normalize at the boundary — downstream code treats these as arrays.
+            return {
+                scopes: scopes ?? [],
+                scoped_teams: scoped_teams ?? [],
+                scoped_organizations: scoped_organizations ?? [],
+                is_impersonated: false,
+                suppress_analytics: false,
+                ...pickOwner(apiKeyResult.data),
+            }
+        }
+
+        const introspectionResult = await this._api.oauth().introspect({ token: this._api.config.apiToken })
+
+        if (!introspectionResult.success) {
+            // Only a 401 or 403 rejects the token. Self-introspection returns 403 when the token
+            // no longer exists, for example after a refresh rotated it. Any other failure means
+            // the check did not run, and a rejection would make the client discard a valid token.
+            const { error } = introspectionResult
+            if (
+                error.message.includes(ErrorCode.INVALID_API_KEY) ||
+                (error instanceof PostHogApiError && error.status === 403)
+            ) {
+                throw new Error(ErrorCode.INVALID_API_KEY)
+            }
+            throw wrapError('Failed to introspect OAuth token', error)
+        }
+
+        if (!introspectionResult.data.active) {
+            throw new Error(ErrorCode.INACTIVE_OAUTH_TOKEN)
+        }
+
+        const { scope, scoped_teams, scoped_organizations, client_name, client_id } = introspectionResult.data
+
+        // Which OAuth application minted this token. Introspection is server-derived, so unlike
+        // the consumer header the caller cannot set it, which is what makes it usable as the
+        // first-party gate in `resolveEventSource`. Django gates on the same id set.
+        if (client_id) {
+            await this._cache.set('oauthClientId', client_id)
+        }
+
+        const sanitizedClientName = sanitizeHeaderValue(client_name)
+        if (sanitizedClientName) {
+            await this._cache.set('clientName', sanitizedClientName)
+        }
+
+        return {
+            scopes: scope ? scope.split(' ') : [],
+            scoped_teams: scoped_teams ?? [],
+            scoped_organizations: scoped_organizations ?? [],
+            is_impersonated: introspectionResult.data.is_impersonated === true,
+            // Only server-minted sandbox tokens can carry this scope; request headers cannot opt out.
+            suppress_analytics: (scope ?? '').split(' ').includes('scout_experiment_internal:read'),
+            ...(introspectionResult.data.sandbox_task_id
+                ? { sandbox_task_id: introspectionResult.data.sandbox_task_id }
+                : {}),
+            ...(introspectionResult.data.mcp_allowed_tools
+                ? { mcp_allowed_tools: introspectionResult.data.mcp_allowed_tools }
+                : {}),
+            ...(introspectionResult.data.supports_step_up === true ? { supports_step_up: true } : {}),
+            ...pickOwner(introspectionResult.data),
+        }
+    }
+
+    private async _getApiKey(): Promise<NonNullable<State['apiKey']>> {
+        // An OAuth token gets a new value, and so a new cache entry, whenever its scopes change.
+        const refreshable = classifyAuthMethod(this._api.config.apiToken) !== 'oauth'
+        const [cached, fetchedAt] = await Promise.all([
+            this._cache.get('apiKey'),
+            refreshable ? this._cache.get('apiKeyFetchedAt') : undefined,
+        ])
+
+        // The cache is keyed by token, so a project secret API key sent with another project ID
+        // would reuse the answer for the first project. The key belongs to one project only.
+        const usable =
+            cached && !(this._usesProjectSecretKey && String(cached.scoped_teams[0]) !== this._pinned?.pin.projectId)
+                ? cached
+                : undefined
+
+        if (usable && (!refreshable || !this.isCacheStale(fetchedAt, API_KEY_CACHE_TTL_MS))) {
+            return usable
+        }
+
+        try {
+            const apiKey = await this.lookups.get(this._cache.scope, JSON.stringify(['apiKey', fetchedAt]), () =>
+                this._fetchApiKey()
+            )
+            await Promise.all([
+                this._cache.set('apiKey', apiKey),
+                refreshable ? this._cache.set('apiKeyFetchedAt', Date.now()) : undefined,
+            ])
+            return apiKey
+        } catch (error) {
+            if (!usable) {
+                throw error
+            }
+            // A failed refresh must not end a live session. Every API call is authorized again
+            // server-side, so the last known scopes cannot grant access the key does not hold.
+            // A rejected credential is an expected outcome, not a fault, so only report other failures.
+            const { reason } = classifyAuthFailure(error)
+            if (reason !== 'invalid_api_key' && reason !== 'inactive_oauth_token') {
+                this._reportException(error, 'api_key_refresh_failed')
+            }
+            await this._cache.set('apiKeyFetchedAt', Date.now()).catch(() => {})
+            return usable
+        }
+    }
+
+    async getApiKey(): Promise<NonNullable<State['apiKey']>> {
+        const apiKey = await this._getApiKey()
+        const clientName = await this._cache.get('clientName')
+        if (clientName) {
+            this._api.config.oauthClientName = sanitizeHeaderValue(clientName)
+        }
+        return apiKey
+    }
+
+    async getDistinctId(): Promise<NonNullable<State['distinctId']>> {
+        let _distinctId = await this._cache.get('distinctId')
+
+        if (!_distinctId) {
+            const owner = await this._getOwner()
+
+            await this._cache.set('distinctId', owner.distinctId)
+            _distinctId = owner.distinctId
+        }
+
+        return _distinctId
+    }
+
+    private async _getOwner(): Promise<CredentialOwner> {
+        const apiKey = await this.getApiKey()
+        return apiKey.user_distinct_id ? ownerFromApiKey(apiKey) : this._getLiveOwner()
+    }
+
+    /** Reads the owner with a live request, which also rejects a revoked or expired credential. */
+    private async _getLiveOwner(): Promise<CredentialOwner> {
+        try {
+            const user = await this.getUser()
+            return {
+                distinctId: user.distinct_id,
+                organizationId: user.organization?.id ?? null,
+                teamId: user.team?.id ?? null,
+            }
+        } catch (error) {
+            if (!findPostHogPermissionError(error)) {
+                throw error
+            }
+            const fresh = await this._refreshApiKey()
+            if (!fresh.user_distinct_id) {
+                throw error
+            }
+            return ownerFromApiKey(fresh)
+        }
+    }
+
+    private async _refreshApiKey(): Promise<NonNullable<State['apiKey']>> {
+        const fresh = await this.lookups.get(this._cache.scope, 'freshApiKey', () => this._fetchApiKey())
+        await this._cache.set('apiKey', fresh)
+        return fresh
+    }
+
+    private async _getDefaultOrganizationAndProject(): Promise<NonNullable<SessionScopedState['defaultContext']>> {
+        const sessionCache = this._pinned?.sessionScoped ? this._sessionCache : undefined
+        if (!sessionCache) {
+            return this._fetchDefaultOrganizationAndProject()
+        }
+        const saved = await sessionCache.get('defaultContext')
+        if (saved) {
+            if (saved.projectId !== undefined || !saved.organizationId) {
+                return saved
+            }
+            const cachedProjectId = await sessionCache.get('defaultProjectId')
+            if (cachedProjectId !== undefined) {
+                return { ...saved, projectId: cachedProjectId }
+            }
+            const projectId = await this._fetchDefaultProjectInOrganization(saved.organizationId)
+            if (projectId !== undefined) {
+                await sessionCache.setIfAbsent('defaultProjectId', projectId)
+            }
+            return { ...saved, projectId: await sessionCache.get('defaultProjectId') }
+        }
+        const defaults = await this._fetchDefaultOrganizationAndProject()
+        if (!defaults.organizationId && defaults.projectId === undefined) {
+            return defaults
+        }
+        if (await sessionCache.setIfAbsent('defaultContext', defaults)) {
+            return defaults
+        }
+        return (await sessionCache.get('defaultContext')) ?? defaults
+    }
+
+    private async _fetchDefaultOrganizationAndProject(): Promise<NonNullable<SessionScopedState['defaultContext']>> {
+        if (this._usesProjectSecretKey) {
+            return { projectId: (await this.getApiKey()).scoped_teams[0] }
+        }
+        // The owner's current project changes, and the OAuth key cache lives for the token's life.
+        const [{ scoped_organizations, scoped_teams }, owner] = await Promise.all([
+            this.getApiKey(),
+            this._getLiveOwner(),
+        ])
+        const activeOrganization = owner.organizationId ? { id: owner.organizationId } : null
+        const activeTeam = owner.teamId !== null ? { id: owner.teamId } : null
+
+        // Team-scoped key: prefer the active team if the scope allows it,
+        // otherwise pick the first scoped team deterministically. The org is
+        // omitted here — `getAnalyticsContext` recovers it from the project.
+        if (scoped_teams.length > 0) {
+            if (activeTeam && scoped_teams.includes(activeTeam.id)) {
+                return { projectId: activeTeam.id }
+            }
+            return { projectId: scoped_teams[0]! }
+        }
+
+        // No team scoping: prefer the user's active org/team when the scope
+        // allows it. `activeOrganization` / `activeTeam` can be null for users
+        // with no `current_organization` / `current_team` (newly provisioned
+        // accounts, users who left their last org) — fall through to the
+        // scoped-org fallback below when either is missing.
+        if (
+            activeOrganization &&
+            (scoped_organizations.length === 0 || scoped_organizations.includes(activeOrganization.id))
+        ) {
+            return activeTeam
+                ? { organizationId: activeOrganization.id, projectId: activeTeam.id }
+                : { organizationId: activeOrganization.id }
+        }
+
+        // Active org isn't in the scope (or the user has no active org). Pick
+        // the first allowed org and fall back to its first project. If the
+        // project lookup fails or the org has no projects, return the org alone
+        // and let the agent disambiguate. With no scoped orgs and no active
+        // org, we have nothing to anchor on — return empty and let the caller
+        // surface a recoverable missing-context error.
+        const organizationId = scoped_organizations[0]
+        if (!organizationId) {
+            return {}
+        }
+        return { organizationId, projectId: await this._fetchDefaultProjectInOrganization(organizationId) }
+    }
+
+    private async _fetchDefaultProjectInOrganization(organizationId: string): Promise<number | undefined> {
+        try {
+            const projects = await this.lookups.get<Schemas.ProjectBackwardCompat[]>(
+                this._cache.scope,
+                `organizationProjects:${organizationId}`,
+                async () => {
+                    const result = await this._api.organizations().projects({ orgId: organizationId }).list()
+                    if (!result.success) {
+                        throw result.error
+                    }
+                    return result.data
+                }
+            )
+            return projects.length > 0 ? Number(projects[0]!.id) : undefined
+        } catch (error) {
+            if (this._isRecoverableNotFound(error)) {
+                console.warn(
+                    `[StateManager] Scoped org ${organizationId} projects lookup returned 404 (org not accessible to this user or deleted); falling back to org-only context`
+                )
+            } else {
+                await this._reportException(error, 'default_org_project_projects_list_failed', {
+                    organization_id: organizationId,
+                })
+            }
+        }
+
+        return undefined
+    }
+
+    /**
+     * A 404 from the scoped-org projects lookup is an expected missing-context
+     * state (org deleted, or the user lost access to a still-scoped org), not a
+     * service bug. Treat it as recoverable so it stays out of error tracking.
+     */
+    private _isRecoverableNotFound(error: unknown): boolean {
+        return error instanceof PostHogApiError && error.status === 404
+    }
+
+    private async _reportException(
+        error: unknown,
+        context: string,
+        extra: Record<string, unknown> = {}
+    ): Promise<void> {
+        try {
+            // This also reports key-refresh failures, so resolving the key again can recurse.
+            const apiKey = await this._cache.get('apiKey').catch(() => undefined)
+            getPostHogClient().captureException(error, {
+                properties: {
+                    tag: 'mcp',
+                    team: 'posthog_ai',
+                    context,
+                    transport_failure: findTransportError(error)?.failure,
+                    ...extra,
+                    suppress_analytics: apiKey?.suppress_analytics === true,
+                },
+            })
+        } catch {
+            // Never let observability break the request.
+        }
+    }
+
+    async setDefaultOrganizationAndProject(): Promise<{
+        organizationId: string | undefined
+        projectId: number | undefined
+    }> {
+        const { organizationId, projectId } = await this._getDefaultOrganizationAndProject()
+
+        if (this._pinned?.sessionScoped) {
+            this._pinned.orgId = organizationId
+            this._pinned.projectId = projectId?.toString()
+        } else {
+            await this.setActiveContext({ orgId: organizationId, projectId: projectId?.toString() })
+        }
+
+        return { organizationId, projectId }
+    }
+
+    /**
+     * Resolve an organization id without throwing. Reads the cache, then falls
+     * back to the API key's default-org resolution, then derives the org from
+     * the cached project (matches the team-scoped key path in
+     * `_getDefaultOrganizationAndProject` which intentionally omits the org).
+     *
+     * The derived org id is written back to the cache so subsequent calls
+     * short-circuit on the first read — without this, every team-scoped tool
+     * invocation would re-hit `setDefaultOrganizationAndProject` plus a project
+     * fetch.
+     */
+    private async _resolveOrganizationId(): Promise<string | undefined> {
+        const pinned = this._pinned
+        if (pinned?.orgId) {
+            return pinned.orgId
+        }
+        // A pinned project owns the org. The shared token cache can hold another
+        // session's org, so when the project cannot name its org, report missing
+        // context instead of falling back to the cache.
+        if (pinned?.projectId) {
+            const project = await this.getCachedOrFetchProject().catch(() => undefined)
+            pinned.orgId = project?.organization ?? undefined
+            return pinned.orgId
+        }
+        if (pinned) {
+            return undefined
+        }
+
+        const cached = await this._cache.get('orgId')
+        if (cached) {
+            return cached
+        }
+
+        const { organizationId } = await this.setDefaultOrganizationAndProject()
+        if (organizationId) {
+            return organizationId
+        }
+
+        const project = await this.getCachedOrFetchProject().catch(() => undefined)
+        const derived = project?.organization
+        if (derived) {
+            await this._cache.set('orgId', derived)
+        }
+        return derived
+    }
+
+    async getOrgID(): Promise<string> {
+        const orgId = await this._resolveOrganizationId()
+        if (!orgId) {
+            throw new MissingOrganizationContextError()
+        }
+        return orgId
+    }
+
+    async getProjectId(): Promise<string> {
+        const pinned = this._pinned
+        if (pinned) {
+            if (pinned.projectId) {
+                return pinned.projectId
+            }
+            this._pinnedOrgProject ??= this._resolvePinnedOrgProjectId(pinned)
+            return this._pinnedOrgProject
+        }
+
+        const projectId = await this._cache.get('projectId')
+
+        if (!projectId) {
+            const { organizationId, projectId: resolved } = await this.setDefaultOrganizationAndProject()
+            if (resolved === undefined) {
+                throw new MissingProjectContextError({ organizationId })
+            }
+            return resolved.toString()
+        }
+
+        return projectId
+    }
+
+    /**
+     * An organization selection can outlive its project, so accept a default only
+     * when its lookup proves that it belongs to the selected org. Sessionless
+     * requests also consider the token selection for compatibility.
+     */
+    private async _resolvePinnedOrgProjectId(pinned: PinnedActiveContext): Promise<string> {
+        const orgId = pinned.orgId
+        const belongsToOrg = async (candidate: string | undefined): Promise<boolean> => {
+            if (!orgId || !candidate) {
+                return false
+            }
+            const project = await this._getCachedOrFetchProjectById(candidate).catch(() => undefined)
+            return project?.organization === orgId
+        }
+
+        const cachedCandidate = pinned.sessionScoped ? undefined : await this._cache.get('projectId')
+        if (await belongsToOrg(cachedCandidate)) {
+            return cachedCandidate!
+        }
+        const { organizationId, projectId } = await this._getDefaultOrganizationAndProject().catch(() => ({
+            organizationId: undefined,
+            projectId: undefined,
+        }))
+        const defaultCandidate = projectId?.toString()
+        if (
+            defaultCandidate &&
+            defaultCandidate !== cachedCandidate &&
+            ((organizationId !== undefined && organizationId === orgId) || (await belongsToOrg(defaultCandidate)))
+        ) {
+            if (pinned.sessionScoped) {
+                pinned.projectId = defaultCandidate
+            }
+            return defaultCandidate
+        }
+        throw new MissingProjectContextError({ organizationId: orgId })
+    }
+
+    private isCacheStale(fetchedAt: number | undefined, ttlMs: number = CACHE_TTL_MS): boolean {
+        return !fetchedAt || Date.now() - fetchedAt > ttlMs
+    }
+
+    /**
+     * Stale-while-cached helper. Returns fresh cached data if available; otherwise
+     * fetches, writes both the value and its timestamp, and returns the fresh value.
+     * On fetcher failure, returns the last-known cached value (possibly `undefined`)
+     * and captures the exception.
+     */
+    private async getOrFetchCached<D extends keyof State, F extends keyof State>(opts: {
+        name: string
+        cacheKey: D
+        fetchedAtKey: F
+        fetcher: () => Promise<NonNullable<State[D]>>
+        ttlMs?: number | ((cached: State[D]) => number)
+        /** Skip the error report when the fetch hits its deadline. Use it for optional data with a short timeout. */
+        expectTimeouts?: boolean
+        discardOnError?: (cached: State[D]) => boolean
+    }): Promise<State[D]> {
+        const [cached, fetchedAt] = (await Promise.all([
+            this._cache.get(opts.cacheKey),
+            this._cache.get(opts.fetchedAtKey),
+        ])) as [State[D], number | undefined]
+
+        const ttlMs = typeof opts.ttlMs === 'function' ? opts.ttlMs(cached) : opts.ttlMs
+        if (!this.isCacheStale(fetchedAt, ttlMs)) {
+            return cached
+        }
+
+        try {
+            const data = await this.lookups.get(
+                this._cache.scope,
+                JSON.stringify([opts.cacheKey, fetchedAt]),
+                opts.fetcher
+            )
+            await Promise.all([
+                this._cache.set(opts.cacheKey, data as State[D]),
+                this._cache.set(opts.fetchedAtKey, Date.now() as State[F]),
+            ])
+            return data as State[D]
+        } catch (error) {
+            if (!(opts.expectTimeouts && hasTimeoutCause(error)) && !findPostHogPermissionError(error)) {
+                this._reportException(error, `get_or_fetch_${opts.name}`)
+            }
+            await this._cache.set(opts.fetchedAtKey, Date.now() as State[F]).catch(() => {})
+            if (opts.discardOnError?.(cached)) {
+                await this._cache.delete(opts.cacheKey).catch(() => {})
+                return undefined as State[D]
+            }
+            return cached
+        }
+    }
+
+    async getCachedOrFetchUser(): Promise<CachedUser | undefined> {
+        const distinctId = await this.getDistinctId()
+        return this.getOrFetchCached({
+            name: 'user',
+            cacheKey: `cachedUser:${distinctId}` as const,
+            fetchedAtKey: `cachedUserFetchedAt:${distinctId}` as const,
+            fetcher: () => this.getUser(),
+        })
+    }
+
+    async getCachedOrFetchOrg(): Promise<CachedOrg | undefined> {
+        const apiKey = await this.getApiKey()
+        // `/api/organizations/{id}/` is not project-nested. Backend permission
+        // checks reject project-scoped tokens there even when they carry
+        // `organization:read` or `*`, so skip the best-effort fetch entirely.
+        if (apiKey.scoped_teams.length > 0 || !hasScope(apiKey.scopes, 'organization:read')) {
+            return undefined
+        }
+
+        // Non-throwing: consent checks treat "no org" as "skip", not as an error.
+        const orgId = await this._resolveOrganizationId()
+        if (!orgId) {
+            return undefined
+        }
+        return this.getOrFetchCached({
+            name: 'org',
+            cacheKey: `cachedOrg:${orgId}` as const,
+            fetchedAtKey: `cachedOrgFetchedAt:${orgId}` as const,
+            fetcher: async () => {
+                const result = await this._api.organizations().get({ orgId })
+                if (!result.success) {
+                    throw result.error
+                }
+                return result.data
+            },
+        })
+    }
+
+    async getCachedOrFetchProject(): Promise<CachedProject | undefined> {
+        const projectId = await this.getProjectId()
+        if (!projectId) {
+            return undefined
+        }
+        return this._getCachedOrFetchProjectById(projectId)
+    }
+
+    private async _getCachedOrFetchProjectById(projectId: string): Promise<CachedProject | undefined> {
+        // No project secret API key scope reads the project itself.
+        if (this._usesProjectSecretKey) {
+            return undefined
+        }
+        return this.getOrFetchCached({
+            name: 'project',
+            cacheKey: `cachedProject:${projectId}` as const,
+            fetchedAtKey: `cachedProjectFetchedAt:${projectId}` as const,
+            fetcher: async () => {
+                const result = await this._api.projects().get({ projectId })
+                if (!result.success) {
+                    throw result.error
+                }
+                return result.data
+            },
+        })
+    }
+
+    async getOrFetchGroupTypes(projectId: string): Promise<GroupType[] | undefined> {
+        return this.getOrFetchCached({
+            name: 'group_types',
+            cacheKey: `groupTypes:${projectId}` as const,
+            fetchedAtKey: `groupTypesFetchedAt:${projectId}` as const,
+            fetcher: () => this._api.getGroupTypes(projectId),
+        })
+    }
+
+    /**
+     * Integration kinds (github, slack, ...) connected in the project, for the
+     * environment prompt. Returns undefined when the key lacks `integration:read`
+     * so the prompt renders nothing rather than a false "none connected".
+     */
+    async getOrFetchIntegrationKinds(projectId: string): Promise<string[] | undefined> {
+        const apiKey = await this.getApiKey()
+        if (!hasScope(apiKey.scopes, 'integration:read')) {
+            return undefined
+        }
+        return this.getOrFetchCached({
+            name: 'integration_kinds',
+            cacheKey: `integrationKinds:${projectId}` as const,
+            fetchedAtKey: `integrationKindsFetchedAt:${projectId}` as const,
+            fetcher: async () => {
+                const result = await this._api.request<Schemas.PaginatedIntegrationConfigList>({
+                    method: 'GET',
+                    path: `/api/projects/${encodeURIComponent(projectId)}/integrations/`,
+                    query: { limit: 100 },
+                    timeoutMs: INTEGRATION_KINDS_TIMEOUT_MS,
+                })
+                return [...new Set((result.results ?? []).map((integration) => String(integration.kind)))].sort()
+            },
+            expectTimeouts: true,
+        })
+    }
+
+    /** An empty project is re-read on the short TTL, so a source the user just added gets its search guidance within a minute. */
+    async getOrFetchBusinessKnowledgeContent(projectId: string): Promise<BusinessKnowledgeContent | undefined> {
+        return this.getOrFetchCached({
+            name: 'business_knowledge_content',
+            cacheKey: `businessKnowledgeContent:${projectId}` as const,
+            fetchedAtKey: `businessKnowledgeContentFetchedAt:${projectId}` as const,
+            fetcher: async () => {
+                const availability = await this._api.request<{ has_sources?: unknown; has_repositories?: unknown }>({
+                    method: 'GET',
+                    path: `/api/projects/${encodeURIComponent(projectId)}/business_knowledge/sources/availability/`,
+                    timeoutMs: BUSINESS_KNOWLEDGE_CONTENT_TIMEOUT_MS,
+                    signal: AbortSignal.timeout(BUSINESS_KNOWLEDGE_CONTENT_TIMEOUT_MS),
+                })
+                return {
+                    hasSources: typeof availability.has_sources === 'boolean' ? availability.has_sources : undefined,
+                    hasRepositories:
+                        typeof availability.has_repositories === 'boolean' ? availability.has_repositories : undefined,
+                }
+            },
+            ttlMs: (cached) =>
+                cached?.hasSources === false && cached.hasRepositories === false ? NO_DATA_CACHE_TTL_MS : CACHE_TTL_MS,
+            expectTimeouts: true,
+        })
+    }
+
+    async getOrFetchMetricCatalog(projectId: string): Promise<MetricCatalogContent | undefined> {
+        return this.getOrFetchCached({
+            name: 'metric_catalog',
+            cacheKey: `metricCatalog:${projectId}` as const,
+            fetchedAtKey: `metricCatalogFetchedAt:${projectId}` as const,
+            fetcher: async () => {
+                const availability = await this._api.request<Schemas.MetricAvailability>({
+                    method: 'GET',
+                    path: `/api/projects/${encodeURIComponent(projectId)}/data_catalog/metric_availability/`,
+                    timeoutMs: METRIC_CATALOG_TIMEOUT_MS,
+                    signal: AbortSignal.timeout(METRIC_CATALOG_TIMEOUT_MS),
+                })
+                return { hasMetrics: availability.has_metrics }
+            },
+            expectTimeouts: true,
+            // A stale "no metrics" would keep agents skipping a metric saved since, so fall back to lookup.
+            discardOnError: (cached) => cached?.hasMetrics === false,
+        })
+    }
+
+    /**
+     * The third-party MCP tools this user can reach, from the gateway.
+     *
+     * Shorter TTL than the other cached entities: connecting a server is a deliberate
+     * act and the user expects its tools to appear on the next command, not ten minutes
+     * later. Cheap enough to re-fetch — it's one request, and only `exec` triggers it.
+     */
+    async getOrFetchGatewayTools(projectId: string): Promise<Schemas.AvailableToolsResponse | undefined> {
+        return this.getOrFetchCached({
+            name: 'gateway_tools',
+            cacheKey: `gatewayTools:${projectId}` as const,
+            fetchedAtKey: `gatewayToolsFetchedAt:${projectId}` as const,
+            fetcher: () => this._api.getGatewayTools(projectId),
+            ttlMs: GATEWAY_TOOLS_CACHE_TTL_MS,
+        })
+    }
+
+    /**
+     * Resolve the workspace identifiers used to attach analytics events to the
+     * `organization` and `project` PostHog groups. Reuses the cached user/org/project
+     * entities, so repeat calls within a session are cheap.
+     */
+    async getAnalyticsContext(): Promise<{
+        organizationId?: string
+        projectId?: string
+        projectUuid?: string
+        projectName?: string
+    }> {
+        if (this._usesProjectSecretKey) {
+            return { projectId: await this.getProjectId() }
+        }
+        const [orgId, project] = await Promise.all([
+            this._pinned ? this._pinned.orgId : this._cache.get('orgId'),
+            this.getCachedOrFetchProject().catch(() => undefined),
+        ])
+
+        return {
+            ...(orgId
+                ? { organizationId: orgId }
+                : project?.organization
+                  ? { organizationId: project.organization }
+                  : {}),
+            ...(project?.id !== undefined ? { projectId: String(project.id) } : {}),
+            ...(project?.uuid ? { projectUuid: project.uuid } : {}),
+            ...(project?.name ? { projectName: project.name } : {}),
+        }
+    }
+
+    /**
+     * Resolve a field from the active organization, failing closed to `undefined`.
+     *
+     * Tries `/api/organizations/{id}/` first. Team-scoped tokens (e.g. sandbox
+     * OAuth tokens) can never fetch that endpoint — see the guard in
+     * getCachedOrFetchOrg — so fall back to the org embedded in
+     * `/api/users/@me/` (exempt from team scoping). That embedded org is the
+     * user's *current* org, which isn't necessarily the one owning the scoped
+     * project, so only trust it when it matches the active project's owning org.
+     * Any failure resolves to `undefined` so callers keep failing closed.
+     */
+    private async getOrgField<T>(extract: (org: OrgEntitlementFields) => T): Promise<T | undefined> {
+        if (this._usesProjectSecretKey) {
+            return undefined
+        }
+        try {
+            const org = await this.getCachedOrFetchOrg()
+            if (org) {
+                return extract(org as OrgEntitlementFields)
+            }
+
+            const [user, project] = await Promise.all([this.getCachedOrFetchUser(), this.getCachedOrFetchProject()])
+            if (user?.organization && project?.organization === user.organization.id) {
+                return extract(user.organization)
+            }
+            return undefined
+        } catch {
+            return undefined
+        }
+    }
+
+    async getAiConsentGiven(): Promise<boolean | undefined> {
+        const project = await this.getCachedOrFetchProject().catch(() => undefined)
+        if (project?.is_ai_data_processing_approved !== undefined) {
+            return !!project.is_ai_data_processing_approved
+        }
+        return this.getOrgField((org) => !!org.is_ai_data_processing_approved)
+    }
+
+    async getAvailableFeatures(): Promise<string[] | undefined> {
+        // A fetched org resolves to its entitlement keys, treating both `null`
+        // and a missing field as "no features" (`[]`) rather than falling
+        // through — the fallback only exists for tokens that can't fetch the org
+        // at all, where getCachedOrFetchOrg returns undefined.
+        return this.getOrgField((org) => {
+            const features = org.available_product_features
+            if (!Array.isArray(features)) {
+                return []
+            }
+            return features.map((f) => f.key).filter((k): k is string => typeof k === 'string')
+        })
+    }
+}
+
+type CredentialOwner = { distinctId: string; organizationId: string | null; teamId: number | null }
+
+type OwnerFields = Pick<ApiRedactedPersonalApiKey, 'user_distinct_id' | 'current_organization_id' | 'current_team_id'>
+
+function pickOwner(data: OwnerFields): OwnerFields {
+    return data.user_distinct_id
+        ? {
+              user_distinct_id: data.user_distinct_id,
+              current_organization_id: data.current_organization_id ?? null,
+              current_team_id: data.current_team_id ?? null,
+          }
+        : {}
+}
+
+function ownerFromApiKey(apiKey: OwnerFields): CredentialOwner {
+    return {
+        distinctId: apiKey.user_distinct_id!,
+        organizationId: apiKey.current_organization_id ?? null,
+        teamId: apiKey.current_team_id ?? null,
+    }
+}

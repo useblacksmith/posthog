@@ -1,0 +1,202 @@
+import logging
+from typing import TYPE_CHECKING
+
+from django.conf import settings
+
+import posthoganalytics
+
+from posthog.utils import get_instance_region
+
+from products.tasks.backend.constants import (
+    AGENT_OTEL_TELEMETRY_STATE_KEY,
+    DEV_STACK_IMAGE_BAKE_FEATURE_FLAG,
+    GITLAB_TASKS_FEATURE_FLAG,
+    MCP_EXEC_SKILLS_FEATURE_FLAG,
+    OWN_SUBSCRIPTION_CLOUD_FEATURE_FLAGS,
+    PI_CLOUD_RUNTIME_FEATURE_FLAG,
+    get_required_model_flag,
+)
+
+if TYPE_CHECKING:
+    from posthog.models.team.team import Team
+    from posthog.models.user import User
+
+logger = logging.getLogger(__name__)
+
+DEV_STACK_IMAGE_BAKE_DISTINCT_ID = "tasks-dev-stack-image-bake"
+
+
+def is_task_run_stream_presence_gated(origin_product: str) -> bool:
+    return origin_product in settings.TASK_RUN_STREAM_PRESENCE_GATED_ORIGINS
+
+
+def run_stream_presence_gated(state: dict | None) -> bool:
+    """Pinned onto TaskRun.state at creation so writers and readers agree for the run's life; absent means ungated."""
+    return bool((state or {}).get("stream_presence_gated", False))
+
+
+def is_task_run_stream_thin_tail(origin_product: str) -> bool:
+    return origin_product in settings.TASK_RUN_STREAM_THIN_TAIL_ORIGINS
+
+
+def run_stream_thin_tail(state: dict | None) -> bool:
+    """Pinned onto TaskRun.state at creation so writers and readers agree for the run's life; absent means full tail."""
+    return bool((state or {}).get("stream_thin_tail", False))
+
+
+def is_dev_stack_image_bake_enabled() -> bool:
+    """Gates the nightly prebaked dev-stack image bake (a paid Modal VM run per tick).
+
+    The bake publishes into the region's own Modal workspace, so the flag is evaluated
+    with the deployment region as a person property — release conditions can enable one
+    region at a time (`region = US` first). Fail-closed: a flag-service error must not
+    start a bake, and local dev is excluded outright — use `manage.py
+    bake_dev_stack_image` to bake manually."""
+    # Explicit rather than inherited from SDK state: self-capture re-enables
+    # posthoganalytics in local dev, so without this guard a locally seeded flag could
+    # start paid Modal bakes from a laptop.
+    if settings.DEBUG:
+        return False
+    try:
+        return bool(
+            posthoganalytics.feature_enabled(
+                DEV_STACK_IMAGE_BAKE_FEATURE_FLAG,
+                distinct_id=DEV_STACK_IMAGE_BAKE_DISTINCT_ID,
+                # Same region vocabulary as other region-conditioned flags: US / EU / DEV.
+                person_properties={"region": get_instance_region() or "DEV"},
+                only_evaluate_locally=False,
+                send_feature_flag_events=False,
+            )
+        )
+    except Exception:
+        logger.exception("dev_stack_image_bake_flag_check_failed")
+        return False
+
+
+def own_subscription_cloud_enabled(adapter: str, *, distinct_id: str | None, organization_id: str) -> bool:
+    """Whether a cloud run may bill to its owner's plan for this adapter; fail-closed when evaluation fails.
+
+    `distinct_id` is the plan owner's, not the id of whoever started the run.
+    """
+    if not distinct_id:
+        return False
+    if adapter == "codex":
+        return True
+    try:
+        return bool(
+            posthoganalytics.feature_enabled(
+                OWN_SUBSCRIPTION_CLOUD_FEATURE_FLAGS[adapter],
+                distinct_id=distinct_id,
+                groups={"organization": organization_id},
+                group_properties={"organization": {"id": organization_id}},
+                only_evaluate_locally=False,
+                send_feature_flag_events=False,
+            )
+        )
+    except Exception:
+        logger.exception("own_subscription_cloud_flag_check_failed", extra={"adapter": adapter})
+        return False
+
+
+def pi_cloud_runtime_enabled(team: "Team", user: "User") -> bool:
+    """Whether this user may run the Pi harness in the cloud; fail-closed when evaluation fails.
+
+    Lives here rather than in the facade so the run-defaults service can gate a stored Pi
+    preference without importing the facade, which imports this module's own callers.
+    """
+    organization_id = str(team.organization_id)
+    try:
+        return bool(
+            posthoganalytics.feature_enabled(
+                PI_CLOUD_RUNTIME_FEATURE_FLAG,
+                user.distinct_id or f"user_{user.id}",
+                groups={"organization": organization_id},
+                group_properties={"organization": {"id": organization_id}},
+                only_evaluate_locally=False,
+                send_feature_flag_events=False,
+            )
+        )
+    except Exception:
+        logger.exception("pi-harness flag check failed; treating as disabled")
+        return False
+
+
+def gitlab_tasks_enabled(team: "Team", user: "User") -> bool:
+    """Whether this user may start coding tasks in GitLab projects; fail-closed when evaluation fails."""
+    organization_id = str(team.organization_id)
+    try:
+        return bool(
+            posthoganalytics.feature_enabled(
+                GITLAB_TASKS_FEATURE_FLAG,
+                user.distinct_id or f"user_{user.id}",
+                groups={"organization": organization_id},
+                group_properties={"organization": {"id": organization_id}},
+                only_evaluate_locally=False,
+                send_feature_flag_events=False,
+            )
+        )
+    except Exception:
+        logger.exception("gitlab-tasks flag check failed; treating as disabled")
+        return False
+
+
+def get_model_access_error(model: str | None, *, distinct_id: str | None) -> str | None:
+    """Reject a gated model the caller isn't entitled to; `None` when the selection is allowed.
+
+    Fail-closed on purpose. Only a model the catalog gives an `access_flag` reaches an evaluation at all,
+    so an evaluation outage withholds a preview model from everyone rather than opening it to
+    everyone, because this flag decides spend.
+    """
+    flag_key = get_required_model_flag(model)
+    if flag_key is None:
+        return None
+
+    # The analytics SDK is disabled in local dev, where every flag reads as off.
+    if settings.DEBUG:
+        return None
+
+    not_available = f"'{model}' is not available for your account."
+    if not distinct_id:
+        return not_available
+
+    try:
+        enabled = posthoganalytics.feature_enabled(
+            flag_key,
+            distinct_id=distinct_id,
+            only_evaluate_locally=False,
+            send_feature_flag_events=False,
+        )
+    except Exception:
+        logger.exception("model_access_flag_check_failed", extra={"flag": flag_key, "model": model})
+        return not_available
+
+    return None if enabled else not_available
+
+
+def agent_otel_telemetry_enabled_for_state(state: dict | None) -> bool:
+    """DEBUG skips the stamp because in local dev the telemetry and mirror settings are the opt-in."""
+    if settings.DEBUG:
+        return True
+    return (state or {}).get(AGENT_OTEL_TELEMETRY_STATE_KEY) is True
+
+
+def is_mcp_exec_skills_enabled(organization_id: str, distinct_id: str) -> bool:
+    """Whether this run's user gets product skills through the MCP `learn` command.
+
+    Evaluated server-side so organization rules and person rules (an email domain, a cohort)
+    both resolve, the same way the MCP server evaluates the flag for the same user.
+    """
+    try:
+        return bool(
+            posthoganalytics.feature_enabled(
+                MCP_EXEC_SKILLS_FEATURE_FLAG,
+                distinct_id=distinct_id,
+                groups={"organization": organization_id},
+                group_properties={"organization": {"id": organization_id}},
+                only_evaluate_locally=False,
+                send_feature_flag_events=False,
+            )
+        )
+    except Exception:
+        logger.exception("mcp_exec_skills_flag_check_failed")
+        return False
