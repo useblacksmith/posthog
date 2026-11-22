@@ -1,0 +1,106 @@
+import { useActions, useValues } from 'kea'
+import { router } from 'kea-router'
+import { useState } from 'react'
+
+import { IconLetter } from '@posthog/icons'
+import { LemonButton, LemonButtonProps } from '@posthog/lemon-ui'
+
+import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { Popover } from 'lib/lemon-ui/Popover'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { AccessControlLevel, AccessControlResourceType } from '~/types'
+
+import { composeTicketLogic } from './composeTicketLogic'
+import { QuillComposeTicketButton } from './QuillComposeTicketButton'
+
+interface ComposeTicketButtonProps {
+    size?: LemonButtonProps['size']
+    type?: LemonButtonProps['type']
+    distinctId?: string
+    email?: string
+    iconOnly?: boolean
+    onCompose?: () => void
+}
+
+export function ComposeTicketButton({
+    size = 'small',
+    type = 'primary',
+    distinctId,
+    email,
+    iconOnly,
+    onCompose,
+}: ComposeTicketButtonProps): JSX.Element | null {
+    const { currentTeam } = useValues(teamLogic)
+    const { openComposeModal } = useActions(composeTicketLogic)
+    const [showDisabledPopover, setShowDisabledPopover] = useState(false)
+    const conversationsEnabled = !!currentTeam?.conversations_enabled
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+
+    if (todayRailNav) {
+        return (
+            <QuillComposeTicketButton
+                size={size}
+                type={type}
+                distinctId={distinctId}
+                email={email}
+                iconOnly={iconOnly}
+                onCompose={onCompose}
+            />
+        )
+    }
+
+    return (
+        <>
+            <Popover
+                visible={showDisabledPopover}
+                onClickOutside={() => setShowDisabledPopover(false)}
+                overlay={
+                    <div className="p-3 max-w-xs flex flex-col gap-2">
+                        <p className="m-0 text-sm">
+                            Support is not enabled for this project. Enable it in settings to start writing to
+                            customers.
+                        </p>
+                        <LemonButton
+                            type="primary"
+                            size="small"
+                            onClick={() => {
+                                setShowDisabledPopover(false)
+                                router.actions.push(urls.supportSettings())
+                            }}
+                            fullWidth
+                            center
+                        >
+                            Go to settings
+                        </LemonButton>
+                    </div>
+                }
+            >
+                <AccessControlAction
+                    resourceType={AccessControlResourceType.Ticket}
+                    minAccessLevel={AccessControlLevel.Editor}
+                >
+                    <LemonButton
+                        type={type}
+                        size={size}
+                        icon={<IconLetter />}
+                        tooltip={iconOnly ? 'New ticket' : undefined}
+                        onClick={() => {
+                            if (conversationsEnabled) {
+                                openComposeModal({ distinctId, email })
+                                onCompose?.()
+                            } else {
+                                setShowDisabledPopover(true)
+                            }
+                        }}
+                        data-attr="compose-ticket-button"
+                    >
+                        {iconOnly ? null : 'New ticket'}
+                    </LemonButton>
+                </AccessControlAction>
+            </Popover>
+        </>
+    )
+}

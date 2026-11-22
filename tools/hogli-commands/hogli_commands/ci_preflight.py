@@ -1,0 +1,1046 @@
+"""Catch the deterministic CI failures reachable from your diff before you push.
+
+``ci:preflight`` is the pre-push counterpart to ``ci:insights``: insights tells
+you what's broken on master, preflight stops you from being the one who breaks
+it. It scopes a curated set of checks to the files your branch actually touched,
+each mapped to a CI failure class we've seen take master down, plus an always-on
+branch-freshness check that flags concrete merge risks (textual conflicts,
+migration collisions, generated-file drift, CI changes on master), plus
+companion-file checks that fail when a mirrored file moves without its pair.
+
+    hogli ci:preflight            # report what your diff could break in CI
+    hogli ci:preflight --fix      # auto-remediate what's safe, report the rest
+    hogli ci:preflight --strict   # exit non-zero on failed checks (the pre-push hook)
+    hogli ci:preflight --against origin/master   # diff against an explicit base
+
+``HOGLI_PREFLIGHT_DISABLED=1`` makes the command (and thus the pre-push hook) a
+no-op — the rollout/emergency kill switch (still emits a run event so opt-out
+prevalence is measurable).
+
+Checks declare what they need (``node`` modules, the dev ``stack``) and skip with
+a note when it's absent, so the no-dependency checks always run — even on a bare
+checkout or inside an agent sandbox. The pre-push hook runs ``--strict`` (failures
+block, advisories never do); the fix loop is ``--fix`` — see the running-ci-preflight skill.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import time
+import shutil
+import socket
+import subprocess
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Literal
+
+import click
+from hogli import telemetry
+from hogli.hooks import telemetry_property_hooks
+from hogli.manifest import REPO_ROOT
+
+from hogli_commands.build import (
+    TRIGGERS as BUILD_TRIGGERS,
+    _match_commands,
+)
+from hogli_commands.change_detection import changed_files, matches_globs
+from hogli_commands.complexity_lint import PYTHON_SCOPE, TEST_WARN_AT, TYPESCRIPT_SCOPE, WARN_AT
+from hogli_commands.depot_mirrors import mirror_violations
+from hogli_commands.devenv.generator import TRACKED_MPROCS_FILES
+from hogli_commands.lockfile_merge import LOCKFILE_GLOBS, missing_resolutions
+from hogli_commands.ownership_lint import check_test_owners
+from hogli_commands.preflight_checks import (
+    SEMGREP_SCOPE,
+    SNAPSHOT_MANIFEST,
+    Outcome,
+    Scope,
+    Status,
+    check_cross_lane,
+    check_merge_queue_lane,
+    check_semgrep_devex,
+    check_snapshot_baselines,
+    check_stack_depth,
+    prepare_semgrep,
+)
+from hogli_commands.projections import (
+    Tier,
+    all_outputs as projection_outputs,
+    all_triggers as projection_triggers,
+    projections_of,
+)
+from hogli_commands.size_lint import (
+    SCOPE as SIZE_SCOPE,
+    _merge_base,
+)
+
+Requirement = Literal["node", "desktop-node", "agent-node", "stack", "clickhouse", "python-env", "migration-checks"]
+
+_UNMET_REASON: dict[Requirement, str] = {
+    "migration-checks": "POSTHOG_SKIP_MIGRATION_CHECKS is set (the flox default), so migrations:check checks nothing",
+}
+
+
+@dataclass
+class DiffCheck:
+    """A CI failure class triggered by file globs in the diff, and how to catch it locally.
+    The always-on branch-freshness check is a different shape — see ``_staleness``."""
+
+    key: str
+    label: str  # the CI failure class this intercepts
+    triggers: list[str]  # fnmatch globs against changed paths (`*` spans `/`, as in build.py)
+    verify: list[str] | None  # advisory command; None = guidance only (no runnable local check)
+    fix: list[str] | None = None  # remediation for --fix
+    advice: str | None = None  # nudge-only: preflight never runs this check, it just says what to run
+    requires: tuple[Requirement, ...] = ()  # capabilities the check needs, else it skips
+    takes_files: bool = False  # append matched files to the command
+    # Append `--against <base>`, plus `--committed` when the run is scoped to commits.
+    # A check that measures file content has to agree with preflight on both which base
+    # to compare against and which copy of the file to read.
+    takes_diff_scope: bool = False
+    # Run once per pnpm workspace containing matched files (cwd = that workspace),
+    # so nested workspaces like products/desktop validate their own lockfile instead
+    # of the root one. Capability (node_modules present) is checked per workspace.
+    workspace_scoped: bool = False
+    # A zero exit with output is a warning worth showing, not a clean pass —
+    # for advisory checks whose findings print on stdout with exit 0. Warnings
+    # never block and never count toward the advisory footer.
+    soft: bool = False
+    detail_from_tail: bool = False
+    # A check that reads the diff itself. It replaces `verify` and `fix`, and it has no auto-fix.
+    run: Callable[[Scope], Outcome] | None = None
+    matched: list[str] = field(default_factory=list)
+
+    @property
+    def measures(self) -> bool:
+        """Whether this check runs something, or only advises.
+
+        A check that runs nothing has found nothing, so it must not be reported
+        as a finding whatever shape it takes: a nudge (``advice``) and a
+        guidance-only check (``verify is None``) are both unmeasured.
+        """
+        return self.run is not None or (self.advice is None and self.verify is not None)
+
+
+# Ordered cheapest-first. Grounded in failure classes seen in `hogli ci:insights`:
+# broken lockfile blocking all CI, OpenAPI drift, formatting/lint/type checking,
+# flag sort, workflow-convention failures, migration conflicts.
+DIFF_CHECKS: list[DiffCheck] = [
+    DiffCheck(
+        key="lockfile",
+        label="broken pnpm-lock.yaml (blocks ALL CI)",
+        # pnpm-workspace.yaml (catalog versions) and patches/* (patchedDependencies
+        # hashes) invalidate the lockfile just like a package.json edit. The `*/`
+        # variants reach nested standalone workspaces (products/desktop), which
+        # workspace scoping then validates against their own lockfile.
+        triggers=[
+            "package.json",
+            "*/package.json",
+            *LOCKFILE_GLOBS,
+            "pnpm-workspace.yaml",
+            "*/pnpm-workspace.yaml",
+            "patches/*",
+            "*/patches/*",
+        ],
+        # --lockfile-only validates manifest/lockfile agreement without touching node_modules.
+        verify=["pnpm", "install", "--frozen-lockfile", "--lockfile-only"],
+        fix=["pnpm", "install", "--no-frozen-lockfile"],
+        workspace_scoped=True,
+    ),
+    DiffCheck(
+        key="uv-lock",
+        label="uv.lock out of sync with pyproject.toml (blocks Python CI)",
+        triggers=["pyproject.toml", "*/pyproject.toml", "uv.lock"],
+        verify=["uv", "lock", "--check"],
+        fix=["uv", "lock"],
+    ),
+    DiffCheck(
+        key="ruff-lint",
+        label="Python lint (ruff check)",
+        triggers=["*.py"],
+        verify=["ruff", "check"],
+        fix=["ruff", "check", "--fix"],
+        takes_files=True,
+    ),
+    DiffCheck(
+        key="complexity",
+        label=f"cyclomatic complexity (warn >{WARN_AT}, >{TEST_WARN_AT} in tests)",
+        # From complexity_lint.py so preflight and the command can't drift on scope.
+        triggers=[*PYTHON_SCOPE, *TYPESCRIPT_SCOPE],
+        verify=["hogli", "lint:complexity"],
+        takes_files=True,
+        soft=True,
+    ),
+    DiffCheck(
+        key="size",
+        label="file size (warn >1000 lines)",
+        # From size_lint.py so preflight and the command can't drift on scope.
+        triggers=[*SIZE_SCOPE],
+        verify=["hogli", "lint:size"],
+        takes_files=True,
+        takes_diff_scope=True,
+        soft=True,
+    ),
+    DiffCheck(
+        key="test-owners",
+        label="test ownership (a test file left with no team owner)",
+        triggers=["*"],
+        verify=None,
+        run=check_test_owners,
+    ),
+    DiffCheck(
+        key="ruff-format",
+        label="Python format (ruff format)",
+        triggers=["*.py"],
+        verify=["ruff", "format", "--check"],
+        fix=["ruff", "format"],
+        takes_files=True,
+    ),
+    DiffCheck(
+        key="desktop-biome",
+        label="desktop lint/format (Biome, what desktop-quality CI runs)",
+        triggers=[
+            "products/desktop/*.ts",
+            "products/desktop/*.tsx",
+            "products/desktop/*.json",
+            "products/desktop/*.jsonc",
+            "products/desktop/*.css",
+        ],
+        # `pnpm --dir` runs from the nested workspace, so `.` is products/desktop
+        # and Biome resolves desktop's own biome.jsonc. `biome ci` is read-only;
+        # the fix path applies safe fixes only (desktop's own lint script is --unsafe).
+        verify=["pnpm", "--dir", "products/desktop", "exec", "biome", "ci", "."],
+        fix=["pnpm", "--dir", "products/desktop", "exec", "biome", "check", "--write", "."],
+        requires=("desktop-node",),
+    ),
+    DiffCheck(
+        key="agent-biome",
+        label="agent workspace lint/format (Biome, what desktop-quality CI runs)",
+        triggers=[
+            "packages/agent/*.ts",
+            "packages/agent/*.mts",
+            "packages/agent/*.json",
+            "packages/agent/*.jsonc",
+        ],
+        verify=["pnpm", "--dir", "packages/agent", "exec", "biome", "ci", "."],
+        fix=["pnpm", "--dir", "packages/agent", "exec", "biome", "check", "--write", "."],
+        requires=("agent-node",),
+    ),
+    DiffCheck(
+        key="type-check",
+        label="Python type checking (mypy)",
+        triggers=["*.py", "*.pyi"],
+        # A nudge, not a run: mypy is only meaningful repo-wide (it follows imports, so a
+        # changed-file subset both blames files outside the diff and misses reverse-dependency
+        # breakage), and that costs minutes cold. Naming the command lets the agent judge.
+        verify=None,
+        advice="a type error costs a full CI re-run — consider `uv run mypy .` (what CI runs)",
+    ),
+    DiffCheck(
+        key="django-template-format",
+        label="Django template formatting (djlint)",
+        # `*` spans `/`, so these cover the nested template directories too.
+        triggers=["posthog/templates/*.html", "products/*/backend/templates/*.html"],
+        # Mirrors lint-staged's `format:html`, which agents bypass via --no-verify.
+        verify=["hogli", "format:html:check"],
+        fix=["hogli", "format:html"],
+        takes_files=True,
+    ),
+    DiffCheck(
+        key="django-template-lint",
+        label="Django template lint (djlint)",
+        # Only the email templates are clean against the rule set, so only they are linted.
+        # lint-staged formats templates but does not lint them: a second glob over the same
+        # files would let it run the linter against a file the formatter is still rewriting.
+        triggers=["posthog/templates/email/*.html"],
+        verify=["hogli", "lint:html"],
+        takes_files=True,
+    ),
+    DiffCheck(
+        key="markdown-format",
+        label="markdown formatting (oxfmt)",
+        triggers=["*.md", "*.mdx"],
+        # Mirrors lint-staged's `format:markdown`, which agents bypass via --no-verify.
+        # --no-error-on-unmatched-pattern: .oxfmtrc.json ignores whole trees (rust/,
+        # fixtures, ...) and oxfmt exits 2 when every given file is ignored.
+        verify=["pnpm", "exec", "oxfmt", "--check", "--no-error-on-unmatched-pattern"],
+        fix=["hogli", "format:markdown"],
+        requires=("node",),
+        takes_files=True,
+    ),
+    DiffCheck(
+        key="frontend-format",
+        label="frontend formatting (oxfmt)",
+        # The trees and extensions `format:frontend:check` covers in CI.
+        triggers=[
+            f"{tree}/*.{ext}"
+            for tree in ("products", "frontend/src", "docs")
+            for ext in ("js", "mjs", "ts", "tsx", "json", "yaml", "yml", "css", "scss")
+        ],
+        # Mirrors lint-staged's `format:js`, which agents bypass via --no-verify.
+        verify=["pnpm", "exec", "oxfmt", "--check", "--no-error-on-unmatched-pattern"],
+        fix=["pnpm", "exec", "oxfmt", "--no-error-on-unmatched-pattern"],
+        requires=("node",),
+        takes_files=True,
+    ),
+    DiffCheck(
+        key="feature-flags",
+        label="FEATURE_FLAGS not alphabetically sorted",
+        triggers=["frontend/src/lib/constants.tsx"],
+        verify=["hogli", "lint:feature-flags"],
+        fix=["hogli", "lint:feature-flags:fix"],
+    ),
+    DiffCheck(
+        key="api-ratchet",
+        label="new lib/api.ts path method duplicating a generated client",
+        # Both sides of the comparison: a new path method, and a regenerated client
+        # that gives an existing method a twin.
+        triggers=[
+            "frontend/src/lib/api.ts",
+            "frontend/src/lib/api-ratchet-baseline.txt",
+            "frontend/src/generated/core/api.ts",
+            "products/*/frontend/generated/api.ts",
+            ".semgrep/rules/devex/prefer-codegen-api-namespaced.yaml",
+        ],
+        verify=["hogli", "lint:api-ratchet"],
+        # Prune, never update: --update-baseline would grandfather the duplicate the
+        # branch just added, which is the one thing the check exists to stop.
+        fix=["hogli", "lint:api-ratchet", "--prune-baseline", "--write-semgrep"],
+        requires=("python-env",),
+    ),
+    DiffCheck(
+        key="frontend-layers",
+        label="new static import from a lower frontend layer into a higher one",
+        triggers=[
+            "frontend/src/*",
+            "frontend/@posthog/*",
+            "products/*/frontend/*",
+            "common/*",
+            "packages/*",
+            "frontend/bin/layers.mjs",
+            "frontend/bin/layer-baseline.txt",
+        ],
+        verify=["hogli", "lint:frontend-layers"],
+        # Prune, never update: --update-baseline would grandfather the upward import the
+        # branch just added, which is the one thing the check exists to stop.
+        fix=["hogli", "lint:frontend-layers", "--prune-baseline"],
+        requires=("node",),
+    ),
+    DiffCheck(
+        key="frontend-css-coupling",
+        label="new component that uses a stylesheet's class without importing the stylesheet",
+        triggers=[
+            "frontend/src/*",
+            "products/*/frontend/*",
+            "frontend/bin/cssCoupling.mjs",
+            "frontend/bin/css-coupling-baseline.txt",
+        ],
+        verify=["hogli", "lint:frontend-css-coupling"],
+        # Prune, never update: --update-baseline would grandfather the coupling the
+        # branch just added, which is the one thing the check exists to stop.
+        fix=["hogli", "lint:frontend-css-coupling", "--prune-baseline"],
+        requires=("node",),
+    ),
+    DiffCheck(
+        key="workflow-lint",
+        label="workflow-convention failure in .github/workflows",
+        triggers=[".github/workflows/*.yml", ".github/workflows/*.yaml"],
+        verify=["hogli", "lint:workflows"],
+    ),
+    DiffCheck(
+        key="mprocs",
+        label="bin/mprocs*.yaml docker-compose shell out of sync with generator.py",
+        # From TRACKED_MPROCS_FILES so preflight can't drift on which files need a regen.
+        triggers=[
+            "tools/hogli-commands/hogli_commands/devenv/generator.py",
+            *(t.name for t in TRACKED_MPROCS_FILES),
+        ],
+        verify=["hogli", "dev:regenerate-mprocs", "--check"],
+        fix=["hogli", "dev:regenerate-mprocs"],
+    ),
+    DiffCheck(
+        key="openapi",
+        # Measuring real drift means regenerating and diffing, which needs the dev stack.
+        # This check only knows that the diff touches files the generated types are built
+        # from, so the label names that trigger instead of asserting the types are stale.
+        # A branch keeps those source edits in its diff after a regen, so a label that
+        # claims staleness can never be cleared by running the fix.
+        label="OpenAPI sources changed (generated types may need a regen)",
+        # From build.py so preflight and build:openapi can't drift on which diffs need a regen.
+        triggers=list(BUILD_TRIGGERS["build:openapi"]),
+        verify=None,
+        fix=["hogli", "build:openapi"],
+        requires=("stack",),
+    ),
+    DiffCheck(
+        key="projections",
+        label="generated projections out of sync with their Python sources",
+        # From the projection registry, so preflight, build:projections and the registry
+        # cannot drift on which diffs need a regen. The outputs count too, so a hand-edit
+        # to one is caught.
+        triggers=[
+            *projection_triggers(Tier.PREFLIGHT),
+            *projection_outputs(Tier.PREFLIGHT),
+        ],
+        verify=["hogli", "build:projections", "--check", "--tier", Tier.PREFLIGHT],
+        fix=["hogli", "build:projections", "--tier", Tier.PREFLIGHT],
+        requires=("python-env",),
+    ),
+    DiffCheck(
+        key="ci-projections",
+        label="sources of CI-only projections changed (outputs may need a regen)",
+        triggers=[
+            path for projection in projections_of(Tier.CI) for path in (*projection.triggers, *projection.outputs)
+        ],
+        verify=None,
+        fix=["hogli", "build:projections", "--tier", Tier.CI],
+        requires=("python-env",),
+    ),
+    DiffCheck(
+        key="migrations",
+        label="migration conflict, or migrations not applied to the local database",
+        triggers=["*/migrations/*.py"],
+        # migrations:check declares both postgresql and clickhouse services.
+        verify=["hogli", "migrations:check"],
+        requires=("migration-checks", "stack", "clickhouse"),
+        detail_from_tail=True,
+    ),
+    DiffCheck(
+        key="snapshot-baselines",
+        label="visual baselines dropped from snapshots.yml (fails the merge queue batch)",
+        triggers=[SNAPSHOT_MANIFEST],
+        verify=None,
+        run=check_snapshot_baselines,
+    ),
+    DiffCheck(
+        key="semgrep-devex",
+        label="new semgrep findings (devex rules)",
+        triggers=SEMGREP_SCOPE,
+        verify=None,
+        run=check_semgrep_devex,
+    ),
+    DiffCheck(
+        key="new-ee-files",
+        label="new file under ee/ (needs human approval)",
+        triggers=["ee/*"],
+        verify=["python", ".github/scripts/check-no-new-ee-files.py"],
+        takes_diff_scope=True,
+    ),
+    DiffCheck(
+        key="cross-lane",
+        label="Python or frontend changes mixed with Node or Rust changes (fails CI without a label)",
+        triggers=["*"],
+        verify=None,
+        run=check_cross_lane,
+        soft=True,
+    ),
+    DiffCheck(
+        key="merge-queue-lane",
+        label="merge queue lane this diff claims",
+        triggers=["*"],
+        verify=None,
+        run=check_merge_queue_lane,
+        soft=True,
+    ),
+]
+
+
+# A change under these paths can fail .github/workflows/ci-depot-action-mirrors.yml, which runs
+# the same depot_mirrors check. Running it here lands the failure pre-push instead of in CI.
+DEPOT_MIRROR_TRIGGERS = [".github/actions/**", ".depot/**"]
+
+
+def _has_node_modules() -> bool:
+    return (REPO_ROOT / "node_modules" / ".pnpm").exists()
+
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("localhost", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _project_python_ready() -> bool:
+    """Whether the synced project environment is the `python` on PATH.
+
+    `import posthog` is the proxy for it, because it runs `posthog/__init__.py`,
+    which is where the generator fails when the environment is stale. A narrower
+    probe such as `import django` passes on a venv that has fallen behind
+    `uv.lock`, and the check then blocks the push under a drift label it never
+    measured. `cwd` is required, because `python -c` resolves `posthog` from the
+    working directory. The probe spawns the same interpreter a
+    `#!/usr/bin/env python` script gets, so probe and subject agree. A checkout
+    without the environment must read as "skipped", not "fail".
+    """
+    try:
+        probe = subprocess.run(
+            ["python", "-c", "import posthog"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+def _capability_met(req: Requirement) -> bool:
+    if req == "node":
+        return _has_node_modules()
+    if req == "desktop-node":
+        # products/desktop is a nested standalone workspace with its own install.
+        return (REPO_ROOT / "products" / "desktop" / "node_modules" / ".pnpm").exists()
+    if req == "agent-node":
+        # packages/agent is a nested standalone workspace with its own install.
+        return (REPO_ROOT / "packages" / "agent" / "node_modules" / ".pnpm").exists()
+    if req == "python-env":
+        return _project_python_ready()
+    if req == "migration-checks":
+        return not os.environ.get("POSTHOG_SKIP_MIGRATION_CHECKS")
+    if req == "stack":
+        # Postgres reachable — proxy for "dev stack is running".
+        return _port_open(5432)
+    return _port_open(8123)  # ClickHouse HTTP
+
+
+def _unmet(chk: DiffCheck) -> list[Requirement]:
+    return [req for req in chk.requires if not _capability_met(req)]
+
+
+# Generous: pnpm installs and migrations:check are legitimately slow, but a wedged
+# command must not hang the agent loop forever (output is captured, not streamed).
+_CHECK_TIMEOUT_SECONDS = 600
+
+
+def _pnpm_workspace_root(file_path: str) -> str:
+    """Repo-relative root of the pnpm workspace owning *file_path* ("." for the root
+    workspace): the nearest ancestor directory with a pnpm-workspace.yaml."""
+    current = (REPO_ROOT / file_path).parent.resolve()
+    root = REPO_ROOT.resolve()
+    while current != root and root in current.parents:
+        if (current / "pnpm-workspace.yaml").exists():
+            return current.relative_to(root).as_posix()
+        current = current.parent
+    return "."
+
+
+def _workspace_install_present(ws_root: Path) -> bool:
+    return (ws_root / "node_modules" / ".pnpm").exists()
+
+
+def _run_workspace_scoped(chk: DiffCheck, do_fix: bool) -> tuple[Status, str]:
+    """Run *chk* once per pnpm workspace containing matched files, cwd'd into it."""
+    statuses: list[Status] = []
+    parts: list[str] = []
+    for ws in sorted({_pnpm_workspace_root(f) for f in chk.matched}):
+        ws_root = REPO_ROOT if ws == "." else REPO_ROOT / ws
+        label = "root" if ws == "." else ws
+        if not _workspace_install_present(ws_root):
+            statuses.append("skipped")
+            parts.append(f"{label}: needs node (no install)")
+            continue
+        cmd = list(chk.fix) if do_fix and chk.fix is not None else list(chk.verify or [])
+        if not cmd or shutil.which(cmd[0]) is None:
+            statuses.append("skipped")
+            parts.append(f"{label}: {cmd[0] if cmd else 'command'} not found")
+            continue
+        try:
+            result = subprocess.run(cmd, cwd=ws_root, capture_output=True, text=True, timeout=_CHECK_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            statuses.append("fail")
+            parts.append(f"{label}: timed out after {_CHECK_TIMEOUT_SECONDS}s")
+            continue
+        if result.returncode == 0:
+            statuses.append("pass")
+            parts.append(f"{label}: {'fixed' if do_fix else 'ok'}")
+        else:
+            lines = (result.stdout or result.stderr).strip().splitlines()
+            parts.append(f"{label}: {lines[0] if lines else f'exit {result.returncode}'}")
+            statuses.append("fail")
+    if "fail" in statuses:
+        overall: Status = "fail"
+    elif "pass" in statuses:
+        overall = "pass"
+    else:
+        overall = "skipped"
+    return overall, " · ".join(parts)
+
+
+def _run_diff_check(
+    chk: DiffCheck, do_fix: bool, against: str | None, strict: bool, changed: Sequence[str] = ()
+) -> tuple[Status, str]:
+    if chk.run is not None:
+        base = _merge_base(against)
+        if base is None:
+            return "skipped", "no merge-base to compare against"
+        try:
+            return chk.run(Scope(files=chk.matched, changed=list(changed), merge_base=base, committed_only=strict))
+        except Exception as error:
+            # These checks parse the output of other tools. A shape they did not expect
+            # must not block the push with a traceback.
+            return "skipped", f"check could not run ({type(error).__name__}: {str(error)[:120]})"
+    if chk.advice is not None:
+        # Nudge-only: nothing to run, nothing to auto-fix — the advisory *is* the check.
+        return "advisory", chk.advice
+    if chk.workspace_scoped:
+        return _run_workspace_scoped(chk, do_fix)
+    unmet = _unmet(chk)
+    if do_fix and chk.fix is not None and not unmet:
+        cmd = list(chk.fix)
+    elif chk.verify is None:
+        # Guidance-only (no runnable local check, or its fix needs an absent capability):
+        # advise regardless, so the hint still shows on a bare checkout — even with --fix.
+        # Ownership framing lives once in the advisory footer, not per check.
+        # Phrased as a condition the reader can check, because nothing here measured
+        # whether the fix is needed: an unconditional "run this and commit" reads as a
+        # finding, and sends anyone who already ran it looking for a diff that isn't there.
+        return "advisory", f"if you have not run `{' '.join(chk.fix or [])}` since changing them, run it and commit"
+    elif unmet:
+        return "skipped", "; ".join(_UNMET_REASON.get(req, f"needs {req}") for req in unmet)
+    else:
+        cmd = list(chk.verify)
+    if chk.takes_diff_scope:
+        # Forward only an explicit base. Passing a default would pin the child to
+        # `origin/master` while `changed_files` falls back to local `master`, and the two
+        # would then disagree in a clone that has no remote ref. Strict runs also pass
+        # `--committed`, because only commits are about to be pushed; advisory runs keep
+        # the working tree in scope and so must be measured from it.
+        if against is not None:
+            cmd += ["--against", against]
+        if strict:
+            cmd.append("--committed")
+    if chk.takes_files:
+        # Drop deleted paths: ruff (and friends) error E902 on a path that no longer exists.
+        present = [f for f in chk.matched if (REPO_ROOT / f).exists()]
+        if not present:
+            return "skipped", "only deleted files"
+        cmd += present
+    if shutil.which(cmd[0]) is None:
+        return "skipped", f"{cmd[0]} not found"
+    try:
+        result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=_CHECK_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return "fail", f"`{cmd[0]}` timed out after {_CHECK_TIMEOUT_SECONDS}s"
+    if result.returncode == 0:
+        if chk.soft and result.stdout.strip():
+            warn_lines = result.stdout.strip().splitlines()
+            return "warning", " · ".join(warn_lines[:3])
+        return "pass", "fixed" if do_fix else "ok"
+    if chk.detail_from_tail:
+        lines = [line for line in f"{result.stdout}\n{result.stderr}".splitlines() if line.strip()][-3:]
+    else:
+        lines = (result.stdout or result.stderr).strip().splitlines()[:3]
+    return "fail", " · ".join(lines) if lines else f"exit {result.returncode}"
+
+
+# Branch-freshness backstop thresholds. The risk signals in ``_staleness_risks``
+# are the primary advisory trigger; these are a secondary net for branches old
+# enough that generic (undetected) drift is likely. Deliberately aggressive to
+# start — master moves fast and we'd rather over-warn and tune down from
+# telemetry than under-warn. Advisory only (never auto-merged). Env-tunable.
+_MASTER_REF = "origin/master"
+_STALE_COMMITS_DEFAULT = 5
+_STALE_DAYS_DEFAULT = 2
+_FETCH_TTL_SECONDS = 600  # skip re-fetching origin/master if refreshed this recently
+
+
+def _git_run(*args: str, timeout: float = 15.0) -> subprocess.CompletedProcess[str] | None:
+    """Run a git command in the repo; None on OS error or timeout."""
+    try:
+        return subprocess.run(["git", "-C", str(REPO_ROOT), *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git(*args: str, timeout: float = 5.0) -> str | None:
+    """Like ``_git_run`` but collapses to trimmed stdout, None on any failure."""
+    result = _git_run(*args, timeout=timeout)
+    return result.stdout.strip() if result is not None and result.returncode == 0 else None
+
+
+def _untracked_count() -> int:
+    out = _git("ls-files", "--others", "--exclude-standard", "-z")
+    return len([path for path in out.split("\0") if path]) if out else 0
+
+
+def _fetch_marker() -> Path | None:
+    """Our own TTL marker — FETCH_HEAD won't do, since fetching *any* ref touches it."""
+    raw = _git("rev-parse", "--git-path", "hogli-preflight-fetched")
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else REPO_ROOT / raw
+
+
+def _fetch_master() -> None:
+    """Refresh origin/master for an accurate diff base and behind-count, skipping the
+    fetch if done recently (the agent loop reruns preflight often). Offline → keep
+    the local ref."""
+    marker = _fetch_marker()
+    if marker is not None:
+        try:
+            if time.time() - marker.stat().st_mtime < _FETCH_TTL_SECONDS:
+                return
+        except OSError:
+            pass
+    if _git("fetch", "--quiet", "origin", "master", timeout=10.0) is not None and marker is not None:
+        marker.touch()
+
+
+def _env_int(var: str, default: int) -> int:
+    try:
+        return int(os.environ.get(var, default))
+    except ValueError:
+        return default
+
+
+def _commit_age_days(ref: str) -> int | None:
+    """Whole days since *ref* was committed — how long since the branch last held master's state."""
+    iso = _git("show", "-s", "--format=%cI", ref)
+    if not iso:
+        return None
+    try:
+        when = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    return max(0, (datetime.now(when.tzinfo) - when).days)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class MergePreview:
+    """The tree merging master would produce, and the files that would conflict."""
+
+    tree_oid: str
+    conflicts: list[str]
+
+
+def _merge_preview() -> MergePreview | None:
+    """The tree merging master would produce, and the files that would conflict.
+
+    Computed without touching the working tree (``git merge-tree``, git >= 2.38).
+    None = can't tell. The tree is written to the object store, so a caller can
+    read the merged content of any file out of it.
+
+    ``--no-messages`` drops the trailing "Auto-merging"/"CONFLICT" prose, which
+    otherwise lands in the same stream as the file names and counts as conflicted
+    files: one conflicted file reads as three without it.
+    """
+    result = _git_run("merge-tree", "--write-tree", "--name-only", "--no-messages", "HEAD", _MASTER_REF)
+    if result is None or result.returncode not in (0, 1):
+        return None
+    lines = result.stdout.splitlines()
+    if not lines or not lines[0].strip():
+        return None
+    # returncode 1 = conflicts; first output line is the merged tree OID.
+    conflicts = [line for line in lines[1:] if line] if result.returncode == 1 else []
+    return MergePreview(tree_oid=lines[0].strip(), conflicts=conflicts)
+
+
+def _lockfile_breakage(preview: MergePreview, branch_files: list[str], master_files: list[str]) -> list[str]:
+    """Dependencies the merged lockfiles name but no longer resolve.
+
+    Only a lockfile both sides edited can break this way, and one git already
+    reports as conflicted is covered by the conflict risk. The repo keeps a
+    lockfile per pnpm workspace, so every path that matches is checked.
+    """
+    breakage: list[str] = []
+    for path in sorted(set(_matching_lockfiles(branch_files)) & set(_matching_lockfiles(master_files))):
+        if path in preview.conflicts:
+            continue
+        merged = _git("show", f"{preview.tree_oid}:{path}", timeout=20.0)
+        if merged:
+            breakage.extend(missing_resolutions(merged))
+    return breakage
+
+
+def _matching_lockfiles(files: list[str]) -> list[str]:
+    return [f for f in files if matches_globs(f, list(LOCKFILE_GLOBS))]
+
+
+def _changed_on_master(merge_base: str) -> list[str]:
+    result = _git_run("diff", "--name-only", "-z", f"{merge_base}..{_MASTER_REF}")
+    if result is None or result.returncode != 0:
+        return []
+    return [path for path in result.stdout.split("\0") if path]
+
+
+_MIGRATION_GLOB = ["*/migrations/*.py"]
+
+
+def _staleness_risks(
+    branch_files: list[str],
+    master_files: list[str],
+    conflicts: list[str] | None,
+    lockfile_breakage: list[str],
+) -> list[str]:
+    """Concrete ways merging master late will break this branch — each a failure
+    class that recurs on unrebased PRs: textual conflicts, migration collisions,
+    generated-file drift, and CI workflows changing underneath the branch."""
+    risks: list[str] = []
+    if conflicts:
+        risks.append(f"merging master conflicts in {len(conflicts)} file(s) (e.g. {conflicts[0]})")
+    if lockfile_breakage:
+        risks.append(
+            f"merging master leaves {len(lockfile_breakage)} dependency(s) unresolved in pnpm-lock.yaml "
+            f"(e.g. {lockfile_breakage[0][:60]}) — regenerate with pnpm install --no-frozen-lockfile"
+        )
+    branch_apps = {str(Path(f).parent) for f in branch_files if matches_globs(f, _MIGRATION_GLOB)}
+    master_apps = {str(Path(f).parent) for f in master_files if matches_globs(f, _MIGRATION_GLOB)}
+    collisions = sorted(branch_apps & master_apps)
+    if collisions:
+        risks.append(f"migrations added on both sides in {', '.join(collisions)}")
+    drift = sorted(set(_match_commands(branch_files)) & set(_match_commands(master_files)))
+    if drift:
+        risks.append(f"master also changed {', '.join(drift)} inputs — regenerate after merging")
+    workflows = sum(f.startswith(".github/workflows/") for f in master_files)
+    if workflows:
+        risks.append(f"CI workflows changed on master ({workflows} file(s))")
+    return risks
+
+
+def _staleness(branch_files: list[str]) -> tuple[Status, str, dict[str, Any]]:
+    """Whether merging master *now* would break this branch. Risk signals are the
+    primary advisory trigger; a raw behind-count backstop also fires, aggressively
+    by default. On squash-merge master, commits behind ≈ PRs merged.
+    Returns (status, detail, telemetry props)."""
+    merge_base = _git("merge-base", "HEAD", _MASTER_REF)
+    if not merge_base:
+        return "skipped", f"no merge-base with {_MASTER_REF}", {"stale": None}
+
+    # Commits on master we don't have = how far behind; 0 means up to date.
+    # A failed/timed-out count must not read as "even with master".
+    count = _git("rev-list", "--count", f"{merge_base}..{_MASTER_REF}")
+    if count is None or not count.isdigit():
+        return "skipped", "could not count commits behind master", {"stale": None}
+    behind = int(count)
+    if behind == 0:
+        return "pass", "even with master", {"stale": False, "behind_commits": 0, "branch_age_days": 0}
+
+    age_days = _commit_age_days(merge_base)  # merge-base age ≈ time since the branch last synced with master
+    preview = _merge_preview()
+    conflicts = None if preview is None else preview.conflicts
+    master_files = _changed_on_master(merge_base)
+    breakage = _lockfile_breakage(preview, branch_files, master_files) if preview else []
+    risks = _staleness_risks(branch_files, master_files, conflicts, breakage)
+    if behind >= _env_int("HOGLI_PREFLIGHT_STALE_COMMITS", _STALE_COMMITS_DEFAULT):
+        risks.append(f"{behind} commits (≈ PRs) behind")
+    elif age_days is not None and age_days >= _env_int("HOGLI_PREFLIGHT_STALE_DAYS", _STALE_DAYS_DEFAULT):
+        risks.append(f"last synced {age_days}d ago")
+
+    props: dict[str, Any] = {
+        "stale": bool(risks),
+        "behind_commits": behind,
+        "branch_age_days": age_days,
+        "merge_conflict_files": len(conflicts) if conflicts is not None else None,
+        "staleness_risks": len(risks),
+        "lockfile_unresolved": len(breakage),
+    }
+    if risks:
+        return "advisory", f"{' · '.join(risks)} — merge master in: git merge {_MASTER_REF}", props
+
+    synced = f", synced {age_days}d ago" if age_days is not None else ""
+    return "pass", f"{behind} commits behind master{synced} — no conflict or drift risk detected", props
+
+
+_ICON: dict[Status, str] = {"pass": "✓", "fail": "✗", "warning": "⚠", "advisory": "→", "skipped": "·"}
+_COLOR: dict[Status, str] = {
+    "pass": "green",
+    "fail": "red",
+    "warning": "yellow",
+    "advisory": "yellow",
+    "skipped": "bright_black",
+}
+
+
+def _emit_telemetry(summary: dict[str, Any]) -> None:
+    """Emit ``ci_preflight_run`` to measure failures intercepted locally vs. what
+    would reach CI. Gated on ``is_active()`` first so an opt-out/CI run doesn't fork
+    the ``gh``/``git`` property hooks for an event ``track()`` would drop anyway."""
+    if not telemetry.is_active():
+        return
+    keys = (
+        "changed_files",
+        "triggered",
+        "failures",
+        "advisories",
+        "mode",
+        "stale",
+        "behind_commits",
+        "branch_age_days",
+        "merge_conflict_files",
+        "staleness_risks",
+        "lockfile_unresolved",
+    )
+    props: dict[str, Any] = {k: summary[k] for k in keys if k in summary}
+    props["results"] = {r["check"]: r["status"] for r in summary["results"]}
+    # Registries are read directly by design (see hogli.hooks). Merge the same
+    # dev-context props the command lifecycle attaches to command_completed
+    # (incl. git_branch, so a run ties back to its PR).
+    for hook in telemetry_property_hooks:
+        try:
+            props.update(hook("ci:preflight"))
+        except Exception:
+            pass
+    telemetry.track("ci_preflight_run", props)
+
+
+@click.command(
+    name="ci:preflight",
+    help="Catch the deterministic CI failures reachable from your diff before you push.",
+)
+@click.option("--fix", "do_fix", is_flag=True, help="Auto-remediate what's safe instead of only reporting.")
+@click.option(
+    "--strict",
+    is_flag=True,
+    help="Exit non-zero on any failed check (advisories never block) — for the pre-push hook.",
+)
+@click.option("--against", default=None, help="Diff against this base ref instead of the branch default.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the result summary as JSON.")
+@click.option(
+    "--include-untracked",
+    is_flag=True,
+    help="Also check (and with --fix, rewrite) files git does not track. Off by default.",
+)
+@click.option(
+    "--prepare-semgrep",
+    "prepare_semgrep_tool",
+    is_flag=True,
+    help="Cache the pinned Semgrep tool without running checks.",
+)
+def ci_preflight(
+    do_fix: bool,
+    strict: bool,
+    against: str | None,
+    as_json: bool,
+    include_untracked: bool,
+    prepare_semgrep_tool: bool,
+) -> None:
+    if os.environ.get("HOGLI_PREFLIGHT_DISABLED", "").lower() in {"1", "true"}:
+        disabled_summary: dict[str, Any] = {"mode": "disabled", "results": []}
+        if as_json:
+            click.echo(json.dumps(disabled_summary))
+        else:
+            click.secho(
+                "  ci:preflight disabled by operator (HOGLI_PREFLIGHT_DISABLED) — intentional; "
+                "do not unset. Nothing to check, CI remains the gate.",
+                fg="yellow",
+            )
+        _emit_telemetry(disabled_summary)
+        return
+
+    if prepare_semgrep_tool:
+        status, detail = prepare_semgrep()
+        if status != "pass":
+            raise click.ClickException(detail)
+        click.echo(detail)
+        return
+
+    # Fetch first so both the diff base and the staleness check see a fresh
+    # origin/master — a stale local ref would inflate the diff with master's own commits.
+    _fetch_master()
+    # --strict is the blocking pre-push hook: scope it to the committed diff, since a
+    # push only carries commits. Untracked/uncommitted work never reaches CI, so gating
+    # a push on lint errors in a scratch file is a false block. Advisory/--fix runs keep
+    # the working tree in scope so agents can clean edits before committing, minus untracked
+    # files, which are often scratch scripts and local tool configs that --fix must not rewrite.
+    files = changed_files(against, include_worktree=not strict, include_untracked=include_untracked)
+    base = against or "origin/master"
+
+    triggered: list[DiffCheck] = []
+    for chk in DIFF_CHECKS:
+        chk.matched = [f for f in files if matches_globs(f, chk.triggers)]
+        # A check that can only warn is not worth its run time in the pre-push hook.
+        if chk.matched and not (strict and chk.soft and chk.run is not None):
+            triggered.append(chk)
+    depot_mirrors_triggered = any(matches_globs(path, DEPOT_MIRROR_TRIGGERS) for path in files)
+
+    results: list[dict[str, Any]] = []
+    failures = 0
+    advisories = 0
+    if not as_json:
+        click.secho(f"\n  ci:preflight — {len(files)} changed file(s) vs {base}\n", bold=True)
+        if not strict and not include_untracked and (untracked := _untracked_count()):
+            click.secho(
+                f"  {untracked} untracked file(s) not checked. `git add` the ones that belong to this change, "
+                "or pass --include-untracked.\n",
+                dim=True,
+            )
+
+    # Always-on branch-health check, independent of which files changed: a stale
+    # branch breaks CI on merge no matter what the diff touches. Advisory only —
+    # it never counts toward `failures` (a merge is the human/agent's call).
+    stale_status, stale_detail, stale_props = _staleness(files)
+    results.append({"check": "staleness", "status": stale_status, "files": 0, "detail": stale_detail})
+    if not as_json:
+        click.secho(f"   {_ICON[stale_status]} [staleness] branch freshness vs master", fg=_COLOR[stale_status])
+        click.echo(f"       {stale_detail}")
+
+    depth_status, depth_detail = check_stack_depth()
+    failures += depth_status == "fail"
+    results.append({"check": "stack-depth", "status": depth_status, "files": 0, "detail": depth_detail})
+    if not as_json and depth_status != "skipped":
+        click.secho(f"   {_ICON[depth_status]} [stack-depth] open layers in this gh stack", fg=_COLOR[depth_status])
+        click.echo(f"       {depth_detail}")
+
+    if depot_mirrors_triggered:
+        violations = mirror_violations(REPO_ROOT, set(files))
+        drift_status: Status = "fail" if violations else "pass"
+        drift_detail = " · ".join(violations[:3]) if violations else "depot mirrors in sync"
+        failures += drift_status == "fail"
+        results.append({"check": "depot-mirrors", "status": drift_status, "files": 1, "detail": drift_detail})
+        if not as_json:
+            click.secho(
+                f"   {_ICON[drift_status]} [depot-mirrors] depot action mirrors (.depot/actions)",
+                fg=_COLOR[drift_status],
+            )
+            click.echo(f"       {drift_detail}")
+
+    for chk in triggered:
+        status, detail = _run_diff_check(chk, do_fix, against, strict, files)
+        failures += status == "fail"
+        # Nudges say "consider this", not "this is drift" — counting them would cry wolf in
+        # the footer on every matching push and cost the detected advisories their weight.
+        advisories += status == "advisory" and chk.measures
+        results.append({"check": chk.key, "status": status, "files": len(chk.matched), "detail": detail})
+        if not as_json:
+            click.secho(f"   {_ICON[status]} [{chk.key}] {chk.label}", fg=_COLOR[status])
+            click.echo(f"       {len(chk.matched)} file(s) · {detail}")
+
+    summary = {
+        "changed_files": len(files),
+        "triggered": (["depot-mirrors"] if depot_mirrors_triggered else []) + [c.key for c in triggered],
+        "failures": failures,
+        "advisories": advisories,
+        "mode": "fix" if do_fix else ("strict" if strict else "advisory"),
+        "results": results,
+        **stale_props,
+    }
+    if as_json:
+        click.echo(json.dumps(summary))
+    else:
+        if not triggered and not depot_mirrors_triggered:
+            click.secho("   ✓ Nothing in this diff maps to a known CI failure class.", fg="green")
+        click.echo()
+        click.echo(
+            f"  summary {json.dumps({k: summary[k] for k in ('changed_files', 'triggered', 'failures', 'mode')})}"
+        )
+        if advisories:
+            # Non-blocking, so agents skip these as pre-existing. Restate ownership.
+            click.secho(
+                f"\n  {advisories} advisory(ies) are unpushed CI failures — resolve before pushing, "
+                "including drift you didn't introduce. You own the branch state you push.",
+                fg="yellow",
+            )
+        click.echo()
+
+    _emit_telemetry(summary)
+
+    # Advisory by default — --strict turns verified *failures* into a non-zero exit
+    # for the pre-push hook. Advisories never block: guidance-only checks can't tell
+    # done from not-done, so blocking on them would false-block every matching push.
+    # SystemExit so the telemetry wrapper records it.
+    raise SystemExit(1 if (strict and failures) else 0)

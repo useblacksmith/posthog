@@ -1,0 +1,392 @@
+"""Typed schema for the project profile inventory payload.
+
+`build_inventory` returns an `Inventory` instance; `compute_project_profile` persists
+`inventory.model_dump(mode="json")` into the `SignalProjectProfile.payload` jsonb column.
+
+The model is the single source of truth for the payload shape. Storage stays jsonb — the
+payload is written by one builder, read whole, and never field-queried, so relational
+columns would buy no query benefit and a migration per section as coverage grows. But the
+jsonb is *schema-backed*, not schemaless: the scout skills read the inventory by key, so
+validating the shape on write keeps them from silently drifting when sections are added or
+reshaped (`extra="forbid"` makes a builder emitting an unmodeled key fail loudly in tests
+rather than dropping data a skill might depend on).
+
+Nullability mirrors the underlying Django fields: every serialized timestamp is optional,
+and columns that are `null=True` at the DB layer (`HogFunction.type`/`kind`,
+`AlertConfiguration.calculation_interval`, `Cohort.count`) are optional here too. Bump
+`INVENTORY_SOURCE_VERSION` in `builders.py` when the shape changes meaningfully so
+`get_project_profile` invalidates cached rows built on the old shape.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict
+
+
+class _Section(BaseModel):
+    # Forbid unmodeled keys so the builders and this schema can't drift apart unnoticed —
+    # an extra key is a contract change the scout skills need to know about, so surface it.
+    model_config = ConfigDict(extra="forbid")
+
+
+class ProjectContext(_Section):
+    product_description: str | None
+    app_urls: list[str]
+
+
+class ProductIntentEntry(_Section):
+    product_type: str
+    activated_at: str | None
+    created_at: str | None
+
+
+class IntegrationEntry(_Section):
+    kind: str
+    created_at: str | None
+
+
+class ExternalDataSourceEntry(_Section):
+    source_type: str
+    status: str
+    prefix: str
+    created_at: str | None
+    # `last_run_at` (most recent completed sync) and `latest_error` disambiguate a source stuck
+    # in `Running` that has never synced from a healthy one — `status` alone conflates them.
+    last_run_at: str | None
+    latest_error: str | None
+
+
+class SignalSourceConfigEntry(_Section):
+    source_product: str
+    source_type: str
+
+
+class SignalSourceConfigs(_Section):
+    enabled: list[SignalSourceConfigEntry]
+    disabled: list[SignalSourceConfigEntry]
+
+
+class EmitEligibility(_Section):
+    """Whether a scout's findings and reports can actually reach the inbox.
+
+    `can_emit` is the one value to read, and `blocking_reason` names the gate behind a False: the
+    same reason code `emit_report` returns as `skipped_reason` and `edit_report` refuses with, with
+    `remediation` as the one-line next step. Three gates sit behind it: the organization must have
+    approved AI data processing, the `signals_scout` signal source must be enabled, and the calling
+    scout's own config must not be in dry-run (`emit=False`). When any is off every write is
+    dropped. A dry-run scout continues its investigation without emitting findings or reports.
+    For other blocks, a scout can stop after it checks the reason and remediation.
+
+    As stored on a profile row these are the two team-wide gates only, because the row is shared by
+    every scout on the team: `scout_emit_enabled` is null and `can_emit` is the team-wide floor. The
+    profile endpoint re-derives both for the scout that is reading, which is what makes the value it
+    returns the effective one.
+    """
+
+    ai_processing_approved: bool
+    source_enabled: bool
+    # The calling scout's own dry-run toggle. Null on a stored row (no scout in hand) and whenever
+    # the run's dispatch-time config is gone, which fails closed as `scout_config_missing`.
+    scout_emit_enabled: bool | None
+    can_emit: bool
+    blocking_reason: str | None
+    remediation: str | None
+
+
+class ScoutFleetEntry(_Section):
+    skill_name: str
+    run_interval_minutes: int
+    run_cron_schedule: str | None
+    # The config's dry-run toggle: False means that scout runs but its findings are discarded,
+    # so a reader must not treat its silence as "nothing to find on that surface".
+    emit: bool
+    last_run_at: str | None
+    # Most recent run of this scout that produced output on either channel (a finding or an
+    # authored/edited report), within the run-history window `_scout_fleet` scans. Null means
+    # the scout has been quiet for at least that window, not that it has never emitted.
+    last_emitted_at: str | None
+    # Why this scout is in the `disabled` bucket: `turned_off` (a human or seed posture set
+    # `enabled=False`), `auto_paused` (the system paused it — no operator chose this), or
+    # `skill_unavailable` (left on, but its skill was deleted, superseded, or withheld, so the
+    # coordinator never dispatches it). Null for scouts that actually run.
+    not_running_reason: str | None
+    # The cause behind an `auto_paused` entry (`no_output` / `ignored` / `repeated_failures`);
+    # null for every other entry.
+    pause_reason: str | None
+    # Where the scout's pre-check query comes from: `config` or `skill_default`. Null means no
+    # pre-check, so the scout runs on every due tick.
+    precheck_source: str | None
+    # The latest scheduled pre-check. A `skip` writes no run row, so a gated scout with nothing new
+    # on its surface keeps a stale `last_run_at` while `last_precheck_at` stays fresh.
+    last_precheck_at: str | None
+    last_precheck_outcome: str | None
+
+
+class ScoutFleet(_Section):
+    """The other scouts configured on this team.
+
+    Split on whether the scout actually runs, for the same reason `SignalSourceConfigs` splits
+    on `enabled`: a scout deliberately turned off is different from a surface nobody ever
+    covered. Without this section a running scout can only infer its fleet from
+    `scout-runs-list` skill names, which under-reports any scout whose schedule hasn't come due
+    yet and can't distinguish a disabled scout from one that never existed.
+    """
+
+    enabled: list[ScoutFleetEntry]
+    disabled: list[ScoutFleetEntry]
+    # The window `last_emitted_at` was resolved over, so a reader can size the null case.
+    emitted_lookback_days: int
+
+
+class StatusCount(_Section):
+    status: str
+    count: int
+
+
+class ExistingInboxReports(_Section):
+    total: int
+    by_status: list[StatusCount]
+
+
+class ScopeActivity(_Section):
+    scope: str
+    edits: int
+    users: int
+    last_edit: str | None
+
+
+class RecentActivity(_Section):
+    window_days: int
+    by_scope: list[ScopeActivity]
+
+
+class ReviewerCorrection(_Section):
+    report_id: str
+    report_title: str | None
+    before: list[str]
+    after: list[str]
+    removal_reason: str | None = None
+    removal_reason_reviewers: list[str] = []
+    at: str | None
+
+
+class RecentReviewerCorrections(_Section):
+    window_days: int
+    corrections: list[ReviewerCorrection]
+
+
+class DashboardEntry(_Section):
+    id: int
+    name: str
+    last_accessed_at: str | None
+    last_refresh: str | None
+    created_at: str | None
+
+
+class SurveyEntry(_Section):
+    id: str
+    name: str
+    type: str
+    status: str
+    updated_at: str | None
+
+
+class RecentSurveys(_Section):
+    total_count: int
+    active_count: int
+    recent: list[SurveyEntry]
+
+
+class FeatureFlagEntry(_Section):
+    id: int
+    key: str
+    name: str
+    active: bool
+    updated_at: str | None
+
+
+class RecentFeatureFlags(_Section):
+    total_count: int
+    active_count: int
+    recent: list[FeatureFlagEntry]
+
+
+class ExperimentEntry(_Section):
+    id: int
+    name: str
+    status: str
+    feature_flag_key: str | None
+    updated_at: str | None
+
+
+class RecentExperiments(_Section):
+    total_count: int
+    running_count: int
+    recent: list[ExperimentEntry]
+
+
+class AlertEntry(_Section):
+    id: str
+    name: str
+    enabled: bool
+    state: str
+    calculation_interval: str | None
+    insight_id: int | None
+    created_at: str | None
+
+
+class RecentAlerts(_Section):
+    total_count: int
+    enabled_count: int
+    recent: list[AlertEntry]
+
+
+class HogFunctionEntry(_Section):
+    id: str
+    name: str
+    type: str | None
+    kind: str | None
+    enabled: bool
+    updated_at: str | None
+
+
+class RecentHogFunctions(_Section):
+    total_count: int
+    enabled_count: int
+    recent: list[HogFunctionEntry]
+
+
+class HogFlowEntry(_Section):
+    id: str
+    name: str
+    status: str
+    updated_at: str | None
+
+
+class RecentHogFlows(_Section):
+    total_count: int
+    active_count: int
+    recent: list[HogFlowEntry]
+
+
+class NotebookEntry(_Section):
+    short_id: str
+    title: str
+    last_modified_at: str | None
+
+
+class RecentNotebooks(_Section):
+    total_count: int
+    recent: list[NotebookEntry]
+
+
+class CohortEntry(_Section):
+    id: int
+    name: str
+    is_static: bool
+    count: int | None
+    created_at: str | None
+
+
+class RecentCohorts(_Section):
+    total_count: int
+    recent: list[CohortEntry]
+
+
+class ActionEntry(_Section):
+    id: int
+    name: str
+    updated_at: str | None
+
+
+class RecentActions(_Section):
+    total_count: int
+    recent: list[ActionEntry]
+
+
+class KnowledgeSourceEntry(_Section):
+    id: str
+    name: str
+    source_type: str
+    status: str
+    updated_at: str | None
+
+
+class BusinessKnowledge(_Section):
+    total_count: int
+    ready_count: int
+    document_count: int
+    chunk_count: int
+    recent: list[KnowledgeSourceEntry]
+
+
+class TopEvent(_Section):
+    # `window_days` rides on every row (not the block, since `top_events` is a flat list)
+    # so a scout can't read a `count` without seeing that it's windowed, not lifetime — a
+    # thin count during a capture gap must not read as a genuinely low-volume project.
+    window_days: int
+    event: str
+    count: int
+    distinct_users: int
+    recent_24h_count: int
+    recent_24h_users: int
+    first_seen_in_window: str | None
+    last_seen_in_window: str | None
+
+
+class SurfaceEntry(_Section):
+    """Whether one canonical scout's surface is in use, from the scout's default pre-check query.
+
+    Read this, not `top_events`, to decide whether a surface is in use: `top_events` keeps only the
+    top events by volume, so a quiet surface that is in use falls off it.
+    """
+
+    # True when the query found rows. False when it found none, or one false value such as a zero
+    # count. Null when the profile could not answer, so a reader must check the surface itself.
+    in_use: bool | None
+    evaluated_at: str | None
+    # `skill_default` when the shipped default query answered. Otherwise the reason `in_use` is
+    # null: `query_error`, `no_acting_user`, `time_budget`, or `deferred` when a background build
+    # has not run the query yet.
+    source: Literal["skill_default", "query_error", "no_acting_user", "time_budget", "deferred"]
+    # The rows the query returned, capped at the pre-check row cap. Null when `in_use` is null.
+    row_count: int | None
+
+
+class Inventory(_Section):
+    """The deterministic inventory layer of a `SignalProjectProfile.payload`.
+
+    Field order matches `build_inventory`'s assembly order so the serialized jsonb keeps a
+    stable key order across builds. `top_events` is `None` (not `[]`) when the ClickHouse
+    query fails, so the scout can tell "no captures" apart from "couldn't compute".
+    """
+
+    project_context: ProjectContext
+    # The products the team finished onboarding for. Onboarding is not usage: read `surfaces` to
+    # decide whether a surface is in use.
+    products_in_use: list[str]
+    product_intents: list[ProductIntentEntry]
+    integrations: list[IntegrationEntry]
+    external_data_sources: list[ExternalDataSourceEntry]
+    signal_source_configs: SignalSourceConfigs
+    emit_eligibility: EmitEligibility
+    scout_fleet: ScoutFleet
+    existing_inbox_reports: ExistingInboxReports
+    recent_activity: RecentActivity
+    recent_reviewer_corrections: RecentReviewerCorrections
+    recent_dashboards: list[DashboardEntry]
+    recent_surveys: RecentSurveys
+    recent_feature_flags: RecentFeatureFlags
+    recent_experiments: RecentExperiments
+    recent_alerts: RecentAlerts
+    recent_hog_functions: RecentHogFunctions
+    recent_hog_flows: RecentHogFlows
+    recent_notebooks: RecentNotebooks
+    recent_cohorts: RecentCohorts
+    recent_actions: RecentActions
+    business_knowledge: BusinessKnowledge
+    top_events: list[TopEvent] | None
+    # Keyed by scout name. One entry for each canonical scout that ships a default pre-check.
+    surfaces: dict[str, SurfaceEntry]

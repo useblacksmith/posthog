@@ -1,0 +1,474 @@
+"""Main risk analyzer for Django migrations."""
+
+import re
+
+from posthog.management.migration_analysis.models import MigrationRisk, OperationRisk
+from posthog.management.migration_analysis.operations import (
+    AddConstraintAnalyzer,
+    AddConstraintNotValidAnalyzer,
+    AddFieldAnalyzer,
+    AddIndexAnalyzer,
+    AddIndexConcurrentlyAnalyzer,
+    AlterFieldAnalyzer,
+    AlterIndexTogetherAnalyzer,
+    AlterModelTableAnalyzer,
+    AlterUniqueTogetherAnalyzer,
+    CreateIndexConcurrentlyAnalyzer,
+    CreateModelAnalyzer,
+    DeleteModelAnalyzer,
+    DropColumnConstraintsAnalyzer,
+    DropFieldIndexesConcurrentlyAnalyzer,
+    DropForeignKeyAnalyzer,
+    DropIndexConcurrentlyAnalyzer,
+    ExtensionAnalyzer,
+    RemoveFieldAnalyzer,
+    RemoveIndexAnalyzer,
+    RemoveIndexConcurrentlyAnalyzer,
+    RenameFieldAnalyzer,
+    RenameModelAnalyzer,
+    RunPythonAnalyzer,
+    RunSQLAnalyzer,
+    SafeAddIndexConcurrentlyAnalyzer,
+    SafeDropTableAnalyzer,
+    SafeRemoveIndexConcurrentlyAnalyzer,
+    SeparateDatabaseAndStateAnalyzer,
+    ValidateConstraintAnalyzer,
+    is_unmanaged_model,
+)
+from posthog.management.migration_analysis.policies import POSTHOG_ADVISORIES, POSTHOG_POLICIES
+from posthog.management.migration_analysis.utils import OperationCategorizer
+
+# Generated squash tail files (django-nextgensquash): NNNN_squash_YYYY_MM_DD_*.
+# The name alone proves nothing — a file claiming it must still pass the
+# all-operations-guarded check below.
+_SQUASH_TAIL_NAME_RE = re.compile(r"^\d{4}_squash_\d{4}_\d{2}_\d{2}_")
+
+# Ops from posthog/migration_helpers/squash_idempotent.py: each probes the
+# catalog and no-ops when its object already exists.
+_SQUASH_IDEMPOTENT_MODULE = "posthog.migration_helpers.squash_idempotent"
+
+# Probe-first helpers (posthog/migration_helpers/not_valid_*.py): each checks
+# pg_constraint and skips when the constraint is already present / validated.
+_PROBE_FIRST_HELPER_OPS = frozenset(
+    {"AddConstraintNotValid", "AddForeignKeyNotValid", "ValidateConstraint", "ValidateForeignKey"}
+)
+
+# The SQL shapes the squash tool forwards into schema_addons files: a DO-block
+# whose body only runs when the constraint is absent, CREATE INDEX ... IF NOT
+# EXISTS, VALIDATE CONSTRAINT (Postgres skips an already-validated constraint),
+# and table storage parameters (setting the same value again changes nothing,
+# and the SHARE UPDATE EXCLUSIVE lock does not block reads or writes).
+_GUARDED_DO_BLOCK_RE = re.compile(
+    r"DO\s+\$\$\s*BEGIN\s+IF\s+NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+pg_constraint\b.*?END\s*\$\$\s*;?",
+    re.IGNORECASE | re.DOTALL,
+)
+_GUARDED_CREATE_INDEX_RE = re.compile(
+    r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?IF\s+NOT\s+EXISTS\b[^;]*;?",
+    re.IGNORECASE,
+)
+_VALIDATE_CONSTRAINT_RE = re.compile(
+    r"ALTER\s+TABLE\s+(?:ONLY\s+)?[^;\s]+\s+VALIDATE\s+CONSTRAINT\s+[^;\s]+\s*;?",
+    re.IGNORECASE,
+)
+_STORAGE_PARAMETERS_RE = re.compile(
+    r"ALTER\s+TABLE\s+(?:ONLY\s+)?[^;\s]+\s+(?:SET|RESET)\s*\([^;)]*\)\s*;?",
+    re.IGNORECASE,
+)
+# The squash tool keeps an original lock_timeout as a session setting around forwarded DDL.
+_SESSION_LOCK_TIMEOUT_RE = re.compile(
+    r"(?:SET\s+lock_timeout\s*(?:=|TO)\s*[^;]+|RESET\s+lock_timeout)\s*;?",
+    re.IGNORECASE,
+)
+
+
+class RiskAnalyzer:
+    """
+    Analyzes Django migration operations and assigns risk scores.
+
+    Risk scoring rules:
+    0-1: Safe - Brief or no lock, backwards compatible
+    2-3: Needs Review - May have performance impact
+    4-5: Blocked - Table rewrites, breaks backwards compatibility, or can't rollback
+    """
+
+    # Registry of operation analyzers
+    ANALYZERS = {
+        "AddField": AddFieldAnalyzer(),
+        "RemoveField": RemoveFieldAnalyzer(),
+        "DeleteModel": DeleteModelAnalyzer(),
+        "AlterField": AlterFieldAnalyzer(),
+        "RenameField": RenameFieldAnalyzer(),
+        "RenameModel": RenameModelAnalyzer(),
+        "AlterModelTable": AlterModelTableAnalyzer(),
+        "AddIndex": AddIndexAnalyzer(),
+        "AddIndexConcurrently": AddIndexConcurrentlyAnalyzer(),
+        "AddConstraint": AddConstraintAnalyzer(),
+        "RunSQL": RunSQLAnalyzer(),
+        "RunPython": RunPythonAnalyzer(),
+        "CreateModel": CreateModelAnalyzer(),
+        "AlterUniqueTogether": AlterUniqueTogetherAnalyzer(),
+        # Idempotent squash variants (posthog/migration_helpers/squash_idempotent.py)
+        # behave like their parents on a fresh DB and no-op on existing ones —
+        # score them the same instead of taking the unknown-operation path.
+        "AddFieldIfMissing": AddFieldAnalyzer(),
+        "AddIndexIfMissing": AddIndexAnalyzer(),
+        "AddConstraintIfMissing": AddConstraintAnalyzer(),
+        "AlterUniqueTogetherIfMissing": AlterUniqueTogetherAnalyzer(),
+        "AlterIndexTogether": AlterIndexTogetherAnalyzer(),
+        "RemoveIndex": RemoveIndexAnalyzer(),
+        "RemoveIndexConcurrently": RemoveIndexConcurrentlyAnalyzer(),
+        # PostHog migration helpers (posthog/migration_helpers/concurrent_index.py)
+        "CreateIndexConcurrently": CreateIndexConcurrentlyAnalyzer(),
+        "DropIndexConcurrently": DropIndexConcurrentlyAnalyzer(),
+        "DropFieldIndexesConcurrently": DropFieldIndexesConcurrentlyAnalyzer(),
+        "SafeAddIndexConcurrently": SafeAddIndexConcurrentlyAnalyzer(),
+        "SafeRemoveIndexConcurrently": SafeRemoveIndexConcurrentlyAnalyzer(),
+        "AddConstraintNotValid": AddConstraintNotValidAnalyzer(),
+        "ValidateConstraint": ValidateConstraintAnalyzer(),
+        "DropForeignKey": DropForeignKeyAnalyzer(),
+        "DropColumnConstraints": DropColumnConstraintsAnalyzer(),
+        "SafeDropTable": SafeDropTableAnalyzer(),
+        "SeparateDatabaseAndState": SeparateDatabaseAndStateAnalyzer(),
+        # Postgres extension installs are safe under live load. Sharing one
+        # ExtensionAnalyzer instance across the named operations keeps the
+        # registry shape consistent and avoids the "Unknown operation" path.
+        "CreateExtension": ExtensionAnalyzer(),
+        "TrigramExtension": ExtensionAnalyzer(),
+        "BtreeGistExtension": ExtensionAnalyzer(),
+        "BtreeGinExtension": ExtensionAnalyzer(),
+        "CITextExtension": ExtensionAnalyzer(),
+        "HStoreExtension": ExtensionAnalyzer(),
+        "UnaccentExtension": ExtensionAnalyzer(),
+        "CryptoExtension": ExtensionAnalyzer(),
+    }
+
+    def analyze_migration(self, migration, path: str, file_path: str | None = None) -> MigrationRisk:
+        """Analyze migration without migration loader context (for backwards compatibility)."""
+        return self.analyze_migration_with_context(migration, path, loader=None, file_path=file_path)
+
+    def analyze_migration_with_context(
+        self, migration, path: str, loader=None, file_path: str | None = None
+    ) -> MigrationRisk:
+        """
+        Analyze migration with optional migration loader for enhanced validation.
+
+        Args:
+            migration: Django migration object
+            path: Label for reporting (typically "<app>.<name>")
+            loader: Optional Django MigrationLoader for checking migration history
+            file_path: Optional repo-relative path to the migration file on disk;
+                forwarded to MigrationRisk for downstream consumers that need to
+                map analyzer verdicts back to PR file paths.
+        """
+        if self._is_guarded_catchup_migration(migration):
+            return MigrationRisk(
+                path=path,
+                app=migration.app_label,
+                name=migration.name,
+                operations=[],
+                info_messages=[
+                    "ℹ️  Squash catch-up migration: every operation probes the catalog and no-ops when "
+                    "its object already exists, so it takes no lock on an existing database."
+                ],
+                file_path=file_path,
+            )
+
+        # Collect newly created models for this migration (normalized to lowercase for case-insensitive matching)
+        # Only count models that are managed=True (skipping unmanaged ones to avoid misleading messages)
+        self.newly_created_models = set()
+        self.unmanaged_models = set()
+
+        for op in migration.operations:
+            if op.__class__.__name__ == "CreateModel" and hasattr(op, "name"):
+                model_name = op.name.lower()
+                if is_unmanaged_model(op, migration):
+                    self.unmanaged_models.add(model_name)
+                else:
+                    self.newly_created_models.add(model_name)
+
+        # Store loader for operations that need it
+        self.loader = loader
+        self.migration = migration
+
+        operation_risks = []
+
+        for op in migration.operations:
+            # Skip operations on managed=False models - Django won't execute DDL for them
+            if is_unmanaged_model(op, migration):
+                continue
+
+            risk = self.analyze_operation(op)
+
+            # Skip AddIndex/AddConstraint on newly created tables - they're safe
+            if self._is_safe_on_new_table(op, risk):
+                continue
+
+            operation_risks.append(risk)
+
+            # Recursively analyze database_operations in SeparateDatabaseAndState
+            if (
+                op.__class__.__name__ == "SeparateDatabaseAndState"
+                and hasattr(op, "database_operations")
+                and op.database_operations
+            ):
+                parent_idx = len(operation_risks) - 1  # Index of the parent operation
+                for db_op in op.database_operations:
+                    db_risk = self.analyze_operation(db_op)
+                    db_risk.parent_index = parent_idx
+                    operation_risks.append(db_risk)
+
+        # Check for dangerous operation combinations
+        combination_risks = self.check_operation_combinations(migration, operation_risks)
+
+        # Check PostHog policies
+        policy_violations = self.check_policies(migration)
+
+        # Build info messages
+        info_messages = []
+        if self.newly_created_models:
+            info_messages.append(
+                "ℹ️  Skipped operations on newly created tables (empty tables don't cause lock contention)."
+            )
+        if self.unmanaged_models:
+            info_messages.append(
+                "ℹ️  Skipped operations on unmanaged models (managed=False) - schema managed externally."
+            )
+        for advisory in POSTHOG_ADVISORIES:
+            info_messages.extend(advisory.check_migration(migration))
+
+        return MigrationRisk(
+            path=path,
+            app=migration.app_label,
+            name=migration.name,
+            operations=operation_risks,
+            combination_risks=combination_risks,
+            policy_violations=policy_violations,
+            info_messages=info_messages,
+            file_path=file_path,
+        )
+
+    def _is_guarded_catchup_migration(self, migration) -> bool:
+        """True for a generated squash tail file whose every operation is
+        existence-guarded. Such a migration is a squash catch-up: on an
+        existing database each op finds its object present and no-ops, and on a
+        fresh database it runs against brand-new tables with no traffic. The
+        per-operation lock policies are written for DDL acting on live tables,
+        so they would flag these ops for locks they never take. The name gate
+        keeps hand-written migrations that use the same helper ops on the
+        normal path, with its policies intact.
+        """
+        if not migration.operations or not _SQUASH_TAIL_NAME_RE.match(migration.name):
+            return False
+        for op in migration.operations:
+            cls = op.__class__
+            if cls.__module__ == _SQUASH_IDEMPOTENT_MODULE:
+                continue
+            if cls.__name__ in _PROBE_FIRST_HELPER_OPS and cls.__module__.startswith("posthog.migration_helpers"):
+                continue
+            # Django's own ValidateConstraint: Postgres skips a VALIDATE on an
+            # already-validated constraint, so it is a no-op in catch-up runs.
+            if cls.__name__ == "ValidateConstraint" and cls.__module__.startswith("django.contrib.postgres"):
+                continue
+            if cls.__name__ == "RunSQL" and cls.__module__.startswith("django.db.migrations"):
+                if self._runsql_is_existence_guarded(op):
+                    continue
+            return False
+        return True
+
+    @staticmethod
+    def _runsql_is_existence_guarded(op) -> bool:
+        """True when the RunSQL consists only of pg_constraint-guarded DO blocks,
+        CREATE INDEX ... IF NOT EXISTS, VALIDATE CONSTRAINT and storage-parameter
+        statements."""
+        sql = op.sql
+        if not isinstance(sql, str):
+            return False
+        remainder = re.sub(r"--[^\n]*", "", sql)
+        remainder = _GUARDED_DO_BLOCK_RE.sub("", remainder)
+        remainder = _GUARDED_CREATE_INDEX_RE.sub("", remainder)
+        remainder = _VALIDATE_CONSTRAINT_RE.sub("", remainder)
+        remainder = _STORAGE_PARAMETERS_RE.sub("", remainder)
+        remainder = _SESSION_LOCK_TIMEOUT_RE.sub("", remainder)
+        return not remainder.strip(" \t\n;")
+
+    def _is_safe_on_new_table(self, op, risk: OperationRisk) -> bool:
+        """Check if operation is safe because it's on a newly created table."""
+        if risk.type not in ["AddIndex", "AddConstraint"]:
+            return False
+        model_name = risk.details.get("model") or getattr(op, "model_name", None)
+        if model_name:
+            model_name = model_name.lower()
+        return model_name in self.newly_created_models
+
+    def analyze_operation(self, op) -> OperationRisk:
+        op_type = op.__class__.__name__
+
+        # Look up specific analyzer for this operation type
+        analyzer = self.ANALYZERS.get(op_type)
+
+        if analyzer:
+            # Pass migration context to the drop analyzers so they can check the staging
+            if op_type in ("RunSQL", "SafeDropTable") and hasattr(self, "migration") and hasattr(self, "loader"):
+                return analyzer.analyze(op, migration=self.migration, loader=self.loader)  # type: ignore[call-arg]
+            # Pass migration context to RenameModelAnalyzer for db_table check
+            if op_type == "RenameModel" and hasattr(self, "migration"):
+                return analyzer.analyze(op, migration=self.migration)  # type: ignore[call-arg]
+            return analyzer.analyze(op)
+
+        # Fallback for unscored operation types
+        # Check if it's a known Django operation
+        is_django_operation = op.__class__.__module__.startswith("django.db.migrations.operations")
+
+        if is_django_operation:
+            return OperationRisk(
+                type=op_type,
+                score=2,
+                reason=f"Unscored Django operation: {op_type} (needs manual review)",
+                details={},
+            )
+
+        return OperationRisk(
+            type=op_type,
+            score=2,
+            reason=f"Unknown operation type: {op_type}",
+            details={},
+        )
+
+    def check_operation_combinations(self, migration, operation_risks: list[OperationRisk]) -> list[str]:
+        """
+        Check for dangerous combinations of operations in a single migration.
+
+        Dangerous patterns:
+        1. RunSQL with DML (UPDATE/DELETE) + schema changes = long transaction with locks
+        2. RunSQL + DDL should be isolated
+        3. Multiple schema changes in non-atomic migration
+        """
+        categorizer = OperationCategorizer(operation_risks)
+
+        warnings = []
+        warnings.extend(self._check_dml_with_schema_changes(categorizer))
+        warnings.extend(self._check_runpython_with_schema_changes(categorizer))
+        warnings.extend(self._check_ddl_isolation(categorizer, operation_risks))
+        warnings.extend(self._check_multiple_high_risk_ops(categorizer))
+        warnings.extend(self._check_multiple_indexes(categorizer))
+        warnings.extend(self._check_non_atomic_runsql(migration, categorizer))
+
+        return warnings
+
+    def _check_dml_with_schema_changes(self, categorizer: OperationCategorizer) -> list[str]:
+        """Check for DML operations mixed with schema changes."""
+        if not (categorizer.has_dml and categorizer.has_schema_changes):
+            return []
+
+        dml_refs = categorizer.format_operation_refs(categorizer.dml_ops)
+        schema_refs = categorizer.format_operation_refs(categorizer.schema_ops)
+
+        return [
+            f"❌ CRITICAL: {dml_refs} + {schema_refs}    "
+            "RunSQL with DML (UPDATE/DELETE/INSERT) combined with schema changes. "
+            "This creates a long-running transaction that holds locks for the entire duration. "
+            "Split into separate migrations: 1) schema changes, 2) data migration."
+        ]
+
+    def _check_runpython_with_schema_changes(self, categorizer: OperationCategorizer) -> list[str]:
+        """Check for RunPython operations mixed with schema changes."""
+        if not (categorizer.has_runpython and categorizer.has_schema_changes):
+            return []
+
+        runpython_refs = categorizer.format_operation_refs(categorizer.runpython_ops)
+        schema_refs = categorizer.format_operation_refs(categorizer.schema_ops)
+
+        return [
+            f"❌ BLOCKED: {runpython_refs} + {schema_refs}    "
+            "RunPython data migration combined with schema changes. "
+            "Data migrations can hold locks during execution, especially on large tables. "
+            "Split into separate migrations: 1) schema changes, 2) data migration."
+        ]
+
+    def _check_ddl_isolation(self, categorizer: OperationCategorizer, operation_risks: list) -> list[str]:
+        """Check if DDL operations should be isolated."""
+        if not categorizer.has_ddl:
+            return []
+
+        # Count only top-level operations (nested ops inside SeparateDatabaseAndState
+        # are part of their parent, not separate "mixed" operations)
+        top_level_count = sum(1 for op in operation_risks if op.parent_index is None)
+        if top_level_count <= 1:
+            return []
+
+        ddl_refs = categorizer.format_operation_refs(categorizer.ddl_ops)
+
+        # Specific: DDL + DML
+        if categorizer.has_dml:
+            dml_refs = categorizer.format_operation_refs(categorizer.dml_ops)
+            return [
+                f"❌ BLOCKED: {ddl_refs} mixed with {dml_refs}    "
+                "Schema changes (ALTER TABLE) and data changes (UPDATE/DELETE) should be in separate migrations. "
+                "Both can use atomic=True (default) for rollback safety."
+            ]
+
+        # Specific: DDL + schema operations
+        if categorizer.has_schema_changes:
+            schema_refs = categorizer.format_operation_refs(categorizer.schema_ops)
+            return [
+                f"❌ BLOCKED: {ddl_refs} mixed with {schema_refs}    "
+                "RunSQL DDL and Django schema operations should be in separate migrations. "
+                "Both can use atomic=True (default) for rollback safety."
+            ]
+
+        # Generic fallback
+        return [
+            f"❌ BLOCKED: {ddl_refs} mixed with other operations    "
+            "Consider splitting into separate migrations for rollback safety."
+        ]
+
+    def _check_multiple_high_risk_ops(self, categorizer: OperationCategorizer) -> list[str]:
+        """Check for multiple high-risk operations in one migration."""
+        if not categorizer.has_multiple_high_risk:
+            return []
+
+        high_risk_refs = categorizer.format_operation_refs(categorizer.high_risk_ops)
+
+        return [
+            f"❌ BLOCKED: Multiple high-risk operations in one migration: {high_risk_refs}    "
+            "Each high-risk operation (score 4+) should be isolated to make rollback easier and reduce deployment risk. "
+            "Consider splitting into separate migrations."
+        ]
+
+    def _check_multiple_indexes(self, categorizer: OperationCategorizer) -> list[str]:
+        """Check for multiple index creations in one migration."""
+        if not categorizer.has_multiple_indexes:
+            return []
+
+        index_refs = categorizer.format_operation_refs(categorizer.addindex_ops)
+
+        return [
+            f"❌ BLOCKED: Multiple index creations in one migration: {index_refs}    "
+            "Creating multiple indexes can cause I/O overload and extended lock times. "
+            "Consider splitting into separate migrations to reduce system load."
+        ]
+
+    def _check_non_atomic_runsql(self, migration, categorizer: OperationCategorizer) -> list[str]:
+        """Check for non-atomic migrations with RunSQL."""
+        if not categorizer.runsql_ops or getattr(migration, "atomic", True):
+            return []
+
+        # Skip INFO warning if all RunSQL operations are safe CONCURRENTLY operations
+        all_safe_concurrent = all(
+            op_risk.score == 1 and "CONCURRENTLY" in str(op_risk.details.get("sql", "")).upper()
+            for _, op_risk in categorizer.runsql_ops
+        )
+        if all_safe_concurrent:
+            return []  # No need to warn about atomic=False for safe concurrent operations
+
+        return ["⚠️  INFO: Migration is marked atomic=False. Ensure data migrations handle failures correctly."]
+
+    def check_policies(self, migration) -> list[str]:
+        """Check migration against PostHog coding policies."""
+        violations = []
+
+        for policy in POSTHOG_POLICIES:
+            # Check migration-level policies (which internally check operations as needed)
+            violations.extend(policy.check_migration(migration))
+
+        return violations

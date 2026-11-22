@@ -1,0 +1,1045 @@
+"""Activities for evaluation reports workflow."""
+
+import time
+import hashlib
+import datetime as dt
+from collections import defaultdict
+from dataclasses import replace
+from itertools import batched
+from typing import TYPE_CHECKING, Any, NamedTuple
+from zoneinfo import ZoneInfo
+
+from django.db.models import Q
+
+import temporalio.activity
+from dateutil.rrule import rrulestr
+from structlog import get_logger
+from temporalio.exceptions import ApplicationError
+
+from posthog.hogql import ast
+
+from posthog.clickhouse.client.connection import Workload
+from posthog.exceptions import ClickHouseQueryTimeOut
+from posthog.models.utils import strip_null_bytes
+from posthog.sync import database_sync_to_async
+from posthog.temporal.ai_observability.eval_reports.constants import (
+    COUNT_TRIGGER_CURSOR_SETTLE_LAG,
+    COUNT_TRIGGER_QUERY_MAX_EXECUTION_TIME_SECONDS,
+    COUNT_TRIGGER_QUERY_MIN_EXECUTION_TIME_SECONDS,
+    COUNT_TRIGGER_QUERY_MIN_SPLIT_RANGE,
+    COUNT_TRIGGER_QUERY_OVERSHOOT_FACTOR,
+    COUNT_TRIGGER_QUERY_RETRY_MAX_EXECUTION_TIME_SECONDS,
+    COUNT_TRIGGER_QUERY_TOTAL_BUDGET_SECONDS,
+    COUNT_TRIGGER_QUERY_WIDTH,
+)
+from posthog.temporal.ai_observability.eval_reports.targets import (
+    GENERATION_TARGET,
+    resolve_evaluation_target,
+    target_event_predicate,
+)
+from posthog.temporal.ai_observability.eval_reports.types import (
+    CheckCountTriggeredEvalReportInput,
+    CheckCountTriggeredEvalReportOutput,
+    CheckCountTriggeredEvalReportsBatchInput,
+    CheckCountTriggeredEvalReportsBatchOutput,
+    CheckCountTriggeredReportsWorkflowInputs,
+    DeliverReportInput,
+    FetchDueEvalReportsOutput,
+    PrepareReportContextInput,
+    PrepareReportContextOutput,
+    RunEvalReportAgentInput,
+    RunEvalReportAgentOutput,
+    ScheduleAllEvalReportsWorkflowInputs,
+    StoreReportRunInput,
+    StoreReportRunOutput,
+    UpdateNextDeliveryDateInput,
+)
+from posthog.temporal.common.heartbeat import Heartbeater
+
+from products.ai_observability.backend.models.evaluation_configs import evaluation_supports_reports
+from products.ai_observability.backend.models.evaluation_outcomes import get_outcome_definition
+
+if TYPE_CHECKING:
+    from posthog.models import Team
+
+    from products.ai_observability.backend.models.evaluation_reports import EvaluationReport
+
+logger = get_logger(__name__)
+
+
+@temporalio.activity.defn
+async def fetch_due_eval_reports_activity(
+    inputs: ScheduleAllEvalReportsWorkflowInputs,
+) -> FetchDueEvalReportsOutput:
+    """Return a list of time-based evaluation report IDs that are due for delivery."""
+    now_with_buffer = dt.datetime.now(tz=dt.UTC) + dt.timedelta(minutes=inputs.buffer_minutes)
+
+    @database_sync_to_async(thread_sensitive=False)
+    def get_report_ids() -> list[str]:
+        from products.ai_observability.backend.models.evaluation_reports import EvaluationReport
+
+        return [
+            str(pk)
+            for pk in EvaluationReport.objects.deliverable()
+            .filter(
+                next_delivery_date__lte=now_with_buffer,
+            )
+            .exclude(frequency=EvaluationReport.Frequency.EVERY_N)
+            .values_list("id", flat=True)
+        ]
+
+    report_ids = await get_report_ids()
+    await logger.ainfo(
+        "llma_eval_reports_coordinator_scheduled_poll",
+        reports_found=len(report_ids),
+    )
+    from posthog.temporal.ai_observability.eval_reports.metrics import record_coordinator_reports_found
+
+    record_coordinator_reports_found(len(report_ids), "scheduled")
+    return FetchDueEvalReportsOutput(report_ids=report_ids)
+
+
+@temporalio.activity.defn
+async def fetch_count_triggered_eval_report_candidates_activity(
+    inputs: CheckCountTriggeredReportsWorkflowInputs,
+) -> FetchDueEvalReportsOutput:
+    """Return count-triggered report IDs that need an independent count check, grouped
+    one team per group so each check activity runs a single shared count query."""
+
+    @database_sync_to_async(thread_sensitive=False)
+    def get_report_id_groups() -> list[list[str]]:
+        return _fetch_count_triggered_eval_report_candidate_groups()
+
+    report_id_groups = await get_report_id_groups()
+    report_ids = [report_id for group in report_id_groups for report_id in group]
+    await logger.ainfo(
+        "llma_eval_reports_coordinator_count_triggered_candidates_poll",
+        total_checked=len(report_ids),
+    )
+    from posthog.temporal.ai_observability.eval_reports.metrics import record_coordinator_check_count
+
+    record_coordinator_check_count(len(report_ids), "count_triggered")
+    return FetchDueEvalReportsOutput(report_ids=report_ids, report_id_groups=report_id_groups)
+
+
+@temporalio.activity.defn
+async def check_count_triggered_eval_report_activity(
+    inputs: CheckCountTriggeredEvalReportInput,
+) -> CheckCountTriggeredEvalReportOutput:
+    """Check one count-triggered report against its threshold.
+
+    Superseded by check_count_triggered_eval_reports_activity (batched). Kept registered
+    so coordinator workflows started before the batched path was deployed can finish.
+    """
+
+    @database_sync_to_async(thread_sensitive=False)
+    def check_report() -> CheckCountTriggeredEvalReportOutput:
+        return _check_count_triggered_eval_report_sync(inputs.report_id)
+
+    return await check_report()
+
+
+@temporalio.activity.defn
+async def check_count_triggered_eval_reports_activity(
+    inputs: CheckCountTriggeredEvalReportsBatchInput,
+) -> CheckCountTriggeredEvalReportsBatchOutput:
+    """Check a batch of count-triggered reports, sharing one ClickHouse query per team."""
+
+    @database_sync_to_async(thread_sensitive=False)
+    def check_reports() -> list[CheckCountTriggeredEvalReportOutput]:
+        return _check_count_triggered_eval_reports_batch(inputs.report_ids)
+
+    results = await check_reports()
+    return CheckCountTriggeredEvalReportsBatchOutput(results=results)
+
+
+def _fetch_count_triggered_eval_report_candidate_groups() -> list[list[str]]:
+    """Return candidate report ids grouped one team per group, each group at most
+    COUNT_TRIGGER_QUERY_WIDTH wide, so one check activity runs exactly one ClickHouse
+    count query under its own timeout and retry policy."""
+    from products.ai_observability.backend.models.evaluation_reports import EvaluationReport
+
+    ids_by_team: dict[int, list[str]] = defaultdict(list)
+    for pk, team_id in (
+        EvaluationReport.objects.deliverable()
+        .filter(
+            frequency=EvaluationReport.Frequency.EVERY_N,
+            trigger_threshold__isnull=False,
+        )
+        .order_by("team_id", "id")
+        .values_list("id", "team_id")
+    ):
+        ids_by_team[team_id].append(str(pk))
+    return [
+        list(chunk) for ids in ids_by_team.values() for chunk in batched(ids, COUNT_TRIGGER_QUERY_WIDTH, strict=False)
+    ]
+
+
+def _load_count_triggered_report(report_id: str) -> "EvaluationReport | None":
+    from products.ai_observability.backend.models.evaluation_reports import EvaluationReport
+
+    return (
+        EvaluationReport.objects.deliverable()
+        .filter(
+            id=report_id,
+            frequency=EvaluationReport.Frequency.EVERY_N,
+            trigger_threshold__isnull=False,
+        )
+        .select_related("evaluation", "team")
+        .first()
+    )
+
+
+def _count_triggered_pg_gate(
+    report: "EvaluationReport",
+    now: dt.datetime,
+) -> tuple[str | None, dt.datetime | None]:
+    """Postgres-only eligibility checks shared by the single and batched count paths.
+
+    Returns (skipped_reason, since). When skipped_reason is None the report is eligible
+    for a count check and `since` is the lower bound of its count window.
+    """
+    from products.ai_observability.backend.models.evaluation_reports import EvaluationReportRun
+
+    cooldown_anchor = report.last_attempted_at or report.last_delivered_at
+    if cooldown_anchor:
+        cooldown_delta = dt.timedelta(minutes=report.cooldown_minutes)
+        if (now - cooldown_anchor) < cooldown_delta:
+            return "cooldown", None
+
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_runs = EvaluationReportRun.objects.filter(
+        Q(content__generation_status__isnull=True) | ~Q(content__generation_status="metrics_unavailable"),
+        report=report,
+        created_at__gte=today_start,
+    ).count()
+    if today_runs >= report.daily_run_cap:
+        return "daily_cap", None
+
+    since = report.last_delivered_at or report.starts_at or report.created_at
+    return None, since
+
+
+def _check_count_triggered_eval_report_sync(
+    report_id: str,
+    now: dt.datetime | None = None,
+) -> CheckCountTriggeredEvalReportOutput:
+    report = _load_count_triggered_report(report_id)
+    if report is None:
+        return CheckCountTriggeredEvalReportOutput(report_id=report_id, due=False, skipped_reason="not_deliverable")
+
+    now = now or dt.datetime.now(tz=dt.UTC)
+    skipped_reason, since = _count_triggered_pg_gate(report, now)
+    if skipped_reason is not None:
+        return CheckCountTriggeredEvalReportOutput(report_id=report_id, due=False, skipped_reason=skipped_reason)
+
+    assert since is not None
+    count = _count_eval_results_for_report(report, since)
+
+    assert report.trigger_threshold is not None
+    return CheckCountTriggeredEvalReportOutput(report_id=report_id, due=count >= report.trigger_threshold)
+
+
+def _check_count_triggered_eval_reports_batch(
+    report_ids: list[str],
+    now: dt.datetime | None = None,
+) -> list[CheckCountTriggeredEvalReportOutput]:
+    """Check a group of count-triggered reports, sharing one ClickHouse count query per team.
+
+    The input is normally one team's reports (the fetch activity groups candidates that way),
+    but multi-team input is handled by grouping — one query per team-chunk. The Postgres
+    gating (deliverability, cooldown, daily cap) and the `count >= threshold` decision are
+    identical to the single-report path — only the count query is shared.
+
+    A ClickHouse failure propagates and fails the whole activity, which normally spans just
+    one team's chunk — Temporal retries it under the activity's retry policy.
+    """
+    from products.ai_observability.backend.models.evaluation_reports import EvaluationReport
+
+    now = now or dt.datetime.now(tz=dt.UTC)
+
+    reports = {
+        str(report.id): report
+        for report in EvaluationReport.objects.deliverable()
+        .filter(
+            id__in=report_ids,
+            frequency=EvaluationReport.Frequency.EVERY_N,
+            trigger_threshold__isnull=False,
+        )
+        .select_related("evaluation", "team")
+    }
+
+    outputs: dict[str, CheckCountTriggeredEvalReportOutput] = {}
+    survivors: dict[int, list[_CountCandidate]] = defaultdict(list)
+
+    for report_id in report_ids:
+        report = reports.get(report_id)
+        if report is None:
+            outputs[report_id] = CheckCountTriggeredEvalReportOutput(
+                report_id=report_id, due=False, skipped_reason="not_deliverable"
+            )
+            continue
+        skipped_reason, since = _count_triggered_pg_gate(report, now)
+        if skipped_reason is not None:
+            outputs[report_id] = CheckCountTriggeredEvalReportOutput(
+                report_id=report_id, due=False, skipped_reason=skipped_reason
+            )
+            continue
+        assert since is not None
+        survivors[report.team_id].append(_CountCandidate.start(report_id, report, since))
+
+    deadline = time.monotonic() + COUNT_TRIGGER_QUERY_TOTAL_BUDGET_SECONDS
+    settle_until = now - COUNT_TRIGGER_CURSOR_SETTLE_LAG
+    for candidates in survivors.values():
+        team = candidates[0].report.team
+        # Sort by cursor before capping the per-query width, so entries sharing a chunk
+        # have a comparable window — one stale report no longer sets the scan's lower
+        # bound for every other report queued alongside it.
+        candidates.sort(key=lambda candidate: candidate.cursor)
+        for chunk in batched(candidates, COUNT_TRIGGER_QUERY_WIDTH, strict=False):
+            result = _count_eval_results_for_reports_with_split_retry(
+                team,
+                [
+                    _CountEntry(
+                        key=candidate.report_id,
+                        evaluation_id=str(candidate.report.evaluation_id),
+                        since=candidate.cursor,
+                        event_predicate=candidate.event_predicate,
+                        target_predicate=candidate.target_predicate,
+                    )
+                    for candidate in chunk
+                ],
+                until=now,
+                settle_until=settle_until,
+                deadline=deadline,
+            )
+            if result.covered_before <= now:
+                # The check still succeeds, so this log is the only sign that a team is catching up.
+                logger.warning(
+                    "count_triggered_eval_report_check.partial_count",
+                    team_id=team.pk,
+                    report_count=len(chunk),
+                    scan_start=chunk[0].cursor.isoformat(),
+                    covered_before=result.covered_before.isoformat(),
+                )
+            for candidate in chunk:
+                count = result.counts.get(candidate.report_id, _EntryCount(total=0, settled=0))
+                _save_running_count(
+                    candidate,
+                    cursor=max(candidate.cursor, min(result.covered_before, settle_until)),
+                    counted_results=candidate.counted_results + count.settled,
+                )
+                assert candidate.report.trigger_threshold is not None
+                outputs[candidate.report_id] = CheckCountTriggeredEvalReportOutput(
+                    report_id=candidate.report_id,
+                    due=candidate.counted_results + count.total >= candidate.report.trigger_threshold,
+                )
+
+    # Preserve input order so the workflow's aggregation and logging stay deterministic.
+    return [outputs[report_id] for report_id in report_ids]
+
+
+class _CountCandidate(NamedTuple):
+    report_id: str
+    report: "EvaluationReport"
+    anchor: dt.datetime
+    event_predicate: str
+    target_predicate: str
+    predicates_hash: str
+    # The check counts from here; `counted_results` already covers anchor..cursor.
+    cursor: dt.datetime
+    counted_results: int
+
+    @classmethod
+    def start(cls, report_id: str, report: "EvaluationReport", anchor: dt.datetime) -> "_CountCandidate":
+        event_predicate = get_outcome_definition(report.evaluation.output_type).event_predicate
+        target_predicate = target_event_predicate(report.evaluation.target)
+        predicates_hash = hashlib.sha256(f"{event_predicate}\n{target_predicate}".encode()).hexdigest()
+        cursor, counted_results = anchor, 0
+        # A saved count only holds while the rows it counted still match the evaluation's predicates.
+        if (
+            report.count_anchor_at == anchor
+            and report.count_predicates_hash == predicates_hash
+            and report.count_cursor_at is not None
+            and report.counted_results is not None
+        ):
+            cursor, counted_results = report.count_cursor_at, report.counted_results
+        return cls(
+            report_id, report, anchor, event_predicate, target_predicate, predicates_hash, cursor, counted_results
+        )
+
+
+def _save_running_count(candidate: _CountCandidate, cursor: dt.datetime, counted_results: int) -> None:
+    from products.ai_observability.backend.models.evaluation_reports import EvaluationReport
+
+    report = candidate.report
+    if (
+        report.count_anchor_at == candidate.anchor
+        and report.count_predicates_hash == candidate.predicates_hash
+        and report.count_cursor_at == cursor
+    ):
+        return
+    # Match the values this check read, so a concurrent check or a reset does not get overwritten.
+    EvaluationReport.objects.filter(
+        id=report.id,
+        count_anchor_at=report.count_anchor_at,
+        count_predicates_hash=report.count_predicates_hash,
+        count_cursor_at=report.count_cursor_at,
+    ).update(
+        count_anchor_at=candidate.anchor,
+        count_predicates_hash=candidate.predicates_hash,
+        count_cursor_at=cursor,
+        counted_results=counted_results,
+    )
+
+
+def _count_eval_results_for_report(report: "EvaluationReport", since: dt.datetime) -> int:
+    from posthog.hogql.parser import parse_select
+    from posthog.hogql.query import execute_hogql_query
+
+    from posthog.clickhouse.query_tagging import Feature, Product, tags_context
+
+    # Pass the datetime directly to ast.Constant. HogQL's printer serializes it
+    # as toDateTime64(..., 6, <team_tz>) with correct TZ alignment. A bare string
+    # would be coerced in the team's timezone and silently shift the comparison
+    # by the team's offset.
+    outcome_definition = get_outcome_definition(report.evaluation.output_type)
+    evaluation_target_predicate = target_event_predicate(report.evaluation.target)
+    # nosemgrep: hogql-fstring-audit (the predicate comes from fixed internal output-type definitions)
+    query = parse_select(
+        f"""
+        SELECT count() as total
+        FROM events
+        WHERE event = '$ai_evaluation'
+            AND properties.$ai_evaluation_id = {{evaluation_id}}
+            AND {outcome_definition.event_predicate}
+            AND {evaluation_target_predicate}
+            AND timestamp >= {{since}}
+        """,
+        placeholders={
+            "evaluation_id": ast.Constant(value=str(report.evaluation_id)),
+            "since": ast.Constant(value=since),
+        },
+    )
+    # These count checks run every 5 minutes across all count-triggered reports, so keep them
+    # off the online cluster that serves user-facing queries — route to the offline replica.
+    with tags_context(product=Product.LLM_ANALYTICS, feature=Feature.ENRICHMENT, team_id=report.team_id):
+        result = execute_hogql_query(
+            query=query, team=report.team, workload=Workload.OFFLINE, query_type="EvalReportResultCount"
+        )
+    rows = result.results or []
+    if not rows:
+        return 0
+    return int(rows[0][0] or 0)
+
+
+class _CountEntry(NamedTuple):
+    key: str
+    evaluation_id: str
+    since: dt.datetime
+    event_predicate: str
+    target_predicate: str
+
+
+class _EntryCount(NamedTuple):
+    total: int
+    # The part of `total` with a timestamp before `settle_until`.
+    settled: int
+
+
+class _CountResult(NamedTuple):
+    counts: dict[str, _EntryCount]
+    # The counts cover the requested range from its start up to, but not including, this instant.
+    covered_before: dt.datetime
+
+
+def _count_eval_results_for_reports(
+    team: "Team",
+    entries: list[_CountEntry],
+    since: dt.datetime,
+    until: dt.datetime,
+    settle_until: dt.datetime,
+    max_execution_time: int,
+) -> dict[str, _EntryCount]:
+    """Count `$ai_evaluation` events for many reports over one time range, in a single
+    ClickHouse query.
+
+    We emit two `countIf` columns per entry, each carrying the exact per-report predicate
+    (evaluation_id + output-type `event_predicate` + `target_predicate` + `timestamp >=
+    entry.since`), so a call covering every entry's own window returns what the single-report
+    query would. The second column also requires `timestamp < settle_until`. The shared WHERE
+    narrows the scan to `since`..`until` and to the entries' evaluation ids. Callers that pass
+    a range narrower than an entry's own window get that range's share of the count, and must
+    sum the shares to get the entry's total.
+    """
+    from posthog.hogql.constants import HogQLGlobalSettings
+    from posthog.hogql.parser import parse_expr, parse_select
+    from posthog.hogql.query import execute_hogql_query
+
+    from posthog.clickhouse.query_tagging import Feature, Product, tags_context
+
+    if not entries:
+        return {}
+
+    # evaluation_id and since go in as ast.Constant placeholders (no interpolation to audit);
+    # `since` stays a datetime so HogQL prints toDateTime64(..., 6, <team_tz>) — a bare string
+    # would shift by the team's offset. The predicates are trusted internal output-type and
+    # target definitions (never user input), interpolated to match the single-report query
+    # exactly. Columns are read positionally below, so no aliases are needed.
+    select_columns: list[ast.Expr] = [
+        # nosemgrep: hogql-fstring-audit (the predicates come from fixed internal definitions)
+        parse_expr(
+            f"countIf(properties.$ai_evaluation_id = {{evaluation_id}}"
+            f" AND {entry.event_predicate} AND {entry.target_predicate} AND timestamp >= {{since}}{extra_predicate})",
+            placeholders={
+                "evaluation_id": ast.Constant(value=entry.evaluation_id),
+                "since": ast.Constant(value=entry.since),
+                "settle_until": ast.Constant(value=settle_until),
+            },
+        )
+        for entry in entries
+        for extra_predicate in ("", " AND timestamp < {settle_until}")
+    ]
+
+    unique_evaluation_ids = list(dict.fromkeys(entry.evaluation_id for entry in entries))
+    query = parse_select(
+        "SELECT 1 FROM events WHERE event = '$ai_evaluation' "
+        "AND properties.$ai_evaluation_id IN {evaluation_ids} "
+        "AND timestamp >= {since} AND timestamp <= {until}",
+        placeholders={
+            "evaluation_ids": ast.Tuple(exprs=[ast.Constant(value=e) for e in unique_evaluation_ids]),
+            "since": ast.Constant(value=since),
+            "until": ast.Constant(value=until),
+        },
+    )
+    assert isinstance(query, ast.SelectQuery)
+    # Replace the placeholder projection with the per-entry count columns.
+    query.select = select_columns
+
+    with tags_context(product=Product.LLM_ANALYTICS, feature=Feature.ENRICHMENT, team_id=team.pk):
+        result = execute_hogql_query(
+            query=query,
+            team=team,
+            workload=Workload.OFFLINE,
+            query_type="EvalReportResultCountBatch",
+            # "throw", not the profile default: the split retry needs the timeout to raise. A
+            # partial count reads as below threshold and silently keeps the report from firing.
+            settings=HogQLGlobalSettings(max_execution_time=max_execution_time, timeout_overflow_mode="throw"),
+        )
+
+    rows = result.results or []
+    if not rows:
+        return {entry.key: _EntryCount(total=0, settled=0) for entry in entries}
+    row = rows[0]
+    return {
+        entry.key: _EntryCount(total=int(row[2 * index] or 0), settled=int(row[2 * index + 1] or 0))
+        for index, entry in enumerate(entries)
+    }
+
+
+def _count_eval_results_for_reports_with_split_retry(
+    team: "Team",
+    entries: list[_CountEntry],
+    until: dt.datetime,
+    settle_until: dt.datetime,
+    since: dt.datetime | None = None,
+    deadline: float | None = None,
+    max_execution_time: int = COUNT_TRIGGER_QUERY_MAX_EXECUTION_TIME_SECONDS,
+) -> _CountResult:
+    """Run the batched count query, halving the time range and retrying over each half if
+    ClickHouse can't finish it inside its own execution-time budget.
+
+    A `ClickHouseQueryTimeOut` means the rows in `since`..`until` don't fit the budget, so
+    replaying the identical query would just time out again. Halving the range halves the
+    rows each attempt reads, and the two halves sum to the same per-entry counts. Splitting
+    the countIf columns instead would leave both halves reading almost the same rows, because
+    the columns share one scan and the width barely moves its cost.
+
+    Every attempt draws on one shared wall-clock budget (`deadline`, in `time.monotonic()`
+    seconds), capping its own execution time by what remains, so the whole split tree
+    concludes before the activity's own timeout. ClickHouse can overrun its execution limit,
+    so an attempt only claims a limit it can afford to overshoot by
+    COUNT_TRIGGER_QUERY_OVERSHOOT_FACTOR. Once the remainder can't fund a meaningful query,
+    the timeout surfaces and the activity fails cleanly instead of being killed mid-split by
+    Temporal.
+
+    The halves run oldest first. When a later part cannot finish, the result keeps the counts
+    of the finished earlier part and `covered_before` marks where they stop, so the caller can
+    save that progress. The timeout surfaces only when no part of the range finished.
+    """
+    if since is None:
+        since = min(entry.since for entry in entries)
+    if deadline is None:
+        deadline = time.monotonic() + COUNT_TRIGGER_QUERY_TOTAL_BUDGET_SECONDS
+    affordable_execution_time = int((deadline - time.monotonic()) / COUNT_TRIGGER_QUERY_OVERSHOOT_FACTOR)
+    budget = min(max_execution_time, affordable_execution_time)
+    if budget < COUNT_TRIGGER_QUERY_MIN_EXECUTION_TIME_SECONDS:
+        raise ClickHouseQueryTimeOut("Count query budget exhausted before the split could finish.")
+    # The events table stores timestamps as DateTime64(6), so one microsecond past an instant
+    # is the next representable one and adjacent ranges cannot overlap.
+    try:
+        counts = _count_eval_results_for_reports(
+            team, entries, since=since, until=until, settle_until=settle_until, max_execution_time=budget
+        )
+        return _CountResult(counts=counts, covered_before=until + dt.timedelta(microseconds=1))
+    except ClickHouseQueryTimeOut:
+        if (until - since) <= COUNT_TRIGGER_QUERY_MIN_SPLIT_RANGE:
+            raise
+        midpoint = since + (until - since) / 2
+        earlier_half = _count_eval_results_for_reports_with_split_retry(
+            team,
+            entries,
+            since=since,
+            until=midpoint,
+            settle_until=settle_until,
+            deadline=deadline,
+            max_execution_time=COUNT_TRIGGER_QUERY_RETRY_MAX_EXECUTION_TIME_SECONDS,
+        )
+        if earlier_half.covered_before <= midpoint:
+            return earlier_half
+        try:
+            later_half = _count_eval_results_for_reports_with_split_retry(
+                team,
+                entries,
+                since=midpoint + dt.timedelta(microseconds=1),
+                until=until,
+                settle_until=settle_until,
+                deadline=deadline,
+                max_execution_time=COUNT_TRIGGER_QUERY_RETRY_MAX_EXECUTION_TIME_SECONDS,
+            )
+        except ClickHouseQueryTimeOut:
+            return earlier_half
+        counts = dict(earlier_half.counts)
+        for key, count in later_half.counts.items():
+            earlier = counts.get(key, _EntryCount(total=0, settled=0))
+            counts[key] = _EntryCount(total=earlier.total + count.total, settled=earlier.settled + count.settled)
+        return _CountResult(counts=counts, covered_before=later_half.covered_before)
+
+
+def _find_nth_eval_timestamp(
+    team_id: int,
+    evaluation_id: str,
+    n: int,
+    before: dt.datetime,
+    output_type: str = "boolean",
+    evaluation_target: str = "generation",
+) -> dt.datetime:
+    """Find the timestamp of the Nth-most-recent eval result.
+
+    Returns the timestamp so the report window covers exactly the last N evals.
+    Falls back to 24h ago if there are fewer than N results.
+    """
+    from posthog.hogql.parser import parse_select
+    from posthog.hogql.query import execute_hogql_query
+
+    from posthog.clickhouse.query_tagging import Feature, Product, tags_context
+    from posthog.models import Team
+
+    team = Team.objects.get(id=team_id)
+    # Pass `before` as a datetime so HogQL serializes it as toDateTime64(..., 6, <team_tz>)
+    # instead of a bare string that would be coerced in the team's timezone.
+    outcome_definition = get_outcome_definition(output_type)
+    evaluation_target_predicate = target_event_predicate(evaluation_target)
+    # nosemgrep: hogql-fstring-audit (the predicate comes from fixed internal output-type definitions)
+    query = parse_select(
+        f"""
+        SELECT min(ts) FROM (
+            SELECT timestamp as ts
+            FROM events
+            WHERE event = '$ai_evaluation'
+                AND properties.$ai_evaluation_id = {{evaluation_id}}
+                AND {outcome_definition.event_predicate}
+                AND {evaluation_target_predicate}
+                AND timestamp <= {{before}}
+            ORDER BY timestamp DESC
+            LIMIT {{limit}}
+        )
+        """,
+        placeholders={
+            "evaluation_id": ast.Constant(value=evaluation_id),
+            "before": ast.Constant(value=before),
+            "limit": ast.Constant(value=int(n)),
+        },
+    )
+    with tags_context(product=Product.LLM_ANALYTICS, feature=Feature.ENRICHMENT, team_id=team.pk):
+        result = execute_hogql_query(
+            query=query, team=team, workload=Workload.OFFLINE, query_type="EvalReportNthResultTimestamp"
+        )
+    rows = result.results or []
+    if rows and rows[0][0] is not None:
+        ts = rows[0][0]
+        if isinstance(ts, dt.datetime):
+            if ts.tzinfo is None:
+                return ts.replace(tzinfo=dt.UTC)
+            return ts
+    # Fallback: 24h ago
+    return before - dt.timedelta(days=1)
+
+
+_DEFAULT_PERIOD = dt.timedelta(days=1)
+
+
+def _period_for_scheduled_report(report, now: dt.datetime) -> dt.timedelta:
+    """Return the typical gap between successive RRULE occurrences.
+
+    Used as the "one period" lookback for scheduled reports — e.g. an hourly
+    RRULE yields 1h, a weekly RRULE yields 7d. Falls back to 1 day if the rule
+    hasn't accumulated enough history yet (fewer than two past occurrences).
+
+    The RRULE is expanded in the report's local timezone so that e.g. "daily
+    9am America/New_York" yields a true 23h/25h gap across DST transitions,
+    matching the real wall-clock firing cadence rather than a naive UTC delta.
+    """
+    if not report.rrule or not report.starts_at:
+        return _DEFAULT_PERIOD
+    try:
+        tz = ZoneInfo(report.timezone_name or "UTC")
+        starts_local = report.starts_at.astimezone(tz).replace(tzinfo=None)
+        rule = rrulestr(report.rrule, dtstart=starts_local, ignoretz=True)
+    except (ValueError, TypeError):
+        return _DEFAULT_PERIOD
+    now_local = now.astimezone(tz).replace(tzinfo=None)
+    prev = rule.before(now_local, inc=False)
+    if prev is None:
+        return _DEFAULT_PERIOD
+    prev_prev = rule.before(prev, inc=False)
+    if prev_prev is None:
+        return _DEFAULT_PERIOD
+    # Reattach the target tz and normalize to UTC so the returned delta reflects
+    # the real wall-clock gap (23/24/25h around DST), not the naive-local delta.
+    prev_utc = prev.replace(tzinfo=tz).astimezone(dt.UTC)
+    prev_prev_utc = prev_prev.replace(tzinfo=tz).astimezone(dt.UTC)
+    return prev_utc - prev_prev_utc
+
+
+@temporalio.activity.defn
+async def prepare_report_context_activity(
+    inputs: PrepareReportContextInput,
+) -> PrepareReportContextOutput:
+    """Load evaluation from Postgres and calculate time windows."""
+
+    @database_sync_to_async(thread_sensitive=False)
+    def prepare() -> PrepareReportContextOutput:
+        from products.ai_observability.backend.models.evaluation_reports import EvaluationReport
+
+        report = EvaluationReport.objects.select_related("evaluation").filter(id=inputs.report_id).first()
+        if report is None:
+            raise ApplicationError(
+                "This evaluation report no longer exists.", type="ReportNotFound", non_retryable=True
+            )
+        evaluation = report.evaluation
+        now = dt.datetime.now(tz=dt.UTC)
+        if not evaluation_supports_reports(evaluation.output_type, evaluation.target, evaluation.output_config):
+            if not inputs.manual:
+                report.last_attempted_at = now
+                report.set_next_delivery_date()
+                report.save(update_fields=["last_attempted_at", "next_delivery_date"])
+            # Activity failures remain readable by workflow workers from an older release.
+            raise ApplicationError(
+                "This evaluation no longer supports reports. For numeric or categorical evaluations, set a passing rule and generate the report again.",
+                type="ReportNotEligible",
+                non_retryable=True,
+            )
+
+        period_end = now
+
+        if inputs.manual:
+            # Manual "Generate now": always look back one full period so the
+            # user gets something meaningful regardless of last delivery.
+            if report.is_count_triggered:
+                # For count-triggered reports, sample the most recent N evals so
+                # "Generate now" always produces something useful even if the
+                # threshold hasn't been crossed yet.
+                period_start = _find_nth_eval_timestamp(
+                    team_id=report.team_id,
+                    evaluation_id=str(evaluation.id),
+                    n=report.trigger_threshold or 100,
+                    before=now,
+                    output_type=evaluation.output_type,
+                    evaluation_target=evaluation.target,
+                )
+            else:
+                period_start = now - _period_for_scheduled_report(report, now)
+        elif report.last_delivered_at:
+            period_start = report.last_delivered_at
+        else:
+            # First run: look back one typical period (count-triggered reports
+            # fall back to the report's anchor — starts_at if present, else its
+            # creation time — since they don't have a natural cadence).
+            if report.is_count_triggered:
+                period_start = report.starts_at or report.created_at
+            else:
+                period_start = now - _period_for_scheduled_report(report, now)
+
+        # Previous period for comparison (same duration, shifted back)
+        period_duration = period_end - period_start
+        previous_period_start = period_start - period_duration
+
+        guidance = report.report_prompt_guidance or ""
+
+        return PrepareReportContextOutput(
+            report_id=str(report.id),
+            team_id=report.team_id,
+            evaluation_id=str(evaluation.id),
+            evaluation_name=evaluation.name,
+            evaluation_description=evaluation.description or "",
+            evaluation_prompt=evaluation.evaluation_config.get(
+                "source" if evaluation.evaluation_type == "hog" else "prompt", ""
+            ),
+            evaluation_type=evaluation.evaluation_type,
+            output_type=evaluation.output_type,
+            true_is_failure=bool(evaluation.output_config.get("true_is_failure")),
+            output_config=evaluation.output_config,
+            period_start=period_start.isoformat(),
+            period_end=period_end.isoformat(),
+            previous_period_start=previous_period_start.isoformat(),
+            report_prompt_guidance=guidance,
+        )
+
+    return await prepare()
+
+
+@temporalio.activity.defn
+async def run_eval_report_agent_activity(
+    inputs: RunEvalReportAgentInput,
+) -> RunEvalReportAgentOutput:
+    """Run the LLM report agent."""
+    async with Heartbeater():
+        await logger.ainfo(
+            "llma_eval_reports_agent_started",
+            report_id=inputs.report_id,
+            team_id=inputs.team_id,
+            evaluation_id=inputs.evaluation_id,
+        )
+
+        @database_sync_to_async(thread_sensitive=False)
+        def run_agent():
+            from posthog.temporal.ai_observability.eval_reports.report_agent import run_eval_report_agent
+
+            evaluation_target = _load_evaluation_target(inputs.team_id, inputs.evaluation_id)
+            evaluation_output_configs = _load_evaluation_output_configs(inputs.team_id)
+            agent_inputs = inputs
+            if inputs.output_type in ("numeric", "categorical") and not inputs.output_config:
+                # Older workflow payloads omit the rule snapshot.
+                output_config = evaluation_output_configs.get(inputs.evaluation_id, {})
+                if not evaluation_supports_reports(inputs.output_type, evaluation_target, output_config):
+                    raise ApplicationError(
+                        "This evaluation no longer supports reports.", type="ReportNotEligible", non_retryable=True
+                    )
+                agent_inputs = replace(inputs, output_config=output_config)
+            return (
+                run_eval_report_agent(
+                    agent_inputs,
+                    evaluation_target=evaluation_target,
+                    detector_evaluation_ids=_load_detector_evaluation_ids(inputs.team_id),
+                    evaluation_output_configs=evaluation_output_configs,
+                ),
+                evaluation_target,
+            )
+
+        content, evaluation_target = await run_agent()
+        content.evaluation_target = evaluation_target
+
+        return RunEvalReportAgentOutput(
+            report_id=inputs.report_id,
+            content=content.to_dict(),
+            period_start=inputs.period_start,
+            period_end=inputs.period_end,
+            generation_status=content.generation_status.value,
+        )
+
+
+def _load_evaluation_target(team_id: int, evaluation_id: str) -> str:
+    from products.ai_observability.backend.models.evaluations import Evaluation
+
+    return Evaluation.objects.values_list("target", flat=True).get(id=evaluation_id, team_id=team_id)
+
+
+def _load_evaluation_output_configs(team_id: int) -> dict[str, dict[str, Any]]:
+    from products.ai_observability.backend.models.evaluations import Evaluation
+
+    return {
+        str(evaluation_id): config
+        for evaluation_id, config in Evaluation.objects.filter(
+            team_id=team_id, output_type__in=("numeric", "categorical")
+        ).values_list("id", "output_config")
+    }
+
+
+def _load_detector_evaluation_ids(team_id: int) -> list[str]:
+    """The generation detail tool lists every evaluation on a generation, not just this report's,
+    so it needs each one's polarity to label it. Read here rather than in the context activity,
+    which would carry the whole team's list through two Temporal payloads to reach this one."""
+    from products.ai_observability.backend.models.evaluations import Evaluation
+
+    return [
+        str(evaluation_id)
+        for evaluation_id in Evaluation.objects.filter(
+            team_id=team_id, output_type="boolean", output_config__true_is_failure=True
+        ).values_list("id", flat=True)
+    ]
+
+
+@temporalio.activity.defn
+async def store_report_run_activity(
+    inputs: StoreReportRunInput,
+) -> StoreReportRunOutput:
+    """Save the generated report as an EvaluationReportRun and emit a $ai_evaluation_report event."""
+
+    @database_sync_to_async(thread_sensitive=False)
+    def store() -> str:
+        import uuid
+
+        from posthog.models.team import Team
+        from posthog.temporal.ai_observability.eval_reports.report_agent.schema import (  # noqa: PLC0415 -- keeps report agent dependencies off the activity import path
+            EvalReportGenerationStatus,
+            EvalReportMetrics,
+            normalize_report_content_payload,
+        )
+        from posthog.temporal.ai_observability.generated_event_usage import create_generated_ai_event
+
+        from products.ai_observability.backend.models.evaluation_reports import EvaluationReportRun
+
+        # Mirror content.metrics into the legacy `metadata` JSONField for consumers that still read it.
+        # The report agent can quote generation text, which can contain NUL.
+        content: dict[str, Any] = strip_null_bytes(normalize_report_content_payload(inputs.content or {}))
+        evaluation_target = resolve_evaluation_target(content.get("evaluation_target", GENERATION_TARGET))
+        generation_status = EvalReportGenerationStatus(content["generation_status"])
+        metrics = content.get("metrics")
+        parsed_metrics = EvalReportMetrics.from_dict(metrics) if isinstance(metrics, dict) else None
+
+        run = EvaluationReportRun.objects.create(
+            report_id=inputs.report_id,
+            content=content,
+            metadata=metrics or {},
+            period_start=inputs.period_start,
+            period_end=inputs.period_end,
+        )
+
+        # Emit $ai_evaluation_report event to ClickHouse
+        team = Team.objects.get(id=inputs.team_id)
+
+        # Collect citations from structured content (v2), not from per-section lists
+        citations = content.get("citations", []) or []
+        all_referenced_ids = [c.get("generation_id", "") for c in citations if c.get("generation_id")]
+        all_referenced_trace_ids = [c.get("trace_id", "") for c in citations if c.get("trace_id")]
+        all_referenced_session_ids = [c.get("session_id", "") for c in citations if c.get("session_id")]
+
+        properties: dict = {
+            "$ai_evaluation_id": inputs.evaluation_id,
+            "$ai_evaluation_report_id": str(run.report_id),
+            "$ai_evaluation_report_run_id": str(run.id),
+            "$ai_report_title": content.get("title", ""),
+            "$ai_report_period_start": inputs.period_start,
+            "$ai_report_period_end": inputs.period_end,
+            "$ai_report_evaluation_target": evaluation_target,
+            "$ai_report_generation_status": generation_status.value,
+            # Structured content + citations for downstream consumption
+            "$ai_report_content": content,
+            "$ai_report_citations": citations,
+            "$ai_report_referenced_generation_ids": all_referenced_ids,
+            "$ai_report_referenced_trace_ids": all_referenced_trace_ids,
+            "$ai_report_referenced_session_ids": all_referenced_session_ids,
+            "$ai_report_section_count": len(content.get("sections", [])),
+        }
+        if parsed_metrics is not None:
+            properties.update(
+                {
+                    "$ai_report_output_type": parsed_metrics.output_type,
+                    "$ai_report_result_counts": parsed_metrics.result_counts,
+                    "$ai_report_result_rates": parsed_metrics.result_rates,
+                    "$ai_report_previous_result_counts": parsed_metrics.previous_result_counts,
+                    "$ai_report_previous_result_rates": parsed_metrics.previous_result_rates,
+                    "$ai_report_total_runs": parsed_metrics.total_runs,
+                    "$ai_report_previous_total_runs": parsed_metrics.previous_total_runs,
+                }
+            )
+        if parsed_metrics is not None and parsed_metrics.output_type in ("boolean", "numeric", "categorical"):
+            # Preserve the original flat properties for existing boolean-report consumers.
+            properties.update(
+                {
+                    "$ai_report_pass_count": parsed_metrics.result_counts["pass"],
+                    "$ai_report_fail_count": parsed_metrics.result_counts["fail"],
+                    "$ai_report_na_count": parsed_metrics.result_counts["na"],
+                    "$ai_report_pass_rate": parsed_metrics.pass_rate,
+                    "$ai_report_previous_pass_rate": parsed_metrics.previous_pass_rate,
+                }
+            )
+
+        create_generated_ai_event(
+            event_uuid=uuid.uuid4(),
+            event="$ai_evaluation_report",
+            team=team,
+            distinct_id=f"eval_report_{inputs.team_id}",
+            properties=properties,
+        )
+
+        return str(run.id)
+
+    run_id = await store()
+    return StoreReportRunOutput(report_run_id=run_id)
+
+
+@temporalio.activity.defn
+async def deliver_report_activity(
+    inputs: DeliverReportInput,
+) -> None:
+    """Deliver the report via configured delivery targets (email/Slack)."""
+    async with Heartbeater():
+        await logger.ainfo(
+            "llma_eval_reports_delivery_started",
+            report_id=inputs.report_id,
+            report_run_id=inputs.report_run_id,
+        )
+
+        @database_sync_to_async(thread_sensitive=False)
+        def deliver():
+            from posthog.temporal.ai_observability.eval_reports.delivery import deliver_report
+
+            deliver_report(
+                report_id=inputs.report_id,
+                report_run_id=inputs.report_run_id,
+            )
+
+        await deliver()
+
+
+def _update_next_delivery_date(inputs: UpdateNextDeliveryDateInput) -> None:
+    """Persist automatic-run timing without creating gaps in the report data cursor.
+
+    `period_end` is captured when report context is prepared. It anchors both the
+    attempt and successful cursor so time spent generating and delivering cannot
+    leave uncovered data between consecutive reports.
+
+    `advance_data_cursor=None` preserves the behavior of activity inputs recorded
+    before attempt and delivery updates were split.
+    """
+    from products.ai_observability.backend.models.evaluation_reports import (  # noqa: PLC0415 -- keeps product model loading inside activity execution
+        EvaluationReport,
+    )
+
+    report = EvaluationReport.objects.get(id=inputs.report_id)
+    period_end = dt.datetime.fromisoformat(inputs.period_end)
+    advance_data_cursor = (
+        inputs.generation_status == "completed" if inputs.advance_data_cursor is None else inputs.advance_data_cursor
+    )
+    update_fields: list[str] = []
+    if inputs.record_attempt:
+        report.last_attempted_at = period_end
+        report.set_next_delivery_date()
+        update_fields.extend(["next_delivery_date", "last_attempted_at"])
+    if advance_data_cursor:
+        report.last_delivered_at = period_end
+        update_fields.append("last_delivered_at")
+    report.save(update_fields=update_fields)
+
+
+@temporalio.activity.defn
+async def update_next_delivery_date_activity(
+    inputs: UpdateNextDeliveryDateInput,
+) -> None:
+    @database_sync_to_async(thread_sensitive=False)
+    def update() -> None:
+        _update_next_delivery_date(inputs)
+
+    await update()

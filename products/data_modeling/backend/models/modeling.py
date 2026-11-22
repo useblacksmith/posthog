@@ -1,0 +1,474 @@
+import time
+from typing import ClassVar
+
+from prometheus_client import Counter, Histogram
+
+from posthog.hogql import ast
+from posthog.hogql.constants import HogQLDialect
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.database.database import Database
+from posthog.hogql.database.models import SavedQuery as HogQLSavedQuery
+from posthog.hogql.errors import BoundedResolverError, ResolutionDepthExceededError, ResolutionError
+from posthog.hogql.resolver import Resolver, ResolverFactory
+from posthog.hogql.visitor import TraversingVisitor
+
+from posthog.models.team import Team
+
+# Migrations of this product name the field by this module path.
+from posthog.models.utils import LabelTreeField  # noqa: F401
+
+from products.data_modeling.backend.facade.system_tables import DATA_MODELING_ALLOWED_SYSTEM_TABLES
+from products.data_modeling.backend.logic.incremental_filter import parse_model_query
+
+DEFAULT_RESOLUTION_MAX_VIEW_DEPTH = 100
+DEFAULT_RESOLUTION_DEADLINE_SECONDS = 60.0
+
+
+class ResolutionTimeoutError(BoundedResolverError):
+    """View resolution exceeded its wall-clock deadline."""
+
+    status_label: ClassVar[str] = "timeout"
+
+    def __init__(self, elapsed_seconds: float, deadline_seconds: float, initial_view: str | None = None):
+        message = f"View resolution exceeded deadline ({elapsed_seconds:.2f}s > {deadline_seconds:.2f}s)"
+        if initial_view:
+            message += f" while resolving '{initial_view}'"
+        super().__init__(message, initial_view=initial_view)
+        self.elapsed_seconds = elapsed_seconds
+        self.deadline_seconds = deadline_seconds
+
+
+# `source` separates the two jobs the resolver does, which fail differently and are read
+# differently: a `materialization` failure fails a customer's model on a scheduled run, while
+# `lineage` resolves a query's parents at save time to maintain DAG edges and view metadata.
+# Lineage runs orders of magnitude more often, so unlabelled they share one series and the
+# rarer, costlier one becomes unreadable. Anything under `other` is a caller added without
+# saying which of the two it is.
+RESOLUTION_SOURCE_MATERIALIZATION = "materialization"
+RESOLUTION_SOURCE_LINEAGE = "lineage"
+RESOLUTION_SOURCE_OTHER = "other"
+
+DAG_RESOLUTION_TOTAL = Counter(
+    "data_modeling_dag_resolution_total",
+    "Total HogQL view-dependency resolutions performed, by calling path and terminal status.",
+    labelnames=["source", "status"],  # ok | cycle | depth_exceeded | timeout | error
+)
+DAG_RESOLUTION_DURATION_SECONDS = Histogram(
+    "data_modeling_dag_resolution_duration_seconds",
+    "Wall-clock time spent resolving HogQL view dependencies, by calling path.",
+    labelnames=["source"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
+DAG_RESOLUTION_VIEW_DEPTH = Histogram(
+    "data_modeling_dag_resolution_view_depth",
+    "Maximum nested view depth observed on successful HogQL dependency resolution, by calling path.",
+    labelnames=["source"],
+    buckets=(1, 2, 4, 8, 16, 25, 50, 100),
+)
+DAG_RESOLUTION_DEADLINE_VIOLATIONS = Counter(
+    "data_modeling_dag_resolution_deadline_violations_total",
+    "Resolutions where the deadline elapsed; in soft mode this is observed without raising.",
+    labelnames=["source"],
+)
+
+
+class BoundedResolver(Resolver):
+    """A resolver with a configurable view depth and wall-clock deadline, plus resolution metrics.
+
+    The base Resolver already refuses cycles and applies hard limits on view depth,
+    expansion count and expanded SQL size. This subclass adds (a) a nesting depth
+    below the hard limit, (b) a deadline that raises `ResolutionTimeoutError`, and
+    (c) `DAG_RESOLUTION_*` metrics for data modeling callers.
+
+    When `enforce_bounds=False`, depth and deadline violations emit metrics but
+    do not raise. Cycle detection still raises unconditionally — without it the
+    resolver would loop forever and the deadline check would never run.
+    The core Resolver's hard compilation limits still apply in observe-only mode.
+
+    The deadline is checked on every `visit()` call, not only at view boundaries,
+    so expensive non-join work between views is also interruptible. Metrics
+    (`DAG_RESOLUTION_*`) are emitted from the outermost `visit()` invocation, so
+    every construction-then-visit usage gets a single counter increment.
+
+    `deadline_anchor` is an optional monotonic timestamp that lets multiple
+    BoundedResolver instances share a deadline clock. `prepare_ast_for_printing`
+    invokes nested resolve_types/resolve_lazy_tables calls each of which builds
+    a fresh BoundedResolver via the factory — without a shared anchor, each
+    instance would get its own deadline_seconds budget and the bound would
+    compound. The factory in `bounded_resolver_factory_for_view` seeds one
+    anchor and passes it to every resolver it produces, so the deadline binds
+    end-to-end across the whole query. When omitted, the resolver falls back
+    to its own `start_time`, so standalone construction still works.
+    """
+
+    def __init__(
+        self,
+        *args,
+        initial_view_name: str | None = None,
+        max_view_depth: int = DEFAULT_RESOLUTION_MAX_VIEW_DEPTH,
+        deadline_seconds: float | None = DEFAULT_RESOLUTION_DEADLINE_SECONDS,
+        enforce_bounds: bool = True,
+        deadline_anchor: float | None = None,
+        source: str = RESOLUTION_SOURCE_OTHER,
+        **kwargs,
+    ):
+        super().__init__(*args, initial_view_name=initial_view_name, **kwargs)
+        self.source = source
+        self.max_view_depth = max_view_depth
+        self.deadline_seconds = deadline_seconds
+        self.enforce_bounds = enforce_bounds
+        self.deadline_anchor = deadline_anchor
+        # local clock — for per-resolver metric duration, distinct from deadline_anchor which
+        # may span multiple resolvers from the same factory
+        self.start_time: float | None = None
+        self.max_view_depth_observed = 0
+        self.deadline_violated = False
+
+    def visit(self, node: ast.AST | None):
+        if self.start_time is not None:
+            self._check_deadline()
+            return super().visit(node)
+
+        # outermost call owns metric emission
+        start_time = time.monotonic()
+        self.start_time = start_time
+        self._check_deadline()
+        status: str = "ok"
+        try:
+            return super().visit(node)
+        except BoundedResolverError as e:
+            status = e.status_label
+            raise
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            DAG_RESOLUTION_TOTAL.labels(source=self.source, status=status).inc()
+            DAG_RESOLUTION_DURATION_SECONDS.labels(source=self.source).observe(time.monotonic() - start_time)
+            if status == "ok":
+                DAG_RESOLUTION_VIEW_DEPTH.labels(source=self.source).observe(self.max_view_depth_observed)
+            if self.deadline_violated:
+                DAG_RESOLUTION_DEADLINE_VIOLATIONS.labels(source=self.source).inc()
+
+    def _check_deadline(self) -> None:
+        if self.deadline_seconds is None:
+            return
+        anchor = self.deadline_anchor if self.deadline_anchor is not None else self.start_time
+        if anchor is None:
+            return
+        elapsed = time.monotonic() - anchor
+        if elapsed <= self.deadline_seconds:
+            return
+        if self.enforce_bounds:
+            raise ResolutionTimeoutError(elapsed, self.deadline_seconds, initial_view=self.initial_view_name)
+        # soft mode: record and keep walking — caller opted into observe-only deadlines
+        self.deadline_violated = True
+
+    def _check_saved_view_expansion(self, view_name: str) -> None:
+        super()._check_saved_view_expansion(view_name)
+        next_depth = self.current_view_depth + 1
+        if next_depth > self.max_view_depth_observed:
+            self.max_view_depth_observed = next_depth
+        if self.enforce_bounds and next_depth > self.max_view_depth:
+            raise ResolutionDepthExceededError(next_depth, self.max_view_depth, initial_view=self.initial_view_name)
+
+
+def bounded_resolver_factory_for_view(
+    view_name: str | None,
+    *,
+    deadline_anchor: float | None = None,
+    max_view_depth: int = DEFAULT_RESOLUTION_MAX_VIEW_DEPTH,
+    deadline_seconds: float | None = DEFAULT_RESOLUTION_DEADLINE_SECONDS,
+    enforce_bounds: bool = True,
+    source: str = RESOLUTION_SOURCE_MATERIALIZATION,
+) -> ResolverFactory:
+    """Build a ResolverFactory bound to a specific saved-query view.
+
+    The returned factory matches the signature expected by `prepare_ast_for_printing`
+    and `resolve_types`: it accepts (context, dialect, scopes) and returns a
+    BoundedResolver pre-seeded with the view name so cycle detection works.
+
+    `prepare_ast_for_printing` forwards the factory through `resolve_lazy_tables`,
+    `resolve_in_cohorts`, and `resolve_in_cohorts_conjoined`, so subqueries built
+    mid-transform also resolve through BoundedResolver. All resolvers produced
+    by one factory call share a `deadline_anchor`, so `deadline_seconds` is the
+    total wall-clock budget for the whole `prepare_ast_for_printing` pass, not
+    a per-call budget. Callers may pass an explicit `deadline_anchor` to anchor
+    the clock to an earlier event (e.g. a test fixture); when omitted the
+    factory seeds it with the current monotonic time.
+    """
+    anchor = deadline_anchor if deadline_anchor is not None else time.monotonic()
+
+    def factory(
+        context: HogQLContext,
+        dialect: HogQLDialect,
+        scopes: list[ast.SelectQueryType] | None,
+    ) -> Resolver:
+        return BoundedResolver(
+            scopes=scopes,
+            context=context,
+            dialect=dialect,
+            initial_view_name=view_name,
+            max_view_depth=max_view_depth,
+            deadline_seconds=deadline_seconds,
+            enforce_bounds=enforce_bounds,
+            deadline_anchor=anchor,
+            source=source,
+        )
+
+    return factory
+
+
+# enclosing WITH clauses, innermost first — a name resolves against the closest one
+CteScope = tuple[dict[str, ast.CTE], ...]
+
+
+def _scope_for_union_branches(select_set: ast.SelectSetQuery, scope: CteScope) -> CteScope:
+    """Extend `scope` with the WITH that precedes a union.
+
+    A leading WITH covers every branch of the union, but HogQL parses it onto the first
+    branch's `ctes`. The branches are walked independently, so hoist it first or later
+    branches resolve their CTE references as though they were tables.
+    """
+    leading: ast.SelectQuery | ast.SelectSetQuery = select_set.initial_select_query
+    while isinstance(leading, ast.SelectSetQuery):
+        leading = leading.initial_select_query
+
+    if leading.ctes:
+        return (leading.ctes, *scope)
+    return scope
+
+
+def _lookup_cte(name: str, scope: CteScope) -> ast.CTE | None:
+    for ctes in scope:
+        cte = ctes.get(name)
+        if cte is not None:
+            return cte
+    return None
+
+
+def _select_queries_with_scope(
+    select: ast.SelectQuery | ast.SelectSetQuery, scope: CteScope
+) -> list[tuple[ast.SelectQuery, CteScope]]:
+    """Flatten a query into (leaf SelectQuery, CTE scope) pairs, threading scope per branch.
+
+    A union's leading WITH must scope only that union's own branches. Computing one scope
+    for the whole container and applying it to every flattened leaf loses the WITH that a
+    *nested* union carries in a non-initial branch. Recursing branch by branch keeps each
+    nested union's WITH bound to its own branches, at any depth or position.
+    """
+    if isinstance(select, ast.SelectQuery):
+        return [(select, scope)]
+
+    branch_scope = _scope_for_union_branches(select, scope)
+    result = _select_queries_with_scope(select.initial_select_query, branch_scope)
+    for node in select.subsequent_select_queries:
+        result.extend(_select_queries_with_scope(node.select_query, branch_scope))
+    return result
+
+
+class _SubqueryCollector(TraversingVisitor):
+    """Collect the subqueries a FROM-chain walk never reaches.
+
+    Stops at every nested select rather than descending into it, so the caller can feed
+    each one back through its own loop with the CTE scope that query can see. Skips a
+    join's table and a CTE's body for the same reason: both already have an owner.
+    """
+
+    def __init__(self, root: ast.SelectQuery) -> None:
+        self._root = root
+        self.selects: list[ast.SelectQuery | ast.SelectSetQuery] = []
+
+    def visit_select_query(self, node: ast.SelectQuery) -> None:
+        if node is self._root:
+            super().visit_select_query(node)
+            return
+        self.selects.append(node)
+
+    def visit_select_set_query(self, node: ast.SelectSetQuery) -> None:
+        self.selects.append(node)
+
+    def visit_join_expr(self, node: ast.JoinExpr) -> None:
+        # the FROM-chain walk already reaches node.table, but nothing else reaches an ON
+        # constraint or a table function's arguments
+        self.visit(node.constraint)
+        for arg in node.table_args or []:
+            self.visit(arg)
+        self.visit(node.next_join)
+
+    def visit_cte(self, node: ast.CTE) -> None:
+        # a CTE body is expanded where it is referenced, so that an unreferenced one stays
+        # out of the parent set
+        pass
+
+
+def _subqueries_outside_from(query: ast.SelectQuery) -> list[ast.SelectQuery | ast.SelectSetQuery]:
+    collector = _SubqueryCollector(query)
+    collector.visit(query)
+    return collector.selects
+
+
+def _name_that_reads_view(database: Database, view_name: str) -> str:
+    """The name a view is recorded under as a parent: `models.<stored name>` when that path reads it.
+
+    A warehouse table can take a model's bare name, and then only the `models.` path still reads the
+    model. A view with no such path, like a managed view or an endpoint, keeps its stored name.
+    """
+    qualified_name = f"models.{view_name}"
+    try:
+        table = database.get_table_node(qualified_name).table
+    except ResolutionError:
+        return view_name
+    if isinstance(table, HogQLSavedQuery) and table.name == view_name:
+        return qualified_name
+    return view_name
+
+
+def get_parents_from_model_query(
+    team: Team, model_name: str, model_query: str, database: Database | None = None
+) -> set[str]:
+    """Get parents from a given query.
+
+    The parents of a query are every name it reads: the `FROM` clause, and any subquery
+    that sits elsewhere — a `WHERE`, a `HAVING`, the select list, a join's `ON`.
+    Uses BoundedResolver to detect circular dependencies, cap nested view
+    depth, and enforce a wall-clock deadline on view references. Resolver-level
+    metrics (`DAG_RESOLUTION_*`) are emitted from the resolver itself, so this
+    function does not need its own try/except/metric cascade.
+
+    Args:
+        team: The team context for database resolution.
+        model_name: The name of the saved query being parsed; used as the
+            initial view so cycles back to it are detected.
+        model_query: The HogQL query string to parse.
+        database: An optional prebuilt database to reuse for dependency resolution.
+    """
+    hogql_query = parse_model_query(model_query)
+    context = HogQLContext(
+        team_id=team.pk,
+        team=team,
+        enable_select_queries=True,
+    )
+    context.database = database
+    if context.database is None:
+        # Internal DAG parsing (no user); bypass warehouse HogQL access control so parent-table
+        # resolution sees every referenced table/view.
+        context.database = Database.create_for(
+            context.team_id,
+            modifiers=context.modifiers,
+            team=context.team,
+            bypass_warehouse_access_control=True,
+            allowed_system_tables=DATA_MODELING_ALLOWED_SYSTEM_TABLES,
+        )
+    lineage_database = context.database
+
+    resolver = BoundedResolver(
+        context=context, dialect="hogql", initial_view_name=model_name, source=RESOLUTION_SOURCE_LINEAGE
+    )
+    prepared_ast = resolver.visit(hogql_query)
+
+    if prepared_ast is None:
+        return set()
+
+    # each query is walked with the CTE scopes it can actually see, so a name defined in
+    # one query's WITH never resolves a reference in an unrelated one
+    queries: list[tuple[ast.SelectQuery, CteScope]] = _select_queries_with_scope(prepared_ast, ())
+
+    parents: set[str] = set()
+
+    # track by object id so that a recursive CTE (same object) is only
+    # expanded once, while an inner CTE that shadows an outer name (different
+    # object) is still expanded. The AST holds a strong reference for the
+    # lifetime of this function, so the id() identity is stable.
+    expanded_ctes: set[int] = set()
+
+    def record_or_queue(select: ast.SelectQuery | ast.SelectSetQuery, scope: CteScope) -> None:
+        """Record a view by name, or queue an anonymous query to be walked.
+
+        A saved-query view is itself the parent, so descending past it would report its
+        sources instead of it. A SelectQuery view carries its name; a union body doesn't,
+        so recover that one from the resolver's id map.
+        """
+        if isinstance(select, ast.SelectQuery):
+            view_name = select.view_name
+        else:
+            view_name = resolver.union_view_name_by_id.get(id(select))
+
+        if view_name is not None:
+            parents.add(_name_that_reads_view(lineage_database, view_name))
+        else:
+            queries.extend(_select_queries_with_scope(select, scope))
+
+    while queries:
+        query, scope = queries.pop()
+
+        if query.ctes:
+            scope = (query.ctes, *scope)
+
+        for subquery in _subqueries_outside_from(query):
+            record_or_queue(subquery, scope)
+
+        # a FROM clause is a next_join chain; PIVOT/UNPIVOT over a join nests another chain,
+        # so keep a stack of chains still to walk
+        pending_joins: list[ast.JoinExpr | None] = [query.select_from]
+
+        while pending_joins:
+            join = pending_joins.pop()
+
+            while join is not None:
+                # every table in the FROM is a parent, so keep walking next_join past
+                # subqueries and expanded views rather than stopping at the first one
+                table: ast.Expr | None = join.table
+
+                # PIVOT/UNPIVOT wrap a real source — a table, a subquery, or a whole join — so
+                # unwrap to it; the source is the parent, not the pivot
+                while isinstance(table, ast.PivotExpr | ast.UnpivotExpr):
+                    table = table.table
+
+                if isinstance(table, ast.JoinExpr):
+                    # a pivot over a join result: walk that inner chain too
+                    pending_joins.append(table)
+                    join = join.next_join
+                    continue
+                elif isinstance(table, ast.SelectQuery | ast.SelectSetQuery):
+                    record_or_queue(table, scope)
+                    join = join.next_join
+                    continue
+                elif isinstance(table, ast.ValuesQuery):
+                    # inline literal rows, no parent
+                    join = join.next_join
+                    continue
+
+                if join.table_args is not None:
+                    # Table functions like numbers(), s3(), etc. are not real parents
+                    join = join.next_join
+                    continue
+                elif isinstance(table, ast.Placeholder):
+                    parent_name = table.field
+                elif isinstance(table, ast.Field):
+                    parent_name = ".".join(str(s) for s in table.chain)
+                else:
+                    raise ValueError(f"No handler for {table.__class__.__name__} in get_parents_from_model_query")
+
+                if isinstance(parent_name, str):
+                    cte = _lookup_cte(parent_name, scope)
+                    if cte is None:
+                        parents.add(parent_name)
+                    elif id(cte) not in expanded_ctes:
+                        expanded_ctes.add(id(cte))
+                        if isinstance(cte.expr, ast.SelectQuery | ast.SelectSetQuery):
+                            queries.extend(_select_queries_with_scope(cte.expr, scope))
+
+                join = join.next_join
+
+    return parents
+
+
+class UnknownParentError(Exception):
+    """Exception raised when the parent for a model is not found."""
+
+    def __init__(self, parent: str, query: str):
+        super().__init__(
+            f"The parent name {parent} does not correspond to an existing PostHog table, Data Warehouse Table, or Data Warehouse Saved Query."
+        )
+        self.query = query

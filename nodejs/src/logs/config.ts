@@ -1,0 +1,258 @@
+import {
+    KAFKA_APP_METRICS_2,
+    KAFKA_LOGS_CLICKHOUSE,
+    KAFKA_LOGS_INGESTION,
+    KAFKA_LOGS_INGESTION_DLQ,
+    KAFKA_LOGS_INGESTION_OVERFLOW,
+    KAFKA_LOG_ENTRIES,
+    KAFKA_TRACES_CLICKHOUSE,
+    KAFKA_TRACES_INGESTION,
+    KAFKA_TRACES_INGESTION_DLQ,
+    KAFKA_TRACES_INGESTION_OVERFLOW,
+} from '~/common/config/kafka-topics'
+import { isProdEnv } from '~/common/utils/env-utils'
+
+import { LogsProducerName, WARPSTREAM_INGESTION_PRODUCER, WARPSTREAM_LOGS_PRODUCER } from './outputs/producers'
+
+export type LogsIngestionOutputsConfig = {
+    LOGS_INGESTION_OUTPUT_APP_METRICS_TOPIC: string
+    LOGS_INGESTION_OUTPUT_APP_METRICS_PRODUCER: LogsProducerName
+    LOGS_INGESTION_OUTPUT_LOG_ENTRIES_TOPIC: string
+    LOGS_INGESTION_OUTPUT_LOG_ENTRIES_PRODUCER: LogsProducerName
+    LOGS_INGESTION_OUTPUT_LOGS_PRODUCER: LogsProducerName
+    LOGS_INGESTION_OUTPUT_DLQ_PRODUCER: LogsProducerName
+}
+
+export function getDefaultLogsIngestionOutputsConfig(): LogsIngestionOutputsConfig {
+    return {
+        LOGS_INGESTION_OUTPUT_APP_METRICS_TOPIC: KAFKA_APP_METRICS_2,
+        LOGS_INGESTION_OUTPUT_APP_METRICS_PRODUCER: WARPSTREAM_INGESTION_PRODUCER,
+        LOGS_INGESTION_OUTPUT_LOG_ENTRIES_TOPIC: KAFKA_LOG_ENTRIES,
+        LOGS_INGESTION_OUTPUT_LOG_ENTRIES_PRODUCER: WARPSTREAM_INGESTION_PRODUCER,
+        LOGS_INGESTION_OUTPUT_LOGS_PRODUCER: WARPSTREAM_LOGS_PRODUCER,
+        LOGS_INGESTION_OUTPUT_DLQ_PRODUCER: WARPSTREAM_LOGS_PRODUCER,
+    }
+}
+
+export type LogsIngestionConsumerConfig = {
+    LOGS_INGESTION_CONSUMER_GROUP_ID: string
+    LOGS_INGESTION_CONSUMER_CONSUME_TOPIC: string
+    LOGS_INGESTION_CONSUMER_OVERFLOW_TOPIC: string
+    LOGS_INGESTION_CONSUMER_DLQ_TOPIC: string
+    LOGS_INGESTION_CONSUMER_CLICKHOUSE_TOPIC: string
+    LOGS_REDIS_HOST: string
+    LOGS_REDIS_PORT: number
+    LOGS_REDIS_PASSWORD: string
+    LOGS_REDIS_TLS: boolean
+    LOGS_LIMITER_ENABLED_TEAMS: string
+    LOGS_LIMITER_DISABLED_FOR_TEAMS: string
+    LOGS_LIMITER_BUCKET_SIZE_KB: number
+    LOGS_LIMITER_REFILL_RATE_KB_PER_SECOND: number
+    LOGS_LIMITER_TTL_SECONDS: number
+    LOGS_LIMITER_TEAM_BUCKET_SIZE_KB: string
+    LOGS_LIMITER_TEAM_REFILL_RATE_KB_PER_SECOND: string
+    /** Comma-separated team IDs, or `*` for all teams, or empty to disable sampling evaluation entirely. Default `*`; set empty in env to turn off globally. */
+    LOGS_SAMPLING_ENABLED_TEAMS: string
+    /** When `true`, sampling always keeps every record (metrics path may still run). */
+    LOGS_SAMPLING_KILLSWITCH: boolean
+    /** Comma-separated team IDs, or `*` for all teams, or empty to disable metric-rule evaluation entirely. */
+    LOGS_METRICS_RULES_ENABLED_TEAMS: string
+    /** When `true`, metric-rule evaluation and emission are skipped for every team. */
+    LOGS_METRICS_RULES_KILLSWITCH: boolean
+    /** Comma-separated team IDs, or `*` for all teams, that also get the built-in default metric rules. Independent of `LOGS_METRICS_RULES_ENABLED_TEAMS`. */
+    LOGS_DEFAULT_METRIC_RULES_ENABLED_TEAMS: string
+    /** Comma-separated team IDs, or `*` for all teams, whose metric-rule points are summed per series over `LOGS_METRICS_RULES_WINDOW_MS` instead of sent once per batch. */
+    LOGS_METRICS_RULES_WINDOW_TEAMS: string
+    /** Window for `LOGS_METRICS_RULES_WINDOW_TEAMS`, rounded to whole 10 s steps. */
+    LOGS_METRICS_RULES_WINDOW_MS: number
+    /** capture-logs OTLP metrics endpoint (e.g. `http://capture-logs:3308/i/v1/metrics`); empty disables emission. */
+    LOGS_METRICS_RULES_EXPORT_URL: string
+    /** Comma-separated team IDs, or `*` for all teams, or empty to disable per-row retention rule evaluation entirely. */
+    LOGS_RETENTION_ENABLED_TEAMS: string
+    /** Comma-separated team IDs, or `*` for all teams. A `backfill_days` message from any other team is dropped. */
+    LOGS_BACKFILL_ENABLED_TEAMS: string
+    /** When `true`, retention rules are never evaluated (rows keep the team default via the batch header). */
+    LOGS_RETENTION_KILLSWITCH: boolean
+    /** Comma-separated team IDs, or `*` for all teams. A `posthog-internal` batch from any other team is billed as normal. */
+    LOGS_INTERNAL_INGESTION_ENABLED_TEAMS: string
+    /** Secret. Comma-separated HMAC keys, newest first. Producers sign with the first key, and the consumer accepts any. */
+    LOGS_INTERNAL_INGESTION_SIGNING_KEYS: string
+    /** MUST be the in-cluster capture-logs service, never a public endpoint: the signature makes logs unbilled. Empty disables sending. */
+    LOGS_INTERNAL_PRODUCER_URL: string
+    /** Comma-separated team IDs, or `*` for all teams, whose internal logs a producer sends to the logs product. */
+    LOGS_INTERNAL_PRODUCER_TEAMS: string
+    /** Requests a producer keeps open at once. A batch over this cap waits in the buffer. */
+    LOGS_INTERNAL_PRODUCER_MAX_IN_FLIGHT: number
+    /** Bytes of records a producer holds while capture-logs is slow or down. A record that does not fit is dropped. */
+    LOGS_INTERNAL_PRODUCER_MAX_BUFFERED_BYTES: number
+    /** How long a producer retries one batch before it gives up on it. */
+    LOGS_INTERNAL_PRODUCER_RETRY_TIMEOUT_MS: number
+    /** Comma-separated team IDs, or `*` for all teams, or empty (default) to disable measure-only pattern masking. */
+    LOGS_PATTERN_MASKING_ENABLED_TEAMS: string
+    LOGS_JSON_ATTRIBUTE_PARSING_ENABLED_TEAMS: string
+    LOGS_JSON_ATTRIBUTE_EXTRACTION_ENABLED_TEAMS: string
+    /**
+     * When `true`, rows removed by drop rules are credited back to the billed usage metrics
+     * (`bytes_ingested` / `records_ingested`). When `false` (default), the credit is only
+     * computed and observable via the `logs_ingestion_billing_*_credited_total` counters
+     * (shadow mode) — billing is unchanged.
+     */
+    LOGS_BILLING_PRORATE_ENABLED: boolean
+    LOGS_INGESTION_USE_FRAMEWORK: boolean
+    /** Comma-separated team IDs, or `*` for all teams, or empty (default) to disable hog log transformations entirely. */
+    LOGS_TRANSFORMATIONS_ENABLED_TEAMS: string
+    /** When `true`, hog log transformations are skipped regardless of the allowlist. */
+    LOGS_TRANSFORMATIONS_KILLSWITCH: boolean
+    /** Hard per-record HogVM kill in milliseconds. */
+    LOGS_TRANSFORMATIONS_HOG_TIMEOUT_MS: number
+    /** Cumulative HogVM time budget per Kafka message; exhaustion skips remaining records (fail-open). */
+    LOGS_TRANSFORMATIONS_MESSAGE_BUDGET_MS: number
+    /** Cumulative HogVM time budget per consumer batch; bounds worst-case added batch latency. */
+    LOGS_TRANSFORMATIONS_BATCH_BUDGET_MS: number
+    /** Max failed invocations whose logs are captured, per function per message. */
+    LOGS_TRANSFORMATIONS_MAX_ERROR_LOGS_PER_FUNCTION: number
+    REDIS_URL: string
+    REDIS_POOL_MIN_SIZE: number
+    REDIS_POOL_MAX_SIZE: number
+    KAFKA_CLIENT_RACK: string | undefined
+}
+
+export function getDefaultLogsIngestionConsumerConfig(): LogsIngestionConsumerConfig {
+    return {
+        LOGS_INGESTION_CONSUMER_GROUP_ID: 'ingestion-logs',
+        LOGS_INGESTION_CONSUMER_CONSUME_TOPIC: KAFKA_LOGS_INGESTION,
+        LOGS_INGESTION_CONSUMER_OVERFLOW_TOPIC: KAFKA_LOGS_INGESTION_OVERFLOW,
+        LOGS_INGESTION_CONSUMER_DLQ_TOPIC: KAFKA_LOGS_INGESTION_DLQ,
+        LOGS_INGESTION_CONSUMER_CLICKHOUSE_TOPIC: KAFKA_LOGS_CLICKHOUSE,
+        LOGS_REDIS_HOST: '127.0.0.1',
+        LOGS_REDIS_PORT: 6379,
+        LOGS_REDIS_PASSWORD: '',
+        LOGS_REDIS_TLS: isProdEnv() ? true : false,
+        LOGS_LIMITER_ENABLED_TEAMS: isProdEnv() ? '' : '*',
+        LOGS_LIMITER_DISABLED_FOR_TEAMS: '',
+        LOGS_LIMITER_BUCKET_SIZE_KB: 10000,
+        LOGS_LIMITER_REFILL_RATE_KB_PER_SECOND: 1000,
+        LOGS_LIMITER_TTL_SECONDS: 60 * 60 * 24,
+        LOGS_LIMITER_TEAM_BUCKET_SIZE_KB: '',
+        LOGS_LIMITER_TEAM_REFILL_RATE_KB_PER_SECOND: '',
+        LOGS_SAMPLING_ENABLED_TEAMS: '*',
+        LOGS_SAMPLING_KILLSWITCH: false,
+        LOGS_METRICS_RULES_ENABLED_TEAMS: isProdEnv() ? '' : '*',
+        LOGS_METRICS_RULES_KILLSWITCH: false,
+        LOGS_METRICS_RULES_EXPORT_URL: '',
+        LOGS_DEFAULT_METRIC_RULES_ENABLED_TEAMS: '',
+        LOGS_METRICS_RULES_WINDOW_TEAMS: '',
+        LOGS_METRICS_RULES_WINDOW_MS: 60_000,
+        // Off in prod until per-team rollout; on in dev for local end-to-end testing.
+        LOGS_RETENTION_ENABLED_TEAMS: isProdEnv() ? '' : '*',
+        LOGS_BACKFILL_ENABLED_TEAMS: isProdEnv() ? '' : '*',
+        LOGS_RETENTION_KILLSWITCH: false,
+        LOGS_INTERNAL_INGESTION_ENABLED_TEAMS: '',
+        LOGS_INTERNAL_INGESTION_SIGNING_KEYS: '',
+        LOGS_INTERNAL_PRODUCER_URL: '',
+        LOGS_INTERNAL_PRODUCER_TEAMS: '',
+        LOGS_INTERNAL_PRODUCER_MAX_IN_FLIGHT: 20,
+        LOGS_INTERNAL_PRODUCER_MAX_BUFFERED_BYTES: 64 * 1024 * 1024,
+        // The librdkafka default message.timeout.ms, so a record retries as long as the log_entries Kafka write beside it.
+        LOGS_INTERNAL_PRODUCER_RETRY_TIMEOUT_MS: 300_000,
+        // Off by default: enabling forces decode+re-encode for allowlisted teams.
+        LOGS_PATTERN_MASKING_ENABLED_TEAMS: '',
+        LOGS_JSON_ATTRIBUTE_PARSING_ENABLED_TEAMS: '',
+        LOGS_JSON_ATTRIBUTE_EXTRACTION_ENABLED_TEAMS: '',
+        LOGS_BILLING_PRORATE_ENABLED: false,
+        LOGS_INGESTION_USE_FRAMEWORK: false,
+        LOGS_TRANSFORMATIONS_ENABLED_TEAMS: '',
+        LOGS_TRANSFORMATIONS_KILLSWITCH: false,
+        LOGS_TRANSFORMATIONS_HOG_TIMEOUT_MS: 10,
+        // A regex-heavy scrub measured ~95µs/record (see transformations/benchmarks/);
+        // 100ms covers one such function over a full ~1,100-record message.
+        LOGS_TRANSFORMATIONS_MESSAGE_BUDGET_MS: 100,
+        LOGS_TRANSFORMATIONS_BATCH_BUDGET_MS: 2000,
+        LOGS_TRANSFORMATIONS_MAX_ERROR_LOGS_PER_FUNCTION: 3,
+        // Overlapping fields with CommonConfig, included for standalone usage
+        // ok to connect to localhost over plaintext
+        // nosemgrep: trailofbits.generic.redis-unencrypted-transport.redis-unencrypted-transport
+        REDIS_URL: 'redis://127.0.0.1',
+        REDIS_POOL_MIN_SIZE: 1,
+        REDIS_POOL_MAX_SIZE: 3,
+        KAFKA_CLIENT_RACK: undefined,
+    }
+}
+
+export type TracesIngestionConsumerConfig = {
+    TRACES_INGESTION_CONSUMER_GROUP_ID: string
+    TRACES_INGESTION_CONSUMER_CONSUME_TOPIC: string
+    TRACES_INGESTION_CONSUMER_OVERFLOW_TOPIC: string
+    TRACES_INGESTION_CONSUMER_DLQ_TOPIC: string
+    TRACES_INGESTION_CONSUMER_CLICKHOUSE_TOPIC: string
+    TRACES_REDIS_HOST: string
+    TRACES_REDIS_PORT: number
+    TRACES_REDIS_PASSWORD: string
+    TRACES_REDIS_TLS: boolean
+    TRACES_LIMITER_ENABLED_TEAMS: string
+    TRACES_LIMITER_DISABLED_FOR_TEAMS: string
+    TRACES_LIMITER_BUCKET_SIZE_KB: number
+    TRACES_LIMITER_REFILL_RATE_KB_PER_SECOND: number
+    TRACES_LIMITER_TTL_SECONDS: number
+    TRACES_LIMITER_TEAM_BUCKET_SIZE_KB: string
+    TRACES_LIMITER_TEAM_REFILL_RATE_KB_PER_SECOND: string
+    TRACES_METRICS_RULES_ENABLED_TEAMS: string
+    TRACES_METRICS_RULES_KILLSWITCH: boolean
+    TRACES_METRICS_RULES_EXPORT_URL: string
+    /** Comma-separated team IDs, or `*` for all teams, that also get the built-in default span metric rules. */
+    TRACES_DEFAULT_METRIC_RULES_ENABLED_TEAMS: string
+    /** Comma-separated team IDs, or `*` for all teams, or empty to disable per-row span retention rules. */
+    TRACES_RETENTION_ENABLED_TEAMS: string
+    /** When `true`, span retention rules are never evaluated (spans keep the team default via the batch header). */
+    TRACES_RETENTION_KILLSWITCH: boolean
+    TRACES_INGESTION_USE_FRAMEWORK: boolean
+    /** Comma-separated team IDs, or `*` for all teams, or empty to disable span drop rules and rate limits. */
+    TRACES_SAMPLING_ENABLED_TEAMS: string
+    /** When `true`, span drop rules and rate limits are never evaluated. */
+    TRACES_SAMPLING_KILLSWITCH: boolean
+    REDIS_URL: string
+    REDIS_POOL_MIN_SIZE: number
+    REDIS_POOL_MAX_SIZE: number
+    KAFKA_CLIENT_RACK: string | undefined
+}
+
+export function getDefaultTracesIngestionConsumerConfig(): TracesIngestionConsumerConfig {
+    return {
+        TRACES_INGESTION_CONSUMER_GROUP_ID: 'ingestion-traces',
+        TRACES_INGESTION_CONSUMER_CONSUME_TOPIC: KAFKA_TRACES_INGESTION,
+        TRACES_INGESTION_CONSUMER_OVERFLOW_TOPIC: KAFKA_TRACES_INGESTION_OVERFLOW,
+        TRACES_INGESTION_CONSUMER_DLQ_TOPIC: KAFKA_TRACES_INGESTION_DLQ,
+        TRACES_INGESTION_CONSUMER_CLICKHOUSE_TOPIC: KAFKA_TRACES_CLICKHOUSE,
+        TRACES_REDIS_HOST: '127.0.0.1',
+        TRACES_REDIS_PORT: 6379,
+        TRACES_REDIS_PASSWORD: '',
+        TRACES_REDIS_TLS: isProdEnv() ? true : false,
+        TRACES_LIMITER_ENABLED_TEAMS: isProdEnv() ? '' : '*',
+        TRACES_LIMITER_DISABLED_FOR_TEAMS: '',
+        TRACES_LIMITER_BUCKET_SIZE_KB: 10000,
+        TRACES_LIMITER_REFILL_RATE_KB_PER_SECOND: 1000,
+        TRACES_LIMITER_TTL_SECONDS: 60 * 60 * 24,
+        TRACES_LIMITER_TEAM_BUCKET_SIZE_KB: '',
+        TRACES_LIMITER_TEAM_REFILL_RATE_KB_PER_SECOND: '',
+        // Mirror the logs default: enabled for all teams on the dev stack so a span rule
+        // works out of the box locally, off in prod until explicitly enabled per team.
+        TRACES_METRICS_RULES_ENABLED_TEAMS: isProdEnv() ? '' : '*',
+        TRACES_METRICS_RULES_KILLSWITCH: false,
+        TRACES_METRICS_RULES_EXPORT_URL: '',
+        TRACES_DEFAULT_METRIC_RULES_ENABLED_TEAMS: '',
+        // Same rollout shape as the logs retention rules: on locally, off in prod until enabled per team.
+        TRACES_RETENTION_ENABLED_TEAMS: isProdEnv() ? '' : '*',
+        TRACES_RETENTION_KILLSWITCH: false,
+        TRACES_INGESTION_USE_FRAMEWORK: false,
+        // Span drop rules follow the same rollout: on locally, off in prod until enabled per team.
+        TRACES_SAMPLING_ENABLED_TEAMS: isProdEnv() ? '' : '*',
+        TRACES_SAMPLING_KILLSWITCH: false,
+        // Overlapping fields with CommonConfig, included for standalone usage
+        // ok to connect to localhost over plaintext
+        // nosemgrep: trailofbits.generic.redis-unencrypted-transport.redis-unencrypted-transport
+        REDIS_URL: 'redis://127.0.0.1',
+        REDIS_POOL_MIN_SIZE: 1,
+        REDIS_POOL_MAX_SIZE: 3,
+        KAFKA_CLIENT_RACK: undefined,
+    }
+}

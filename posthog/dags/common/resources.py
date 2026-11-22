@@ -1,0 +1,456 @@
+import json
+import socket
+import asyncio
+from dataclasses import dataclass
+from typing import Any
+
+import dagster
+import psycopg2
+import requests
+import tenacity
+import psycopg2.extras
+import posthoganalytics
+from clickhouse_driver.errors import Error, ErrorCodes
+
+from posthog import settings
+from posthog.clickhouse.backoff import ExponentialBackoff
+from posthog.clickhouse.client.connection import (
+    ClickHouseCredentials,
+    ClickHouseUser,
+    get_clickhouse_creds,
+    is_file_backed_user,
+)
+from posthog.clickhouse.cluster import ClickhouseCluster, RetryPolicy, get_cluster
+from posthog.redis import get_client, redis
+from posthog.utils import initialize_self_capture_api_token
+
+
+def _is_retryable_clickhouse_exception(e: Exception) -> bool:
+    """Check if a ClickHouse-related exception should be retried.
+
+    Handles both ClickHouse driver errors (with specific error codes) and
+    network-level exceptions like socket timeouts.
+    """
+    # Network-level exceptions (socket timeouts, connection errors)
+    if isinstance(e, (TimeoutError, socket.timeout, OSError, ConnectionError)):
+        return True
+
+    # ClickHouse driver-specific errors
+    return isinstance(e, Error) and (
+        (
+            e.code
+            in (  # these are typically transient errors and unrelated to the query being executed
+                ErrorCodes.NETWORK_ERROR,
+                ErrorCodes.TOO_MANY_SIMULTANEOUS_QUERIES,
+                ErrorCodes.NOT_ENOUGH_SPACE,
+                ErrorCodes.SOCKET_TIMEOUT,
+                # Raised by waitMutationToFinishOnReplicas / cross-replica reads when the
+                # coordinator's snapshot of active replicas momentarily lacks the covering
+                # part (e.g. mid-fetch, mid-merge) or no replica is online. The mutation
+                # itself usually proceeds; the wait is what fails. Retry to re-poll.
+                ErrorCodes.NO_REPLICA_HAS_PART,  # 234
+                ErrorCodes.NO_ACTIVE_REPLICAS,  # 254
+                439,  # CANNOT_SCHEDULE_TASK: "Cannot schedule a task: cannot allocate thread"
+            )
+        )
+        # queries that exceed memory limits can be retried if they were killed due to total server
+        # memory consumption, but we should avoid retrying queries that were killed due to query limits
+        or (e.code == ErrorCodes.MEMORY_LIMIT_EXCEEDED and "Memory limit (total) exceeded" in e.message)
+    )
+
+
+def _dedicated_user_connection_overrides(creds: ClickHouseCredentials) -> dict[str, Any]:
+    """Build get_cluster connection_overrides for a dedicated ClickHouse user.
+
+    Mirrors the file-backed branch of get_pool: a user whose credential comes from a rotating token
+    file passes a credential_provider so RefreshingChPool re-stamps the live token on each checkout,
+    while a static-password user passes the password directly. get_cluster leaves the user override
+    untouched, so the pool authenticates as this user with this user's credential.
+    """
+    overrides: dict[str, Any] = {"user": creds.user}
+    if is_file_backed_user(creds, creds.user):
+        overrides["credential_provider"] = creds.read_password
+    else:
+        overrides["password"] = creds.password
+    return overrides
+
+
+class ClickhouseClusterResource(dagster.ConfigurableResource):
+    """
+    The ClickHouse cluster used to run the job.
+    """
+
+    client_settings: dict[str, str] = {
+        "lightweight_deletes_sync": "0",
+        "max_execution_time": "0",
+        "max_memory_usage": "0",
+        "mutations_sync": "0",
+        "receive_timeout": f"{15 * 60}",  # some synchronous queries like dictionary checksumming can be very slow to return
+    }
+
+    host: str = settings.CLICKHOUSE_HOST
+    cluster: str | None = None
+    retry_max_attempts: int = 8
+
+    def create_resource(self, context: dagster.InitResourceContext) -> ClickhouseCluster:
+        return get_cluster(
+            context.log,
+            host=self.host,
+            cluster=self.cluster,
+            client_settings=self.client_settings,
+            retry_policy=RetryPolicy(
+                max_attempts=self.retry_max_attempts,
+                delay=ExponentialBackoff(delay=20, max_delay=60),
+                exceptions=_is_retryable_clickhouse_exception,
+            ),
+        )
+
+
+class SatelliteClickhouseClusterResource(dagster.ConfigurableResource):
+    max_execution_time: int
+    max_memory_usage: int
+    satellite_cluster: str
+
+    # OPS is discoverable only from the migrations host/cluster: satellite discovery runs
+    # clusterAllReplicas(ops, system.clusters) WHERE cluster = <migrations cluster>, which the default
+    # app host/cluster don't match. Mirrors get_migrations_cluster, the path migrations use to reach OPS.
+    host: str = settings.CLICKHOUSE_MIGRATIONS_HOST
+    cluster: str = settings.CLICKHOUSE_MIGRATIONS_CLUSTER
+
+    def create_resource(self, context: dagster.InitResourceContext) -> ClickhouseCluster:
+        return get_cluster(
+            context.log,
+            host=self.host,
+            cluster=self.cluster,
+            satellite_clusters=[self.satellite_cluster],
+            client_settings={
+                "max_execution_time": str(self.max_execution_time),
+                "max_memory_usage": str(self.max_memory_usage),
+                # Socket read timeout must outlast the query's own time cap.
+                "receive_timeout": str(self.max_execution_time + 300),
+                "mutations_sync": "0",
+            },
+            retry_policy=RetryPolicy(
+                max_attempts=2,
+                delay=ExponentialBackoff(delay=20, max_delay=60),
+                exceptions=_is_retryable_clickhouse_exception,
+            ),
+        )
+
+
+class OpsClickhouseClusterResource(SatelliteClickhouseClusterResource):
+    satellite_cluster: str = settings.CLICKHOUSE_OPS_CLUSTER
+
+
+class BackupsClickhouseClusterResource(dagster.ConfigurableResource):
+    """
+    ClickHouse cluster resource that connects as the dedicated 'backups' user.
+
+    Requires CLICKHOUSE_BACKUPS_USER and either CLICKHOUSE_BACKUPS_PASSWORD or
+    CLICKHOUSE_BACKUPS_PASSWORD_FILE env vars.
+    The backups user must have a server-side settings profile with
+    use_concurrency_control=0 (configured in users.xml via Ansible) because
+    async BACKUP threads don't inherit session-level settings.
+    """
+
+    host: str = settings.CLICKHOUSE_HOST
+    cluster: str = settings.CLICKHOUSE_CLUSTER
+
+    client_settings: dict[str, str] = {
+        "max_execution_time": "0",
+        "max_memory_usage": "0",
+        "mutations_sync": "0",
+        "receive_timeout": f"{60 * 60}",  # backups can take a long time
+    }
+
+    def create_resource(self, context: dagster.InitResourceContext) -> ClickhouseCluster:
+        assert context.log is not None
+        creds = get_clickhouse_creds(ClickHouseUser.BACKUPS)
+        from django.conf import settings as django_settings
+
+        if creds.user == django_settings.CLICKHOUSE_USER:
+            context.log.warning(
+                "CLICKHOUSE_BACKUPS_USER not configured, falling back to default user. "
+                "Backups will not use the dedicated 'backups' profile with use_concurrency_control=0."
+            )
+        return get_cluster(
+            context.log,
+            host=self.host,
+            cluster=self.cluster,
+            client_settings=self.client_settings,
+            retry_policy=RetryPolicy(
+                max_attempts=8,
+                delay=ExponentialBackoff(delay=20, max_delay=60),
+                exceptions=_is_retryable_clickhouse_exception,
+            ),
+            connection_overrides=_dedicated_user_connection_overrides(creds),
+        )
+
+
+class PartBreakerClickhouseClusterResource(dagster.ConfigurableResource):
+    """
+    ClickHouse cluster resource that connects as the dedicated 'part_breaker' user.
+
+    Requires CLICKHOUSE_PART_BREAKER_USER and either CLICKHOUSE_PART_BREAKER_PASSWORD or
+    CLICKHOUSE_PART_BREAKER_PASSWORD_FILE env vars.
+    The part_breaker user needs SELECT on system tables, CREATE/DROP/INSERT/ALTER on
+    staging tables, and ALTER FREEZE / DROP PART on source tables.
+    """
+
+    client_settings: dict[str, str] = {
+        "max_execution_time": str(settings.PART_BREAKER_MAX_EXECUTION_TIME),  # default 24h
+        "max_memory_usage": str(settings.PART_BREAKER_MAX_MEMORY_USAGE),  # default 128 GiB
+        "receive_timeout": str(settings.PART_BREAKER_RECEIVE_TIMEOUT),  # default 48h
+    }
+
+    def create_resource(self, context: dagster.InitResourceContext) -> ClickhouseCluster:
+        assert context.log is not None
+        creds = get_clickhouse_creds(ClickHouseUser.PART_BREAKER)
+        from django.conf import settings as django_settings
+
+        if creds.user == django_settings.CLICKHOUSE_USER:
+            context.log.warning(
+                f"CLICKHOUSE_PART_BREAKER_USER not configured, falling back to default user '{creds.user}'. "
+                "Part breaker will not use a dedicated user with restricted permissions."
+            )
+        return get_cluster(
+            context.log,
+            client_settings=self.client_settings,
+            retry_policy=RetryPolicy(
+                max_attempts=8,
+                delay=ExponentialBackoff(delay=20, max_delay=60),
+                exceptions=_is_retryable_clickhouse_exception,
+            ),
+            connection_overrides=_dedicated_user_connection_overrides(creds),
+        )
+
+
+class RedisResource(dagster.ConfigurableResource):
+    """
+    A Redis resource that can be used to store and retrieve data.
+    """
+
+    def create_resource(self, context: dagster.InitResourceContext) -> redis.Redis:
+        client = get_client()
+        return client
+
+
+class PostgresResource(dagster.ConfigurableResource):
+    """
+    A Postgres database connection resource that returns a psycopg2 connection.
+    """
+
+    host: str
+    port: str = "5432"
+    database: str
+    user: str
+    password: str
+
+    def create_resource(self, context: dagster.InitResourceContext) -> psycopg2.extensions.connection:
+        # Without a timeout a blackholed route hangs this connect for the OS TCP timeout
+        # (about two minutes) and the step emits nothing while it waits.
+        return psycopg2.connect(
+            host=self.host,
+            port=int(self.port),
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            connect_timeout=10,
+        )
+
+
+class PostHogAnalyticsResource(dagster.ConfigurableResource):
+    personal_api_key: str | None
+
+    def create_resource(self, context: dagster.InitResourceContext):
+        assert context.log is not None
+
+        context.log.info("Initializing PostHogAnalyticsResource")
+
+        if not (self.personal_api_key or "").strip() and not (posthoganalytics.personal_api_key or "").strip():
+            context.log.warning(
+                "Personal API key not set on the PostHogAnalyticsResource. Local feature flag evaluation will not work."
+            )
+
+        asyncio.run(initialize_self_capture_api_token())
+        posthoganalytics.personal_api_key = self.personal_api_key  # ty: ignore[invalid-assignment]
+
+        return None
+
+
+class PostgresURL(dagster.ConfigurableResource):
+    """A Postgres connection URL handed to the op unopened.
+
+    An op that connects in its own body turns a connect failure into a step failure, which is
+    what lets failure hooks run; a connection opened at resource init fails before the step
+    exists and no hook fires. It also lets a dry run skip the connect entirely.
+    """
+
+    connection_url: str
+
+    def create_resource(self, context: dagster.InitResourceContext) -> str:
+        return self.connection_url
+
+
+def _is_retryable_http_error(exception: BaseException) -> bool:
+    """Check if an HTTP error should be retried."""
+    if isinstance(exception, requests.exceptions.HTTPError):
+        response = exception.response
+        if response is not None and response.status_code in {429, 500, 502, 503, 504}:
+            return True
+    return isinstance(exception, requests.exceptions.ConnectionError)
+
+
+@dataclass
+class ClayBatchResult:
+    """Result from create_batches containing batches and stats for monitoring."""
+
+    batches: list[list[dict]]
+    truncated_count: int
+    skipped_count: int
+
+
+class ClayWebhookResource(dagster.ConfigurableResource):
+    """Clay webhook client for sending enriched contact data."""
+
+    webhook_url: str
+    api_key: str
+    timeout: int = 60
+    max_batch_bytes: int = 90_000  # 90KB, leaving margin under Clay's 100KB limit
+    max_records_per_batch: int = 10  # Rate limit friendly (Clay allows 10 records/sec sustained)
+    max_retries: int = 3
+
+    def _truncate_record_to_fit(self, record: dict, truncatable_fields: list[str]) -> dict:
+        """Truncate array fields in a record to fit within max_batch_bytes."""
+        record = record.copy()
+        record_size = self._get_batch_size([record])
+
+        if record_size <= self.max_batch_bytes:
+            return record
+
+        # Progressively truncate fields until it fits
+        for field in truncatable_fields:
+            if field not in record or not isinstance(record[field], list):
+                continue
+
+            arr = record[field]
+            if not arr:
+                continue
+
+            # Progressively halve array length until it fits
+            while len(arr) > 0 and record_size > self.max_batch_bytes:
+                # Halve the array length each iteration
+                new_len = max(1, len(arr) // 2)
+                if new_len == len(arr):
+                    new_len = 0
+                record[field] = arr[:new_len]
+                record_size = self._get_batch_size([record])
+                arr = record[field]
+
+            if record_size <= self.max_batch_bytes:
+                break
+
+        return record
+
+    def _post(self, session: requests.Session, data: list[dict]) -> requests.Response:
+        """Make a POST request to the webhook."""
+        headers = {
+            "x-clay-webhook-auth": self.api_key,
+            "Content-Type": "application/json",
+        }
+        response = session.post(
+            self.webhook_url,
+            json=data,
+            headers=headers,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response
+
+    def _send_with_retry(self, session: requests.Session, data: list[dict]) -> requests.Response:
+        """Send data with tenacity retry logic."""
+        retryer = tenacity.Retrying(
+            stop=tenacity.stop_after_attempt(self.max_retries + 1),
+            wait=tenacity.wait_exponential(multiplier=1, min=1, max=10),
+            retry=tenacity.retry_if_exception(_is_retryable_http_error),
+            reraise=True,
+        )
+        return retryer(self._post, session, data)
+
+    def send(self, data: list[dict]) -> requests.Response:
+        """Send data to Clay webhook."""
+        with requests.Session() as session:
+            return self._send_with_retry(session, data)
+
+    def _get_batch_size(self, batch: list[dict]) -> int:
+        """Get the serialized size of a batch in bytes."""
+        return len(json.dumps(batch, default=str).encode("utf-8"))
+
+    def create_batches(
+        self,
+        data: list[dict],
+        logger: Any | None = None,
+        truncatable_fields: list[str] | None = None,
+    ) -> ClayBatchResult:
+        """Split data into batches respecting both record count and byte limits.
+
+        Returns a ClayBatchResult containing:
+        - batches: list of batches, each containing records that fit within
+          max_records_per_batch and max_batch_bytes constraints
+        - truncated_count: number of records that were truncated to fit
+        - skipped_count: number of records that were skipped entirely
+        """
+        if not data:
+            return ClayBatchResult(batches=[], truncated_count=0, skipped_count=0)
+
+        fields = truncatable_fields or []
+        batches: list[list[dict]] = []
+        current_batch: list[dict] = []
+        truncated_count = 0
+        skipped_count = 0
+
+        for record in data:
+            record_size = self._get_batch_size([record])
+            if record_size > self.max_batch_bytes:
+                original_size = record_size
+                record = self._truncate_record_to_fit(record, fields)
+                record_size = self._get_batch_size([record])
+                truncated_count += 1
+                if logger:
+                    logger.info(
+                        "Truncated record for domain %s: %d -> %d bytes",
+                        record.get("domain", "unknown"),
+                        original_size,
+                        record_size,
+                    )
+                if record_size > self.max_batch_bytes:
+                    skipped_count += 1
+                    if logger:
+                        logger.warning(
+                            "Skipped oversized record for domain %s: %d bytes exceeds max %d bytes",
+                            record.get("domain", "unknown"),
+                            record_size,
+                            self.max_batch_bytes,
+                        )
+                    continue
+
+            # Check if adding this record would exceed limits
+            candidate = [*current_batch, record]
+            if len(candidate) > self.max_records_per_batch or self._get_batch_size(candidate) > self.max_batch_bytes:
+                if current_batch:
+                    batches.append(current_batch)
+                current_batch = [record]
+            else:
+                current_batch = candidate
+
+        if current_batch:
+            batches.append(current_batch)
+
+        if logger:
+            if truncated_count > 0:
+                logger.info("Truncated %d records to fit batch size limits", truncated_count)
+            if skipped_count > 0:
+                logger.warning("Skipped %d records that exceeded max batch size", skipped_count)
+
+        return ClayBatchResult(batches=batches, truncated_count=truncated_count, skipped_count=skipped_count)

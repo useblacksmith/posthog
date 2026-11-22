@@ -1,0 +1,546 @@
+import json
+import time
+import hashlib
+import datetime as dt
+import dataclasses
+from dataclasses import dataclass
+from typing import Any
+
+from django.utils import timezone
+
+from rest_framework.exceptions import PermissionDenied, ValidationError
+
+from posthog.schema import FilterLogicalOperator, RecordingsQuery
+
+from posthog.hogql import ast
+from posthog.hogql.constants import HogQLGlobalSettings
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.clickhouse.client.connection import ClickHouseUser
+from posthog.clickhouse.query_tagging import Feature, Product, tag_queries, tags_context
+from posthog.errors import CHQueryErrorTooManyBytes
+from posthog.exceptions import (
+    ClickHouseEstimatedQueryExecutionTimeTooLong,
+    ClickHouseQueryMemoryLimitExceeded,
+    ClickHouseQueryTimeOut,
+)
+from posthog.models import Team, User
+from posthog.session_recordings.queries.session_recording_list_from_query import SessionRecordingListFromQuery
+from posthog.utils import get_safe_cache, safe_cache_set
+
+from products.replay_vision.backend.billing import ESTIMATE_MONTH_DAYS
+from products.replay_vision.backend.models.replay_scanner import ReplayScanner, ScannerType
+from products.replay_vision.backend.queries.scanner_candidate_query import eligibility_predicates
+from products.replay_vision.backend.scope.load import scope_for
+
+# The estimate always projects to a calendar month.
+ESTIMATE_WINDOW_DAYS = ESTIMATE_MONTH_DAYS
+# Fallback sample rate for events subqueries; matched counts are corrected back up.
+_ESTIMATE_EVENTS_SAMPLE_FACTOR = 0.1
+_EXACT_ATTEMPT_BUDGET_FRACTION = 0.5
+
+
+@dataclass(frozen=True, kw_only=True)
+class EstimateBudget:
+    """What a single estimate may spend. Keyword-only because the fields are plain counts, so
+    positional arguments would let a call site swap them without any type error.
+
+    Only windows that are whole weeks are safe to persist. A shorter one inherits whichever weekdays
+    it happened to land on, which biases the monthly projection instead of merely adding noise.
+    """
+
+    # A pathological filter must not be able to hang the caller.
+    max_execution_seconds: int
+    # Scanning a slice and extrapolating: a 30-day scan of event-filtered queries reads billions of rows.
+    scan_window_days: int
+    # Used when the operand rules out sampling, which makes the scan full price. None keeps one window
+    # for both cases, which is what any estimate that gets persisted needs.
+    unsampled_scan_window_days: int | None = None
+    # Skips the exact attempt so the caller blocks for at most one query.
+    sampled_only: bool = False
+    # Reuses a result for the same team, user, and filter for this long. A user tweaking a draft re-sends
+    # the same estimate many times a minute, and each one re-reads a week of events.
+    result_cache_seconds: int = 0
+
+    def window_days(self, *, unsampled: bool) -> int:
+        if unsampled and self.unsampled_scan_window_days is not None:
+            return self.unsampled_scan_window_days
+        return self.scan_window_days
+
+
+# The refresher recomputes at most daily per scanner, so it can afford the full window.
+BATCH_ESTIMATE_BUDGET = EstimateBudget(max_execution_seconds=30, scan_window_days=7)
+# A save blocks the request, so it gets a tighter clock and fails soft. It still writes the persisted
+# number, so the window stays a whole week.
+SAVE_ESTIMATE_BUDGET = EstimateBudget(max_execution_seconds=10, scan_window_days=7, sampled_only=True)
+# The editor's cost preview and Max both re-estimate freely and neither result is persisted, so where
+# sampling is unavailable they take an order-of-magnitude answer from a shorter window.
+PREVIEW_ESTIMATE_BUDGET = EstimateBudget(
+    max_execution_seconds=10, scan_window_days=7, unsampled_scan_window_days=2, result_cache_seconds=300
+)
+
+# The exact count is the expensive half of the exact-then-sampled pair, and on a large team it reads terabytes in
+# its few seconds before timing out. Past this cap it stops and the sampled count answers instead. ClickHouse checks
+# the cap on each server that reads, so a distributed query can read up to this much per shard.
+EXACT_ESTIMATE_MAX_BYTES = 200 * 1024**3
+# A filter whose exact count just failed fails the same way on the next estimate, so the exact attempt is skipped
+# for this long and the sampled count runs straight away.
+EXACT_ESTIMATE_SKIP_TTL_SECONDS = 24 * 3600
+
+# Persisted per-scanner estimates older than this are recomputed by the refresher. Estimates only
+# track data drift between edits (an edit nulls `estimated_at` and refreshes within one cycle), so a
+# slower clock trades projection freshness directly for ClickHouse reads.
+ESTIMATE_STALE_AFTER = dt.timedelta(hours=72)
+# A scanner whose estimate query keeps failing waits this long between attempts, so it can't burn its
+# full ClickHouse budget on every refresher tick.
+ESTIMATE_RETRY_BACKOFF = dt.timedelta(hours=1)
+# Disabled scanners refresh on a slower clock still: fresh enough that re-enabling one puts a usable
+# number into the quota sum, without paying a full-price estimate for every parked scanner.
+DISABLED_ESTIMATE_STALE_AFTER = dt.timedelta(days=7)
+
+
+@dataclass(frozen=True)
+class ScannerVolumeEstimate:
+    matched_sessions: int
+    # May be smaller than the scan window when the team has fewer days of recordings.
+    effective_window_days: int
+    sampled: bool = False
+
+
+@dataclass(frozen=True)
+class _EstimateQueryPlan:
+    combined_query: ast.SelectQuery
+    sampled: bool
+
+
+# One exclusion query covers this many ids, which is also the sweep's chunk size.
+_MATCH_CHECK_ROWS = 1_000
+
+
+class MatchCheckIncomplete(Exception):
+    """The match check could not reach an answer: every fetched recording was excluded and more remain."""
+
+
+def _combines_with_or(query: RecordingsQuery) -> bool:
+    # Read the way the recordings query builder reads it: every operand but AND, an explicit null included, is OR.
+    return query.operand != FilterLogicalOperator.AND_
+
+
+def has_recent_matching_recording(
+    *,
+    team: Team,
+    query: RecordingsQuery,
+    user: User | None,
+    budget: EstimateBudget = PREVIEW_ESTIMATE_BUDGET,
+) -> bool:
+    """Whether the sweep would observe at least one recording that matches `query` in the estimate's window.
+
+    The estimate is no answer to this: it drops negative filters, because they never sample and an
+    over-count is the safe direction for a forecast. This runs the sweep's own selection instead: the
+    recordings list without its in-query blocklists, the sweep's eligibility rules, then the negative
+    filters against the fetched rows, the way `find_scanner_candidates` excludes.
+
+    It reads one batch, because each further page would scan the whole window again. Raises
+    `MatchCheckIncomplete` when the exclusions remove every fetched row and more remain, and lets a
+    timeout or query failure raise, so the caller never reads "no match" from a check that did not
+    finish. Both queries share one deadline from `budget`. `user` is the principal for the exposure
+    access check and the exclusion reads.
+    """
+    deadline = time.monotonic() + budget.max_execution_seconds
+
+    def seconds_left() -> int:
+        remaining = int(deadline - time.monotonic())
+        if remaining < 1:
+            raise TimeoutError("The recent-recording match check ran out of time.")
+        return remaining
+
+    scan_window_days = budget.window_days(unsampled=_combines_with_or(query))
+    windowed = query.model_copy(deep=True)
+    windowed.date_from = (dt.datetime.now(dt.UTC) - dt.timedelta(days=scan_window_days)).isoformat()
+    windowed.date_to = None
+    windowed.limit = _MATCH_CHECK_ROWS
+    windowed.offset = None
+    windowed.after = None
+    extra_having = eligibility_predicates()
+    tag_queries(team_id=team.id, product=Product.REPLAY_VISION, feature=Feature.QUERY)
+    listing = SessionRecordingListFromQuery(
+        team=team,
+        query=windowed,
+        user=user,
+        extra_having_predicates=extra_having,
+        skip_negative_blocklists=True,
+        max_execution_time=seconds_left(),
+        throw_on_timeout=True,
+        resolve_group_properties=ClickHouseUser.APP,
+    )
+    page = listing.run()
+    session_ids = [row["session_id"] for row in page.results]
+    excluded: set[str] = set()
+    for exclusion in listing.excluded_sessions_queries(session_ids) if session_ids else []:
+        response = execute_hogql_query(
+            query=exclusion,
+            team=team,
+            user=user,
+            query_type="ScannerMatchCheckExcludedSessions",
+            settings=HogQLGlobalSettings(max_execution_time=seconds_left(), timeout_overflow_mode="throw"),
+        )
+        excluded.update(row[0] for row in response.results or [])
+    if any(session_id not in excluded for session_id in session_ids):
+        return True
+    if page.has_more_recording:
+        raise MatchCheckIncomplete()
+    return False
+
+
+def estimate_scanner_session_volume(
+    *,
+    team: Team,
+    query: RecordingsQuery,
+    user: User | None = None,
+    ch_user: ClickHouseUser = ClickHouseUser.APP,
+    budget: EstimateBudget = BATCH_ESTIMATE_BUDGET,
+) -> ScannerVolumeEstimate:
+    """Count sessions matching `query` over a recent window, for the scanner cost preview.
+
+    Reuses `SessionRecordingListFromQuery`'s filter compilation so the estimate and the real
+    recordings list agree on what "matches". The exact count runs first; when it times out, is
+    rejected as too slow, or hits a memory limit, it retries with sampled events subqueries and
+    corrects the count back up (`sampled=True` on the result).
+
+    `user` is the principal the experiment_exposure filter's access check runs as. With no
+    principal (a genuinely userless caller, or a scanner whose creator was deleted) the exposure
+    filter is dropped and the broader eligible set counted — an over-count is the safe direction
+    for a budget forecast.
+    """
+    # Sampling is only sound when every match must pass the sampled events leg; under OR, sessions
+    # matched via unsampled branches (persons, cohorts, console logs) would be multiplied by the
+    # correction. Without sampling the scan is full price, so bound its window instead.
+    unsampled = _combines_with_or(query)
+    sample_factor = None if unsampled else _ESTIMATE_EVENTS_SAMPLE_FACTOR
+    scan_window_days = budget.window_days(unsampled=unsampled)
+
+    filter_key = _filter_cache_key(team, query, scan_window_days)
+    result_key = f"{filter_key}:result:{user.pk if user is not None else '-'}"
+    if budget.result_cache_seconds and isinstance(cached := get_safe_cache(result_key), dict):
+        try:
+            return ScannerVolumeEstimate(**cached)
+        except TypeError:
+            pass  # Written before a deploy that changed the fields, so it is recomputed.
+    estimate = _estimate_scanner_session_volume(
+        team=team,
+        query=query,
+        user=user,
+        ch_user=ch_user,
+        budget=budget,
+        sample_factor=sample_factor,
+        scan_window_days=scan_window_days,
+        exact_skip_key=f"{filter_key}:exact-skip",
+        timeout_budget=budget.max_execution_seconds,
+    )
+    if budget.result_cache_seconds:
+        safe_cache_set(result_key, dataclasses.asdict(estimate), budget.result_cache_seconds)
+    return estimate
+
+
+def _estimate_scanner_session_volume(
+    *,
+    team: Team,
+    query: RecordingsQuery,
+    user: User | None,
+    ch_user: ClickHouseUser,
+    budget: EstimateBudget,
+    sample_factor: float | None,
+    scan_window_days: int,
+    exact_skip_key: str,
+    timeout_budget: int,
+) -> ScannerVolumeEstimate:
+    # Per budget for a timeout, which under a preview's short budget says nothing about a longer one.
+    timeout_skip_key = f"{exact_skip_key}:{timeout_budget}"
+    now = dt.datetime.now(dt.UTC)
+    window_start = now - dt.timedelta(days=scan_window_days)
+    windowed = query.model_copy(deep=True)
+    # Exact timestamp — the relative date form truncates to start-of-day, over-counting a day against the divisor.
+    windowed.date_from = window_start.isoformat()
+    windowed.date_to = None
+
+    sampled_plan = _plan_estimate_query(
+        team=team,
+        query=windowed,
+        user=user,
+        sample_factor=sample_factor,
+        scan_window_days=scan_window_days,
+        now=now,
+        ch_user=ch_user,
+    )
+
+    tag_queries(team_id=team.id, product=Product.REPLAY_VISION, feature=Feature.QUERY)
+    if (
+        not sampled_plan.sampled
+        or budget.sampled_only
+        or get_safe_cache(exact_skip_key)
+        or get_safe_cache(timeout_skip_key)
+    ):
+        # Nothing was sampled, so a fallback would rerun the identical query.
+        return _execute_estimate_query(
+            sampled_plan,
+            team=team,
+            query_type=(
+                "ReplayVisionScannerEstimateSampledQuery"
+                if sampled_plan.sampled
+                else "ReplayVisionScannerEstimateQuery"
+            ),
+            max_execution_seconds=budget.max_execution_seconds,
+            scan_window_days=scan_window_days,
+            ch_user=ch_user,
+        )
+
+    exact_plan = _plan_estimate_query(
+        team=team,
+        query=windowed,
+        user=user,
+        sample_factor=None,
+        scan_window_days=scan_window_days,
+        now=now,
+        ch_user=ch_user,
+    )
+    exact_budget = max(1, round(budget.max_execution_seconds * _EXACT_ATTEMPT_BUDGET_FRACTION))
+    try:
+        return _execute_estimate_query(
+            exact_plan,
+            team=team,
+            query_type="ReplayVisionScannerEstimateExactQuery",
+            max_execution_seconds=exact_budget,
+            scan_window_days=scan_window_days,
+            ch_user=ch_user,
+            max_bytes_to_read=EXACT_ESTIMATE_MAX_BYTES,
+        )
+    except (
+        ClickHouseQueryTimeOut,
+        ClickHouseEstimatedQueryExecutionTimeTooLong,
+        ClickHouseQueryMemoryLimitExceeded,
+        CHQueryErrorTooManyBytes,
+    ) as error:
+        # The byte cap is the same under every budget, so hitting it skips the exact count for all of them.
+        skip_key = exact_skip_key if isinstance(error, CHQueryErrorTooManyBytes) else timeout_skip_key
+        safe_cache_set(skip_key, True, EXACT_ESTIMATE_SKIP_TTL_SECONDS)
+        # Full budget: halving it fails teams whose sampled count needs more than half.
+        return _execute_estimate_query(
+            sampled_plan,
+            team=team,
+            query_type="ReplayVisionScannerEstimateSampledQuery",
+            max_execution_seconds=budget.max_execution_seconds,
+            scan_window_days=scan_window_days,
+            ch_user=ch_user,
+        )
+
+
+def _plan_estimate_query(
+    *,
+    team: Team,
+    query: RecordingsQuery,
+    user: User | None,
+    sample_factor: float | None,
+    scan_window_days: int,
+    now: dt.datetime,
+    ch_user: ClickHouseUser,
+) -> _EstimateQueryPlan:
+    # Count only sessions the sweep would actually observe, so the forecast matches the eligible set the candidate query selects.
+    extra_having = eligibility_predicates()
+    # Without a principal the experiment_exposure access check would raise, so drop the filter and
+    # count the broader eligible set: an over-count is the safe direction for a budget forecast.
+    # Callers that have a principal keep the filter and get the real, narrowed count.
+    estimate_query = query
+    if query.experiment_exposure is not None and user is None:
+        estimate_query = query.model_copy(deep=True)
+        estimate_query.experiment_exposure = None
+    list_query = SessionRecordingListFromQuery(
+        team=team,
+        query=estimate_query,
+        user=user,
+        extra_having_predicates=extra_having,
+        events_sample_factor=sample_factor,
+        # Negative filters never sample, so they'd scan at full price; dropping them only over-counts.
+        skip_negative_blocklists=True,
+        # A group filter otherwise joins every group row on each shard, over a week of events.
+        resolve_group_properties=ch_user,
+    )
+    inner = list_query.get_query()
+    # The inner query groups by session_id, so one row is one session; order is irrelevant to a count.
+    inner.order_by = None
+
+    matched_subquery = ast.SelectQuery(
+        select=[ast.Alias(alias="matched", expr=ast.Call(name="count", args=[]))],
+        select_from=ast.JoinExpr(table=inner, alias="_matched"),
+    )
+    earliest_subquery = ast.SelectQuery(
+        select=[
+            ast.Alias(
+                alias="earliest",
+                expr=ast.Call(name="min", args=[ast.Field(chain=["min_first_timestamp"])]),
+            )
+        ],
+        select_from=ast.JoinExpr(table=ast.Field(chain=["raw_session_replay_events"])),
+        # Bounded so the probe partition-prunes; older data clamps the divisor to the scan window anyway.
+        where=ast.CompareOperation(
+            op=ast.CompareOperationOp.GtEq,
+            left=ast.Field(chain=["min_first_timestamp"]),
+            right=ast.Constant(value=now - dt.timedelta(days=scan_window_days + 1)),
+        ),
+    )
+    combined_query = ast.SelectQuery(
+        select=[
+            ast.Field(chain=["m", "matched"]),
+            ast.Field(chain=["e", "earliest"]),
+        ],
+        select_from=ast.JoinExpr(
+            table=matched_subquery,
+            alias="m",
+            next_join=ast.JoinExpr(
+                join_type="CROSS JOIN",
+                table=earliest_subquery,
+                alias="e",
+            ),
+        ),
+    )
+    return _EstimateQueryPlan(combined_query=combined_query, sampled=list_query.events_subqueries_sampled)
+
+
+def _execute_estimate_query(
+    plan: _EstimateQueryPlan,
+    *,
+    team: Team,
+    query_type: str,
+    max_execution_seconds: int,
+    scan_window_days: int,
+    ch_user: ClickHouseUser,
+    max_bytes_to_read: int | None = None,
+) -> ScannerVolumeEstimate:
+    response = execute_hogql_query(
+        query=plan.combined_query,
+        team=team,
+        query_type=query_type,
+        # "throw" so a timeout or the byte cap raises instead of returning a partial count as exact.
+        settings=HogQLGlobalSettings(
+            max_execution_time=max_execution_seconds,
+            timeout_overflow_mode="throw",
+            max_bytes_to_read=max_bytes_to_read,
+            read_overflow_mode="throw" if max_bytes_to_read is not None else None,
+        ),
+        ch_user=ch_user,
+    )
+    results = response.results or []
+    matched = int(results[0][0]) if results else 0
+    if plan.sampled:
+        matched = round(matched / _ESTIMATE_EVENTS_SAMPLE_FACTOR)
+    earliest = results[0][1] if results else None
+
+    return ScannerVolumeEstimate(
+        matched_sessions=matched,
+        effective_window_days=_clamp_window_days(earliest, scan_window_days),
+        sampled=plan.sampled,
+    )
+
+
+def project_monthly_observations(estimate: ScannerVolumeEstimate, sampling_rate: float) -> int:
+    """Scale matched sessions to a 30-day month and apply the sampling rate."""
+    return round(estimate.matched_sessions / estimate.effective_window_days * ESTIMATE_WINDOW_DAYS * sampling_rate)
+
+
+def refresh_scanner_estimate(
+    scanner: ReplayScanner,
+    *,
+    budget: EstimateBudget = BATCH_ESTIMATE_BUDGET,
+    ch_user: ClickHouseUser = ClickHouseUser.APP,
+) -> None:
+    """Recompute and persist the scanner's projected monthly volume. Raises on failure; callers decide severity."""
+    # An attempt is the query starting, not how it ends: a worker killed mid-query must still back off.
+    ReplayScanner.objects.filter(pk=scanner.pk).update(estimate_attempted_at=timezone.now())
+    # Scoped, not tag_queries: a bare tag on the worker thread would leak onto later queries and
+    # charge other scanners' reads to this one in the meter. Previews stay untagged (no scanner yet).
+    with tags_context(scanner_id=str(scanner.pk)):
+        estimate = estimate_scanner_session_volume(
+            team=scanner.team,
+            query=scanner.targeted_recordings_query(),
+            # The refresher has no request; the creator is the same principal the sweep scans as.
+            user=scanner.created_by,
+            budget=budget,
+            ch_user=ch_user,
+        )
+    # Balanced sampling redistributes rather than shrinks the budget (VariantSamplingPlan.
+    # effective_rate always equals the configured rate), so the projection is the same with
+    # balancing on or off and needs no plan here.
+    projection = project_monthly_observations(estimate, scanner.sampling_rate)
+    estimated_at = timezone.now()
+    # Filtered write so a config edit racing the (slow) estimate query can't get stamped fresh with stale numbers.
+    # JSONField quirk: `field=None` filters for JSON null, not SQL NULL, so the no-targeting case needs isnull.
+    guard_fields: dict[str, Any] = (
+        {"experiment_targeting__isnull": True}
+        if scanner.experiment_targeting is None
+        else {"experiment_targeting": scanner.experiment_targeting}
+    )
+    if scanner.scanner_type == ScannerType.EXPERIMENT:
+        # The experiment type keeps its scope in scanner_config, so a racing config edit must
+        # invalidate the stamp the way an experiment_targeting edit does for the other types.
+        guard_fields["scanner_config"] = scanner.scanner_config
+    updated = ReplayScanner.objects.filter(
+        pk=scanner.pk,
+        query=scanner.query,
+        sampling_rate=scanner.sampling_rate,
+        **guard_fields,
+    ).update(estimated_monthly_observations=projection, estimated_at=estimated_at)
+    if updated:
+        scanner.estimated_monthly_observations = projection
+        scanner.estimated_at = estimated_at
+
+
+def is_experiment_linkage_unresolved(scanner: ReplayScanner, error: Exception) -> bool:
+    """True when an estimate failure means the scanner's experiment targeting cannot resolve an
+    exposed population: a draft that has not launched, a deleted or group-aggregated experiment,
+    no variants, a renamed variant, exposures still computing, or lost creator access. False when
+    the scanner's own query is what fails to build, for example a deleted action or a bad cohort
+    reference; no launch heals that, so callers keep it on their error path. Both groups raise
+    the same DRF ValidationError type inside the recordings query, so this re-resolves the
+    linkage to tell them apart. The extra resolution runs on the failure path only."""
+    scope = scope_for(scanner)
+    if scope is None:
+        return False
+    experiment_id = scope.settings.experiment_id
+    if isinstance(error, PermissionDenied):
+        # Only the exposure access check raises PermissionDenied inside the recordings query.
+        return True
+    # Deferred: the experiments facade imports posthog.api on init, which circles back into the
+    # recordings query modules this package loads.
+    from products.experiments.backend.facade.replay import resolve_exposure_linkage  # noqa: PLC0415
+
+    try:
+        resolve_exposure_linkage(
+            scanner.team,
+            experiment_id=experiment_id,
+            # `scope_for` folds a legacy singular `variant` into the plural list.
+            variant=None,
+            variants=scope.settings.variants,
+        )
+    except ValidationError:
+        return True
+    except Exception:
+        # The re-resolution failed on infrastructure. Callers treat that as the loud path.
+        return False
+    return False
+
+
+def _filter_cache_key(team: Team, query: RecordingsQuery, scan_window_days: int) -> str:
+    # The window's dates are dropped because they move with the clock, while the filter they bound does not.
+    filter_json = query.model_dump_json(exclude={"date_from", "date_to"}, exclude_none=True)
+    payload = json.dumps([filter_json, scan_window_days])
+    return f"replay-vision-estimate:{team.pk}:{hashlib.sha256(payload.encode()).hexdigest()}"
+
+
+def _clamp_window_days(earliest: object, scan_window_days: int) -> int:
+    """Clamp the divisor to the team's actual data span so a new team isn't under-estimated."""
+    if not isinstance(earliest, dt.datetime):
+        # The probe covers the whole scan window, so no-earliest implies matched == 0 and any divisor projects 0.
+        return scan_window_days
+    if earliest.tzinfo is None:
+        earliest = earliest.replace(tzinfo=dt.UTC)
+    days_of_data = (dt.datetime.now(dt.UTC) - earliest).days + 1
+    return max(1, min(scan_window_days, days_of_data))

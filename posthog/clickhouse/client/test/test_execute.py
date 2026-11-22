@@ -1,0 +1,336 @@
+from datetime import date
+from ipaddress import IPv4Address, IPv6Address
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from unittest.mock import MagicMock, patch
+
+from clickhouse_driver.columns.datecolumn import DateColumn
+
+from posthog.hogql.query_stats import query_stats_scope
+
+from posthog.clickhouse.client.connection import (
+    ClickHouseClient,
+    ClickHouseUser,
+    ProxyClient,
+    Workload,
+    get_default_clickhouse_workload_type,
+)
+from posthog.clickhouse.client.execute import clickhouse_query_counter, query_with_columns, sync_execute
+from posthog.clickhouse.client.limit import ConcurrencySlot, RateLimit, get_llm_analytics_rate_limiter
+from posthog.clickhouse.query_tagging import AccessMethod, Feature, Product, QueryCounter, tags_context
+
+
+@pytest.fixture
+def client_from_pool():
+    with patch("posthog.clickhouse.client.execute.get_client_from_pool") as mock:
+        client = MagicMock()
+        client.execute.return_value = [(1,)]
+        mock.return_value.__enter__.return_value = client
+        yield mock
+
+
+@pytest.fixture
+def llm_analytics_slots():
+    """Counts concurrency slots taken per query, with the limiter forced on (it is inert in tests)."""
+    limiter = get_llm_analytics_rate_limiter()
+    with patch.object(limiter, "applicable", lambda *args, **kwargs: True):
+        slot = ConcurrencySlot(running_tasks_key="key", task_id="task")
+        with patch.object(RateLimit, "use", return_value=slot) as use, patch.object(RateLimit, "release"):
+            yield use
+
+
+@pytest.mark.parametrize(
+    "workload,access_method,expected_workload,expected_ch_user",
+    [
+        (Workload.DEFAULT, None, Workload.ONLINE, ClickHouseUser.APP),
+        (Workload.OFFLINE, None, Workload.ONLINE, ClickHouseUser.APP),
+        (Workload.LOGS, None, Workload.LOGS, ClickHouseUser.APP),
+        (Workload.DEFAULT, AccessMethod.OAUTH, Workload.ONLINE, ClickHouseUser.APP),
+        (Workload.DEFAULT, AccessMethod.PERSONAL_API_KEY, Workload.OFFLINE, ClickHouseUser.API),
+        (Workload.ONLINE, AccessMethod.PROJECT_SECRET_API_KEY, Workload.OFFLINE, ClickHouseUser.API),
+        (Workload.LOGS, AccessMethod.PERSONAL_API_KEY, Workload.LOGS, ClickHouseUser.API),
+        (Workload.METRICS, None, Workload.METRICS, ClickHouseUser.APP),
+    ],
+)
+def test_process_query_task_workload_routing(
+    client_from_pool, workload, access_method, expected_workload, expected_ch_user
+):
+    # The async query worker forces app traffic onto the online cluster while API-key traffic
+    # keeps the offline routing it gets when run synchronously. Neither may override
+    # cluster-pinned workloads: logs and metrics tables only exist on their own clusters.
+    with tags_context(kind="celery", id="posthog.tasks.tasks.process_query_task", access_method=access_method):
+        sync_execute("SELECT 1", workload=workload, flush=False)
+
+    called_workload, _, _, called_ch_user = client_from_pool.call_args[0]
+    assert called_workload == expected_workload
+    assert called_ch_user == expected_ch_user
+
+
+@pytest.mark.parametrize(
+    "access_method,expected_workload",
+    [
+        (None, Workload.ONLINE),
+        (AccessMethod.PERSONAL_API_KEY, Workload.OFFLINE),
+    ],
+)
+def test_celery_cache_warming_workload_routing(client_from_pool, access_method, expected_workload):
+    with tags_context(kind="celery", feature=Feature.CACHE_WARMUP, access_method=access_method):
+        sync_execute("SELECT 1", flush=False)
+
+    assert client_from_pool.call_args[0][0] == expected_workload
+
+
+@pytest.mark.parametrize(
+    "workload,expected_workload",
+    [
+        (Workload.DEFAULT, Workload.ENDPOINTS),
+        (Workload.LOGS, Workload.LOGS),
+        (Workload.METRICS, Workload.METRICS),
+    ],
+)
+def test_endpoints_tag_workload_routing(client_from_pool, workload, expected_workload):
+    # The ENDPOINTS tag reroutes queries to the endpoints cluster, but must not override
+    # a logs or metrics cluster pin either.
+    with tags_context(kind="request", id="api/endpoint", workload=Workload.ENDPOINTS):
+        sync_execute("SELECT 1", workload=workload, flush=False)
+
+    assert client_from_pool.call_args[0][0] == expected_workload
+
+
+@pytest.mark.parametrize(
+    "product,kind,tag_id,requested_ch_user,expected_ch_user",
+    [
+        (Product.LLM_ANALYTICS, "temporal", "llma-eval-reports", ClickHouseUser.DEFAULT, ClickHouseUser.LLM_ANALYTICS),
+        (Product.LLM_ANALYTICS, "request", "api/projects/2/llm_analytics", ClickHouseUser.DEFAULT, ClickHouseUser.APP),
+        (Product.WAREHOUSE, "temporal", "data-imports", ClickHouseUser.DEFAULT, ClickHouseUser.DEFAULT),
+        # The AI observability usage reports carry this product tag from Celery. The budget is sized
+        # for the per-team Temporal fan-out, so they stay off it.
+        (Product.LLM_ANALYTICS, "celery", "posthog.tasks.usage_report", ClickHouseUser.DEFAULT, ClickHouseUser.DEFAULT),
+        # HogQL's materialized-column lookups name their own user, and must keep it rather than
+        # spending a slot of the concurrency budget sized for real queries.
+        (Product.LLM_ANALYTICS, "temporal", "llma-eval-reports", ClickHouseUser.HOGQL, ClickHouseUser.HOGQL),
+        (Product.LLM_ANALYTICS, "temporal", "llma-eval-reports", ClickHouseUser.META, ClickHouseUser.META),
+    ],
+)
+def test_llm_analytics_ch_user_routing(client_from_pool, product, kind, tag_id, requested_ch_user, expected_ch_user):
+    with tags_context(product=product, kind=kind, id=tag_id):
+        sync_execute("SELECT 1", flush=False, ch_user=requested_ch_user)
+
+    assert client_from_pool.call_args[0][3] == expected_ch_user
+
+
+@pytest.mark.parametrize(
+    "tagged_ch_user,feature,service_name,requested_ch_user,expected_ch_user",
+    [
+        (
+            ClickHouseUser.ALERTS_PLATFORM_INSIGHT,
+            None,
+            None,
+            ClickHouseUser.DEFAULT,
+            ClickHouseUser.ALERTS_PLATFORM_INSIGHT,
+        ),
+        (None, None, None, ClickHouseUser.DEFAULT, ClickHouseUser.DEFAULT),
+        (ClickHouseUser.ALERTS_PLATFORM_INSIGHT, None, None, ClickHouseUser.META, ClickHouseUser.META),
+        (ClickHouseUser.EXPERIMENTS, Feature.CACHE_WARMUP, None, ClickHouseUser.DEFAULT, ClickHouseUser.EXPERIMENTS),
+        (None, Feature.CACHE_WARMUP, None, ClickHouseUser.DEFAULT, ClickHouseUser.CACHE_WARMUP),
+        (
+            ClickHouseUser.ALERTS_PLATFORM_INSIGHT,
+            None,
+            "temporal-worker-max-ai",
+            ClickHouseUser.DEFAULT,
+            ClickHouseUser.ALERTS_PLATFORM_INSIGHT,
+        ),
+        (None, None, "temporal-worker-max-ai", ClickHouseUser.DEFAULT, ClickHouseUser.MAX_AI),
+    ],
+)
+def test_tagged_ch_user_routing(
+    client_from_pool: MagicMock,
+    tagged_ch_user: ClickHouseUser | None,
+    feature: Feature | None,
+    service_name: str | None,
+    requested_ch_user: ClickHouseUser,
+    expected_ch_user: ClickHouseUser,
+) -> None:
+    with tags_context(
+        product=Product.PRODUCT_ANALYTICS,
+        feature=feature,
+        kind="temporal",
+        id="alerts",
+        ch_user=tagged_ch_user,
+        service_name=service_name,
+    ):
+        sync_execute("SELECT 1", flush=False, ch_user=requested_ch_user)
+
+    assert client_from_pool.call_args[0][3] == expected_ch_user
+
+
+@pytest.mark.parametrize(
+    "product,expected_slots",
+    [
+        (Product.LLM_ANALYTICS, 1),
+        (Product.WAREHOUSE, 0),
+    ],
+)
+def test_llm_analytics_queries_take_a_concurrency_slot(client_from_pool, llm_analytics_slots, product, expected_slots):
+    # Asserted here rather than at the AI observability call sites because those reach ClickHouse
+    # through shared helpers too (query_ai_events, TraceQueryRunner). Holding the slot at this
+    # single funnel is what makes the budget cover all of them.
+    with tags_context(product=product, kind="temporal", id="llma-eval-reports"):
+        sync_execute("SELECT 1", flush=False)
+
+    assert llm_analytics_slots.call_count == expected_slots
+
+
+def _fake_query_info(rows: int, elapsed_ns: int) -> SimpleNamespace:
+    return SimpleNamespace(progress=SimpleNamespace(rows=rows, elapsed_ns=elapsed_ns))
+
+
+class _FakeNativeClient(ClickHouseClient):
+    # Nothing here connects, so disconnect() only clears last_query.
+    def __init__(self, fails: str | None = None, last_query: SimpleNamespace | None = None) -> None:
+        super().__init__(host="localhost")
+        self.last_query = last_query
+        self._fails = fails
+
+    def execute(self, *args: Any, **kwargs: Any) -> list[tuple[int]]:
+        if self._fails == "connect":
+            self.disconnect()
+            raise ValueError("Connection refused")
+        self.last_query = _fake_query_info(rows=7, elapsed_ns=3_000_000)
+        if self._fails == "kill":
+            self.disconnect()
+            raise ValueError("Memory limit (for query) exceeded")
+        return [(1,)]
+
+
+def _proxy_client() -> ProxyClient:
+    summary = {"read_rows": "7", "elapsed_ns": "3000000"}
+    http_client = SimpleNamespace(query=lambda **kwargs: SimpleNamespace(summary=summary, result_set=[(1,)]))
+    return ProxyClient(http_client)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "make_client,raises,tags,expected,expected_workload",
+    [
+        (_FakeNativeClient, False, {}, (7, 3.0), "default"),
+        (_FakeNativeClient, False, {"kind": "celery"}, (7, 3.0), "OFFLINE"),
+        (
+            _FakeNativeClient,
+            False,
+            {"kind": "celery", "id": "posthog.tasks.tasks.process_query_task"},
+            (7, 3.0),
+            "ONLINE",
+        ),
+        (lambda: _FakeNativeClient(fails="kill"), True, {}, (7, 3.0), "default"),
+        # Counting the previous query's progress would charge this query with another query's rows.
+        (
+            lambda: _FakeNativeClient(fails="connect", last_query=_fake_query_info(rows=99, elapsed_ns=1)),
+            True,
+            {},
+            (0, 0.0),
+            None,
+        ),
+        (_proxy_client, False, {}, (7, 3.0), "default"),
+    ],
+    ids=[
+        "ok",
+        "celery_resolves_to_offline",
+        "app_query_task_resolves_to_online",
+        "killed_by_the_server",
+        "connect_failed",
+        "http_client",
+    ],
+)
+def test_sync_execute_records_what_clickhouse_read(make_client, raises, tags, expected, expected_workload):
+    with patch("posthog.clickhouse.client.execute.get_client_from_pool") as pool, tags_context(**tags):
+        pool.return_value.__enter__.return_value = make_client()
+        with query_stats_scope() as stats:
+            if raises:
+                with pytest.raises(ValueError):
+                    sync_execute("SELECT 1", flush=False)
+            else:
+                sync_execute("SELECT 1", flush=False)
+
+    assert (stats.rows_read, stats.duration_ms) == expected
+    if expected_workload == "default":
+        expected_workload = get_default_clickhouse_workload_type().value
+    assert stats.workload() == expected_workload
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_sync_execute_records_query_counts_and_durations(client_from_pool, fails: bool) -> None:
+    counter = QueryCounter()
+    client = client_from_pool.return_value.__enter__.return_value
+    durations = iter([0.01, 0.125])
+
+    with patch("posthog.clickhouse.client.execute.perf_counter", return_value=0.0) as clock:
+
+        def execute(*args: Any, **kwargs: Any) -> list[tuple[int]]:
+            clock.return_value += next(durations)
+            if fails:
+                raise ValueError("Query failed")
+            return [(1,)]
+
+        client.execute.side_effect = execute
+        with clickhouse_query_counter(counter):
+            for _ in range(2):
+                if fails:
+                    with pytest.raises(ValueError, match="Query failed"):
+                        sync_execute("SELECT 1", workload=Workload.ONLINE, flush=False)
+                else:
+                    assert sync_execute("SELECT 1", workload=Workload.ONLINE, flush=False) == [(1,)]
+
+    assert counter.count == 2
+    assert counter.query_time_ms == pytest.approx(135.0)
+    assert counter.max_query_time_ms == pytest.approx(125.0)
+    assert counter.slow_count == 1
+
+
+@pytest.mark.parametrize(
+    "types,row,expected",
+    [
+        # `system.query_log` grew `connection_address` on top of the two IP columns the
+        # callers used to name, and one unserializable value fails the whole API response.
+        (
+            [("duration", "Float64"), ("connection_address", "IPv6"), ("address", "IPv6")],
+            (1.0, IPv6Address("::1"), IPv6Address("::1")),
+            {"duration": 1.0},
+        ),
+        (
+            [("duration", "Float64"), ("client", "Nullable(IPv4)")],
+            (1.0, IPv4Address("127.0.0.1")),
+            {"duration": 1.0},
+        ),
+        (
+            [("duration", "Float64"), ("query", "String")],
+            (1.0, "SELECT 1"),
+            {"duration": 1.0, "query": "SELECT 1"},
+        ),
+    ],
+)
+def test_query_with_columns_removes_columns_by_type(types, row, expected):
+    with patch("posthog.clickhouse.client.execute.sync_execute", return_value=([row], types)):
+        rows = query_with_columns("SELECT *", column_types_to_remove=("IPv4", "IPv6"))
+
+    assert rows == [expected]
+
+
+@pytest.mark.parametrize(
+    "raw_day_number_hex,expected",
+    [
+        ("aeba0500", date(2998, 1, 1)),
+        ("8c29f5ff", date(25, 5, 17)),
+    ],
+)
+def test_sync_execute_decodes_date32_outside_driver_default_range(raw_day_number_hex, expected):
+    # RowBinary keeps the raw day number, the same way ClickHouse 26.9+ passes through out-of-range
+    # Parquet and CAST values. The driver's default lookup table stops at 1900-2299.
+    lookup_size = len(DateColumn.date_lut)
+
+    rows = sync_execute(f"SELECT d FROM format(RowBinary, 'd Date32', unhex('{raw_day_number_hex}'))", flush=False)
+
+    assert rows == [(expected,)]
+    # The lookup is shared by every query in the process, so out-of-range days must not be cached in it.
+    assert len(DateColumn.date_lut) == lookup_size

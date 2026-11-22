@@ -1,0 +1,88 @@
+import { urls } from 'scenes/urls'
+
+import { InsightVizNode, NodeKind, QuerySchema } from '~/queries/schema/schema-general'
+import { isWebAnalyticsInsightQuery } from '~/queries/utils'
+
+import { TileId, WebAnalyticsTile } from './common'
+import { withoutWebQueryModifiers } from './webQueryModifiers'
+
+export const getDashboardItemId = (section: TileId, tab: string | undefined, isModal?: boolean): `new-${string}` => {
+    return `new-AdHoc.web-analytics.${section}.${tab || 'default'}.${isModal ? 'modal' : 'default'}`
+}
+
+// A saved insight runs for every viewer, so it must not keep this browser's web query modifiers.
+export const getNewInsightUrlForQuery = (query: QuerySchema): string =>
+    urls.insightNew({ query: withoutWebQueryModifiers(query), sceneSource: 'web-analytics' })
+
+export const getNewInsightUrlFactory = (tiles: WebAnalyticsTile[]) => {
+    return function getNewInsightUrl(tileId: TileId, tabId?: string): string | undefined {
+        const formatQueryForNewInsight = (tileQuery: QuerySchema): QuerySchema => {
+            const query = withoutWebQueryModifiers(tileQuery)
+            if (query.kind === NodeKind.InsightVizNode) {
+                const source = query.source
+                const editableSource =
+                    source.kind === NodeKind.TrendsQuery && source.marketingAnalyticsCostFallback
+                        ? {
+                              ...source,
+                              series: source.marketingAnalyticsCostFallback.series,
+                              breakdownFilter: undefined,
+                              marketingAnalyticsCostFallback: undefined,
+                          }
+                        : source
+                return {
+                    ...query,
+                    source: editableSource,
+                    embedded: undefined,
+                    hidePersonsModal: undefined,
+                }
+            }
+            // Extract source from DataTableNode if present
+            if (query.kind === NodeKind.DataTableNode && 'source' in query) {
+                const source = query.source
+                if (isWebAnalyticsInsightQuery(source)) {
+                    return {
+                        kind: NodeKind.InsightVizNode,
+                        source: source,
+                    } as InsightVizNode
+                }
+                return source
+            }
+            // Wrap Web Analytics queries in InsightVizNode so they can be used as insights
+            if (isWebAnalyticsInsightQuery(query)) {
+                return {
+                    kind: NodeKind.InsightVizNode,
+                    source: query,
+                } as InsightVizNode
+            }
+            return query
+        }
+
+        const tile = tiles.find((t) => t.tileId === tileId)
+        if (!tile) {
+            return undefined
+        }
+
+        if (tile.kind === 'tabs') {
+            const tab = tile.tabs.find((t) => t.id === tabId)
+            if (!tab) {
+                return undefined
+            }
+            return urls.insightNew({ query: formatQueryForNewInsight(tab.query), sceneSource: 'web-analytics' })
+        } else if (tile.kind === 'query') {
+            return urls.insightNew({ query: formatQueryForNewInsight(tile.query), sceneSource: 'web-analytics' })
+        } else if (tile.kind === 'section' && 'tiles' in tile) {
+            // For section tiles, find the first query tile inside
+            const queryTiles = tile.tiles.filter((t: any) => t.kind === 'query')
+            if (queryTiles.length > 0 && queryTiles[0].kind === 'query') {
+                return urls.insightNew({
+                    query: formatQueryForNewInsight(queryTiles[0].query),
+                    sceneSource: 'web-analytics',
+                })
+            }
+        } else if (tile.kind === 'replay') {
+            return urls.replay()
+        }
+
+        return undefined
+    }
+}

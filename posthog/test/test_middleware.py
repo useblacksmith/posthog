@@ -1,0 +1,3899 @@
+import hmac
+import json
+import hashlib
+from collections.abc import Mapping
+from datetime import datetime, timedelta
+from typing import Any, cast
+
+import pytest
+import time_machine
+from posthog.test.base import APIBaseTest, FuzzyInt, override_settings
+from unittest.mock import MagicMock, Mock, patch
+
+from django.conf import settings
+from django.contrib.auth.models import AnonymousUser
+from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
+from django.db import connection, transaction
+from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
+from django.test import (
+    AsyncClient,
+    Client as DjangoClient,
+    RequestFactory,
+    SimpleTestCase,
+)
+from django.test.utils import CaptureQueriesContext
+from django.urls import path, resolve, reverse
+from django.utils import timezone
+
+import requests
+import structlog
+from loginas import settings as la_settings
+from parameterized import parameterized
+from prometheus_client import REGISTRY
+from rest_framework import status
+from rest_framework.exceptions import ValidationError
+from social_core.backends.base import BaseAuth
+from social_core.exceptions import AuthCanceled, AuthFailed, AuthMissingParameter, AuthStateForbidden, AuthStateMissing
+from structlog.testing import capture_logs
+
+from posthog.api.current_alias_usage import (
+    CURRENT_ALIAS_USED_EVENT,
+    FLAT_ROUTE_USED_EVENT,
+    CurrentAliasScope,
+    current_alias_scope,
+)
+from posthog.api.test.test_organization import create_organization
+from posthog.api.test.test_team import create_team
+from posthog.clickhouse.query_tagging import get_query_tags
+from posthog.client_build_middleware import ClientBuildSkewMiddleware
+from posthog.constants import AvailableFeature
+from posthog.ip_restrictions import enforce_ip_restrictions, get_ip_restriction_denial
+from posthog.middleware import (
+    ActivityLoggingMiddleware,
+    Fix204Middleware,
+    ManagedProxyClientIPMiddleware,
+    SignedClientIPOutcome,
+    UnversionedStaticPathMiddleware,
+    per_request_logging_context_middleware,
+    request_route,
+    user_logging_context_middleware,
+)
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.oauth import OAuthAccessToken, OAuthApplication
+from posthog.models.organization import Organization, OrganizationMembership
+from posthog.models.organization_invite import InviteExpiredException, OrganizationInvite
+from posthog.models.organization_ip_restrictions import OrganizationIPRestrictions
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.team import Team
+from posthog.models.user import User
+from posthog.models.utils import generate_random_token_personal, hash_key_value
+from posthog.run_mode import derive_run_mode
+from posthog.settings import SITE_URL, base_variables
+from posthog.utils import get_ip_address, get_trusted_client_ip
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.access_control.backend.models.role import Role, RoleMembership
+from products.actions.backend.facade.testing import create_action
+from products.cohorts.backend.models.cohort import Cohort
+from products.dashboards.backend.models.dashboard import Dashboard
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.product_analytics.backend.facade.models import Insight
+
+
+def _social_auth_backend() -> BaseAuth:
+    return cast(BaseAuth, MagicMock())
+
+
+MANAGED_PROXY_KEY = "managed-proxy-test-key"
+MANAGED_PROXY_OLD_KEY = "managed-proxy-old-key"
+MANAGED_PROXY_NOW = 1_800_000_000
+MANAGED_PROXY_EDGE_IP = "198.51.100.10"
+MANAGED_PROXY_CLIENT_IP = "203.0.113.7"
+# GeoIP resolves these two, so the geo-block can tell them apart.
+MANAGED_PROXY_GERMAN_CLIENT_IP = "45.90.4.87"
+MANAGED_PROXY_NON_GERMAN_EDGE_IP = "28.160.62.192"
+# hex(HMAC-SHA256(MANAGED_PROXY_KEY, f"{MANAGED_PROXY_CLIENT_IP}:{MANAGED_PROXY_NOW}")), computed
+# independently of _managed_proxy_signature so that it pins the format the Worker also asserts.
+MANAGED_PROXY_KNOWN_ANSWER_SIGNATURE = "f825f520f1c3a2ef243b6a055a528b8ce94a3b4b9110bb6f3c2b568191e7b717"
+MANAGED_PROXY_KNOWN_ANSWER_HEADERS = {
+    "HTTP_X_POSTHOG_CLIENT_IP": MANAGED_PROXY_CLIENT_IP,
+    "HTTP_X_POSTHOG_CLIENT_IP_TIMESTAMP": str(MANAGED_PROXY_NOW),
+    "HTTP_X_POSTHOG_CLIENT_IP_SIGNATURE": MANAGED_PROXY_KNOWN_ANSWER_SIGNATURE,
+}
+
+
+def _managed_proxy_signature(key: str, ip: str, timestamp: str) -> str:
+    return hmac.new(key.encode(), f"{ip}:{timestamp}".encode(), hashlib.sha256).hexdigest()
+
+
+def _managed_proxy_headers(
+    ip: str = MANAGED_PROXY_CLIENT_IP,
+    *,
+    key: str = MANAGED_PROXY_KEY,
+    signed_ip: str | None = None,
+    timestamp: int | str = MANAGED_PROXY_NOW,
+) -> dict[str, Any]:  # dict[str, str] does not unpack into the test client's typed keyword arguments
+    return {
+        "HTTP_X_POSTHOG_CLIENT_IP": ip,
+        "HTTP_X_POSTHOG_CLIENT_IP_TIMESTAMP": str(timestamp),
+        "HTTP_X_POSTHOG_CLIENT_IP_SIGNATURE": _managed_proxy_signature(key, signed_ip or ip, str(timestamp)),
+    }
+
+
+MCP_CLIENT_IP_KEY = "mcp-client-ip-test-key"
+MCP_CLIENT_IP_OLD_KEY = "mcp-client-ip-old-key"
+MCP_POD_IP = "10.0.0.5"
+
+
+def _mcp_client_ip_headers(
+    ip: str = MANAGED_PROXY_CLIENT_IP,
+    *,
+    key: str = MCP_CLIENT_IP_KEY,
+    timestamp: int | str = MANAGED_PROXY_NOW,
+) -> dict[str, Any]:  # dict[str, str] does not unpack into the test client's typed keyword arguments
+    return {
+        "HTTP_X_POSTHOG_MCP_CLIENT_IP": ip,
+        "HTTP_X_POSTHOG_MCP_CLIENT_IP_TIMESTAMP": str(timestamp),
+        "HTTP_X_POSTHOG_MCP_CLIENT_IP_SIGNATURE": _managed_proxy_signature(key, ip, str(timestamp)),
+    }
+
+
+class TestIPRestrictionsMiddleware(APIBaseTest):
+    @parameterized.expand([("/",), ("/project/{team_id}/feature_flags",)])
+    def test_renders_a_recovery_page_for_blocked_browser_navigation(self, path: str) -> None:
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+        path = path.format(team_id=self.team.id)
+        response = self.client.get(path, REMOTE_ADDR="198.51.100.7", HTTP_ACCEPT="text/html")
+
+        self.assertContains(response, "Your IP address is blocked", status_code=403)
+        self.assertContains(response, "198.51.100.7", status_code=403)
+        self.assertContains(response, f'href="{path}"', status_code=403)
+        self.assertContains(response, 'action="/logout"', status_code=403)
+        self.assertIn("no-store", response.headers["Cache-Control"])
+
+    @parameterized.expand(
+        [
+            ("/api/organizations/@current/",),
+            ("/api/projects/{team_id}/feature_flags/",),
+            ("/api/projects/{team_id}/conversations/tickets/",),
+        ]
+    )
+    def test_blocks_an_ip_outside_the_allowlist(self, path: str) -> None:
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+
+        response = self.client.get(
+            path.format(team_id=self.team.id), REMOTE_ADDR="198.51.100.7", HTTP_ACCEPT="text/html,application/json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        data = response.json()
+        self.assertEqual(data["code"], "ip_not_allowed")
+        self.assertEqual(data["ip"], "198.51.100.7")
+        self.assertIn("198.51.100.7", data["detail"])
+
+    @parameterized.expand(
+        [
+            (operation, ip, expected)
+            for operation in ("get_or_set", "get", "set")
+            for ip, expected in (
+                ("203.0.113.7", status.HTTP_200_OK),
+                ("198.51.100.7", status.HTTP_403_FORBIDDEN),
+            )
+        ]
+    )
+    def test_cache_failures_use_authoritative_policies(self, operation: str, ip: str, expected: int) -> None:
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+        with (
+            patch(f"posthog.ip_restrictions.cache.{operation}", side_effect=RuntimeError("cache unavailable")),
+            CaptureQueriesContext(connection) as queries,
+        ):
+            response = self.client.get(f"/api/projects/{self.team.id}/feature_flags/", REMOTE_ADDR=ip)
+        self.assertEqual(response.status_code, expected)
+        policy_reads = [
+            query for query in queries.captured_queries if 'FROM "posthog_organizationiprestrictions"' in query["sql"]
+        ]
+        self.assertEqual(len(policy_reads), 1)
+
+    def test_impersonated_sessions_are_not_blocked(self):
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+        session = self.client.session
+        session[la_settings.USER_SESSION_FLAG] = "original-user"
+        session.save()
+
+        response = self.client.get("/api/organizations/@current/", REMOTE_ADDR="198.51.100.7")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @override_settings(ROOT_URLCONF=__name__)
+    def test_cached_restrictions_skip_the_database_on_later_requests(self):
+        OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["203.0.113.0/24"], enabled=True
+        )
+        self.client.get("/api/_http_request_id_probe/", REMOTE_ADDR="203.0.113.42")
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get("/api/_http_request_id_probe/", REMOTE_ADDR="198.51.100.7")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(
+            any("posthog_organizationiprestrictions" in query["sql"] for query in queries.captured_queries)
+        )
+
+    @override_settings(ROOT_URLCONF=__name__)
+    def test_saving_restrictions_invalidates_the_cached_rules(self):
+        config = OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["203.0.113.0/24"], enabled=True
+        )
+        self.client.get("/api/_http_request_id_probe/", REMOTE_ADDR="203.0.113.42")
+
+        config.ip_restrictions = ["10.0.0.0/8"]
+        # The signal invalidates the cache on commit, so run the queued callback before the next request.
+        with self.captureOnCommitCallbacks(execute=True):
+            config.save()
+
+        response = self.client.get("/api/_http_request_id_probe/", REMOTE_ADDR="203.0.113.42")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_policy_change_during_cache_fill_cannot_restore_old_rules(self) -> None:
+        config = OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["203.0.113.0/24"], enabled=False
+        )
+        original_set = cache.set
+
+        def enable_before_cache_write(key: str, value: object, timeout: int) -> None:
+            with self.captureOnCommitCallbacks(execute=True):
+                config.enabled = True
+                config.save()
+            original_set(key, value, timeout)
+
+        with patch("posthog.ip_restrictions.cache.set", side_effect=enable_before_cache_write):
+            self.assertIsNone(get_ip_restriction_denial(self.user, "198.51.100.7"))
+
+        self.assertIsNotNone(get_ip_restriction_denial(self.user, "198.51.100.7"))
+
+    def test_enabled_with_no_rules_does_not_block(self):
+        OrganizationIPRestrictions.objects.create(
+            organization=self.organization,
+            ip_restrictions=[],
+            enabled=True,
+        )
+
+        response = self.client.get("/api/organizations/@current/", REMOTE_ADDR="198.51.100.7")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_disabled_restrictions_do_not_block(self):
+        OrganizationIPRestrictions.objects.create(
+            organization=self.organization,
+            ip_restrictions=["203.0.113.0/24"],
+            enabled=False,
+        )
+
+        response = self.client.get("/api/organizations/@current/", REMOTE_ADDR="198.51.100.7")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @parameterized.expand([("203.0.113.42",), ("2001:db8::1",)])
+    def test_allows_an_ip_inside_the_allowlist(self, ip: str):
+        OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["203.0.113.0/24", "2001:db8::/32"]
+        )
+
+        response = self.client.get("/api/organizations/@current/", REMOTE_ADDR=ip)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_cache_invalidation_failure_does_not_abort_commit_callbacks(self) -> None:
+        config = OrganizationIPRestrictions.objects.create(
+            organization=self.organization, ip_restrictions=["203.0.113.0/24"]
+        )
+        later_callback = Mock()
+        with (
+            patch("posthog.ip_restrictions.cache.delete_many", side_effect=RuntimeError("cache unavailable")),
+            patch("posthog.tasks.ip_restrictions.retry_ip_restrictions_invalidation.delay") as retry,
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                config.enabled = False
+                config.save()
+                transaction.on_commit(later_callback)
+        later_callback.assert_called_once()
+        self.assertTrue(retry.called)
+        config.refresh_from_db()
+        self.assertFalse(config.enabled)
+
+    @parameterized.expand([(None, False), ("198.51.100.7", False), ("203.0.113.7", True)])
+    def test_delegated_credentials_require_an_allowed_ip(self, verified_ip: str | None, allowed: bool) -> None:
+        from types import SimpleNamespace
+
+        from rest_framework.exceptions import PermissionDenied
+
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+        request = RequestFactory().get("/", REMOTE_ADDR="198.51.100.7")
+        if verified_ip:
+            setattr(request, "verified_mcp_client_ip", verified_ip)  # noqa: B010 -- middleware adds this attribute dynamically
+        authenticator = SimpleNamespace(activity_credential_type="personal_api_key", is_user_delegated=True)
+        if allowed:
+            enforce_ip_restrictions(request, self.user, authenticator)
+        else:
+            with self.assertRaises(PermissionDenied):
+                enforce_ip_restrictions(request, self.user, authenticator)
+
+    def test_logout_prefix_does_not_exempt_the_frontend(self) -> None:
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+        response = self.client.get("/logout-extra?deferred_app_context=0", REMOTE_ADDR="198.51.100.7")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["code"], "ip_not_allowed")
+
+    @override_settings(IS_BEHIND_PROXY=True, TRUSTED_PROXIES="10.0.0.0/8")
+    def test_untrusted_forwarded_ip_cannot_bypass_restrictions(self) -> None:
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+        response = self.client.get(
+            "/api/organizations/@current/", REMOTE_ADDR="198.51.100.7", HTTP_X_FORWARDED_FOR="203.0.113.7"
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_joining_a_restricted_organization_invalidates_cached_rules(self) -> None:
+        from posthog.models import Organization, OrganizationMembership
+
+        self.assertIsNone(get_ip_restriction_denial(self.user, "198.51.100.7"))
+        organization = Organization.objects.create(name="Restricted example")
+        OrganizationIPRestrictions.objects.create(organization=organization, ip_restrictions=["203.0.113.0/24"])
+        with self.captureOnCommitCallbacks(execute=True):
+            OrganizationMembership.objects.create(organization=organization, user=self.user)
+        self.assertIsNone(get_ip_restriction_denial(self.user, "198.51.100.7"))
+        self.assertIsNotNone(get_ip_restriction_denial(self.user, "198.51.100.7", str(organization.id)))
+
+    @parameterized.expand(
+        [
+            (credential, path, expected)
+            for credential in ("session", "personal_api_key")
+            for path, expected in (
+                ("/api/organizations/{restricted_org}/", 403),
+                ("/api/organizations/{restricted_org_upper}/", 403),
+                ("/api/organizations/{restricted_org}/members/", 403),
+                ("/api/projects/{restricted_team}/", 403),
+                ("/api/projects/{restricted_team}/feature_flags/", 403),
+                ("/api/projects/{other_team}/feature_flags/?token={restricted_token}", 403),
+                ("/api/projects/0/feature_flags/?token={restricted_token}", 403),
+                ("/api/feature_flag/?token={restricted_token}", 403),
+                ("/api/projects/{other_team}/feature_flags/?api_key={restricted_token}", 403),
+                ("/api/billing/?organization_id={restricted_org}", 403),
+                ("/api/organizations/{other_org}/", 200),
+                ("/api/organizations/{other_org}/members/", 200),
+                ("/api/projects/{other_team}/", 200),
+                ("/api/projects/{other_team}/feature_flags/", 200),
+                ("/api/projects/{restricted_team}/feature_flags/?token={other_token}", 200),
+            )
+        ]
+    )
+    def test_ip_policy_applies_to_the_requested_organization(self, credential: str, path: str, expected: int) -> None:
+        other = Organization.objects.create(name="Other example organization")
+        other_team = Team.objects.create(organization=other)
+        self.user.join(organization=other)
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+        self.user.current_organization = other
+        self.user.current_team = other_team
+        self.user.save()
+        if credential == "personal_api_key":
+            self.client.logout()
+            token = generate_random_token_personal()
+            PersonalAPIKey.objects.create(
+                user=self.user,
+                label="Example key",
+                secure_value=hash_key_value(token),
+                scopes=[
+                    "organization:read",
+                    "organization_member:read",
+                    "project:read",
+                    "feature_flag:read",
+                    "billing:read",
+                ],
+            )
+            self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+        response = self.client.get(
+            path.format(
+                restricted_org=self.organization.id,
+                restricted_org_upper=str(self.organization.id).upper(),
+                restricted_team=self.team.id,
+                restricted_token=self.team.api_token,
+                other_org=other.id,
+                other_team=other_team.id,
+                other_token=other_team.api_token,
+            ),
+            REMOTE_ADDR="198.51.100.7",
+        )
+        self.assertEqual(response.status_code, expected, response.content)
+
+        if expected == status.HTTP_403_FORBIDDEN:
+            self.assertEqual(response.json()["code"], "ip_not_allowed")
+
+    @parameterized.expand(
+        [
+            ("/",),
+            ("/_app_context",),
+            ("/api/user/prepare_toolbar_preloaded_flags/",),
+            ("/api/user/get_toolbar_preloaded_flags/",),
+            ("/api/organizations/@current/",),
+        ]
+    )
+    def test_current_team_policy_applies_when_selected_organization_differs(self, path: str) -> None:
+        other = Organization.objects.create(name="Open example organization")
+        self.user.join(organization=other)
+        self.user.current_organization = other
+        self.user.current_team = self.team
+        self.user.save(update_fields=["current_organization", "current_team"])
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+
+        response = self.client.get(path, REMOTE_ADDR="198.51.100.7")
+
+        self.assertEqual(response.status_code, 200 if path.startswith("/api/organizations/") else 403)
+        if response.status_code == 403:
+            self.assertEqual(response.json()["code"], "ip_not_allowed")
+
+    @parameterized.expand(
+        [
+            ("get", "/api/users/@me/"),
+            ("get", "/api/organizations/"),
+            ("patch", "/api/users/@me/"),
+            ("delete", "/api/organizations/{organization_id}/members/@me/"),
+            ("delete", "/api/organizations/{organization_id}/members/{user_uuid}/"),
+        ]
+    )
+    def test_ip_policy_preserves_account_recovery(self, method: str, path: str) -> None:
+        other = Organization.objects.create(name="Other example organization")
+        Team.objects.create(organization=other)
+        self.user.join(organization=other)
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        OrganizationIPRestrictions.objects.create(organization=self.organization, ip_restrictions=["203.0.113.0/24"])
+        response = getattr(self.client, method)(
+            path.format(organization_id=self.organization.id, user_uuid=self.user.uuid),
+            {"set_current_organization": str(other.id)} if method == "patch" else {},
+            format="json",
+            REMOTE_ADDR="198.51.100.7",
+        )
+        self.assertEqual(response.status_code, 204 if method == "delete" else 200, response.content)
+        if method == "patch":
+            self.user.refresh_from_db()
+            self.assertEqual(self.user.current_organization_id, other.id)
+        if method == "delete":
+            self.assertFalse(self.user.organization_memberships.filter(organization=self.organization).exists())
+
+
+class TestAccessMiddleware(APIBaseTest):
+    CONFIG_AUTO_LOGIN = False
+
+    def test_ip_range(self):
+        """
+        Also test that capture endpoint is not restrictied by ALLOWED_IP_BLOCKS
+        """
+
+        with self.settings(ALLOWED_IP_BLOCKS=["192.168.0.0/31", "127.0.0.0/25", "128.0.0.1"]):
+            # not in list
+            response = self.client.get("/", REMOTE_ADDR="10.0.0.1")
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertIn(b"PostHog is not available", response.content)
+
+            # /31 block
+            response = self.client.get("/", REMOTE_ADDR="192.168.0.1")
+            self.assertNotEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertNotIn(b"PostHog is not available", response.content)
+
+            response = self.client.get("/", REMOTE_ADDR="192.168.0.2")
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertIn(b"PostHog is not available", response.content)
+
+            # /24 block
+            response = self.client.get("/", REMOTE_ADDR="127.0.0.1")
+            self.assertNotEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertNotIn(b"PostHog is not available", response.content)
+
+            response = self.client.get("/", REMOTE_ADDR="127.0.0.100")
+            self.assertNotEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertNotIn(b"PostHog is not available", response.content)
+
+            response = self.client.get("/", REMOTE_ADDR="127.0.0.200")
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertIn(b"PostHog is not available", response.content)
+
+            # precise ip
+            response = self.client.get("/", REMOTE_ADDR="128.0.0.1")
+            self.assertNotEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertNotIn(b"PostHog is not available", response.content)
+
+            response = self.client.get("/", REMOTE_ADDR="128.0.0.2")
+            self.assertIn(b"PostHog is not available", response.content)
+
+    def test_trusted_proxies(self):
+        with self.settings(
+            ALLOWED_IP_BLOCKS=["192.168.0.0/31", "127.0.0.0/25,128.0.0.1"],
+            USE_X_FORWARDED_HOST=True,
+        ):
+            with self.settings(TRUSTED_PROXIES="10.0.0.1"):
+                response = self.client.get(
+                    "/",
+                    REMOTE_ADDR="10.0.0.1",
+                    headers={"x-forwarded-for": "192.168.0.1,10.0.0.1"},
+                )
+                self.assertNotIn(b"PostHog is not available", response.content)
+
+    def test_attempt_spoofing(self):
+        with self.settings(
+            ALLOWED_IP_BLOCKS=["192.168.0.0/31", "127.0.0.0/25,128.0.0.1"],
+            USE_X_FORWARDED_HOST=True,
+        ):
+            with self.settings(TRUSTED_PROXIES="10.0.0.1"):
+                response = self.client.get(
+                    "/",
+                    REMOTE_ADDR="10.0.0.1",
+                    headers={"x-forwarded-for": "192.168.0.1,10.0.0.2"},
+                )
+                self.assertEqual(response.status_code, 403)
+                self.assertIn(b"PostHog is not available", response.content)
+
+    def test_trust_all_proxies(self):
+        with self.settings(
+            ALLOWED_IP_BLOCKS=["192.168.0.0/31", "127.0.0.0/25,128.0.0.1"],
+            USE_X_FORWARDED_HOST=True,
+        ):
+            with self.settings(TRUST_ALL_PROXIES=True):
+                response = self.client.get(
+                    "/",
+                    REMOTE_ADDR="10.0.0.1",
+                    headers={"x-forwarded-for": "192.168.0.1,10.0.0.1"},
+                )
+                self.assertNotIn(b"PostHog is not available", response.content)
+
+    def test_blocked_geoip_regions(self):
+        with self.settings(
+            BLOCKED_GEOIP_REGIONS=["DE"],
+            USE_X_FORWARDED_HOST=True,
+        ):
+            with self.settings(TRUST_ALL_PROXIES=True):
+                response = self.client.get(
+                    "/",
+                    REMOTE_ADDR="45.90.4.87",
+                )
+                self.assertIn(b"PostHog is not available", response.content)
+                response = self.client.get(
+                    "/",
+                    REMOTE_ADDR="28.160.62.192",
+                )
+                self.assertNotIn(b"PostHog is not available", response.content)
+
+        with self.settings(
+            BLOCKED_GEOIP_REGIONS=["DE"],
+            USE_X_FORWARDED_HOST=True,
+        ):
+            with self.settings(TRUST_ALL_PROXIES=True):
+                response = self.client.get("/", REMOTE_ADDR="28.160.62.192", headers={"x-forwarded-for": ""})
+                self.assertNotIn(b"PostHog is not available", response.content)
+
+    def test_ip_with_port_stripped(self):
+        """IP addresses with ports should have the port stripped before validation."""
+        with self.settings(
+            ALLOWED_IP_BLOCKS=["192.168.0.0/24"],
+            USE_X_FORWARDED_HOST=True,
+            TRUST_ALL_PROXIES=True,
+        ):
+            # IPv4 with port
+            response = self.client.get("/", headers={"x-forwarded-for": "192.168.0.1:8080"})
+            self.assertNotIn(b"PostHog is not available", response.content)
+
+            # IPv6 with port (bracketed format)
+            response = self.client.get("/", headers={"x-forwarded-for": "[::1]:443"})
+            # ::1 is not in allowed blocks, so should be blocked
+            self.assertIn(b"PostHog is not available", response.content)
+
+    def test_malformed_ip_blocked(self):
+        """Malformed IPs and attack payloads should be blocked (fail closed)."""
+        with self.settings(
+            ALLOWED_IP_BLOCKS=["0.0.0.0/0"],
+            USE_X_FORWARDED_HOST=True,
+            TRUST_ALL_PROXIES=True,
+        ):
+            # Attack payload in XFF header
+            response = self.client.get(
+                "/",
+                headers={"x-forwarded-for": "nslookup${IFS}attacker.com||curl${IFS}attacker.com"},
+            )
+            self.assertIn(b"PostHog is not available", response.content)
+
+            # Invalid IP format
+            response = self.client.get("/", headers={"x-forwarded-for": "not-an-ip"})
+            self.assertIn(b"PostHog is not available", response.content)
+
+            # Valid IP should work
+            response = self.client.get("/", headers={"x-forwarded-for": "192.168.1.1"})
+            self.assertNotIn(b"PostHog is not available", response.content)
+
+    @parameterized.expand([("signed", MANAGED_PROXY_KEY, True), ("unsigned", "some-other-key", False)])
+    def test_blocked_geoip_regions_sees_managed_proxy_client_ip(self, _name: str, key: str, blocked: bool) -> None:
+        with (
+            self.settings(
+                BLOCKED_GEOIP_REGIONS=["DE"],
+                USE_X_FORWARDED_HOST=True,
+                TRUST_ALL_PROXIES=True,
+                MANAGED_PROXY_SIGNING_KEYS=[MANAGED_PROXY_KEY],
+            ),
+            time_machine.travel(MANAGED_PROXY_NOW, tick=False),
+        ):
+            response = self.client.get(
+                "/",
+                HTTP_X_FORWARDED_FOR=MANAGED_PROXY_NON_GERMAN_EDGE_IP,
+                **_managed_proxy_headers(MANAGED_PROXY_GERMAN_CLIENT_IP, key=key),
+            )
+
+        assert (b"PostHog is not available" in response.content) is blocked
+
+
+@override_settings(
+    MANAGED_PROXY_SIGNING_KEYS=[MANAGED_PROXY_KEY, MANAGED_PROXY_OLD_KEY],
+    USE_X_FORWARDED_HOST=True,
+    TRUST_ALL_PROXIES=True,
+)
+class TestManagedProxyClientIPMiddleware(SimpleTestCase):
+    def _verification_counts(self) -> dict[str, float]:
+        return {
+            outcome.value: REGISTRY.get_sample_value(
+                "posthog_managed_proxy_client_ip_verifications_total", {"outcome": outcome.value}
+            )
+            or 0.0
+            for outcome in SignedClientIPOutcome
+        }
+
+    def _run_middleware(self, meta: dict[str, Any], expected_outcome: str | None) -> tuple[str, str | None]:
+        counts_before = self._verification_counts()
+        request = RequestFactory().get("/", REMOTE_ADDR="10.0.0.5", HTTP_X_FORWARDED_FOR=MANAGED_PROXY_EDGE_IP, **meta)
+        # An earlier middleware may read request.headers, which caches a snapshot of META.
+        assert request.headers.get("x-forwarded-for") == MANAGED_PROXY_EDGE_IP
+        seen: dict[str, Any] = {}
+
+        def get_response(request: HttpRequest) -> HttpResponse:
+            seen["ips"] = (get_ip_address(request), get_trusted_client_ip(request))
+            seen["leftover"] = [key for key in request.META if key.startswith("HTTP_X_POSTHOG_CLIENT_IP")] + [
+                name for name in request.headers if name.lower().startswith("x-posthog-client-ip")
+            ]
+            return HttpResponse()
+
+        with time_machine.travel(MANAGED_PROXY_NOW, tick=False):
+            ManagedProxyClientIPMiddleware(get_response)(request)
+
+        assert seen["leftover"] == []
+        expected_counts = dict(counts_before)
+        if expected_outcome:
+            expected_counts[expected_outcome] += 1
+        assert self._verification_counts() == expected_counts
+        return seen["ips"]
+
+    @parameterized.expand(
+        [
+            ("known_answer_vector", MANAGED_PROXY_KNOWN_ANSWER_HEADERS, MANAGED_PROXY_CLIENT_IP),
+            (
+                "uppercase_hex",
+                {
+                    **MANAGED_PROXY_KNOWN_ANSWER_HEADERS,
+                    "HTTP_X_POSTHOG_CLIENT_IP_SIGNATURE": MANAGED_PROXY_KNOWN_ANSWER_SIGNATURE.upper(),
+                },
+                MANAGED_PROXY_CLIENT_IP,
+            ),
+            ("older_key", _managed_proxy_headers(key=MANAGED_PROXY_OLD_KEY), MANAGED_PROXY_CLIENT_IP),
+            ("ipv6", _managed_proxy_headers("2001:db8::1"), "2001:db8::1"),
+            ("oldest_timestamp", _managed_proxy_headers(timestamp=MANAGED_PROXY_NOW - 60), MANAGED_PROXY_CLIENT_IP),
+            ("newest_timestamp", _managed_proxy_headers(timestamp=MANAGED_PROXY_NOW + 5), MANAGED_PROXY_CLIENT_IP),
+        ]
+    )
+    def test_valid_signature_sets_client_ip(self, _name: str, meta: dict[str, Any], expected_ip: str) -> None:
+        assert self._run_middleware(meta, "valid") == (expected_ip, expected_ip)
+
+    @parameterized.expand(
+        [
+            ("no_headers", {}, None),
+            ("unknown_key", _managed_proxy_headers(key="some-other-key"), "bad_signature"),
+            ("signed_for_another_ip", _managed_proxy_headers(signed_ip="192.0.2.1"), "bad_signature"),
+            (
+                "expired_timestamp",
+                _managed_proxy_headers(timestamp=MANAGED_PROXY_NOW - 61),
+                "timestamp_out_of_window",
+            ),
+            (
+                "future_timestamp",
+                _managed_proxy_headers(timestamp=MANAGED_PROXY_NOW + 6),
+                "timestamp_out_of_window",
+            ),
+            ("non_numeric_timestamp", _managed_proxy_headers(timestamp="1800000000.0"), "invalid_input"),
+            ("oversized_timestamp", _managed_proxy_headers(timestamp="1" * 5000), "invalid_input"),
+            ("malformed_ip", _managed_proxy_headers("not-an-ip"), "invalid_input"),
+            (
+                "missing_timestamp",
+                {k: v for k, v in _managed_proxy_headers().items() if k != "HTTP_X_POSTHOG_CLIENT_IP_TIMESTAMP"},
+                "invalid_input",
+            ),
+            (
+                "empty_signature",
+                {**_managed_proxy_headers(), "HTTP_X_POSTHOG_CLIENT_IP_SIGNATURE": ""},
+                "invalid_input",
+            ),
+            (
+                "non_ascii_signature",
+                {**_managed_proxy_headers(), "HTTP_X_POSTHOG_CLIENT_IP_SIGNATURE": "é" * 64},
+                "bad_signature",
+            ),
+        ]
+    )
+    def test_unverified_request_keeps_edge_ip(
+        self, _name: str, meta: dict[str, Any], expected_outcome: str | None
+    ) -> None:
+        assert self._run_middleware(meta, expected_outcome) == (MANAGED_PROXY_EDGE_IP, MANAGED_PROXY_EDGE_IP)
+
+    @parameterized.expand(
+        [
+            ("no_keys", [], "not_configured"),
+            ("empty_key", [""], "not_configured"),
+            ("empty_key_in_list", [MANAGED_PROXY_KEY, ""], "bad_signature"),
+        ]
+    )
+    def test_signing_key_list_keeps_edge_ip(self, _name: str, keys: list[str], expected_outcome: str) -> None:
+        with self.settings(MANAGED_PROXY_SIGNING_KEYS=keys):
+            client_ips = self._run_middleware(_managed_proxy_headers(key="some-other-key"), expected_outcome)
+
+        assert client_ips == (MANAGED_PROXY_EDGE_IP, MANAGED_PROXY_EDGE_IP)
+
+    def test_runs_before_the_middleware_that_logs_the_forwarded_for_header(self) -> None:
+        # per_request_logging_context_middleware reads x-forwarded-for on the request path, so it
+        # only records the signed IP while it stays below this middleware. AllowIPMiddleware and axes
+        # read the client IP at or after the view, so their position does not constrain this one.
+        middleware = list(settings.MIDDLEWARE)
+        assert middleware.index("posthog.middleware.ManagedProxyClientIPMiddleware") < middleware.index(
+            "posthog.middleware.per_request_logging_context_middleware"
+        )
+
+
+@patch("posthog.client_build_middleware.get_git_commit_short", return_value="abc1234567")
+class TestClientBuildSkewMiddleware(SimpleTestCase):
+    def _skew_counts(self) -> dict[tuple[str, str], float]:
+        return {
+            (builds, status_class): REGISTRY.get_sample_value(
+                "posthog_api_requests_by_client_build_total", {"builds": builds, "status_class": status_class}
+            )
+            or 0.0
+            for builds in ("same", "different")
+            for status_class in ("2xx", "5xx")
+        }
+
+    @parameterized.expand(
+        [
+            ("same_build", "abc1234567", 200, ("same", "2xx")),
+            ("different_build", "0123456789", 500, ("different", "5xx")),
+            ("no_client_build", None, 200, None),
+            ("not_hex", "abc123456z", 200, None),
+            ("too_long", "a" * 41, 200, None),
+        ]
+    )
+    def test_counts_api_requests_by_client_build(
+        self,
+        _mock_commit: MagicMock,
+        _name: str,
+        client_build: str | None,
+        status_code: int,
+        expected_labels: tuple[str, str] | None,
+    ) -> None:
+        headers = {"X-PostHog-Client-Build": client_build} if client_build else None
+        request = RequestFactory().get("/api/projects/2/insights/", headers=headers)
+        counts_before = self._skew_counts()
+
+        response = ClientBuildSkewMiddleware(lambda request: HttpResponse(status=status_code))(request)
+
+        expected_counts = dict(counts_before)
+        if expected_labels:
+            expected_counts[expected_labels] += 1
+        assert self._skew_counts() == expected_counts
+        assert response["X-PostHog-Build"] == "abc1234567"
+
+    def test_leaves_non_api_responses_alone(self, _mock_commit: MagicMock) -> None:
+        request = RequestFactory().get("/insights", HTTP_X_POSTHOG_CLIENT_BUILD="0123456789")
+        counts_before = self._skew_counts()
+
+        response = ClientBuildSkewMiddleware(lambda request: HttpResponse())(request)
+
+        assert self._skew_counts() == counts_before
+        assert "X-PostHog-Build" not in response
+
+
+class TestFix204Middleware(SimpleTestCase):
+    def test_no_content_response_has_no_body_or_content_length(self) -> None:
+        def get_response(request: HttpRequest) -> HttpResponse:
+            response = HttpResponse(b'{"ok": true}', status=204, content_type="application/json")
+            response.headers["Content-Length"] = str(len(response.content))
+            return response
+
+        response = Fix204Middleware(get_response)(RequestFactory().post("/"))
+
+        assert response.content == b""
+        assert "Content-Length" not in response.headers
+
+
+class TestUnversionedStaticPathMiddleware(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("versioned_script", "/static/1.438.12/posthog-recorder.js", "/static/posthog-recorder.js"),
+            ("prerelease_version", "/static/1.438.12-beta.1/array.js", "/static/array.js"),
+            ("nested_file", "/static/1.438.12/icons/a.png", "/static/icons/a.png"),
+            ("unversioned_script", "/static/posthog-recorder.js", "/static/posthog-recorder.js"),
+            ("hashed_asset_folder", "/static/chunks/1.2.js", "/static/chunks/1.2.js"),
+            ("version_outside_static", "/api/1.438.12/foo", "/api/1.438.12/foo"),
+        ]
+    )
+    @override_settings(CLOUD_DEPLOYMENT=None, DEBUG=False)
+    def test_rewrites_only_versioned_static_paths(self, _name: str, path: str, expected_path: str) -> None:
+        seen_paths: list[str] = []
+
+        def get_response(request: HttpRequest) -> HttpResponse:
+            seen_paths.append(request.path_info)
+            return HttpResponse()
+
+        UnversionedStaticPathMiddleware(get_response)(RequestFactory().get(path))
+
+        assert seen_paths == [expected_path]
+
+    @parameterized.expand(
+        [
+            ("us_cloud", "US", False),
+            ("eu_cloud", "EU", False),
+            ("cloud_dev", "DEV", False),
+            ("local_development", None, True),
+        ]
+    )
+    def test_never_rewrites_outside_hobby(self, _name: str, cloud_deployment: str | None, debug: bool) -> None:
+        seen_paths: list[str] = []
+
+        def get_response(request: HttpRequest) -> HttpResponse:
+            seen_paths.append(request.path_info)
+            return HttpResponse()
+
+        with override_settings(CLOUD_DEPLOYMENT=cloud_deployment, DEBUG=debug):
+            UnversionedStaticPathMiddleware(get_response)(RequestFactory().get("/static/1.438.12/array.js"))
+
+        assert seen_paths == ["/static/1.438.12/array.js"]
+
+    def test_registered_only_in_hobby_and_before_whitenoise(self) -> None:
+        middleware = list(settings.MIDDLEWARE)
+        name = "posthog.middleware.UnversionedStaticPathMiddleware"
+        registered_expected = derive_run_mode(base_variables.CLOUD_DEPLOYMENT, base_variables.DEBUG).is_hobby
+
+        assert (name in middleware) == registered_expected
+        if registered_expected:
+            assert middleware.index(name) < middleware.index("whitenoise.middleware.WhiteNoiseMiddleware")
+
+
+class TestAutoProjectMiddleware(APIBaseTest):
+    # On Cloud there's an additional multi_tenancy_organizationbilling query
+    second_team: Team
+    third_team: Team
+    no_access_team: Team
+    base_app_query_budget: int
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        # 56, not 54: the app context serializes the project's tags, which costs one
+        # indexed lookup on posthog_taggeditem per page load, and the organization it
+        # serializes comes off the user's current_organization foreign key, which carries
+        # no signed-BAA annotation, so the AI training lock costs one more indexed lookup.
+        # +5: the app context also serializes the team's five extension configs, and each
+        # request reads them on its own Team instance, one primary-key lookup each.
+        cls.base_app_query_budget = 61
+        # Create another team that the user does have access to
+        cls.second_team = create_team(organization=cls.organization, name="Second Life")
+        # A page load creates any missing config row, which adds an insert per config to its first
+        # count. Create the rows here so that each count covers only the lookups.
+        for team in (cls.team, cls.second_team):
+            for config in (
+                "revenue_analytics_config",
+                "marketing_analytics_config",
+                "customer_analytics_config",
+                "workflows_config",
+                "feature_flag_policy_config",
+            ):
+                getattr(team, config)
+
+        # some teams have non-standard API tokens
+        cls.third_team = create_team(organization=cls.organization, name="Third Life")
+        cls.third_team.api_token = "sTMFPsFhdP1Ssg"
+        cls.third_team.save()
+
+        other_org = create_organization(name="test org")
+        cls.no_access_team = create_team(organization=other_org)
+
+    def setUp(self):
+        super().setUp()
+        # Reset back to initial team/org for each test
+        self.user.current_team = self.team
+        self.user.current_organization = self.organization
+        # The page load reads a content type through Django's per-process cache. Without a reset, the query
+        # counts depend on whether an earlier test in the same process already filled that cache.
+        ContentType.objects.clear_cache()
+
+    def app_context(self, response) -> dict:
+        return response.context["posthog_app_context"]
+
+    @override_settings(PERSON_ON_EVENTS_V2_OVERRIDE=False)
+    def test_project_switched_when_accessing_dashboard_of_another_accessible_team(self):
+        dashboard = Dashboard.objects.create(team=self.second_team)
+
+        with self.assertNumQueries(
+            FuzzyInt(0, self.base_app_query_budget + 10)
+        ):  # AutoProjectMiddleware adds 4 queries + 1 from activity logging
+            response_app = self.client.get(f"/dashboard/{dashboard.id}")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+        response_dashboards_api = self.client.get(f"/api/projects/@current/dashboards/{dashboard.id}/")
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.second_team.id)
+        self.assertEqual(response_dashboards_api.status_code, 200)
+
+    def test_project_switched_when_accessing_dashboard_of_another_accessible_team_with_trailing_slash(
+        self,
+    ):
+        dashboard = Dashboard.objects.create(team=self.second_team)
+
+        response_app = self.client.get(f"/dashboard/{dashboard.id}/")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+        response_dashboards_api = self.client.get(f"/api/projects/@current/dashboards/{dashboard.id}/")
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.second_team.id)
+        self.assertEqual(response_dashboards_api.status_code, 200)
+
+    def test_project_unchanged_when_accessing_dashboard_of_another_off_limits_team(
+        self,
+    ):
+        _, _, third_team = Organization.objects.bootstrap(
+            None,
+            name="Third Party",
+            slug="third-party",
+            team_fields={"name": "Third Team"},
+        )
+        dashboard = Dashboard.objects.create(team=third_team)
+
+        response_app = self.client.get(f"/dashboard/{dashboard.id}")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+        response_dashboards_api = self.client.get(f"/api/projects/@current/dashboards/{dashboard.id}/")
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.team.id)  # NOT third_team
+        self.assertEqual(response_dashboards_api.status_code, 404)
+
+    @override_settings(PERSON_ON_EVENTS_V2_OVERRIDE=False)
+    def test_project_unchanged_when_accessing_dashboards_list(self):
+        with self.assertNumQueries(FuzzyInt(0, self.base_app_query_budget + 4)):  # No AutoProjectMiddleware queries
+            response_app = self.client.get(f"/dashboard")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.team.id)  # NOT third_team
+
+    def test_project_switched_when_accessing_insight_of_another_accessible_team(self):
+        # short_id is unique per team only, and this insight has the lower id, so an unscoped lookup finds it first
+        Insight.objects.create(team=self.no_access_team, short_id="shared1")
+        insight = Insight.objects.create(team=self.second_team, short_id="shared1")
+
+        response_app = self.client.get(f"/insights/{insight.short_id}")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+        response_insights_api = self.client.get(f"/api/projects/@current/insights/{insight.id}/")
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.second_team.id)
+        self.assertEqual(response_insights_api.status_code, 200)
+
+    def test_staff_get_users_to_log_in_as_when_accessing_insight_of_off_limits_team(self):
+        self.user.is_staff = True
+        self.user.save()
+        member = User.objects.create_and_join(self.no_access_team.organization, "member@example.com", None)
+        insight = Insight.objects.create(team=self.no_access_team)
+
+        response_app = self.client.get(f"/insights/{insight.short_id}")
+
+        self.assertEqual(response_app.status_code, 200)
+        suggested_users = self.app_context(response_app)["suggested_users_with_access"]
+        self.assertEqual([user["email"] for user in suggested_users], [member.email])
+
+    def test_project_switched_when_accessing_insight_edit_mode_of_another_accessible_team(
+        self,
+    ):
+        insight = Insight.objects.create(team=self.second_team)
+
+        response_app = self.client.get(f"/insights/{insight.short_id}/edit")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+        response_insights_api = self.client.get(f"/api/projects/@current/insights/{insight.id}/")
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.second_team.id)
+        self.assertEqual(response_insights_api.status_code, 200)
+
+    def test_project_switched_when_accessing_action_of_another_accessible_team(self):
+        action = create_action(team=self.second_team)
+
+        response_app = self.client.get(f"/action/{action.id}")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+        response_actions_api = self.client.get(f"/api/projects/@current/actions/{action.id}/")
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.second_team.id)
+        self.assertEqual(response_actions_api.status_code, 200)
+
+    def test_project_switched_when_accessing_cohort_of_another_accessible_team(self):
+        cohort = Cohort.objects.create(team=self.second_team, created_by=self.user)
+
+        response_app = self.client.get(f"/cohorts/{cohort.id}")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+        response_cohorts_api = self.client.get(f"/api/projects/@current/cohorts/{cohort.id}/")
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.second_team.id)
+        self.assertEqual(response_cohorts_api.status_code, 200)
+
+    @parameterized.expand(["feature_flags", "feature-flags"])
+    @override_settings(PERSON_ON_EVENTS_V2_OVERRIDE=False)
+    def test_project_switched_when_accessing_feature_flag_of_another_accessible_team(
+        self,
+        path: str,
+    ) -> None:
+        feature_flag = FeatureFlag.objects.create(team=self.second_team, created_by=self.user)
+
+        with self.assertNumQueries(
+            FuzzyInt(0, self.base_app_query_budget + 10)
+        ):  # +1 from activity logging _get_before_update(), +1 from the credential review checks
+            response_app = self.client.get(f"/{path}/{feature_flag.id}")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+        response_feature_flags_api = self.client.get(f"/api/projects/@current/feature_flags/{feature_flag.id}/")
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.second_team.id)
+        self.assertEqual(response_feature_flags_api.status_code, 200)
+
+    @parameterized.expand(["feature_flags", "feature-flags"])
+    @override_settings(PERSON_ON_EVENTS_V2_OVERRIDE=False)
+    def test_project_unchanged_when_creating_feature_flag(self, path: str) -> None:
+        with self.assertNumQueries(FuzzyInt(0, self.base_app_query_budget + 10)):
+            response_app = self.client.get(f"/{path}/new")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        response_users_api_data = response_users_api.json()
+        self.user.refresh_from_db()
+
+        self.assertEqual(response_app.status_code, 200)
+        self.assertEqual(response_users_api.status_code, 200)
+        self.assertEqual(response_users_api_data.get("team", {}).get("id"), self.team.id)
+
+    def test_project_switched_when_accessing_another_project_by_id(self):
+        project_1_request = self.client.get(f"/project/{self.team.pk}/home")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        assert project_1_request.status_code == 200
+        assert response_users_api.json().get("team", {}).get("id") == self.team.id
+
+        project_2_request = self.client.get(f"/project/{self.second_team.pk}/home")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        assert project_2_request.status_code == 200
+        assert response_users_api.json().get("team", {}).get("id") == self.second_team.id
+
+    def test_bootstrap_does_not_serialize_a_project_after_access_is_revoked(self):
+        self.organization_membership.level = OrganizationMembership.Level.MEMBER
+        self.organization_membership.save()
+        response = self.client.get(f"/project/{self.second_team.pk}/home")
+        assert response.status_code == 200
+        self.user.refresh_from_db()
+        assert self.user.current_team_id == self.second_team.pk
+
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.uses_most_specific_access_resolution = True
+        self.organization.save()
+        role = Role.objects.create(name="Project admins", organization=self.organization)
+        RoleMembership.objects.create(role=role, user=self.user, organization_member=self.organization_membership)
+        AccessControl.objects.create(
+            team=self.second_team,
+            resource="project",
+            resource_id=str(self.second_team.pk),
+            access_level="none",
+            organization_member=self.organization_membership,
+        )
+        AccessControl.objects.create(
+            team=self.second_team,
+            resource="project",
+            resource_id=str(self.second_team.pk),
+            access_level="admin",
+            role=role,
+        )
+
+        response = self.client.get(f"/project/{self.second_team.pk}/home")
+        fetched = self.client.get(f"/project/{self.second_team.pk}/_app_context")
+
+        assert response.status_code == 200
+        assert self.app_context(response)["deferred"] is True
+        assert fetched.status_code == 200
+        merged_app_context = {**self.app_context(response), **fetched.json()["app_context"]}
+        assert merged_app_context["current_team"] is None
+        assert merged_app_context["current_project"] is None
+        self.user.refresh_from_db()
+        assert self.user.current_team_id is None
+
+    def test_project_unchanged_when_accessing_inaccessible_project_by_id(self):
+        project_1_request = self.client.get(f"/project/{self.team.pk}/home")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        assert project_1_request.status_code == 200
+        assert response_users_api.json().get("team", {}).get("id") == self.team.id
+        assert self.app_context(project_1_request)["project_access_denied"] is None
+
+        project_2_request = self.client.get(f"/project/{self.no_access_team.pk}/home")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        assert project_2_request.status_code == 200
+        assert response_users_api.json().get("team", {}).get("id") == self.team.id
+        assert self.app_context(project_2_request)["project_access_denied"] == str(self.no_access_team.pk)
+
+    def test_project_unchanged_when_accessing_missing_project_by_id(self):
+        project_1_request = self.client.get(f"/project/{self.team.pk}/home")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        assert project_1_request.status_code == 200
+        assert response_users_api.json().get("team", {}).get("id") == self.team.id
+
+        project_2_request = self.client.get(f"/project/999999/home")
+        response_users_api = self.client.get(f"/api/users/@me/")
+        assert project_2_request.status_code == 200
+        assert response_users_api.json().get("team", {}).get("id") == self.team.id
+        assert self.app_context(project_2_request)["project_access_denied"] == "999999"
+
+    def test_project_redirects_to_new_team_when_accessing_project_by_token(self):
+        res = self.client.get(f"/project/{self.second_team.api_token}/home")
+        assert res.status_code == 302
+        assert res.headers["Location"] == f"/project/{self.second_team.pk}/home"
+
+    def test_project_redirects_to_posthog_org_style_tokens(self):
+        res = self.client.get(
+            f"/project/{self.third_team.api_token}/replay/018f5c3e-1a17-7f2b-ac83-32d06be3269b?t=2601"
+        )
+        assert res.status_code == 302, res.content
+        assert (
+            res.headers["Location"]
+            == f"/project/{self.third_team.pk}/replay/018f5c3e-1a17-7f2b-ac83-32d06be3269b?t=2601"
+        )
+
+    @parameterized.expand([("missing", None), ("inaccessible", "no_access_team")])
+    def test_project_access_denied_when_accessing_unreachable_project_by_token(self, _name, team_attribute):
+        token = getattr(self, team_attribute).api_token if team_attribute else "phc_123"
+
+        res = self.client.get(f"/project/{token}/home")
+        assert res.status_code == 200
+        response_users_api = self.client.get(f"/api/users/@me/")
+        assert response_users_api.json().get("team", {}).get("id") == self.team.id
+        assert self.app_context(res)["project_access_denied"] == token
+
+    def test_project_redirects_including_query_params(self):
+        res = self.client.get(f"/project/{self.second_team.api_token}?t=1")
+        assert res.status_code == 302
+        assert res.headers["Location"] == f"/project/{self.second_team.pk}?t=1"
+
+        res = self.client.get(f"/project/{self.second_team.api_token}/home?t=1")
+        assert res.status_code == 302
+        assert res.headers["Location"] == f"/project/{self.second_team.pk}/home?t=1"
+
+
+@override_settings(CLOUD_DEPLOYMENT="US")  # As PostHog Cloud
+class TestPostHogTokenCookieMiddleware(APIBaseTest):
+    CONFIG_AUTO_LOGIN = False
+
+    def test_logged_out_client(self):
+        self.client.logout()
+        response = self.client.get("/")
+        self.assertEqual(0, len(response.cookies))
+
+    def test_logged_in_client(self):
+        self.client.force_login(self.user, backend="django.contrib.auth.backends.ModelBackend")
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        ph_project_token_cookie = response.cookies["ph_current_project_token"]
+        self.assertEqual(ph_project_token_cookie.key, "ph_current_project_token")
+        self.assertEqual(ph_project_token_cookie.value, self.team.api_token)
+        self.assertEqual(ph_project_token_cookie["path"], "/")
+        self.assertEqual(ph_project_token_cookie["samesite"], "Strict")
+        self.assertEqual(ph_project_token_cookie["httponly"], "")
+        self.assertEqual(ph_project_token_cookie["domain"], "posthog.com")
+        self.assertEqual(ph_project_token_cookie["comment"], "")
+        self.assertEqual(ph_project_token_cookie["secure"], True)
+        self.assertEqual(ph_project_token_cookie["max-age"], 31536000)
+
+        ph_project_name_cookie = response.cookies["ph_current_project_name"]
+        self.assertEqual(ph_project_name_cookie.key, "ph_current_project_name")
+        self.assertEqual(ph_project_name_cookie.value, self.team.name)
+        self.assertEqual(ph_project_name_cookie["path"], "/")
+        self.assertEqual(ph_project_name_cookie["samesite"], "Strict")
+        self.assertEqual(ph_project_name_cookie["httponly"], "")
+        self.assertEqual(ph_project_name_cookie["domain"], "posthog.com")
+        self.assertEqual(ph_project_name_cookie["comment"], "")
+        self.assertEqual(ph_project_name_cookie["secure"], True)
+        self.assertEqual(ph_project_name_cookie["max-age"], 31536000)
+
+        ph_instance_cookie = response.cookies["ph_current_instance"]
+        self.assertEqual(ph_instance_cookie.key, "ph_current_instance")
+        self.assertEqual(ph_instance_cookie.value, SITE_URL)
+        self.assertEqual(ph_instance_cookie["path"], "/")
+        self.assertEqual(ph_instance_cookie["samesite"], "Strict")
+        self.assertEqual(ph_instance_cookie["httponly"], "")
+        self.assertEqual(ph_instance_cookie["domain"], "posthog.com")
+        self.assertEqual(ph_instance_cookie["comment"], "")
+        self.assertEqual(ph_instance_cookie["secure"], True)
+        self.assertEqual(ph_instance_cookie["max-age"], 31536000)
+
+        ph_authenticated_cookie = response.cookies["ph_authenticated_us"]
+        self.assertEqual(ph_authenticated_cookie.value, "1")
+        self.assertEqual(ph_authenticated_cookie["path"], "/")
+        self.assertEqual(ph_authenticated_cookie["samesite"], "Lax")
+        self.assertEqual(ph_authenticated_cookie["httponly"], True)
+        self.assertEqual(ph_authenticated_cookie["domain"], "posthog.com")
+        self.assertEqual(ph_authenticated_cookie["secure"], True)
+        self.assertNotIn("ph_authenticated_eu", response.cookies)
+        self.assertLessEqual(ph_authenticated_cookie["max-age"], settings.SESSION_COOKIE_AGE)
+        self.assertGreater(ph_authenticated_cookie["max-age"], settings.SESSION_COOKIE_AGE - 60)
+
+        ph_last_login_method_cookie = response.cookies["ph_last_login_method"]
+        self.assertEqual(ph_last_login_method_cookie.key, "ph_last_login_method")
+        self.assertEqual(ph_last_login_method_cookie.value, "password")
+        self.assertEqual(ph_last_login_method_cookie["path"], "/")
+        self.assertEqual(ph_last_login_method_cookie["samesite"], "Strict")
+        self.assertEqual(ph_last_login_method_cookie["httponly"], "")
+        self.assertEqual(ph_last_login_method_cookie["domain"], "posthog.com")
+        self.assertEqual(ph_last_login_method_cookie["comment"], "")
+        self.assertEqual(ph_last_login_method_cookie["secure"], True)
+        self.assertEqual(ph_last_login_method_cookie["max-age"], 31536000)
+
+    def test_logout(self):
+        self.client.force_login(self.user, backend="django.contrib.auth.backends.ModelBackend")
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.assertEqual(response.cookies["ph_current_project_token"].key, "ph_current_project_token")
+        self.assertEqual(response.cookies["ph_current_project_token"].value, self.team.api_token)
+        self.assertEqual(response.cookies["ph_current_project_token"]["max-age"], 31536000)
+
+        self.assertEqual(response.cookies["ph_current_project_name"].key, "ph_current_project_name")
+        self.assertEqual(response.cookies["ph_current_project_name"].value, self.team.name)
+        self.assertEqual(response.cookies["ph_current_project_name"]["max-age"], 31536000)
+
+        self.assertEqual(response.cookies["ph_current_instance"].key, "ph_current_instance")
+        self.assertEqual(response.cookies["ph_current_instance"].value, SITE_URL)
+        self.assertEqual(response.cookies["ph_current_instance"]["max-age"], 31536000)
+
+        self.assertEqual(response.cookies["ph_last_login_method"].key, "ph_last_login_method")
+        self.assertEqual(response.cookies["ph_last_login_method"].value, "password")
+        self.assertEqual(response.cookies["ph_last_login_method"]["max-age"], 31536000)
+
+        response = self.client.post("/logout/")
+
+        # Check that the local cookies will be removed by having 'expires' in the past
+        self.assertTrue(response.cookies["ph_current_project_token"]["expires"] == "Thu, 01 Jan 1970 00:00:00 GMT")
+        self.assertTrue(response.cookies["ph_current_project_name"]["expires"] == "Thu, 01 Jan 1970 00:00:00 GMT")
+        # We don't want to remove the ph_current_instance cookie
+        self.assertNotIn("ph_current_instance", response.cookies)
+        # ...but the region cookie has to go, or the OAuth picker redirects into a signed-out region
+        self.assertEqual(response.cookies["ph_authenticated_us"]["expires"], "Thu, 01 Jan 1970 00:00:00 GMT")
+
+        # Request a page after logging out
+        response = self.client.get("/")
+
+        # Check if the cookies are not present in the response
+        self.assertNotIn("ph_current_project_token", response.cookies)
+        self.assertNotIn("ph_current_project_name", response.cookies)
+
+
+@override_settings(IMPERSONATION_TIMEOUT_SECONDS=100)
+@override_settings(IMPERSONATION_IDLE_TIMEOUT_SECONDS=20)
+@override_settings(ADMIN_PORTAL_ENABLED=True)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_KEY=None)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_SECRET=None)
+class TestAutoLogoutImpersonateMiddleware(APIBaseTest):
+    other_user: User
+
+    def setUp(self):
+        super().setUp()
+        # Reset back to initial team/org for each test
+        self.other_user = User.objects.create_and_join(
+            self.organization, email="other-user@posthog.com", password="123456"
+        )
+
+        self.user.is_staff = True
+        self.user.save()
+
+        # Use Django's standard Client instead of APIClient for these tests.
+        # The loginas admin view expects form-encoded POST data, which is
+        # Django Client's default (APIClient defaults to JSON).
+        self.client = cast(Any, DjangoClient())
+        self.client.force_login(self.user)
+
+    def get_csrf_token_payload(self):
+        return {}
+
+    def login_as_other_user(self):
+        return self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "false", "reason": "Test impersonation"},
+            follow=True,
+        )
+
+    def test_staff_user_can_login(self):
+        assert self.client.get("/api/users/@me").json()["email"] == self.user.email
+        response = self.login_as_other_user()
+        assert response.status_code == 200
+        assert self.client.get("/api/users/@me").json()["email"] == "other-user@posthog.com"
+
+    def test_not_staff_user_cannot_login(self):
+        self.user.is_staff = False
+        self.user.save()
+        assert self.client.get("/api/users/@me").json()["email"] == self.user.email
+        response = self.login_as_other_user()
+        assert response.status_code == 200
+        assert self.client.get("/api/users/@me").json()["email"] == self.user.email
+
+    def test_after_idle_timeout_api_requests_401(self):
+        now = datetime(2024, 1, 1, 12, 0, 0)
+        with time_machine.travel(now, tick=False):
+            self.login_as_other_user()
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "other-user@posthog.com"
+            assert res.json()["is_impersonated_until"] == "2024-01-01T12:00:20+00:00"
+            assert self.client.session.get("session_created_at") == now.timestamp()
+
+        # Move forward by 19
+        now = now + timedelta(seconds=19)
+        with time_machine.travel(now, tick=False):
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "other-user@posthog.com"
+            assert res.json()["is_impersonated_until"] == "2024-01-01T12:00:39+00:00"
+
+        # Past idle timeout
+        now = now + timedelta(seconds=21)
+
+        with time_machine.travel(now, tick=False):
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 401
+
+    def test_after_total_timeout_api_requests_401(self):
+        now = datetime(2024, 1, 1, 12, 0, 0)
+        with time_machine.travel(now, tick=False):
+            self.login_as_other_user()
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "other-user@posthog.com"
+            assert res.json()["is_impersonated_until"] == "2024-01-01T12:00:20+00:00"
+            assert self.client.session.get("session_created_at") == now.timestamp()
+
+        for _ in range(4):
+            # Move forward by 19 seconds 4 times for a total of 76 seconds
+            now = now + timedelta(seconds=19)
+            with time_machine.travel(now, tick=False):
+                res = self.client.get("/api/users/@me")
+                assert res.status_code == 200
+                assert res.json()["email"] == "other-user@posthog.com"
+                # Format exactly like the date above
+                assert res.json()["is_impersonated_until"] == (now + timedelta(seconds=20)).strftime(
+                    "%Y-%m-%dT%H:%M:%S+00:00"
+                )
+
+        now = now + timedelta(seconds=19)
+        with time_machine.travel(now, tick=False):
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "other-user@posthog.com"
+            # Even though below the idle timeout, we now see the total timeout as that is earlier
+            assert res.json()["is_impersonated_until"] == "2024-01-01T12:01:40+00:00"
+
+        # Now even less than the idle time will take us past the total timeout
+        now = now + timedelta(seconds=10)
+
+        with time_machine.travel(now, tick=False):
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 401
+
+    def test_after_timeout_non_admin_page_redirects_to_admin(self):
+        """When session times out on a non-admin page, redirect to /admin/."""
+        now = datetime.now()
+        with time_machine.travel(now, tick=False):
+            self.login_as_other_user()
+
+        with time_machine.travel(now + timedelta(seconds=35), tick=False):
+            res = self.client.get("/dashboards")
+            assert res.status_code == 302
+            assert res.headers["Location"] == "/admin/"
+
+            # Verify we're back to original user
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "user1@posthog.com"
+
+    def test_after_timeout_admin_page_redirects_to_intended_admin_page(self):
+        """When session times out navigating to an admin page, redirect to that page."""
+        third_user = User.objects.create_and_join(self.organization, email="third-user@posthog.com", password="123456")
+
+        now = datetime.now()
+        with time_machine.travel(now, tick=False):
+            self.login_as_other_user()
+
+        with time_machine.travel(now + timedelta(seconds=35), tick=False):
+            # Navigate to a different user's admin page
+            res = self.client.get(f"/admin/posthog/user/{third_user.id}/change/")
+            assert res.status_code == 302
+            # Should redirect to the intended admin page, not the impersonated user's page
+            assert res.headers["Location"] == f"/admin/posthog/user/{third_user.id}/change/"
+
+            # Verify we're back to original user
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "user1@posthog.com"
+
+    def test_explicit_logout_redirects_to_impersonated_user_admin(self):
+        """When explicitly logging out via /logout, redirect to impersonated user's admin page."""
+        now = datetime.now()
+        with time_machine.travel(now, tick=False):
+            self.login_as_other_user()
+
+            # Explicit logout via the main logout endpoint
+            res = self.client.post("/logout/")
+            assert res.status_code == 302
+            assert res.headers["Location"] == f"/admin/posthog/user/{self.other_user.id}/change/"
+
+            res = self.client.get(res.headers["Location"])
+            assert [str(message) for message in res.context["messages"]] == [
+                "You are now logged back in as user1@posthog.com."
+            ]
+
+            # Verify we're back to original user
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "user1@posthog.com"
+
+    @parameterized.expand(
+        [
+            # A safe `next` lets staff return straight to the PostHog app.
+            ("safe_next", "?next=/", "/"),
+            # No `next` keeps the default admin change-page redirect.
+            ("no_next", "", None),
+            # Unsafe `next` values are ignored, falling back to the admin default.
+            ("unsafe_scheme_relative", "?next=//evil.com/path", None),
+            ("unsafe_absolute_url", "?next=https://evil.com", None),
+        ]
+    )
+    def test_loginas_logout_redirect(self, _name, query_suffix, expected_location):
+        """The loginas logout endpoint redirects to a safe `next` when given, otherwise to the admin change page."""
+        now = datetime.now()
+        with time_machine.travel(now, tick=False):
+            self.login_as_other_user()
+
+            res = self.client.get(f"/admin/logout/{query_suffix}")
+            assert res.status_code == 302
+            assert res.headers["Location"] == (expected_location or f"/admin/posthog/user/{self.other_user.id}/change/")
+
+            # Verify we're back to the original staff user
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "user1@posthog.com"
+
+    def test_loginas_logout_with_next_returns_to_app_after_expiry(self):
+        """Even when the session has expired server-side, `next` survives the middleware
+        bounce so staff still land back in the PostHog app."""
+        now = datetime.now()
+        with time_machine.travel(now, tick=False):
+            self.login_as_other_user()
+
+        with time_machine.travel(now + timedelta(seconds=35), tick=False):
+            # First hit: the auto-logout middleware restores the original login and
+            # bounces back to the same path, preserving ?next=/.
+            res = self.client.get("/admin/logout/?next=/")
+            assert res.status_code == 302
+            assert res.headers["Location"] == "/admin/logout/?next=/"
+
+            # Second hit: no longer an impersonated session, so the view honors `next`.
+            res = self.client.get("/admin/logout/?next=/")
+            assert res.status_code == 302
+            assert res.headers["Location"] == "/"
+
+            # Verify we're back to the original staff user
+            res = self.client.get("/api/users/@me")
+            assert res.status_code == 200
+            assert res.json()["email"] == "user1@posthog.com"
+
+
+@override_settings(IMPERSONATION_TIMEOUT_SECONDS=100)
+@override_settings(IMPERSONATION_IDLE_TIMEOUT_SECONDS=20)
+@override_settings(ADMIN_PORTAL_ENABLED=True)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_KEY=None)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_SECRET=None)
+class TestImpersonationReadOnlyMiddleware(APIBaseTest):
+    other_user: User
+
+    def setUp(self):
+        super().setUp()
+        self.other_user = User.objects.create_and_join(
+            self.organization, email="other-user@posthog.com", password="123456"
+        )
+        self.user.is_staff = True
+        self.user.save()
+
+        # Use Django's standard Client instead of APIClient for these tests.
+        # The loginas admin view expects form-encoded POST data, which is
+        # Django Client's default (APIClient defaults to JSON).
+        self.client = cast(Any, DjangoClient())
+        self.client.force_login(self.user)
+
+    def login_as_other_user(self):
+        return self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "false", "reason": "Test impersonation"},
+            follow=True,
+        )
+
+    def login_as_other_user_read_only(self):
+        return self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "true", "reason": "Test read-only impersonation"},
+            follow=True,
+        )
+
+    def test_read_only_impersonation_blocks_write(self):
+        """Verify read-only impersonation blocks DELETE requests with correct error."""
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+
+        self.login_as_other_user_read_only()
+
+        # Verify we're logged in as the other user
+        assert self.client.get("/api/users/@me").json()["email"] == "other-user@posthog.com"
+
+        # Try to delete the dashboard
+        response = self.client.delete(f"/api/projects/{self.team.id}/dashboards/{dashboard.id}/")
+
+        assert response.status_code == 403
+        response_data = response.json()
+        assert response_data["type"] == "authentication_error"
+        assert response_data["code"] == "impersonation_read_only"
+        assert "read-only" in response_data["detail"].lower()
+
+        # Verify dashboard still exists
+        dashboard.refresh_from_db()
+        assert dashboard.name == "Test Dashboard"
+
+    def test_read_only_impersonation_allows_get_requests(self):
+        """Verify read-only impersonation allows GET requests."""
+        self.login_as_other_user_read_only()
+
+        # Verify we're logged in as the other user
+        response = self.client.get("/api/users/@me")
+        assert response.status_code == 200
+        assert response.json()["email"] == "other-user@posthog.com"
+
+        # GET request to dashboards should work
+        response = self.client.get(f"/api/projects/{self.team.id}/dashboards/")
+        assert response.status_code == 200
+
+    def test_reimpersonating_same_user_read_write_clears_read_only(self):
+        self.login_as_other_user_read_only()
+        assert self.client.get("/api/users/@me/").json()["is_impersonated_read_only"] is True
+
+        # Re-impersonating the same user reuses the session (Django only flushes on a user change),
+        # so the start must clear the prior read-only flag instead of silently forcing read-only.
+        self.login_as_other_user()
+        assert self.client.get("/api/users/@me/").json()["is_impersonated_read_only"] is False
+
+    def test_rejected_reimpersonation_preserves_read_only_and_reason(self):
+        self.login_as_other_user_read_only()
+        assert self.client.get("/api/users/@me/").json()["is_impersonated_read_only"] is True
+
+        # An empty reason is rejected by loginas without changing the session (it redirects back to
+        # the referer). The rejected attempt must not clear the active read-only flag or its reason.
+        self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "false", "reason": ""},
+            HTTP_REFERER="/some/page",
+        )
+
+        user = self.client.get("/api/users/@me/").json()
+        assert user["is_impersonated_read_only"] is True
+        assert user["is_impersonated_reason"] == "Test read-only impersonation"
+
+    @parameterized.expand(
+        [
+            ("query", "query/", {"query": {"kind": "EventsQuery", "select": ["event"]}}),
+            ("query_kind", "query/HogQLQuery/", {"query": {"kind": "HogQLQuery", "query": "select 1"}}),
+            # digit-containing kind — the allowlist regex used to miss these. The kind is
+            # made up on purpose: the middleware matches on the path alone, and a real kind
+            # here would execute a product-owned query runner from a core test.
+            ("query_kind_digit", "query/SomeV2Query/", {"query": {"kind": "SomeV2Query"}}),
+            ("query_upgrade", "query/upgrade/", {"query": {"kind": "EventsQuery", "select": ["event"]}}),
+            ("endpoint_materialization_preview", "endpoints/some_endpoint/materialization_preview/", {}),
+            (
+                "external_data_schemas_incremental_fields",
+                "external_data_schemas/00000000-0000-0000-0000-000000000000/incremental_fields/",
+                {},
+            ),
+            (
+                "warehouse_saved_queries_check_incremental",
+                "warehouse_saved_queries/check_incremental/",
+                {"query": "select 1"},
+            ),
+            (
+                "exports",
+                "exports/",
+                {"export_format": "video/mp4", "export_context": {"session_recording_id": "test-session"}},
+            ),
+            ("hog_flows_user_blast_radius", "hog_flows/user_blast_radius/", {}),
+            ("logs_query", "logs/query/", {}),
+            # hyphenated action that the shorter `count` alternative must not shadow
+            ("logs_count_ranges", "logs/count-ranges/", {"query": "not-a-dict"}),
+            ("tracing_attribute_breakdown", "tracing/spans/attribute-breakdown/", {}),
+            ("tracing_trace_by_id", "tracing/spans/trace/zzz/", {}),
+            ("metrics_query", "metrics/query/", {}),
+            ("experiments_setup_context", "experiments/setup_context/", {}),
+            (
+                "persons_properties_timeline",
+                "persons/00000000-0000-0000-0000-000000000000/properties_timeline/",
+                {},
+            ),
+        ]
+    )
+    def test_read_only_impersonation_allows_allowlisted_post(self, _name, path_suffix, body):
+        self.login_as_other_user_read_only()
+
+        assert self.client.get("/api/users/@me").json()["email"] == "other-user@posthog.com"
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/{path_suffix}",
+            data=body,
+            content_type="application/json",
+        )
+
+        assert response.status_code != 403 or response.json().get("code") != "impersonation_read_only"
+
+    @parameterized.expand(
+        [
+            ("logs_alerts", "logs/alerts/"),
+            ("logs_views", "logs/views/"),
+            ("logs_sampling_rules", "logs/sampling_rules/"),
+            (
+                "warehouse_saved_query_materialize",
+                "warehouse_saved_queries/00000000-0000-0000-0000-000000000000/materialize/",
+            ),
+            ("experiments_create", "experiments/"),
+            ("hog_flow_publish", "hog_flows/00000000-0000-0000-0000-000000000000/publish/"),
+            ("hog_flow_bulk_delete", "hog_flows/bulk_delete/"),
+        ]
+    )
+    def test_read_only_impersonation_blocks_mutating_siblings(self, _name, path_suffix):
+        self.login_as_other_user_read_only()
+
+        # Every allowlist entry names its action exactly, because each of these prefixes also
+        # hosts mutating actions. Widening one to its prefix would reach these.
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/{path_suffix}",
+            data={},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+        assert response.json()["code"] == "impersonation_read_only"
+
+    def test_read_only_impersonation_blocks_query_cancellation(self):
+        self.login_as_other_user_read_only()
+
+        assert self.client.get("/api/users/@me").json()["email"] == "other-user@posthog.com"
+
+        # DELETE /query/<id>/ cancels a query. The ID below matches the allowlisted query
+        # path pattern, so only the method check keeps this blocked.
+        response = self.client.delete(f"/api/projects/{self.team.id}/query/SomeQueryId123/")
+
+        assert response.status_code == 403
+        assert response.json()["code"] == "impersonation_read_only"
+
+    def test_regular_impersonation_allows_write(self):
+        """Verify regular (non-read-only) impersonation can still write."""
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+
+        self.login_as_other_user()
+
+        start = ActivityLog.objects.filter(scope="User", activity="logged_in", item_id=str(self.other_user.id)).latest(
+            "created_at"
+        )
+        assert (
+            start.user_id,
+            start.was_impersonated,
+            start.credential_type,
+            start.credential_id,
+            start.impersonated_by_id,
+        ) == (self.user.id, True, "session", None, self.user.id)
+
+        # Verify we're logged in as the other user
+        assert self.client.get("/api/users/@me").json()["email"] == "other-user@posthog.com"
+
+        # Update should work with regular impersonation
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard.id}/",
+            data={"name": "Updated Dashboard"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+
+        # Verify dashboard was updated
+        dashboard.refresh_from_db()
+        assert dashboard.name == "Updated Dashboard"
+
+        log = ActivityLog.objects.filter(scope="Dashboard", item_id=str(dashboard.id)).latest("created_at")
+        assert (log.user, log.was_impersonated, log.credential_type, log.impersonated_by_id) == (
+            self.other_user,
+            True,
+            "session",
+            self.user.id,
+        )
+
+    def test_impersonation_blocked_when_user_disallows(self):
+        """Verify regular impersonation fails when target user has allow_impersonation=False."""
+        self.other_user.allow_impersonation = False
+        self.other_user.save()
+
+        self.login_as_other_user()
+
+        # Should still be logged in as original user
+        assert self.client.get("/api/users/@me").json()["email"] == self.user.email
+
+    def test_read_only_impersonation_blocked_when_user_disallows(self):
+        """Verify read-only impersonation fails when target user has allow_impersonation=False."""
+        self.other_user.allow_impersonation = False
+        self.other_user.save()
+
+        self.login_as_other_user_read_only()
+
+        # Should still be logged in as original user
+        assert self.client.get("/api/users/@me").json()["email"] == self.user.email
+
+    @parameterized.expand([("with_trailing_slash", "/logout/"), ("without_trailing_slash", "/logout")])
+    def test_read_only_impersonation_logout_redirects_to_user_admin(self, _name, logout_path):
+        self.login_as_other_user_read_only()
+
+        # Verify we're logged in as the other user
+        assert self.client.get("/api/users/@me").json()["email"] == "other-user@posthog.com"
+
+        # Explicit logout via main logout endpoint — frontend submits to /logout (no slash),
+        # while server-side tooling and tests sometimes use /logout/. Both must work.
+        response = self.client.post(logout_path)
+
+        assert response.status_code == 302
+        assert response.headers["Location"] == f"/admin/posthog/user/{self.other_user.id}/change/"
+
+        # Verify we're back to original user
+        assert self.client.get("/api/users/@me").json()["email"] == self.user.email
+
+    def test_read_only_impersonation_allows_set_current_organization(self):
+        """Verify read-only impersonation allows PATCH with only set_current_organization."""
+        self.login_as_other_user_read_only()
+
+        response = self.client.patch(
+            "/api/users/@me/",
+            data={"set_current_organization": str(self.organization.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+
+    def test_read_only_impersonation_blocks_set_current_organization_with_other_fields(
+        self,
+    ):
+        """Verify read-only impersonation blocks PATCH with set_current_organization plus other fields."""
+        self.login_as_other_user_read_only()
+
+        response = self.client.patch(
+            "/api/users/@me/",
+            data={
+                "set_current_organization": str(self.organization.id),
+                "first_name": "Hacked",
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+        assert response.json()["code"] == "impersonation_read_only"
+
+
+@override_settings(IMPERSONATION_TIMEOUT_SECONDS=100)
+@override_settings(IMPERSONATION_IDLE_TIMEOUT_SECONDS=20)
+@override_settings(ADMIN_PORTAL_ENABLED=True)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_KEY=None)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_SECRET=None)
+# Bypass ManifestStaticFilesStorage so admin templates render in tests without a manifest.
+@override_settings(STORAGES={"staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"}})
+class TestAdminImpersonationMiddleware(APIBaseTest):
+    """Tests AdminImpersonationMiddleware: admin panel must remain accessible to the
+    original staff user during impersonation, even though `request.user` would
+    normally be the (non-staff) impersonated customer."""
+
+    other_user: User
+
+    def setUp(self):
+        super().setUp()
+        self.other_user = User.objects.create_and_join(
+            self.organization, email="other-user@posthog.com", password="123456"
+        )
+        self.user.is_staff = True
+        self.user.save()
+
+        # Use Django's standard Client because the loginas admin view expects
+        # form-encoded POST data (APIClient defaults to JSON).
+        self.client = cast(Any, DjangoClient())
+        self.client.force_login(self.user)
+
+    def login_as_other_user(self):
+        # Don't `follow=True` — the post-loginas redirect lands on `/` which renders
+        # the frontend's index.html (not present in tests).
+        return self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "false", "reason": "Test impersonation"},
+        )
+
+    def test_admin_index_accessible_during_impersonation(self):
+        """The admin index must respond 200, not redirect to /admin/login/, during impersonation."""
+        self.login_as_other_user()
+
+        # API confirms we're impersonating
+        assert self.client.get("/api/users/@me").json()["email"] == "other-user@posthog.com"
+
+        response = self.client.get("/admin/")
+        assert response.status_code == 200
+        # Banner should be rendered with the impersonated user
+        assert b"other-user@posthog.com" in response.content
+
+    def test_admin_index_redirects_when_no_impersonation_and_not_staff(self):
+        """Sanity check: a non-staff user without impersonation still cannot access /admin/."""
+        self.user.is_staff = False
+        self.user.save()
+
+        response = self.client.get("/admin/")
+        # Django redirects to /admin/login/ for unauthorized requests
+        assert response.status_code == 302
+        assert "/admin/login" in response.headers.get("Location", "")
+
+    def test_non_admin_paths_still_use_impersonated_user(self):
+        """Outside of /admin/, the impersonated user must remain in effect."""
+        self.login_as_other_user()
+
+        response = self.client.get("/api/users/@me/")
+        assert response.status_code == 200
+        assert response.json()["email"] == "other-user@posthog.com"
+
+    def test_admin_logout_still_sees_impersonated_user(self):
+        """/admin/logout/ must keep the impersonated user as request.user so it can
+        redirect back to that user's admin change page."""
+        self.login_as_other_user()
+
+        response = self.client.get("/admin/logout/")
+        assert response.status_code == 302
+        assert response.headers["Location"] == f"/admin/posthog/user/{self.other_user.id}/change/"
+
+    def test_admin_unaffected_when_not_impersonating(self):
+        """Regular staff users without an impersonation session still access admin normally."""
+        response = self.client.get("/admin/")
+        assert response.status_code == 200
+
+    def login_as_other_user_read_only(self):
+        return self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "true", "reason": "Test read-only impersonation"},
+        )
+
+    @patch("posthog.admin.console.redis_tool.get_client")
+    def test_admin_writes_allowed_during_read_only_impersonation(self, mock_get_client: MagicMock):
+        """Admin POST/PATCH/DELETE actions must not be blocked by the read-only
+        impersonation middleware — admin runs as the original staff user."""
+        mock_redis = MagicMock()
+        mock_redis.ttl.return_value = -1
+        mock_get_client.return_value = mock_redis
+
+        self.login_as_other_user_read_only()
+
+        # POST to a console tool operation, which is registered directly in the URLconf (not
+        # lazy-loaded), so it's reachable in tests. A successful POST redirects (302) to the tool.
+        response = self.client.post(
+            "/admin/console/tools/redis-values/set-ttl/",
+            data={"key": "test:key", "ttl_seconds": "60", "reason": "Test"},
+        )
+
+        # Endpoint must be reached (would-be 404 means the test isn't proving anything).
+        assert response.status_code != 404, "admin URL not registered in test environment"
+        # Middleware must not return its read-only 403.
+        assert response.status_code != 403, f"unexpected 403: {response.content!r}"
+        # Sanity check the write actually happened.
+        mock_redis.expire.assert_called_once_with("test:key", 60)
+
+    def test_api_writes_still_blocked_during_read_only_impersonation(self):
+        """Non-admin write requests must still be blocked under read-only impersonation."""
+        from products.dashboards.backend.models.dashboard import Dashboard
+
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        self.login_as_other_user_read_only()
+
+        response = self.client.delete(f"/api/projects/{self.team.id}/dashboards/{dashboard.id}/")
+        assert response.status_code == 403
+        assert response.json()["code"] == "impersonation_read_only"
+
+    @parameterized.expand(
+        [
+            ("loses_staff", {"is_staff": False}),
+            ("deactivated", {"is_active": False}),
+        ]
+    )
+    def test_admin_blocked_when_original_user_cannot_swap(self, _name, user_attrs):
+        """The swap requires `original_user.is_active and original_user.is_staff`.
+        Falsifying either attribute on the original user must block admin access on
+        the next request — proves both halves of the gate are load-bearing."""
+        self.login_as_other_user()
+        for attr, val in user_attrs.items():
+            setattr(self.user, attr, val)
+        self.user.save()
+
+        response = self.client.get("/admin/")
+        assert response.status_code == 302
+        assert "/admin/login" in response.headers.get("Location", "")
+
+    @patch("posthog.admin.console.redis_tool.get_client")
+    @patch("posthog.admin.console.redis_tool.log_activity")
+    def test_admin_action_attributes_activity_to_staff_user_during_impersonation(
+        self, mock_log_activity: MagicMock, mock_get_client: MagicMock
+    ):
+        """Load-bearing security claim: admin actions performed during impersonation
+        must pass the original staff user (not the impersonated customer) to downstream
+        activity logging. The PR's middleware-ordering comment in `posthog/settings/web.py`
+        says the swap must run before activity-logging code — this asserts that.
+
+        A future middleware reorder that breaks attribution would silently leak
+        `customer-as-actor` into audit logs without breaking any existing test.
+
+        Mechanism: the Redis tool's `set_ttl` operation calls `log_activity(user=request.user, ...)`.
+        Patch `log_activity` and assert the captured `user` kwarg is the staff user.
+        """
+        mock_redis = MagicMock()
+        mock_redis.ttl.return_value = -1
+        mock_get_client.return_value = mock_redis
+
+        self.login_as_other_user()
+
+        response = self.client.post(
+            "/admin/console/tools/redis-values/set-ttl/",
+            data={"key": "test:key", "ttl_seconds": "60", "reason": "Test"},
+        )
+
+        assert response.status_code in (200, 302), f"unexpected status: {response.status_code}"
+        assert mock_log_activity.called, "log_activity was not called — admin view did not reach attribution code"
+        for call in mock_log_activity.call_args_list:
+            logged_user = call.kwargs.get("user")
+            assert logged_user is not None, "log_activity called with user=None"
+            assert logged_user.id == self.user.id, (
+                f"log_activity called with user={logged_user.id} ({logged_user.email}), "
+                f"expected staff user {self.user.id} ({self.user.email}), "
+                f"NOT impersonated customer {self.other_user.id} ({self.other_user.email})"
+            )
+
+    def test_admin_index_banner_shows_both_staff_and_customer_email(self):
+        """The banner must surface both identities. The existing test only asserts the
+        customer email — a regression dropping the staff portion would pass it. This test
+        pins both halves; it also proves request.user is swapped at template render time."""
+        self.login_as_other_user()
+        response = self.client.get("/admin/")
+        assert response.status_code == 200
+        assert self.other_user.email.encode() in response.content, "impersonated customer email missing from banner"
+        assert self.user.email.encode() in response.content, (
+            "staff user email missing from banner — request.user not swapped at template render"
+        )
+
+    def test_swap_rejects_tampered_session_flag(self):
+        """`get_original_user_from_session` unsigns `la_settings.USER_SESSION_FLAG` via
+        `TimestampSigner`. A session value lacking a valid signature must not produce a
+        swap, even when `is_impersonated_session(request)` returns True. Pins the
+        cryptographic boundary."""
+        self.login_as_other_user()
+
+        # Inject the STAFF user's PK as an unsigned value. If signature verification
+        # were bypassed, `get_original_user_from_session` would return the staff user,
+        # both `is_active` and `is_staff` would be True, the swap would succeed, and
+        # `/admin/` would return 200 (not 302). The 302 assertion therefore directly
+        # pins the TimestampSigner gate — a bypass would change the response.
+        session = self.client.session
+        session[la_settings.USER_SESSION_FLAG] = str(self.user.pk)
+        session.save()
+
+        response = self.client.get("/admin/")
+        assert response.status_code == 302
+        assert "/admin/login" in response.headers.get("Location", "")
+
+    def test_swap_no_ops_when_original_user_deleted(self):
+        """If the original user has been deleted between session start and the current
+        request, `User.objects.get(pk=...)` raises DoesNotExist; the helper catches it
+        and returns None. Middleware must leave request.user untouched."""
+        self.login_as_other_user()
+        impersonated_pk = self.other_user.pk
+
+        self.user.delete()
+
+        response = self.client.get("/admin/")
+        assert response.status_code == 302
+        assert "/admin/login" in response.headers.get("Location", "")
+        assert User.objects.filter(pk=impersonated_pk).exists()
+
+    def test_read_only_bypass_does_not_fire_for_path_without_trailing_slash(self):
+        """`request.path.startswith('/admin/')` requires the trailing slash. A bare
+        `/admin` POST must NOT bypass the read-only middleware. Asserts the prefix
+        check correctly excludes the trailing-slash-less form — boundary test against
+        future tweaks to the prefix check."""
+        self.login_as_other_user_read_only()
+
+        response = self.client.post("/admin", data={})
+        # The read-only middleware must block this POST since `/admin` does NOT
+        # match the `/admin/` prefix. The bypass branch is gated on the same
+        # `startswith('/admin/')` check that the AdminImpersonationMiddleware uses,
+        # so blocking here proves both checks correctly exclude this path.
+        assert response.status_code == 403, (
+            f"expected 403 (read-only block), got {response.status_code}: {response.content[:200]!r}"
+        )
+        assert response.json().get("code") == "impersonation_read_only", (
+            f"expected impersonation_read_only response, got: {response.content!r}"
+        )
+
+
+@override_settings(IMPERSONATION_TIMEOUT_SECONDS=100)
+@override_settings(IMPERSONATION_IDLE_TIMEOUT_SECONDS=20)
+@override_settings(ADMIN_PORTAL_ENABLED=True)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_KEY=None)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_SECRET=None)
+class TestImpersonationBlockedPathsMiddleware(APIBaseTest):
+    other_user: User
+
+    def setUp(self):
+        super().setUp()
+        self.other_user = User.objects.create_and_join(
+            self.organization, email="other-user@posthog.com", password="123456"
+        )
+        self.user.is_staff = True
+        self.user.save()
+
+        # Use Django's standard Client instead of APIClient for these tests.
+        # The loginas admin view expects form-encoded POST data, which is
+        # Django Client's default (APIClient defaults to JSON).
+        self.client = cast(Any, DjangoClient())
+        self.client.force_login(self.user)
+
+    def login_as_other_user(self):
+        return self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "false", "reason": "Test impersonation"},
+            follow=True,
+        )
+
+    def test_impersonation_allows_get_to_users_api(self):
+        """Verify impersonation allows GET requests to /api/users/."""
+        self.login_as_other_user()
+
+        response = self.client.get("/api/users/@me/")
+        assert response.status_code == 200
+        assert response.json()["email"] == "other-user@posthog.com"
+
+    def test_impersonation_blocks_patch_to_users_api(self):
+        """Verify any impersonation blocks PATCH requests to /api/users/."""
+        self.login_as_other_user()
+
+        # Verify we're logged in as the other user
+        assert self.client.get("/api/users/@me/").json()["email"] == "other-user@posthog.com"
+
+        # Try to update user
+        response = self.client.patch(
+            "/api/users/@me/",
+            data={"first_name": "Changed"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+        response_data = response.json()
+        assert response_data["type"] == "authentication_error"
+        assert response_data["code"] == "impersonation_path_blocked"
+
+    def test_non_impersonated_session_can_patch_users_api(self):
+        """Verify non-impersonated sessions can PATCH /api/users/."""
+        response = self.client.patch(
+            "/api/users/@me/",
+            data={"first_name": "Updated"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+        self.user.refresh_from_db()
+        assert self.user.first_name == "Updated"
+
+    def test_impersonation_allows_set_current_organization(self):
+        """Verify impersonation allows PATCH with only set_current_organization."""
+        self.login_as_other_user()
+
+        response = self.client.patch(
+            "/api/users/@me/",
+            data={"set_current_organization": str(self.organization.id)},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 200
+
+    def test_impersonation_blocks_set_current_organization_with_other_fields(self):
+        """Verify impersonation blocks PATCH with set_current_organization plus other fields."""
+        self.login_as_other_user()
+
+        response = self.client.patch(
+            "/api/users/@me/",
+            data={
+                "set_current_organization": str(self.organization.id),
+                "first_name": "Hacked",
+            },
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+        assert response.json()["code"] == "impersonation_path_blocked"
+
+    def test_impersonation_allows_get_to_personal_api_keys(self):
+        """Verify impersonation allows GET requests to /api/personal_api_keys/."""
+        self.login_as_other_user()
+
+        # Verify we're logged in as the other user
+        assert self.client.get("/api/users/@me/").json()["email"] == "other-user@posthog.com"
+
+        response = self.client.get("/api/personal_api_keys/")
+        assert response.status_code == 200
+
+    def test_impersonation_blocks_post_to_personal_api_keys(self):
+        """Verify any impersonation blocks POST requests to /api/personal_api_keys/."""
+        self.login_as_other_user()
+
+        # Verify we're logged in as the other user
+        assert self.client.get("/api/users/@me/").json()["email"] == "other-user@posthog.com"
+
+        response = self.client.post(
+            "/api/personal_api_keys/",
+            data={"label": "Test Key"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+        response_data = response.json()
+        assert response_data["type"] == "authentication_error"
+        assert response_data["code"] == "impersonation_path_blocked"
+
+    def test_impersonation_blocks_post_to_personal_api_keys_without_trailing_slash(self):
+        """The DefaultRouterPlusPlus router accepts paths with or without a trailing slash
+        (trailing_slash = r"/?"), so /api/personal_api_keys reaches the same viewset as
+        /api/personal_api_keys/. The middleware must block both forms — a startswith
+        check against "/api/personal_api_keys/" alone is bypassed by the slashless variant."""
+        self.login_as_other_user()
+
+        assert self.client.get("/api/users/@me/").json()["email"] == "other-user@posthog.com"
+
+        response = self.client.post(
+            "/api/personal_api_keys",
+            data={"label": "Test Key"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403, (
+            f"expected 403 (impersonation block), got {response.status_code}: {response.content[:200]!r}"
+        )
+        response_data = response.json()
+        assert response_data["type"] == "authentication_error"
+        assert response_data["code"] == "impersonation_path_blocked"
+
+    def test_impersonation_blocks_patch_to_users_api_without_trailing_slash(self):
+        """Same bypass class as the personal_api_keys slashless test: /api/users/@me
+        (no trailing slash) must be blocked just like /api/users/@me/."""
+        self.login_as_other_user()
+
+        assert self.client.get("/api/users/@me/").json()["email"] == "other-user@posthog.com"
+
+        response = self.client.patch(
+            "/api/users/@me",
+            data={"first_name": "Changed"},
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403, (
+            f"expected 403 (impersonation block), got {response.status_code}: {response.content[:200]!r}"
+        )
+        assert response.json()["code"] == "impersonation_path_blocked"
+
+
+@override_settings(ADMIN_PORTAL_ENABLED=True)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_KEY=None)
+@override_settings(ADMIN_AUTH_GOOGLE_OAUTH2_SECRET=None)
+class TestImpersonationLoginReasonRequired(APIBaseTest):
+    other_user: User
+
+    def setUp(self):
+        super().setUp()
+        self.other_user = User.objects.create_and_join(
+            self.organization, email="other-user@posthog.com", password="123456"
+        )
+        self.user.is_staff = True
+        self.user.save()
+
+        self.client = cast(Any, DjangoClient())
+        self.client.force_login(self.user)
+
+    def test_impersonation_rejected_without_reason(self):
+        """Verify impersonation is rejected when no reason is provided."""
+        self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "true"},
+            follow=True,
+        )
+
+        # Should still be logged in as original staff user (impersonation rejected)
+        assert self.client.get("/api/users/@me/").json()["email"] == self.user.email
+
+    def test_impersonation_succeeds_with_reason(self):
+        """Verify impersonation succeeds when a reason is provided."""
+        self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "true", "reason": "Investigating support ticket #1234"},
+            follow=True,
+        )
+
+        # Should now be logged in as other user
+        assert self.client.get("/api/users/@me/").json()["email"] == "other-user@posthog.com"
+
+    def test_impersonation_rejected_with_empty_reason(self):
+        """Verify impersonation is rejected when reason is empty string."""
+        self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "true", "reason": ""},
+            follow=True,
+        )
+
+        # Should still be logged in as original staff user
+        assert self.client.get("/api/users/@me/").json()["email"] == self.user.email
+
+    def test_impersonation_rejected_with_whitespace_only_reason(self):
+        """Verify impersonation is rejected when reason is only whitespace."""
+        self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "true", "reason": "   "},
+            follow=True,
+        )
+
+        # Should still be logged in as original staff user
+        assert self.client.get("/api/users/@me/").json()["email"] == self.user.email
+
+
+class TestUpgradeImpersonation(APIBaseTest):
+    other_user: User
+
+    def setUp(self):
+        super().setUp()
+        self.other_user = User.objects.create_and_join(
+            self.organization, email="other-user@posthog.com", password="123456"
+        )
+        self.user.is_staff = True
+        self.user.save()
+
+        self.client = cast(Any, DjangoClient())
+        self.client.force_login(self.user)
+
+    def login_as_read_only(self):
+        return self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "true", "reason": "Initial read-only impersonation"},
+            follow=True,
+        )
+
+    def login_as_read_write(self):
+        return self.client.post(
+            reverse("loginas-user-login", kwargs={"user_id": self.other_user.id}),
+            data={"read_only": "false", "reason": "Initial read-write impersonation"},
+            follow=True,
+        )
+
+    def test_upgrade_succeeds_from_read_only_with_reason(self):
+        self.login_as_read_only()
+
+        # Verify we're in read-only mode
+        user_response = self.client.get("/api/users/@me/")
+        assert user_response.json()["is_impersonated_read_only"] is True
+
+        # Upgrade to read-write
+        response = self.client.post(
+            reverse("impersonation-upgrade"),
+            data=json.dumps({"reason": "Need to make changes for support ticket #5678"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+        # Verify we're now in read-write mode
+        user_response = self.client.get("/api/users/@me/")
+        assert user_response.json()["is_impersonated_read_only"] is False
+
+    def test_start_exposes_reason_on_user_api(self):
+        self.login_as_read_only()
+        assert self.client.get("/api/users/@me/").json()["is_impersonated_reason"] == "Initial read-only impersonation"
+
+    def test_upgrade_returns_404_when_not_impersonated(self):
+        response = self.client.post(
+            reverse("impersonation-upgrade"),
+            data=json.dumps({"reason": "Some reason"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+    def test_upgrade_returns_404_when_already_read_write(self):
+        self.login_as_read_write()
+
+        response = self.client.post(
+            reverse("impersonation-upgrade"),
+            data=json.dumps({"reason": "Some reason"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 404
+
+    def test_upgrade_returns_400_without_reason(self):
+        self.login_as_read_only()
+
+        response = self.client.post(
+            reverse("impersonation-upgrade"),
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+        assert "reason" in response.json()["error"].lower()
+
+    def test_upgrade_returns_400_with_empty_reason(self):
+        self.login_as_read_only()
+
+        response = self.client.post(
+            reverse("impersonation-upgrade"),
+            data=json.dumps({"reason": "   "}),
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+
+    @patch("ee.admin.loginas_views.get_original_user_from_session", return_value=None)
+    def test_upgrade_returns_400_when_staff_user_not_found(self, mock_get_staff):
+        self.login_as_read_only()
+
+        response = self.client.post(
+            reverse("impersonation-upgrade"),
+            data=json.dumps({"reason": "Some reason"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+        assert response.json()["error"] == "Unable to upgrade impersonation"
+
+    def test_upgrade_returns_400_when_staff_demoted_mid_session(self):
+        self.login_as_read_only()
+
+        # Revoke staff privileges mid-session
+        self.user.is_staff = False
+        self.user.save()
+
+        response = self.client.post(
+            reverse("impersonation-upgrade"),
+            data=json.dumps({"reason": "Some reason"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+        assert response.json()["error"] == "Unable to upgrade impersonation"
+
+
+@override_settings(SESSION_COOKIE_AGE=100)
+class TestSessionAgeMiddleware(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+        # Patch time.time before login to ensure session creation time is correct
+        self.time_patcher = patch("time.time", return_value=1704110400.0)  # 2024-01-01 12:00:00
+        self.time_patcher.start()
+        self.client.force_login(self.user)
+        self.time_patcher.stop()
+
+    def tearDown(self):
+        super().tearDown()
+        cache.clear()
+        # Ensure any remaining patches are stopped
+        self.time_patcher.stop()
+
+    @time_machine.travel("2024-01-01 12:00:00", tick=False)
+    @patch("time.time", return_value=1704110400.0)  # 2024-01-01 12:00:00
+    def test_session_continues_when_not_expired(self, mock_time):
+        # Initial request sets session creation time
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.client.session.get(settings.SESSION_COOKIE_CREATED_AT_KEY),
+            1704110400.0,
+        )
+
+        # Move forward 99 seconds (before timeout)
+        mock_time.return_value = 1704110499.0  # 2024-01-01 12:01:39
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+
+    @time_machine.travel("2024-01-01 12:00:00", tick=False)
+    @patch("time.time", return_value=1704110400.0)  # 2024-01-01 12:00:00
+    def test_session_expires_after_total_time(self, mock_time):
+        # Initial request sets session creation time
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.client.session.get(settings.SESSION_COOKIE_CREATED_AT_KEY),
+            1704110400.0,
+        )
+
+        # Move forward past total session age (101 seconds)
+        mock_time.return_value = 1704110501.0  # 2024-01-01 12:01:41
+        response = self.client.get("/")
+        # Should redirect to login
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.headers["Location"],
+            "/login?message=Your%20session%20has%20expired.%20Please%20log%20in%20again.",
+        )
+
+    @time_machine.travel("2024-01-01 12:00:00", tick=False)
+    @patch("time.time", return_value=1704110400.0)  # 2024-01-01 12:00:00
+    def test_org_specific_session_timeout_from_cache(self, mock_time):
+        # Set org-specific timeout in cache
+        cache.set(f"org_session_age:{self.organization.id}", 50)
+
+        # Initial request sets session creation time
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.client.session.get(settings.SESSION_COOKIE_CREATED_AT_KEY),
+            1704110400.0,
+        )
+
+        # Move forward past org timeout (51 seconds)
+        mock_time.return_value = 1704110451.0  # 2024-01-01 12:00:51
+        response = self.client.get("/")
+        # Should redirect to login
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.headers["Location"],
+            "/login?message=Your%20session%20has%20expired.%20Please%20log%20in%20again.",
+        )
+
+    @time_machine.travel("2024-01-01 12:00:00", tick=False)
+    @patch("time.time", return_value=1704110400.0)  # 2024-01-01 12:00:00
+    def test_session_timeout_after_switching_org_with_cache(self, mock_time):
+        # Create another org with different timeout
+        other_org = Organization.objects.create(name="Other Org", session_cookie_age=30)
+        other_team = Team.objects.create(organization=other_org, name="Other Team")
+        self.user.organizations.add(other_org)
+
+        # Set cache for both orgs
+        cache.set(f"org_session_age:{self.organization.id}", 50)
+        cache.set(f"org_session_age:{other_org.id}", 30)
+
+        # Initial request sets session creation time
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.client.session.get(settings.SESSION_COOKIE_CREATED_AT_KEY),
+            1704110400.0,
+        )
+
+        # Switch to other team
+        self.user.team = other_team
+        self.user.current_team = other_team
+        self.user.current_organization = other_org
+        self.user.save()
+
+        # Move forward 29 seconds (before new org's timeout)
+        mock_time.return_value = 1704110429.0  # 2024-01-01 12:00:29
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+
+        # Move forward 31 seconds (past new org's timeout)
+        mock_time.return_value = 1704110431.0  # 2024-01-01 12:00:31
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.headers["Location"],
+            "/login?message=Your%20session%20has%20expired.%20Please%20log%20in%20again.",
+        )
+
+
+class TestActiveOrganizationMiddleware(APIBaseTest):
+    def test_active_organization_allows_request(self):
+        self.organization.is_active = True
+        self.organization.save()
+
+        # API paths are skipped by middleware
+        response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["email"], self.user.email)
+
+        # Non-API paths are checked
+        response = self.client.get("/dashboard")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_api_paths_skipped_even_with_inactive_org(self):
+        """API paths should be skipped by middleware regardless of org status"""
+        self.organization.is_active = False
+        self.organization.is_not_active_reason = "Test deactivation"
+        self.organization.save()
+
+        # API paths should work even with inactive org
+        response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_inactive_organization_redirects_non_api_paths(self):
+        other_org = Organization.objects.create(name="Other Org", is_active=True)
+        self.user.organizations.add(other_org)
+
+        self.organization.is_active = False
+        self.organization.is_not_active_reason = "Test deactivation"
+        self.organization.save()
+
+        # Non-API paths should redirect
+        response = self.client.get("/dashboard")
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(response.headers["Location"], "/organization-deactivated")
+
+    def test_inactive_organization_allows_organization_deactivated_page(self):
+        self.organization.is_active = False
+        self.organization.is_not_active_reason = "Test deactivation"
+        self.organization.save()
+
+        # Should allow access to the deactivated page itself
+        response = self.client.get("/organization-deactivated")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_logout_path_skipped(self):
+        """Logout paths should be skipped by middleware"""
+        self.organization.is_active = False
+        self.organization.save()
+
+        response = self.client.post("/logout/")
+        # Logout may redirect (302 is normal), but should not redirect to organization-deactivated
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertNotIn("organization-deactivated", response.headers.get("Location", ""))
+
+    def test_unauthenticated_user_not_affected(self):
+        self.client.logout()
+        # API paths are skipped, so auth check happens in view
+        response = self.client.get("/api/users/@me/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # Non-API paths are also skipped for unauthenticated users
+        response = self.client.get("/dashboard")
+        # Should redirect to login or show appropriate response
+        self.assertIn(response.status_code, [status.HTTP_302_FOUND, status.HTTP_200_OK])
+
+    @parameterized.expand(
+        [
+            ("/dashboard", status.HTTP_302_FOUND, "/organization-pending-deletion"),
+            ("/some-page", status.HTTP_302_FOUND, "/organization-pending-deletion"),
+            ("/organization-pending-deletion", status.HTTP_200_OK, None),
+            ("/api/users/@me/", status.HTTP_200_OK, None),
+        ]
+    )
+    def test_pending_deletion_routing(self, path, expected_status, expected_location):
+        self.organization.is_pending_deletion = True
+        self.organization.save()
+
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, expected_status)
+        if expected_location:
+            self.assertEqual(response.headers["Location"], expected_location)
+
+    @parameterized.expand(
+        [
+            ("deactivated_keeps_invites", "is_active", "/signup/{invite_id}", status.HTTP_200_OK),
+            ("deactivated_keeps_billing", "is_active", "/organization/billing", status.HTTP_200_OK),
+            ("deactivated_keeps_stripe_return", "is_active", "/billing/authorization_status", status.HTTP_200_OK),
+            ("deactivated_keeps_partner_consent", "is_active", "/agentic/authorize", status.HTTP_200_OK),
+            ("deactivated_keeps_app_context", "is_active", "/_app_context", status.HTTP_200_OK),
+            ("pending_deletion_keeps_invites", "is_pending_deletion", "/signup/{invite_id}", status.HTTP_200_OK),
+            ("pending_deletion_keeps_partner_consent", "is_pending_deletion", "/agentic/authorize", status.HTTP_200_OK),
+            ("pending_deletion_keeps_app_context", "is_pending_deletion", "/_app_context", status.HTTP_200_OK),
+            ("pending_deletion_drops_billing", "is_pending_deletion", "/organization/billing", status.HTTP_302_FOUND),
+            (
+                "pending_deletion_drops_stripe_return",
+                "is_pending_deletion",
+                "/billing/authorization_status",
+                status.HTTP_302_FOUND,
+            ),
+        ]
+    )
+    def test_blocked_organization_page_access(
+        self, _name: str, blocking_field: str, path_template: str, expected_status: int
+    ) -> None:
+        inviting_org = Organization.objects.create(name="Inviting Org")
+        invite = OrganizationInvite.objects.create(organization=inviting_org, target_email=self.user.email)
+
+        setattr(self.organization, blocking_field, blocking_field == "is_pending_deletion")
+        self.organization.save()
+
+        response = self.client.get(path_template.format(invite_id=invite.id))
+        self.assertEqual(response.status_code, expected_status)
+
+    def test_link_into_another_active_organization_loads(self):
+        active_org = Organization.objects.create(name="Active Org")
+        active_team = Team.objects.create(organization=active_org, name="Active Team")
+        self.user.organizations.add(active_org)
+
+        self.organization.is_active = False
+        self.organization.save()
+
+        response = self.client.get(f"/project/{active_team.pk}/dashboard")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_runs_after_the_middleware_that_switches_project(self):
+        # The block check reads `current_organization`, so it only sees the organization a
+        # `/project/<id>` URL names once AutoProjectMiddleware has switched the user into it.
+        middleware = list(settings.MIDDLEWARE)
+        self.assertLess(
+            middleware.index("posthog.middleware.AutoProjectMiddleware"),
+            middleware.index("posthog.middleware.ActiveOrganizationMiddleware"),
+        )
+
+
+class TestActivityLoggingMiddleware(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        from django.test import RequestFactory
+
+        from posthog.middleware import ActivityLoggingMiddleware
+        from posthog.models.activity_logging.utils import activity_storage
+
+        self.activity_storage = activity_storage
+        self.factory = RequestFactory()
+        self.captured: dict[str, Any] = {}
+
+        def get_response(request):
+            self.captured["client"] = activity_storage.get_client()
+            self.captured["user"] = activity_storage.get_user()
+            self.captured["ip_address"] = activity_storage.get_ip_address()
+            from django.http import HttpResponse
+
+            return HttpResponse()
+
+        self.middleware = ActivityLoggingMiddleware(get_response)
+
+    @parameterized.expand(
+        [
+            ("the session authenticates", "unchanged", "session"),
+            ("a later middleware rewraps the same user", "rewrapped", "session"),
+            ("another class authenticates", "replaced", None),
+        ]
+    )
+    def test_session_credential_applies_only_while_the_session_user_is_the_request_user(
+        self, _name: str, request_user: str, expected_type: str | None
+    ):
+        from django.contrib.auth.models import AnonymousUser
+        from django.http import HttpResponse
+        from django.utils.functional import SimpleLazyObject
+
+        from posthog.middleware import ActivityLoggingMiddleware
+
+        def get_response(request):
+            if request_user == "rewrapped":
+                request.user = SimpleLazyObject(lambda: self.user)
+            elif request_user == "replaced":
+                # DRF writes the principal of the class that authenticated back onto the request.
+                request.user = AnonymousUser()
+            self.captured["credential"] = self.activity_storage.get_credential()
+            return HttpResponse()
+
+        request = self.factory.get("/")
+        request.user = self.user
+        ActivityLoggingMiddleware(get_response)(request)
+
+        credential = self.captured["credential"]
+        assert (credential.type if credential else None) == expected_type
+        assert self.activity_storage.get_credential() is None
+
+    def test_captures_x_posthog_client_header(self):
+        request = self.factory.get("/", HTTP_X_POSTHOG_CLIENT="posthog-js/1.234.0")
+        request.user = self.user
+        self.middleware(request)
+        self.assertEqual(self.captured["client"], "posthog-js/1.234.0")
+        # Storage is cleared after the request finishes
+        self.assertIsNone(self.activity_storage.get_client())
+
+    def test_missing_header_leaves_client_unset(self):
+        request = self.factory.get("/")
+        request.user = self.user
+        self.middleware(request)
+        self.assertIsNone(self.captured["client"])
+
+    def test_long_header_value_is_truncated(self):
+        from posthog.models.activity_logging.utils import ACTIVITY_LOG_CLIENT_HEADER_MAX_LENGTH
+
+        long_value = "x" * (ACTIVITY_LOG_CLIENT_HEADER_MAX_LENGTH * 4)
+        request = self.factory.get("/", HTTP_X_POSTHOG_CLIENT=long_value)
+        request.user = self.user
+        self.middleware(request)
+        self.assertEqual(self.captured["client"], "x" * ACTIVITY_LOG_CLIENT_HEADER_MAX_LENGTH)
+
+    @parameterized.expand(
+        [
+            ("lowercase prefix", "scout:signals-scout-errors"),
+            ("upper case prefix", "SCOUT:signals-scout-errors"),
+            ("padded prefix", "  scout:signals-scout-errors  "),
+        ]
+    )
+    def test_header_claiming_a_server_derived_prefix_is_dropped(self, _name: str, header_value: str):
+        request = self.factory.get("/", HTTP_X_POSTHOG_CLIENT=header_value)
+        request.user = self.user
+        self.middleware(request)
+        self.assertIsNone(self.captured["client"])
+
+    def test_captures_ip_address_from_remote_addr(self):
+        request = self.factory.get("/", REMOTE_ADDR="203.0.113.42")
+        request.user = self.user
+        self.middleware(request)
+        self.assertEqual(self.captured["ip_address"], "203.0.113.42")
+        # Storage is cleared after the request finishes
+        self.assertIsNone(self.activity_storage.get_ip_address())
+
+    def test_captures_ip_address_from_x_forwarded_for(self):
+        request = self.factory.get(
+            "/",
+            HTTP_X_FORWARDED_FOR="198.51.100.7, 10.0.0.1",
+            REMOTE_ADDR="10.0.0.1",
+        )
+        request.user = self.user
+        self.middleware(request)
+        # leftmost XFF entry wins
+        self.assertEqual(self.captured["ip_address"], "198.51.100.7")
+
+    def test_invalid_ip_stored_as_none(self):
+        request = self.factory.get("/", REMOTE_ADDR="not-an-ip")
+        request.user = self.user
+        self.middleware(request)
+        self.assertIsNone(self.captured["ip_address"])
+
+    @parameterized.expand(
+        [
+            ("signed ip", _mcp_client_ip_headers(), [MCP_CLIENT_IP_KEY], MANAGED_PROXY_CLIENT_IP, "valid"),
+            (
+                "signed with an older key",
+                _mcp_client_ip_headers("2001:db8::1", key=MCP_CLIENT_IP_OLD_KEY),
+                [MCP_CLIENT_IP_KEY, MCP_CLIENT_IP_OLD_KEY],
+                "2001:db8::1",
+                "valid",
+            ),
+            (
+                "signed with the managed proxy key",
+                _mcp_client_ip_headers(key=MANAGED_PROXY_KEY),
+                [MCP_CLIENT_IP_KEY],
+                MCP_POD_IP,
+                "bad_signature",
+            ),
+            ("no key configured", _mcp_client_ip_headers(), [], MCP_POD_IP, "not_configured"),
+            (
+                "expired timestamp",
+                _mcp_client_ip_headers(timestamp=MANAGED_PROXY_NOW - 61),
+                [MCP_CLIENT_IP_KEY],
+                MCP_POD_IP,
+                "timestamp_out_of_window",
+            ),
+            (
+                "unsigned ip",
+                {"HTTP_X_POSTHOG_MCP_CLIENT_IP": MANAGED_PROXY_CLIENT_IP},
+                [MCP_CLIENT_IP_KEY],
+                MCP_POD_IP,
+                "invalid_input",
+            ),
+            ("no mcp headers", {}, [MCP_CLIENT_IP_KEY], MCP_POD_IP, None),
+        ]
+    )
+    def test_mcp_signed_client_ip(
+        self,
+        _name: str,
+        meta: dict[str, Any],
+        signing_keys: list[str],
+        expected_ip: str,
+        expected_outcome: str | None,
+    ) -> None:
+        def verification_counts() -> dict[str, float]:
+            return {
+                outcome.value: REGISTRY.get_sample_value(
+                    "posthog_mcp_client_ip_verifications_total", {"outcome": outcome.value}
+                )
+                or 0.0
+                for outcome in SignedClientIPOutcome
+            }
+
+        def get_response(request: HttpRequest) -> HttpResponse:
+            self.captured["ip_address"] = self.activity_storage.get_ip_address()
+            self.captured["request_ip"] = get_ip_address(request)
+            self.captured["leftover"] = [name for name in request.headers if name.lower().startswith("x-posthog-mcp")]
+            return HttpResponse()
+
+        request = self.factory.get("/", REMOTE_ADDR=MCP_POD_IP, **meta)
+        request.user = self.user
+        # An earlier middleware may read request.headers, which caches a snapshot of META.
+        assert request.headers.get("x-posthog-mcp-client-ip") == meta.get("HTTP_X_POSTHOG_MCP_CLIENT_IP")
+        counts_before = verification_counts()
+
+        with self.settings(MCP_CLIENT_IP_SIGNING_KEYS=signing_keys), time_machine.travel(MANAGED_PROXY_NOW, tick=False):
+            ActivityLoggingMiddleware(get_response)(request)
+
+        assert self.captured["ip_address"] == expected_ip
+        assert self.captured["request_ip"] == MCP_POD_IP
+        assert self.captured["leftover"] == []
+        assert getattr(request, "verified_mcp_client_ip", None) == (
+            expected_ip if expected_outcome == "valid" else None
+        )
+        expected_counts = dict(counts_before)
+        if expected_outcome:
+            expected_counts[expected_outcome] += 1
+        assert verification_counts() == expected_counts
+
+
+class TestSocialAuthExceptionMiddleware(SimpleTestCase):
+    CONFIG_AUTO_LOGIN = False
+
+    def setUp(self):
+        super().setUp()
+        from django.test import RequestFactory
+
+        from posthog.middleware import SocialAuthExceptionMiddleware
+
+        self.middleware = SocialAuthExceptionMiddleware(lambda request: None)
+        self.factory = RequestFactory()
+
+    @parameterized.expand(
+        [
+            (
+                "oauth_cancelled_on_complete",
+                "/complete/google-oauth2/",
+                AuthCanceled(_social_auth_backend(), "User cancelled"),
+                "/login?error_code=oauth_cancelled",
+            ),
+            (
+                "saml_sso_enforced",
+                "/complete/saml/",
+                AuthFailed(_social_auth_backend(), "saml_sso_enforced"),
+                "/login?error_code=saml_sso_enforced",
+            ),
+            (
+                "google_sso_enforced",
+                "/complete/google-oauth2/",
+                AuthFailed(_social_auth_backend(), "google_sso_enforced"),
+                "/login?error_code=google_sso_enforced",
+            ),
+            (
+                "github_sso_enforced",
+                "/complete/github/",
+                AuthFailed(_social_auth_backend(), "github_sso_enforced"),
+                "/login?error_code=github_sso_enforced",
+            ),
+            (
+                "gitlab_sso_enforced",
+                "/complete/gitlab/",
+                AuthFailed(_social_auth_backend(), "gitlab_sso_enforced"),
+                "/login?error_code=gitlab_sso_enforced",
+            ),
+            (
+                "generic_sso_enforced",
+                "/complete/saml/",
+                AuthFailed(_social_auth_backend(), "sso_enforced"),
+                "/login?error_code=sso_enforced",
+            ),
+            (
+                "access_blocked",
+                "/complete/google-oauth2/",
+                AuthFailed(_social_auth_backend(), "access_blocked"),
+                "/login?error_code=access_blocked",
+            ),
+            (
+                "oauth_state_missing",
+                "/complete/google-oauth2/",
+                AuthStateMissing(_social_auth_backend(), "state"),
+                "/login?error_code=oauth_state_invalid",
+            ),
+            (
+                "oauth_state_mismatch",
+                "/complete/github/",
+                AuthStateForbidden(_social_auth_backend()),
+                "/login?error_code=oauth_state_invalid",
+            ),
+            (
+                "expired_invite",
+                "/complete/google-oauth2/",
+                InviteExpiredException(),
+                "/login?error_code=invalid_invite",
+            ),
+            (
+                "invite_for_another_email",
+                "/complete/google-oauth2/",
+                ValidationError("This invite is intended for another email address.", code="invalid_recipient"),
+                "/login?error_code=invite_email_mismatch",
+            ),
+            (
+                "already_a_member",
+                "/complete/google-oauth2/",
+                ValidationError("You already are a member of this organization.", code="user_already_member"),
+                "/login?error_code=invite_already_member",
+            ),
+            (
+                "invite_email_already_in_org",
+                "/complete/saml/",
+                ValidationError("Another user with this email already belongs.", code="existing_email_address"),
+                "/login?error_code=invite_email_taken",
+            ),
+            (
+                "unknown_validation_code",
+                "/complete/google-oauth2/",
+                ValidationError("Something else.", code="something_else"),
+                "/login?error_code=social_login_failure",
+            ),
+            (
+                "provider_read_timeout",
+                "/complete/google-oauth2/",
+                requests.exceptions.ReadTimeout("Read timed out."),
+                "/login?error_code=social_login_failure",
+            ),
+            (
+                "provider_server_error",
+                "/complete/github/",
+                requests.exceptions.HTTPError(
+                    "500 Server Error: Internal Server Error for url: https://example.com",
+                    response=requests.Response(),
+                ),
+                "/login?error_code=social_login_failure",
+            ),
+        ]
+    )
+    def test_redirects_with_expected_url(self, _name, path, exception, expected_url):
+        request = self.factory.get(path)
+        response = self.middleware.process_exception(request, exception)
+
+        self.assertIsNotNone(response)
+        assert isinstance(response, HttpResponseRedirect)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(response.url, expected_url)
+
+    @parameterized.expand(
+        [
+            (
+                "auth_failed_generic_on_complete",
+                "/complete/saml/",
+                AuthFailed(_social_auth_backend(), "SAML not configured for this user."),
+            ),
+            (
+                "auth_missing_parameter_on_complete",
+                "/complete/saml/",
+                AuthMissingParameter(_social_auth_backend(), "email"),
+            ),
+            (
+                "auth_failed_on_login_path",
+                "/login/saml/",
+                AuthFailed(_social_auth_backend(), "SAML not configured for this user."),
+            ),
+        ]
+    )
+    def test_redirects_with_social_login_failure(self, _name, path, exception):
+        from urllib.parse import parse_qs, urlparse
+
+        request = self.factory.get(path)
+        response = self.middleware.process_exception(request, exception)
+
+        self.assertIsNotNone(response)
+        assert isinstance(response, HttpResponseRedirect)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn("error_code=social_login_failure", response.url)
+        self.assertIn("error_detail=", response.url)
+
+        parsed = urlparse(response.url)
+        error_detail = parse_qs(parsed.query).get("error_detail", [""])[0]
+        if isinstance(exception, AuthFailed):
+            self.assertFalse(error_detail.startswith("Authentication failed: "))
+
+    @parameterized.expand(
+        [
+            (
+                "non_auth_exception_on_oauth_path",
+                "/complete/saml/",
+                ValueError("some random error"),
+            ),
+            (
+                "auth_failed_on_non_oauth_path",
+                "/api/some-endpoint/",
+                AuthFailed(_social_auth_backend(), "some error"),
+            ),
+        ]
+    )
+    def test_returns_none_for_unhandled_cases(self, _name, path, exception):
+        request = self.factory.get(path)
+        response = self.middleware.process_exception(request, exception)
+
+        self.assertIsNone(response)
+
+
+@pytest.mark.parametrize(
+    "path,query_string,session_next,expected_coop",
+    [
+        ("/connect/vercel/link", "", None, "unsafe-none"),
+        ("/oauth/callback", "", None, "unsafe-none"),
+        ("/login", "next=/connect/vercel/link", None, "unsafe-none"),
+        ("/login", "next=/connect/vercel/link?session=abc", None, "unsafe-none"),
+        ("/login", "", None, "same-origin"),
+        ("/login", "next=/dashboard", None, "same-origin"),
+        ("/login", "next=/connect/vercel/../../admin", None, "same-origin"),
+        ("/some/other/path", "", None, "same-origin"),
+        ("/login/google-oauth2/", "next=/connect/vercel/link", None, "unsafe-none"),
+        ("/login/github/", "", None, "same-origin"),
+        ("/login/github/", "next=/dashboard", None, "same-origin"),
+        ("/complete/google-oauth2/", "code=x&state=y", "/connect/vercel/link", "unsafe-none"),
+        ("/complete/google-oauth2/", "code=x&state=y", None, "same-origin"),
+        ("/complete/google-oauth2/", "code=x&state=y", "/dashboard", "same-origin"),
+        ("/signup", "next=/connect/vercel/link", None, "unsafe-none"),
+        ("/signup", "", None, "same-origin"),
+        ("/signup", "next=/dashboard", None, "same-origin"),
+        ("/organization/confirm-creation", "next=/connect/vercel/link?session=abc", None, "unsafe-none"),
+        ("/organization/confirm-creation", "next=/dashboard", None, "same-origin"),
+        (
+            "/verify_email/00000000-0000-0000-0000-000000000001",
+            "next=/connect/vercel/link?session=abc",
+            None,
+            "unsafe-none",
+        ),
+        ("/verify_email/00000000-0000-0000-0000-000000000001", "next=/dashboard", None, "same-origin"),
+        ("/complete/github-link/", "", None, "same-origin"),
+        ("/complete/slack-link/", "", None, "same-origin"),
+        ("/login/not-a-backend/", "", None, "same-origin"),
+    ],
+    ids=[
+        "direct-oauth-vercel",
+        "direct-oauth-callback",
+        "login-next-oauth",
+        "login-next-oauth-with-params",
+        "login-no-next",
+        "login-next-non-oauth",
+        "login-next-path-traversal",
+        "unrelated-path",
+        "social-login-start-with-next",
+        "social-login-start-plain",
+        "social-login-start-non-oauth-next",
+        "social-complete-session-oauth",
+        "social-complete-no-session",
+        "social-complete-session-non-oauth",
+        "signup-next-oauth",
+        "signup-no-next",
+        "signup-next-non-oauth",
+        "confirm-creation-next-oauth",
+        "confirm-creation-next-non-oauth",
+        "verify-email-next-oauth",
+        "verify-email-next-non-oauth",
+        "linking-complete-github",
+        "linking-complete-slack",
+        "login-unknown-backend",
+    ],
+)
+def test_oauth_coop_middleware(path, query_string, session_next, expected_coop):
+    from django.contrib.sessions.backends.signed_cookies import SessionStore
+    from django.http import HttpResponse
+    from django.test import RequestFactory
+
+    from posthog.middleware import OAuthCoopMiddleware
+
+    factory = RequestFactory()
+    request = factory.get(path + ("?" + query_string if query_string else ""))
+    if session_next is not None:
+        session = SessionStore()
+        session["next"] = session_next
+        request.session = session
+
+    def get_response(req):
+        resp = HttpResponse("ok")
+        resp["Cross-Origin-Opener-Policy"] = "same-origin"
+        return resp
+
+    middleware = OAuthCoopMiddleware(get_response)
+    response = middleware(request)
+    assert response["Cross-Origin-Opener-Policy"] == expected_coop
+
+
+@parameterized.expand(
+    [
+        ("posthog/mcp-server v1", "mcp"),
+        ("Mozilla/5.0", "web"),
+        ("posthog/code", "posthog_code"),
+    ]
+)
+def test_chqueries_middleware_tags_source(user_agent, expected_source):
+    # Middleware only tags `source`. Product/feature are filled later by `add_fallback_query_tags`
+    # in `sync_execute` based on scene/query_type — or surfaced via UntaggedQueryError if neither
+    # is available. Tagging product=mcp here would mask genuinely untagged queries.
+    from django.http import HttpResponse
+    from django.test import RequestFactory
+
+    from posthog.clickhouse.query_tagging import get_query_tags, reset_query_tags
+    from posthog.middleware import CHQueries
+
+    reset_query_tags()
+
+    captured: dict = {}
+
+    def get_response(req):
+        tags = get_query_tags()
+        captured["source"] = tags.source
+        captured["product"] = tags.product
+        captured["feature"] = tags.feature
+        return HttpResponse("ok")
+
+    factory = RequestFactory()
+    request = factory.get("/api/projects/@current/query/", HTTP_USER_AGENT=user_agent)
+    request.user = MagicMock(pk=1, is_authenticated=False)
+    request.session = MagicMock(session_key="abc123")
+
+    CHQueries(get_response)(request)
+
+    assert captured["source"] == expected_source
+    assert captured["product"] is None
+    assert captured["feature"] is None
+
+
+def _http_request_id_probe(request: HttpRequest) -> HttpResponse:
+    return HttpResponse(str(get_query_tags().http_request_id))
+
+
+def _route_id_probe(request: HttpRequest, probe_id: int) -> HttpResponse:
+    return HttpResponse(get_query_tags().route_id)
+
+
+def _raising_probe(request: HttpRequest) -> HttpResponse:
+    raise RuntimeError("probe")
+
+
+urlpatterns = [
+    path("api/_http_request_id_probe/", _http_request_id_probe),
+    path("api/_raising_probe/", _raising_probe),
+    path("api/_route_id_probe/<int:probe_id>/", _route_id_probe),
+]
+
+
+@pytest.mark.parametrize(
+    "header_value,expected_tag",
+    [
+        pytest.param("0b8a6a4e-4c1f-4d2e-9a57-3f6f0f6c2b11", "0b8a6a4e-4c1f-4d2e-9a57-3f6f0f6c2b11", id="uuid"),
+        # django-structlog binds the client's X-Request-ID header without checking that it is a UUID.
+        pytest.param("not-a-uuid", "None", id="not_a_uuid"),
+    ],
+)
+@override_settings(ROOT_URLCONF=__name__)
+async def test_chqueries_middleware_tags_http_request_id_under_asgi(header_value, expected_tag):
+    # AsyncClient runs settings.MIDDLEWARE through the ASGI handler, as production does.
+    # There, django-structlog binds request_id on the event loop. CHQueries reads it from a worker thread.
+    response = await AsyncClient().get("/api/_http_request_id_probe/", headers={"X-Request-ID": header_value})
+
+    assert response.content.decode() == expected_tag
+    if expected_tag == "None":
+        assert "X-Request-ID" not in response.headers
+    else:
+        # Any API response, not only query ones, so frontend failure events can join the backend logs.
+        assert response.headers["X-Request-ID"] == expected_tag
+
+
+@override_settings(ROOT_URLCONF=__name__)
+async def test_chqueries_middleware_tags_route_id_under_asgi() -> None:
+    response = await AsyncClient().get("/api/_route_id_probe/1/")
+
+    assert response.content.decode() == "api/_route_id_probe/<int:probe_id>/"
+
+
+@pytest.mark.parametrize(
+    "path,expected_event",
+    [
+        pytest.param("/api/_route_id_probe/1/", "request_finished", id="finished"),
+        pytest.param("/api/_raising_probe/", "request_failed", id="failed"),
+    ],
+)
+@override_settings(ROOT_URLCONF=__name__)
+async def test_request_log_carries_duration_ms(path, expected_event) -> None:
+    with capture_logs() as logs:
+        await AsyncClient(raise_request_exception=False).get(path)
+
+    [entry] = [log for log in logs if log["event"] == expected_event]
+    assert isinstance(entry["duration_ms"], float)
+    assert entry["duration_ms"] >= 0
+
+
+@parameterized.expand(
+    [
+        ("ids_templated", "/api/projects/123/feature_flags/456/", "api/projects/{project_id}/feature_flags/{pk}/"),
+        (
+            "format_suffix_folded",
+            "/api/projects/123/feature_flags/456.json",
+            "api/projects/{project_id}/feature_flags/{pk}/",
+        ),
+        ("optional_suffix_dropped", "/api/signup", "api/signup/"),
+        ("api_404_catch_all", "/api/this_does_not_exist/123/", "unmatched"),
+        ("unresolved", None, "unmatched"),
+    ]
+)
+def test_request_route_is_a_bounded_template(name, path, expected):
+    request = HttpRequest()
+    request.resolver_match = resolve(path) if path else None
+
+    assert request_route(request) == expected
+
+
+@parameterized.expand(
+    [
+        ("api_path_emits", "/api/projects/@current/query/", True),
+        ("api_capture_excluded", "/api/projects/@current/capture/", False),
+        ("non_api_path_excluded", "/login", False),
+    ]
+)
+def test_chqueries_middleware_api_latency_histogram_scope(name, path, should_emit):
+    from django.http import HttpResponse
+    from django.test import RequestFactory
+
+    from prometheus_client import REGISTRY
+
+    from posthog.middleware import CHQueries
+
+    labels = {
+        "view": "project_query-list",
+        "route": "api/projects/{team_id}/query/",
+        "method": "GET",
+        "source": "web",
+        "access_method": "",
+        "status_class": "2xx",
+    }
+
+    def sample_count() -> float:
+        return REGISTRY.get_sample_value("posthog_api_requests_latency_seconds_count", labels=labels) or 0.0
+
+    before = sample_count()
+
+    request = RequestFactory().get(path)
+    request.resolver_match = resolve(request.path)
+    request.user = MagicMock(pk=1, is_authenticated=False)
+    request.session = MagicMock(session_key="abc123")
+
+    CHQueries(lambda r: HttpResponse("ok"))(request)
+
+    delta = sample_count() - before
+    expected = 1.0 if should_emit else 0.0
+    assert delta == expected, f"{name}: expected delta {expected}, got {delta}"
+
+
+@parameterized.expand(
+    [
+        ("source_mcp", "posthog/mcp-server v1", None, "mcp", ""),
+        ("source_web", "Mozilla/5.0", None, "web", ""),
+        ("access_method_personal_api_key", "Mozilla/5.0", "personal_api_key", "web", "personal_api_key"),
+        ("access_method_oauth", "Mozilla/5.0", "oauth", "web", "oauth"),
+    ]
+)
+def test_chqueries_middleware_api_latency_labels(name, user_agent, access_method, expected_source, expected_access):
+    from django.http import HttpResponse
+    from django.test import RequestFactory
+
+    from prometheus_client import REGISTRY
+
+    from posthog.clickhouse.query_tagging import tag_queries
+    from posthog.middleware import CHQueries
+
+    labels = {
+        "view": "project_query-list",
+        "route": "api/projects/{team_id}/query/",
+        "method": "GET",
+        "source": expected_source,
+        "access_method": expected_access,
+        "status_class": "2xx",
+    }
+
+    def sample_count() -> float:
+        return REGISTRY.get_sample_value("posthog_api_requests_latency_seconds_count", labels=labels) or 0.0
+
+    before = sample_count()
+
+    def get_response(req):
+        if access_method is not None:
+            tag_queries(access_method=access_method)
+        return HttpResponse("ok")
+
+    request = RequestFactory().get("/api/projects/@current/query/", HTTP_USER_AGENT=user_agent)
+    request.resolver_match = resolve(request.path)
+    request.user = MagicMock(pk=1, is_authenticated=False)
+    request.session = MagicMock(session_key="abc123")
+
+    CHQueries(get_response)(request)
+
+    assert sample_count() - before == 1.0, f"{name}: histogram not observed for labels {labels}"
+
+
+@parameterized.expand(
+    [
+        ("ok_2xx", 200, "2xx"),
+        ("redirect_3xx", 301, "3xx"),
+        ("client_error_4xx", 404, "4xx"),
+        ("server_error_5xx", 503, "5xx"),
+    ]
+)
+def test_chqueries_middleware_api_latency_status_class(name, status_code, expected_class):
+    from django.http import HttpResponse
+    from django.test import RequestFactory
+
+    from prometheus_client import REGISTRY
+
+    from posthog.middleware import CHQueries
+
+    labels = {
+        "view": "project_query-list",
+        "route": "api/projects/{team_id}/query/",
+        "method": "GET",
+        "source": "web",
+        "access_method": "",
+        "status_class": expected_class,
+    }
+
+    def sample_count() -> float:
+        return REGISTRY.get_sample_value("posthog_api_requests_latency_seconds_count", labels=labels) or 0.0
+
+    before = sample_count()
+
+    request = RequestFactory().get("/api/projects/@current/query/")
+    request.resolver_match = resolve(request.path)
+    request.user = MagicMock(pk=1, is_authenticated=False)
+    request.session = MagicMock(session_key="abc123")
+
+    CHQueries(lambda r: HttpResponse("body", status=status_code))(request)
+
+    assert sample_count() - before == 1.0, f"{name}: expected 1 observation at status_class={expected_class}"
+
+
+def test_chqueries_middleware_api_latency_records_on_raise():
+    from django.test import RequestFactory
+
+    from prometheus_client import REGISTRY
+
+    from posthog.middleware import CHQueries
+
+    labels = {
+        "view": "project_query-list",
+        "route": "api/projects/{team_id}/query/",
+        "method": "GET",
+        "source": "web",
+        "access_method": "",
+        "status_class": "error",
+    }
+
+    def sample_count() -> float:
+        return REGISTRY.get_sample_value("posthog_api_requests_latency_seconds_count", labels=labels) or 0.0
+
+    before = sample_count()
+
+    def boom(req):
+        raise RuntimeError("view exploded")
+
+    request = RequestFactory().get("/api/projects/@current/query/")
+    request.resolver_match = resolve(request.path)
+    request.user = MagicMock(pk=1, is_authenticated=False)
+    request.session = MagicMock(session_key="abc123")
+
+    with pytest.raises(RuntimeError, match="view exploded"):
+        CHQueries(boom)(request)
+
+    assert sample_count() - before == 1.0, "exception path must still record latency at status_class=error"
+
+
+@parameterized.expand(
+    [
+        ("success", "01234567-89ab-4def-8123-456789abcdef", 200, "01234567-89ab-4def-8123-456789abcdef"),
+        ("async", "0123456789AB4DEF8123456789ABCDEF", 202, "01234567-89ab-4def-8123-456789abcdef"),
+        ("auth_error", "01234567-89ab-4def-8123-456789abcdef", 401, "01234567-89ab-4def-8123-456789abcdef"),
+        ("invalid", 'user@example.com;desc="unsafe"', 400, None),
+        ("missing", None, 200, None),
+    ]
+)
+def test_chqueries_middleware_correlates_query_response(
+    name: str, request_id: str | None, status_code: int, expected_id: str | None
+) -> None:
+    from django.contrib.auth.models import AnonymousUser
+    from django.contrib.sessions.backends.signed_cookies import SessionStore
+    from django.http.response import HttpResponseBase
+
+    from rest_framework.request import Request
+    from rest_framework.response import Response
+
+    from posthog.api.query import QueryViewSet, get_query_request_analytics_properties
+    from posthog.event_usage import get_request_analytics_properties
+    from posthog.middleware import CHQueries
+
+    analytics_props: dict[str, object] = {}
+    view = QueryViewSet()
+    view.headers = {}
+
+    def get_response(request: HttpRequest) -> HttpResponseBase:
+        assert "http_request_id" not in get_request_analytics_properties(request)
+        analytics_props.update(get_query_request_analytics_properties(request))
+        response = Response(
+            {"results": []},
+            status=status_code,
+            headers={"Server-Timing": "existing;dur=5"},
+        )
+        return view.finalize_response(Request(request), response)
+
+    request = RequestFactory().get("/api/projects/@current/query/")
+    request.user = AnonymousUser()
+    request.session = SessionStore()
+    with structlog.contextvars.bound_contextvars(request_id=request_id):
+        response = CHQueries(get_response)(request)
+
+    assert isinstance(response, Response)
+    assert response.status_code == status_code
+    assert response.data == {"results": []}
+    assert analytics_props.get("http_request_id") == expected_id
+    if expected_id:
+        assert response["X-Request-ID"] == expected_id
+        assert response["Server-Timing"] == f'existing;dur=5, request_id;desc="{expected_id}"'
+    else:
+        assert "X-Request-ID" not in response
+        assert response["Server-Timing"] == "existing;dur=5"
+
+
+@override_settings(CAPTURE_TIME_TO_SEE_DATA=True)
+def test_query_time_counting_middleware_preserves_request_identity() -> None:
+    from posthog.middleware import QueryTimeCountingMiddleware
+
+    request_id_timing = 'request_id;desc="01234567-89ab-4def-8123-456789abcdef"'
+    middleware = QueryTimeCountingMiddleware(
+        get_response=lambda request: HttpResponse(headers={"Server-Timing": request_id_timing})
+    )
+    response = middleware(RequestFactory().get("/api/projects/@current/insights/"))
+
+    assert response["Server-Timing"].startswith(f"{request_id_timing}, django;dur=")
+
+
+def test_query_time_counting_middleware_emits_durations_in_milliseconds() -> None:
+    from posthog.middleware import QueryTimeCountingMiddleware
+
+    middleware = QueryTimeCountingMiddleware(get_response=lambda r: None)
+    header = middleware._construct_header(
+        durations_ms={"django": 2050.4, "pg": 1490.6, "pg_max": 1200.0, "ch": 0.0, "ch_max": 0.0},
+        counts={"pg_count": 17, "pg_slow": 2, "ch_count": 0, "ch_slow": 0},
+    )
+
+    assert "django;dur=2050" in header
+    assert "pg;dur=1491" in header
+    assert "pg_max;dur=1200" in header
+    assert 'pg_count;desc="17"' in header
+    assert 'pg_slow;desc="2"' in header
+
+
+@parameterized.expand(
+    [
+        ("/api/projects/@current/insights/", True),
+        ("/api/projects/@current/dashboards/", True),
+        ("/api/projects/@current/property_definitions/", True),
+        ("/", True),
+        ("/insights/abc123", True),
+        ("/dashboard/42", True),
+        ("/project/2/insights", True),
+        ("/api/projects/@current/feature_flags/", False),
+    ]
+)
+def test_query_time_counting_middleware_should_instrument(path, expected) -> None:
+    from django.test import RequestFactory
+
+    from posthog.middleware import QueryTimeCountingMiddleware
+
+    middleware = QueryTimeCountingMiddleware(get_response=lambda r: None)
+    request = RequestFactory().get(path)
+
+    assert middleware._should_instrument(request) is expected
+
+
+def _insight_detail(request: HttpRequest, project_id: int, pk: int) -> HttpResponse:
+    assert len(connection.execute_wrappers) == 1
+    return HttpResponse()
+
+
+class _PgQueryCountRoutes:
+    urlpatterns = [path("api/projects/<int:project_id>/insights/<int:pk>/", _insight_detail, name="insight-detail")]
+
+
+@override_settings(ROOT_URLCONF=_PgQueryCountRoutes, MIDDLEWARE=["posthog.middleware.QueryTimeCountingMiddleware"])
+class TestQueryTimeCountingMiddlewarePgQueryMetric(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("server_timing_on", True, "GET", "GET"),
+            ("server_timing_off", False, "POST", "POST"),
+            ("unknown_method", False, "PURGE", "other"),
+        ]
+    )
+    def test_records_route_name_not_path(
+        self, _name: str, capture_time_to_see_data: bool, method: str, expected_method_label: str
+    ) -> None:
+        client = MagicMock()
+        with (
+            override_settings(CAPTURE_TIME_TO_SEE_DATA=capture_time_to_see_data),
+            patch("posthog.middleware.posthoganalytics.default_client", client),
+        ):
+            self.client.generic(method, "/api/projects/2/insights/7/")
+
+        client.metrics.histogram.assert_called_once_with(
+            "api.request.pg_queries",
+            0,
+            unit="{query}",
+            attributes={"route": "insight-detail", "method": expected_method_label, "status_class": "2xx"},
+        )
+
+    @parameterized.expand([("unresolved_api_path", "/api/unknown/"), ("non_api_path", "/insights/7/")])
+    def test_skips_requests_without_an_api_route(self, _name: str, path_: str) -> None:
+        client = MagicMock()
+        with patch("posthog.middleware.posthoganalytics.default_client", client):
+            self.client.get(path_)
+
+        client.metrics.histogram.assert_not_called()
+
+
+class TestPerRequestLoggingContextMiddlewareMcpHeaders(SimpleTestCase):
+    """Covers MCP session header binding inside `per_request_logging_context_middleware`."""
+
+    def _run_middleware(self, **headers):
+        captured: dict[str, Any] = {}
+
+        def get_response(request):
+            captured["ctx"] = dict(structlog.contextvars.get_contextvars())
+            return HttpResponse()
+
+        try:
+            structlog.contextvars.clear_contextvars()
+            middleware = per_request_logging_context_middleware(get_response)
+            request = RequestFactory().get("/", **headers)
+            middleware(request)
+        finally:
+            structlog.contextvars.clear_contextvars()
+        return captured["ctx"]
+
+    @parameterized.expand(
+        [
+            (
+                "both_headers_present",
+                {
+                    "HTTP_X_POSTHOG_MCP_SESSION_ID": "abc123session",
+                    "HTTP_X_POSTHOG_MCP_CONVERSATION_ID": "01984ad9-bda4-7000-8000-abcdef012345",
+                },
+                "abc123session",
+                "01984ad9-bda4-7000-8000-abcdef012345",
+            ),
+            (
+                "session_id_alone",
+                {"HTTP_X_POSTHOG_MCP_SESSION_ID": "abc123session"},
+                "abc123session",
+                None,
+            ),
+            (
+                "conversation_id_alone",
+                {"HTTP_X_POSTHOG_MCP_CONVERSATION_ID": "01984ad9-bda4-7000-8000-abcdef012345"},
+                None,
+                "01984ad9-bda4-7000-8000-abcdef012345",
+            ),
+        ]
+    )
+    def test_binds_mcp_ids_when_present(self, _name, headers, expected_session, expected_conversation):
+        with patch("posthog.middleware.trace") as mock_trace:
+            span = MagicMock()
+            mock_trace.get_current_span.return_value = span
+            ctx = self._run_middleware(**headers)
+
+        if expected_session is not None:
+            assert ctx["mcp_session_id"] == expected_session
+            span.set_attribute.assert_any_call("mcp.session_id", expected_session)
+        else:
+            assert "mcp_session_id" not in ctx
+        if expected_conversation is not None:
+            assert ctx["mcp_conversation_id"] == expected_conversation
+            span.set_attribute.assert_any_call("mcp.conversation_id", expected_conversation)
+        else:
+            assert "mcp_conversation_id" not in ctx
+
+    def test_no_mcp_keys_bound_when_headers_absent(self):
+        with patch("posthog.middleware.trace") as mock_trace:
+            span = MagicMock()
+            mock_trace.get_current_span.return_value = span
+            ctx = self._run_middleware()
+
+        assert "mcp_session_id" not in ctx
+        assert "mcp_conversation_id" not in ctx
+        assert "sessionId" not in ctx
+        span.set_attribute.assert_not_called()
+
+    @parameterized.expand(
+        [
+            ("plain", "01a11c97-2437-72c0-b147-66a8e9f56ec3", "01a11c97-2437-72c0-b147-66a8e9f56ec3"),
+            ("control_chars_stripped", "01a11c97-2437\n-72c0", "01a11c97-2437-72c0"),
+            ("blank", "   ", None),
+        ]
+    )
+    def test_binds_frontend_session_id(self, _name: str, header_value: str, expected: str | None) -> None:
+        with patch("posthog.middleware.trace") as mock_trace:
+            span = MagicMock()
+            mock_trace.get_current_span.return_value = span
+            ctx = self._run_middleware(HTTP_X_POSTHOG_SESSION_ID=header_value)
+
+        if expected is None:
+            assert "sessionId" not in ctx
+            span.set_attribute.assert_not_called()
+        else:
+            assert ctx["sessionId"] == expected
+            span.set_attribute.assert_any_call("sessionId", expected)
+
+
+class TestUserLoggingContextMiddleware(APIBaseTest):
+    def _run_middleware(self, user: User | AnonymousUser) -> tuple[dict[str, Any], MagicMock]:
+        captured: dict[str, Any] = {}
+
+        def get_response(request: HttpRequest) -> HttpResponse:
+            captured["ctx"] = dict(structlog.contextvars.get_contextvars())
+            return HttpResponse()
+
+        request = RequestFactory().get("/")
+        request.user = user
+        try:
+            structlog.contextvars.clear_contextvars()
+            with patch("posthog.middleware.trace") as mock_trace:
+                span = MagicMock()
+                mock_trace.get_current_span.return_value = span
+                user_logging_context_middleware(get_response)(request)
+        finally:
+            structlog.contextvars.clear_contextvars()
+        return captured["ctx"], span
+
+    def test_binds_team_and_distinct_id_for_authenticated_user(self) -> None:
+        ctx, span = self._run_middleware(self.user)
+
+        assert ctx["team_id"] == self.team.pk
+        assert ctx["posthogDistinctId"] == self.user.distinct_id
+        span.set_attribute.assert_called_once_with("posthogDistinctId", self.user.distinct_id)
+
+    def test_binds_nothing_for_anonymous_user(self) -> None:
+        ctx, span = self._run_middleware(AnonymousUser())
+
+        assert "team_id" not in ctx
+        assert "posthogDistinctId" not in ctx
+        span.set_attribute.assert_not_called()
+
+
+@parameterized.expand(
+    [
+        ("project", "/api/projects/@current/query/", CurrentAliasScope.PROJECT),
+        ("environment", "/api/environments/@current/web_vitals", CurrentAliasScope.PROJECT),
+        ("organization", "/api/organizations/@current/members/", CurrentAliasScope.ORGANIZATION),
+        ("organization_detail", "/api/organizations/@current", CurrentAliasScope.ORGANIZATION),
+        ("personal_api_key", "/api/personal_api_keys/@current/", CurrentAliasScope.PERSONAL_API_KEY),
+        ("numeric_project", "/api/projects/123/query/", None),
+        ("alias_deeper_in_path", "/api/projects/123/feature_flags/@current/", None),
+        ("unknown_collection", "/api/users/@current/", None),
+        ("non_api", "/project/@current/insights", None),
+    ]
+)
+def test_current_alias_scope(_name: str, path: str, expected: CurrentAliasScope | None) -> None:
+    assert current_alias_scope(path) == expected
+
+
+class TestCurrentAliasUsage(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        cache.clear()
+
+    def _alias_events(self, capture: MagicMock, event: str = CURRENT_ALIAS_USED_EVENT) -> list[Mapping[str, Any]]:
+        return [call.kwargs for call in capture.call_args_list if call.kwargs.get("event") == event]
+
+    def test_reports_each_credential_caller_once_per_route(self) -> None:
+        token = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            user=self.user, label="Reporting script", secure_value=hash_key_value(token), scopes=["*"]
+        )
+
+        with patch("posthog.event_usage.posthoganalytics.capture") as capture:
+            self.client.get("/api/projects/@current/")
+            self.client.logout()
+            self.client.get("/api/projects/@current/", HTTP_AUTHORIZATION=f"Bearer {token}")
+            self.client.get("/api/projects/@current/", HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        events = self._alias_events(capture)
+        assert len(events) == 1
+        assert events[0]["distinct_id"] == self.user.distinct_id
+        assert events[0]["groups"]["organization"] == str(self.organization.id)
+        assert {key: events[0]["properties"][key] for key in ("access_method", "route", "scope", "api_key_label")} == {
+            "access_method": "personal_api_key",
+            "route": "api/projects/{id}/",
+            "scope": CurrentAliasScope.PROJECT,
+            "api_key_label": "Reporting script",
+        }
+
+    def test_reports_each_oauth_application_separately(self) -> None:
+        tokens = {}
+        for name in ("Reporting app", "Sync app"):
+            application = OAuthApplication.objects.create(
+                name=name,
+                client_type=OAuthApplication.CLIENT_CONFIDENTIAL,
+                authorization_grant_type=OAuthApplication.GRANT_AUTHORIZATION_CODE,
+                redirect_uris="https://example.com/callback",
+                algorithm="RS256",
+                organization=self.organization,
+                user=self.user,
+            )
+            token = OAuthAccessToken.objects.create(
+                user=self.user,
+                application=application,
+                token=f"pha_{name.split()[0].lower()}_token",
+                expires=timezone.now() + timedelta(hours=1),
+                scope="project:read",
+            )
+            tokens[token.token] = str(application.id)
+
+        with patch("posthog.event_usage.posthoganalytics.capture") as capture:
+            self.client.get("/api/projects/@current/")
+            self.client.logout()
+            for token in [*tokens, *tokens]:
+                self.client.get("/api/projects/@current/", HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        events = self._alias_events(capture)
+        assert [
+            (event["properties"]["access_method"], event["properties"]["oauth_application_id"]) for event in events
+        ] == [("oauth", application_id) for application_id in tokens.values()]
+
+    @parameterized.expand(
+        [
+            ("unscoped_key_on_project", "/api/projects/@current/", None, status.HTTP_200_OK, ("user", False)),
+            (
+                "project_scoped_key_on_project",
+                "/api/projects/@current/",
+                "own_team",
+                status.HTTP_200_OK,
+                ("user", True),
+            ),
+            (
+                "key_listing_a_project_outside_its_organization",
+                "/api/projects/@current/",
+                "own_and_foreign_team_in_own_organization",
+                status.HTTP_200_OK,
+                ("user", True),
+            ),
+            (
+                "key_scoped_to_another_project",
+                "/api/projects/@current/",
+                "other_team",
+                status.HTTP_403_FORBIDDEN,
+                ("user", True),
+            ),
+            (
+                "project_token_on_a_nested_project_route",
+                "/api/projects/@current/feature_flags/?token={project_token}",
+                None,
+                status.HTTP_200_OK,
+                ("token", False),
+            ),
+            (
+                "unscoped_key_on_organization",
+                "/api/organizations/@current/members/",
+                None,
+                status.HTTP_200_OK,
+                ("user", False),
+            ),
+            (
+                "project_scoped_key_on_organization",
+                "/api/organizations/@current/members/",
+                "own_team",
+                status.HTTP_403_FORBIDDEN,
+                ("user", True),
+            ),
+            (
+                "organization_scoped_key_on_organization",
+                "/api/organizations/@current/members/",
+                "own_organization",
+                status.HTTP_200_OK,
+                ("user", True),
+            ),
+        ]
+    )
+    def test_reports_what_decided_the_scope(
+        self, _name: str, path: str, key_scope: str | None, expected_status: int, expected: tuple[str, bool]
+    ) -> None:
+        other_team = Team.objects.create(organization=self.organization, name="Other project")
+        foreign_team = create_team(organization=create_organization(name="Foreign"))
+        scoping_by_kind: dict[str | None, dict[str, list[int] | list[str]]] = {
+            None: {},
+            "own_team": {"scoped_teams": [self.team.id]},
+            "other_team": {"scoped_teams": [other_team.id]},
+            "own_and_foreign_team_in_own_organization": {
+                "scoped_teams": [self.team.id, foreign_team.id],
+                "scoped_organizations": [str(self.organization.id)],
+            },
+            "own_organization": {"scoped_organizations": [str(self.organization.id)]},
+        }
+        token = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            user=self.user, secure_value=hash_key_value(token), scopes=["*"], **scoping_by_kind[key_scope]
+        )
+        self.client.logout()
+
+        with patch("posthog.event_usage.posthoganalytics.capture") as capture:
+            response = self.client.get(
+                path.format(project_token=self.team.api_token), HTTP_AUTHORIZATION=f"Bearer {token}"
+            )
+
+        assert response.status_code == expected_status
+        [event] = self._alias_events(capture)
+        assert (event["properties"]["project_from"], event["properties"]["credential_pins_scope"]) == expected
+
+    @parameterized.expand(
+        [
+            ("flat_route_follows_the_user", "/api/feature_flag/", False, [("api/feature_flag/", "user")]),
+            ("flat_route_with_a_token", "/api/cohort/", True, [("api/cohort/", "token")]),
+            ("nested_route", "/api/projects/{team_id}/feature_flags/", False, []),
+        ]
+    )
+    def test_reports_flat_route_callers(
+        self, _name: str, path: str, with_token: bool, expected: list[tuple[str, str]]
+    ) -> None:
+        token = generate_random_token_personal()
+        PersonalAPIKey.objects.create(user=self.user, secure_value=hash_key_value(token), scopes=["*"])
+        self.client.logout()
+        query = {"token": self.team.api_token} if with_token else {}
+
+        with patch("posthog.event_usage.posthoganalytics.capture") as capture:
+            response = self.client.get(path.format(team_id=self.team.id), query, HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        assert response.status_code == status.HTTP_200_OK
+        events = self._alias_events(capture, FLAT_ROUTE_USED_EVENT)
+        assert [(event["properties"]["route"], event["properties"]["project_from"]) for event in events] == expected
+
+    def test_recording_failure_does_not_fail_the_request(self) -> None:
+        token = generate_random_token_personal()
+        PersonalAPIKey.objects.create(user=self.user, secure_value=hash_key_value(token), scopes=["*"])
+        self.client.logout()
+
+        with patch("posthog.api.current_alias_usage.dedupe_cache.add", side_effect=ConnectionError("redis is down")):
+            response = self.client.get("/api/projects/@current/", HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        assert response.status_code == status.HTTP_200_OK

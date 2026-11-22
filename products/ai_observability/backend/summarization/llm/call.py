@@ -1,0 +1,42 @@
+"""
+LLM calling function for summarization via LLM gateway.
+
+Routes all summarization requests through the LLM gateway with OpenAI models.
+"""
+
+from typing import cast
+
+from ..constants import DEFAULT_MODE, DEFAULT_MODEL_OPENAI
+from ..models import OpenAIModel, SummarizationMode
+from .openai import summarize_with_openai
+from .schema import SummarizationResponse
+
+
+def summarize(
+    text_repr: str,
+    team_id: int,
+    mode: SummarizationMode = DEFAULT_MODE,
+    model: OpenAIModel | None = None,
+    user_id: str | None = None,
+    flex: bool = False,
+    final_attempt: bool = True,
+) -> SummarizationResponse:
+    """
+    Generate AI-powered summary from text representation via LLM gateway.
+
+    Args:
+        text_repr: Line-numbered text representation to summarize
+        team_id: Team ID for cost tracking and analytics
+        mode: Summary detail level
+        model: OpenAI model to use (defaults to DEFAULT_MODEL_OPENAI)
+        user_id: Optional user distinct_id for analytics attribution
+        flex: Request the flex service tier, cheaper but slower (gpt-5 family only)
+        final_attempt: False when the caller retries a failure, so the failure is not captured
+
+    Returns:
+        Structured summarization response with flow diagram, bullets, and notes
+    """
+    openai_model = cast(OpenAIModel, model) if model else DEFAULT_MODEL_OPENAI
+    return summarize_with_openai(
+        text_repr, team_id, mode, openai_model, user_id, flex=flex, final_attempt=final_attempt
+    )

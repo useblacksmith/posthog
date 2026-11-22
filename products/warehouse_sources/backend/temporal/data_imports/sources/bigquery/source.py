@@ -1,0 +1,857 @@
+import dataclasses
+from typing import Optional, cast
+
+from products.warehouse_sources.backend.facade.codebase_detection import detect
+from products.warehouse_sources.backend.facade.source_config import (
+    DataWarehouseSourceCategory,
+    SourceConfig,
+    SourceFieldFileUploadConfig,
+    SourceFieldFileUploadJsonFormatConfig,
+    SourceFieldInputConfig,
+    SourceFieldInputConfigType,
+    SourceFieldOauthConfig,
+    SourceFieldSelectConfig,
+    SourceFieldSelectConfigOption,
+    SourceFieldSwitchGroupConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.bigquery.bigquery import (
+    BIGQUERY_API_VERSION_V2,
+    BIGQUERY_CREDENTIALS_REJECTED_ERROR,
+    BIGQUERY_DATASET_NOT_FOUND_ERROR,
+    BIGQUERY_IMPERSONATION_PERMISSION_ERROR,
+    BIGQUERY_IMPERSONATION_UNAVAILABLE_ERROR,
+    BIGQUERY_INTEGRATION_NOT_FOUND_ERROR,
+    BIGQUERY_INVALID_IDENTIFIER_ERROR,
+    BIGQUERY_INVALID_KEY_FILE_ERROR,
+    BIGQUERY_INVALID_TOKEN_URI_ERROR,
+    BIGQUERY_JOB_TIMEOUT_ERROR,
+    BIGQUERY_MISSING_KEY_FILE_FIELDS_ERROR,
+    BIGQUERY_NO_CREDENTIALS_ERROR,
+    BIGQUERY_ON_DEMAND_RATIO_EXCEEDED_ERROR,
+    BIGQUERY_OWNERSHIP_UNVERIFIED_ERROR_PREFIX,
+    BIGQUERY_READ_TIMEOUT_ERROR,
+    BIGQUERY_RESOURCES_EXCEEDED_ERROR,
+    BIGQUERY_SERVICE_ACCOUNT_NOT_FOUND_ERROR,
+    BIGQUERY_TOKEN_RESPONSE_ERROR,
+    BIGQUERY_VPC_SERVICE_CONTROLS_ERROR,
+    BigQueryImplementation,
+    build_destination_table_prefix,
+    classify_bigquery_validation_error,
+    resolve_bigquery_auth,
+    validate_bigquery_credentials,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common import config as source_config
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
+    UNVERSIONED_API_VERSION,
+    FieldType,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.base import SQLSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.bigquery import (
+    BigQueryAuthTypeConfigKeyFileConfig,
+    BigQuerySourceConfig,
+)
+from products.warehouse_sources.backend.types import ExternalDataSourceType
+
+__all__ = ["BigQuerySource", "build_destination_table_prefix"]
+
+_BIGQUERY_IMPLEMENTATION = BigQueryImplementation()
+
+# Every field of the key file is read out of the JSON the user uploads, never typed into the form,
+# so the generic "Required field ..." error for one names something they have no way to fill in.
+_KEY_FILE_FIELD_NAMES = tuple(field.name for field in dataclasses.fields(BigQueryAuthTypeConfigKeyFileConfig))
+_KEY_FILE_FIELD_ERRORS = frozenset(source_config.missing_field_error(name) for name in _KEY_FILE_FIELD_NAMES)
+_MISSING_KEY_FILE_ERROR = "Upload a Google Cloud service account JSON key file."
+_INCOMPLETE_KEY_FILE_ERROR = (
+    "That file is not a complete Google Cloud service account key. Upload the JSON key file "
+    "exactly as you downloaded it, then try again."
+)
+
+
+@SourceRegistry.register
+class BigQuerySource(SQLSource[BigQuerySourceConfig]):
+    # BigQuery authenticates with a Google Cloud service-account JSON key
+    # file, like Firebase - the source's only required credential field
+    # is a file upload, and the terminal prompt collects single-line text, so
+    # there is no in-cli path that can accept it. Deep-link to the app's
+    # new-source form instead of dead-ending on an unpasteable credential.
+    codebase_detection = detect(
+        env=("^BIGQUERY_",),
+        npm=(
+            "@google-cloud/bigquery",
+            "@google-cloud/bigquery-storage",
+            "@google-cloud/bigquery-storage-api",
+            "@google-cloud/bigquery-data-transfer",
+            "@google-cloud/bigquery-connection",
+            "@google-cloud/bigquery-reservation",
+            "@google-cloud/bigquery-migration",
+            "@google-cloud/bigquery-analyticshub",
+            "@google-cloud/bigquery-datapolicies",
+            "@google-cloud/bigquery-data-exchange",
+            "@googleapis/bigquery",
+            "@googleapis/bigquerydatatransfer",
+            "@googleapis/bigqueryreservation",
+            "@googleapis/bigqueryconnection",
+            "@googleapis/bigquerydatapolicy",
+            "@firebaseextensions/firestore-bigquery-change-tracker",
+            "@dataform/core",
+            "@dataform/cli",
+        ),
+        pypi=(
+            "google-cloud-bigquery",
+            "sqlalchemy-bigquery",
+            "pandas-gbq",
+            "google-cloud-bigquery-storage",
+            "google-cloud-bigquery-datatransfer",
+            "google-cloud-bigquery-connection",
+            "google-cloud-bigquery-reservation",
+            "google-cloud-bigquery-migration",
+            "google-cloud-bigquery-datapolicies",
+            "google-cloud-bigquery-analyticshub",
+            "google-cloud-bigquery-data-exchange",
+            "google-cloud-bigquery-logging",
+            "google-cloud-bigquery-biglake",
+            "bigframes",
+            "bigquery-magics",
+            "pybigquery",
+            "dbt-bigquery",
+        ),
+        cargo=(
+            "gcp-bigquery-client",
+            "google-cloud-bigquery",
+            "google-cloud-bigquery-v2",
+            "google-cloud-bigquery-derive",
+            "google-cloud-bigquery-datapolicies-v1",
+            "google-cloud-bigquery-datapolicies-v2",
+            "google-cloud-bigquery-reservation-v1",
+            "google-cloud-bigquery-datatransfer-v1",
+            "google-cloud-bigquery-connection-v1",
+            "google-cloud-bigquery-migration-v2",
+            "google-cloud-bigquery-analyticshub-v1",
+            "gcloud-bigquery",
+            "google-bigquery2",
+            "google-bigquerydatatransfer1",
+            "google-bigqueryreservation1",
+        ),
+        composer=(
+            "google/cloud-bigquery",
+            "google/cloud-bigquery-storage",
+            "google/cloud-bigquerydatatransfer",
+            "google/cloud-bigquery-connection",
+            "google/cloud-bigquery-reservation",
+            "google/cloud-bigquery-analyticshub",
+            "google/cloud-bigquery-datapolicies",
+            "google/cloud-bigquery-migration",
+            "google/cloud-bigquery-data-exchange",
+        ),
+        go=("cloud.google.com/go/bigquery",),
+        hex=(
+            "google_api_big_query",
+            "google_api_big_query_connection",
+            "google_api_big_query_data_policy",
+            "google_api_big_query_data_transfer",
+            "google_api_big_query_reservation",
+            "req_bigquery",
+        ),
+        maven=(
+            "com.google.cloud:google-cloud-bigquery",
+            "com.google.cloud:google-cloud-bigquerystorage",
+            "com.google.cloud:google-cloud-bigquerydatatransfer",
+            "com.google.cloud:google-cloud-bigqueryconnection",
+            "com.google.cloud:google-cloud-bigqueryreservation",
+            "com.google.cloud:google-cloud-bigquerymigration",
+            "com.google.cloud:google-cloud-bigquerydatapolicy",
+            "com.google.cloud:google-cloud-bigquery-data-exchange",
+            "com.google.cloud:google-cloud-analyticshub",
+            "com.google.cloud:google-cloud-bigquery-jdbc",
+            "com.google.cloud:google-cloud-bigquery-bom",
+            "com.google.cloud:gcloud-java-bigquery",
+            "com.google.cloud:spring-cloud-gcp-starter-bigquery",
+            "com.google.cloud:spring-cloud-gcp-bigquery",
+            "org.springframework.cloud:spring-cloud-gcp-starter-bigquery",
+            "org.springframework.cloud:spring-cloud-gcp-bigquery",
+            "com.google.apis:google-api-services-bigquery",
+            "com.google.apis:google-api-services-bigquerydatatransfer",
+            "com.google.apis:google-api-services-bigqueryconnection",
+            "com.google.apis:google-api-services-bigqueryreservation",
+            "com.google.apis:google-api-services-bigquerydatapolicy",
+            "com.google.cloud.bigdataoss:bigquery-connector",
+            "com.google.cloud.spark:spark-bigquery-with-dependencies_2.11",
+            "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12",
+            "com.google.cloud.spark:spark-bigquery-with-dependencies_2.13",
+            "com.google.cloud.spark:spark-bigquery_2.11",
+            "com.google.cloud.spark:spark-bigquery_2.12",
+            "com.google.cloud.spark:spark-bigquery_2.13",
+            "com.google.cloud.spark:spark-2.4-bigquery",
+            "com.google.cloud.spark:spark-3.1-bigquery",
+            "com.google.cloud.spark:spark-3.2-bigquery",
+            "com.google.cloud.spark:spark-3.3-bigquery",
+            "com.google.cloud.spark:spark-3.4-bigquery",
+            "com.google.cloud.spark:spark-3.5-bigquery",
+            "com.google.cloud.spark:spark-4.0-bigquery",
+            "com.google.cloud.spark:spark-4.1-bigquery",
+            "com.google.cloud.spark:spark-4.2-bigquery",
+            "com.google.cloud.flink:flink-1.17-connector-bigquery",
+            "com.google.cloud.flink:flink-2.1-connector-bigquery",
+            "com.google.cloud.hive:hive-bigquery-connector",
+        ),
+        rubygems=(
+            "google-cloud-bigquery",
+            "google-cloud-bigquery-data_transfer",
+            "google-cloud-bigquery-data_transfer-v1",
+            "google-cloud-bigquery-storage",
+            "google-cloud-bigquery-storage-v1",
+            "google-cloud-bigquery-reservation",
+            "google-cloud-bigquery-reservation-v1",
+            "google-cloud-bigquery-connection",
+            "google-cloud-bigquery-connection-v1",
+            "google-cloud-bigquery-migration",
+            "google-cloud-bigquery-migration-v2",
+            "google-cloud-bigquery-analytics_hub",
+            "google-cloud-bigquery-analytics_hub-v1",
+            "google-cloud-bigquery-data_policies",
+            "google-cloud-bigquery-data_policies-v1",
+            "google-cloud-bigquery-data_policies-v1beta1",
+            "google-cloud-bigquery-data_exchange",
+            "google-cloud-bigquery-data_exchange-v1beta1",
+            "google-apis-bigquery_v2",
+            "google-apis-bigquerydatatransfer_v1",
+            "google-apis-bigqueryreservation_v1",
+            "google-apis-bigqueryconnection_v1",
+            "google-apis-bigqueryconnection_v1beta1",
+            "google-apis-bigquerydatapolicy_v1",
+            "fluent-plugin-bigquery",
+            "embulk-output-bigquery",
+        ),
+        swiftpm=(
+            "github.com/googleapis/swift-google-cloud-bigquery-analyticshub-v1",
+            "github.com/googleapis/swift-google-cloud-bigquery-biglake-v1",
+            "github.com/googleapis/swift-google-cloud-bigquery-connection-v1",
+            "github.com/googleapis/swift-google-cloud-bigquery-datapolicies-v1",
+            "github.com/googleapis/swift-google-cloud-bigquery-datapolicies-v2",
+            "github.com/googleapis/swift-google-cloud-bigquery-datatransfer-v1",
+            "github.com/googleapis/swift-google-cloud-bigquery-logging-v1",
+            "github.com/googleapis/swift-google-cloud-bigquery-migration-v2",
+            "github.com/googleapis/swift-google-cloud-bigquery-reservation-v1",
+        ),
+    )
+
+    # BigQuery's core REST API is stable at v2. Existing sources stay on the legacy unversioned pin;
+    # new sources start on v2. Both resolve to the same /bigquery/v2/ REST endpoint, so the default
+    # bump leaves existing syncs byte-for-byte unchanged.
+    supported_versions = (UNVERSIONED_API_VERSION, BIGQUERY_API_VERSION_V2)
+    default_version = BIGQUERY_API_VERSION_V2
+    api_docs_url = "https://cloud.google.com/bigquery/docs/release-notes"
+
+    @property
+    def get_implementation(self) -> BigQueryImplementation:
+        return _BIGQUERY_IMPLEMENTATION
+
+    @property
+    def source_type(self) -> ExternalDataSourceType:
+        return ExternalDataSourceType.BIGQUERY
+
+    @property
+    def credential_kind(self) -> str | None:
+        return "google-cloud-service-account"
+
+    def get_retryable_errors(self) -> set[str]:
+        # The client-side limits on a query job and on the wait for one page of rows. BigQuery was
+        # reachable and then gave no result in time, so a later attempt can succeed.
+        return {BIGQUERY_JOB_TIMEOUT_ERROR, BIGQUERY_READ_TIMEOUT_ERROR}
+
+    def get_non_retryable_errors(self) -> dict[str, str | None]:
+        return {
+            # google-api-core raises `PermissionDenied` from the Storage Read API's
+            # `create_read_session`, whose message is the gRPC form "403 request failed: the user
+            # does not have '<permission>' permission for '<resource>'". Reading a table that way
+            # needs dataset read access and permission to open a read session on the project the
+            # read bills to, and the denial names only whichever one it hit first — so name both
+            # roles rather than leaving the customer to work out which grant is missing. Matched on
+            # the stable status wording, not the volatile permission and resource ids.
+            "PermissionDenied: 403 request failed": "BigQuery denied your service account access while reading your data. Grant it the BigQuery Data Viewer role on the dataset you're syncing and the Read Session User role on its project, then reconnect the source.",
+            # OAuth2 error code returned by Google's token endpoint when the service account grant
+            # is rejected — a rotated/revoked private key ("Invalid JWT Signature") or a deleted
+            # service account ("account not found"). Raised as a `RefreshError` while refreshing the
+            # token, so it surfaces on every BigQuery call rather than at a single site. Retrying
+            # can't recover invalid credentials; the user must upload a new key file. Matched on the
+            # stable `invalid_grant` code rather than `RefreshError`, which can also wrap transient
+            # token-endpoint failures that should stay retryable.
+            "invalid_grant": BIGQUERY_CREDENTIALS_REJECTED_ERROR,
+            # Raised from `bigquery_client` when `service_account.Credentials.from_service_account_info`
+            # parses the uploaded key file's `private_key`. A truncated or corrupted PEM body (wrong
+            # padding, stray characters, copy-paste damage) makes the `cryptography` backend reject it
+            # as a `ValueError: Unable to load PEM file. ... InvalidData(InvalidPadding)`. The key can't
+            # be repaired by retrying — the user must re-upload an intact JSON key file. Matched on the
+            # stable "Unable to load PEM file" wording rather than the volatile InvalidData detail.
+            "Unable to load PEM file": BIGQUERY_INVALID_KEY_FILE_ERROR,
+            # Raised before any request when the key file's token endpoint is not Google's. The key
+            # file is the problem, so retrying cannot help; the user must re-upload an unedited key.
+            BIGQUERY_INVALID_TOKEN_URI_ERROR: BIGQUERY_INVALID_TOKEN_URI_ERROR,
+            # Raised by `resolve_bigquery_auth` before any request, when the source's stored
+            # credentials cannot produce an identity to sync as: the service account integration was
+            # disconnected, the uploaded key file lost fields, the instance can't impersonate, or the
+            # source has no credentials at all. Each is a config problem the user has to fix in the
+            # source, so retrying only repeats the same failure every run.
+            BIGQUERY_INTEGRATION_NOT_FOUND_ERROR: BIGQUERY_INTEGRATION_NOT_FOUND_ERROR,
+            BIGQUERY_MISSING_KEY_FILE_FIELDS_ERROR: BIGQUERY_MISSING_KEY_FILE_FIELDS_ERROR,
+            BIGQUERY_IMPERSONATION_UNAVAILABLE_ERROR: BIGQUERY_IMPERSONATION_UNAVAILABLE_ERROR,
+            BIGQUERY_NO_CREDENTIALS_ERROR: BIGQUERY_NO_CREDENTIALS_ERROR,
+            # Raised when PostHog impersonates the customer's service account but Google Cloud
+            # rejects the ownership check that guards impersonation — the account is gone, PostHog
+            # can't read it, or its description doesn't name the connecting organization. All three
+            # need a change in the customer's Google Cloud project, so retrying can't recover them.
+            BIGQUERY_SERVICE_ACCOUNT_NOT_FOUND_ERROR: BIGQUERY_SERVICE_ACCOUNT_NOT_FOUND_ERROR,
+            BIGQUERY_IMPERSONATION_PERMISSION_ERROR: BIGQUERY_IMPERSONATION_PERMISSION_ERROR,
+            # The ownership check above only needs `iam.serviceAccounts.get`, so it can pass while a
+            # later gRPC call (the Storage Read API's `create_read_session`/`read_rows`) still fails
+            # to mint a token, because minting one needs `iam.serviceAccounts.getAccessToken` too.
+            # grpc's auth metadata plugin surfaces that denial as a `ServiceUnavailable` wrapping
+            # Google's raw token-endpoint JSON, e.g. "Getting metadata from plugin failed with
+            # error: ('Unable to acquire impersonated credentials', '{"error": {"code": 403,
+            # "message": "Permission \'iam.serviceAccounts.getAccessToken\' denied on resource ..." ...'".
+            # Same remediation as the ownership check — grant Service Account Token Creator — so reuse
+            # its message. Deterministic IAM config problem; retrying can't grant the permission.
+            # Matched on the stable permission name plus "denied", not the volatile error id or
+            # troubleshooter URL. Mirrors the same check in `classify_bigquery_validation_error`,
+            # which covers this for the connection wizard rather than an in-progress sync. Python's
+            # `repr()` of the JSON body (inside the tuple `str()`) backslash-escapes the quotes
+            # around the permission name, so match both the raw and escaped forms.
+            "iam.serviceAccounts.getAccessToken' denied": BIGQUERY_IMPERSONATION_PERMISSION_ERROR,
+            "iam.serviceAccounts.getAccessToken\\' denied": BIGQUERY_IMPERSONATION_PERMISSION_ERROR,
+            BIGQUERY_OWNERSHIP_UNVERIFIED_ERROR_PREFIX: None,
+            # Matched on the stable wording, not the volatile vpcServiceControlsUniqueIdentifier.
+            "VPC Service Controls": BIGQUERY_VPC_SERVICE_CONTROLS_ERROR,
+            # Writing query results into the `__posthog_import_...` temp tables PostHog creates
+            # (`WRITE_TRUNCATE` in `_run_destination_query_with_job_retry`, on incremental / view /
+            # row-filtered reads) needs write access on the dataset those tables live in. When the
+            # service account only has read access, BigQuery rejects the copy with "Permission
+            # bigquery.tables.update denied on table <temp id>". This is a distinct problem from the
+            # read-side denials the "Access Denied:" key below covers — and that key would match this
+            # message first and misdirect the customer to grant *read* access (Data Viewer), which
+            # can't fix a *write* failure. Keep this key above "Access Denied:" so the write-specific
+            # guidance wins. Deterministic IAM config problem — retrying can't grant the permission.
+            # Matched on the stable permission name (also covers `bigquery.tables.updateData`), not
+            # the volatile temp-table id.
+            "bigquery.tables.update": "BigQuery denied write access to a temporary table PostHog creates in your dataset. PostHog copies query results into temporary tables before reading them, so read access alone isn't enough. Please grant your service account write access (for example the BigQuery Data Editor role) on the dataset where these temporary tables are created — your main dataset, or the temporary dataset if you configured one — then reconnect the source.",
+            # Creating the `__posthog_import_...` temp tables (the `WRITE_TRUNCATE` destination in
+            # `_run_destination_query_with_job_retry`, on incremental / view / row-filtered reads) needs
+            # create access on the dataset those tables live in. When the service account only has read
+            # access, BigQuery rejects it with "Permission bigquery.tables.create denied on dataset
+            # <id>" — the create-side twin of the `bigquery.tables.update` denial above. Like that key,
+            # it also starts with "Access Denied:", so it must sit above that key or the customer is told
+            # to grant *read* access (Data Viewer), which can't fix a *create* failure. Deterministic IAM
+            # config problem — retrying can't grant the permission. Matched on the stable permission name,
+            # not the volatile dataset id.
+            "bigquery.tables.create": "BigQuery denied permission to create a temporary table PostHog needs in your dataset. PostHog copies query results into temporary tables before reading them, so read access alone isn't enough. Please grant your service account permission to create tables (for example the BigQuery Data Editor role) on the dataset where these temporary tables are created — your main dataset, or the temporary dataset if you configured one — then reconnect the source.",
+            # BigQuery rejects query-job creation (POST .../jobs) with "Access Denied: Project <id>:
+            # User does not have bigquery.jobs.create permission in project <id>." when the service
+            # account can read the data but can't run query jobs in the project the jobs bill to. We
+            # create query jobs throughout the sync (primary-key discovery, row counts, temp-table
+            # copies), so this fails before any rows are read. Like the tables.update key above, the
+            # generic "Access Denied:" key would match first and misdirect the customer to grant
+            # *read* access (Data Viewer), which can't grant job creation — so keep this key above it.
+            # Deterministic IAM config problem; retrying can't grant the permission. Matched on the
+            # stable permission name, not the volatile project id.
+            "bigquery.jobs.create": "BigQuery denied your service account permission to run query jobs — it's missing the bigquery.jobs.create permission on the project it queries. Read access alone isn't enough, because PostHog runs query jobs to sync your data. Please grant your service account permission to run jobs (for example the BigQuery Job User role) on that project, then reconnect the source.",
+            # Raised as a 403 Forbidden when a table or view being synced reads through a BigQuery
+            # connection (used for federated queries or BigLake external tables) that the service
+            # account isn't authorized to use, e.g. "Access Denied: Connection projects/<p>/
+            # locations/<l>/connections/<c>: User does not have bigquery.connections.use permission
+            # for connection projects/<p>/locations/<l>/connections/<c>.". This is a separate IAM
+            # grant from table/dataset access — it lives on the connection resource itself, not the
+            # dataset — so the generic "Access Denied:" key below would match first and misdirect the
+            # customer to grant table read access (Data Viewer), which can't authorize connection use.
+            # Deterministic IAM config problem; retrying can't grant the permission. Matched on the
+            # stable permission name, not the volatile project/location/connection id.
+            "bigquery.connections.use": "BigQuery denied access to a BigQuery connection that a table or view being synced depends on (used for federated queries or external/BigLake tables). Please grant your service account the bigquery.connections.use permission (for example the BigQuery Connection User role) on that connection, then reconnect the source.",
+            # BigQuery prefixes every IAM/permission failure with "Access Denied:" — e.g.
+            # "Access Denied: Table <id>: Permission bigquery.tables.getData denied on table <id>
+            # (or it may not exist).". The matched string above only covers the REST client's
+            # "PermissionDenied: 403 request failed" wording; the Storage Read API raises a
+            # google.api_core PermissionDenied whose `str()` is "403 Access Denied: ..." instead,
+            # so it slips through and retries forever. These are config/permission problems on the
+            # customer's service account — retrying can't resolve them; the user must grant the
+            # missing permission (or the referenced table/dataset must exist).
+            "Access Denied:": "BigQuery denied access to a table or dataset. Please ensure your service account has read access (the bigquery.tables.getData permission, e.g. the BigQuery Data Viewer role) on every dataset and table you're syncing, then reconnect the source.",
+            # Federated/external BigQuery tables (e.g. a Cloud SQL connection) read through to the
+            # underlying database. When that database's role lacks read access, BigQuery surfaces the
+            # upstream ACL failure inside a 400 BadRequest, e.g. "Error while reading data ...
+            # Failed to fetch row from PostgreSQL server. Error: ERROR:  permission denied for table
+            # <name>". This is a deterministic permission problem on the customer's data source —
+            # retrying can't resolve it; the user must grant the federation's database user read
+            # access. The "Access Denied:"/403 keys above only cover BigQuery's own IAM wording, so
+            # this lowercase upstream form slips through and retries forever.
+            "permission denied for table": 'BigQuery couldn\'t read a federated table because the underlying database denied permission ("permission denied for table"). Please grant the database user behind your BigQuery connection read access to the table, then reconnect the source.',
+            # BigQuery raises this 400 BadRequest when it can't compile a view it's importing, e.g.
+            # "Invalid table-valued function EXTERNAL_QUERY; failed to parse view '<dataset>.<view>'".
+            # For a federated EXTERNAL_QUERY view this means the upstream schema drifted away from the
+            # view definition — a column the view selects was renamed or dropped in the source database
+            # ("prepare statement failed. Error: ERROR:  column \"x\" does not exist"). It's a
+            # deterministic mismatch between the customer's view and their data; retrying can't recover
+            # it — they must fix the view definition or restore the column. The "permission denied for
+            # table" / "Access Denied:" keys only cover federation ACL failures, so this slips through
+            # and retries forever. Matched on BigQuery's stable "failed to parse view" wording rather
+            # than the volatile view/column names.
+            "failed to parse view": "BigQuery couldn't read a view it was importing because its definition no longer matches the underlying data — a column it references was renamed or removed (for federated query views, in the upstream database). Please update the view definition (or restore the column), then reconnect the source.",
+            # Raised as a 400 BadRequest from job polling (the same `_wait_for_job` in `bigquery.py`
+            # that "failed to parse view" above covers) when a BigQuery external table backed by
+            # CSV files in Cloud Storage hits a line with more fields than the table's schema
+            # declares, e.g. "Error while reading table: <project>.<dataset>.<table>, error message:
+            # Too many values in line. Found 23 column(s) when expecting 21.; line_number: 2
+            # byte_offset_to_start_of_line: 291 File: gs://<bucket>/<object>". This is a malformed
+            # row in the customer's underlying CSV export, not anything our query shapes — retrying
+            # the same file fails identically every time, so it just spams error tracking. The
+            # customer must fix or remove the offending file (or widen the external table's schema)
+            # before the table can be read again. Matched on BigQuery's stable "Too many values in
+            # line" wording, not the volatile column counts, line/byte offsets, or GCS object path.
+            "Too many values in line": "BigQuery couldn't read an external table because one of its underlying CSV files in Cloud Storage has a line with more columns than the table's schema expects (\"Too many values in line\"). Please fix or remove the malformed file in the external table's source data (or widen the table's schema to match), then re-enable the source.",
+            # Raised from the Storage Read API's `create_read_session` (see `get_rows` in
+            # `bigquery.py`) when the service account is missing the `bigquery.readsessions.create`
+            # permission the Read API requires. The google.api_core PermissionDenied stringifies as
+            # "403 request failed: the user does not have 'bigquery.readsessions.create' permission
+            # for 'projects/<id>'", so neither the "Access Denied:"/403 keys nor "PermissionDenied:
+            # 403 request failed" cover this wording, and it retries forever. This is an IAM config
+            # problem on the customer's service account — retrying can't resolve it; the user must
+            # grant the missing permission (e.g. the BigQuery Read Session User role). Matched on the
+            # stable permission name rather than the volatile project id.
+            "bigquery.readsessions.create": "BigQuery denied access to the Storage Read API: your service account is missing the bigquery.readsessions.create permission. Please grant it (for example via the BigQuery Read Session User role) on the project you're syncing, then reconnect the source.",
+            # Raised while reading rows from a Storage Read API stream (see `get_rows` in `bigquery.py`)
+            # when the service account can create a read session but lacks `bigquery.readsessions.getData`,
+            # the separate permission required to pull data from the session's streams. The
+            # google.api_core PermissionDenied stringifies as "there was an error operating on
+            # 'projects/<id>/.../streams/<id>': the user does not have 'bigquery.readsessions.getData'
+            # permission for '...'", so neither the "Access Denied:"/403 keys nor the readsessions.create
+            # key cover this wording, and it retries forever. Same IAM config fix as create — the BigQuery
+            # Read Session User role grants both. Matched on the stable permission name rather than the
+            # volatile session/stream ids.
+            "bigquery.readsessions.getData": "BigQuery denied access to the Storage Read API: your service account is missing the bigquery.readsessions.getData permission needed to read data from a read session. Please grant it (for example via the BigQuery Read Session User role) on the project you're syncing, then reconnect the source.",
+            # Raised from the Storage Read API's `create_read_session` (see `get_rows` in
+            # `bigquery.py`) when the BigQuery Storage API itself is disabled on the project the read
+            # bills to — a project-level setting, distinct from the IAM permission denials above,
+            # which all assume the API is already enabled. The google.api_core PermissionDenied
+            # stringifies as "403 BigQuery Storage API has not been used in project <id> before or it
+            # is disabled. Enable it by visiting https://console.developers.google.com/apis/api/
+            # bigquerystorage.googleapis.com/overview?project=<id> then retry. ...", so match only the
+            # stable prefix before the volatile project id. Retrying can't enable the API; the
+            # customer must enable it in the Google Cloud console.
+            "BigQuery Storage API has not been used in project": "BigQuery denied access because the BigQuery Storage API is disabled on the project your read bills to. Enable the BigQuery Storage API for that project in the Google Cloud console, then reconnect the source.",
+            # Raised from query jobs when the configured dataset/table doesn't exist in the location
+            # we query — the dataset was deleted or renamed, or it lives in a different region than the
+            # one we run against. The google exception stringifies as "404 Not found: Dataset ... was
+            # not found in location US", so match the stable phrasing here. Retrying can't recover —
+            # the user must fix the dataset or set the correct region.
+            "was not found in location": BIGQUERY_DATASET_NOT_FOUND_ERROR,
+            # Schema discovery (`get_columns`) re-raises the same 404 as `BigQueryDatasetNotFoundError`
+            # carrying this exact wording (so the create/validate path shows it instead of the raw
+            # 404). Match it here too so the discovery activity treats it as non-retryable.
+            BIGQUERY_DATASET_NOT_FOUND_ERROR: BIGQUERY_DATASET_NOT_FOUND_ERROR,
+            # `bq_client.get_table(...)` in `_build_source_response` (see `bigquery.py`) issues a
+            # direct REST GET rather than a query job, so a dataset deleted or renamed after schema
+            # discovery surfaces as "GET .../tables/<table>?prettyPrint=false: Not found: Dataset
+            # <project>:<dataset>" — with no "was not found in location" suffix, since no query job
+            # (and therefore no queried-region mismatch) is involved. The "was not found in location"
+            # key above only covers the query-job path, so this slips through and retries forever.
+            # Retrying can't recover a deleted dataset; the user must restore or rename it back, or
+            # remove it from the sync. Matched on the stable "Not found: Dataset" wording rather than
+            # the volatile project/dataset id.
+            "Not found: Dataset": BIGQUERY_DATASET_NOT_FOUND_ERROR,
+            # A syntactically invalid project/dataset ID (e.g. a value carrying parentheses like
+            # "(default)") is rejected as a 400 "Invalid dataset ID ..." / "Invalid project ID ...".
+            # Schema discovery re-raises it as `BigQueryInvalidIdentifierError` carrying the friendly
+            # wording, so match that here, plus the raw 400 phrasings for occurrences elsewhere in the
+            # sync. Deterministic config error — retrying never succeeds until the id is corrected.
+            BIGQUERY_INVALID_IDENTIFIER_ERROR: BIGQUERY_INVALID_IDENTIFIER_ERROR,
+            "Invalid dataset ID": BIGQUERY_INVALID_IDENTIFIER_ERROR,
+            "Invalid project ID": BIGQUERY_INVALID_IDENTIFIER_ERROR,
+            # `bq.dataset(...)`-based REST calls (`list_tables`, used by temp-table cleanup and
+            # credential validation) reject a malformed project/dataset ID with this resource-name
+            # wording instead of "Invalid project ID"/"Invalid dataset ID", which only query jobs
+            # raise for the same misconfiguration. Matched on the stable wording, not the volatile
+            # offending id.
+            "Invalid resource name": BIGQUERY_INVALID_IDENTIFIER_ERROR,
+            # Raised as a 400 BadRequest from job creation (POST .../jobs) when the location the
+            # client runs in — the custom region from the source form, or the dataset's own location
+            # auto-detected in `connect` — isn't a region BigQuery can run query jobs in, e.g.
+            # "Location ua does not support this operation.". It's a deterministic config problem:
+            # retrying the same location always fails identically, so the user must set a valid
+            # BigQuery region. The "was not found in location" key only covers a dataset missing from
+            # a queried region, not an unsupported region, so this slips through and retries forever.
+            # Matched on the stable wording rather than the volatile location code.
+            "does not support this operation": "BigQuery rejected the dataset region this source runs in — it isn't a location BigQuery can run queries in. Please set a valid BigQuery region (for example US, EU, or us-east1) in your source configuration, then reconnect the source.",
+            # Raised from `bq_client.get_table(...)` in `_build_source_response` when the table being
+            # synced no longer exists at sync time — it was deleted or renamed in BigQuery (common with
+            # dbt-managed datasets) after schema discovery selected it. The google exception stringifies
+            # as "... Not found: Table <project>:<dataset>.<table>", which the "was not found in
+            # location" key (dataset-region 404s) doesn't cover, so it slips through and retries forever.
+            # Retrying within the sync's window can't recover a missing table; the user must restore or
+            # rename it back, or remove it from the sync. Matched on the stable "Not found: Table"
+            # wording rather than the volatile table id.
+            "Not found: Table": "BigQuery couldn't find a table this source is syncing — it was deleted or renamed after the source was set up. Restore or rename the table in BigQuery, or remove it from this source's synced tables, then re-enable the source.",
+            # Raised from `bq_client.get_table(...)` in `_build_source_response` (and other calls) when
+            # the GCP project the source references no longer exists — it was deleted, or the Project ID
+            # in the service account key file (or the configured dataset project) is wrong. The google
+            # exception stringifies as "... Project <id> is not found. Make sure it references valid GCP
+            # project that hasn't been deleted.", which the table/dataset "Not found" keys don't cover, so
+            # it slips through and retries forever. Retrying can't conjure a missing project; the user
+            # must fix the project reference. Matched on the stable guidance wording rather than the
+            # volatile project id that appears earlier in the message.
+            "Make sure it references valid GCP project": "BigQuery couldn't find the Google Cloud project this source references — it may have been deleted, or the Project ID in your service account key file (or the configured dataset project) may be incorrect. Verify the project exists in Google Cloud and correct the project details in your source configuration, then reconnect the source.",
+            # Raised as a 403 Forbidden by `bq_client.get_table(...)` in `_build_source_response` (and
+            # other direct REST calls) when the GCP project the source runs against has been deleted,
+            # e.g. "... Project #898288516447 has been deleted.". Unlike the "Make sure it references
+            # valid GCP project" key above (a 404 naming the friendly project id), this is a 403 naming
+            # the numeric project number, so it slips through and retries forever against a project that
+            # no longer exists. The `delete_table` cleanup path in `bigquery.py` already treats this
+            # wording as terminal (skips rather than raises); this key gives the same condition the same
+            # treatment on the main sync path. Matched on the stable "has been deleted" wording rather
+            # than the volatile project number.
+            "has been deleted": "BigQuery couldn't complete this sync because the Google Cloud project it uses has been deleted. Restore the project in Google Cloud, or update your source configuration to use a project that still exists, then reconnect the source.",
+            # Raised by google-cloud-bigquery's `TableReference.from_string` when a table id has
+            # more than the three `project.dataset.table` components. This happens when the
+            # Dataset ID field is set to `project.dataset` instead of just `dataset` — we then
+            # build `project.project.dataset.table` and the client rejects it. It's a deterministic
+            # config error, so retrying never succeeds.
+            "table_id must be a fully-qualified ID in standard SQL format": "Your BigQuery Dataset ID looks misconfigured — it should be just the dataset name (for example `analytics`), not `project.dataset`. Please update the Dataset ID in your source configuration.",
+            # Forbidden 403 with `reason: billingNotEnabled` — the customer's Google Cloud project
+            # has billing disabled (BigQuery sandbox mode), so any query job is rejected before it
+            # runs. There's nothing we can do but stop retrying until they enable billing.
+            "Billing has not been enabled for this project": "BigQuery billing is not enabled for your Google Cloud project. Enable billing in the Google Cloud console (https://console.cloud.google.com/billing), then resume this source.",
+            # Raised as a 400 BadRequest from `job.result()` (`_wait_for_job` in `bigquery.py`) when
+            # the queried region has neither on-demand pricing nor a flat-rate/capacity reservation
+            # configured for the customer's project, e.g. "Cannot run query: project does not have
+            # the reservation in the data region or no slots are configured; reason: invalid, ...".
+            # This is a billing/capacity setup problem on the customer's Google Cloud project, not a
+            # transient slot shortage — the same query fails identically on every retry until they
+            # enable on-demand pricing or create a reservation in that region. Matched on BigQuery's
+            # stable wording, not the volatile location or job id.
+            "project does not have the reservation in the data region or no slots are configured": "BigQuery couldn't run a query for this source because your Google Cloud project has neither on-demand pricing nor a flat-rate reservation configured for the queried region. Please enable on-demand pricing or create a BigQuery reservation for that region (https://console.cloud.google.com/bigquery/admin/reservations), then re-enable the source.",
+            # Raised from the shared `evolve_pyarrow_schema` in `pipelines/core/arrow_utils.py`
+            # when an integer column's source type was widened (e.g. `INT64` widened from a
+            # narrower numeric type) after the destination table was created with the narrower
+            # type. Delta Lake can't widen an existing column in place, so retrying won't help —
+            # the table must be reset and fully re-synced to adopt the new type.
+            "Source column type changed": "A column's type changed in your source database (for example an integer column was widened to bigint) and no longer fits the type we stored. We can't widen an existing column in place — please reset and fully re-sync this table to adopt the new type.",
+            # Raised from `BigQueryImplementation.get_columns` when the service-account OAuth
+            # token endpoint returns a non-JSON-object 200 (bad `token_uri`, or an intercepting
+            # proxy). Authentication can't succeed until the key file is fixed, so retrying just
+            # hammers the endpoint and spams error tracking.
+            BIGQUERY_TOKEN_RESPONSE_ERROR: "We couldn't authenticate with BigQuery — Google's OAuth token endpoint returned an unexpected response. Please re-upload your service account key file and verify its token_uri.",
+            # A service-account key whose `token_uri` points at an ngrok tunnel that's offline:
+            # google-auth POSTs the token request and gets back ngrok's HTML error page instead of
+            # an OAuth JSON response, so it raises a `RefreshError` carrying that page. Google's real
+            # token endpoint is never fronted by ngrok, so this is a misconfigured `token_uri` — the
+            # user must fix their key file; retrying can't recover. Matched on ngrok's stable
+            # offline-endpoint code rather than the volatile tunnel subdomain in the page.
+            "ERR_NGROK_3200": "We couldn't authenticate with BigQuery — your service account key's token_uri points at an offline endpoint, not Google's OAuth token endpoint. Please re-upload your service account key file and verify its token_uri.",
+            # A service-account key whose `token_uri` points at a non-globally-routable address
+            # (for example a cloud metadata endpoint). PostHog's egress proxy denies the request
+            # before it leaves our network and google-auth surfaces that denial as a `RefreshError`
+            # naming the proxy's stable rule. The proxy rejects the same non-public host on every
+            # retry, so retrying just hammers a request that can never succeed. Google's real OAuth
+            # token endpoint is always a public host, so this is a misconfigured `token_uri` — the
+            # user must fix their key file. Matched on the proxy's stable rule name rather than the
+            # volatile denied host.
+            "denied by rule 'Deny: Not Global Unicast'": "We couldn't authenticate with BigQuery — your service account key's token_uri points at an address PostHog can't reach. Please re-upload your service account key file and verify its token_uri is Google's OAuth token endpoint.",
+            # Raised as a `Forbidden` (403, reason `quotaExceeded`) when the customer's BigQuery
+            # project hits an administrator-configured custom cost control, e.g. "Custom quota
+            # exceeded: Your usage exceeded the custom quota for QueryUsagePerDay, which is set by
+            # your administrator.". This is a deliberate spend cap on the customer's GCP project,
+            # not a transient limit — retrying within the sync's retry window can't recover it (the
+            # cap resets on Google's daily schedule), so it just hammers the endpoint and spams
+            # error tracking. We match the stable "Custom quota exceeded" wording, which is distinct
+            # from transient rate-limit quota errors ("Quota exceeded: ..." / reason
+            # `rateLimitExceeded`) that must stay retryable.
+            "Custom quota exceeded": "Your BigQuery project hit a custom usage quota set by your administrator (for example QueryUsagePerDay). Raise the custom cost-control quota in Google Cloud, or reduce how much data you're syncing, then re-enable the source.",
+            # Raised from the Storage Read API's `create_read_session` (see `get_rows` in
+            # `bigquery.py`) when the source table uses change data capture with a `max_staleness`
+            # window and has pending upserts older than that window. The Storage Read API can't
+            # apply CDC changes on the fly — only GoogleSQL queries and BigQuery's background apply
+            # jobs do — so it rejects the read as a google.api_core InvalidArgument whose str() is
+            # "400 request failed: The table has un-applied upsert data that is not fresh enough to
+            # meet table's max_staleness.". Retrying within the sync's window can't recover it: the
+            # pending changes are applied on BigQuery's own schedule, not ours, so it just hammers
+            # the Read API and spams error tracking until a later sync finds the table caught up.
+            # Matched on the stable freshness phrasing rather than the volatile table id.
+            "un-applied upsert data that is not fresh enough": "BigQuery couldn't read this table through the Storage Read API because it uses change data capture and has pending upserts that haven't been applied within the table's max_staleness window. This usually clears once BigQuery applies the pending changes, so a later sync should recover. If it persists, lower the table's max_staleness or run a query against the table in BigQuery to apply the changes.",
+            # BigQuery aborts a query job with "Resources exceeded during query execution" (reason
+            # `resourcesExceeded`) when the query can't run within a worker's memory — heavy sorts or
+            # analytic OVER() clauses over a large table or view. We copy incremental / view /
+            # row-filtered reads into a temp table before reading them (`_run_destination_query_with_job_retry`
+            # in `bigquery.py`), and that copy carries the offending shape, so it fails here. It's a
+            # deterministic property of the customer's data volume and query shape — retrying the same
+            # query always fails identically (Google's own default job-retry doesn't retry this reason),
+            # so it just spams error tracking. The user must reduce the data synced or simplify the
+            # source view. Matched on BigQuery's stable wording, not the volatile peak-usage percentage
+            # or job id.
+            BIGQUERY_RESOURCES_EXCEEDED_ERROR: "BigQuery couldn't run a query for this source because it exceeded the memory allowed for a single query. This is usually caused by heavy sorts or analytic (window) functions over a large table or view. Retrying won't help — please reduce how much data you're syncing (for example add row filters or an incremental field), or simplify the source view, then re-enable the source.",
+            # Raised as a 400 BadRequest from `jobs.getQueryResults` (reason `billingTierLimitExceeded`)
+            # when a query's CPU-second usage relative to the bytes it billed exceeds the ratio the
+            # on-demand pricing model allows, e.g. "Query exceeded resource limits. This query used
+            # <N> CPU seconds but would charge only <M> Analysis bytes. This exceeds the ratio
+            # supported by the on-demand pricing model.". We copy incremental / view / row-filtered
+            # reads into a temp table before reading them (`_run_destination_query_with_job_retry` in
+            # `bigquery.py`), and a CPU-heavy source view or query shape carries this ratio into that
+            # copy. It's a deterministic property of the customer's query shape and billing tier —
+            # retrying the identical query always fails identically, so it just spams error tracking.
+            # BigQuery itself tells the user to move to capacity-based pricing or reduce the workload.
+            # Matched on BigQuery's stable wording, not the volatile CPU-second/byte counts or job id.
+            BIGQUERY_ON_DEMAND_RATIO_EXCEEDED_ERROR: "BigQuery couldn't run a query for this source because it used too many CPU seconds relative to the data it billed, which exceeds the ratio the on-demand pricing model allows. Retrying won't help — please move this workload to a capacity-based pricing model, or reduce how much data you're syncing (for example add row filters or an incremental field, or simplify the source view), then re-enable the source.",
+            # Raised as a 400 BadRequest from `jobs.getQueryResults` (the poll `_run_destination_query_
+            # with_job_retry` / `_query_result_with_job_retry` in `bigquery.py` do while awaiting a query
+            # job) when the job's result set holds a NaN in a column typed NUMERIC/BIGNUMERIC — that type
+            # can't represent NaN the way FLOAT64 can. This traces back to the source table or view itself
+            # (a computed column doing arithmetic like division by zero) rather than anything our SELECT
+            # constructs, so it's a deterministic property of the customer's data: the same query keeps
+            # producing the same NaN on every retry, and Google's own default job-retry doesn't cover it.
+            # The user must fix the source view/column; retrying just spams error tracking. Matched on
+            # BigQuery's stable wording, not the volatile job id/URL.
+            "Invalid NUMERIC value: NaN": "BigQuery couldn't complete a query for this source because it produced a NaN (not-a-number) value in a column typed NUMERIC, which that type can't represent. This is usually caused by a computed column or view doing arithmetic like division by zero. Please fix the underlying view or column in BigQuery, then re-enable the source.",
+            # Raised as a 400 BadRequest (reason `invalidQuery`) when the table or view being synced
+            # has a column name BigQuery can't resolve to a single source, e.g. "Column name x is
+            # ambiguous". We select each configured column by its own unqualified name (see
+            # `_get_query`/`_bq_select_clause` in `bigquery.py`), so this only happens when the
+            # underlying relation itself has the conflict — a view that joins tables sharing a column
+            # name, or a table/external table with two columns differing only by letter case. It's a
+            # deterministic property of the customer's view/table definition: the same query fails
+            # identically on every retry, so it just hammers BigQuery and spams error tracking. The
+            # user must fix the view or table definition. Matched on BigQuery's stable wording, not
+            # the volatile column name or [row:col] location.
+            "is ambiguous": "BigQuery couldn't run a query for this source because a column name in the table or view being synced is ambiguous. This usually happens when a view joins tables that share a column name, or two columns differ only by letter case. Retrying won't help — please update the view or table definition to remove the naming conflict (for example by aliasing the duplicate column), then reconnect the source.",
+            # Raised as a 400 BadRequest (reason `invalidQuery`) when a query we build references a
+            # column that no longer exists on the table, e.g. "Unrecognized name: ingested_at at
+            # [1:37]". We only reference columns the customer configured — the incremental field, an
+            # enabled column, or a row filter — so this means that column was renamed or dropped from
+            # the source table after the source (or its incremental field) was set up. It's a
+            # deterministic mismatch between our stored config and the customer's live schema: the
+            # same query fails identically on every retry. The user must update the source's column
+            # selection or incremental field to match the table's current schema. Matched on
+            # BigQuery's stable wording, not the volatile column name or [row:col] location.
+            "Unrecognized name:": "BigQuery couldn't run a query for this source because it referenced a column that no longer exists on the table — usually the configured incremental field, or a column selected for syncing, was renamed or removed. Retrying won't help — please update the source's column selection or incremental field to match the table's current schema, then reconnect the source.",
+            # Raised from the Storage Read API's `create_read_session` (see `get_rows` in
+            # `bigquery.py`) when a column selected for syncing no longer exists on the live table —
+            # the direct-read counterpart of "Unrecognized name:" above, which covers the same drift
+            # on the query-job path (incremental / view / row-filtered reads). The google.api_core
+            # InvalidArgument stringifies as "request failed: The following selected fields do not
+            # exist in the table schema: <col1>, <col2>, ...". It's a deterministic mismatch between
+            # our stored config and the customer's live schema: the same read fails identically on
+            # every retry. The user must update the source's column selection to match the table's
+            # current schema. Matched on the stable wording, not the volatile list of column names.
+            "do not exist in the table schema": "BigQuery couldn't read this table because it referenced columns that no longer exist on it — usually columns selected for syncing were renamed or removed. Retrying won't help — please update the source's column selection to match the table's current schema, then reconnect the source.",
+            # Raised as a 400 BadRequest from `jobs.getQueryResults` (the same poll `_with_job_not_
+            # found_retry` in `bigquery.py` awaits) when the table or view being synced is guarded by
+            # a deprecation check the customer's own BigQuery team added to it — a query against that
+            # relation deliberately errors to redirect callers to its replacement. It's a deterministic
+            # property of which table the source reads, not of our query shape: the same table fails
+            # identically on every retry until the source is pointed at the replacement. Matched on
+            # BigQuery's stable "Deprecated legacy table/view" wording, not the volatile project name
+            # or job id that surround it.
+            "Deprecated legacy table/view": "BigQuery rejected a query for this source because the table or view it reads has been marked deprecated by your BigQuery team, in favor of a newer replacement. Retrying won't help — please update this source to sync the replacement table or view, then reconnect the source.",
+        }
+
+    def validate_config(self, job_inputs: dict) -> tuple[bool, list[str]]:
+        is_valid, errors = super().validate_config(job_inputs)
+
+        # An empty `key_file` object reaches us both when the upload produced nothing and when the
+        # form sends the option the user did not pick, so on its own it says nothing worth showing.
+        if any(error in _KEY_FILE_FIELD_ERRORS for error in errors):
+            errors = [error for error in errors if error not in _KEY_FILE_FIELD_ERRORS]
+            is_valid = not errors
+
+        # The credential fields under each option are optional on the form, because the option the
+        # user did not pick must not block the save. That makes this the only check that stops a
+        # source being created with no credentials at all.
+        auth_type = job_inputs.get("auth_type")
+        selection: str | None
+        credentials: dict
+        if isinstance(auth_type, str):
+            # A select container also arrives as the bare string naming the chosen option, and
+            # then its fields sit at the top level of the payload rather than under it.
+            selection, credentials = auth_type, job_inputs
+        elif isinstance(auth_type, dict):
+            selection, credentials = auth_type.get("selection"), auth_type
+        else:
+            return is_valid, errors
+
+        if selection == "key_file":
+            key_file = credentials.get("key_file")
+            if not isinstance(key_file, dict) or not any(key_file.values()):
+                errors.append(_MISSING_KEY_FILE_ERROR)
+                is_valid = False
+            elif not all(key_file.get(name) for name in _KEY_FILE_FIELD_NAMES):
+                errors.append(_INCOMPLETE_KEY_FILE_ERROR)
+                is_valid = False
+        elif credentials.get("google_cloud_service_account_integration_id") in (None, ""):
+            errors.append("Pick a Google Cloud service account.")
+            is_valid = False
+
+        return is_valid, errors
+
+    def validate_credentials(
+        self,
+        config: BigQuerySourceConfig,
+        team_id: int,
+        schema_name: Optional[str] = None,
+        api_version: str | None = None,
+    ) -> tuple[bool, str | None]:
+        try:
+            auth = resolve_bigquery_auth(config, team_id)
+        except Exception as e:
+            return False, classify_bigquery_validation_error(e)
+
+        region: str | None = None
+        if (
+            config.use_custom_region
+            and config.use_custom_region.enabled
+            and config.use_custom_region.region is not None
+            and config.use_custom_region.region != ""
+        ):
+            region = config.use_custom_region.region
+        return validate_bigquery_credentials(
+            config.dataset_id,
+            auth.project_id,
+            auth.credentials,
+            config.dataset_project.dataset_project_id if config.dataset_project else None,
+            region,
+        )
+
+    @property
+    def get_source_config(self) -> SourceConfig:
+        return SourceConfig(
+            name=ExternalDataSourceType.BIGQUERY,
+            category=DataWarehouseSourceCategory.DATABASES,
+            keywords=["bq", "gbq", "sql", "gcp", "google cloud"],
+            featured=True,
+            iconPath="/static/services/bigquery.png",
+            caption=(
+                "Enter your BigQuery credentials to automatically pull your BigQuery data into the PostHog Data "
+                "warehouse. To send PostHog data to BigQuery instead, set up a batch export.\n\n"
+                "To use a service account, select **Choose Google Cloud service account connection**, then "
+                "**Configure new Google Cloud service account**. It shows how to let PostHog use your service account.\n\n"
+                "Your service account also needs these BigQuery roles: **BigQuery Job User** and **BigQuery Read "
+                "Session User** on the project, and **BigQuery Data Editor** on the dataset you sync. If you use a "
+                "separate dataset for temporary tables, grant **BigQuery Data Editor** there instead and **BigQuery "
+                "Data Viewer** on the dataset you sync. Without these roles, the connection check can pass but the "
+                "sync fails."
+            ),
+            docsUrl="https://posthog.com/docs/cdp/sources/bigquery",
+            fields=cast(
+                list[FieldType],
+                [
+                    SourceFieldSelectConfig(
+                        name="auth_type",
+                        label="Authentication type",
+                        required=True,
+                        defaultValue="service_account",
+                        options=[
+                            SourceFieldSelectConfigOption(
+                                label="Google Cloud service account",
+                                value="service_account",
+                                fields=cast(
+                                    list[FieldType],
+                                    [
+                                        SourceFieldOauthConfig(
+                                            name="google_cloud_service_account_integration_id",
+                                            label="Google Cloud service account",
+                                            required=False,
+                                            kind="google-cloud-service-account",
+                                        ),
+                                    ],
+                                ),
+                            ),
+                            SourceFieldSelectConfigOption(
+                                label="JSON key file",
+                                value="key_file",
+                                fields=cast(
+                                    list[FieldType],
+                                    [
+                                        SourceFieldFileUploadConfig(
+                                            name="key_file",
+                                            label="Google Cloud JSON key file",
+                                            fileFormat=SourceFieldFileUploadJsonFormatConfig(
+                                                format=".json",
+                                                keys=[
+                                                    "project_id",
+                                                    "private_key",
+                                                    "private_key_id",
+                                                    "client_email",
+                                                    "token_uri",
+                                                ],
+                                            ),
+                                            required=False,
+                                        ),
+                                    ],
+                                ),
+                            ),
+                        ],
+                    ),
+                    SourceFieldSwitchGroupConfig(
+                        name="use_custom_region",
+                        label="Manually specify your dataset region?",
+                        caption="In most cases, BigQuery is able to automatically determine the region your dataset is located in. For the rare instances that BigQuery fails to do so, you can manually specify your dataset region here.",
+                        default=False,
+                        fields=cast(
+                            list[FieldType],
+                            [
+                                SourceFieldInputConfig(
+                                    name="region",
+                                    label="Region",
+                                    type=SourceFieldInputConfigType.TEXT,
+                                    required=True,
+                                    placeholder="us-east1",
+                                    secret=False,
+                                ),
+                            ],
+                        ),
+                    ),
+                    SourceFieldInputConfig(
+                        name="dataset_id",
+                        sync_setting=True,
+                        label="Dataset ID",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=True,
+                        placeholder="",
+                        secret=False,
+                    ),
+                    SourceFieldSwitchGroupConfig(
+                        name="temporary-dataset",
+                        sync_setting=True,
+                        label="Use a different dataset for the temporary tables?",
+                        caption="We have to create and delete temporary tables when querying your data, this is a requirement of querying large BigQuery tables. We can use a different dataset if you'd like to limit the permissions available to the service account provided.",
+                        default=False,
+                        fields=cast(
+                            list[FieldType],
+                            [
+                                SourceFieldInputConfig(
+                                    name="temporary_dataset_id",
+                                    label="Dataset ID for temporary tables",
+                                    type=SourceFieldInputConfigType.TEXT,
+                                    required=True,
+                                    placeholder="",
+                                    secret=False,
+                                )
+                            ],
+                        ),
+                    ),
+                    SourceFieldSwitchGroupConfig(
+                        name="dataset_project",
+                        label="Use a different project for the dataset than your service account project?",
+                        caption="If the dataset you're wanting to sync exists in a different project than that of your service account, use this to provide the project ID of the BigQuery dataset.",
+                        default=False,
+                        fields=cast(
+                            list[FieldType],
+                            [
+                                SourceFieldInputConfig(
+                                    name="dataset_project_id",
+                                    label="Project ID for dataset",
+                                    type=SourceFieldInputConfigType.TEXT,
+                                    required=True,
+                                    placeholder="",
+                                    secret=False,
+                                )
+                            ],
+                        ),
+                    ),
+                ],
+            ),
+        )

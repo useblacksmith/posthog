@@ -1,0 +1,288 @@
+from typing import TYPE_CHECKING, Any, Optional
+
+import orjson
+import structlog
+from pydantic import BaseModel
+
+from posthog.schema import CacheMissResponse, DashboardFilter
+
+from posthog.hogql.constants import LimitContext
+
+from posthog.api.services.query import (
+    ExecutionMode,
+    PlannedQuery,
+    RawCachedQueryResponse,
+    plan_query_dict,
+    process_query_dict,
+    run_planned_query,
+)
+from posthog.clickhouse.query_tagging import get_team_query_tags, tag_queries
+from posthog.dataclasses import frozen
+from posthog.event_usage import AnalyticsProps
+from posthog.hogql_queries.apply_dashboard_filters import resolve_effective_dashboard_filters
+from posthog.hogql_queries.query_runner import get_query_runner_or_none, response_results_contain_models
+from posthog.models import Team, User
+from posthog.schema_migrations.upgrade_manager import upgrade_insight
+
+from products.dashboards.backend.facade.contracts import AppliedDashboard
+from products.product_analytics.backend.facade.models import Insight
+
+if TYPE_CHECKING:
+    from posthog.caching.insight_result import InsightResult
+
+    from products.access_control.backend.facade.user_access_control import UserAccessControl
+
+
+logger = structlog.get_logger(__name__)
+
+
+def _model_field_as_dict(model: BaseModel, field: str) -> Optional[dict]:
+    value = getattr(model, field, None)
+    if value is None:
+        return None
+    if isinstance(value, BaseModel):
+        return value.model_dump(by_alias=True)
+    return value
+
+
+def _dump_nested_models(value: Any) -> Any:
+    """Container-preserving conversion of pydantic models to dicts (lists, dicts, scalars pass through)."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(by_alias=True)
+    if isinstance(value, list):
+        return [_dump_nested_models(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _dump_nested_models(item) for key, item in value.items()}
+    return value
+
+
+def _model_list_field_as_dicts(model: BaseModel, field: str) -> Optional[list]:
+    value = getattr(model, field, None)
+    if value is None:
+        return None
+    return [item.model_dump(by_alias=True) if isinstance(item, BaseModel) else item for item in value]
+
+
+def calculate_cache_key(insight: Insight, *, dashboard: AppliedDashboard | None) -> Optional[str]:
+    """The cache key of the insight's query, with the dashboard's filters applied when the insight runs on one.
+
+    The filter overrides of the insight's tile are not applied.
+    """
+    with upgrade_insight(insight):
+        if insight.query:
+            query_runner = get_query_runner_or_none(insight.query, insight.team)
+            if query_runner is None:
+                return None  # Uncacheable query-based insight
+            if dashboard is not None and dashboard.filters:
+                query_runner.apply_dashboard_filters(DashboardFilter(**dashboard.filters))
+            return query_runner.get_cache_key()
+
+    return None
+
+
+@frozen
+class _ResolvedInsightQuery:
+    query: dict
+    dashboard_filters: Optional[dict]
+    variables_override: Optional[dict]
+
+
+def _resolve_insight_query(
+    insight: Insight,
+    *,
+    dashboard: AppliedDashboard | None,
+    filters_override: Optional[dict],
+    variables_override: Optional[dict],
+    tile_filters_override: Optional[dict],
+    query_override: Optional[dict],
+) -> _ResolvedInsightQuery:
+    dashboard_filters_json = (
+        filters_override if filters_override is not None else dashboard.filters if dashboard is not None else None
+    )
+
+    variables_override_json = (
+        variables_override if variables_override is not None else dashboard.variables if dashboard is not None else None
+    )
+
+    query_json: dict | None = query_override if query_override is not None else insight.query
+    if query_json is None:
+        raise ValueError("Insight has no query and no query_override was provided")
+
+    effective = resolve_effective_dashboard_filters(query_json, dashboard_filters_json, tile_filters_override)
+    return _ResolvedInsightQuery(
+        query=effective.query, dashboard_filters=effective.filters, variables_override=variables_override_json
+    )
+
+
+def plan_query_based_insight(
+    insight: Insight,
+    *,
+    team: Team,
+    dashboard: AppliedDashboard | None,
+    user: Optional[User],
+    user_access_control: Optional["UserAccessControl"],
+    filters_override: Optional[dict],
+    variables_override: Optional[dict],
+    tile_filters_override: Optional[dict],
+    allow_raw_results: bool,
+    limit_context: LimitContext,
+) -> Optional[PlannedQuery]:
+    """The query `calculate_for_query_based_insight` would run for these arguments, before it runs. None when the
+    insight has to go through the unplanned path."""
+    resolved = _resolve_insight_query(
+        insight,
+        dashboard=dashboard,
+        filters_override=filters_override,
+        variables_override=variables_override,
+        tile_filters_override=tile_filters_override,
+        query_override=None,
+    )
+    return plan_query_dict(
+        team,
+        resolved.query,
+        dashboard_filters_json=resolved.dashboard_filters,
+        variables_override_json=resolved.variables_override,
+        limit_context=limit_context,
+        user=user,
+        user_access_control=user_access_control,
+        allow_raw_results=allow_raw_results,
+    )
+
+
+def calculate_for_query_based_insight(
+    insight: Insight,
+    *,
+    team: Team,
+    dashboard: AppliedDashboard | None = None,
+    execution_mode: ExecutionMode,
+    user: Optional[User],
+    user_access_control: Optional["UserAccessControl"] = None,
+    filters_override: Optional[dict] = None,
+    variables_override: Optional[dict] = None,
+    tile_filters_override: Optional[dict] = None,
+    query_override: Optional[dict] = None,
+    cache_age_seconds: Optional[int] = None,
+    analytics_props: Optional[AnalyticsProps] = None,
+    allow_raw_results: bool = False,
+    limit_context: LimitContext = LimitContext.QUERY_ASYNC,
+) -> "InsightResult":
+    tag_queries(**get_team_query_tags(team), insight_id=insight.pk)
+    if dashboard:
+        tag_queries(dashboard_id=dashboard.id)
+
+    resolved = _resolve_insight_query(
+        insight,
+        dashboard=dashboard,
+        filters_override=filters_override,
+        variables_override=variables_override,
+        tile_filters_override=tile_filters_override,
+        query_override=query_override,
+    )
+
+    process_response = process_query_dict(
+        team,
+        resolved.query,
+        dashboard_filters_json=resolved.dashboard_filters,
+        variables_override_json=resolved.variables_override,
+        execution_mode=execution_mode,
+        user=user,
+        user_access_control=user_access_control,
+        insight_id=insight.pk,
+        dashboard_id=dashboard.id if dashboard else None,
+        limit_context=limit_context,
+        cache_age_seconds=cache_age_seconds,
+        analytics_props=analytics_props,
+        allow_raw_results=allow_raw_results,
+    )
+    return _insight_result_from_response(process_response)
+
+
+def calculate_planned_query_based_insight(
+    insight: Insight,
+    planned: PlannedQuery,
+    *,
+    team: Team,
+    dashboard: AppliedDashboard | None,
+    execution_mode: ExecutionMode,
+    user: Optional[User],
+    cache_age_seconds: Optional[int],
+    analytics_props: Optional[AnalyticsProps],
+) -> "InsightResult":
+    """`calculate_for_query_based_insight` for a query `plan_query_based_insight` planned. Runs the planned runner
+    instead of planning it again, and shapes the response the same way."""
+    tag_queries(**get_team_query_tags(team), insight_id=insight.pk)
+    if dashboard:
+        tag_queries(dashboard_id=dashboard.id)
+
+    process_response = run_planned_query(
+        planned,
+        execution_mode=execution_mode,
+        user=user,
+        insight_id=insight.pk,
+        dashboard_id=dashboard.id if dashboard else None,
+        cache_age_seconds=cache_age_seconds,
+        analytics_props=analytics_props,
+    )
+
+    return _insight_result_from_response(process_response)
+
+
+def _insight_result_from_response(
+    process_response: dict | BaseModel | RawCachedQueryResponse,
+) -> "InsightResult":
+    from posthog.caching.insight_result import InsightResult, NothingInCacheResult
+
+    raw_results: Optional[bytes] = None
+    if isinstance(process_response, RawCachedQueryResponse):
+        raw_results = process_response.raw_results
+        process_response = process_response.response
+
+    if isinstance(process_response, CacheMissResponse):
+        return NothingInCacheResult(
+            cache_key=process_response.cache_key, query_status=_model_field_as_dict(process_response, "query_status")
+        )
+
+    if isinstance(process_response, BaseModel):
+        # Don't model_dump() the whole response: `results` alone can be tens of MB of plain
+        # dicts, and dumping deep-copies all of it only for a handful of fields to be re-read.
+        # Pull fields off the model instead, converting just the small nested models to dicts
+        # (which is what model_dump produced before). The response class may not carry every
+        # field (legacy insights shape), hence the getattr defaults.
+        if raw_results is not None:
+            # orjson.Fragment embeds the cached results bytes into the JSON response as-is,
+            # skipping the parse/re-serialize round trip. Callers passing allow_raw_results
+            # guarantee the result feeds an orjson renderer.
+            result: Any = orjson.Fragment(raw_results)
+        else:
+            result = getattr(process_response, "results", None)
+            if result is not None and response_results_contain_models(type(process_response)):
+                # Model-typed results (e.g. RetentionResult, PathsLink) must be dumped to dicts
+                # like model_dump did — DRF's JSON encoder would otherwise mangle them into
+                # (field, value) tuple arrays. Results whose annotation is plain data (the huge
+                # trends/funnels payloads, or scalar/dict-shaped results) pass through untouched.
+                result = _dump_nested_models(result)
+        return InsightResult(
+            result=result,
+            has_more=getattr(process_response, "hasMore", None),
+            columns=getattr(process_response, "columns", None),
+            last_refresh=getattr(process_response, "last_refresh", None),
+            cache_key=getattr(process_response, "cache_key", None),
+            is_cached=getattr(process_response, "is_cached", False),
+            timezone=getattr(process_response, "timezone", None),
+            next_allowed_client_refresh=getattr(process_response, "next_allowed_client_refresh", None),
+            cache_target_age=getattr(process_response, "cache_target_age", None),
+            timings=_model_list_field_as_dicts(process_response, "timings"),
+            query_status=_model_field_as_dict(process_response, "query_status"),
+            hogql=getattr(process_response, "hogql", None),
+            types=getattr(process_response, "types", None),
+            resolved_date_range=_model_field_as_dict(process_response, "resolved_date_range"),
+            resolved_compare_date_range=_model_field_as_dict(process_response, "resolved_compare_date_range"),
+            action_names=getattr(process_response, "action_names", None),
+            query_scan=_model_field_as_dict(process_response, "query_scan"),
+            warnings=_model_list_field_as_dicts(process_response, "warnings"),
+        )
+
+    response = process_response
+    assert isinstance(response, dict)
+
+    return InsightResult.from_response_dict(response)

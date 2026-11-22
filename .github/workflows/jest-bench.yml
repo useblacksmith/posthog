@@ -1,0 +1,54 @@
+# Benchmark only. The whole frontend jest suite in four fixed shards, with no select job:
+#   plain: jest as upstream runs it
+#   cold:  @useblacksmith/jest with no record to restore (a first run)
+#   warm:  @useblacksmith/jest with the last run's record restored and a change that reruns every test file
+# All three install the same lockfile. No secrets are referenced and the job token has no permissions.
+name: jest-bench-raw
+on:
+    push:
+        branches: [jest-plugin-bench-raw]
+
+permissions: {}
+
+env:
+    NPM_CONFIG_AUDIT: 'false'
+    NPM_CONFIG_FUND: 'false'
+
+jobs:
+    jest:
+        name: ${{ matrix.arm }} (${{ matrix.chunk }})
+        runs-on: blacksmith-4vcpu-ubuntu-2404
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                arm: [plain, cold, warm]
+                chunk: [1, 2, 3, 4]
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  persist-credentials: false
+            - name: Install pnpm dependencies
+              uses: ./.github/actions/pnpm-install
+              with:
+                  install-command: pnpm --filter=@posthog/frontend... install --frozen-lockfile
+            - name: Test with Jest
+              env:
+                  NODE_OPTIONS: --max-old-space-size=16384
+                  SHARD_INDEX: ${{ matrix.chunk }}
+                  SHARD_COUNT: 4
+                  ARM: ${{ matrix.arm }}
+                  RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+              run: |
+                  set +e
+                  case "$ARM" in
+                      cold) export BLACKSMITH_JEST=1 BENCH_CACHE_KEY="cold-$RUN" ;;
+                      warm) export BLACKSMITH_JEST=1 BENCH_CACHE_KEY=warm
+                            echo "// $RUN" >> frontend/jest.config.ts ;;
+                  esac
+                  start=$(date +%s)
+                  pnpm --filter=@posthog/frontend test --maxWorkers=100% 2>&1 | tee /tmp/jest.log
+                  code=${PIPESTATUS[0]}
+                  echo "BENCH_RESULT arm=$ARM shard=$SHARD_INDEX/$SHARD_COUNT exit=$code seconds=$(( $(date +%s) - start )) suites=[$(grep -E '^Test Suites:' /tmp/jest.log | tail -1)] time=[$(grep -E '^Time:' /tmp/jest.log | tail -1)] plugin=[$(grep -E '^\[blacksmith\] [0-9]+ of [0-9]+ test file' /tmp/jest.log | cut -c1-200 | tail -1)]"
+                  grep -E '^\[blacksmith\]' /tmp/jest.log | cut -c1-600
+                  exit "$code"

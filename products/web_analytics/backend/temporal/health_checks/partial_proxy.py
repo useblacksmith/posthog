@@ -1,0 +1,117 @@
+from posthog.job_owners import JobOwners
+from posthog.models.health_issue import HealthIssue
+from posthog.temporal.health_checks.framework import (
+    _SEVERITY_WEIGHT,
+    AlertContent,
+    Remediation,
+    SignalContent,
+    build_signal_extra,
+)
+from posthog.temporal.health_checks.models import HealthCheckResult
+from posthog.temporal.health_checks.rollups.checks import RollupHealthCheck
+from posthog.temporal.health_checks.rollups.freshness import RollupWindow
+
+from products.web_analytics.backend.models.health_rollups import HostProxyDaily
+from products.web_analytics.backend.rollups.host_proxy import is_valid_host
+from products.web_analytics.backend.temporal.health_checks.rollup_reads import host_traffic
+
+PARTIAL_PROXY_LOOKBACK_DAYS = 7
+MIN_EVENTS_PER_HOST = 50
+MAX_HOSTS_IN_PAYLOAD = 10
+
+
+class PartialProxyCheck(RollupHealthCheck):
+    name = "partial_proxy"
+    kind = "partial_proxy"
+    owner = JobOwners.TEAM_WEB_ANALYTICS
+    schedule = "45 6 * * *"
+    active_since_days = 30
+    rollup_model = HostProxyDaily
+    window_days = PARTIAL_PROXY_LOOKBACK_DAYS
+    remediation = Remediation(
+        human="""
+            Open the Web analytics health page — it lists the hostnames that aren't going through a proxy.
+            For each of those, point the SDK's `api_host` at your reverse proxy (the same proxy your other
+            domains already use) and redeploy, so every domain ingests through your own domain.
+        """,
+        agent="""
+            Read this issue with `health-issues-get` — the payload's `unproxied_hosts` lists the domains to
+            fix — and use `execute-sql` to verify coverage per host (group recent $pageview events by
+            `properties.$host` and whether `properties.$lib_custom_api_host` is set). Check existing proxies
+            with `proxy-list`. Then fix it in the user's codebase: for the deployments serving those hosts,
+            set `api_host` in the `posthog.init` call to the existing reverse proxy URL (adding the proxy
+            rewrite/route, or a new managed proxy via `proxy-create`, if that host doesn't have one yet).
+            Use `docs-search` for the reverse proxy guide. Once all hosts are proxied, the issue clears on
+            the next check run.
+        """,
+    )
+
+    @classmethod
+    def render_alert(cls, issue: HealthIssue) -> AlertContent:
+        unproxied = issue.payload.get("unproxied_hosts") or []
+        summary = (
+            f"{len(unproxied)} host(s) lack a reverse proxy: {', '.join(unproxied[:3])}"
+            if unproxied
+            else issue.payload.get("reason", "Reverse proxy is only configured on some hostnames")
+        )
+        return AlertContent(
+            title="Partial reverse-proxy coverage",
+            summary=summary,
+            link="/web/health",
+        )
+
+    @classmethod
+    def render_signal(cls, issue: HealthIssue) -> SignalContent | None:
+        unproxied = issue.payload.get("unproxied_hosts") or []
+        hosts_clause = f" ({', '.join(unproxied[:5])})" if unproxied else ""
+        title = "Partial reverse-proxy coverage"
+        summary = (
+            f"{len(unproxied)} host(s) lack a reverse proxy{hosts_clause}"
+            if unproxied
+            else issue.payload.get("reason", "Reverse proxy is only configured on some hostnames.")
+        )
+        return SignalContent(
+            description=(
+                f"This project sends events through a reverse proxy on some hostnames but not others — "
+                f"{len(unproxied)} host(s) are unproxied{hosts_clause}. Traffic from the unproxied hosts is "
+                "more likely to be blocked by ad blockers and to have inaccurate geolocation, so analytics "
+                "will be inconsistent across your domains. Recommend extending the reverse proxy to every host."
+            ),
+            weight=_SEVERITY_WEIGHT[issue.severity],
+            extra=build_signal_extra(issue, title=title, summary=summary, link="/web/health"),
+        )
+
+    def detect_from_rollup(self, team_ids: list[int], window: RollupWindow) -> dict[int, list[HealthCheckResult]]:
+        proxied_by_team: dict[int, list[str]] = {}
+        unproxied_by_team: dict[int, list[str]] = {}
+        for team_id, hosts in host_traffic(team_ids, window, min_events=MIN_EVENTS_PER_HOST).items():
+            busy = sorted(
+                (host for host in hosts if is_valid_host(host.host)),
+                key=lambda host: (-host.event_count, host.host),
+            )
+            proxied_by_team[team_id] = [host.host for host in busy if host.proxied][:MAX_HOSTS_IN_PAYLOAD]
+            unproxied_by_team[team_id] = [host.host for host in busy if not host.proxied][:MAX_HOSTS_IN_PAYLOAD]
+        return _partial_proxy_issues(proxied_by_team, unproxied_by_team)
+
+
+def _partial_proxy_issues(
+    proxied_by_team: dict[int, list[str]], unproxied_by_team: dict[int, list[str]]
+) -> dict[int, list[HealthCheckResult]]:
+    issues: dict[int, list[HealthCheckResult]] = {}
+    for team_id, proxied in proxied_by_team.items():
+        unproxied = unproxied_by_team.get(team_id, [])
+        if not proxied or not unproxied:
+            continue
+        issues[team_id] = [
+            HealthCheckResult(
+                severity=HealthIssue.Severity.WARNING,
+                payload={
+                    "reason": "Reverse proxy is only configured on some hostnames. "
+                    "Traffic from unproxied hosts is more likely to be blocked or have inaccurate geolocation.",
+                    "proxied_hosts": sorted(proxied),
+                    "unproxied_hosts": sorted(unproxied),
+                },
+                hash_keys=[],
+            )
+        ]
+    return issues

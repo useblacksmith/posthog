@@ -1,0 +1,288 @@
+import { useActions, useMountedLogic, useValues } from 'kea'
+
+import {
+    LemonBanner,
+    LemonButton,
+    LemonInput,
+    LemonSelect,
+    LemonTable,
+    LemonTableColumn,
+    LemonTableColumns,
+    LemonTag,
+    Link,
+} from '@posthog/lemon-ui'
+
+import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { CopyToClipboardInline } from 'lib/components/CopyToClipboard'
+import { MemberSelect } from 'lib/components/MemberSelect'
+import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture'
+import { getProductAccessDisabledReason } from 'lib/utils/accessControlUtils'
+import { Scene } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { updatedAtColumn } from '~/lib/lemon-ui/LemonTable/columnUtils'
+import { AccessControlLevel, AccessControlResourceType, UserBasicType } from '~/types'
+
+import { ResourceTagFilter } from '../components/ResourceTagFilter'
+import { ResourceTags } from '../components/ResourceTags'
+import type {
+    ScoreDefinitionKindEnumApi as ScoreDefinitionKind,
+    ScoreDefinitionApi as ScoreDefinition,
+} from '../generated/api.schemas'
+import {
+    aiObservabilityScoreDefinitionsLogic,
+    SCORE_DEFINITIONS_PER_PAGE,
+} from './aiObservabilityScoreDefinitionsLogic'
+import { ScoreDefinitionActions } from './ScoreDefinitionActions'
+import { formatKindLabel } from './scoreDefinitionModalUtils'
+import { ScorersEmptyState } from './ScorersEmptyState'
+
+const KIND_OPTIONS: { label: string; value: ScoreDefinitionKind | '' }[] = [
+    { label: 'All kinds', value: '' },
+    { label: 'Categorical', value: 'categorical' },
+    { label: 'Numeric', value: 'numeric' },
+    { label: 'Boolean', value: 'boolean' },
+]
+
+const ARCHIVED_OPTIONS: { label: string; value: '' | 'false' | 'true' }[] = [
+    { label: 'Active only', value: 'false' },
+    { label: 'All scorers', value: '' },
+    { label: 'Archived only', value: 'true' },
+]
+
+export function AIObservabilityScoreDefinitions(): JSX.Element {
+    const logic = useMountedLogic(aiObservabilityScoreDefinitionsLogic())
+    const { setFilters, toggleArchive, loadScoreDefinitions } = useActions(logic)
+    const showHistory = !getProductAccessDisabledReason({ sceneKey: Scene.AIObservabilityOfflineScorerHistory })
+    const {
+        scoreDefinitions,
+        scoreDefinitionsLoading,
+        scoreDefinitionsLoaded,
+        scoreDefinitionsError,
+        showEmptyState,
+        sorting,
+        pagination,
+        filters,
+        scoreDefinitionCountLabel,
+        isArchivingDefinition,
+    } = useValues(logic)
+    if (showEmptyState) {
+        return <ScorersEmptyState />
+    }
+
+    const columns: LemonTableColumns<ScoreDefinition> = [
+        {
+            title: 'Name',
+            dataIndex: 'name',
+            key: 'name',
+            width: '18%',
+            render: function renderName(_, scoreDefinition) {
+                return (
+                    <div className="font-semibold max-w-64 @max-[50rem]/scorers:max-w-32 @max-[40rem]/scorers:max-w-24 truncate">
+                        <Link to={urls.aiObservabilityScorer(scoreDefinition.id)} data-attr="llma-scorer-open">
+                            {scoreDefinition.name}
+                        </Link>
+                    </div>
+                )
+            },
+        },
+        {
+            title: 'Kind',
+            dataIndex: 'kind',
+            key: 'kind',
+            className: '@max-[40rem]/scorers:hidden',
+            render: function renderKind(kind, scorer) {
+                return (
+                    <div className="flex flex-wrap gap-1">
+                        <LemonTag type="muted">{formatKindLabel(kind as ScoreDefinitionKind)}</LemonTag>
+                        {scorer.calculation === 'composite' && <LemonTag type="info">Composite</LemonTag>}
+                    </div>
+                )
+            },
+        },
+        {
+            title: 'Version',
+            dataIndex: 'current_version',
+            key: 'current_version',
+            className: '@max-[40rem]/scorers:hidden',
+            render: function renderVersion(version, scoreDefinition) {
+                return scoreDefinition.current_version_id ? (
+                    <CopyToClipboardInline
+                        description="scorer version ID"
+                        explicitValue={scoreDefinition.current_version_id}
+                        tooltipMessage="Copy exact version ID"
+                    >
+                        <span className="font-mono text-xs">v{String(version)}</span>
+                    </CopyToClipboardInline>
+                ) : (
+                    <span className="font-mono text-xs">v{String(version)}</span>
+                )
+            },
+        },
+        {
+            title: 'Status',
+            dataIndex: 'archived',
+            key: 'archived',
+            render: function renderArchived(archived) {
+                return archived ? (
+                    <LemonTag type="muted">Archived</LemonTag>
+                ) : (
+                    <LemonTag type="success">Active</LemonTag>
+                )
+            },
+        },
+        {
+            title: 'Tags',
+            key: 'tags',
+            width: '18%',
+            className: '@max-[40rem]/scorers:hidden',
+            render: (_, scoreDefinition) => (
+                <ResourceTags
+                    compact
+                    entity="scorers"
+                    resourceId={scoreDefinition.id}
+                    tags={scoreDefinition.tags}
+                    onSaved={() => loadScoreDefinitions(false)}
+                    onTagClick={(tag) => setFilters({ tags: [tag] }, true, false)}
+                />
+            ),
+        },
+        {
+            title: 'Created by',
+            key: 'created_by',
+            className:
+                '[&_.profile-package]:max-w-32 @max-[40rem]/scorers:[&_.profile-package]:max-w-24 [&_.profile-name]:truncate',
+            render: (_, scorer) =>
+                scorer.created_by ? (
+                    <ProfilePicture user={scorer.created_by as UserBasicType} size="md" showName />
+                ) : (
+                    <span className="text-muted">Unknown</span>
+                ),
+        },
+        {
+            title: <span className="whitespace-normal">Last updated by</span>,
+            key: 'updated_by',
+            className:
+                '[&_.profile-package]:max-w-32 @max-[40rem]/scorers:[&_.profile-package]:max-w-24 [&_.profile-name]:truncate',
+            render: (_, scorer) =>
+                scorer.updated_by ? (
+                    <ProfilePicture user={scorer.updated_by as UserBasicType} size="md" showName />
+                ) : (
+                    <span className="text-muted">Unknown</span>
+                ),
+        },
+        {
+            ...(updatedAtColumn<ScoreDefinition>() as LemonTableColumn<
+                ScoreDefinition,
+                keyof ScoreDefinition | undefined
+            >),
+            className: '@max-[50rem]/scorers:hidden',
+        },
+        {
+            width: 0,
+            render: function renderActions(_, scoreDefinition) {
+                return (
+                    <ScoreDefinitionActions
+                        definition={scoreDefinition}
+                        archiving={isArchivingDefinition(scoreDefinition.id)}
+                        showHistory={showHistory}
+                        toggleArchive={toggleArchive}
+                    />
+                )
+            },
+        },
+    ]
+
+    return (
+        <div className="space-y-4 @container/scorers">
+            <div className="flex gap-x-4 gap-y-2 items-center flex-wrap pb-4 mb-4 border-b justify-between">
+                <div className="flex items-center gap-2 flex-wrap">
+                    <LemonInput
+                        size="small"
+                        type="search"
+                        placeholder="Search scorers..."
+                        value={filters.search}
+                        onChange={(value) => setFilters({ search: value })}
+                        className="min-w-64"
+                        data-attr="llma-scorers-search-input"
+                    />
+                    <ResourceTagFilter
+                        size="small"
+                        filters={filters}
+                        onChange={(tags) => setFilters(tags, true, false)}
+                    />
+                    <div data-attr="llma-scorers-created-by-filter">
+                        <MemberSelect
+                            value={filters.created_by}
+                            size="small"
+                            defaultLabel="Any creator"
+                            onChange={(user) => setFilters({ created_by: user?.id ?? null }, true, false)}
+                        />
+                    </div>
+                    <LemonSelect<ScoreDefinitionKind | ''>
+                        size="small"
+                        value={filters.kind}
+                        onChange={(value) => setFilters({ kind: value || '' })}
+                        options={KIND_OPTIONS}
+                        data-attr="llma-scorers-kind-filter"
+                    />
+                    <LemonSelect<'' | 'false' | 'true'>
+                        size="small"
+                        value={filters.archived}
+                        onChange={(value) => setFilters({ archived: value === '' ? '' : value || 'false' })}
+                        options={ARCHIVED_OPTIONS}
+                        data-attr="llma-scorers-archived-filter"
+                    />
+                </div>
+
+                <div className="flex items-center gap-2">
+                    <div className="text-muted-alt">{scoreDefinitionCountLabel}</div>
+                    <AccessControlAction
+                        resourceType={AccessControlResourceType.LlmAnalytics}
+                        minAccessLevel={AccessControlLevel.Editor}
+                    >
+                        <LemonButton
+                            type="primary"
+                            size="small"
+                            to={urls.aiObservabilityScorer('new')}
+                            data-attr="llma-scorers-create-button"
+                        >
+                            New scorer
+                        </LemonButton>
+                    </AccessControlAction>
+                </div>
+            </div>
+
+            {scoreDefinitionsError && (
+                <LemonBanner
+                    type="error"
+                    action={{ children: 'Try again', onClick: () => loadScoreDefinitions(false) }}
+                >
+                    Could not load scorers. Try again.
+                </LemonBanner>
+            )}
+            {!scoreDefinitionsError && (
+                <LemonTable
+                    className="@max-[50rem]/scorers:[&_colgroup]:hidden"
+                    size="small"
+                    loading={scoreDefinitionsLoading || !scoreDefinitionsLoaded}
+                    columns={columns}
+                    dataSource={scoreDefinitions.results}
+                    pagination={pagination}
+                    noSortingCancellation
+                    sorting={sorting}
+                    onSort={(newSorting) =>
+                        setFilters({
+                            order_by: newSorting
+                                ? `${newSorting.order === -1 ? '-' : ''}${newSorting.columnKey}`
+                                : undefined,
+                        })
+                    }
+                    rowKey="id"
+                    loadingSkeletonRows={SCORE_DEFINITIONS_PER_PAGE}
+                    nouns={['scorer', 'scorers']}
+                />
+            )}
+        </div>
+    )
+}

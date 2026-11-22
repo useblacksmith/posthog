@@ -1,0 +1,992 @@
+import './FeatureFlag.scss'
+
+import { useActions, useValues } from 'kea'
+import { router } from 'kea-router'
+import { Suspense, lazy, useEffect, useMemo, useState } from 'react'
+
+import { IconArchive, IconCopy, IconGraph, IconPlusSmall, IconRewind, IconSend, IconTrash } from '@posthog/icons'
+import { LemonSkeleton } from '@posthog/lemon-ui'
+import { Badge, Button } from '@posthog/quill'
+
+import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { AccessDenied } from 'lib/components/AccessDenied'
+import { ActivityLog } from 'lib/components/ActivityLog/ActivityLog'
+import { NotFound } from 'lib/components/NotFound'
+import { SceneAddToNotebookDropdownMenu } from 'lib/components/Scenes/InsightOrDashboard/SceneAddToNotebookDropdownMenu'
+import { SceneFile } from 'lib/components/Scenes/SceneFile'
+import { SceneMenuBarAddToNotebook } from 'lib/components/Scenes/SceneMenuBarAddToNotebook'
+import { SceneMenuBarFileItems } from 'lib/components/Scenes/SceneMenuBarFileItems'
+import { SceneTags } from 'lib/components/Scenes/SceneTags'
+import { SceneTagsCombobox } from 'lib/components/Scenes/SceneTagsCombobox'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { useFileSystemLogView } from 'lib/hooks/useFileSystemLogView'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { LemonTab, LemonTabs } from 'lib/lemon-ui/LemonTabs'
+import { LemonTag } from 'lib/lemon-ui/LemonTag/LemonTag'
+import 'lib/lemon-ui/Lettermark'
+import { Link } from 'lib/lemon-ui/Link'
+import { featureFlagLogic as enabledFeaturesLogic } from 'lib/logic/featureFlagLogic'
+import { ButtonPrimitive, DisabledReasonsObject } from 'lib/ui/Button/ButtonPrimitives'
+import { getAccessControlDisabledReason, userHasAccess } from 'lib/utils/accessControlUtils'
+import { copyToClipboard } from 'lib/utils/copyToClipboard'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { addProductIntentForCrossSell } from 'lib/utils/product-intents'
+import { lazyWithRetry, retryImport } from 'lib/utils/retryImport'
+import { PendingChangeRequestBanner } from 'scenes/approvals/PendingChangeRequestBanner'
+import { ChunkLoadErrorBoundary } from 'scenes/ChunkLoadErrorBoundary'
+import { Dashboard } from 'scenes/dashboard/Dashboard'
+import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
+import { FeatureFlagPermissions } from 'scenes/FeatureFlagPermissions'
+import { NotebookNodeType } from 'scenes/notebooks/types'
+import { SceneContentFallback } from 'scenes/SceneContentFallback'
+import { SceneExport } from 'scenes/sceneTypes'
+import { SURVEY_CREATED_SOURCE } from 'scenes/surveys/constants'
+import { QuickSurveyType } from 'scenes/surveys/quick-create/types'
+import { QuickSurveyModal } from 'scenes/surveys/QuickSurveyModal'
+import { getSurveyForFeatureFlagVariant } from 'scenes/surveys/utils'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import {
+    SceneMenuBar,
+    SceneMenuBarItem,
+    SceneMenuBarMenu,
+    SceneMenuBarPopover,
+    SceneMenuBarSeparator,
+    SceneMenuBarSubMenu,
+} from '~/layout/scenes/components/SceneMenuBar'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import {
+    ScenePanel,
+    ScenePanelActionsSection,
+    ScenePanelDivider,
+    ScenePanelInfoSection,
+} from '~/layout/scenes/SceneLayout'
+import { defaultDataTableColumns } from '~/queries/nodes/DataTable/utils'
+import { Query } from '~/queries/Query/Query'
+import { NodeKind, ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+import {
+    AccessControlLevel,
+    AccessControlResourceType,
+    ActivityScope,
+    AnyPropertyFilter,
+    DashboardPlacement,
+    DashboardType,
+    EarlyAccessFeatureStage,
+    FeatureFlagType,
+    PropertyFilterType,
+    PropertyOperator,
+} from '~/types'
+
+import { deletedCohortDisabledReason, restoreChecksCohorts } from 'products/feature_flags/frontend/deletedCohortFilters'
+import {
+    ARCHIVE_UNAVAILABLE_DISABLED_REASON,
+    RESTORE_UNAVAILABLE_DISABLED_REASON,
+    canArchiveFeatureFlag,
+    canRestoreFeatureFlag,
+    featureFlagConfigFormatLabel,
+    isRulesV2EditableConfig,
+} from 'products/feature_flags/frontend/featureFlagConfigFormat'
+import { FeatureFlagDeletedBanner } from 'products/feature_flags/frontend/FeatureFlagDeletedBanner'
+import { FeatureFlagDeletedCohortBanner } from 'products/feature_flags/frontend/FeatureFlagDeletedCohortBanner'
+import { featureFlagBreakdownInsightUrl, keyBeforeDelete } from 'products/feature_flags/frontend/featureFlagKeyLinks'
+import { FeatureFlagStaleBanner } from 'products/feature_flags/frontend/FeatureFlagStaleBanner'
+import { FeatureFlagRestoreVersionButton } from 'products/feature_flags/frontend/restoreVersion/FeatureFlagRestoreVersionButton'
+import { AGENT_TOOL_APPLY_BACK_CONTEXT_ITEM, useAttachedContext } from 'products/posthog_ai/frontend/api/logics'
+
+import { featureFlagContextItems } from './featureFlagAiContext'
+import { openFeatureFlagArchiveDialog } from './featureFlagArchiveDialog'
+import { openFeatureFlagDeleteDialog } from './featureFlagDeleteDialog'
+import { FeatureFlagEvaluationContexts } from './FeatureFlagEvaluationContexts'
+import { ExperimentsTab } from './FeatureFlagExperimentsTab'
+import { FeedbackTab } from './FeatureFlagFeedbackTab'
+import { FeatureFlagLoadError } from './FeatureFlagLoadError'
+import {
+    FINDING_FLAG_PEOPLE_MESSAGE,
+    FeatureFlagLogicProps,
+    broadcastNoOneReason,
+    featureFlagLogic,
+} from './featureFlagLogic'
+import { FeatureFlagOverview } from './FeatureFlagOverview'
+import FeatureFlagProjects from './FeatureFlagProjects'
+import { FeatureFlagRulesV2Editor } from './FeatureFlagRulesV2Editor'
+import FeatureFlagSchedule from './FeatureFlagSchedule'
+import { FeatureFlagsTab, featureFlagsLogic } from './featureFlagsLogic'
+import { FeatureFlagTestingTab } from './FeatureFlagTestingTab'
+import { FeatureFlagUsageMetrics } from './FeatureFlagUsageMetrics'
+import { FLAG_EVALUATIONS_RETENTION_DAYS, readsFlagEvaluationsTable } from './flagEvaluationsTable'
+import { useFeatureFlagAgentRefresh } from './useFeatureFlagAgentRefresh'
+
+const RESOURCE_TYPE = 'feature_flag'
+const VIEW_ONLY_DISABLED_REASON =
+    "You have only 'View' access for this feature flag. To make changes, please contact the flag's creator."
+
+function firstDisabledReason(reasons: DisabledReasonsObject): string | undefined {
+    return Object.entries(reasons).find(([, active]) => active)?.[0]
+}
+
+// The edit/create form pulls in heavy deps (dnd-kit, JSON editors, sortable release conditions).
+// Lazy-mounting it lets the Edit click flip state and paint a loading skeleton before that render,
+// instead of the click blocking the main thread for seconds and reading as a dead click.
+const FeatureFlagForm = lazy(() =>
+    retryImport(() => import('./FeatureFlagForm').then((m) => ({ default: m.FeatureFlagForm })))
+)
+
+// Only teams with code analysis see the Code tab, so its code stays out of the flag page's chunk.
+const FeatureFlagCodeTab = lazyWithRetry(() =>
+    import('products/feature_flags/frontend/FeatureFlagCodeTab').then((m) => ({ default: m.FeatureFlagCodeTab }))
+)
+
+function FeatureFlagFormSkeleton(): JSX.Element {
+    return (
+        <div className="deprecated-space-y-2">
+            <LemonSkeleton active className="h-4 w-2/5" />
+            <LemonSkeleton active className="h-4 w-full" />
+            <LemonSkeleton active className="h-4 w-full" />
+            <LemonSkeleton active className="h-4 w-3/5" />
+        </div>
+    )
+}
+
+export const scene: SceneExport<FeatureFlagLogicProps> = {
+    component: FeatureFlag,
+    logic: featureFlagLogic,
+    paramsToProps: ({ params: { id } }) => ({
+        id: id && id !== 'new' ? parseInt(id) : 'new',
+    }),
+}
+
+export function FeatureFlag({ id }: FeatureFlagLogicProps): JSX.Element {
+    const {
+        props,
+        featureFlag,
+        featureFlagLoading,
+        featureFlagMissing,
+        featureFlagLoadFailed,
+        activeTab,
+        availableTabs,
+        accessDeniedToFeatureFlag,
+        earlyAccessFeaturesList,
+        featureFlagActiveUpdateLoading,
+        featureFlagRestoreLoading,
+        dependentFlags,
+        configFormat,
+        editorKind,
+        deletedCohortFilters,
+        broadcastCohortLoading,
+    } = useValues(featureFlagLogic)
+    const isV1Config = configFormat === 'v1'
+    const canRestore = canRestoreFeatureFlag(featureFlag.filters)
+    const restoreUnavailable = !!featureFlag.deleted && !canRestore
+    const deletedCohortReason = deletedCohortDisabledReason(deletedCohortFilters)
+    const restoreBlockedReason = restoreChecksCohorts(featureFlag) ? deletedCohortReason : undefined
+    const archiveDisabledReasons: DisabledReasonsObject = {
+        [VIEW_ONLY_DISABLED_REASON]: !featureFlag.can_edit,
+        [ARCHIVE_UNAVAILABLE_DISABLED_REASON]: !canArchiveFeatureFlag(featureFlag.filters),
+        ...(featureFlag.archived && deletedCohortReason ? { [deletedCohortReason]: true } : {}),
+        'Updating…': featureFlagActiveUpdateLoading,
+    }
+    const deleteDisabledReasons: DisabledReasonsObject = {
+        [VIEW_ONLY_DISABLED_REASON]: !featureFlag.can_edit,
+        [RESTORE_UNAVAILABLE_DISABLED_REASON]: restoreUnavailable,
+        ...(restoreBlockedReason ? { [restoreBlockedReason]: true } : {}),
+        'Restoring…': featureFlagRestoreLoading,
+    }
+    const { featureFlags } = useValues(enabledFeaturesLogic)
+    const {
+        deleteFeatureFlag,
+        restoreFeatureFlag,
+        editFeatureFlag,
+        createStaticCohort,
+        findOrCreateBroadcastCohort,
+        setSelectedTab,
+        saveDescriptionInline,
+        saveTagsInline,
+        saveSidebarTags,
+        updateFeatureFlagArchived,
+        refreshFeatureFlagAfterAgentChange,
+    } = useActions(featureFlagLogic)
+
+    const { currentTeamId } = useValues(teamLogic)
+    const { reportUserFeedbackButtonClicked } = useActions(eventUsageLogic)
+
+    const [isQuickSurveyModalOpen, setIsQuickSurveyModalOpen] = useState(false)
+    const [quickSurveyVariantKey, setQuickSurveyVariantKey] = useState<string | null>(null)
+
+    const handleGetFeedback = (variantKey?: string): void => {
+        const hasVariantSurvey = variantKey
+            ? !!getSurveyForFeatureFlagVariant(variantKey, featureFlag.surveys ?? [])
+            : featureFlag.surveys && featureFlag.surveys.length > 0
+
+        reportUserFeedbackButtonClicked(SURVEY_CREATED_SOURCE.FEATURE_FLAGS, {
+            existingSurvey: hasVariantSurvey,
+        })
+
+        void addProductIntentForCrossSell({
+            from: ProductKey.FEATURE_FLAGS,
+            to: ProductKey.SURVEYS,
+            intent_context: ProductIntentContext.QUICK_SURVEY_STARTED,
+        })
+
+        if (hasVariantSurvey) {
+            setSelectedTab(FeatureFlagsTab.FEEDBACK)
+        } else {
+            setIsQuickSurveyModalOpen(true)
+            setQuickSurveyVariantKey(variantKey ?? null)
+        }
+    }
+
+    const isNewFeatureFlag = id === 'new' || id === undefined
+    const canCreateFlagCohort = isV1Config && !!featureFlags[FEATURE_FLAGS.FEATURE_FLAG_COHORT_CREATION]
+    const broadcastDisabledReason =
+        getAccessControlDisabledReason(AccessControlResourceType.Workflow, AccessControlLevel.Editor) ??
+        (broadcastCohortLoading ? FINDING_FLAG_PEOPLE_MESSAGE : broadcastNoOneReason(featureFlag))
+
+    // Expose the flag's release conditions to PostHog AI so it can answer "who does this match?"
+    // and build an equivalent insight. The blast-radius endpoint only returns counts, so without
+    // this the agent on a flag page has no visibility into the targeting.
+    const featureFlagContext = useMemo(
+        () =>
+            isNewFeatureFlag || !featureFlag?.key
+                ? null
+                : // Without the apply-back instruction the agent narrates a change instead of making it.
+                  [...featureFlagContextItems(featureFlag), AGENT_TOOL_APPLY_BACK_CONTEXT_ITEM],
+        [isNewFeatureFlag, featureFlag]
+    )
+    useAttachedContext(featureFlagContext)
+
+    useFeatureFlagAgentRefresh({
+        flagId: isNewFeatureFlag ? null : (featureFlag?.id ?? null),
+        onAgentChange: refreshFeatureFlagAfterAgentChange,
+    })
+
+    // Mounting the edit form is a multi-second render (Monaco editors + dnd-kit sortables). Mount it
+    // immediately when the scene first renders already in form mode (deep-link/new flag), but when the
+    // user clicks Edit on the readonly view, defer one frame so the click flips state and the loading
+    // skeleton paints before that render — otherwise the click blocks the thread and reads as dead.
+    const shouldShowForm = editorKind === 'v1'
+    const [isFormMounted, setIsFormMounted] = useState(shouldShowForm)
+    useEffect(() => {
+        if (!shouldShowForm) {
+            setIsFormMounted(false)
+            return
+        }
+        if (isFormMounted) {
+            return
+        }
+        const raf = requestAnimationFrame(() => setIsFormMounted(true))
+        return () => cancelAnimationFrame(raf)
+    }, [shouldShowForm, isFormMounted])
+
+    useFileSystemLogView({
+        type: 'feature_flag',
+        ref: featureFlag?.id,
+        enabled: Boolean(
+            currentTeamId &&
+            !featureFlagMissing &&
+            !accessDeniedToFeatureFlag &&
+            props.id !== 'new' &&
+            props.id !== 'link' &&
+            featureFlag?.id
+        ),
+    })
+
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+
+    const editButton = (
+        <AccessControlAction
+            resourceType={AccessControlResourceType.FeatureFlag}
+            minAccessLevel={AccessControlLevel.Editor}
+            userAccessLevel={featureFlag.user_access_level}
+        >
+            {({ disabledReason }) =>
+                todayRailNav ? (
+                    <Button
+                        variant="outline"
+                        disabledReason={disabledReason}
+                        onClick={() => editFeatureFlag(true)}
+                        data-attr={isV1Config ? undefined : 'edit-rules-v2-flag'}
+                    >
+                        Edit
+                    </Button>
+                ) : (
+                    <LemonButton
+                        type="secondary"
+                        size="small"
+                        disabledReason={disabledReason}
+                        onClick={() => editFeatureFlag(true)}
+                        data-attr={isV1Config ? undefined : 'edit-rules-v2-flag'}
+                    >
+                        Edit
+                    </LemonButton>
+                )
+            }
+        </AccessControlAction>
+    )
+
+    if (featureFlagMissing) {
+        return <NotFound object="feature flag" />
+    }
+
+    // Before the form branch below: an edit session whose flag never loaded has nothing to edit.
+    if (featureFlagLoadFailed) {
+        return <FeatureFlagLoadError id={props.id} />
+    }
+
+    if (featureFlagLoading) {
+        return <FeatureFlagFormSkeleton />
+    }
+
+    if (editorKind === 'rules_v2') {
+        return <FeatureFlagRulesV2Editor id={props.id} />
+    }
+
+    // Use the form UI for creating new flags or editing existing flags.
+    // For viewing existing flags (readonly), use the tabbed UI below.
+    if (shouldShowForm) {
+        if (!isFormMounted) {
+            return <FeatureFlagFormSkeleton />
+        }
+        return (
+            <ChunkLoadErrorBoundary>
+                <Suspense
+                    fallback={
+                        <SceneContentFallback>
+                            <FeatureFlagFormSkeleton />
+                        </SceneContentFallback>
+                    }
+                >
+                    <FeatureFlagForm id={id} />
+                </Suspense>
+            </ChunkLoadErrorBoundary>
+        )
+    }
+
+    if (accessDeniedToFeatureFlag) {
+        return <AccessDenied object="feature flag" />
+    }
+
+    const earlyAccessFeature = earlyAccessFeaturesList?.find((f) => f.flagKey === featureFlag.key)
+
+    // Labels and content live here; which tabs exist is the logic's `availableTabs`, so the
+    // tab list, the active tab, and the URL can't disagree
+    const tabs = (
+        [
+            {
+                label: 'Overview',
+                key: FeatureFlagsTab.OVERVIEW,
+                content: <FeatureFlagOverview featureFlag={featureFlag} />,
+            },
+            {
+                label: 'Usage',
+                key: FeatureFlagsTab.USAGE,
+                content: <UsageTab featureFlag={featureFlag} />,
+            },
+            {
+                label: 'Projects',
+                key: FeatureFlagsTab.PROJECTS,
+                content: <FeatureFlagProjects />,
+            },
+            {
+                label: 'Schedule',
+                key: FeatureFlagsTab.SCHEDULE,
+                content: <FeatureFlagSchedule />,
+            },
+            {
+                label: 'History',
+                key: FeatureFlagsTab.HISTORY,
+                content: (
+                    <>
+                        {featureFlag.id && (
+                            <ActivityLog
+                                scope={ActivityScope.FEATURE_FLAG}
+                                id={featureFlag.id}
+                                renderRowActions={(logItem) => (
+                                    <FeatureFlagRestoreVersionButton
+                                        flagId={featureFlag.id as number}
+                                        logItem={logItem}
+                                    />
+                                )}
+                            />
+                        )}
+                    </>
+                ),
+            },
+            {
+                label: 'Permissions',
+                key: FeatureFlagsTab.PERMISSIONS,
+                content: <FeatureFlagPermissions featureFlag={featureFlag} />,
+            },
+            {
+                label: 'User feedback',
+                key: FeatureFlagsTab.FEEDBACK,
+                content: <FeedbackTab featureFlag={featureFlag} />,
+            },
+            {
+                label: (
+                    <div className="flex flex-row">
+                        <div>Experiments</div>
+                    </div>
+                ),
+                key: FeatureFlagsTab.EXPERIMENTS,
+                content: <ExperimentsTab featureFlag={featureFlag} />,
+            },
+            {
+                label: 'Testing',
+                key: FeatureFlagsTab.TESTING,
+                content: <FeatureFlagTestingTab featureFlag={featureFlag} />,
+            },
+            {
+                label: 'Code',
+                key: FeatureFlagsTab.CODE,
+                content: featureFlag.id ? (
+                    <ChunkLoadErrorBoundary>
+                        <Suspense fallback={<LemonSkeleton className="h-24" />}>
+                            <FeatureFlagCodeTab id={featureFlag.id} featureFlag={featureFlag} />
+                        </Suspense>
+                    </ChunkLoadErrorBoundary>
+                ) : null,
+            },
+        ] as LemonTab<FeatureFlagsTab>[]
+    ).filter((tab) => availableTabs.includes(tab.key))
+
+    return (
+        <>
+            <div className="feature-flag">
+                <ScenePanel>
+                    <ScenePanelInfoSection>
+                        {featureFlags[FEATURE_FLAGS.FLAG_EVALUATION_TAGS] ? (
+                            <FeatureFlagEvaluationContexts
+                                tags={featureFlag.tags}
+                                evaluationContexts={featureFlag.evaluation_contexts || []}
+                                onSave={saveSidebarTags}
+                                evaluationContextsDisabledReason={
+                                    isV1Config ? null : "Evaluation contexts can't be changed on this flag yet."
+                                }
+                                flagId={featureFlag.id}
+                                context="sidebar"
+                            />
+                        ) : (
+                            <SceneTags
+                                onSave={(tags) => saveSidebarTags(tags)}
+                                canEdit
+                                tags={featureFlag.tags}
+                                dataAttrKey={RESOURCE_TYPE}
+                            />
+                        )}
+
+                        <SceneFile dataAttrKey={RESOURCE_TYPE} />
+                    </ScenePanelInfoSection>
+                    <ScenePanelDivider />
+                    <ScenePanelActionsSection>
+                        {isV1Config && (
+                            <ButtonPrimitive
+                                onClick={() => {
+                                    router.actions.push(urls.featureFlagNew({ sourceId: featureFlag.id }))
+                                }}
+                                menuItem
+                                data-attr={`${RESOURCE_TYPE}-duplicate`}
+                            >
+                                <IconCopy />
+                                Duplicate
+                            </ButtonPrimitive>
+                        )}
+                        <ButtonPrimitive
+                            menuItem
+                            onClick={() => void copyToClipboard(keyBeforeDelete(featureFlag), 'feature flag key')}
+                            data-attr={`${RESOURCE_TYPE}-copy-key`}
+                        >
+                            <IconCopy />
+                            Copy key
+                        </ButtonPrimitive>
+                        {!featureFlag.deleted && (
+                            <ButtonPrimitive
+                                menuItem
+                                onClick={() => router.actions.push(featureFlagBreakdownInsightUrl(featureFlag.key))}
+                                data-attr={`${RESOURCE_TYPE}-try-in-insights`}
+                            >
+                                <IconGraph />
+                                Try out in Insights
+                            </ButtonPrimitive>
+                        )}
+                        <SceneAddToNotebookDropdownMenu dataAttrKey={RESOURCE_TYPE} />
+                        {canCreateFlagCohort && (
+                            <ButtonPrimitive
+                                menuItem
+                                data-attr={`${RESOURCE_TYPE}-create-cohort`}
+                                onClick={() => createStaticCohort()}
+                            >
+                                <IconPlusSmall />
+                                Create cohort
+                            </ButtonPrimitive>
+                        )}
+                        {canCreateFlagCohort && (
+                            <ButtonPrimitive
+                                menuItem
+                                data-attr={`${RESOURCE_TYPE}-message-audience-broadcast`}
+                                onClick={() => findOrCreateBroadcastCohort()}
+                                disabled={!!broadcastDisabledReason}
+                                tooltip={broadcastDisabledReason}
+                            >
+                                <IconSend />
+                                Send a broadcast
+                            </ButtonPrimitive>
+                        )}
+                        <ButtonPrimitive
+                            menuItem
+                            data-attr={`${RESOURCE_TYPE}-create-survey`}
+                            onClick={() => handleGetFeedback()}
+                        >
+                            <IconPlusSmall />
+                            Create survey
+                        </ButtonPrimitive>
+                    </ScenePanelActionsSection>
+                    <ScenePanelDivider />
+                    <ScenePanelActionsSection>
+                        {!featureFlag.deleted && (
+                            <AccessControlAction
+                                resourceType={AccessControlResourceType.FeatureFlag}
+                                minAccessLevel={AccessControlLevel.Editor}
+                            >
+                                {({ disabledReason }) => (
+                                    <ButtonPrimitive
+                                        menuItem
+                                        data-attr={
+                                            featureFlag.archived ? 'unarchive-feature-flag' : 'archive-feature-flag'
+                                        }
+                                        onClick={() => {
+                                            if (featureFlag.archived) {
+                                                updateFeatureFlagArchived({ archived: false })
+                                            } else {
+                                                openFeatureFlagArchiveDialog(featureFlag, () =>
+                                                    updateFeatureFlagArchived({ archived: true, via: 'archive-dialog' })
+                                                )
+                                            }
+                                        }}
+                                        // ButtonPrimitive ignores `disabled` when `disabledReasons` is set.
+                                        disabledReasons={{
+                                            ...(disabledReason ? { [disabledReason]: true } : {}),
+                                            ...archiveDisabledReasons,
+                                        }}
+                                    >
+                                        {featureFlag.archived ? <IconRewind /> : <IconArchive />}
+                                        {featureFlag.archived ? 'Unarchive' : 'Archive'} feature flag
+                                    </ButtonPrimitive>
+                                )}
+                            </AccessControlAction>
+                        )}
+                        {configFormat !== 'unsupported' && (
+                            <AccessControlAction
+                                resourceType={AccessControlResourceType.FeatureFlag}
+                                minAccessLevel={AccessControlLevel.Editor}
+                            >
+                                {({ disabledReason }) => (
+                                    <ButtonPrimitive
+                                        menuItem
+                                        variant="danger"
+                                        data-attr={featureFlag.deleted ? 'restore-feature-flag' : 'delete-feature-flag'}
+                                        onClick={() => {
+                                            if (featureFlag.deleted) {
+                                                restoreFeatureFlag(featureFlag)
+                                            } else {
+                                                openFeatureFlagDeleteDialog(
+                                                    featureFlag,
+                                                    () => deleteFeatureFlag(featureFlag),
+                                                    dependentFlags
+                                                )
+                                            }
+                                        }}
+                                        disabledReasons={{
+                                            ...(disabledReason ? { [disabledReason]: true } : {}),
+                                            ...deleteDisabledReasons,
+                                        }}
+                                    >
+                                        {featureFlag.deleted ? <IconRewind /> : <IconTrash />}
+                                        {featureFlag.deleted ? 'Restore' : 'Delete'} feature flag
+                                    </ButtonPrimitive>
+                                )}
+                            </AccessControlAction>
+                        )}
+                    </ScenePanelActionsSection>
+                </ScenePanel>
+                <SceneContent>
+                    {featureFlag.id && (
+                        <PendingChangeRequestBanner resourceType="feature_flag" resourceId={featureFlag.id} />
+                    )}
+
+                    <FeatureFlagDeletedBanner
+                        flag={featureFlag}
+                        onRestore={() => restoreFeatureFlag(featureFlag)}
+                        restoreLoading={featureFlagRestoreLoading}
+                    />
+                    {featureFlag.archived && (
+                        <LemonBanner
+                            type="warning"
+                            action={
+                                featureFlag.can_edit
+                                    ? {
+                                          children: 'Unarchive',
+                                          onClick: () => updateFeatureFlagArchived({ archived: false }),
+                                          disabledReason: featureFlagActiveUpdateLoading
+                                              ? 'Updating…'
+                                              : deletedCohortReason,
+                                      }
+                                    : undefined
+                            }
+                        >
+                            This feature flag is archived. It's hidden from the flag list and can't be enabled — linked
+                            experiments and surveys keep their data.
+                        </LemonBanner>
+                    )}
+                    {isV1Config && <FeatureFlagDeletedCohortBanner />}
+                    {isV1Config && <FeatureFlagStaleBanner />}
+                    {earlyAccessFeature && earlyAccessFeature.stage === EarlyAccessFeatureStage.Concept && (
+                        <LemonBanner type="info">
+                            This feature flag is assigned to an early access feature in the{' '}
+                            <LemonTag type="default" className="uppercase">
+                                Concept
+                            </LemonTag>{' '}
+                            stage. All users who register interest will be assigned this feature flag. Gate your code
+                            behind a different feature flag if you'd like to keep it hidden, and then switch your code
+                            to this feature flag when you're ready to release to your early access users.
+                        </LemonBanner>
+                    )}
+                    {featureFlags[FEATURE_FLAGS.SCENE_MENU_BAR] && (
+                        <SceneMenuBar>
+                            <SceneMenuBarMenu label="File" dataAttr={`${RESOURCE_TYPE}-menubar-file`}>
+                                <SceneMenuBarSubMenu label="Create">
+                                    {/* Adding to notebooks is deprecated under the rail redesign; gated here so an emptied menu can disable itself. */}
+                                    {featureFlag.id && !todayRailNav && (
+                                        <SceneMenuBarAddToNotebook
+                                            dataAttrKey={RESOURCE_TYPE}
+                                            notebookSelectButtonProps={{
+                                                resource: {
+                                                    type: NotebookNodeType.FeatureFlag,
+                                                    attrs: { id: featureFlag.id },
+                                                },
+                                            }}
+                                        />
+                                    )}
+                                    {canCreateFlagCohort && (
+                                        <SceneMenuBarItem
+                                            onClick={() => createStaticCohort()}
+                                            data-attr={`${RESOURCE_TYPE}-menubar-create-cohort`}
+                                        >
+                                            <IconPlusSmall />
+                                            Cohort
+                                        </SceneMenuBarItem>
+                                    )}
+                                    {canCreateFlagCohort && (
+                                        <SceneMenuBarItem
+                                            onClick={() => findOrCreateBroadcastCohort()}
+                                            disabled={!!broadcastDisabledReason}
+                                            tooltip={broadcastDisabledReason}
+                                            data-attr={`${RESOURCE_TYPE}-menubar-message-audience-broadcast`}
+                                        >
+                                            <IconSend />
+                                            Broadcast
+                                        </SceneMenuBarItem>
+                                    )}
+                                    <SceneMenuBarItem
+                                        opensFloatingUi
+                                        onClick={() => handleGetFeedback()}
+                                        data-attr={`${RESOURCE_TYPE}-menubar-create-survey`}
+                                    >
+                                        <IconPlusSmall />
+                                        Survey
+                                    </SceneMenuBarItem>
+                                </SceneMenuBarSubMenu>
+                                <SceneMenuBarSeparator />
+                                <SceneMenuBarFileItems dataAttrKey={RESOURCE_TYPE} />
+                                <SceneMenuBarItem
+                                    onClick={() =>
+                                        void copyToClipboard(keyBeforeDelete(featureFlag), 'feature flag key')
+                                    }
+                                    data-attr={`${RESOURCE_TYPE}-menubar-copy-key`}
+                                >
+                                    <IconCopy />
+                                    Copy key
+                                </SceneMenuBarItem>
+                                {(!featureFlag.deleted || configFormat !== 'unsupported') && <SceneMenuBarSeparator />}
+                                {!featureFlag.deleted && (
+                                    <AccessControlAction
+                                        resourceType={AccessControlResourceType.FeatureFlag}
+                                        minAccessLevel={AccessControlLevel.Editor}
+                                        userAccessLevel={featureFlag.user_access_level}
+                                    >
+                                        {({ disabledReason }) => {
+                                            const archiveDisabledReason =
+                                                disabledReason ?? firstDisabledReason(archiveDisabledReasons)
+                                            return (
+                                                <SceneMenuBarItem
+                                                    variant="destructive"
+                                                    disabled={!!archiveDisabledReason}
+                                                    tooltip={archiveDisabledReason}
+                                                    data-attr={
+                                                        featureFlag.archived
+                                                            ? `${RESOURCE_TYPE}-menubar-unarchive`
+                                                            : `${RESOURCE_TYPE}-menubar-archive`
+                                                    }
+                                                    onClick={() => {
+                                                        if (featureFlag.archived) {
+                                                            updateFeatureFlagArchived({ archived: false })
+                                                        } else {
+                                                            openFeatureFlagArchiveDialog(featureFlag, () =>
+                                                                updateFeatureFlagArchived({
+                                                                    archived: true,
+                                                                    via: 'archive-dialog',
+                                                                })
+                                                            )
+                                                        }
+                                                    }}
+                                                >
+                                                    {featureFlag.archived ? <IconRewind /> : <IconArchive />}
+                                                    {featureFlag.archived ? 'Unarchive' : 'Archive'} feature flag
+                                                </SceneMenuBarItem>
+                                            )
+                                        }}
+                                    </AccessControlAction>
+                                )}
+                                {configFormat !== 'unsupported' && (
+                                    <AccessControlAction
+                                        resourceType={AccessControlResourceType.FeatureFlag}
+                                        minAccessLevel={AccessControlLevel.Editor}
+                                        userAccessLevel={featureFlag.user_access_level}
+                                    >
+                                        {({ disabledReason }) => {
+                                            const deleteDisabledReason =
+                                                disabledReason ?? firstDisabledReason(deleteDisabledReasons)
+                                            return (
+                                                <SceneMenuBarItem
+                                                    variant="destructive"
+                                                    disabled={!!deleteDisabledReason}
+                                                    tooltip={deleteDisabledReason}
+                                                    data-attr={
+                                                        featureFlag.deleted
+                                                            ? `${RESOURCE_TYPE}-menubar-restore`
+                                                            : `${RESOURCE_TYPE}-menubar-delete`
+                                                    }
+                                                    onClick={() => {
+                                                        if (featureFlag.deleted) {
+                                                            restoreFeatureFlag(featureFlag)
+                                                        } else {
+                                                            openFeatureFlagDeleteDialog(
+                                                                featureFlag,
+                                                                () => deleteFeatureFlag(featureFlag),
+                                                                dependentFlags
+                                                            )
+                                                        }
+                                                    }}
+                                                >
+                                                    {featureFlag.deleted ? <IconRewind /> : <IconTrash />}
+                                                    {featureFlag.deleted ? 'Restore' : 'Delete'} feature flag
+                                                </SceneMenuBarItem>
+                                            )
+                                        }}
+                                    </AccessControlAction>
+                                )}
+                            </SceneMenuBarMenu>
+                            {isV1Config && (
+                                <SceneMenuBarMenu label="Edit" dataAttr={`${RESOURCE_TYPE}-menubar-edit`}>
+                                    <SceneMenuBarItem
+                                        onClick={() => {
+                                            router.actions.push(urls.featureFlagNew({ sourceId: featureFlag.id }))
+                                        }}
+                                        data-attr={`${RESOURCE_TYPE}-menubar-duplicate`}
+                                    >
+                                        <IconCopy />
+                                        Duplicate
+                                    </SceneMenuBarItem>
+                                </SceneMenuBarMenu>
+                            )}
+                            {!featureFlag.deleted && (
+                                <SceneMenuBarMenu label="View" dataAttr={`${RESOURCE_TYPE}-menubar-view`}>
+                                    <SceneMenuBarItem
+                                        onClick={() =>
+                                            router.actions.push(featureFlagBreakdownInsightUrl(featureFlag.key))
+                                        }
+                                        data-attr={`${RESOURCE_TYPE}-menubar-try-in-insights`}
+                                    >
+                                        <IconGraph />
+                                        Try out in Insights
+                                    </SceneMenuBarItem>
+                                </SceneMenuBarMenu>
+                            )}
+                            <SceneMenuBarPopover label="Metadata" dataAttr={`${RESOURCE_TYPE}-menubar-metadata`}>
+                                <SceneTagsCombobox
+                                    onSave={(updatedTags) => saveTagsInline(updatedTags)}
+                                    canEdit
+                                    tags={featureFlag.tags}
+                                    dataAttrKey={RESOURCE_TYPE}
+                                />
+                            </SceneMenuBarPopover>
+                        </SceneMenuBar>
+                    )}
+                    <SceneTitleSection
+                        name={featureFlag.key}
+                        description={featureFlag.name}
+                        resourceType={{
+                            type: featureFlag.active ? 'feature_flag' : 'feature_flag_off',
+                        }}
+                        canEdit={
+                            !featureFlag.deleted &&
+                            userHasAccess(
+                                AccessControlResourceType.FeatureFlag,
+                                AccessControlLevel.Editor,
+                                featureFlag.user_access_level
+                            )
+                        }
+                        saveOnBlur
+                        onDescriptionChange={(newName) => {
+                            saveDescriptionInline(newName)
+                        }}
+                        actions={
+                            isV1Config ? (
+                                editButton
+                            ) : (
+                                <div className="flex items-center gap-2">
+                                    {todayRailNav ? (
+                                        <Badge variant="info" data-attr="feature-flag-config-format">
+                                            {featureFlagConfigFormatLabel(featureFlag.filters)}
+                                        </Badge>
+                                    ) : (
+                                        <LemonTag type="highlight" data-attr="feature-flag-config-format">
+                                            {featureFlagConfigFormatLabel(featureFlag.filters)}
+                                        </LemonTag>
+                                    )}
+                                    {isRulesV2EditableConfig(featureFlag.filters, featureFlags) && editButton}
+                                </div>
+                            )
+                        }
+                    />
+                    <LemonTabs
+                        activeKey={activeTab}
+                        // Re-clicking the active tab must stay a no-op: the setSelectedTab listener
+                        // resets the schedule form, which would wipe in-progress edits
+                        onChange={(tab) => tab !== activeTab && setSelectedTab(tab)}
+                        tabs={tabs}
+                        sceneInset
+                    />
+                </SceneContent>
+            </div>
+            <QuickSurveyModal
+                context={{
+                    type: QuickSurveyType.FEATURE_FLAG,
+                    flag: featureFlag,
+                    initialVariantKey: quickSurveyVariantKey,
+                }}
+                info="This survey will display to all users in this feature flag, filtered by any conditions you specify below."
+                isOpen={isQuickSurveyModalOpen}
+                onCancel={() => {
+                    setIsQuickSurveyModalOpen(false)
+                    setQuickSurveyVariantKey(null)
+                }}
+            />
+        </>
+    )
+}
+
+function ConnectedUsageDashboard({
+    featureFlag,
+    dashboardId,
+}: {
+    featureFlag: FeatureFlagType
+    dashboardId: number
+}): JSX.Element | null {
+    const { dashboard, error404 } = useValues(
+        dashboardLogic({ id: dashboardId, placement: DashboardPlacement.FeatureFlag })
+    ) as {
+        dashboard: DashboardType | null
+        error404: boolean
+    }
+    // The dashboard FK survives a soft delete (SET_NULL only fires on a hard delete), so a
+    // deleted dashboard still looks linked here. Fall back to the same inline charts a
+    // dashboardless flag gets instead of an unrecoverable skeleton.
+    if (error404) {
+        return <FeatureFlagUsageMetrics id={featureFlag.id!} />
+    }
+
+    if (!dashboard) {
+        return <LemonSkeleton className="h-60" />
+    }
+
+    return (
+        <Dashboard
+            id={dashboardId.toString()}
+            placement={DashboardPlacement.FeatureFlag}
+            backTo={{ url: urls.featureFlag(featureFlag.id!), name: featureFlag.key }}
+        />
+    )
+}
+
+function UsageTab({ featureFlag }: { featureFlag: FeatureFlagType }): JSX.Element {
+    const {
+        key: featureFlagKey,
+        usage_dashboard: dashboardId,
+        has_enriched_analytics: hasEnrichedAnalytics,
+    } = featureFlag
+    const { enrichAnalyticsNoticeAcknowledged } = useValues(featureFlagsLogic)
+    const { closeEnrichAnalyticsNotice } = useActions(featureFlagsLogic)
+    const { currentTeam } = useValues(teamLogic)
+
+    const propertyFilter: AnyPropertyFilter[] = [
+        {
+            key: '$feature_flag',
+            type: PropertyFilterType.Event,
+            value: featureFlagKey,
+            operator: PropertyOperator.Exact,
+        },
+    ]
+
+    if (featureFlag.deleted) {
+        return (
+            <div data-attr="feature-flag-usage-deleted-banner">
+                <LemonBanner type="info">Usage data is not shown for a deleted feature flag.</LemonBanner>
+            </div>
+        )
+    }
+
+    return (
+        <div data-attr="feature-flag-usage-container">
+            {!hasEnrichedAnalytics && !enrichAnalyticsNoticeAcknowledged && (
+                <LemonBanner type="info" className="mb-3" onClose={() => closeEnrichAnalyticsNotice()}>
+                    Get richer insights automatically by{' '}
+                    <Link to="https://posthog.com/docs/libraries/js/features#enriched-flag-analytics" target="_blank">
+                        enabling enriched analytics for flags
+                    </Link>
+                </LemonBanner>
+            )}
+            {dashboardId ? (
+                <ConnectedUsageDashboard featureFlag={featureFlag} dashboardId={dashboardId} />
+            ) : featureFlag.id ? (
+                <FeatureFlagUsageMetrics id={featureFlag.id} />
+            ) : null}
+            <div className="mt-4 mb-4">
+                <b>Log</b>
+                <div className="text-secondary">{`Feature flag calls for "${featureFlagKey}" will appear here`}</div>
+                {readsFlagEvaluationsTable(currentTeam) && (
+                    <div className="text-secondary">
+                        The log can show calls from up to {FLAG_EVALUATIONS_RETENTION_DAYS} days ago.
+                    </div>
+                )}
+            </div>
+            <Query
+                query={{
+                    kind: NodeKind.DataTableNode,
+                    source: {
+                        kind: NodeKind.EventsQuery,
+                        select: [...defaultDataTableColumns(NodeKind.EventsQuery), 'properties.$feature_flag_response'],
+                        event: '$feature_flag_called',
+                        properties: propertyFilter,
+                        after: '-30d',
+                    },
+                    full: false,
+                    showDateRange: true,
+                }}
+            />
+        </div>
+    )
+}

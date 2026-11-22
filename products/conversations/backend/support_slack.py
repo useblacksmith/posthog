@@ -1,0 +1,210 @@
+from datetime import timedelta
+from typing import TYPE_CHECKING, cast
+
+from django.db import transaction
+
+from posthog.cache_utils import cache_for
+from posthog.credentials_service.callers import CredentialsCaller
+from posthog.credentials_service.instance_settings import get_many_or_instance_settings
+from posthog.models.activity_logging.activity_log import Change, Detail, log_activity
+from posthog.models.team.extensions import get_or_create_team_extension
+from posthog.models.utils import mask_key_value
+
+from products.conversations.backend.models import TeamConversationsSlackConfig
+from products.conversations.backend.models.constants import AUTOMATED_UPDATE_SLACK_CHANNEL_IDS
+
+if TYPE_CHECKING:
+    from posthog.models.team.team import Team
+    from posthog.models.user import User
+
+SUPPORT_SLACK_ALLOWED_HOST_SUFFIXES = ("slack.com", "slack-edge.com", "slack-files.com")
+
+# Attachment sync in both directions depends on these. Older installs were authorized without
+# them, so the settings page asks those teams to reconnect.
+SUPPORT_SLACK_FILE_READ_SCOPE = "files:read"
+SUPPORT_SLACK_FILE_WRITE_SCOPE = "files:write"
+SUPPORT_SLACK_FILE_SCOPES = frozenset({SUPPORT_SLACK_FILE_READ_SCOPE, SUPPORT_SLACK_FILE_WRITE_SCOPE})
+
+# Posting under a name and avatar other than the bot's own needs this.
+SUPPORT_SLACK_CUSTOM_IDENTITY_SCOPE = "chat:write.customize"
+
+
+def automated_update_channel_allowed(team: "Team", channel_id: str) -> bool:
+    project_team = team.parent_team or team
+    settings = project_team.conversations_settings
+    channel_ids = settings.get(AUTOMATED_UPDATE_SLACK_CHANNEL_IDS) if isinstance(settings, dict) else None
+    return isinstance(channel_ids, list) and channel_id in channel_ids
+
+
+# Every SupportHog delivery is verified with the signing secret, so the read is cached and not made
+# once per request. A rotation reaches each process within five minutes.
+@cache_for(timedelta(minutes=5))
+def get_support_slack_settings() -> dict[str, str]:
+    return get_many_or_instance_settings(
+        [
+            "SUPPORT_SLACK_SIGNING_SECRET",
+        ],
+        CredentialsCaller.CONVERSATIONS,
+    )
+
+
+def get_support_slack_signing_secret() -> str | None:
+    """The secret ingress verifies SupportHog deliveries with."""
+    secret = get_support_slack_settings().get("SUPPORT_SLACK_SIGNING_SECRET")
+    return str(secret) if secret else None
+
+
+def supporthog_missing_file_scopes(team: "Team") -> list[str]:
+    """File scopes this install hasn't granted, for logging why attachments failed.
+
+    Installs authorized before we recorded scopes report both as missing, which is what
+    they are: neither was requested at the time.
+    """
+    settings = team.conversations_settings
+    granted = settings.get("slack_scopes") if isinstance(settings, dict) else None
+    return sorted(SUPPORT_SLACK_FILE_SCOPES.difference(granted or []))
+
+
+def supporthog_lacks_custom_identity_scope(team: "Team") -> bool:
+    """Whether this install is *known* to be unable to post under a custom name and avatar.
+
+    False when scopes were never recorded: the scope has been requested for as long as we've
+    recorded them, so an unrecorded install most likely has it, and refusing on that guess
+    would block installs that work. Slack still rejects the post if it really is missing.
+    """
+    settings = team.conversations_settings
+    granted = settings.get("slack_scopes") if isinstance(settings, dict) else None
+    if not granted:
+        return False
+    return SUPPORT_SLACK_CUSTOM_IDENTITY_SCOPE not in granted
+
+
+def get_support_slack_bot_token(team: "Team") -> str:
+    config = get_or_create_team_extension(team, TeamConversationsSlackConfig)
+    return str(config.slack_bot_token or "")
+
+
+def get_support_slack_workspace_id(team: "Team") -> str | None:
+    config = get_or_create_team_extension(team, TeamConversationsSlackConfig)
+    return config.slack_team_id or None
+
+
+def team_for_slack_workspace(slack_team_id: str) -> "Team | None":
+    """Return the team that owns this Slack workspace, if SupportHog is connected."""
+    config = (
+        TeamConversationsSlackConfig.objects.filter(slack_team_id=slack_team_id, slack_bot_token__isnull=False)
+        .select_related("team")
+        .first()
+    )
+    return config.team if config else None
+
+
+def team_exists_for_slack_workspace(slack_team_id: str) -> bool:
+    """Whether any team has SupportHog connected to this Slack workspace."""
+    return TeamConversationsSlackConfig.objects.filter(
+        slack_team_id=slack_team_id, slack_bot_token__isnull=False
+    ).exists()
+
+
+def save_supporthog_slack_token(
+    *,
+    team: "Team",
+    user: "User",
+    is_impersonated_session: bool,
+    bot_token: str,
+    slack_team_id: str,
+    granted_scopes: list[str] | None = None,
+) -> None:
+    config = get_or_create_team_extension(team, TeamConversationsSlackConfig)
+    old_token = config.slack_bot_token
+    old_slack_team_id = config.slack_team_id
+
+    settings = team.conversations_settings or {}
+    settings["slack_enabled"] = True
+    if granted_scopes is not None:
+        # Left untouched when the caller doesn't know them, so we never replace a real
+        # install's scopes with an empty list and prompt a pointless reconnect.
+        settings["slack_scopes"] = sorted(set(granted_scopes))
+    team.conversations_settings = settings
+
+    with transaction.atomic():
+        config.slack_bot_token = bot_token
+        config.slack_team_id = slack_team_id
+        config.save(update_fields=["slack_bot_token", "slack_team_id"])
+        team.save(update_fields=["conversations_settings"])
+
+    log_activity(
+        organization_id=team.organization_id,
+        team_id=team.pk,
+        user=cast("User", user),
+        was_impersonated=is_impersonated_session,
+        scope="Team",
+        item_id=team.pk,
+        activity="updated",
+        detail=Detail(
+            name=str(team.name),
+            changes=[
+                Change(
+                    type="Team",
+                    action="created" if old_token is None else "changed",
+                    field="support_slack_bot_token",
+                    before=mask_key_value(old_token) if old_token else None,
+                    after=mask_key_value(bot_token),
+                ),
+                Change(
+                    type="Team",
+                    action="created" if old_slack_team_id is None else "changed",
+                    field="slack_team_id",
+                    before=old_slack_team_id,
+                    after=slack_team_id,
+                ),
+            ],
+        ),
+    )
+
+
+def clear_supporthog_slack_token(
+    *,
+    team: "Team",
+    user: "User",
+    is_impersonated_session: bool,
+) -> None:
+    config = get_or_create_team_extension(team, TeamConversationsSlackConfig)
+    old_token = config.slack_bot_token
+    if old_token is None:
+        return
+
+    settings = team.conversations_settings or {}
+    settings["slack_enabled"] = False
+    settings.pop("slack_bot_display_name", None)
+    settings.pop("slack_bot_icon_url", None)
+    settings.pop("slack_scopes", None)
+    team.conversations_settings = settings
+
+    with transaction.atomic():
+        config.slack_bot_token = None
+        config.slack_team_id = None
+        config.save(update_fields=["slack_bot_token", "slack_team_id"])
+        team.save(update_fields=["conversations_settings"])
+
+    log_activity(
+        organization_id=team.organization_id,
+        team_id=team.pk,
+        user=cast("User", user),
+        was_impersonated=is_impersonated_session,
+        scope="Team",
+        item_id=team.pk,
+        activity="updated",
+        detail=Detail(
+            name=str(team.name),
+            changes=[
+                Change(
+                    type="Team",
+                    action="deleted",
+                    field="support_slack_bot_token",
+                    before=mask_key_value(old_token),
+                    after=None,
+                ),
+            ],
+        ),
+    )

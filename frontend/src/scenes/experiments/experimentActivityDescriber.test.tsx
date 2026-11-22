@@ -1,0 +1,663 @@
+import { render } from '@testing-library/react'
+
+import { ActivityLogItem, HumanizedChange } from 'lib/components/ActivityLog/humanizeActivity'
+
+import { ActivityScope } from '~/types'
+
+import { experimentActivityDescriber } from './experimentActivityDescriber'
+
+const textOf = (result: HumanizedChange): string => {
+    const { container } = render(<>{result.description}</>)
+    return container.textContent ?? ''
+}
+
+const baseLogItem = (overrides: Partial<ActivityLogItem>): ActivityLogItem => ({
+    activity: 'updated',
+    created_at: '2026-05-21T00:00:00Z',
+    scope: 'Experiment',
+    item_id: '42',
+    user: { first_name: 'Alice', last_name: 'Adams', email: 'alice@example.com' },
+    detail: { name: 'Checkout funnel', changes: null, merge: null, trigger: null },
+    ...overrides,
+})
+
+describe('experimentActivityDescriber', () => {
+    describe('saved_metric_config rows', () => {
+        it.each([
+            {
+                name: 'created: "added shared metric X to experiment"',
+                activity: 'created',
+                expected: ['Alice Adams', 'added shared metric', 'Conversion rate', 'experiment'],
+                notExpected: ['created a new', 'deleted'],
+            },
+            {
+                name: 'updated: "updated configuration for shared metric X on experiment"',
+                activity: 'updated',
+                expected: ['Alice Adams', 'updated configuration for shared metric', 'Conversion rate', 'experiment'],
+                notExpected: ['created a new', 'deleted'],
+            },
+            {
+                name: 'deleted: "removed shared metric X from experiment"',
+                activity: 'deleted',
+                expected: ['Alice Adams', 'removed shared metric', 'Conversion rate', 'experiment'],
+                notExpected: ['deleted experiment:', 'created a new'],
+            },
+        ])('$name', ({ activity, expected, notExpected }) => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity,
+                    detail: {
+                        name: 'Conversion rate',
+                        type: 'saved_metric_config',
+                        changes: [],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            const text = textOf(result)
+            for (const fragment of expected) {
+                expect(text).toContain(fragment)
+            }
+            for (const fragment of notExpected) {
+                expect(text).not.toContain(fragment)
+            }
+        })
+    })
+
+    describe('exposure freeze rows', () => {
+        it.each([
+            { activity: 'exposure_frozen', expectedFragment: 'froze exposure for', notExpected: 'unfroze' },
+            { activity: 'exposure_unfrozen', expectedFragment: 'unfroze exposure for', notExpected: 'unknown action' },
+            { activity: 'paused', expectedFragment: 'paused experiment:', notExpected: 'unknown action' },
+            { activity: 'resumed', expectedFragment: 'resumed experiment:', notExpected: 'unknown action' },
+        ])('$activity: "$expectedFragment experiment name"', ({ activity, expectedFragment, notExpected }) => {
+            const result = experimentActivityDescriber(baseLogItem({ activity }))
+            const text = textOf(result)
+            expect(text).toContain('Alice Adams')
+            expect(text).toContain(expectedFragment)
+            expect(text).toContain('Checkout funnel')
+            expect(text).not.toContain(notExpected)
+        })
+    })
+
+    describe('metric reorder rows on the experiment scope', () => {
+        it.each([
+            {
+                name: 'primary reorder',
+                field: 'primary_metrics_ordered_uuids',
+                expectedFragment: 'reordered the primary metrics',
+            },
+            {
+                name: 'secondary reorder',
+                field: 'secondary_metrics_ordered_uuids',
+                expectedFragment: 'reordered the secondary metrics',
+            },
+        ])('$name: "$expectedFragment for Checkout funnel"', ({ field, expectedFragment }) => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field,
+                                before: ['uuid-a', 'uuid-b'],
+                                after: ['uuid-b', 'uuid-a'],
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            const text = textOf(result)
+            expect(text).toContain('Alice Adams')
+            expect(text).toContain(expectedFragment)
+            expect(text).toContain('Checkout funnel')
+            // The reorder must not bleed into the saved_metric_config copy
+            expect(text).not.toContain('shared metric')
+        })
+
+        it.each([
+            {
+                name: 'the same order',
+                before: ['uuid-a', 'uuid-b'],
+                after: ['uuid-a', 'uuid-b'],
+                described: false,
+            },
+            {
+                name: 'a metric removed without moving the rest',
+                before: ['uuid-a', 'uuid-b', 'uuid-c'],
+                after: ['uuid-a', 'uuid-b'],
+                described: false,
+            },
+            {
+                name: 'a metric added without moving the rest',
+                before: ['uuid-a', 'uuid-b'],
+                after: ['uuid-a', 'uuid-b', 'uuid-c'],
+                described: false,
+            },
+            {
+                name: 'a reorder whose before value still lists a removed metric',
+                before: ['uuid-a', 'uuid-b', 'uuid-c'],
+                after: ['uuid-b', 'uuid-a'],
+                described: true,
+            },
+            {
+                name: 'a metric the array never listed dragged ahead of a listed one',
+                before: ['uuid-a'],
+                after: ['uuid-b', 'uuid-a'],
+                described: true,
+            },
+            {
+                name: 'repeated entries dropped without moving anything',
+                before: ['uuid-a', 'uuid-a', 'uuid-b'],
+                after: ['uuid-a', 'uuid-b'],
+                described: false,
+            },
+        ])('$name: reorder described=$described', ({ before, after, described }) => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'primary_metrics_ordered_uuids',
+                                before,
+                                after,
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(textOf(result).includes('reordered')).toBe(described)
+        })
+    })
+
+    describe('excluded_variants describer', () => {
+        it.each([
+            {
+                name: 'single variant added to exclusion list',
+                before: { excluded_variants: [] },
+                after: { excluded_variants: ['test-2'] },
+                expected: 'excluded variant test-2 from analysis',
+            },
+            {
+                name: 'single variant removed from exclusion list',
+                before: { excluded_variants: ['test-2'] },
+                after: { excluded_variants: [] },
+                expected: 're-included variant test-2 in analysis',
+            },
+            {
+                name: 'multiple variants added to exclusion list',
+                before: { excluded_variants: [] },
+                after: { excluded_variants: ['test-2', 'test-3'] },
+                expected: 'excluded variants test-2, test-3 from analysis',
+            },
+            {
+                name: 'multiple variants removed from exclusion list',
+                before: { excluded_variants: ['test-2', 'test-3'] },
+                after: { excluded_variants: [] },
+                expected: 're-included variants test-2, test-3 in analysis',
+            },
+            {
+                name: 'simultaneous add and remove',
+                before: { excluded_variants: ['test-2'] },
+                after: { excluded_variants: ['test-3'] },
+                expected: 'excluded variant test-3 from analysis and re-included variant test-2 in analysis',
+            },
+            {
+                name: 'falls back to updated parameters for other parameter changes',
+                before: { excluded_variants: ['test-2'], rollout_percentage: 50 },
+                after: { excluded_variants: ['test-2'], rollout_percentage: 75 },
+                expected: 'updated parameters',
+            },
+            {
+                name: 'handles null before payload (fresh record case)',
+                before: null,
+                after: { excluded_variants: ['test-2'] },
+                expected: 'excluded variant test-2 from analysis',
+            },
+        ])('$name', ({ before, after, expected }) => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'parameters',
+                                before,
+                                after,
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(textOf(result)).toContain(expected)
+        })
+    })
+
+    describe('test account filter rows', () => {
+        it.each([
+            {
+                name: 'a write that stores the default adds no line',
+                before: null,
+                after: { filterTestAccounts: true },
+                expected: null,
+            },
+            {
+                name: 'turning off a filter that had no stored value',
+                before: {},
+                after: { filterTestAccounts: false },
+                expected: 'removed the test account filter',
+            },
+            {
+                name: 'a write that drops an explicit false turns the filter back on',
+                before: { filterTestAccounts: false },
+                after: {},
+                expected: 'added the test account filter',
+            },
+        ])('$name', ({ before, after, expected }) => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'exposure_criteria',
+                                before,
+                                after,
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            const text = textOf(result)
+            const described =
+                ['added the test account filter', 'removed the test account filter'].find((line) =>
+                    text.includes(line)
+                ) ?? null
+            expect(described).toBe(expected)
+        })
+    })
+
+    describe('running_time_calculation rows', () => {
+        it('describes a running_time_calculation change', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'running_time_calculation',
+                                before: { minimum_detectable_effect: 20 },
+                                after: { minimum_detectable_effect: 30 },
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(textOf(result)).toContain('updated the running time calculation')
+        })
+
+        it('omits the parameters entry when only calculator keys changed', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'parameters',
+                                before: { excluded_variants: ['test-2'], minimum_detectable_effect: 20 },
+                                after: { excluded_variants: ['test-2'], minimum_detectable_effect: 30 },
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(textOf(result)).not.toContain('updated parameters')
+        })
+
+        it.each([
+            {
+                name: 'recomputed outputs drifted',
+                action: 'changed' as const,
+                before: { recommended_sample_size: 5442, recommended_running_time: 10 },
+                after: { recommended_sample_size: 21781, recommended_running_time: 127 },
+            },
+            {
+                name: 'first save only stored recomputed outputs',
+                action: 'created' as const,
+                before: null,
+                after: { recommended_sample_size: 7307, recommended_running_time: 13 },
+            },
+        ])('drops the row when no calculator input was edited: $name', ({ action, before, after }) => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action,
+                                field: 'running_time_calculation',
+                                before,
+                                after,
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(result.description).toBeNull()
+        })
+
+        it('keeps the row when output drift accompanies a real change', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'created',
+                                field: 'start_date',
+                                before: null,
+                                after: '2026-06-18T14:25:34Z',
+                            },
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'running_time_calculation',
+                                before: { recommended_sample_size: 5442 },
+                                after: { recommended_sample_size: 21781 },
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            const text = textOf(result)
+            expect(text).toContain('launched experiment')
+            expect(text).not.toContain('running time calculation')
+        })
+    })
+
+    describe('lifecycle entries', () => {
+        it('describes a stop entry without narrating status or the conclusion comment', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'created',
+                                field: 'end_date',
+                                before: null,
+                                after: '2026-06-18T14:25:34Z',
+                            },
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'status',
+                                before: 'running',
+                                after: 'complete',
+                            },
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'created',
+                                field: 'conclusion',
+                                before: null,
+                                after: 'won',
+                            },
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'created',
+                                field: 'conclusion_comment',
+                                before: null,
+                                after: 'Variant B lifted signups.',
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            const text = textOf(result)
+            expect(text).toContain('stopped experiment')
+            expect(text).toContain('completed it as')
+            const summaryText = render(<>{result.summary?.action}</>).container.textContent || ''
+            expect(summaryText).toContain('stopped experiment')
+            expect(summaryText).toContain('completed it as')
+            expect(summaryText).not.toMatch(/ (for|to|from|on)$/)
+            expect(render(<>{result.summary?.target}</>).container.querySelector('a')).not.toBeNull()
+            expect(text).not.toContain('status')
+            expect(text).not.toContain('conclusion comment')
+            const extended = render(<>{result.extendedDescription}</>).container.textContent
+            expect(extended).toContain('Variant B lifted signups.')
+        })
+
+        it('drops the status clause from a launch entry', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'created',
+                                field: 'start_date',
+                                before: null,
+                                after: '2026-06-18T14:25:34Z',
+                            },
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'status',
+                                before: 'draft',
+                                after: 'running',
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            const text = textOf(result)
+            expect(text).toContain('launched experiment')
+            expect(text).not.toContain('status')
+            expect(text).not.toContain(': on')
+        })
+
+        it('describes a reset entry without narrating the cleared fields', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'reset',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'deleted',
+                                field: 'start_date',
+                                before: '2026-06-18T14:25:34Z',
+                                after: null,
+                            },
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'deleted',
+                                field: 'end_date',
+                                before: '2026-07-18T14:25:34Z',
+                                after: null,
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            const text = textOf(result)
+            expect(text).toContain('reset experiment')
+            expect(text).not.toContain('start date')
+            expect(text).not.toContain('end date')
+        })
+
+        it('keeps a row for a standalone end date removal', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'deleted',
+                                field: 'end_date',
+                                before: '2026-07-18T14:25:34Z',
+                                after: null,
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(textOf(result)).toContain('removed the end date')
+        })
+
+        it.each([
+            [true, 'archived experiment'],
+            [false, 'unarchived experiment'],
+        ])('describes an archived change to %s', (after, expected) => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'archived',
+                                before: !after,
+                                after,
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(textOf(result)).toContain(expected)
+        })
+
+        it('names the shipped variant', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'variant_shipped',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'created',
+                                field: 'shipped_variant',
+                                before: null,
+                                after: 'test-b',
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            const text = textOf(result)
+            expect(text).toContain('shipped variant')
+            expect(text).toContain('test-b')
+        })
+
+        it('keeps a row for a comment-only conclusion edit', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'conclusion_comment',
+                                before: 'Variant B lifted signups.',
+                                after: 'Variant B lifted signups by 4%.',
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(textOf(result)).toContain('changed the conclusion')
+            const extended = render(<>{result.extendedDescription}</>).container.textContent
+            expect(extended).toContain('Variant B lifted signups by 4%.')
+        })
+
+        it('keeps a row for a comment-only conclusion removal', () => {
+            const result = experimentActivityDescriber(
+                baseLogItem({
+                    activity: 'updated',
+                    detail: {
+                        name: 'Checkout funnel',
+                        changes: [
+                            {
+                                type: ActivityScope.EXPERIMENT,
+                                action: 'changed',
+                                field: 'conclusion_comment',
+                                before: 'Variant B lifted signups.',
+                                after: null,
+                            },
+                        ],
+                        merge: null,
+                        trigger: null,
+                    },
+                })
+            )
+            expect(textOf(result)).toContain('removed the conclusion comment')
+            expect(result.extendedDescription).toBeUndefined()
+        })
+    })
+})

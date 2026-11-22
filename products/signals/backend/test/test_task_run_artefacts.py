@@ -1,0 +1,775 @@
+import json
+from datetime import UTC, datetime
+
+from posthog.test.base import BaseTest
+
+from django.db import transaction
+
+from parameterized import parameterized
+
+from posthog.models.user import User
+
+from products.signals.backend.billing import first_billable_pr_run_at
+from products.signals.backend.custom_agent.persistence import create_custom_agent_ready_report
+from products.signals.backend.custom_agent.schemas import CustomAgentFinalReport
+from products.signals.backend.models import (
+    ArtefactAttribution,
+    SignalActorKind,
+    SignalReport,
+    SignalReportArtefact,
+    SignalReportAssignment,
+    SignalReportPullRequest,
+    SignalReportTask,
+)
+from products.signals.backend.report_assignments import (
+    create_claim,
+    release_claim,
+    sync_task_pull_request_to_assignments,
+)
+from products.signals.backend.report_claims import get_active_claim
+from products.signals.backend.report_generation.research import (
+    ActionabilityAssessment,
+    ActionabilityChoice,
+    Priority,
+    PriorityAssessment,
+)
+from products.signals.backend.task_run_artefacts import (
+    SIGNALS_PRODUCT,
+    TASK_RUN_TYPE_IMPLEMENTATION,
+    TASK_RUN_TYPE_REPO_SELECTION,
+    TASK_RUN_TYPE_RESEARCH,
+    ReportTaskCapExceeded,
+    aappend_task_run_artefact,
+    append_task_run_artefact,
+    enforce_report_implementation_rerun_cap,
+    enforce_report_task_cap,
+    implementation_in_flight_report_ids,
+    record_implementation_task,
+    release_quota_cancelled_implementation,
+    signals_task_ids,
+)
+from products.tasks.backend.facade.repo_selection_types import RepoSelectionResult
+
+# Task/TaskRun ORM models needed to build cross-product fixtures; the tasks facade exposes DTOs only.
+from products.tasks.backend.models import Task, TaskRun
+
+
+class TestTaskRunArtefacts(BaseTest):
+    def _report(self) -> SignalReport:
+        return SignalReport.objects.create(
+            team=self.team,
+            status=SignalReport.Status.READY,
+            title="t",
+            summary="s",
+            signal_count=1,
+            total_weight=1.0,
+        )
+
+    def _task(self, created_by: User | None = None) -> Task:
+        return Task.objects.create(
+            team=self.team,
+            title="task",
+            description="desc",
+            origin_product=Task.OriginProduct.SIGNAL_REPORT,
+            created_by=created_by,
+        )
+
+    def _task_run_artefacts(self, report: SignalReport) -> list[SignalReportArtefact]:
+        return list(SignalReportArtefact.objects.filter(report=report, type=SignalReportArtefact.ArtefactType.TASK_RUN))
+
+    @parameterized.expand(
+        [
+            (TASK_RUN_TYPE_RESEARCH,),
+            (TASK_RUN_TYPE_IMPLEMENTATION,),
+            (TASK_RUN_TYPE_REPO_SELECTION,),
+        ]
+    )
+    def test_append_records_signals_product_and_type(self, task_type):
+        report = self._report()
+        task = self._task()
+
+        artefact = append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product=SIGNALS_PRODUCT,
+            type=task_type,
+            task_id=str(task.id),
+        )
+
+        content = json.loads(artefact.content)
+        assert artefact.type == SignalReportArtefact.ArtefactType.TASK_RUN
+        assert content["task_id"] == str(task.id)
+        assert content["product"] == "signals"
+        assert content["type"] == task_type
+        assert content["run_id"] is None
+
+    def test_append_attributes_artefact_to_the_task(self):
+        report = self._report()
+        task = self._task()
+
+        artefact = append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_RESEARCH,
+            task_id=str(task.id),
+        )
+
+        assert str(artefact.task_id) == str(task.id)
+        assert artefact.actor_kind == SignalActorKind.TASK
+        assert artefact.created_by_id is None
+
+    async def test_aappend_carries_run_id(self):
+        report = await SignalReport.objects.acreate(
+            team=self.team,
+            status=SignalReport.Status.READY,
+            title="t",
+            summary="s",
+            signal_count=1,
+            total_weight=1.0,
+        )
+        task = await Task.objects.acreate(
+            team=self.team,
+            title="task",
+            description="desc",
+            origin_product=Task.OriginProduct.SIGNAL_REPORT,
+        )
+
+        artefact = await aappend_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_IMPLEMENTATION,
+            task_id=str(task.id),
+            run_id="run-789",
+        )
+
+        content = json.loads(artefact.content)
+        assert content["task_id"] == str(task.id)
+        assert content["run_id"] == "run-789"
+        assert content["product"] == "signals"
+        assert content["type"] == "implementation"
+        assert str(artefact.task_id) == str(task.id)
+        assert artefact.actor_kind == SignalActorKind.TASK
+
+    def test_signals_task_ids_filters_by_product_and_type(self):
+        report = self._report()
+        task = self._task()
+        append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_RESEARCH,
+            task_id=str(task.id),
+        )
+        other_task = self._task()
+        append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product="billing",
+            type=TASK_RUN_TYPE_IMPLEMENTATION,
+            task_id=str(other_task.id),
+        )
+
+        assert signals_task_ids(report_id=str(report.id), type=TASK_RUN_TYPE_RESEARCH) == [str(task.id)]
+        # The custom product's "implementation" row doesn't count as a signals implementation.
+        assert signals_task_ids(report_id=str(report.id), type=TASK_RUN_TYPE_IMPLEMENTATION) == []
+
+    @parameterized.expand(
+        [
+            ("manual_start_claims_for_the_creator", True, None, SignalActorKind.USER),
+            ("manual_start_without_creator_keeps_a_task_claim", False, None, SignalActorKind.TASK),
+            ("auto_start_keeps_a_task_claim", True, "posthog/self-driving-fix", SignalActorKind.TASK),
+        ]
+    )
+    def test_record_implementation_task_writes_gate_row_and_artefact(
+        self, _name, has_creator, automation_branch, expected_kind
+    ):
+        report = self._report()
+        task = self._task(created_by=self.user if has_creator else None)
+        record_implementation_task(
+            team_id=self.team.id, report_id=str(report.id), task_id=str(task.id), automation_branch=automation_branch
+        )
+
+        # Both the legacy SignalReportTask gate row and the task_run work-log artefact are written.
+        assert SignalReportTask.objects.filter(
+            report=report, task=task, relationship=TASK_RUN_TYPE_IMPLEMENTATION
+        ).exists()
+        assert signals_task_ids(report_id=str(report.id), type=TASK_RUN_TYPE_IMPLEMENTATION) == [str(task.id)]
+        assignment = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert assignment is not None
+        assert assignment.actor_kind == expected_kind
+        if expected_kind == SignalActorKind.USER:
+            assert assignment.actor_user_id == self.user.id
+            assert assignment.actor_task_id is None
+        else:
+            assert assignment.actor_task_id == task.id
+        task_run = SignalReportArtefact.objects.get(report=report, type="task_run", task_id=task.id)
+        assert task_run.claim_id == assignment.claim_id
+
+        # Idempotent on the gate row for the same task — re-recording doesn't duplicate the link.
+        record_implementation_task(
+            team_id=self.team.id, report_id=str(report.id), task_id=str(task.id), automation_branch=automation_branch
+        )
+        assert SignalReportTask.objects.filter(report=report, task=task).count() == 1
+
+        # A rerun after the run released its claim claims the report again for the same actor.
+        release_claim(assignment, ArtefactAttribution.system())
+        with transaction.atomic():
+            enforce_report_implementation_rerun_cap(
+                team_id=self.team.id, report_id=str(report.id), task_id=str(task.id)
+            )
+        rerun_claim = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert rerun_claim is not None
+        assert rerun_claim.claim_id != assignment.claim_id
+        assert rerun_claim.actor_kind == expected_kind
+
+    def test_rerun_keeps_the_task_claim_of_a_manual_task(self):
+        report = self._report()
+        task = self._task(created_by=self.user)
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+        user_claim = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert user_claim is not None
+        release_claim(user_claim, ArtefactAttribution.system())
+        task_claim = create_claim(report, ArtefactAttribution.from_task(str(task.id)))
+
+        with transaction.atomic():
+            enforce_report_implementation_rerun_cap(
+                team_id=self.team.id, report_id=str(report.id), task_id=str(task.id)
+            )
+
+        assignment = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert assignment is not None
+        assert assignment.claim_id == task_claim.claim_id
+
+    @parameterized.expand(
+        [
+            ("settled_run_is_replaced", TaskRun.Status.FAILED, False),
+            ("running_run_blocks", TaskRun.Status.IN_PROGRESS, True),
+        ]
+    )
+    def test_rerun_over_another_tasks_claim(self, _name, holder_run_status, blocked):
+        report = self._report()
+        holder = self._task()
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(holder.id))
+        TaskRun.objects.create(team=self.team, task=holder, status=holder_run_status)
+        holder_claim = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert holder_claim is not None
+        rerun = self._task(created_by=self.user)
+        SignalReportTask.objects.create(
+            team=self.team, report=report, task=rerun, relationship=TASK_RUN_TYPE_IMPLEMENTATION
+        )
+
+        if blocked:
+            with transaction.atomic(), self.assertRaises(ReportTaskCapExceeded):
+                enforce_report_implementation_rerun_cap(
+                    team_id=self.team.id, report_id=str(report.id), task_id=str(rerun.id)
+                )
+        else:
+            with transaction.atomic():
+                enforce_report_implementation_rerun_cap(
+                    team_id=self.team.id, report_id=str(report.id), task_id=str(rerun.id)
+                )
+
+        assignment = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert assignment is not None
+        assert (assignment.claim_id == holder_claim.claim_id) is blocked
+
+    @parameterized.expand(
+        [
+            ("running", TaskRun.Status.IN_PROGRESS, None, True),
+            ("settled", TaskRun.Status.FAILED, None, False),
+            ("shipped", TaskRun.Status.COMPLETED, "https://github.com/posthog/posthog/pull/1", False),
+        ]
+    )
+    def test_implementation_in_flight_report_ids(self, _name, run_status, pr_url, expected):
+        report = self._report()
+        idle_report = self._report()
+        task = self._task()
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+        TaskRun.objects.create(
+            team=self.team, task=task, status=run_status, output={"pr_url": pr_url} if pr_url else None
+        )
+
+        in_flight = implementation_in_flight_report_ids(
+            team_id=self.team.id, report_ids=[str(report.id), str(idle_report.id)]
+        )
+
+        assert in_flight == ({str(report.id)} if expected else set())
+
+    @parameterized.expand(
+        [
+            ("direct_claim", SignalActorKind.USER),
+            ("agent_claim", SignalActorKind.AGENT),
+        ]
+    )
+    def test_claimer_starts_implementation_under_their_own_claim(self, _name, claim_kind):
+        report = self._report()
+        claimer = self._create_user("claimer@example.com")
+        if claim_kind == SignalActorKind.AGENT:
+            create_claim(report, ArtefactAttribution.from_agent(claimer.id, "codex"))
+        else:
+            create_claim(report, ArtefactAttribution.from_user(claimer.id))
+
+        with transaction.atomic():
+            enforce_report_task_cap(
+                team_id=self.team.id,
+                report_id=str(report.id),
+                relationship=TASK_RUN_TYPE_IMPLEMENTATION,
+                created_by_id=claimer.id,
+            )
+            task = Task.objects.create(
+                team=self.team,
+                title="task",
+                description="desc",
+                origin_product=Task.OriginProduct.SIGNAL_REPORT,
+                created_by=claimer,
+            )
+            record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+            enforce_report_implementation_rerun_cap(
+                team_id=self.team.id, report_id=str(report.id), task_id=str(task.id)
+            )
+
+        assignment = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert assignment is not None
+        assert assignment.actor_kind == claim_kind
+        assert assignment.actor_user_id == claimer.id
+        task_run = SignalReportArtefact.objects.get(report=report, type="task_run", task_id=task.id)
+        assert task_run.claim_id == assignment.claim_id
+
+    def test_person_claim_blocks_implementation_started_by_someone_else(self):
+        report = self._report()
+        claimer = self._create_user("claimer@example.com")
+        other = self._create_user("other@example.com")
+        create_claim(report, ArtefactAttribution.from_user(claimer.id))
+
+        with transaction.atomic(), self.assertRaises(ReportTaskCapExceeded):
+            enforce_report_task_cap(
+                team_id=self.team.id,
+                report_id=str(report.id),
+                relationship=TASK_RUN_TYPE_IMPLEMENTATION,
+                created_by_id=other.id,
+            )
+
+        assignment = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert assignment is not None
+        assert assignment.actor_user_id == claimer.id
+
+    def test_rerun_pr_links_to_the_claim_the_rerun_took(self):
+        report = self._report()
+        task = self._task(created_by=self.user)
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+        first_claim = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert first_claim is not None
+        release_claim(first_claim, ArtefactAttribution.system())
+        with transaction.atomic():
+            enforce_report_implementation_rerun_cap(
+                team_id=self.team.id, report_id=str(report.id), task_id=str(task.id)
+            )
+        rerun_claim = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert rerun_claim is not None
+
+        TaskRun.objects.create(
+            team=self.team,
+            task=task,
+            status=TaskRun.Status.COMPLETED,
+            output={"pr_url": "https://github.com/PostHog/posthog/pull/44", "pr_state": "open"},
+        )
+
+        pr_artefact = SignalReportArtefact.objects.get(report=report, type="pull_request")
+        assert pr_artefact.claim_id == rerun_claim.claim_id
+
+    @parameterized.expand([(False, False), (True, False), (False, True)])
+    def test_task_run_pr_is_linked_to_the_claim(self, attach_after_merge, has_creator):
+        report = self._report()
+        task = self._task(created_by=self.user if has_creator else None)
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+
+        if attach_after_merge:
+            TaskRun.objects.create(
+                team=self.team,
+                task=task,
+                status=TaskRun.Status.COMPLETED,
+                output={
+                    "pr_url": "https://github.com/PostHog/posthog/pull/42",
+                    "pr_state": "merged",
+                    "pr_merged": True,
+                },
+            )
+            report.refresh_from_db()
+            assert report.status == SignalReport.Status.RESOLVED
+
+        TaskRun.objects.create(
+            team=self.team,
+            task=task,
+            status=TaskRun.Status.COMPLETED,
+            output={
+                "pr_url": "https://github.com/PostHog/posthog/pull/42",
+                "pr_state": "merged",
+                "pr_merged": True,
+                "pr_urls": ["https://github.com/PostHog/posthog/pull/42", "https://github.com/example/app/pull/43"],
+            },
+        )
+
+        assignment = get_active_claim(team_id=self.team.id, report_id=report.id)
+        assert assignment is not None
+        pr = SignalReportPullRequest.objects.for_team(self.team.id).get(repository="posthog/posthog", number=42)
+        assert pr.url == "https://github.com/PostHog/posthog/pull/42"
+        assert pr.repository == "posthog/posthog"
+        assert pr.number == 42
+        assert pr.state == SignalReportAssignment.PrState.MERGED
+        report.refresh_from_db()
+        assert report.status == SignalReport.Status.READY
+        assert SignalReportPullRequest.objects.for_team(self.team.id).count() == 2
+        assert (
+            SignalReportArtefact.objects.filter(
+                report=report, type="pull_request", claim_id=assignment.claim_id
+            ).count()
+            == 2
+        )
+
+    def test_task_pr_sync_preserves_shared_merged_state(self):
+        merged_report = self._report()
+        new_report = self._report()
+        task = self._task()
+        for report in (merged_report, new_report):
+            record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+
+        pr_url = "https://github.com/PostHog/posthog/pull/42"
+        SignalReportAssignment.all_teams.create(
+            team=self.team,
+            report=merged_report,
+            pr_url=pr_url,
+            repository="posthog/posthog",
+            pr_number=42,
+            pr_state=SignalReportAssignment.PrState.MERGED,
+            pr_merged=True,
+        )
+
+        sync_task_pull_request_to_assignments(
+            team_id=self.team.id,
+            task_id=str(task.id),
+            pr_url=pr_url,
+        )
+
+        pr = SignalReportPullRequest.objects.for_team(self.team.id).get(repository="posthog/posthog", number=42)
+        assert pr.state == "merged"
+        assert SignalReportArtefact.objects.filter(pull_request=pr).values("report_id").distinct().count() == 2
+
+    def test_record_implementation_task_declared_billing_exemption_marks_report(self):
+        # A caller that knows its origin is PostHog-system freezes the exemption in the same
+        # transaction that records the task — dropping this plumbing would silently bill it.
+        report = self._report()
+        task = self._task()
+        record_implementation_task(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            task_id=str(task.id),
+            billing_exempt_reason=SignalReport.BillingExemptReason.POSTHOG_ONBOARDING,
+        )
+        report.refresh_from_db()
+        assert report.billing_exempt_reason == SignalReport.BillingExemptReason.POSTHOG_ONBOARDING
+
+    def _final_report(self) -> CustomAgentFinalReport:
+        return CustomAgentFinalReport(
+            title="title",
+            description="description",
+            actionability=ActionabilityAssessment(
+                explanation="e",
+                actionability=ActionabilityChoice.IMMEDIATELY_ACTIONABLE,
+                already_addressed=False,
+            ),
+            assignees=[],
+            priority=PriorityAssessment(explanation="e", priority=Priority.P1),
+        )
+
+    def test_custom_agent_report_with_task_uses_agent_identifier(self):
+        task = self._task()
+
+        persisted = create_custom_agent_ready_report(
+            team_id=self.team.id,
+            final_report=self._final_report(),
+            repo_selection=RepoSelectionResult(repository="acme/repo", reason="r"),
+            task_id=str(task.id),
+            agent_identifier=("billing", "anomaly_scan"),
+        )
+
+        report = SignalReport.objects.get(id=persisted.report_id)
+        artefacts = self._task_run_artefacts(report)
+        assert len(artefacts) == 1
+        content = json.loads(artefacts[0].content)
+        assert content["task_id"] == str(task.id)
+        assert content["product"] == "billing"
+        assert content["type"] == "anomaly_scan"
+        # Everything the custom agent produced is attributed to its task.
+        for artefact in SignalReportArtefact.objects.filter(report=report):
+            assert str(artefact.task_id) == str(task.id)
+
+    def test_custom_agent_report_without_task_appends_nothing(self):
+        persisted = create_custom_agent_ready_report(
+            team_id=self.team.id,
+            final_report=self._final_report(),
+            repo_selection=RepoSelectionResult(repository="acme/repo", reason="r"),
+            task_id=None,
+            agent_identifier=("billing", "anomaly_scan"),
+        )
+
+        report = SignalReport.objects.get(id=persisted.report_id)
+        assert self._task_run_artefacts(report) == []
+        # No task in scope — system attribution (both columns null).
+        for artefact in SignalReportArtefact.objects.filter(report=report):
+            assert artefact.task_id is None
+            assert artefact.created_by_id is None
+
+    def test_custom_agent_report_is_stamped_first_visible_at_creation(self):
+        # Born READY without passing through transition_to, so creation must stamp first_visible_at
+        # or the daily report limit would never count custom-agent reports.
+        persisted = create_custom_agent_ready_report(
+            team_id=self.team.id,
+            final_report=self._final_report(),
+            repo_selection=RepoSelectionResult(repository="acme/repo", reason="r"),
+            task_id=None,
+            agent_identifier=("billing", "anomaly_scan"),
+        )
+
+        report = SignalReport.objects.get(id=persisted.report_id)
+        assert report.first_visible_at is not None
+
+
+class TestAssociatedTaskRunsFilter(BaseTest):
+    """`SignalReport.associated_task_runs_filter` matches a TaskRun whose task is associated with
+    the report via either source (task_run artefact or legacy SignalReportTask)."""
+
+    def _report(self) -> SignalReport:
+        return SignalReport.objects.create(
+            team=self.team, status=SignalReport.Status.READY, title="t", summary="s", signal_count=1, total_weight=1.0
+        )
+
+    def _task_with_run(self) -> tuple[Task, TaskRun]:
+        task = Task.objects.create(
+            team=self.team, title="task", description="desc", origin_product=Task.OriginProduct.SIGNAL_REPORT
+        )
+        return task, TaskRun.objects.create(team=self.team, task=task, status=TaskRun.Status.COMPLETED)
+
+    def _matched_task_ids(self, report: SignalReport) -> set[str]:
+        return {
+            str(task_id)
+            for task_id in TaskRun.objects.filter(SignalReport.associated_task_runs_filter(report.id)).values_list(
+                "task_id", flat=True
+            )
+        }
+
+    def test_matches_task_associated_via_artefact_only(self):
+        report = self._report()
+        task, _run = self._task_with_run()
+        append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_IMPLEMENTATION,
+            task_id=str(task.id),
+        )
+        assert not SignalReportTask.objects.filter(report=report).exists()
+        assert self._matched_task_ids(report) == {str(task.id)}
+
+    def test_matches_task_associated_via_signal_report_task_only(self):
+        report = self._report()
+        task, _run = self._task_with_run()
+        SignalReportTask.objects.create(
+            team=self.team, report=report, task=task, relationship=TASK_RUN_TYPE_IMPLEMENTATION
+        )
+        assert not SignalReportArtefact.objects.filter(report=report).exists()
+        assert self._matched_task_ids(report) == {str(task.id)}
+
+    def test_matches_task_associated_via_current_assignment(self):
+        report = self._report()
+        task, _run = self._task_with_run()
+        SignalReportAssignment.all_teams.create(
+            team=self.team,
+            report=report,
+            actor_kind=SignalActorKind.TASK,
+            actor_task_id=task.id,
+        )
+
+        assert self._matched_task_ids(report) == {str(task.id)}
+
+    def test_unions_both_sources_without_duplicate_rows(self):
+        report = self._report()
+        task, _run = self._task_with_run()
+        # Dual-writes both the gate row and the artefact for the same task.
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+        # OR of two task_id__in subqueries must not double-count the run.
+        assert TaskRun.objects.filter(SignalReport.associated_task_runs_filter(report.id)).count() == 1
+        assert self._matched_task_ids(report) == {str(task.id)}
+
+    def test_excludes_tasks_associated_with_a_different_report(self):
+        report = self._report()
+        other_report = self._report()
+        other_task, _run = self._task_with_run()
+        append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(other_report.id),
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_IMPLEMENTATION,
+            task_id=str(other_task.id),
+        )
+        assert self._matched_task_ids(report) == set()
+        assert self._matched_task_ids(other_report) == {str(other_task.id)}
+
+
+class TestReportsForTaskFilter(BaseTest):
+    """`SignalReport.reports_for_task_filter` matches the reports a task is associated with via
+    either source (task_run artefact or legacy SignalReportTask)."""
+
+    def _report(self) -> SignalReport:
+        return SignalReport.objects.create(
+            team=self.team, status=SignalReport.Status.READY, title="t", summary="s", signal_count=1, total_weight=1.0
+        )
+
+    def _task(self) -> Task:
+        return Task.objects.create(
+            team=self.team, title="task", description="desc", origin_product=Task.OriginProduct.SIGNAL_REPORT
+        )
+
+    def _matched_report_ids(self, task: Task) -> set[str]:
+        return {
+            str(report_id)
+            for report_id in SignalReport.objects.filter(SignalReport.reports_for_task_filter(task.id)).values_list(
+                "id", flat=True
+            )
+        }
+
+    def test_matches_report_associated_via_artefact_only(self):
+        report = self._report()
+        task = self._task()
+        append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_IMPLEMENTATION,
+            task_id=str(task.id),
+        )
+        assert not SignalReportTask.objects.filter(task=task).exists()
+        assert self._matched_report_ids(task) == {str(report.id)}
+
+    def test_matches_report_associated_via_signal_report_task_only(self):
+        report = self._report()
+        task = self._task()
+        SignalReportTask.objects.create(
+            team=self.team, report=report, task=task, relationship=TASK_RUN_TYPE_IMPLEMENTATION
+        )
+        assert not SignalReportArtefact.objects.filter(task=task).exists()
+        assert self._matched_report_ids(task) == {str(report.id)}
+
+    def test_matches_report_associated_via_current_assignment(self):
+        report = self._report()
+        task = self._task()
+        SignalReportAssignment.all_teams.create(
+            team=self.team,
+            report=report,
+            actor_kind=SignalActorKind.TASK,
+            actor_task_id=task.id,
+        )
+
+        assert self._matched_report_ids(task) == {str(report.id)}
+
+    def test_unions_both_sources_without_duplicate_rows(self):
+        report = self._report()
+        task = self._task()
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+        assert SignalReport.objects.filter(SignalReport.reports_for_task_filter(task.id)).count() == 1
+        assert self._matched_report_ids(task) == {str(report.id)}
+
+    def test_excludes_reports_not_associated_with_the_task(self):
+        report = self._report()
+        task = self._task()
+        other_task = self._task()
+        append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_IMPLEMENTATION,
+            task_id=str(task.id),
+        )
+        assert self._matched_report_ids(other_task) == set()
+        assert self._matched_report_ids(task) == {str(report.id)}
+
+
+class TestReleaseQuotaCancelledImplementation(BaseTest):
+    def _report(self) -> SignalReport:
+        return SignalReport.objects.create(
+            team=self.team,
+            status=SignalReport.Status.READY,
+            title="t",
+            summary="s",
+            signal_count=1,
+            total_weight=1.0,
+        )
+
+    def _task(self) -> Task:
+        return Task.objects.create(
+            team=self.team,
+            title="task",
+            description="desc",
+            origin_product=Task.OriginProduct.SIGNAL_REPORT,
+        )
+
+    def test_release_removes_gate_records_and_leaves_only_the_report(self):
+        # The auto-start gate reads both the SignalReportTask row and the implementation artefact;
+        # leaving either behind after a quota cancel would permanently block re-implementation.
+        report = self._report()
+        task = self._task()
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+        # A research artefact from another task must survive the release untouched.
+        research_task = self._task()
+        append_task_run_artefact(
+            team_id=self.team.id,
+            report_id=str(report.id),
+            product=SIGNALS_PRODUCT,
+            type=TASK_RUN_TYPE_RESEARCH,
+            task_id=str(research_task.id),
+        )
+
+        released = release_quota_cancelled_implementation(team_id=self.team.id, task_id=str(task.id))
+
+        assert released == [str(report.id)]
+        assert not SignalReportTask.objects.filter(task_id=task.id).exists()
+        assert not SignalReport.associated_task_runs(
+            report_id=str(report.id), team_id=self.team.id, product=SIGNALS_PRODUCT, type=TASK_RUN_TYPE_IMPLEMENTATION
+        )
+        assert SignalReport.associated_task_runs(
+            report_id=str(report.id), team_id=self.team.id, product=SIGNALS_PRODUCT, type=TASK_RUN_TYPE_RESEARCH
+        )
+        note = SignalReportArtefact.objects.get(report=report, type=SignalReportArtefact.ArtefactType.NOTE)
+        assert "pull request limit" in json.loads(note.content)["note"]
+
+    def test_release_without_implementation_link_is_a_noop(self):
+        task = self._task()
+        assert release_quota_cancelled_implementation(team_id=self.team.id, task_id=str(task.id)) == []
+
+    @parameterized.expand([("legacy", None), ("manual", "posthog_ai")])
+    def test_release_skips_report_whose_billable_pr_shipped_from_a_sibling_run(self, _name, billing_product):
+        # The cancel decision is run-scoped but this delete is task-scoped: a sibling run of the
+        # same task can have shipped the report's billable PR in an earlier period. The bridge row
+        # is billing's evidence for that charge (billed-earlier dedup, refund eligibility), so the
+        # release must leave the report untouched instead of re-opening it for a second billing.
+        report = self._report()
+        task = self._task()
+        record_implementation_task(team_id=self.team.id, report_id=str(report.id), task_id=str(task.id))
+        TaskRun.objects.create(
+            team=self.team,
+            task=task,
+            output={"pr_url": "https://github.com/x/y/pull/1"},
+            state={"billing_product": billing_product} if billing_product else {},
+            created_at=datetime(2026, 6, 10, tzinfo=UTC),
+        )
+
+        released = release_quota_cancelled_implementation(team_id=self.team.id, task_id=str(task.id))
+        assert (first_billable_pr_run_at(report.id, team_id=report.team_id) is not None) == (billing_product is None)
+
+        assert released == []
+        assert SignalReportTask.objects.filter(task_id=task.id, relationship=TASK_RUN_TYPE_IMPLEMENTATION).exists()
+        # Auto-start must still see a started implementation — the report is implemented, not stuck.
+        assert SignalReport.associated_task_runs(
+            report_id=str(report.id), team_id=self.team.id, product=SIGNALS_PRODUCT, type=TASK_RUN_TYPE_IMPLEMENTATION
+        )

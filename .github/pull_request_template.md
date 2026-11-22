@@ -1,0 +1,124 @@
+<!-- This has to stand on its own: a reader who opens no files should still know why the PR is necessary and what it does. Aim for 150 words or fewer, table cells included. Diagrams, code blocks and <details> blocks do not count. A section you have nothing for gets one bullet: "- None." -->
+
+## Problem
+
+<!-- Who are we building for, what are their needs, why is this important? -->
+<!-- First line: who is affected and what is wrong for them today. A fix says what breaks; a feature names the goal and what stands in the way; a chore says who is blocked. It must stay true under a different solution. Take the need from the request or an issue, and say so when none gives one. The code path goes under Changes. -->
+
+<!-- Does this fix an issue? Uncomment the line below with the issue ID to automatically close it when merged -->
+<!-- Closes #ISSUE_ID -->
+
+## Changes
+
+<!-- For each change a person can notice, say what they will now see or do differently, not only the code path that does it. Mark the rest as mechanical so a reviewer knows nothing user-visible is hiding in it. -->
+
+<!-- If there are frontend changes, please include screenshots. For a new interaction that one screenshot cannot show, a short GIF or animated WebP of the flow can replace the after screenshot. -->
+<!-- For frontend or user-facing changes under products/mobile/, follow products/mobile/AGENTS.md for the required iOS and Android screenshot pairs and device coverage. -->
+<!-- PostHog employees: `hogli pr:upload-image <file>` attaches a screenshot to this description once the PR exists, or prints markdown to paste here. Never upload customer data, secrets, or internal info. -->
+
+<!-- If a reference design was involved, include a link to the relevant Figma frame! -->
+
+## How did you test this code?
+
+<!-- Describe steps to reproduce and verify the changes, and what the expected behavior is. -->
+<!-- Include automated tests if possible, otherwise describe the manual testing routine. -->
+<!-- Agents: do NOT claim manual testing you haven't done. State what the agent wasn't able to do and list only the automated tests you (the agent) actually ran. -->
+<!-- For each group of added or changed tests, name the distinct regression, the closest existing test checked, and why this test level is needed. If no new test is needed, name the existing coverage or explain why a test would not help. Do not add tests solely to raise patch coverage. https://posthog.com/handbook/engineering/conventions/backend-coding#testing -->
+
+**Test rationale:** [Name the regression and closest existing test, or explain why no new test is needed.]
+
+<!-- Don't recite pass counts for suites CI runs; the checks report those with more authority. Link the evidence instead (run, permalink, error tracking issue), and say what you did not check. Long transcripts go in a <details> block. -->
+
+👉 _Stay up-to-date with [PostHog coding conventions](https://posthog.com/docs/contribute/coding-conventions) for a smoother review._
+
+## Release status
+
+<!-- Keep exactly one line and delete the other two. Agents must inspect the changed code for feature flag checks before choosing. -->
+<!-- Plain bullets, not checkboxes: GitHub counts every checkbox in the body as an open task. The changelog bot reads the hidden markers. -->
+
+- No feature flag controls this change <!-- release-status: no-feature-flag -->
+- This change is behind a feature flag and is not available to users <!-- release-status: behind-feature-flag -->
+- This change makes a previously flagged feature available to everyone <!-- release-status: fully-available -->
+
+## Docs update
+
+<!-- Add the `skip-inkeep-docs` label if this PR should not trigger an automatic docs update from the Inkeep agent. -->
+
+## 🤖 Agent context
+
+<!-- Fill this section if an agent co-authored or authored this PR. Remove it for fully human-authored PRs. -->
+
+<!-- Autonomy — keep one of the two options on the line below:
+     - "Human-driven (agent-assisted)" when a person directed the work — assign that person as the PR assignee (the DRI).
+     - "Fully autonomous" when no human drove it; leave the PR unassigned for the owning team to triage. -->
+
+**Autonomy:** Human-driven (agent-assisted) - or - Fully autonomous
+
+<!-- Name the tool and the exact model, e.g. "Claude Code, Opus 5". List each model if more than one wrote code. -->
+
+**Agent:** tool, model
+
+<!-- List every repo-provided or public skill invoked (e.g. /django-migrations, /improving-drf-endpoints), so reviewers can see where an agent shaped the code. Write "None" when no skill ran. -->
+
+**Skills:** `/skill`
+
+<!-- What the person who directed the work checked themselves: the diff or the files they read, the behavior they ran, the design they decided. Record only what that person stated in the session, and update the line when they check more.
+     - Do not infer it. Approving a plan, answering a question, or saying "looks good" to a summary is not a check of the code. Checks the agent ran go under "How did you test this code?", never here.
+     - Write "Not yet checked by the driver" when the person has stated nothing. That is a complete answer, and it tells the reviewer no person has read the diff yet.
+     - Write "No human driver" when Autonomy is "Fully autonomous".
+     - A person editing this body by hand fills the line with what they checked. -->
+
+**Driver checked:** [what the driver read, ran or decided, or "Not yet checked by the driver"]
+
+<!-- Check every PR against "Requesting a security review" in .agents/security.md. Write "needed" if the PR matches the list and "not needed" if it does not. When the PR is ready for review, a check adds the `security-review` label to a PR marked "needed". -->
+
+**Security review:** [needed or not needed]
+
+<!-- Definition of done (agents): not done until each gate below holds. Verify against the named artifact or skill — don't assume. Add gates as the PR touches more areas.
+     - No duplicate: when this PR fixes something believed to be live on master, no open PR already fixes it. A broken master attracts parallel agents, so search before opening — `gh pr list --state open --search "<keywords>" --limit 20`, which lists drafts too, and most agent PRs start as drafts. Say here which PR you found and why this one is still needed, or that the search found nothing.
+     - Patch coverage: the lines this PR changed are covered, or the uncovered ones are justified under "How did you test this code?". Don't pad untouched code to lift the number. Check the "🧪 Backend test coverage" PR comment (and its patch-coverage artifact).
+     - New events schema: Backend CI reruns the paths in `.github/new-events-schema-targets.txt` against the native-JSON events table. A test whose result can differ between the two events tables is added to that file, as its header describes. Add `test-new-events-schema` when the diff should run the whole backend suite on both tables: event ingestion or cleaning, or event reads whose tests are outside the list. Apply it while draft, or push another commit after labeling, because label events do not start Backend CI. State the result under "How did you test this code?".
+     - Test ownership: every test file this PR adds resolves to a team (`hogli owners:who <path>`). Say under "How did you test this code?" which team you named for any that had none, and why.
+     - CI report: every section of the "🤖 CI report" comment is ✅, or you considered each finding: fixed it, explained in the PR body why it does not apply, or escalated it to a person. Warn-only sections, such as eager graph budgets, pass the checks while still open. See AGENTS.md, "The CI report".
+     - Public artifact: nothing in this PR — code, fixtures and sample data, comments, commit messages, or this description — carries material from the agent session that isn't already public. If the work drew on a customer conversation, ticket, or log, say so here and state that the committed data is invented. Renaming people, hosts, and identifiers does not clear real material; see AGENTS.md "Public open source repo guidance".
+-->
+
+<details>
+<summary>More context for AI agents</summary>
+
+<!-- Agents: this block is collapsed by default and does not count toward the 150 words.
+     Keep it current: on every push, rewrite it to describe the PR at that commit. Replace stale bullets, never append a log.
+     Keep the fields below in this order. One line per bullet, under 25 words, 10 bullets at most. Delete a field you have nothing for.
+     - Decisions: what changed across the session. The reason the shipped design beats the obvious alternative goes in Changes, where a reviewer will see it.
+     This is the ONLY place that may describe what this PR looked like before its present state. Don't repeat facts from the sections above.
+     Paraphrase the intent of user prompts, never paste them. Link the session, name the tools, but leave out tool call results.
+     DO NOT INCLUDE sensitive data that may have been shared in an agent session — that applies to every part of this PR, not just this block. -->
+
+- **Session:** link, tools used
+- **Decisions:** one bullet per decision
+- **Follow-ups:** work left for a later PR
+- **Read closely:** files or lines that need a careful review
+
+</details>
+
+<!-- Overall PR authoring rules for agents:
+- Title: <type>(<scope>): <description> — type=feat|fix|chore, scope required, lowercase, no period, <72 chars.
+  ✅ feat(insights): add retention graph export
+  ❌ feat: Added retention export.   (capitalized, period, no scope)
+- Description: high-level rationale, not a step-by-step replay.
+- Voice: the subject of every sentence is the change, never its author. No "I", "me" or "my" anywhere in the body. "I (actually Claude)" is worse than either half: it hands the assignee an account of work they did not do. Authorship is one stated fact in the Agent context section below.
+- Body: pass it straight to the creation tool's `body` arg (GitHub MCP `create_pull_request` body, or `gh pr create --body-file -` via stdin) — don't write it to a temp file first; the arg preserves markdown and newlines verbatim.
+- Architecture and topology changes: include separate before-and-after Mermaid `flowchart` blocks with PostHog colors under one short sentence that states the change, also for a one-step change. This covers CI wiring, pipelines, services and their calls, module or package boundaries, state machines with several states, and request paths across systems. A UI flow or a linear sequence of screens gets screenshots or a reel, not a diagram. Use `/writing-pr-descriptions` for the palette and role mapping.
+- Public OSS repo: no internal customers, incidents, or operational metrics.
+- Stack instead of stuffing: if the diff holds two or more separable steps (migration then behavior, rename then rewrite), open a stack rather than one big PR. If the body needs more than 150 words, suggest a stack to the person who directed the work. See AGENTS.md, "Stacked PRs" and /stacking-prs.
+- Simplify before opening: if your agent has a behavior-preserving cleanup pass (Claude Code: `/simplify`), run it on a non-trivial diff before final tests and preflight, since it edits the tree. Skip it for small mechanical changes.
+- Draft by default: open new PRs as drafts (`gh pr create --draft`) — drafts run only a narrow CI subset and save runner credits. Fix CI and run affected tests locally before marking ready for review.
+- Labels: apply `skip-agent-review` for trivial/chore PRs that don't need an automatic review.
+- When a human directed the work, the PR must be attributable to that person, even if agent-assisted.
+- If a human directed this work, assign them as the PR assignee (the DRI) — actually set the assignee, don't just name them here. Leave a PR unassigned only when it is fully autonomous with no human driver (set Autonomy to "Fully autonomous").
+- Never write a GitHub @mention or username you have not verified this session. Resolve a real handle from `gh api user` (current user) or the PR's actual author/assignee via `gh pr view --json author,assignees` — never infer a handle from a display name.
+- Do not add a human Co-authored-by just for the sake of attribution — if no human was involved in the changes, own it as agent-authored.
+- Agent-authored PRs always require human review — do not self-merge or auto-approve.
+- Do NOT claim manual testing you haven't done.
+- Shape and style: invoke the `/writing-pr-descriptions` skill before writing this body. In short: lead Problem with who is affected and what is wrong for them, taken from a source and true under any solution, then lead Changes with the effect a person sees rather than the code path behind it. Make the body stand alone for a reader who opens no files, aim for 150 words, link evidence rather than asserting what CI already reports, then hold what's left to one fact per bullet in under 25 words. A body that got longer as bullets was not cut.
+-->

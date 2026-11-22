@@ -1,0 +1,650 @@
+use common_types::error_tracking::FrameId;
+use reqwest::Url;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
+use symbolic::sourcemapcache::{ScopeLookupResult, SourceLocation, SourcePosition};
+use tracing::warn;
+
+use crate::{
+    error::{FrameError, JsResolveErr, ResolveError, UnhandledError},
+    frames::{record_frame_resolution_failure, Frame},
+    langs::CommonFrameMetadata,
+    metric_consts::SOURCEMAP_IGNORED_FRAME,
+    sanitize_string,
+    symbolication::symbol_store::{
+        chunk_id::OrChunkId, sourcemap::OwnedSourceMapCache, SymbolCatalog,
+    },
+};
+
+use super::utils::{add_raw_to_junk, get_sourcelocation_context, is_kotlin_compose_source};
+
+// A minifed JS stack frame. Just the minimal information needed to lookup some
+// sourcemap for it and produce a "real" stack frame.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RawJSFrame {
+    #[serde(flatten)]
+    pub location: Option<FrameLocation>, // Sometimes we get frames with no location information. We treat these as already resolved, or unminified
+    #[serde(rename = "filename")]
+    pub source_url: Option<String>, // The url the the script the frame was in was fetched from
+    #[serde(rename = "function")]
+    pub fn_name: String,
+    #[serde(alias = "chunkId", skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<String>,
+    #[serde(flatten)]
+    pub meta: CommonFrameMetadata,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
+pub struct FrameLocation {
+    #[serde(rename = "lineno")]
+    pub line: u32,
+    #[serde(rename = "colno")]
+    pub column: u32,
+}
+
+impl RawJSFrame {
+    pub async fn resolve_frame<C>(
+        &self,
+        team_id: i32,
+        catalog: &C,
+        context_lines: usize,
+    ) -> Result<Frame, UnhandledError>
+    where
+        C: SymbolCatalog<OrChunkId<Url>, OwnedSourceMapCache>,
+    {
+        match self.resolve_impl(team_id, catalog, context_lines).await {
+            Ok(frame) => Ok(frame),
+            Err(ResolveError::ResolutionError(FrameError::JavaScript(e))) => {
+                Ok(self.handle_resolution_error(e))
+            }
+            Err(ResolveError::ResolutionError(FrameError::MissingChunkIdData(chunk_id))) => {
+                Ok(self.handle_resolution_error(JsResolveErr::NoSourcemapUploaded(chunk_id)))
+            }
+            Err(ResolveError::ResolutionError(e)) => {
+                warn!(team_id, "Unexpected JS symbol resolution error: {:?}", e);
+                Ok(self.handle_resolution_error(JsResolveErr::InvalidSourceMap(e.to_string())))
+            }
+            Err(ResolveError::UnhandledError(e)) => Err(e),
+        }
+    }
+
+    async fn resolve_impl<C>(
+        &self,
+        team_id: i32,
+        catalog: &C,
+        context_lines: usize,
+    ) -> Result<Frame, ResolveError>
+    where
+        C: SymbolCatalog<OrChunkId<Url>, OwnedSourceMapCache>,
+    {
+        let Some(location) = &self.location else {
+            return Ok(Frame::from(self)); // We're probably an unminified frame
+        };
+
+        let r = self.get_ref()?; // We need either a chunk ID or a source URL to resolve a frame
+
+        let sourcemap = catalog.lookup(team_id, r).await?;
+        let smc = sourcemap.get_smc();
+
+        // JS stack frame lines and columns are 1-based, but the sourcemap cache is 0-based
+        let generated_position = SourcePosition::new(
+            location.line.saturating_sub(1),
+            location.column.saturating_sub(1),
+        );
+        let resolved = smc
+            .lookup(generated_position)
+            .or_else(|| sourcemap.dart2js_lookback(&smc, generated_position));
+        let Some(location) = resolved else {
+            return Err(JsResolveErr::TokenNotFound(
+                self.fn_name.clone(),
+                location.line,
+                location.column,
+            )
+            .into());
+        };
+
+        let mut frame = Frame::from((self, location, context_lines));
+        if sourcemap.is_source_ignored(generated_position) {
+            frame.in_app = false;
+            metrics::counter!(SOURCEMAP_IGNORED_FRAME, "runtime" => "browser").increment(1);
+        }
+        Ok(frame)
+    }
+
+    // JS frames can only handle JS resolution errors - errors at the network level
+    pub fn handle_resolution_error(&self, e: JsResolveErr) -> Frame {
+        // If we failed to resolve the frame, we mark it as "not resolved" and add the error message,
+        // then return a Frame anyway, because frame handling is a best-effort thing.
+        let Some(location) = &self.location else {
+            return self.into();
+        };
+        (self, e, location).into()
+    }
+
+    fn get_ref(&self) -> Result<OrChunkId<Url>, JsResolveErr> {
+        match (self.source_url().ok(), self.chunk_id.clone()) {
+            (Some(url), Some(id)) => Ok(OrChunkId::both(url, id)),
+            (Some(url), None) => Ok(OrChunkId::inner(url)),
+            (None, Some(id)) => Ok(OrChunkId::chunk_id(id)),
+            (None, None) => Err(JsResolveErr::NoUrlOrChunkId),
+        }
+    }
+
+    pub fn symbol_set_ref(&self) -> Option<String> {
+        // Prefer the chunk id in frame metadata when present; persistence derives its keys separately.
+        self.get_ref().ok().map(|r| r.to_string())
+    }
+
+    fn source_url(&self) -> Result<Url, JsResolveErr> {
+        // We can't resolve a frame without a source ref, and are forced
+        // to assume this frame is not minified
+        let Some(source_url) = &self.source_url else {
+            return Err(JsResolveErr::NoSourceUrl);
+        };
+
+        // We outright reject relative URLs, or ones that are not HTTP
+        if !source_url.starts_with("http://") && !source_url.starts_with("https://") {
+            return Err(JsResolveErr::InvalidSourceUrl(source_url.clone()));
+        }
+
+        // TODO - we assume these are always absolute urls, and maybe should handle cases where
+        // they aren't? We control this on the client side, and I'd prefer to enforce it here.
+
+        // These urls can have a trailing line and column number, formatted like: http://example.com/path/to/file.js:1:2.
+        // We need to strip that off to get the actual source url
+        // If the last colon is after the last slash, remove it, under the assumption that it's a column number.
+        // If there is no colon, or it's before the last slash, we assume the whole thing is a url,
+        // with no trailing line and column numbers
+        let last_colon = source_url.rfind(':');
+        let last_slash = source_url.rfind('/');
+        let useful = match (last_colon, last_slash) {
+            (Some(colon), Some(slash)) if colon > slash => colon,
+            _ => source_url.len(),
+        };
+
+        // We do this check one more time, to account for possible line number
+        let source_url = &source_url[..useful];
+        let last_colon = source_url.rfind(':');
+        let last_slash = source_url.rfind('/');
+        let useful = match (last_colon, last_slash) {
+            (Some(colon), Some(slash)) if colon > slash => colon,
+            _ => source_url.len(),
+        };
+
+        Url::parse(&source_url[..useful])
+            .map_err(|_| JsResolveErr::InvalidSourceUrl(source_url.to_string()))
+    }
+
+    pub fn frame_id(&self) -> String {
+        let mut hasher = Sha512::new();
+        hasher.update(self.fn_name.as_bytes());
+        if let Some(location) = &self.location {
+            hasher.update(location.line.to_string().as_bytes());
+            hasher.update(location.column.to_string().as_bytes());
+        }
+        hasher.update(
+            self.source_url
+                .as_ref()
+                .unwrap_or(&"".to_string())
+                .as_bytes(),
+        );
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub fn is_suspicious(&self) -> bool {
+        // posthog-js is served from a regional asset CDN whose host is
+        // `{region}-assets.i.posthog.com` (the `assets` target in the SDK's request router).
+        // Matching that host rather than a `posthog.com/static/` substring keeps PostHog's own
+        // app bundles out of the count: they are served from hosts like
+        // `app-static-prod.posthog.com` under the same `/static/` path, so a substring match
+        // marks every error in the PostHog app itself as an SDK exception.
+        const SDK_ASSET_HOST_SUFFIX: &str = "-assets.i.posthog.com";
+
+        let Ok(url) = self.source_url() else {
+            return false;
+        };
+
+        url.host_str()
+            .is_some_and(|host| host.ends_with(SDK_ASSET_HOST_SUFFIX))
+    }
+}
+
+impl From<(&RawJSFrame, SourceLocation<'_>, usize)> for Frame {
+    fn from(src: (&RawJSFrame, SourceLocation, usize)) -> Self {
+        let (raw_frame, token, context_lines) = src;
+
+        let resolved_name = match token.scope() {
+            // The `$async$` prefix is a Dart/Flutter compiler artifact that appears in
+            // JavaScript source maps when Flutter code is compiled to JavaScript (web).
+            // This branch normalizes such Flutter-to-JavaScript async function names.
+            // See internal context: https://posthog.slack.com/archives/C07AA937K9A/p1768415443965209
+            ScopeLookupResult::NamedScope(name) => {
+                let scope_name = name.to_string();
+                let resolved = if name.starts_with("$async$") {
+                    token.name().map_or(scope_name.clone(), |n| n.to_owned())
+                } else {
+                    scope_name
+                };
+                Some(sanitize_string(resolved))
+            }
+            ScopeLookupResult::AnonymousScope => Some("<anonymous>".to_string()),
+            ScopeLookupResult::Unknown => None,
+        };
+
+        let source = token
+            .file()
+            .and_then(|f| f.name())
+            .map(|s| sanitize_string(s.to_string()));
+
+        let in_app = raw_frame.meta.in_app && !source.as_deref().is_some_and(is_dependency_source);
+
+        let suspicious = source.as_ref().is_some_and(|s| s.contains("posthog-js@"));
+
+        let mut res = Self {
+            frame_id: FrameId::placeholder(), // We use placeholders here, as they're overriden at the RawFrame level
+            mangled_name: raw_frame.fn_name.clone(),
+            line: Some(token.line() + 1),
+            column: Some(token.column() + 1),
+            source,
+            in_app,
+            resolved_name,
+            lang: "javascript".to_string(),
+            resolved: true,
+            resolve_failure: None,
+
+            junk_drawer: None,
+            code_variables: None,
+            context: get_sourcelocation_context(&token, context_lines),
+            synthetic: raw_frame.meta.synthetic,
+            suspicious,
+            module: None,
+        };
+
+        add_raw_to_junk(&mut res, raw_frame);
+
+        res
+    }
+}
+
+// If we failed to resolve the frame, but it's a frame that has location information,
+// mark it as a failed resolve and emit an "unresolved" frame
+impl From<(&RawJSFrame, JsResolveErr, &FrameLocation)> for Frame {
+    fn from((raw_frame, err, location): (&RawJSFrame, JsResolveErr, &FrameLocation)) -> Self {
+        // TODO - extremely rough
+        let was_minified = match err {
+            JsResolveErr::NoSourceUrl | JsResolveErr::NoUrlOrChunkId => false, // This frame's `source` didn't exist
+            // A total guess - intuition is people tend not to write lines longer than about 300 chars
+            JsResolveErr::NoSourcemap(_) => location.column > 300,
+            _ => true,
+        };
+
+        let resolved = !was_minified;
+
+        // Only record a frame-resolution-failure when the frame is actually unresolved —
+        // for `NoUrlOrChunkId` / `NoSourceUrl` (and short-line `NoSourcemap`) the heuristic
+        // above keeps the original function name and marks the frame `resolved: true`, so the
+        // dispatcher will already emit `FRAME_RESOLVED`. Firing here too would double-count.
+        if !resolved {
+            record_frame_resolution_failure("javascript", err.metric_reason(), &err);
+        }
+
+        let resolved_name = if was_minified {
+            None
+        } else {
+            Some(raw_frame.fn_name.clone())
+        };
+
+        let resolve_failure = Some(err.to_string());
+
+        let mut res = Self {
+            frame_id: FrameId::placeholder(),
+            mangled_name: raw_frame.fn_name.clone(),
+            line: Some(location.line),
+            column: Some(location.column),
+            source: raw_frame.source_url().map(|u| u.path().to_string()).ok(),
+            in_app: raw_frame.meta.in_app,
+            resolved_name,
+            lang: "javascript".to_string(),
+            resolved,
+            // Regardless of whather we think this was a minified frame or not, we still put
+            // the error message in resolve_failure, so if a user comes along and want to know
+            // why we thought a frame wasn't minified, they can see the error message
+            resolve_failure,
+            junk_drawer: None,
+            code_variables: None,
+            context: None,
+            synthetic: raw_frame.meta.synthetic,
+            suspicious: false,
+            module: None,
+        };
+
+        add_raw_to_junk(&mut res, raw_frame);
+
+        res
+    }
+}
+
+// Finally, if we have a frame that has NO location information, we treat it as not minified, since it's
+// probably a native function or something else weird
+impl From<&RawJSFrame> for Frame {
+    fn from(raw_frame: &RawJSFrame) -> Self {
+        // If this is a source_url: <anonymous> frame, we always assume it's not in_app
+        let is_anon = raw_frame
+            .source_url
+            .as_ref()
+            .map(|s| s == "<anonymous>")
+            .unwrap_or_default();
+
+        let in_app = raw_frame.meta.in_app && !is_anon;
+
+        let mut res = Self {
+            frame_id: FrameId::placeholder(),
+            mangled_name: raw_frame.fn_name.clone(),
+            line: None,
+            column: None,
+            source: raw_frame.source_url().map(|u| u.path().to_string()).ok(),
+            in_app,
+            resolved_name: Some(raw_frame.fn_name.clone()),
+            lang: "javascript".to_string(),
+            resolved: true, // Without location information, we're assuming this is not minified
+            resolve_failure: None,
+
+            junk_drawer: None,
+            code_variables: None,
+            context: None,
+            synthetic: raw_frame.meta.synthetic,
+            suspicious: false,
+            module: None,
+        };
+
+        add_raw_to_junk(&mut res, raw_frame);
+
+        res
+    }
+}
+
+fn is_dependency_source(source: &str) -> bool {
+    source.contains("node_modules") || is_kotlin_compose_source(source)
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{
+        langs::CommonFrameMetadata,
+        symbolication::symbol_store::sourcemap::test_support::{
+            source_map_catalog, source_map_catalog_from,
+        },
+    };
+
+    use super::{is_dependency_source, FrameLocation, RawJSFrame};
+
+    fn resolvable_frame(column: u32) -> RawJSFrame {
+        RawJSFrame {
+            location: Some(FrameLocation { line: 1, column }),
+            source_url: Some("https://example.com/bundle.js".to_string()),
+            fn_name: "minified".to_string(),
+            chunk_id: None,
+            meta: CommonFrameMetadata {
+                in_app: true,
+                synthetic: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn source_map_ignore_list_demotes_only_ignored_sources() {
+        let catalog = source_map_catalog();
+
+        let vendor = resolvable_frame(1)
+            .resolve_frame(1, &catalog, 0)
+            .await
+            .unwrap();
+        assert!(vendor.resolved);
+        assert_eq!(vendor.source.as_deref(), Some("vendor.js"));
+        assert!(!vendor.in_app);
+
+        let app = resolvable_frame(11)
+            .resolve_frame(1, &catalog, 0)
+            .await
+            .unwrap();
+        assert!(app.resolved);
+        assert_eq!(app.source.as_deref(), Some("app.js"));
+        assert!(app.in_app);
+    }
+
+    #[tokio::test]
+    async fn resolves_1_based_frame_positions_to_1_based_source_positions() {
+        let catalog = source_map_catalog();
+
+        // The map starts app.js at 0-based minified column 10, which is 1-based column 11.
+        for (column, expected_source) in [(10, "vendor.js"), (11, "app.js")] {
+            let frame = resolvable_frame(column)
+                .resolve_frame(1, &catalog, 1)
+                .await
+                .unwrap();
+            assert_eq!(frame.source.as_deref(), Some(expected_source), "{column}");
+            assert_eq!((frame.line, frame.column), (Some(1), Some(1)), "{column}");
+            assert_eq!(frame.context.as_ref().unwrap().line.number, 1, "{column}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dart2js_frames_look_back_to_the_nearest_earlier_mapping() {
+        // Line 1 (0-based) has one token, at `A.err`, after the `throw`.
+        let unmapped_line_start = ("function main(){\n  throw A.err()}", "AAAA;QACQ");
+        // Line 1 starts with a token at the same location as the last token of line 0.
+        let repeated_location = ("function main(){throw A.err(\n1)}", "AAAA,iBACE;AAAA");
+        // Line 1 has a token and line 2 has none, so the walk passes line 2 and stops at line 1.
+        let nearest_of_two_mappings = (
+            "function main(){\n  x();\n\n  throw A.err()}",
+            "AAAA;EACA;;QAAQ",
+        );
+        let five_lines_back = (
+            "function main(){\n\n\n\n\n  throw A.err()}",
+            "AAAA;;;;;QACQ",
+        );
+        let six_lines_back = (
+            "function main(){\n\n\n\n\n\n  throw A.err()}",
+            "AAAA;;;;;;QACQ",
+        );
+        // A column-only segment at the start of line 1 ends the mapping of line 0.
+        let unmapped_segment_between = ("function main(){\n}\n\n  throw A.err()", "AAAA;A;;");
+        // The only earlier token is in function `a`, and the frame's line has a token in `b`.
+        let token_in_other_function = (
+            "function a(){x()}\nfunction b(){\n  throw y(); z()}",
+            "aAAA;;aACQ",
+        );
+
+        let cases = [
+            (
+                "unmapped line start",
+                unmapped_line_start,
+                true,
+                (2, 3),
+                Some((1, 1)),
+            ),
+            (
+                "own line token wins",
+                unmapped_line_start,
+                true,
+                (2, 9),
+                Some((2, 9)),
+            ),
+            (
+                "repeated location",
+                repeated_location,
+                true,
+                (2, 1),
+                Some((2, 3)),
+            ),
+            ("not dart2js", repeated_location, false, (2, 1), None),
+            (
+                "nearest of two earlier mappings",
+                nearest_of_two_mappings,
+                true,
+                (4, 3),
+                Some((2, 1)),
+            ),
+            (
+                "five lines back",
+                five_lines_back,
+                true,
+                (6, 3),
+                Some((1, 1)),
+            ),
+            ("six lines back", six_lines_back, true, (7, 3), None),
+            (
+                "unmapped segment between",
+                unmapped_segment_between,
+                true,
+                (4, 3),
+                None,
+            ),
+            (
+                "frame on a column-only segment",
+                unmapped_segment_between,
+                true,
+                (2, 1),
+                None,
+            ),
+            (
+                "token in other function",
+                token_in_other_function,
+                true,
+                (3, 3),
+                None,
+            ),
+        ];
+
+        for (label, (minified_source, mappings), dart2js, (line, column), expected) in cases {
+            let mut sourcemap = serde_json::json!({
+                "version": 3,
+                "sources": ["main.dart"],
+                "sourcesContent": ["void main() {\n  throw StateError('x');\n}"],
+                "names": [],
+                "mappings": mappings,
+            });
+            if dart2js {
+                sourcemap["x_org_dartlang_dart2js"] = serde_json::json!({});
+            }
+            let catalog = source_map_catalog_from(minified_source, &sourcemap.to_string());
+
+            let frame = RawJSFrame {
+                location: Some(FrameLocation { line, column }),
+                ..resolvable_frame(column)
+            }
+            .resolve_frame(1, &catalog, 0)
+            .await
+            .unwrap();
+
+            let resolved_to = frame
+                .resolved
+                .then(|| (frame.line.unwrap(), frame.column.unwrap()));
+            assert_eq!(
+                resolved_to, expected,
+                "{label}: {:?}",
+                frame.resolve_failure
+            );
+        }
+    }
+
+    #[test]
+    fn detects_dependency_sources() {
+        let cases = [
+            ("webpack:///app/node_modules/react/index.js", true),
+            (
+                "webpack:///app/../dependencies/compose/ui/src/commonMain/kotlin/androidx/compose/ui/Button.kt",
+                true,
+            ),
+            (
+                "webpack:///app/../dependencies/compose/ui/src/skikoMain/kotlin/androidx/compose/ui/RootNodeOwner.kt",
+                true,
+            ),
+            (
+                "webpack:///app/../dependencies/compose/resources/src/commonMain/kotlin/org/jetbrains/compose/resources/Resource.kt",
+                true,
+            ),
+            (
+                "webpack:///app/src/commonMain/kotlin/com/example/checkout/App.kt",
+                false,
+            ),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(is_dependency_source(source), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn source_ref_generation() {
+        let frame = super::RawJSFrame {
+            location: None,
+            source_url: Some("http://example.com/path/to/file.js:1:2".to_string()),
+            fn_name: "main".to_string(),
+            chunk_id: None,
+            meta: Default::default(),
+        };
+
+        assert_eq!(
+            frame.source_url().unwrap(),
+            "http://example.com/path/to/file.js".parse().unwrap()
+        );
+
+        let frame = super::RawJSFrame {
+            location: None,
+            source_url: Some("http://example.com/path/to/file.js".to_string()),
+            fn_name: "main".to_string(),
+            chunk_id: None,
+            meta: Default::default(),
+        };
+
+        assert_eq!(
+            frame.source_url().unwrap(),
+            "http://example.com/path/to/file.js".parse().unwrap()
+        );
+    }
+
+    fn frame_from(source_url: Option<&str>) -> super::RawJSFrame {
+        super::RawJSFrame {
+            location: None,
+            source_url: source_url.map(str::to_string),
+            fn_name: "main".to_string(),
+            chunk_id: None,
+            meta: Default::default(),
+        }
+    }
+
+    #[test]
+    fn only_the_sdk_asset_cdn_is_suspicious() {
+        let cases = [
+            ("https://us-assets.i.posthog.com/static/array.js", true),
+            ("https://eu-assets.i.posthog.com/static/recorder.js", true),
+            // Frame filenames often carry a trailing `:line:column`, so this has to match after
+            // the same parsing the resolution path does, not on the raw string.
+            ("https://us-assets.i.posthog.com/static/array.js:1:2", true),
+            (
+                "https://app-static-prod.posthog.com/static/chunk-ABC12345.js",
+                false,
+            ),
+            (
+                "https://app-static.eu.posthog.com/static/chunk-DEF67890.js",
+                false,
+            ),
+            // The legacy host served both the app and the pre-CDN snippet, so a frame here
+            // cannot be attributed to the SDK.
+            ("https://app.posthog.com/static/array.js", false),
+            ("https://example.com/static/bundle.js", false),
+            ("/static/relative.js", false),
+        ];
+
+        for (source_url, expected) in cases {
+            assert_eq!(
+                frame_from(Some(source_url)).is_suspicious(),
+                expected,
+                "{source_url}"
+            );
+        }
+
+        assert!(!frame_from(None).is_suspicious());
+    }
+}

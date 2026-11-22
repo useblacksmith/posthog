@@ -1,0 +1,143 @@
+import { useActions, useValues } from 'kea'
+import { useCallback, useState } from 'react'
+
+import { IconChevronRight } from '@posthog/icons'
+
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { LemonInput } from 'lib/lemon-ui/LemonInput'
+import { LemonMenu, LemonMenuItem, LemonMenuItems, LemonMenuSection } from 'lib/lemon-ui/LemonMenu'
+import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
+
+import { dashboardsModel } from '~/models/dashboardsModel'
+import type { DashboardBasicType } from '~/types'
+
+export interface DashboardWidgetPlacementDestination {
+    dashboard: DashboardBasicType
+    /** When set, the row is disabled and this explains why (e.g. widget already on that dashboard). */
+    disabledReason?: string
+}
+
+interface DashboardWidgetPlacementMenuProps {
+    destinations: DashboardWidgetPlacementDestination[]
+    onSelect: (dashboard: DashboardBasicType) => void
+    /** Submenu trigger label (e.g. "Move to" vs "Copy to"). */
+    label?: string
+    /** When there are no destinations, the trigger stays visible but disabled (avoids hiding the action). */
+    emptyDisabledReason?: string
+    leadingSections?: LemonMenuSection[]
+}
+
+export function DashboardWidgetPlacementMenu({
+    destinations,
+    onSelect,
+    label = 'Move to',
+    emptyDisabledReason = 'No other dashboards',
+    leadingSections = [],
+}: DashboardWidgetPlacementMenuProps): JSX.Element {
+    const [searchTerm, setSearchTermState] = useState('')
+    const { dashboardsLoading } = useValues(dashboardsModel)
+    const { loadDashboardsIfNeeded } = useActions(dashboardsModel)
+
+    const handleSearchChange = useCallback((value: string) => {
+        setSearchTermState(value)
+    }, [])
+
+    // TODO: make use Fuse search (might be overkill though)
+    const filteredDestinations =
+        searchTerm.trim() === ''
+            ? destinations
+            : destinations.filter((entry) =>
+                  (entry.dashboard.name || 'Untitled').toLowerCase().includes(searchTerm.toLowerCase())
+              )
+    const SearchInputLabel = useCallback(() => {
+        return (
+            <div className="px-2 pt-2 pb-1">
+                <LemonInput
+                    type="search"
+                    placeholder="Search dashboards"
+                    value={searchTerm}
+                    onChange={handleSearchChange}
+                    size="small"
+                    fullWidth
+                    allowClear
+                    onClick={(event) => event.stopPropagation()}
+                    autoFocus
+                />
+            </div>
+        )
+    }, [handleSearchChange, searchTerm])
+
+    const searchItem: LemonMenuItem = {
+        custom: true,
+        label: SearchInputLabel,
+    }
+
+    const dashboardItems: LemonMenuItems = dashboardsLoading
+        ? [{ custom: true, label: () => <LemonSkeleton.Row className="m-2 h-8" repeat={5} fade /> }]
+        : filteredDestinations.length > 0
+          ? [
+                { items: [searchItem] },
+                {
+                    items: filteredDestinations.map(({ dashboard, disabledReason }) => ({
+                        label: disabledReason ? (
+                            <span className="flex flex-col items-start gap-0.5 text-left">
+                                <span>{dashboard.name || <i>Untitled</i>}</span>
+                                <span className="text-xs font-normal text-muted">{disabledReason}</span>
+                            </span>
+                        ) : (
+                            dashboard.name || <i>Untitled</i>
+                        ),
+                        key: dashboard.id,
+                        disabled: !!disabledReason,
+                        onClick: () => {
+                            if (!disabledReason) {
+                                onSelect(dashboard)
+                                setSearchTermState('')
+                            }
+                        },
+                    })),
+                },
+            ]
+          : [
+                {
+                    items: [
+                        searchItem,
+                        {
+                            label: 'No dashboards match this search',
+                            key: 'no-results',
+                        },
+                    ],
+                },
+            ]
+
+    const hasDashboardItems = destinations.length > 0 || dashboardsLoading
+    const items: LemonMenuItems = [...leadingSections, ...(hasDashboardItems ? dashboardItems : [])]
+
+    if (!items.length) {
+        return (
+            <LemonButton fullWidth disabledReason={emptyDisabledReason}>
+                {label}
+            </LemonButton>
+        )
+    }
+
+    return (
+        <LemonMenu
+            items={items}
+            placement="right-start"
+            fallbackPlacements={['left-start']}
+            closeParentPopoverOnClickInside
+            onVisibilityChange={(visible) => {
+                if (visible) {
+                    loadDashboardsIfNeeded()
+                } else {
+                    setSearchTermState('')
+                }
+            }}
+        >
+            <LemonButton fullWidth sideIcon={<IconChevronRight className="size-3" />}>
+                {label}
+            </LemonButton>
+        </LemonMenu>
+    )
+}

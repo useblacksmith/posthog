@@ -1,0 +1,274 @@
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Result};
+use tracing::info;
+
+use crate::{
+    api::{self, releases::ReleaseBuilder, symbol_sets::SymbolSetUpload},
+    dsym::{find_dsym_bundles, DsymFile},
+    sourcemaps::args::{pack_version, ReleaseArgs, UploadConflictArgs},
+    utils::{git::get_git_info, xcode::PlistInfo},
+};
+
+#[derive(clap::Args, Clone)]
+pub struct Args {
+    /// The directory containing dSYM files to upload. This is typically $DWARF_DSYM_FOLDER_PATH
+    /// when running from an Xcode build phase.
+    #[arg(short, long)]
+    pub directory: PathBuf,
+
+    #[clap(flatten)]
+    pub release: ReleaseArgs,
+
+    #[clap(flatten)]
+    pub conflict: UploadConflictArgs,
+
+    /// The main dSYM file name (e.g., MyApp.app.dSYM).
+    /// Used to extract version info from the correct dSYM when multiple are present.
+    /// This is typically $DWARF_DSYM_FILE_NAME in Xcode build phases.
+    #[arg(long)]
+    pub main_dsym: Option<String>,
+
+    /// Include source code files in the dSYM upload.
+    /// When enabled, source files referenced by DWARF debug info are bundled into the upload,
+    /// allowing PostHog to display source code context around crash locations.
+    /// Implies --force unless --skip-on-conflict is set. [default: false]
+    #[arg(long, default_value_t = false)]
+    pub include_source: bool,
+
+    /// Deprecated: the symbol sets always bind to the release the build creates. The flag stays
+    /// accepted so a released posthog-ios upload-symbols.sh that still passes it does not fail
+    /// the Xcode build with a parse error.
+    #[arg(long, default_value_t = false, hide = true)]
+    pub no_release_bind: bool,
+}
+
+pub fn upload(args: &Args) -> Result<()> {
+    let Args {
+        directory,
+        release,
+        conflict,
+        main_dsym,
+        include_source,
+        no_release_bind,
+    } = args;
+
+    if *no_release_bind {
+        tracing::warn!(
+            "--no-release-bind is deprecated and does nothing. The symbol sets are uploaded bound \
+             to the release this build creates. Remove the flag."
+        );
+    }
+
+    let release_args = release.resolve_info_plist()?;
+
+    let directory = directory.canonicalize().map_err(|e| {
+        anyhow!(
+            "Path {} canonicalization failed: {}",
+            directory.display(),
+            e
+        )
+    })?;
+
+    if !directory.is_dir() {
+        anyhow::bail!("Path {} is not a directory", directory.display());
+    }
+
+    // Find all dSYM bundles
+    let dsym_paths = find_dsym_bundles(&directory)?;
+
+    if dsym_paths.is_empty() {
+        info!("No dSYM bundles found in {}", directory.display());
+        return Ok(());
+    }
+
+    info!("Found {} dSYM bundle(s)", dsym_paths.len());
+
+    // Find the main dSYM to extract version info from
+    // Priority: --main-dsym flag > first .app.dSYM > first dSYM
+    let main_dsym_path = if let Some(main_name) = main_dsym {
+        // Use the specified main dSYM
+        dsym_paths
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy() == *main_name)
+                    .unwrap_or(false)
+            })
+            .cloned()
+    } else {
+        // Try to find the app dSYM (not a framework)
+        dsym_paths
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().ends_with(".app.dSYM"))
+                    .unwrap_or(false)
+            })
+            .cloned()
+    }
+    .or_else(|| dsym_paths.first().cloned());
+
+    // Extract info from main dSYM's Info.plist as fallback
+    let plist_info = main_dsym_path.as_ref().and_then(|p| {
+        let plist_path = p.join("Contents/Info.plist");
+        match PlistInfo::from_plist(&plist_path) {
+            Ok(info) => {
+                info!(
+                    "Extracted plist info from {}: {:?}",
+                    p.file_name().unwrap_or_default().to_string_lossy(),
+                    info
+                );
+                Some(info)
+            }
+            Err(e) => {
+                tracing::debug!("Could not extract plist info: {}", e);
+                None
+            }
+        }
+    });
+
+    // Determine release name, version, and build - CLI args take precedence over plist
+    let resolved_release_name = release_args.name.clone().or_else(|| {
+        plist_info
+            .as_ref()
+            .and_then(|p| p.bundle_identifier.clone())
+    });
+    let resolved_release_version = release_args
+        .version
+        .clone()
+        .or_else(|| plist_info.as_ref().and_then(|p| p.short_version.clone()));
+    let resolved_build = release_args
+        .build
+        .clone()
+        .or_else(|| plist_info.as_ref().and_then(|p| p.bundle_version.clone()));
+
+    if let Some(ref name) = resolved_release_name {
+        info!("Release name: {}", name);
+    }
+    if let Some(ref ver) = resolved_release_version {
+        info!("Release version: {}", ver);
+    }
+
+    let full_version = pack_version(&resolved_release_version, &resolved_build);
+
+    if let Some(ref build) = resolved_build {
+        info!("Build: {}", build);
+    }
+
+    // Set up release info
+    let mut release_builder = ReleaseBuilder::default();
+
+    // Add git info as metadata if available (but don't use it for project/version)
+    if let Ok(Some(git_info)) = get_git_info(Some(directory.clone())) {
+        release_builder.with_git(git_info);
+    }
+
+    // Add plist info as apple metadata
+    if let Some(ref info) = plist_info {
+        let _ = release_builder.with_metadata("dsym_info", info);
+    }
+
+    if let Some(ref release_name) = resolved_release_name {
+        release_builder.with_name(release_name);
+    }
+    if let Some(ref version) = full_version {
+        release_builder.with_version(version);
+    }
+
+    let created_release = release_builder
+        .can_create()
+        .then(|| release_builder.fetch_or_create())
+        .transpose()?;
+
+    let release_id = created_release.map(|r| r.id.to_string());
+
+    let chunk_release_id = release_id.clone();
+
+    // Process each dSYM
+    let mut uploads: Vec<SymbolSetUpload> = Vec::new();
+
+    for dsym_path in dsym_paths {
+        info!("Processing dSYM: {}", dsym_path.display());
+
+        match DsymFile::new(&dsym_path, *include_source, None) {
+            Ok(mut dsym_file) => {
+                dsym_file.release_id = chunk_release_id.clone();
+                info!(
+                    "  UUIDs: {} ({})",
+                    dsym_file.uuids().join(", "),
+                    dsym_file.uuids().len()
+                );
+                info!("  Total size: {} bytes", dsym_file.total_size());
+
+                uploads.extend(dsym_file.into_uploads());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to process dSYM {}: {}", dsym_path.display(), e);
+            }
+        }
+    }
+
+    if uploads.is_empty() {
+        info!("No dSYMs to upload");
+        return Ok(());
+    }
+
+    info!("Uploading {} dSYM(s)...", uploads.len());
+    // --include-source implies force unless the user explicitly asked to keep
+    // existing symbol sets with --skip-on-conflict.
+    let effective_force = conflict.force || (*include_source && !conflict.skip_on_conflict);
+    let (_summary, upload_result) = api::symbol_sets::upload_with_retry(
+        uploads,
+        10,
+        release_args.skip_release_on_fail,
+        effective_force,
+        conflict.skip_on_conflict,
+    );
+    upload_result?;
+    info!("dSYM upload complete");
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct DsymCli {
+        #[command(subcommand)]
+        command: crate::dsym::DsymSubcommand,
+    }
+
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = vec!["dsym", "upload", "--directory", "dsyms"];
+        argv.extend_from_slice(extra);
+        let crate::dsym::DsymSubcommand::Upload(args) = DsymCli::parse_from(argv).command;
+        args
+    }
+
+    #[test]
+    fn accepts_the_deprecated_no_release_bind_flag() {
+        // Released posthog-ios upload-symbols.sh passes `--no-release-bind` when
+        // POSTHOG_NO_RELEASE_BIND=1. Rejecting the flag would fail the Xcode build phase with a
+        // parse error on CLI upgrade.
+        assert!(parse(&["--no-release-bind"]).no_release_bind);
+        assert!(!parse(&[]).no_release_bind);
+    }
+
+    #[test]
+    fn deprecated_no_release_bind_is_hidden() {
+        let cmd = DsymCli::command();
+        let upload = cmd
+            .find_subcommand("upload")
+            .expect("expected the upload subcommand");
+        let arg = upload
+            .get_arguments()
+            .find(|a| a.get_id() == "no_release_bind")
+            .expect("expected the no_release_bind argument");
+
+        assert!(arg.is_hide_set());
+    }
+}

@@ -1,0 +1,388 @@
+//! Payload decompression and decoding logic
+//!
+//! This module handles decompression of HTTP request payloads using various
+//! compression formats (GZIP, LZ64) and handles legacy base64 encoding.
+
+use std::io::prelude::*;
+
+use bytes::Bytes;
+use common_compression::{decompress_lz64_capped, has_gzip_magic_header, CompressionError};
+use flate2::read::GzDecoder;
+use metrics;
+use tracing::{debug, info, instrument, warn, Span};
+
+use crate::{
+    api::CaptureError,
+    prometheus::report_dropped_events,
+    utils::{decode_base64, is_likely_base64, Base64Option, MAX_PAYLOAD_SNIPPET_SIZE},
+    v0_request::path_is_legacy_endpoint,
+};
+
+use super::types::Compression;
+
+// Metrics constants
+const METRIC_PAYLOAD_SIZE_EXCEEDED: &str = "capture_payload_size_exceeded";
+const METRIC_GZIP_DECOMPRESSION_RATIO: &str = "capture_gzip_decompression_ratio";
+const METRIC_LZ64_DECOMPRESSION_RATIO: &str = "capture_lz64_decompression_ratio";
+
+/// Decompression ratios above this threshold are flagged as potential bombs.
+const GZIP_BOMB_RATIO_THRESHOLD: f64 = 20.0;
+const LZ64_BOMB_RATIO_THRESHOLD: f64 = 20.0;
+
+/// Decompress GZIP data with chunked reads and bomb detection.
+/// Returns raw bytes -- callers decide whether to convert to String.
+pub fn decompress_gzip_to_bytes(compressed: &[u8], limit: usize) -> Result<Vec<u8>, CaptureError> {
+    let len = compressed.len();
+    let mut zipstream = GzDecoder::new(compressed);
+    let mut chunk = [0; 8192];
+    let mut buf = Vec::new();
+    let mut total_read = 0;
+
+    loop {
+        let got = match zipstream.read(&mut chunk) {
+            Ok(got) => got,
+            Err(_) => {
+                return Err(CaptureError::RequestDecodingError(String::from(
+                    "invalid GZIP data",
+                )));
+            }
+        };
+        if got == 0 {
+            break;
+        }
+
+        if total_read + got > limit {
+            metrics::counter!(METRIC_PAYLOAD_SIZE_EXCEEDED, "kind" => "gzip").increment(1);
+            metrics::histogram!("capture_full_payload_size", "oversize" => "true")
+                .record((total_read + got) as f64);
+            report_dropped_events("event_too_big", 1);
+
+            return Err(CaptureError::EventTooBig(format!(
+                "Decompressed payload would exceed {} bytes (got {} bytes)",
+                limit,
+                total_read + got
+            )));
+        }
+
+        buf.extend_from_slice(&chunk[..got]);
+        total_read += got;
+    }
+
+    if len > 0 {
+        let ratio = total_read as f64 / len as f64;
+        metrics::histogram!(METRIC_GZIP_DECOMPRESSION_RATIO).record(ratio);
+
+        if ratio > GZIP_BOMB_RATIO_THRESHOLD {
+            warn!(
+                compressed_size = len,
+                decompressed_size = total_read,
+                ratio = ratio,
+                "High GZIP compression ratio detected - potential GZIP bomb"
+            );
+        }
+    }
+
+    Ok(buf)
+}
+
+/// Decompress LZ64 (lz-string) data with an output cap and bomb detection.
+/// The payload arrives as the base64 text lz-string emits.
+pub fn decompress_lz64_to_string(payload: &[u8], limit: usize) -> Result<String, CaptureError> {
+    let b64_payload = std::str::from_utf8(payload).unwrap_or("INVALID_UTF8");
+
+    // The cap is the same byte budget gzip enforces. The decoder counts the
+    // UTF-8 size of what it emits, so a payload of multi-byte characters cannot
+    // clear the cap as code units and then exceed the budget once converted.
+    let decomp_utf16 = match decompress_lz64_capped(b64_payload, limit) {
+        Ok(units) => units,
+        Err(CompressionError::Lz64OutputTooLarge { bytes, .. }) => {
+            metrics::counter!(METRIC_PAYLOAD_SIZE_EXCEEDED, "kind" => "lz64").increment(1);
+            metrics::histogram!("capture_full_payload_size", "oversize" => "true")
+                .record(bytes as f64);
+            report_dropped_events("event_too_big", 1);
+
+            return Err(CaptureError::EventTooBig(format!(
+                "Decompressed LZ64 payload would exceed {limit} bytes"
+            )));
+        }
+        Err(_) => {
+            let max_chars: usize = std::cmp::min(payload.len(), MAX_PAYLOAD_SNIPPET_SIZE);
+            let payload_snippet = String::from_utf8(payload[..max_chars].to_vec())
+                .unwrap_or(String::from("INVALID_UTF8"));
+            debug!(
+                payload_snippet = payload_snippet,
+                "decompress_lz64: failed decompress to UTF16"
+            );
+            return Err(CaptureError::RequestDecodingError(String::from(
+                "decompress_lz64: failed decompress to UTF16",
+            )));
+        }
+    };
+
+    // the decompressed data is UTF16 so we need to convert it to UTF8 to
+    // obtain the JSON event batch payload we've come to know and love
+    let decompressed = match String::from_utf16(&decomp_utf16) {
+        Ok(result) => result,
+        Err(_) => {
+            return Err(CaptureError::RequestDecodingError(String::from(
+                "decompress_lz64: failed UTF16 to UTF8 conversion",
+            )));
+        }
+    };
+
+    // The decoder already charged these bytes against `limit`, so this holds for
+    // any payload it accepted. It stays as a backstop because an accounting bug
+    // in the decoder would otherwise reach the rest of the pipeline unbounded,
+    // and it records the same sample the decoder's own rejection records.
+    if decompressed.len() > limit {
+        metrics::counter!(METRIC_PAYLOAD_SIZE_EXCEEDED, "kind" => "lz64").increment(1);
+        metrics::histogram!("capture_full_payload_size", "oversize" => "true")
+            .record(decompressed.len() as f64);
+        report_dropped_events("event_too_big", 1);
+        return Err(CaptureError::EventTooBig(String::from(
+            "lz64 request payload size limit exceeded",
+        )));
+    }
+
+    if !payload.is_empty() {
+        let ratio = decompressed.len() as f64 / payload.len() as f64;
+        metrics::histogram!(METRIC_LZ64_DECOMPRESSION_RATIO).record(ratio);
+
+        if ratio > LZ64_BOMB_RATIO_THRESHOLD {
+            warn!(
+                compressed_size = payload.len(),
+                decompressed_size = decompressed.len(),
+                ratio = ratio,
+                "High LZ64 compression ratio detected - potential LZ64 bomb"
+            );
+        }
+    }
+
+    Ok(decompressed)
+}
+
+/// Decompresses and decodes a payload based on compression hint and content detection.
+/// This is shared logic used by both analytics and recording event processing.
+///
+/// # Arguments
+/// * `bytes` - Raw compressed/encoded bytes from the HTTP request
+/// * `compression` - Compression hint from query params or headers
+/// * `limit` - Maximum allowed size for decompressed payload (in bytes)
+/// * `path` - Request path (used for legacy endpoint detection)
+///
+/// # Returns
+/// Decompressed UTF-8 string payload ready for JSON deserialization
+#[instrument(skip_all, fields(compression, path))]
+pub fn decompress_payload(
+    bytes: Bytes,
+    compression: Compression,
+    limit: usize,
+    path: &str,
+) -> Result<String, CaptureError> {
+    Span::current().record("compression", compression.to_string());
+    Span::current().record("path", path);
+
+    debug!(
+        payload_len = bytes.len(),
+        "decompress_payload: decoding payload"
+    );
+    metrics::histogram!("capture_raw_payload_size").record(bytes.len() as f64);
+
+    let mut payload = if compression == Compression::Gzip || has_gzip_magic_header(&bytes) {
+        debug!(
+            payload_len = bytes.len(),
+            "decompress_payload: matched GZIP compression"
+        );
+
+        let buf = decompress_gzip_to_bytes(&bytes, limit)?;
+
+        match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(CaptureError::RequestDecodingError(String::from(
+                    "invalid gzip data",
+                )));
+            }
+        }
+    } else if compression == Compression::LZString {
+        debug!(
+            payload_len = bytes.len(),
+            "decompress_payload: matched LZ64 compression"
+        );
+        decompress_lz64_to_string(&bytes, limit)?
+    } else {
+        debug!(
+            path = path,
+            payload_len = bytes.len(),
+            "decompress_payload: best-effort, assuming no compression"
+        );
+
+        let s = String::from_utf8(bytes.into()).map_err(|e| {
+            debug!(
+                valid_up_to = &e.utf8_error().valid_up_to(),
+                "decompress_payload: failed to convert request payload to UTF8: {e:#}"
+            );
+            CaptureError::RequestDecodingError(String::from("invalid UTF8 in request payload"))
+        })?;
+        if s.len() > limit {
+            metrics::counter!(METRIC_PAYLOAD_SIZE_EXCEEDED, "kind" => "none").increment(1);
+            metrics::histogram!("capture_full_payload_size", "oversize" => "true")
+                .record(s.len() as f64);
+            report_dropped_events("event_too_big", 1);
+            return Err(CaptureError::EventTooBig(format!(
+                "Uncompressed payload size limit {} exceeded: {}",
+                limit,
+                s.len(),
+            )));
+        }
+        s
+    };
+    metrics::histogram!("capture_full_payload_size", "oversize" => "false")
+        .record(payload.len() as f64);
+
+    // TODO: test removing legacy special casing against /i/v0/e/ and /batch/ using mirror deploy
+    if path_is_legacy_endpoint(path) {
+        if is_likely_base64(payload.as_bytes(), Base64Option::Strict) {
+            debug!("decompress_payload: payload still base64 after decoding step");
+            payload = match decode_base64(payload.as_bytes(), "decompress_payload_after_decoding") {
+                Ok(out) => match String::from_utf8(out) {
+                    Ok(unwrapped_payload) => {
+                        let unwrapped_size = unwrapped_payload.len();
+                        if unwrapped_size > limit {
+                            report_dropped_events("event_too_big", 1);
+                            return Err(CaptureError::EventTooBig(format!(
+                                    "decompress_payload: payload size limit {limit} exceeded after post-decode base64 unwrap: {unwrapped_size}",
+                                )));
+                        }
+                        unwrapped_payload
+                    }
+                    Err(e) => {
+                        info!(
+                            "decompress_payload: failed UTF8 conversion after post-decode base64: {e:#}"
+                        );
+                        payload
+                    }
+                },
+                Err(e) => {
+                    info!(
+                        path = path,
+                        "decompress_payload: failed post-decode base64 unwrap: {e:#}"
+                    );
+                    payload
+                }
+            }
+        } else {
+            debug!("decompress_payload: payload may be LZ64 or other after decoding step");
+        }
+    }
+
+    let truncate_at: usize = payload
+        .char_indices()
+        .nth(MAX_PAYLOAD_SNIPPET_SIZE)
+        .map(|(n, _)| n)
+        .unwrap_or(0);
+    let payload_snippet = &payload[0..truncate_at];
+    debug!(
+        path = path,
+        json = payload_snippet,
+        "decompress_payload: event payload extracted"
+    );
+
+    Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    fn gzip_compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn test_decompress_gzip_to_bytes_valid() {
+        let original = b"hello world";
+        let compressed = gzip_compress(original);
+        let result = decompress_gzip_to_bytes(&compressed, 1024).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_decompress_gzip_to_bytes_rejects_oversized_output() {
+        // 64 KB of zeros compresses to ~80 bytes with gzip
+        let bomb_data = vec![0u8; 65_536];
+        let compressed = gzip_compress(&bomb_data);
+        assert!(compressed.len() < 200);
+
+        let limit = 1024;
+        let result = decompress_gzip_to_bytes(&compressed, limit);
+        assert!(
+            matches!(result, Err(CaptureError::EventTooBig(_))),
+            "expected EventTooBig, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_decompress_gzip_to_bytes_exactly_at_limit() {
+        let data = vec![b'A'; 1024];
+        let compressed = gzip_compress(&data);
+        let result = decompress_gzip_to_bytes(&compressed, 1024).unwrap();
+        assert_eq!(result.len(), 1024);
+    }
+
+    #[test]
+    fn test_decompress_gzip_to_bytes_one_over_limit() {
+        let data = vec![b'A'; 1025];
+        let compressed = gzip_compress(&data);
+        let result = decompress_gzip_to_bytes(&compressed, 1024);
+        assert!(matches!(result, Err(CaptureError::EventTooBig(_))));
+    }
+
+    #[test]
+    fn test_decompress_gzip_to_bytes_invalid_gzip() {
+        let garbage = b"not gzip data at all";
+        let result = decompress_gzip_to_bytes(garbage, 4096);
+        assert!(matches!(result, Err(CaptureError::RequestDecodingError(_))));
+    }
+
+    #[test]
+    fn test_decompress_payload_lz64_valid() {
+        let original = r#"[{"event":"$pageview","properties":{"token":"abc"}}]"#;
+        let compressed = lz_str::compress_to_base64(original);
+
+        let result = decompress_payload(
+            Bytes::from(compressed),
+            Compression::LZString,
+            4096,
+            "/i/v0/e",
+        )
+        .unwrap();
+
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_decompress_payload_lz64_rejects_oversized_output() {
+        // 1 MB of one repeated character, which lz-string packs into ~2KB
+        let compressed = lz_str::compress_to_base64(&"A".repeat(1024 * 1024));
+        assert!(compressed.len() < 16 * 1024);
+
+        let result = decompress_payload(
+            Bytes::from(compressed),
+            Compression::LZString,
+            1024,
+            "/i/v0/e",
+        );
+
+        assert!(
+            matches!(result, Err(CaptureError::EventTooBig(_))),
+            "expected EventTooBig, got {:?}",
+            result
+        );
+    }
+}

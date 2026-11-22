@@ -1,0 +1,748 @@
+import { lemonToast } from '@posthog/lemon-ui'
+import {
+    MAX_CATEGORY_LABEL_WIDTH,
+    type AxisLinesConfig,
+    type BarChartConfig,
+    type ChartLegendConfig,
+    type ReferenceLineProps,
+    type Series,
+    type SeriesType,
+    type TimeSeriesBarChartConfig,
+    type TimeSeriesComboChartConfig,
+    type TimeSeriesLineChartConfig,
+    type TooltipConfig,
+    type TooltipContext,
+    type TrendLineConfig,
+    type ValueLabelsConfig,
+    type XAxisConfig,
+    type YAxisConfig,
+} from '@posthog/quill-charts'
+
+import { chartStyleCurve } from 'lib/charts/chartStyleAdapter'
+import type { DataColorTheme } from 'lib/colors'
+import { dayjs } from 'lib/dayjs'
+import { getColorFromToken } from 'scenes/dataThemeLogic'
+
+import { ChartSettings, GoalLine, YAxisSettings } from '~/queries/schema/schema-general'
+import { ChartDisplayType } from '~/types'
+
+import {
+    goalLinesToReferenceLines,
+    schemaGoalLinesToConfigs,
+} from 'products/product_analytics/frontend/insights/trends/shared/goalLinesAdapter'
+
+import { AxisSeries, AxisSeriesSettings, formatDataWithSettings } from '../../dataVisualizationLogic'
+import { AxisBreakdownSeries, BreakdownSeriesData } from '../seriesBreakdownLogic'
+import { type SqlChartProps } from './SqlChart'
+
+export const MAX_SERIES = 200
+
+/** Without a breakdown, rows that share an x value would draw on top of each other in one slot, so they
+ *  are summed per x value like the breakdown path does. A bar value chart draws one bar per row, so it keeps them. */
+export const sqlChartData = (
+    breakdown: BreakdownSeriesData<number | null>,
+    xData: AxisSeries<string> | null,
+    yData: AxisSeries<number | null>[],
+    visualizationType: ChartDisplayType
+): Pick<SqlChartProps, 'xData' | 'yData'> => {
+    if (breakdown.xData.data.length) {
+        return { xData: breakdown.xData, yData: breakdown.seriesData }
+    }
+    const uniqueX = Array.from(new Set(xData?.data))
+    if (!xData || visualizationType === ChartDisplayType.ActionsBarValue || uniqueX.length === xData.data.length) {
+        return { xData, yData }
+    }
+    const slotByX = new Map(uniqueX.map((x, index) => [x, index]))
+    return {
+        xData: { ...xData, data: uniqueX },
+        yData: yData.map((series) => {
+            if (!series.data.length) {
+                return series
+            }
+            const data: (number | null)[] = uniqueX.map(() => null)
+            series.data.forEach((value, index) => {
+                const slot = slotByX.get(xData.data[index])
+                if (value !== null && slot !== undefined) {
+                    data[slot] = (data[slot] ?? 0) + value
+                }
+            })
+            return { ...series, data }
+        }),
+    }
+}
+
+/** Matches the legacy path's `hexToRGBA(seriesColor, 0.5)` area fill. */
+export const AREA_FILL_OPACITY = 0.5
+
+export type SqlLineYSeries = AxisSeries<number | null> | AxisBreakdownSeries<number | null>
+
+export const isAreaSeries = (visualizationType: ChartDisplayType, settings: AxisSeriesSettings | undefined): boolean =>
+    visualizationType === ChartDisplayType.ActionsAreaGraph || settings?.display?.displayType === 'area'
+
+/** Per-series quill `type` that drives mixed-type rendering on {@link ComboChart}. */
+export function seriesDisplayType(
+    visualizationType: ChartDisplayType,
+    settings: AxisSeriesSettings | undefined
+): SeriesType {
+    if (visualizationType === ChartDisplayType.ActionsBarValue) {
+        return 'bar'
+    }
+
+    const displayType = settings?.display?.displayType
+    if (displayType === 'bar') {
+        return 'bar'
+    }
+    if (displayType === 'line') {
+        return 'line'
+    }
+    if (displayType === 'area') {
+        return 'area'
+    }
+    if (visualizationType === ChartDisplayType.ActionsBar || visualizationType === ChartDisplayType.ActionsStackedBar) {
+        return 'bar'
+    }
+    if (visualizationType === ChartDisplayType.ActionsAreaGraph) {
+        return 'area'
+    }
+    return 'line'
+}
+
+/** True when the series resolve to a mix of bar and line/area — the case neither the line-only nor
+ *  the bar-only quill path can render, so it routes to {@link SqlComboGraph}. */
+export function hasMixedSeriesTypes(yData: SqlLineYSeries[], visualizationType: ChartDisplayType): boolean {
+    let hasBar = false
+    let hasLineLike = false
+    for (const series of yData) {
+        if (seriesDisplayType(visualizationType, series.settings) === 'bar') {
+            hasBar = true
+        } else {
+            hasLineLike = true
+        }
+        if (hasBar && hasLineLike) {
+            return true
+        }
+    }
+    return false
+}
+
+/** Honors a column's custom display label, falling back to the breakdown value / column name —
+ *  matches the legacy renderer (`LineGraph.tsx`). `||` so a blank label falls through. */
+const getSeriesLabel = (series: SqlLineYSeries): string =>
+    series.settings?.display?.label || ('name' in series ? series.name : series.column.name)
+
+export const getSeriesKey = (series: SqlLineYSeries, index: number): string =>
+    'breakdownValue' in series ? JSON.stringify([series.name, series.breakdownValue]) : `${series.column.name}-${index}`
+
+/** Shares {@link getSeriesKey} with {@link buildSeries} so each trend line's `seriesKey` matches its source series. */
+export function buildTrendLineConfigs(ySeriesData: SqlLineYSeries[] | null | undefined): TrendLineConfig[] {
+    if (!ySeriesData) {
+        return []
+    }
+    return ySeriesData.reduce<TrendLineConfig[]>((configs, series, index) => {
+        if (series.settings?.display?.trendLine) {
+            configs.push({ seriesKey: getSeriesKey(series, index), kind: 'linear' })
+        }
+        return configs
+    }, [])
+}
+
+export type SqlChartKind = 'line' | 'bar' | 'combo'
+
+/** The slice of chart props renderer dispatch reads — `SqlChartProps` and Customer analytics'
+ *  `BillingChartProps` both satisfy it. */
+export type SqlChartKindProps = Pick<SqlChartProps, 'visualizationType' | 'yData' | 'chartSettings'>
+
+/**
+ * The single source of truth for which quill renderer draws a SQL insight. Resolves the per-series
+ * display types once (`auto` inherits the chart-level type) and picks from there, so the answer
+ * follows the series rather than the chart-level type alone: a line chart whose every column is set
+ * to Bar draws bars.
+ */
+export function sqlChartKind({ visualizationType, yData, chartSettings }: SqlChartKindProps): SqlChartKind {
+    const isBarBase =
+        visualizationType === ChartDisplayType.ActionsBar ||
+        visualizationType === ChartDisplayType.ActionsBarValue ||
+        visualizationType === ChartDisplayType.ActionsStackedBar
+    const isLineBase =
+        visualizationType === ChartDisplayType.ActionsLineGraph ||
+        visualizationType === ChartDisplayType.ActionsAreaGraph
+
+    // Pie and friends never reach dispatch — PieChart wraps them separately.
+    if (!isBarBase && !isLineBase) {
+        return 'line'
+    }
+    if (!yData?.length) {
+        return isBarBase ? 'bar' : 'line'
+    }
+
+    if (hasMixedSeriesTypes(yData, visualizationType)) {
+        // Percent-stacked bars clamp their axis to [0, 1] — a line/area series sharing that same
+        // axis would plot its raw values off-scale with no way to reconcile the two domains. Keep
+        // the percent stack and draw those series as bars — but only when every non-bar series is on
+        // the left axis: `TimeSeriesBarChart` has no notion of `series.type` and percent-stacks every
+        // series it's given, so a right-axis non-bar series would still get force-stacked into a
+        // constant 100% bar. A right-axis non-bar series has its own scale and is safe to combo.
+        const hasNonBarOnLeftAxis = yData.some(
+            (series) => seriesDisplayType(visualizationType, series.settings) !== 'bar' && !isRightAxisSeries(series)
+        )
+        const hasNonBarOnRightAxis = yData.some(
+            (series) => seriesDisplayType(visualizationType, series.settings) !== 'bar' && isRightAxisSeries(series)
+        )
+        const sharesPercentAxis =
+            visualizationType === ChartDisplayType.ActionsStackedBar &&
+            chartSettings.stackBars100 &&
+            hasNonBarOnLeftAxis &&
+            !hasNonBarOnRightAxis
+        return sharesPercentAxis ? 'bar' : 'combo'
+    }
+
+    // Not mixed, so every series resolved the same way — the first one speaks for all of them.
+    return seriesDisplayType(visualizationType, yData[0].settings) === 'bar' ? 'bar' : 'line'
+}
+
+export function barLayoutForDisplay(
+    visualizationType: ChartDisplayType,
+    chartSettings: ChartSettings
+): NonNullable<TimeSeriesBarChartConfig['barLayout']> {
+    if (visualizationType === ChartDisplayType.ActionsStackedBar) {
+        return chartSettings.stackBars100 ? 'percent' : 'stacked'
+    }
+    return 'grouped'
+}
+
+/** Bar layout for the combo path. */
+export function comboBarLayoutForDisplay(
+    visualizationType: ChartDisplayType,
+    chartSettings: ChartSettings
+): NonNullable<TimeSeriesComboChartConfig['barLayout']> {
+    if (visualizationType === ChartDisplayType.ActionsStackedBar) {
+        return chartSettings.stackBars100 ? 'percent' : 'stacked'
+    }
+    return 'grouped'
+}
+
+/** Returns true when {@link MAX_SERIES} is exceeded and the user should be warned (not on dashboards). */
+export function exceedsMaxSeries(yData: SqlChartProps['yData'], dashboardId: SqlChartProps['dashboardId']): boolean {
+    return !!yData && yData.length > MAX_SERIES && !dashboardId
+}
+
+export function warnTooManySeries(count: number): void {
+    lemonToast.warning(
+        `This breakdown has too many series (${count}). Only showing top ${MAX_SERIES} series in the chart. All series are still available in the table below.`
+    )
+}
+
+/** Pure cap to {@link MAX_SERIES}; warn separately via {@link exceedsMaxSeries}/{@link warnTooManySeries}. */
+export function capYSeriesData(yData: SqlChartProps['yData']): SqlLineYSeries[] | null {
+    if (!yData) {
+        return null
+    }
+    return yData.length > MAX_SERIES ? yData.slice(0, MAX_SERIES) : yData
+}
+
+/** Per-series display settings carried into quill's `series.meta` so the tooltip can format each
+ *  row with its own column's currency/duration/percent/prefix/suffix settings. */
+export interface SqlLineSeriesMeta {
+    settings?: AxisSeriesSettings
+}
+
+// A percent column doesn't sum meaningfully with the other columns.
+const isExcludedFromTotal = (settings: AxisSeriesSettings | undefined): boolean =>
+    settings?.formatting?.style === 'percent' || !!settings?.display?.excludeFromTotal
+
+const optsIntoValueLabels = (series: SqlLineYSeries): boolean => series.settings?.display?.valueLabels === 'show'
+
+export function hasValueLabels(
+    chartSettings: ChartSettings,
+    ySeriesData: SqlLineYSeries[] | null | undefined
+): boolean {
+    return !!chartSettings.showValuesOnSeries || !!ySeriesData?.some(optsIntoValueLabels)
+}
+
+export function withCategoryBarColors(
+    series: Series<SqlLineSeriesMeta>[],
+    labels: string[],
+    visualizationType: ChartDisplayType,
+    chartSettings: ChartSettings,
+    colors: string[],
+    dataTheme: DataColorTheme | null
+): Series<SqlLineSeriesMeta>[] {
+    if (
+        !chartSettings.colorBarsByCategory ||
+        chartSettings.seriesBreakdownColumn ||
+        series.length !== 1 ||
+        ![ChartDisplayType.ActionsBar, ChartDisplayType.ActionsBarValue].includes(visualizationType)
+    ) {
+        return series
+    }
+    const colorByCategory = new Map<string, string | undefined>()
+    const bars = labels.map((value) => {
+        const key = String(value)
+        if (!colorByCategory.has(key)) {
+            const customization = chartSettings.resultCustomizations?.[key]
+            const presetColor =
+                customization?.color && dataTheme ? getColorFromToken(dataTheme, customization.color) : undefined
+            colorByCategory.set(
+                key,
+                customization?.customColor ?? presetColor ?? colors[colorByCategory.size % colors.length]
+            )
+        }
+        return { color: colorByCategory.get(key) }
+    })
+    return [{ ...series[0], bars }]
+}
+
+export function buildSeries(
+    yData: SqlLineYSeries[],
+    visualizationType: ChartDisplayType,
+    showValuesOnSeries = false
+): Series<SqlLineSeriesMeta>[] {
+    const onlyOptedIn = !showValuesOnSeries && yData.some(optsIntoValueLabels)
+    return yData.map((series, index) => {
+        const settings = series.settings
+        const color = settings?.display?.color
+        const type = seriesDisplayType(visualizationType, settings)
+        const valueLabels = settings?.display?.valueLabels
+        const hideValueLabel = valueLabels === 'hide' || (onlyOptedIn && valueLabels !== 'show')
+
+        return {
+            key: getSeriesKey(series, index),
+            label: getSeriesLabel(series),
+            // null -> NaN so quill draws a gap rather than a zero.
+            data: series.data.map((value) => (value == null ? NaN : value)),
+            meta: { settings },
+            // Per-series type; ignored by the single-type line/bar charts, read by ComboChart.
+            type,
+            visibility: {
+                total: isExcludedFromTotal(settings) ? false : undefined,
+                valueLabel: hideValueLabel ? false : undefined,
+            },
+            // Only pin an explicit color; otherwise let quill assign palette colors by index.
+            ...(color ? { color } : {}),
+            ...(visualizationType !== ChartDisplayType.ActionsBarValue && settings?.display?.yAxisPosition === 'right'
+                ? { yAxisId: 'right' }
+                : {}),
+            ...(type !== 'bar' && isAreaSeries(visualizationType, settings)
+                ? { fill: { opacity: AREA_FILL_OPACITY } }
+                : {}),
+        }
+    })
+}
+
+/** Formats a chart display value (tooltip rows/total, value labels, custom axis ticks) with a
+ *  column's display settings. Values without an explicit style or decimal-place count are capped
+ *  at 3 fraction digits — a computed column (e.g. a ratio) otherwise renders with full float
+ *  precision (`22.222222222222`). The results table keeps full precision on purpose; this rounding
+ *  is chart-display only. */
+export function formatSqlSeriesValue(value: number, settings?: AxisSeriesSettings): string {
+    const formatting = settings?.formatting
+    // Styled values round inside formatDataWithSettings. Unstyled values are capped here — at the
+    // column's explicit decimalPlaces when set, else at 3. Prefix/suffix don't round, so they
+    // don't opt out.
+    const hasStyle = !!formatting && (formatting.style ?? 'none') !== 'none'
+    const display = hasStyle || !Number.isFinite(value) ? value : Number(value.toFixed(formatting?.decimalPlaces ?? 3))
+    return String(formatDataWithSettings(display, settings) ?? display)
+}
+
+const isRightAxisSeries = (series: SqlLineYSeries): boolean => series.settings?.display?.yAxisPosition === 'right'
+
+/** Series assigned to a given gutter — tick formatting reads the first series on that axis, so each
+ *  gutter formats from a column actually on it rather than a blind `series[0]`. */
+const seriesForAxis = (
+    ySeriesData: SqlLineYSeries[] | null | undefined,
+    position: 'left' | 'right'
+): SqlLineYSeries[] => (ySeriesData ?? []).filter((series) => isRightAxisSeries(series) === (position === 'right'))
+
+/** True when a column carries formatting that should override quill's default numeric axis ticks —
+ *  a non-default `style`, a prefix/suffix, or an explicit decimal-place count. Default settings fall
+ *  through so the axis keeps quill's human-friendly auto-formatting. */
+export function hasAxisTickFormatting(settings?: AxisSeriesSettings): boolean {
+    const formatting = settings?.formatting
+    if (!formatting) {
+        return false
+    }
+    return (
+        (formatting.style != null && formatting.style !== 'none') ||
+        !!formatting.prefix ||
+        !!formatting.suffix ||
+        formatting.decimalPlaces != null
+    )
+}
+
+/** Built-in tooltip for the line + combo SQL charts: each row formatted by its column's settings
+ *  (from `series.meta`), plus an optional total row. */
+export function buildSqlTooltipConfig(
+    chartSettings: ChartSettings,
+    ySeriesData?: SqlLineYSeries[] | null
+): TooltipConfig {
+    // The total sums only the columns buildSeries keeps in it (via `visibility.total`), so it must
+    // format with a column that's actually in the sum — a blind `[0]` borrows a percent column's
+    // style and renders a sum of counts as "15,061.4%". Matches the legacy renderer's
+    // first-summable-column choice.
+    const totalSettings = ySeriesData?.find((series) => !isExcludedFromTotal(series.settings))?.settings
+    return {
+        enabled: true,
+        pinnable: true,
+        placement: 'cursor',
+        sortedByValue: true,
+        valueFormatter: (value: number, entry: TooltipContext['seriesData'][number]) =>
+            formatSqlSeriesValue(value, (entry.series.meta as SqlLineSeriesMeta | undefined)?.settings),
+        showTotal: chartSettings.showTotalRow !== false,
+        totalFormatter: (value: number) => formatSqlSeriesValue(value, totalSettings),
+    }
+}
+
+/** Returns a tooltip label formatter for date/datetime x-axes, or undefined for non-date axes. */
+export function buildSqlDateLabelFormatter(
+    xData: AxisSeries<string>,
+    timezone: string
+): ((label: string) => string) | undefined {
+    const typeName = xData.column.type.name
+    if (typeName === 'DATETIME') {
+        return (label: string) => dayjs(label).tz(timezone).format('MMM D, HH:mm')
+    }
+    if (typeName === 'DATE') {
+        return (label: string) => dayjs(label).format('MMM D, YYYY')
+    }
+    return undefined
+}
+
+interface BuildConfigArgs {
+    xData: AxisSeries<string>
+    chartSettings: ChartSettings
+    timezone: string
+    goalLines?: GoalLine[]
+    ySeriesData?: SqlLineYSeries[] | null
+    series?: Series<SqlLineSeriesMeta>[]
+    embedded?: boolean
+    /** Wraps each legend row, e.g. with the series right-click menu. Passed straight through to
+     *  quill so this module stays free of JSX. */
+    legendRenderItem?: ChartLegendConfig['renderItem']
+}
+
+export interface BuildBarConfigArgs extends BuildConfigArgs {
+    visualizationType: ChartDisplayType
+}
+
+export type SqlBarGraphConfig = BarChartConfig &
+    TimeSeriesBarChartConfig & { yAxis?: YAxisConfig; referenceLines?: ReferenceLineProps[] }
+
+const SQL_BAR_TICK_LABEL_ROTATION = -45
+
+function buildXAxisConfig(
+    xData: AxisSeries<string>,
+    chartSettings: ChartSettings,
+    timezone: string,
+    tickLabelRotation?: number
+): XAxisConfig {
+    const isDateAxis = xData.column.type.name === 'DATE' || xData.column.type.name === 'DATETIME'
+
+    return {
+        label: chartSettings.xAxisLabel,
+        timezone: isDateAxis ? timezone : undefined,
+        hide: false,
+        tickLabelRotation: chartSettings.xAxisTickRotation ?? (isDateAxis ? undefined : tickLabelRotation),
+        tickFormatter:
+            chartSettings.showXAxisTicks === false
+                ? () => ''
+                : isDateAxis && chartSettings.xAxisDateFormat
+                  ? (label) =>
+                        (/^\d{4}-\d{2}-\d{2}$/.test(label)
+                            ? dayjs.tz(label, timezone)
+                            : dayjs(label).tz(timezone)
+                        ).format(chartSettings.xAxisDateFormat)
+                  : undefined,
+    }
+}
+
+/**
+ * One y-axis config from its `YAxisSettings` plus the series on that axis. Tick formatting reads the
+ * first series on the gutter (the same per-column settings the tooltip uses), and "start at zero"
+ * follows legacy: a linear axis begins at 0 unless explicitly turned off (`yAxisAtZero` fallback).
+ * Percent-stacked bars (`forceLinear`) skip both — the axis shows a 0–100% scale, not column values.
+ */
+function buildYAxisConfig(
+    yAxis: YAxisSettings | undefined,
+    axisSeries: SqlLineYSeries[],
+    yAxisAtZero: boolean | undefined,
+    { forceLinear = false, id, position }: { forceLinear?: boolean; id?: string; position?: 'left' | 'right' } = {}
+): YAxisConfig {
+    const isLog = !forceLinear && yAxis?.scale === 'logarithmic'
+    const tickSettings = axisSeries[0]?.settings
+    const tickFormatter =
+        !forceLinear && hasAxisTickFormatting(tickSettings)
+            ? (value: number): string => formatSqlSeriesValue(value, tickSettings)
+            : undefined
+
+    return {
+        ...(id ? { id } : {}),
+        ...(position ? { position } : {}),
+        label: yAxis?.label,
+        scale: isLog ? 'log' : 'linear',
+        showGrid: yAxis?.showGridLines ?? true,
+        hide: false,
+        tickFormatter: yAxis?.showTicks === false ? () => '' : tickFormatter,
+        // Quill ignores startAtZero on a log scale; floatBaseline (the false case) is line-only, so
+        // bars/combo keep their zero baseline regardless.
+        startAtZero: forceLinear || !isLog ? (yAxis?.startAtZero ?? yAxisAtZero ?? true) : undefined,
+    }
+}
+
+function buildLegendConfig(
+    chartSettings: ChartSettings,
+    renderItem: ChartLegendConfig['renderItem']
+): ChartLegendConfig {
+    // No `hiddenKeys`, so the legend is uncontrolled: quill owns which series are toggled off, and
+    // isolating a series works without SQL charts having to persist anything.
+    return {
+        show: chartSettings.showLegend ?? false,
+        position: chartSettings.legendPosition ?? 'top',
+        interactive: true,
+        renderItem,
+    }
+}
+
+/** The X/Y axis-border toggles map onto quill's per-edge axis lines — undefined when both are on
+ *  (the default), so the app-level style default still applies. */
+function buildAxisLinesConfig(chartSettings: ChartSettings, horizontal = false): AxisLinesConfig | undefined {
+    const x = chartSettings.showXAxisBorder ?? true
+    const y = chartSettings.showYAxisBorder ?? true
+    return x && y ? undefined : horizontal ? { x: y, y: x } : { x, y }
+}
+
+/**
+ * "Show values on series" — each on-series label formats with its own column's settings, reusing the
+ * tooltip's {@link formatSqlSeriesValue} path so labels read identically to the tooltip. `seriesIndex`
+ * aligns with `ySeriesData` because {@link buildSeries} preserves order and quill keeps hidden series
+ * in place (excluded, not removed). `context.rawValue` is the unscaled value (the `value` arg becomes a
+ * 0–1 fraction in percent-stacked bars), so labels always show the real number.
+ */
+function buildValueLabelsConfig(
+    chartSettings: ChartSettings,
+    ySeriesData: SqlLineYSeries[] | null | undefined
+): ValueLabelsConfig | undefined {
+    if (!hasValueLabels(chartSettings, ySeriesData)) {
+        return undefined
+    }
+    return {
+        position: chartSettings.valueLabelPosition,
+        background: chartSettings.valueLabelBackground,
+        color: chartSettings.valueLabelColor,
+        backgroundColor: chartSettings.valueLabelBackgroundColor,
+        fontSize: chartSettings.valueLabelFontSize,
+        rotation: chartSettings.valueLabelRotation,
+        formatter: (_value, seriesIndex, _dataIndex, context) =>
+            formatSqlSeriesValue(context.rawValue, ySeriesData?.[seriesIndex]?.settings),
+    }
+}
+
+export function buildLineChartConfig({
+    xData,
+    chartSettings,
+    timezone,
+    goalLines,
+    ySeriesData,
+    legendRenderItem,
+}: BuildConfigArgs): TimeSeriesLineChartConfig {
+    const leftSeries = seriesForAxis(ySeriesData, 'left')
+    const rightSeries = seriesForAxis(ySeriesData, 'right')
+    const labelFormatter = buildSqlDateLabelFormatter(xData, timezone)
+
+    return {
+        xAxis: buildXAxisConfig(xData, chartSettings, timezone),
+        // Emit a per-axis array only when a series actually targets the right axis — otherwise keep
+        // the single-object form so single-axis charts render unchanged. Each gutter formats and
+        // starts-at-zero from a column on that axis.
+        yAxis:
+            rightSeries.length > 0
+                ? [
+                      buildYAxisConfig(chartSettings.leftYAxisSettings, leftSeries, chartSettings.yAxisAtZero, {
+                          id: 'left',
+                          position: 'left',
+                      }),
+                      buildYAxisConfig(chartSettings.rightYAxisSettings, rightSeries, chartSettings.yAxisAtZero, {
+                          id: 'right',
+                          position: 'right',
+                      }),
+                  ]
+                : buildYAxisConfig(chartSettings.leftYAxisSettings, leftSeries, chartSettings.yAxisAtZero),
+        goalLines: schemaGoalLinesToConfigs(goalLines),
+        showAxisLines: buildAxisLinesConfig(chartSettings),
+        trendLines: buildTrendLineConfigs(ySeriesData),
+        legend: buildLegendConfig(chartSettings, legendRenderItem),
+        valueLabels: buildValueLabelsConfig(chartSettings, ySeriesData),
+        curve: chartStyleCurve(chartSettings.chartStyle),
+        tooltip: {
+            ...buildSqlTooltipConfig(chartSettings, ySeriesData),
+            ...(labelFormatter ? { labelFormatter } : {}),
+        },
+    }
+}
+
+export function buildBarChartConfig({
+    xData,
+    chartSettings,
+    timezone,
+    goalLines,
+    visualizationType,
+    ySeriesData,
+    legendRenderItem,
+}: BuildBarConfigArgs): SqlBarGraphConfig {
+    const barLayout = barLayoutForDisplay(visualizationType, chartSettings)
+    const labelFormatter = buildSqlDateLabelFormatter(xData, timezone)
+    const leftSeries = seriesForAxis(ySeriesData, 'left')
+    const rightSeries = seriesForAxis(ySeriesData, 'right')
+
+    return {
+        xAxis: buildXAxisConfig(xData, chartSettings, timezone, SQL_BAR_TICK_LABEL_ROTATION),
+        maxCategoryLabelWidth: MAX_CATEGORY_LABEL_WIDTH,
+        yAxis:
+            rightSeries.length > 0
+                ? [
+                      buildYAxisConfig(chartSettings.leftYAxisSettings, leftSeries, chartSettings.yAxisAtZero, {
+                          id: 'left',
+                          position: 'left',
+                          forceLinear: barLayout === 'percent',
+                      }),
+                      buildYAxisConfig(chartSettings.rightYAxisSettings, rightSeries, chartSettings.yAxisAtZero, {
+                          id: 'right',
+                          position: 'right',
+                          forceLinear: barLayout === 'percent',
+                      }),
+                  ]
+                : buildYAxisConfig(chartSettings.leftYAxisSettings, leftSeries, chartSettings.yAxisAtZero, {
+                      forceLinear: barLayout === 'percent',
+                  }),
+        goalLines: schemaGoalLinesToConfigs(goalLines),
+        showAxisLines: buildAxisLinesConfig(chartSettings),
+        barLayout,
+        bandPadding: chartSettings.barGap,
+        barCornerRadius: chartSettings.barGap === 0 ? 0 : undefined,
+        // Stacked bars must preserve negative values (SQL results can be negative) so they render
+        // below the zero baseline instead of being clamped to 0. Only the stacked layout stacks.
+        divergingStack: barLayout === 'stacked',
+        // Percent bars scale against a [0, 1] domain; trend lines plot raw series values, so they'd
+        // render off-scale and invisible.
+        trendLines: barLayout === 'percent' ? [] : buildTrendLineConfigs(ySeriesData),
+        legend: buildLegendConfig(chartSettings, legendRenderItem),
+        valueLabels: buildValueLabelsConfig(chartSettings, ySeriesData),
+        tooltip: {
+            ...buildSqlTooltipConfig(chartSettings, ySeriesData),
+            ...(labelFormatter ? { labelFormatter } : {}),
+        },
+    }
+}
+
+export function buildBarValueChartConfig({
+    xData,
+    chartSettings,
+    timezone,
+    goalLines,
+    ySeriesData,
+    series,
+    legendRenderItem,
+    embedded,
+}: BuildBarConfigArgs): SqlBarGraphConfig {
+    const categoryAxis = buildXAxisConfig(xData, { ...chartSettings, showXAxisTicks: true }, timezone)
+    const valueAxis = buildYAxisConfig(chartSettings.leftYAxisSettings, ySeriesData ?? [], chartSettings.yAxisAtZero)
+    const dateLabelFormatter = buildSqlDateLabelFormatter(xData, timezone)
+    const categoryLabelFormatter = (label: string): string => {
+        const index = Number(label)
+        if (!Number.isInteger(index) || index < 0 || index >= xData.data.length) {
+            return label
+        }
+        const value = xData.data[index]
+        if (value == null) {
+            return '[No value]'
+        }
+        const stringValue = String(value)
+        return chartSettings.xAxisDateFormat
+            ? (categoryAxis.tickFormatter?.(stringValue, index) ?? stringValue)
+            : (dateLabelFormatter?.(stringValue) ?? stringValue)
+    }
+    const referenceLines = goalLinesToReferenceLines(goalLines, series ?? [], 'horizontal')
+    const referenceLineValues = referenceLines.flatMap((line) => (typeof line.value === 'number' ? [line.value] : []))
+
+    return {
+        axisOrientation: 'horizontal',
+        barLayout: 'grouped',
+        barCornerRadius: chartSettings.barGap === 0 ? 0 : 4,
+        referenceLines,
+        xTickFormatter: chartSettings.showXAxisTicks === false ? () => '' : categoryLabelFormatter,
+        yTickFormatter: valueAxis.tickFormatter,
+        yScaleType: valueAxis.scale,
+        hideXAxis: valueAxis.hide,
+        hideYAxis: categoryAxis.hide,
+        xAxisLabel: valueAxis.label,
+        yAxisLabel: categoryAxis.label,
+        showGrid: valueAxis.showGrid,
+        showAxisLines: buildAxisLinesConfig(chartSettings, true),
+        maxCategoryLabelWidth: MAX_CATEGORY_LABEL_WIDTH,
+        bars: {
+            fitToHeight: embedded,
+            bandPadding: chartSettings.barGap,
+            valueDomain: referenceLineValues.length ? { include: referenceLineValues } : undefined,
+        },
+        legend: buildLegendConfig(chartSettings, legendRenderItem),
+        tooltip: {
+            ...buildSqlTooltipConfig(chartSettings, ySeriesData),
+            labelFormatter: categoryLabelFormatter,
+        },
+    }
+}
+
+export function buildComboChartConfig({
+    xData,
+    chartSettings,
+    timezone,
+    goalLines,
+    visualizationType,
+    ySeriesData,
+    legendRenderItem,
+}: BuildBarConfigArgs): TimeSeriesComboChartConfig & { yAxis?: YAxisConfig } {
+    const labelFormatter = buildSqlDateLabelFormatter(xData, timezone)
+
+    const leftSeries = seriesForAxis(ySeriesData, 'left')
+    const rightSeries = seriesForAxis(ySeriesData, 'right')
+    const barLayout = comboBarLayoutForDisplay(visualizationType, chartSettings)
+    const isPercent = barLayout === 'percent'
+
+    return {
+        xAxis: buildXAxisConfig(xData, chartSettings, timezone),
+        yAxis:
+            rightSeries.length > 0
+                ? [
+                      buildYAxisConfig(chartSettings.leftYAxisSettings, leftSeries, chartSettings.yAxisAtZero, {
+                          id: 'left',
+                          position: 'left',
+                          forceLinear: isPercent,
+                      }),
+                      buildYAxisConfig(chartSettings.rightYAxisSettings, rightSeries, chartSettings.yAxisAtZero, {
+                          id: 'right',
+                          position: 'right',
+                          forceLinear: isPercent,
+                      }),
+                  ]
+                : buildYAxisConfig(chartSettings.leftYAxisSettings, leftSeries, chartSettings.yAxisAtZero, {
+                      forceLinear: isPercent,
+                  }),
+        goalLines: schemaGoalLinesToConfigs(goalLines),
+        showAxisLines: buildAxisLinesConfig(chartSettings),
+        barLayout,
+        bandPadding: chartSettings.barGap,
+        barCornerRadius: chartSettings.barGap === 0 ? 0 : undefined,
+        // Stacked bars must preserve negative values (SQL results can be negative) so they render
+        // below the zero baseline instead of being clamped to 0 — mirrors buildBarChartConfig.
+        divergingStack: barLayout === 'stacked',
+        // Percent bars scale against a [0, 1] domain; trend lines plot raw series values, so they'd
+        // render off-scale and invisible.
+        trendLines: isPercent ? [] : buildTrendLineConfigs(ySeriesData),
+        curve: chartStyleCurve(chartSettings.chartStyle),
+        legend: buildLegendConfig(chartSettings, legendRenderItem),
+        valueLabels: buildValueLabelsConfig(chartSettings, ySeriesData),
+        tooltip: {
+            ...buildSqlTooltipConfig(chartSettings, ySeriesData),
+            ...(labelFormatter ? { labelFormatter } : {}),
+        },
+    }
+}

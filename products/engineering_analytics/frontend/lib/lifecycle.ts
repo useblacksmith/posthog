@@ -1,0 +1,105 @@
+import type { PRLifecycleEventApi, WorkflowRunDetailApi } from '../generated/api.schemas'
+
+export interface WorkflowRun {
+    ciEngine?: WorkflowRunDetailApi['ci_engine']
+    workflow: string
+    /** GitHub's id of the workflow, which survives a rename. Null for Depot CI and for rows synced without it. */
+    workflowId?: number | null
+    /** What started the run: 'push', 'pull_request', 'schedule'. Null when unknown. */
+    event?: string | null
+    /** Null while the run has not reported a finish. */
+    conclusion: string | null
+    startedAt: string | null
+    finishedAt: string | null
+    /** The sync's last update of the run. Absent where the source doesn't carry it. */
+    updatedAt?: string | null
+    durationSeconds: number | null
+    runId: number | null
+    /** 1 for the first attempt. Null when unknown, because lifecycle events don't carry it. */
+    runAttempt: number | null
+}
+
+const PASSING_CONCLUSIONS = new Set(['success', 'skipped', 'neutral', 'completed'])
+// Mirrors DECISIVE_FAILURE_CONCLUSIONS in backend/logic/queries/_workflow_filters.py (keep the two in sync).
+const DECISIVE_FAILURE_CONCLUSIONS = new Set(['failure', 'timed_out', 'startup_failure', 'stale'])
+
+/** For a finished run's conclusion; 'completed' stands in when no conclusion was recorded. */
+export function isPassingConclusion(conclusion: string): boolean {
+    return PASSING_CONCLUSIONS.has(conclusion)
+}
+
+/** Non-verdict outcomes and unknown values stay neutral. */
+export function isDecisiveFailure(conclusion: string | null): boolean {
+    return conclusion != null && DECISIVE_FAILURE_CONCLUSIONS.has(conclusion)
+}
+
+/**
+ * ci_finished detail is "workflow name: conclusion" (the name may contain ": "), flattened by the API
+ * from structured backend fields.
+ * TODO: expose workflow/conclusion as structured fields on PRLifecycleEventApi and delete this parse.
+ */
+function parseFinishedDetail(detail: string | null | undefined): { workflow: string; conclusion: string | null } {
+    if (!detail) {
+        return { workflow: 'unknown workflow', conclusion: null }
+    }
+    const splitAt = detail.lastIndexOf(': ')
+    if (splitAt === -1) {
+        return { workflow: detail, conclusion: null }
+    }
+    return { workflow: detail.slice(0, splitAt), conclusion: detail.slice(splitAt + 2) }
+}
+
+function unfinishedKey(event: PRLifecycleEventApi, workflow: string): string {
+    return `${event.ci_engine ?? ''}:${event.run_id ?? ''}:${workflow}`
+}
+
+/** Pairs events FIFO by workflow name. A finish without a matching start (events outside the window) still yields a row. */
+export function workflowRuns(events: PRLifecycleEventApi[]): WorkflowRun[] {
+    const runs: WorkflowRun[] = []
+    const unfinishedByWorkflow = new Map<string, WorkflowRun[]>()
+
+    for (const event of events) {
+        if (event.kind === 'ci_started') {
+            const workflow = event.detail ?? 'unknown workflow'
+            const run: WorkflowRun = {
+                workflow,
+                conclusion: null,
+                startedAt: event.at,
+                finishedAt: null,
+                durationSeconds: null,
+                runId: event.run_id ?? null,
+                ciEngine: event.ci_engine,
+                runAttempt: null,
+            }
+            runs.push(run)
+            const key = unfinishedKey(event, workflow)
+            const queue = unfinishedByWorkflow.get(key) ?? []
+            queue.push(run)
+            unfinishedByWorkflow.set(key, queue)
+        } else if (event.kind === 'ci_finished') {
+            const { workflow, conclusion } = parseFinishedDetail(event.detail)
+            const started = unfinishedByWorkflow.get(unfinishedKey(event, workflow))?.shift()
+            if (started) {
+                started.conclusion = conclusion ?? 'completed'
+                started.finishedAt = event.at
+                started.durationSeconds = Math.max(
+                    0,
+                    Math.round((Date.parse(event.at) - Date.parse(started.startedAt as string)) / 1000)
+                )
+            } else {
+                runs.push({
+                    workflow,
+                    conclusion: conclusion ?? 'completed',
+                    startedAt: null,
+                    finishedAt: event.at,
+                    durationSeconds: null,
+                    runId: event.run_id ?? null,
+                    ciEngine: event.ci_engine,
+                    runAttempt: null,
+                })
+            }
+        }
+    }
+
+    return runs
+}

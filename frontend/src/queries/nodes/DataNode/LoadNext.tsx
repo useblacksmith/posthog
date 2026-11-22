@@ -1,0 +1,124 @@
+import { useActions, useValues } from 'kea'
+import { useMemo } from 'react'
+
+import { IconInfo } from '@posthog/icons'
+
+import { TZLabel } from 'lib/components/TZLabel'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { humanFriendlyNumber } from 'lib/utils/numbers'
+
+import { dataNodeLogic } from '~/queries/nodes/DataNode/dataNodeLogic'
+import { isDataVisualizationNode, isHogQLQuery } from '~/queries/schema/node-guards'
+import { DataNode } from '~/queries/schema/schema-general'
+
+import { DEFAULT_PAGE_SIZE } from '../DataVisualization/Components/Table'
+
+interface LoadNextProps {
+    query: DataNode
+    nouns?: [string, string]
+    expectedTotalRows?: number
+}
+
+export function LoadNext({ query, nouns = ['entry', 'entries'], expectedTotalRows }: LoadNextProps): JSX.Element {
+    const { canLoadNextData, nextDataLoading, numberOfRows, hasMoreData, dataLimit } = useValues(dataNodeLogic)
+    const { loadNextData } = useActions(dataNodeLogic)
+
+    const text = useMemo(() => {
+        // if hogql based viz, show a different text
+        if (isDataVisualizationNode(query) && isHogQLQuery(query.source)) {
+            // No data limit means the user is controlling the pagination
+            if (!dataLimit) {
+                if (numberOfRows && numberOfRows <= DEFAULT_PAGE_SIZE) {
+                    return `Showing ${numberOfRows === 1 ? '' : 'all'} ${numberOfRows === 1 ? 'one' : numberOfRows} ${
+                        numberOfRows === 1 ? 'entry' : 'entries'
+                    }`
+                }
+                // If the number of rows is greater than the default page size, it's handled by pagination component
+                return ''
+            }
+            if (numberOfRows && numberOfRows < dataLimit) {
+                return `Showing ${numberOfRows === 1 ? '' : 'all'} ${numberOfRows === 1 ? 'one' : numberOfRows} ${
+                    numberOfRows === 1 ? 'entry' : 'entries'
+                }`
+            }
+            return `Default limit of ${dataLimit} rows reached`
+        } else if (isHogQLQuery(query) && !canLoadNextData && hasMoreData && dataLimit) {
+            return `Default limit of ${dataLimit} rows reached. Try adding a LIMIT clause to adjust.`
+        }
+        if (!canLoadNextData && !hasMoreData && numberOfRows && expectedTotalRows && numberOfRows < expectedTotalRows) {
+            return `Showing ${humanFriendlyNumber(numberOfRows)} of ${humanFriendlyNumber(expectedTotalRows)} ${nouns[1]}`
+        }
+        const noun = numberOfRows === 1 ? nouns[0] : nouns[1]
+        let result = `Showing ${
+            hasMoreData && (numberOfRows ?? 0) > 1 ? 'first ' : canLoadNextData || numberOfRows === 1 ? '' : 'all '
+        }${numberOfRows === 1 ? 'one' : humanFriendlyNumber(numberOfRows)} ${noun}`
+        if (canLoadNextData) {
+            result += nextDataLoading ? ' – loading more…' : ' – click to load more'
+        } else if (hasMoreData) {
+            result += ' – reached the end of results'
+        }
+        return result
+    }, [query, dataLimit, numberOfRows, canLoadNextData, nextDataLoading, hasMoreData, nouns, expectedTotalRows])
+
+    // pagination component exists
+    if (
+        isDataVisualizationNode(query) &&
+        isHogQLQuery(query.source) &&
+        !dataLimit &&
+        (!numberOfRows || numberOfRows > DEFAULT_PAGE_SIZE)
+    ) {
+        return <></>
+    }
+
+    return (
+        <div className="m-2 flex items-center">
+            <LemonButton onClick={loadNextData} loading={nextDataLoading} fullWidth center disabled={!canLoadNextData}>
+                {text}
+            </LemonButton>
+        </div>
+    )
+}
+
+export function LoadPreviewText({ localResponse }: { localResponse?: Record<string, any> | null }): JSX.Element {
+    const { response: dataNodeResponse, hasMoreData, dataLimit, responseLoading } = useValues(dataNodeLogic)
+
+    const response = dataNodeResponse ?? localResponse
+
+    if (responseLoading) {
+        return <div />
+    }
+
+    const resultCount = response && 'results' in response ? (response.results?.length ?? 0) : 0
+    const rowCountText = resultCount === 1 ? 'one row' : `${humanFriendlyNumber(resultCount)} rows`
+    const showMoreAvailable = hasMoreData && resultCount > 1
+    // The backend reports a limit only when it applied its default row limit to a query without a LIMIT clause.
+    const showRowLimitHint = showMoreAvailable && !!dataLimit
+
+    const lastRefreshTimeUtc: string | null | undefined =
+        response && 'last_refresh' in response ? response['last_refresh'] : null
+
+    return (
+        <>
+            <span className="inline-flex items-center gap-1">
+                <span>{showMoreAvailable ? `${rowCountText} loaded, more available` : `Showing ${rowCountText}`}</span>
+                {showRowLimitHint && (
+                    <LemonButton
+                        type="tertiary"
+                        size="xxsmall"
+                        noPadding
+                        icon={<IconInfo className="text-muted" />}
+                        tooltip="Add a LIMIT clause to return more rows."
+                        aria-label="Row limit information"
+                        data-attr="sql-editor-row-limit"
+                    />
+                )}
+            </span>
+            {lastRefreshTimeUtc && (
+                <>
+                    <span className="ml-2 mr-2">|</span>
+                    <TZLabel noStyles time={lastRefreshTimeUtc} />
+                </>
+            )}
+        </>
+    )
+}

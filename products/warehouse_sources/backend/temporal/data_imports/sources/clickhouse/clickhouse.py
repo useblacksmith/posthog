@@ -1,0 +1,1986 @@
+from __future__ import annotations
+
+import re
+import ssl
+import math
+import time
+import threading
+import collections
+from collections.abc import Callable, Generator, Iterator, Sequence
+from contextlib import _GeneratorContextManager, closing
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal, Optional
+
+import pyarrow as pa
+import structlog
+from clickhouse_connect import get_client
+from clickhouse_connect.driver import httputil
+from clickhouse_connect.driver.client import Client as ClickHouseClient
+from clickhouse_connect.driver.exceptions import ClickHouseError, ProgrammingError, StreamFailureError
+from dlt.common.normalizers.naming.snake_case import NamingConvention
+from structlog.types import FilteringBoundLogger
+from urllib3 import PoolManager
+from urllib3.response import HTTPResponse
+
+from posthog.exceptions_capture import capture_exception
+
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.arrow_utils import (
+    build_pyarrow_decimal_type,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.consts import DEFAULT_CHUNK_SIZE
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.partitioning import (
+    DEFAULT_PARTITION_TARGET_SIZE_IN_BYTES,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.helpers import incremental_type_to_initial_value
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.errors import (
+    is_transient_egress_proxy_error,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.mixins import _require_loopback
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.primary_keys import (
+    resolve_merge_keys,
+    should_probe_for_duplicates,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql import (
+    Column,
+    Table,
+    compute_projected_columns,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.identifiers import (
+    BacktickIdentifierQuoter,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.predicates import (
+    ValidatedRowFilter,
+    render_named_conditions,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
+from products.warehouse_sources.backend.types import ExternalDataSchemaSyncType, IncrementalFieldType, PartitionSettings
+
+# Why a connection is allowed to skip the egress proxy, or None to stay proxied. A reason
+# rather than a bool so `_get_client` — where every call site converges — can check the
+# claim against the address it was given instead of trusting the caller's pairing.
+BypassEnvProxy = Literal["tunnel_loopback", "internal_team"] | None
+
+# ClickHouse default ports
+CLICKHOUSE_HTTP_PORT = 8123
+CLICKHOUSE_HTTPS_PORT = 8443
+
+# Connect timeout for the HTTP client
+CONNECT_TIMEOUT_SECONDS = 15
+# Cloud cold-resume (idle services routinely take 30–60s to wake on the
+# first request) and to leave headroom over the server-side `max_execution_time`
+# caps on bounded probes
+METADATA_QUERY_TIMEOUT_SECONDS = 120
+# Per-query timeout for the main data extraction query
+DATA_QUERY_TIMEOUT_SECONDS = 60 * 60  # 1 hour
+
+# Batch accumulation targets for streaming to Delta Lake. ClickHouse yields
+# one Arrow block per `max_block_size` rows (20k default); writing each to
+# Delta unchanged produces one commit per block, which murders large-table
+# performance. We accumulate blocks until we hit either target, then
+# concat and yield a single pa.Table to the pipeline.
+YIELD_TARGET_BYTES = 200 * 1024 * 1024  # 200 MiB, matches pipeline partition target
+YIELD_TARGET_ROWS = 100_000
+
+# Page sizes for re-reading a table whose single query hits a host's per-query result or memory cap.
+PAGED_READ_INITIAL_ROWS = 500_000
+PAGED_READ_MIN_ROWS = 1_000
+
+# Quoter for user-supplied row-filter column names — the allowlist-validated
+# safety rail the shared predicate renderer expects. Trusted internal
+# identifiers (table/incremental columns) keep using `_quote_identifier`.
+_ROW_FILTER_IDENTIFIER_QUOTER = BacktickIdentifierQuoter()
+
+
+class ClickHouseConnectionError(Exception):
+    """Raised when we cannot establish or use a ClickHouse connection."""
+
+    pass
+
+
+# clickhouse-connect probes the server with `SELECT version(), timezone()` while
+# constructing the client and unpacks the reply into exactly two tab-separated
+# values (BaseClient._init_common_settings). A host that answers 2xx with a body
+# that isn't a ClickHouse response — a proxy/load-balancer landing page, or a
+# different service listening on the host/port — splits into a different shape, so
+# the driver raises a bare `ValueError` ("too many values to unpack") before we ever
+# A body that is a single integer line, or an empty body, is not a
+# sequence at all, so the same unpack raises `TypeError` ("'int' object is not
+# iterable") instead. The endpoint isn't serving the ClickHouse HTTP interface, so a
+# retry replays the identical failure; we surface it as a connection error rather
+# than leaking the cryptic driver error.
+#
+# The same probe can also fail by running out of response bytes mid-parse. For example, the body
+# can be JSON from another service instead of the ClickHouse wire format. clickhouse-connect
+# raises `StreamFailureError` in this case, so it needs the same treatment.
+NOT_A_CLICKHOUSE_HTTP_RESPONSE = (
+    "The host answered but did not return a valid ClickHouse response, so it isn't serving the "
+    "ClickHouse HTTP interface on that host/port. Check the host, port, and HTTPS setting "
+    "(and any tunnel or proxy in front of it)."
+)
+
+
+def _quote_identifier(identifier: str) -> str:
+    """Quote a ClickHouse identifier with backticks.
+
+    ClickHouse allows arbitrary identifiers when wrapped in backticks. We
+    escape backticks inside the name and refuse identifiers containing
+    null bytes — both of which would be unusable in any sane schema.
+    """
+    if "\x00" in identifier:
+        raise ValueError(f"identifier contains null byte: {identifier!r}")
+    escaped = identifier.replace("`", "``")
+    return f"`{escaped}`"
+
+
+def _qualified_table(database: str, table_name: str) -> str:
+    return f"{_quote_identifier(database)}.{_quote_identifier(table_name)}"
+
+
+# Number of times we re-open the client before giving up on a transient drop during connect.
+_MAX_CONNECT_ATTEMPTS = 3
+
+# Substrings of a connect-time failure that denote the connection being dropped before/during the
+# TLS read (ClickHouse Cloud cold-resume hanging up the first request, a proxy/LB idle cull, a
+# network blip) rather than a deterministic config error. A fresh attempt recovers. The TLS config
+# failures we never retry (`certificate verify failed`, `SSL: WRONG_VERSION_NUMBER`) don't contain
+# any of these, so the allowlist can't catch them.
+_TRANSIENT_CONNECT_DROP_SUBSTRINGS = (
+    # OpenSSL 3.x and 1.x wordings for the peer closing the socket without a clean TLS close_notify.
+    "UNEXPECTED_EOF_WHILE_READING",
+    "EOF occurred in violation of protocol",
+    "Connection reset by peer",
+    "Connection aborted",
+    # The egress proxy answered our CONNECT with a transient gateway status
+    # (`http.client` raises `OSError("Tunnel connection failed: <code> ...")`).
+    # 502/503/504 are the proxy or its upstream being briefly unreachable or
+    # overloaded, so a fresh attempt recovers. We match only these gateway
+    # codes, not deterministic proxy responses like 407 (auth required).
+    "Tunnel connection failed: 502",
+    "Tunnel connection failed: 503",
+    "Tunnel connection failed: 504",
+    # The ClickHouse host (or a proxy/gateway in front of it) rate-limited the
+    # request with HTTP 429 ("HTTP driver received HTTP status 429 (for url <url>)").
+    # A 429 is a transient "back off and retry" signal, not a config error.
+    # clickhouse-connect already retries 429 for queries (query_retries), but
+    # the probe it runs while constructing the client passes retries=0, so a
+    # 429 at connect time reaches us with no retry at all — a bounded backoff
+    # retry here recovers the common transient burst. We match only 429; other
+    # HTTP statuses keep their existing handling (404 is non-retryable in the
+    # source, 5xx stay retryable via Temporal).
+    "received HTTP status 429",
+    # urllib3 couldn't open the TCP connection to our own egress proxy at all — it never got far
+    # enough to attempt a CONNECT tunnel — and wraps the raw socket timeout as
+    # `ProxyError('Cannot connect to proxy.', TimeoutError('timed out'))`. This is our proxy
+    # being briefly unreachable, not a customer config problem, so a fresh attempt recovers.
+    # Matching the full inner exception keeps this distinct from `Tunnel connection failed:
+    # 407` above, which wraps the same "Cannot connect to proxy." prefix around a deterministic
+    # proxy-auth response and must stay non-retryable.
+    "Cannot connect to proxy.', TimeoutError('timed out')",
+    # The egress proxy accepted the TCP connection but hung up before answering the CONNECT
+    # request ("ProxyError('Cannot connect to proxy.', RemoteDisconnected('Remote end closed
+    # connection without response'))"). Same proxy-side blip as the TimeoutError case above, just
+    # a different socket-layer shape, so it gets the same in-process re-dial.
+    "Cannot connect to proxy.', RemoteDisconnected",
+)
+
+
+def _is_transient_connect_drop(error_message: str) -> bool:
+    return any(substring in error_message for substring in _TRANSIENT_CONNECT_DROP_SUBSTRINGS)
+
+
+# clickhouse-connect surfaces an upstream rate-limit as a full HTTP response
+# ("HTTP driver received HTTP status 429 (for url <url>)"), not a dropped connection:
+# the request reached the server (or a proxy in front of it) and it told us to
+# slow down. A 429 is explicitly "retry later", so a brief backed-off re-attempt
+# often clears a short rate-limit burst; if it doesn't, the failing Temporal
+# activity stays retryable and recovers later. We match only 429 — other 4xx
+# response codes are deterministic (e.g. 404 stays non-retryable). Matching the
+# stable status phrase keeps the volatile per-request URL out of the comparison.
+_TRANSIENT_RATE_LIMIT_SUBSTRING = "received HTTP status 429"
+
+# Backoff base between connect retries after a 429. Longer than the connect-drop
+# retry (which just re-dials) to give the rate limit room to clear.
+_RATE_LIMIT_BACKOFF_BASE_SECONDS = 2
+
+
+def _is_rate_limited(error_message: str) -> bool:
+    return _TRANSIENT_RATE_LIMIT_SUBSTRING in error_message
+
+
+# The source server's own concurrency limit ("Code: 202. DB::Exception: Too many
+# simultaneous queries for all users. Current: N, maximum: N. (TOO_MANY_SIMULTANEOUS_QUERIES)")
+# rejects even the client-construction probe query when the server is already at capacity.
+# Like a 429, this is the server asking us to back off, not a config error, and it clears on
+# its own as other queries finish — so a backed-off retry recovers it the same way. The
+# "Current"/"maximum" counts are volatile; the ClickHouse error-code name is stable.
+_TRANSIENT_TOO_MANY_QUERIES_SUBSTRING = "TOO_MANY_SIMULTANEOUS_QUERIES"
+
+
+def _is_too_many_queries(error_message: str) -> bool:
+    return _TRANSIENT_TOO_MANY_QUERIES_SUBSTRING in error_message
+
+
+def _is_retryable_connect_error(error_message: str) -> bool:
+    return (
+        _is_transient_connect_drop(error_message)
+        or _is_rate_limited(error_message)
+        or _is_too_many_queries(error_message)
+    )
+
+
+def _apply_session_settings(client: ClickHouseClient, settings: dict[str, Any]) -> None:
+    """Apply session settings, tolerating a server that reports one as readonly.
+
+    Our settings are performance and Arrow-output tuning hints. A readonly user
+    profile (common on managed ClickHouse) reports every setting as readonly, and
+    clickhouse-connect refuses to send those — raising ProgrammingError ("Setting
+    <x> is unknown or readonly"). Passing them at client construction turns that
+    into a fatal connect error that fails the whole sync. Applying them one by one
+    lets us keep the settings the server accepts and fall back to the server
+    default for the rest.
+    """
+    for key, value in settings.items():
+        try:
+            client.set_client_setting(key, value)
+        except ProgrammingError as e:
+            structlog.get_logger().warning(
+                "ClickHouse rejected session setting; falling back to server default",
+                setting=key,
+                exc_info=e,
+            )
+
+
+class _NoRedirectPoolManager(PoolManager):
+    """A urllib3 manager that refuses to follow redirects.
+
+    Only proxy-bypassing connections use this manager. urllib3 follows a cross-host redirect
+    on the same manager, so without this the host we connect to could answer with a redirect
+    to an arbitrary address and we would fetch it directly from the worker, which is the
+    reachability the egress proxy exists to deny. A ClickHouse HTTP endpoint has no reason to
+    redirect us, so refusing costs nothing: the 3xx response goes back to clickhouse-connect,
+    which reports it as a connection error.
+
+    Enforced by overriding `urlopen` rather than through the pool's `retries` option because
+    clickhouse-connect passes its own `retries` on every request, which would take precedence
+    over a pool-level default.
+    """
+
+    # The urllib3 1.26 stub types `urlopen` with the generic `RequestMethods` parameters and
+    # omits `redirect`, even though it is the real third parameter of `PoolManager.urlopen`.
+    # Declaring the stub's parameters instead would forward `encode_multipart` down to
+    # `HTTPConnectionPool.urlopen`, which rejects it, so match the runtime signature.
+    def urlopen(self, method: str, url: str, redirect: bool = True, **kw: Any) -> HTTPResponse:  # type: ignore[override]
+        return super().urlopen(method, url, redirect=False, **kw)
+
+
+# Bounds the manager cache below. `server_hostname` is user-controlled (the source's
+# configured host), so an unbounded cache would let repeated credential validations with
+# distinct hostnames retain a manager each for the life of the worker. Far above the number
+# of distinct tunneled HTTPS hostnames a worker legitimately serves concurrently.
+_POOL_MANAGER_CACHE_MAX = 32
+_pool_managers: collections.OrderedDict[tuple[bool, str | None], Any] = collections.OrderedDict()
+_pool_managers_lock = threading.Lock()
+
+
+def _no_env_proxy_pool_manager(verify: bool, server_hostname: str | None = None) -> Any:
+    """A shared urllib3 pool manager that never consults HTTP(S)_PROXY env vars.
+
+    clickhouse-connect only checks the proxy env vars when it builds its own
+    pool manager, so handing it one is the sanctioned per-code-path opt-out
+    from the egress proxy (see posthog/security/outbound_proxy.py for the
+    requests/httpx equivalents). Cached because clients don't own an injected
+    manager (`close()` leaves it alive), so per-call managers would leak.
+
+    `server_hostname` keeps TLS verification honest through an SSH tunnel: we dial the
+    tunnel's loopback bind, but SNI and hostname validation must run against the database's
+    own hostname or the certificate can never match. Mirrors what clickhouse-connect does
+    with `server_host_name` when it builds its own manager — a branch it skips entirely
+    when handed a `pool_mgr`.
+
+    LRU-bounded: eviction closes the manager's pools and removes it from the library's
+    process-global registry, the two places that would otherwise retain it forever. An
+    evicted manager still held by a live client keeps working — urllib3 rebuilds pools on
+    demand — it just stops being shared or expiry-swept.
+
+    Built from clickhouse-connect's own options factory so the TCP keepalive tuning and
+    certificate handling match a direct connection, then recorded where the library tracks
+    its own managers so connection expiry and interpreter-exit cleanup cover this one too.
+    """
+    key = (verify, server_hostname)
+    with _pool_managers_lock:
+        manager = _pool_managers.get(key)
+        if manager is not None:
+            _pool_managers.move_to_end(key)
+            return manager
+
+        options = httputil.get_pool_manager_options(verify=verify)
+        if server_hostname:
+            if verify:
+                options["assert_hostname"] = server_hostname
+            options["server_hostname"] = server_hostname
+        manager = _NoRedirectPoolManager(**options)
+        httputil.all_managers[manager] = int(time.time())
+        _pool_managers[key] = manager
+
+        while len(_pool_managers) > _POOL_MANAGER_CACHE_MAX:
+            _, evicted = _pool_managers.popitem(last=False)
+            httputil.all_managers.pop(evicted, None)
+            evicted.clear()
+        return manager
+
+
+def _get_client(
+    *,
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str | None,
+    secure: bool,
+    verify: bool,
+    query_timeout: int = DATA_QUERY_TIMEOUT_SECONDS,
+    settings: Optional[dict[str, Any]] = None,
+    bypass_env_proxy: BypassEnvProxy = None,
+    server_hostname: str | None = None,
+) -> ClickHouseClient:
+    """Create a ClickHouse HTTP client.
+
+    Uses clickhouse-connect, which speaks the HTTP/HTTPS interface. This is
+    firewall-friendly, easy to tunnel via SSH, and exposes a streaming Arrow
+    reader that we use to read very large tables without buffering them in
+    memory.
+
+    `bypass_env_proxy` names why the connection may skip the HTTP(S)_PROXY env
+    vars: "internal_team" for PostHog-internal teams
+    (`is_team_allowlisted_for_internal_hosts`), "tunnel_loopback" for an
+    address that came out of our own SSH tunnel — the proxy blocks the tunnel's
+    loopback bind, and no request would reach the forwarded port. For a
+    customer-supplied host the egress proxy is the SSRF backstop and must stay
+    in the path, so the tunnel claim is checked against the address here: the
+    flag and the host travel to this point independently, and a caller pairing
+    "tunnel_loopback" with a non-loopback host has lost that pairing.
+
+    `server_hostname` (tunnel only) is the database's own hostname, so TLS SNI
+    and certificate hostname validation run against it rather than against the
+    loopback address we dial — disabling verification is not the supported way
+    to make HTTPS work through a tunnel.
+    """
+    if bypass_env_proxy == "tunnel_loopback":
+        _require_loopback(host)
+    pool_mgr = None
+    if bypass_env_proxy:
+        tunnel_tls_hostname = server_hostname if bypass_env_proxy == "tunnel_loopback" and secure else None
+        pool_mgr = _no_env_proxy_pool_manager(verify, tunnel_tls_hostname)
+    attempt = 0
+    while True:
+        try:
+            client = get_client(
+                host=host,
+                port=port,
+                database=database,
+                username=user,
+                # clickhouse-connect expects str; passwordless auth is empty string.
+                password=password or "",
+                secure=secure,
+                verify=verify,
+                connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                send_receive_timeout=query_timeout,
+                query_limit=0,  # we manage limits ourselves
+                compress=True,
+                pool_mgr=pool_mgr,
+            )
+        except (ClickHouseError, OSError, ssl.SSLError) as e:
+            # OSError covers socket.gaierror, ConnectionRefusedError, TimeoutError,
+            # and httpx-raised network errors that subclass OSError. ssl.SSLError
+            # covers TLS handshake failures that happen before ClickHouse sees
+            # the request.
+            attempt += 1
+            message = str(e)
+            if attempt < _MAX_CONNECT_ATTEMPTS and _is_retryable_connect_error(message):
+                # A 429 or a too-many-queries rejection is the server asking us to
+                # slow down, so back off exponentially to give it room to clear; a
+                # dropped connection just needs a re-dial, so a short linear wait
+                # is enough.
+                wait = (
+                    _RATE_LIMIT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+                    if _is_rate_limited(message) or _is_too_many_queries(message)
+                    else attempt
+                )
+                structlog.get_logger().warning(
+                    "Transient ClickHouse connect error; retrying",
+                    attempt=attempt,
+                    max_attempts=_MAX_CONNECT_ATTEMPTS,
+                    wait_seconds=wait,
+                    exc_info=e,
+                )
+                time.sleep(wait)
+                continue
+            raise ClickHouseConnectionError(message) from e
+        except (ValueError, TypeError, StreamFailureError) as e:
+            # The construction-time server probe got a response it couldn't parse as a
+            # ClickHouse handshake (see NOT_A_CLICKHOUSE_HTTP_RESPONSE). Deterministic, so
+            # never retryable — don't spend the transient-retry budget on it.
+            raise ClickHouseConnectionError(NOT_A_CLICKHOUSE_HTTP_RESPONSE) from e
+
+        # Apply tuning settings after connect, not at construction, so a readonly
+        # source profile that rejects one degrades to the server default instead
+        # of failing the whole connection.
+        _apply_session_settings(client, settings or {})
+        return client
+
+
+def _strip_type_modifiers(type_name: str) -> tuple[str, bool]:
+    """Strip Nullable(...) and LowCardinality(...) wrappers.
+
+    Returns the inner type and whether the original type was Nullable.
+    LowCardinality alone does not affect nullability, so we recursively
+    unwrap it but never set the nullable flag for it.
+    """
+    nullable = False
+    current = type_name.strip()
+
+    while True:
+        if current.startswith("Nullable(") and current.endswith(")"):
+            nullable = True
+            current = current[len("Nullable(") : -1].strip()
+        elif current.startswith("LowCardinality(") and current.endswith(")"):
+            current = current[len("LowCardinality(") : -1].strip()
+        else:
+            break
+
+    return current, nullable
+
+
+def filter_clickhouse_incremental_fields(
+    columns: list[tuple[str, str, bool]],
+) -> list[tuple[str, IncrementalFieldType, bool]]:
+    """Return columns suitable for use as an incremental cursor.
+
+    ClickHouse type names are case-sensitive in metadata responses (e.g.
+    `DateTime64(6)`, `Int64`, `Date`). We unwrap Nullable/LowCardinality
+    wrappers first and then match against the bare type.
+    """
+    results: list[tuple[str, IncrementalFieldType, bool]] = []
+    for column_name, raw_type, nullable in columns:
+        inner_type, _ = _strip_type_modifiers(raw_type)
+        # DateTime, DateTime64, DateTime('UTC'), DateTime64(3, 'UTC'), ...
+        if inner_type.startswith("DateTime"):
+            results.append((column_name, IncrementalFieldType.Timestamp, nullable))
+        elif inner_type in ("Date", "Date32"):
+            results.append((column_name, IncrementalFieldType.Date, nullable))
+        elif inner_type in (
+            "Int8",
+            "Int16",
+            "Int32",
+            "Int64",
+            "Int128",
+            "Int256",
+            "UInt8",
+            "UInt16",
+            "UInt32",
+            "UInt64",
+            "UInt128",
+            "UInt256",
+        ):
+            results.append((column_name, IncrementalFieldType.Integer, nullable))
+
+    return results
+
+
+def get_schemas(
+    *,
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str | None,
+    secure: bool,
+    verify: bool,
+    names: list[str] | None = None,
+    bypass_env_proxy: BypassEnvProxy = None,
+    server_hostname: str | None = None,
+) -> dict[str, list[tuple[str, str, bool]]]:
+    """Discover columns for all tables in the given database.
+
+    Uses `system.columns`, which gives us everything in one round trip.
+    Note: ClickHouse columns expose the *original* type string, including
+    Nullable/LowCardinality wrappers — we keep the wrappers and parse them
+    later, so we can preserve nullability information.
+    """
+    client = _get_client(
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=password,
+        secure=secure,
+        verify=verify,
+        query_timeout=METADATA_QUERY_TIMEOUT_SECONDS,
+        bypass_env_proxy=bypass_env_proxy,
+        server_hostname=server_hostname,
+    )
+
+    try:
+        params: dict[str, Any] = {"database": database}
+        names_filter = ""
+        if names:
+            # clickhouse-connect formats tuples as `(a, b, c)`, which matches
+            # ClickHouse's IN clause syntax. Lists would format as `[a, b, c]`
+            # which is valid but less standard.
+            params["names"] = tuple(names)
+            names_filter = "AND table IN %(names)s"
+
+        # Skip ALIAS and EPHEMERAL columns. A native `SELECT *` never touches them, but our
+        # `SELECT *` expands to an explicit column list — so an ALIAS whose defining expression no
+        # longer resolves on the server (a dropped/renamed underlying column, or one the connecting
+        # user can't read) fails the whole query with UNKNOWN_IDENTIFIER (code 47), and EPHEMERAL
+        # columns aren't selectable at all. Ordinary, DEFAULT and MATERIALIZED columns hold real,
+        # selectable data and are kept.
+        result = client.query(
+            f"""
+            SELECT table, name, type
+            FROM system.columns
+            WHERE database = %(database)s {names_filter}
+              AND default_kind NOT IN ('ALIAS', 'EPHEMERAL')
+            ORDER BY table ASC, position ASC
+            """,
+            parameters=params,
+        )
+    finally:
+        client.close()
+
+    schema_list: dict[str, list[tuple[str, str, bool]]] = collections.defaultdict(list)
+    for row in result.result_rows:
+        table_name, column_name, raw_type = row[0], row[1], row[2]
+        if _is_inner_table(table_name):
+            continue
+        _, nullable = _strip_type_modifiers(raw_type)
+        schema_list[table_name].append((column_name, raw_type, nullable))
+
+    return schema_list
+
+
+def _is_inner_table(table_name: str) -> bool:
+    """Whether a table is a materialized view's hidden inner table.
+
+    ClickHouse backs a materialized view created without an explicit `TO`
+    target with an auto-generated inner table — `.inner.<mv_name>` on older
+    Ordinary databases, `.inner_id.<uuid>` on Atomic databases. These are
+    implementation details, not user data: their `.inner_id.<uuid>` names
+    change whenever the view is recreated, so a sync pointed at one breaks
+    the moment the view is rebuilt. Discover the materialized view by its own
+    name instead, never its inner table.
+    """
+    return table_name.startswith(".inner.") or table_name.startswith(".inner_id.")
+
+
+# Match `TO db.table` or `TO table` clause in MV CREATE statement.
+# ClickHouse always emits the target in `system.tables.create_table_query`
+# for MVs created with explicit `TO` target.
+_MV_TO_TARGET_RE = re.compile(
+    r"\bTO\s+(?:`((?:[^`]|``)+)`|(\w+))(?:\.(?:`((?:[^`]|``)+)`|(\w+)))?",
+    re.IGNORECASE,
+)
+
+
+def _parse_mv_target(create_query: str | None) -> tuple[str, str] | None:
+    """Parse (database, table) target from an MV's CREATE statement.
+
+    Only matches `TO <target>` — not `AS SELECT ... FROM <source>`. If the
+    MV has no explicit target, returns None and the caller uses the
+    `.inner_id.<uuid>` lookup instead.
+    """
+    if not create_query:
+        return None
+    match = _MV_TO_TARGET_RE.search(create_query)
+    if match is None:
+        return None
+    first = (match.group(1) or match.group(2) or "").replace("``", "`")
+    second = (match.group(3) or match.group(4) or "").replace("``", "`")
+    if second:
+        return (first, second)
+    # Single identifier means `TO target` without database qualifier — we
+    # can't resolve this without knowing the MV's own database; caller
+    # passes it in.
+    return ("", first)
+
+
+def get_clickhouse_row_count(
+    *,
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str | None,
+    secure: bool,
+    verify: bool,
+    names: list[str] | None = None,
+    bypass_env_proxy: BypassEnvProxy = None,
+    server_hostname: str | None = None,
+) -> dict[str, int]:
+    """Return total_rows per table from `system.tables`.
+
+    Coverage:
+    - MergeTree family: free — ClickHouse keeps a running counter.
+    - Distributed: fall back to `SELECT count()` (cheap, distributed).
+    - MaterializedView with `TO target`: resolve target, use its total_rows.
+    - MaterializedView without TO: resolve `.inner_id.<uuid>` inner table.
+    - Plain View / LiveView / WindowView / Memory / Buffer / Log / Kafka /
+      URL etc: omitted — count would require executing the view or scanning
+      the whole table.
+    """
+    client = _get_client(
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=password,
+        secure=secure,
+        verify=verify,
+        query_timeout=METADATA_QUERY_TIMEOUT_SECONDS,
+        bypass_env_proxy=bypass_env_proxy,
+        server_hostname=server_hostname,
+    )
+
+    try:
+        params: dict[str, Any] = {"database": database}
+        names_filter = ""
+        if names:
+            params["names"] = tuple(names)
+            names_filter = "AND name IN %(names)s"
+
+        result = client.query(
+            f"""
+            SELECT name, total_rows, engine, uuid, create_table_query
+            FROM system.tables
+            WHERE database = %(database)s {names_filter}
+            """,
+            parameters=params,
+        )
+
+        counts: dict[str, int] = {}
+        distributed_fallbacks: list[str] = []
+        mv_targets: dict[str, tuple[str, str]] = {}  # mv_name -> (target_db, target_table)
+        mv_inner_lookups: dict[str, str] = {}  # mv_name -> uuid (for .inner_id.<uuid>)
+
+        for row in result.result_rows:
+            # Some ClickHouse-compatible servers return system.tables rows narrower than the select.
+            if len(row) < 5:
+                continue
+            name, total_rows, engine, uuid_val, create_query = row[0], row[1], row[2], row[3], row[4]
+            if total_rows is not None:
+                counts[name] = int(total_rows)
+                continue
+            if engine == "Distributed":
+                distributed_fallbacks.append(name)
+                continue
+            if engine == "MaterializedView":
+                target = _parse_mv_target(create_query)
+                if target is not None:
+                    target_db, target_table = target
+                    mv_targets[name] = (target_db or database, target_table)
+                elif uuid_val:
+                    mv_inner_lookups[name] = str(uuid_val)
+
+        for name in distributed_fallbacks:
+            try:
+                count_result = client.query(f"SELECT count() FROM {_qualified_table(database, name)}")
+                if count_result.result_rows and count_result.result_rows[0][0] is not None:
+                    counts[name] = int(count_result.result_rows[0][0])
+            except ClickHouseError:
+                continue
+
+        # Batch lookup MV targets' total_rows via system.tables.
+        if mv_targets:
+            target_keys = list({(db, tbl) for db, tbl in mv_targets.values()})
+            try:
+                target_result = client.query(
+                    """
+                    SELECT database, name, total_rows
+                    FROM system.tables
+                    WHERE (database, name) IN %(keys)s AND total_rows IS NOT NULL
+                    """,
+                    parameters={"keys": tuple(target_keys)},
+                )
+                target_counts = {(row[0], row[1]): int(row[2]) for row in target_result.result_rows}
+                for mv_name, (target_db, target_table) in mv_targets.items():
+                    target_count = target_counts.get((target_db, target_table))
+                    if target_count is not None:
+                        counts[mv_name] = target_count
+            except ClickHouseError:
+                pass
+
+        # Batch lookup MVs without TO target via .inner_id.<uuid>.
+        if mv_inner_lookups:
+            inner_names = tuple(f".inner_id.{uuid}" for uuid in mv_inner_lookups.values())
+            try:
+                inner_result = client.query(
+                    """
+                    SELECT name, total_rows
+                    FROM system.tables
+                    WHERE database = %(database)s AND name IN %(names)s AND total_rows IS NOT NULL
+                    """,
+                    parameters={"database": database, "names": inner_names},
+                )
+                inner_counts = {row[0]: int(row[1]) for row in inner_result.result_rows}
+                for mv_name, uuid in mv_inner_lookups.items():
+                    inner_count = inner_counts.get(f".inner_id.{uuid}")
+                    if inner_count is not None:
+                        counts[mv_name] = inner_count
+            except ClickHouseError:
+                pass
+    except ClickHouseError:
+        return {}
+    finally:
+        client.close()
+
+    return counts
+
+
+def get_connection_metadata(
+    *,
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str | None,
+    secure: bool,
+    verify: bool,
+    bypass_env_proxy: BypassEnvProxy = None,
+    server_hostname: str | None = None,
+) -> dict[str, Any]:
+    """Probe the server for version metadata.
+
+    Used during onboarding to surface a sensible error if credentials are
+    valid but the database doesn't exist, and to record server version on
+    the source for future debugging.
+    """
+    client = _get_client(
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=password,
+        secure=secure,
+        verify=verify,
+        query_timeout=METADATA_QUERY_TIMEOUT_SECONDS,
+        bypass_env_proxy=bypass_env_proxy,
+        server_hostname=server_hostname,
+    )
+
+    try:
+        result = client.query("SELECT version(), currentDatabase()")
+        row = result.result_rows[0] if result.result_rows else (None, None)
+        version = str(row[0]) if row[0] is not None else ""
+        current_database = str(row[1]) if row[1] is not None else database
+
+        return {
+            "database": current_database,
+            "version": version,
+            "engine": "clickhouse",
+        }
+    finally:
+        client.close()
+
+
+# Regex helpers for parsing ClickHouse type strings.
+# DecimalN(S) variants have fixed precision implied by N — the single
+# argument is scale, not precision. Decimal(P, S) / Decimal(P) is the
+# explicit form.
+_DECIMAL_FIXED_WIDTHS: dict[str, int] = {"32": 9, "64": 18, "128": 38, "256": 76}
+_DECIMAL_FIXED_RE = re.compile(r"^Decimal(32|64|128|256)\(\s*(\d+)\s*\)$")
+_DECIMAL_VAR_RE = re.compile(r"^Decimal\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)$")
+_DATETIME64_RE = re.compile(r"^DateTime64\(\s*(\d+)\s*(?:,\s*'([^']*)'\s*)?\)$")
+_DATETIME_RE = re.compile(r"^DateTime(?:\(\s*'([^']*)'\s*\))?$")
+_FIXED_STRING_RE = re.compile(r"^FixedString\(\s*\d+\s*\)$")
+_ENUM_RE = re.compile(r"^Enum(?:8|16)\(.*\)$")
+
+
+def _datetime_unit_for_precision(precision: int) -> Literal["s", "ms", "us", "ns"]:
+    if precision <= 0:
+        return "s"
+    if precision <= 3:
+        return "ms"
+    if precision <= 6:
+        return "us"
+    return "ns"
+
+
+class ClickHouseColumn(Column):
+    """Implementation of the `Column` protocol for a ClickHouse source.
+
+    Attributes:
+        name: The column's name.
+        data_type: The original ClickHouse type string, possibly wrapped in
+            `Nullable(...)` and/or `LowCardinality(...)`.
+        nullable: Whether the column is nullable. Derived from the
+            `Nullable(...)` wrapper.
+    """
+
+    def __init__(self, name: str, data_type: str, nullable: bool) -> None:
+        self.name = name
+        self.data_type = data_type
+        self.nullable = nullable
+
+    def to_arrow_field(self) -> pa.Field[pa.DataType]:
+        inner, _ = _strip_type_modifiers(self.data_type)
+        arrow_type = self._inner_to_arrow_type(inner)
+        return pa.field(self.name, arrow_type, nullable=self.nullable)
+
+    @classmethod
+    def _inner_to_arrow_type(cls, inner: str) -> pa.DataType:
+        # Integer types
+        match inner:
+            case "Int8":
+                return pa.int8()
+            case "Int16":
+                return pa.int16()
+            case "Int32":
+                return pa.int32()
+            case "Int64":
+                return pa.int64()
+            case "UInt8":
+                return pa.uint8()
+            case "UInt16":
+                return pa.uint16()
+            case "UInt32":
+                return pa.uint32()
+            case "UInt64":
+                return pa.uint64()
+            case "Float32":
+                return pa.float32()
+            case "Float64":
+                return pa.float64()
+            case "Bool":
+                return pa.bool_()
+            case "String":
+                return pa.string()
+            case "UUID":
+                return pa.string()
+            case "Date":
+                return pa.date32()
+            case "Date32":
+                return pa.date32()
+            case "IPv4" | "IPv6":
+                return pa.string()
+            # Wide integers we cannot represent natively in Arrow — fall back to
+            # string so we don't silently truncate.
+            case "Int128" | "Int256" | "UInt128" | "UInt256":
+                return pa.string()
+
+        # DateTime / DateTime('UTC')
+        match_dt = _DATETIME_RE.match(inner)
+        if match_dt is not None:
+            # pa.timestamp stubs don't accept tz=None as a typed overload, so
+            # we branch instead of passing through Optional[str].
+            tz = match_dt.group(1) or None
+            return pa.timestamp("s", tz=tz) if tz else pa.timestamp("s")
+
+        # DateTime64(precision[, timezone])
+        match_dt64 = _DATETIME64_RE.match(inner)
+        if match_dt64 is not None:
+            precision = int(match_dt64.group(1))
+            tz = match_dt64.group(2) or None
+            unit = _datetime_unit_for_precision(precision)
+            return pa.timestamp(unit, tz=tz) if tz else pa.timestamp(unit)
+
+        # DecimalN(S) — N fixes precision (9/18/38/76), the lone arg is scale.
+        match_fixed = _DECIMAL_FIXED_RE.match(inner)
+        if match_fixed is not None:
+            precision = _DECIMAL_FIXED_WIDTHS[match_fixed.group(1)]
+            scale = int(match_fixed.group(2))
+            return build_pyarrow_decimal_type(precision, scale)
+
+        # Decimal(P[, S]) — explicit precision and scale.
+        match_dec = _DECIMAL_VAR_RE.match(inner)
+        if match_dec is not None:
+            precision = int(match_dec.group(1))
+            scale = int(match_dec.group(2)) if match_dec.group(2) is not None else 0
+            return build_pyarrow_decimal_type(precision, scale)
+
+        # FixedString(N) — bytes-like, but stored as string for portability
+        if _FIXED_STRING_RE.match(inner):
+            return pa.string()
+
+        # Enum8(...) / Enum16(...) — surface labels as strings
+        if _ENUM_RE.match(inner):
+            return pa.string()
+
+        # Composite types — Array, Map, Tuple, Nested, JSON, Object — are
+        # serialized to a JSON string. We could be smarter about Array of
+        # primitives in the future.
+        if (
+            inner.startswith("Array(")
+            or inner.startswith("Map(")
+            or inner.startswith("Tuple(")
+            or inner.startswith("Nested(")
+            or inner.startswith("Variant(")
+            or inner.startswith("Dynamic")
+            or inner.startswith("JSON")
+            or inner.startswith("Object(")
+        ):
+            return pa.string()
+
+        # Anything we don't recognise is safest as a string.
+        return pa.string()
+
+
+def _is_view_engine(engine: str | None) -> bool:
+    if not engine:
+        return False
+    return engine in ("View", "MaterializedView", "LiveView", "WindowView")
+
+
+def _is_materialized_view_engine(engine: str | None) -> bool:
+    return engine == "MaterializedView"
+
+
+def _get_table(client: ClickHouseClient, database: str, table_name: str) -> Table[ClickHouseColumn]:
+    """Read columns + table type for a single table from system tables."""
+    # Skip ALIAS and EPHEMERAL columns, matching `get_schemas`'s discovery query — see its
+    # comment for why: our `SELECT *` expands to an explicit column list, and an included
+    # ALIAS whose defining expression no longer resolves fails the whole sync query with
+    # UNKNOWN_IDENTIFIER (code 47), while EPHEMERAL columns aren't selectable at all.
+    cols_result = client.query(
+        """
+        SELECT name, type
+        FROM system.columns
+        WHERE database = %(database)s AND table = %(table)s
+          AND default_kind NOT IN ('ALIAS', 'EPHEMERAL')
+        ORDER BY position ASC
+        """,
+        parameters={"database": database, "table": table_name},
+    )
+
+    columns: list[ClickHouseColumn] = []
+    for name, raw_type in cols_result.result_rows:
+        _, nullable = _strip_type_modifiers(raw_type)
+        columns.append(ClickHouseColumn(name=name, data_type=raw_type, nullable=nullable))
+
+    if not columns:
+        raise ValueError(f"Table {database}.{table_name} not found or has no columns")
+
+    engine_result = client.query(
+        "SELECT engine FROM system.tables WHERE database = %(database)s AND name = %(table)s",
+        parameters={"database": database, "table": table_name},
+    )
+    engine = engine_result.result_rows[0][0] if engine_result.result_rows else None
+
+    table_type: str = "table"
+    if _is_materialized_view_engine(engine):
+        table_type = "materialized_view"
+    elif _is_view_engine(engine):
+        table_type = "view"
+
+    return Table(name=table_name, parents=(database,), columns=columns, type=table_type)  # type: ignore[arg-type]
+
+
+def _get_primary_keys(client: ClickHouseClient, database: str, table_name: str) -> list[str] | None:
+    """Return the columns of the table's sorting key.
+
+    ClickHouse's primary key is by definition a prefix of the sorting key,
+    and is the closest analog to a unique key — though it is *not*
+    necessarily unique. Callers must be prepared to handle duplicates.
+    """
+    result = client.query(
+        """
+        SELECT name
+        FROM system.columns
+        WHERE database = %(database)s AND table = %(table)s AND is_in_sorting_key = 1
+        ORDER BY position ASC
+        """,
+        parameters={"database": database, "table": table_name},
+    )
+    keys = [row[0] for row in result.result_rows]
+    return keys if keys else None
+
+
+def get_primary_keys_for_schemas(
+    *,
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str | None,
+    secure: bool,
+    verify: bool,
+    table_names: list[str],
+    bypass_env_proxy: BypassEnvProxy = None,
+    server_hostname: str | None = None,
+) -> dict[str, list[str] | None]:
+    """Detect primary keys (sorting key columns) for multiple tables.
+
+    Opens a single client and reuses `_get_primary_keys` per table. Returns
+    a dict keyed by every input table name, with None for tables where no
+    sorting key exists or the lookup failed.
+    """
+    result: dict[str, list[str] | None] = dict.fromkeys(table_names)
+    if not table_names:
+        return result
+
+    try:
+        client = _get_client(
+            host=host,
+            port=port,
+            database=database,
+            user=user,
+            password=password,
+            secure=secure,
+            verify=verify,
+            query_timeout=METADATA_QUERY_TIMEOUT_SECONDS,
+            bypass_env_proxy=bypass_env_proxy,
+            server_hostname=server_hostname,
+        )
+        try:
+            for table_name in table_names:
+                try:
+                    result[table_name] = _get_primary_keys(client, database, table_name)
+                except ClickHouseError as e:
+                    structlog.get_logger().warning(
+                        "Failed to detect primary keys for ClickHouse table",
+                        table=table_name,
+                        exc_info=e,
+                    )
+        finally:
+            client.close()
+    except Exception as e:
+        structlog.get_logger().warning("Failed to detect primary keys for ClickHouse schemas", exc_info=e)
+
+    return result
+
+
+# Row budget for the duplicate-PK probe. ClickHouse sorting keys are not
+# enforced unique, so we need *some* signal before trusting a user-selected
+# key for incremental merges — but a full-table GROUP BY (even streamed in
+# sort-key order) is too expensive to run every sync on billion-row tables.
+# Instead we scan up to this many rows and trust the user if no duplicate
+# surfaces. Misconfigured sort keys overwhelmingly surface duplicates in
+# any reasonably-sized prefix.
+DUPLICATE_PK_CHECK_ROW_BUDGET = 10_000_000
+
+# Settings for the duplicate-PK probe.
+# - optimize_aggregation_in_order streams the GROUP BY without a hash table
+#   when the merge key is a prefix of the sorting key. Any other key is a
+#   hash aggregation, which max_memory_usage bounds.
+# - max_rows_to_read + read_overflow_mode='break' cap the scan at
+#   DUPLICATE_PK_CHECK_ROW_BUDGET and *silently stop* instead of throwing.
+# - max_execution_time and max_memory_usage are belt-and-braces bounds.
+_DUPLICATE_PK_CHECK_SETTINGS: dict[str, Any] = {
+    "optimize_aggregation_in_order": 1,
+    "max_rows_to_read": DUPLICATE_PK_CHECK_ROW_BUDGET,
+    "read_overflow_mode": "break",
+    "max_execution_time": 30,
+    "max_memory_usage": 1_000_000_000,
+}
+
+# Substrings of probe errors that are expected environment limits or designed
+# fallbacks rather than bugs on our side. In every case the probe compared no
+# rows, so the key stays unverified and the sync continues. Capturing them only
+# adds error-tracking noise:
+#   - "is unknown or readonly": clickhouse-connect validates session settings
+#     client-side and refuses any the server reports as readonly or unknown
+#     ("Setting <x> is unknown or readonly"), routine on managed offerings
+#     (ClickHouse Cloud) and readonly user profiles.
+#   - MEMORY_LIMIT_EXCEEDED / TIMEOUT_EXCEEDED: the bounded probe exhausted one
+#     of its own budgets (`max_memory_usage` / `max_execution_time`).
+#     A merge key that is not a sorting-key prefix needs a hash table, and on
+#     large/slow (e.g. S3-backed) source tables even a streamed scan can hit
+#     these caps before `read_overflow_mode='break'` truncates on rows — the
+#     probe behaving exactly as designed. Some managed servers also enforce a memory
+#     cap below our `max_memory_usage`, surfacing the same way.
+#   - "Read timed out": the probe's `max_execution_time` only bounds server-side
+#     execution, not ClickHouse Cloud's cold-resume wake-up latency or a scan
+#     the server hasn't yet gotten around to capping — so the HTTP client's own
+#     read timeout can fire first. Same designed fallback as the budget caps.
+#   - A transient egress-proxy blip (`is_transient_egress_proxy_error`) is our own
+#     infrastructure being briefly unreachable, not a sign the probe's query itself
+#     is suspect. Same designed-fallback reasoning as the budget caps above.
+#   - ACCESS_DENIED (code 497): the connecting user lacks SELECT on this table. The main
+#     extraction query against the same table fails identically and the source already
+#     classifies it as a non-retryable customer-config issue (see `get_non_retryable_errors`),
+#     so capturing it here too is the same failure reported twice under a different frame.
+_EXPECTED_PROBE_FAILURE_SUBSTRINGS: tuple[str, ...] = (
+    "is unknown or readonly",
+    "MEMORY_LIMIT_EXCEEDED",
+    "TIMEOUT_EXCEEDED",
+    "Read timed out",
+    "ACCESS_DENIED",
+)
+
+
+def _is_expected_probe_failure(message: str) -> bool:
+    """Whether a duplicate-PK probe failure is an expected environment limit or designed fallback."""
+    return any(
+        substring in message for substring in _EXPECTED_PROBE_FAILURE_SUBSTRINGS
+    ) or is_transient_egress_proxy_error(message)
+
+
+def _has_duplicate_primary_keys(
+    client: ClickHouseClient,
+    database: str,
+    table_name: str,
+    primary_keys: list[str] | None,
+    logger: FilteringBoundLogger,
+    conditions: Sequence[str] = (),
+    parameters: dict[str, Any] | None = None,
+) -> bool | None:
+    """Check whether the merge key has obvious duplicate combinations.
+
+    ClickHouse enforces uniqueness on nothing, so the key an incremental merge
+    matches rows on is unproven until this probes it. `conditions` and
+    `parameters` limit the probe to the rows the sync reads. Without them we
+    probe a bounded prefix of the table (DUPLICATE_PK_CHECK_ROW_BUDGET rows)
+    rather than scanning the whole thing, because:
+
+    1. A user who chose a non-unique key will virtually always show
+       duplicates inside any reasonably sized prefix.
+    2. A full-table GROUP BY every incremental sync is prohibitively
+       expensive on the tables this source is designed for.
+    3. ClickHouse cannot *prove* uniqueness anyway — only the user can.
+
+    Returns:
+        True if duplicates are detected in the probed prefix, or if the
+        probe failed in an unexpected way. False when the probe completed
+        within budget without finding duplicates. None when the probe never
+        got to compare any rows, so it proves nothing either way.
+    """
+    if not primary_keys:
+        return False
+
+    quoted_keys = ", ".join(_quote_identifier(k) for k in primary_keys)
+    where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    # LIMIT 1 lets ClickHouse short-circuit the moment it finds a duplicate.
+    query = f"SELECT 1 FROM {_qualified_table(database, table_name)}{where} GROUP BY {quoted_keys} HAVING count() > 1 LIMIT 1"
+    try:
+        result = client.query(query, parameters=parameters, settings=_DUPLICATE_PK_CHECK_SETTINGS)
+        return len(result.result_rows) > 0
+    except ClickHouseError as e:
+        # An exhausted budget or a rejected setting compared no rows, so it says nothing about
+        # the key. Reporting it as a duplicate would stop a table that can still merge. (We
+        # don't hit max_rows_to_read here because read_overflow_mode='break' turns that into a
+        # silent truncation.)
+        if _is_expected_probe_failure(str(e)):
+            logger.warning(
+                f"_has_duplicate_primary_keys: probe did not complete for {database}.{table_name}, "
+                f"leaving the key unverified: {e}"
+            )
+            return None
+        logger.warning(
+            f"_has_duplicate_primary_keys: assuming duplicates exist (probe failed for {database}.{table_name}): {e}"
+        )
+        capture_exception(e)
+        return True
+
+
+def _get_incremental_row_count(
+    client: ClickHouseClient,
+    database: str,
+    table_name: str,
+    incremental_field: str,
+    last_value: Any,
+    logger: FilteringBoundLogger,
+    incremental_field_type: Optional[IncrementalFieldType] = None,
+) -> int | None:
+    """Count rows the incremental sync will actually pull.
+
+    `system.tables.total_rows` is the size of the entire table, which
+    overstates the work for incremental syncs after the initial backfill.
+    This query is cheap when the cursor is in the sorting key (primary
+    index skip). On error or timeout we return None and the caller falls
+    back to the total-table count.
+    """
+    quoted_field = _quote_identifier(incremental_field)
+    last_value_expr = _last_value_expr(incremental_field_type)
+    query = f"SELECT count() FROM {_qualified_table(database, table_name)} WHERE {quoted_field} > {last_value_expr}"
+    parameters = {"last_value": _last_value_param(last_value, incremental_field_type)}
+    try:
+        try:
+            result = client.query(query, parameters=parameters, settings={"max_execution_time": 30})
+        except ProgrammingError:
+            # A readonly user profile refuses every setting (see `_apply_session_settings`), and the
+            # driver raises before it sends the query. The total-table count the caller falls back to
+            # is also the size the billing limit check gives this sync, so one large table can then
+            # stop every sync of the team. The server's own limits bound the count instead.
+            result = client.query(query, parameters=parameters)
+    except ClickHouseError as e:
+        logger.debug(f"_get_incremental_row_count: fell back, count query failed: {e}")
+        return None
+
+    if not result.result_rows:
+        return None
+    count = result.result_rows[0][0]
+    return int(count) if count is not None else None
+
+
+# clickhouse-connect surfaces a non-2xx HTTP status from the server (or a
+# proxy/LB in front of it) as `HTTP driver received HTTP status <N>`.
+# 429 (rate limited) and the transient gateway codes mean the endpoint can't
+# serve us right now, not that anything we sent was wrong — they clear on their
+# own. A real ClickHouse query error carries a `Code: NNN` instead. We match
+# only these transient statuses so genuine failures still surface.
+# 500 is included: clickhouse-connect only wraps a response this way (rather than
+# "Received ClickHouse exception, code: N") when it carries no
+# `X-ClickHouse-Exception-Code` header, which a genuine ClickHouse-raised error
+# always sets — so a bare 500 means a proxy/load balancer in front of ClickHouse
+# failed, the same shape as 502/503/504.
+_TRANSIENT_HTTP_RESPONSE_SUBSTRINGS: tuple[str, ...] = (
+    "received HTTP status 429",
+    "received HTTP status 500",
+    "received HTTP status 502",
+    "received HTTP status 503",
+    "received HTTP status 504",
+)
+
+
+def _is_transient_http_response(message: str) -> bool:
+    return any(substring in message for substring in _TRANSIENT_HTTP_RESPONSE_SUBSTRINGS)
+
+
+def _get_partition_settings(
+    client: ClickHouseClient, database: str, table_name: str, logger: FilteringBoundLogger
+) -> PartitionSettings | None:
+    """Compute partition settings using `system.tables.total_bytes`.
+
+    ClickHouse maintains compressed and uncompressed sizes per table — we
+    use total_bytes (compressed on disk) as a rough proxy for memory cost
+    on the pipeline side. For non-MergeTree engines `total_bytes` may be
+    NULL, in which case we return None and the pipeline falls back to its
+    default partitioning.
+    """
+    try:
+        result = client.query(
+            """
+            SELECT total_rows, total_bytes
+            FROM system.tables
+            WHERE database = %(database)s AND name = %(table)s
+            """,
+            parameters={"database": database, "table": table_name},
+        )
+    except ClickHouseError as e:
+        # Partitioning is a best-effort optimization; any failure here degrades
+        # to default partitioning. A transient rate-limit/gateway response from
+        # the source, a read timeout from a slow or cold-starting source host, or a
+        # blip reaching our own egress proxy, isn't actionable on our side, so don't
+        # add error-tracking noise for it. clickhouse-connect wraps the proxy failure
+        # in the ClickHouseError caught here, so it never reaches the shared
+        # classification in `_handle_import_error`.
+        message = str(e)
+        if (
+            not _is_transient_http_response(message)
+            and "Read timed out" not in message
+            and not is_transient_egress_proxy_error(message)
+        ):
+            capture_exception(e)
+        logger.debug(f"_get_partition_settings: failed: {e}")
+        return None
+
+    if not result.result_rows or len(result.result_rows[0]) != 2:
+        return None
+
+    total_rows, total_bytes = result.result_rows[0]
+    if total_rows is None or total_bytes is None or total_rows == 0 or total_bytes == 0:
+        return None
+
+    bytes_per_row = total_bytes / total_rows
+    if bytes_per_row <= 0:
+        return None
+
+    partition_size = max(1, int(round(DEFAULT_PARTITION_TARGET_SIZE_IN_BYTES / bytes_per_row)))
+    partition_count = max(1, math.floor(total_rows / partition_size))
+
+    logger.debug(
+        f"_get_partition_settings: total_rows={total_rows} total_bytes={total_bytes} "
+        f"partition_size={partition_size} partition_count={partition_count}"
+    )
+    return PartitionSettings(partition_count=partition_count, partition_size=partition_size)
+
+
+# ClickHouse types Arrow output can't emit directly — we coerce to String
+# via toString() to avoid ClickHouse error 50 "Type is not supported by Arrow".
+_ARROW_UNSUPPORTED_EXACT = frozenset(
+    {
+        "UUID",
+        "IPv4",
+        "IPv6",
+        "Int128",
+        "Int256",
+        "UInt128",
+        "UInt256",
+        "Dynamic",
+        "JSON",
+    }
+)
+_ARROW_UNSUPPORTED_PREFIXES: tuple[str, ...] = (
+    "Enum8(",
+    "Enum16(",
+    "FixedString(",
+    "Array(",
+    "Map(",
+    "Tuple(",
+    "Nested(",
+    "Variant(",
+    "Object(",
+    "JSON(",
+    "Dynamic(",
+)
+
+
+def _needs_to_string_cast(inner: str) -> bool:
+    if inner in _ARROW_UNSUPPORTED_EXACT:
+        return True
+    return any(inner.startswith(prefix) for prefix in _ARROW_UNSUPPORTED_PREFIXES)
+
+
+def _reads_in_incremental_order(
+    columns: list[ClickHouseColumn], should_use_incremental_field: bool, incremental_field: str | None
+) -> bool:
+    """Whether the read returns its rows in ascending order of the incremental value.
+
+    The query has `ORDER BY <incremental field>`, and a paged read walks ascending ranges of that
+    field. A column that the SELECT list casts with `toString()` has an alias with the column's
+    name, so the server can order by the text and not by the number.
+    """
+    if not should_use_incremental_field or incremental_field is None:
+        return False
+    column = next((column for column in columns if column.name == incremental_field), None)
+    if column is None:
+        return False
+    inner, _ = _strip_type_modifiers(column.data_type)
+    return not _needs_to_string_cast(inner)
+
+
+def _build_select_list(columns: list[ClickHouseColumn]) -> str:
+    """Build explicit SELECT list, wrapping Arrow-unsupported types in toString()."""
+    parts: list[str] = []
+    for col in columns:
+        quoted = _quote_identifier(col.name)
+        inner, _ = _strip_type_modifiers(col.data_type)
+        if _needs_to_string_cast(inner):
+            parts.append(f"toString({quoted}) AS {quoted}")
+        else:
+            parts.append(quoted)
+    return ", ".join(parts)
+
+
+def _project_columns(
+    columns: list[ClickHouseColumn],
+    enabled_columns: Optional[list[str]],
+    primary_keys: Optional[list[str]],
+    incremental_field: Optional[str],
+) -> list[ClickHouseColumn]:
+    """Restrict the SELECT to the user-enabled columns.
+
+    `enabled_columns is None` syncs every column. Otherwise we project to the
+    enabled set plus the primary keys and incremental cursor (always synced),
+    reusing the shared `compute_projected_columns` ordering and mapping the
+    names back to typed `ClickHouseColumn`s so toString casting is preserved.
+    Falls back to all columns if nothing resolves, so a sync never selects zero
+    columns.
+    """
+    projected_names = compute_projected_columns(enabled_columns, primary_keys, incremental_field)
+    if projected_names is None:
+        return columns
+    by_name = {column.name: column for column in columns}
+    projected = [by_name[name] for name in projected_names if name in by_name]
+    return projected or columns
+
+
+_DATETIME_CURSOR_TYPES = (IncrementalFieldType.DateTime, IncrementalFieldType.Timestamp)
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _last_value_expr(incremental_field_type: Optional[IncrementalFieldType]) -> str:
+    """SQL expression binding the `last_value` parameter for the incremental cursor.
+
+    The stored cursor for a `Date` column can arrive as a raw day-count integer
+    (ClickHouse's own on-disk representation) rather than a date/string, e.g. after a
+    round-trip through JSON. Comparing that integer directly against a `Date` column
+    fails with "Illegal types of arguments (Date, UInt16) of function greater". Casting
+    through `toDate32` accepts both a day-count integer and a date string, so the
+    comparison always type-checks regardless of which shape the cursor is in.
+    """
+    if incremental_field_type == IncrementalFieldType.Date:
+        return "toDate32(%(last_value)s)"
+    if incremental_field_type in _DATETIME_CURSOR_TYPES:
+        return "fromUnixTimestamp64Micro(%(last_value)s)"
+    return "%(last_value)s"
+
+
+def _last_value_param(last_value: Any, incremental_field_type: Optional[IncrementalFieldType]) -> Any:
+    """The `last_value` parameter for `_last_value_expr`.
+
+    clickhouse-connect binds a datetime as a whole-second string, which ClickHouse then parses in
+    the column's timezone. Epoch microseconds keep the sub-second part and name one exact instant.
+    A naive cursor is UTC, like the naive Arrow timestamps it came from.
+    """
+    if incremental_field_type not in _DATETIME_CURSOR_TYPES:
+        return last_value
+    if isinstance(last_value, datetime):
+        instant = last_value if last_value.tzinfo is not None else last_value.replace(tzinfo=UTC)
+        return (instant - _UNIX_EPOCH) // timedelta(microseconds=1)
+    if isinstance(last_value, int | float) and not isinstance(last_value, bool):
+        return int(last_value * 1_000_000)
+    return last_value
+
+
+def _build_conditions(
+    *,
+    should_use_incremental_field: bool,
+    incremental_field: Optional[str],
+    incremental_field_type: Optional[IncrementalFieldType] = None,
+    row_filters: Optional[list[ValidatedRowFilter]] = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """WHERE conditions of the extraction query: the incremental cursor, then the row filters."""
+    filter_conditions, filter_params = render_named_conditions(row_filters or [], _ROW_FILTER_IDENTIFIER_QUOTER)
+    if not should_use_incremental_field:
+        return filter_conditions, filter_params
+
+    if incremental_field is None:
+        raise ValueError("incremental_field can't be None when should_use_incremental_field is True")
+
+    cursor_condition = f"{_quote_identifier(incremental_field)} > {_last_value_expr(incremental_field_type)}"
+    return [cursor_condition, *filter_conditions], filter_params
+
+
+def _build_query(
+    *,
+    database: str,
+    table_name: str,
+    columns: list[ClickHouseColumn],
+    should_use_incremental_field: bool,
+    incremental_field: Optional[str],
+    incremental_field_type: Optional[IncrementalFieldType] = None,
+    row_filters: Optional[list[ValidatedRowFilter]] = None,
+    page_conditions: Sequence[str] = (),
+) -> tuple[str, dict[str, Any]]:
+    """Build the data extraction query and its bound parameters.
+
+    Returns the SQL string plus the row-filter params dict. We never
+    interpolate values — only identifiers (which are validated) end up in the
+    SQL string; the incremental cursor and every row-filter value bind as
+    parameters. Row filters are ANDed onto the WHERE clause. Column types
+    ClickHouse can't emit as Arrow (UUID, IPv4, enums, arrays, ...) are
+    wrapped in toString() to avoid error 50.
+    """
+    qualified = _qualified_table(database, table_name)
+    select_list = _build_select_list(columns)
+
+    conditions, filter_params = _build_conditions(
+        should_use_incremental_field=should_use_incremental_field,
+        incremental_field=incremental_field,
+        incremental_field_type=incremental_field_type,
+        row_filters=row_filters,
+    )
+    conditions = [*conditions, *page_conditions]
+
+    query = f"SELECT {select_list} FROM {qualified}"
+    if conditions:
+        query += f" WHERE {' AND '.join(conditions)}"
+    if should_use_incremental_field and incremental_field is not None:
+        query += f" ORDER BY {_quote_identifier(incremental_field)} ASC"
+    return query, filter_params
+
+
+def _page_key(
+    columns: Sequence[ClickHouseColumn],
+    should_use_incremental_field: bool,
+    incremental_field: Optional[str],
+    primary_keys: Optional[list[str]],
+) -> list[str] | None:
+    """Columns whose values split the table into pages, or None when the table has none.
+
+    A NULL fails every comparison, so a nullable sorting-key column would drop its NULL rows from
+    every page. The incremental cursor has no such problem: the cursor condition already skips them.
+    """
+    if should_use_incremental_field:
+        return [incremental_field] if incremental_field else None
+    if not primary_keys:
+        return None
+    nullable_by_name = {column.name: column.nullable for column in columns}
+    if any(nullable_by_name.get(key, True) for key in primary_keys):
+        return None
+    return primary_keys
+
+
+def _page_conditions(
+    key: list[str], lower: Sequence[str] | None, upper: Sequence[str] | None
+) -> tuple[list[str], dict[str, Any]]:
+    """Conditions that keep the rows whose key is above `lower` and at most `upper`.
+
+    Bounds are the key values as ClickHouse renders them with toString(). ClickHouse parses each one
+    back into its column type for the comparison, so no precision is lost in the round trip.
+    """
+    key_tuple = f"({', '.join(_quote_identifier(column) for column in key)})"
+    conditions: list[str] = []
+    parameters: dict[str, Any] = {}
+    for name, operator, bound in (("page_lower", ">", lower), ("page_upper", "<=", upper)):
+        if bound is None:
+            continue
+        placeholders = [f"%({name}_{index})s" for index in range(len(bound))]
+        conditions.append(f"{key_tuple} {operator} ({', '.join(placeholders)})")
+        parameters.update({f"{name}_{index}": value for index, value in enumerate(bound)})
+    return conditions, parameters
+
+
+def _build_page_bound_query(
+    *, database: str, table_name: str, key: list[str], conditions: Sequence[str], page_rows: int
+) -> str:
+    """Query for the key of the last row of a page that starts after the given conditions."""
+    quoted_key = [_quote_identifier(column) for column in key]
+    query = f"SELECT {', '.join(f'toString({column})' for column in quoted_key)} FROM {_qualified_table(database, table_name)}"
+    if conditions:
+        query += f" WHERE {' AND '.join(conditions)}"
+    return f"{query} ORDER BY {', '.join(quoted_key)} LIMIT 1 OFFSET {page_rows - 1}"
+
+
+def _query_settings(chunk_size: int) -> dict[str, Any]:
+    """ClickHouse server-side settings applied to every data query.
+
+    These tune the streaming Arrow output and prevent runaway resource use
+    on the source side. They are intentionally conservative — operators
+    can override per-source via chunk_size_override on the schema.
+    """
+    return {
+        # Stream Arrow record batches in chunks of `chunk_size` rows. This is
+        # the per-batch row limit on the source side and bounds memory.
+        "max_block_size": chunk_size,
+        # Make Arrow output use real String columns instead of binary buffers,
+        # which keeps the resulting RecordBatches readable by Delta Lake.
+        "output_format_arrow_string_as_string": 1,
+        # Materialize LowCardinality columns into their underlying type, so the
+        # PyArrow schema we generate matches what we receive.
+        "output_format_arrow_low_cardinality_as_dictionary": 0,
+        # Cap query execution time to avoid hanging the worker on a runaway
+        # source-side query.
+        "max_execution_time": DATA_QUERY_TIMEOUT_SECONDS,
+        # When the ORDER BY column is a prefix of the sorting key, read parts
+        # in sort order and skip the top-level sort entirely. Free when
+        # applicable, harmless otherwise. Critical for incremental syncs on
+        # big tables — without this, ORDER BY forces a full external sort.
+        "optimize_read_in_order": 1,
+        # If we still have to sort (cursor not in sorting key), spill to disk
+        # at 500 MB instead of OOMing the server. The hot path stays in
+        # memory, slow path degrades gracefully.
+        "max_bytes_before_external_sort": 500 * 1024 * 1024,
+    }
+
+
+# Some hosts serve the ClickHouse HTTP interface but not the ArrowStream output format, and the
+# rejection names the format: Tinybird answers with a 403 "invalid format ArrowStream", and a
+# ClickHouse build without Arrow support raises "Unknown format ArrowStream" (UNKNOWN_FORMAT).
+_ARROW_FORMAT_REJECTED_SUBSTRING = "format ArrowStream"
+
+
+def _is_arrow_format_rejected(message: str) -> bool:
+    return _ARROW_FORMAT_REJECTED_SUBSTRING in message
+
+
+# ClickHouse sends a completely empty HTTP body for an ArrowStream query that matches zero rows,
+# instead of a stream that opens with a schema message and no record batches. pyarrow's reader
+# needs that schema message just to open the stream, so it raises rather than yielding nothing.
+# An empty body is exactly what a zero-row match looks like, so we treat it as one.
+_EMPTY_ARROW_RESPONSE_MESSAGE = "Tried reading schema message, was null or length 0"
+
+
+# Per-query caps some hosts enforce and a user can't raise. Tinybird caps each result at 500 MiB and
+# each query's memory, and fails the query before it sends any row.
+_QUERY_LIMIT_EXCEEDED_SUBSTRINGS: tuple[str, ...] = ("TOO_MANY_ROWS_OR_BYTES", "MEMORY_LIMIT_EXCEEDED")
+
+
+def _is_query_limit_exceeded(message: str) -> bool:
+    return any(substring in message for substring in _QUERY_LIMIT_EXCEEDED_SUBSTRINGS)
+
+
+# SETTING_CONSTRAINT_VIOLATION (code 452) — a settings profile caps `max_execution_time` below the
+# value `_query_settings` requests (ClickHouse Cloud plans commonly set this). The cap isn't visible
+# at connect time: `_apply_session_settings` only catches settings the server reports as
+# unconditionally readonly, not ones that are writable but range-constrained. So instead of the
+# server just enforcing its own lower value, it rejects the first data query outright. The error
+# names its own ceiling, so we retry once with that value — still the safety net the setting exists
+# for, just shorter than we asked for.
+_MAX_EXECUTION_TIME_CONSTRAINT_RE = re.compile(r"Setting max_execution_time shouldn't be greater than (\d+)")
+
+
+def _max_execution_time_ceiling(message: str) -> int | None:
+    match = _MAX_EXECUTION_TIME_CONSTRAINT_RE.search(message)
+    return int(match.group(1)) if match else None
+
+
+_TIMESTAMP_UNIT_DIGITS: dict[str, int] = {"s": 0, "ms": 3, "us": 6, "ns": 9}
+
+
+def _datetime64_precision(column: ClickHouseColumn) -> int | None:
+    inner, _ = _strip_type_modifiers(column.data_type)
+    match = _DATETIME64_RE.match(inner)
+    return int(match.group(1)) if match is not None else None
+
+
+def _ticks_to_timestamp(ticks: Sequence[Any], precision: int, timestamp_type: pa.TimestampType) -> pa.Array[Any]:
+    scale = 10 ** (_TIMESTAMP_UNIT_DIGITS[timestamp_type.unit] - precision)
+    if scale != 1:
+        ticks = [None if tick is None else tick * scale for tick in ticks]
+    return pa.array(ticks, type=pa.int64()).cast(timestamp_type)
+
+
+def _native_column_to_arrow(
+    values: Sequence[Any], field: pa.Field[pa.DataType], datetime64_precision: int | None
+) -> pa.Array[Any]:
+    if datetime64_precision is not None and isinstance(field.type, pa.TimestampType):
+        return _ticks_to_timestamp(values, datetime64_precision, field.type)
+    try:
+        return pa.array(values, type=field.type)
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+        # Types that `_build_select_list` does not cast with toString() but `to_arrow_field` maps to
+        # string (geo types, AggregateFunction states, ...) decode to Python tuples, lists or numbers.
+        if not pa.types.is_string(field.type):
+            raise
+        return pa.array([None if value is None else str(value) for value in values], type=pa.string())
+
+
+def _native_block_to_record_batch(
+    block: Sequence[Sequence[Any]], schema: pa.Schema, datetime64_precisions: list[int | None]
+) -> pa.RecordBatch:
+    return pa.RecordBatch.from_arrays(
+        [
+            _native_column_to_arrow(column, field, precision)
+            for column, field, precision in zip(block, schema, datetime64_precisions)
+        ],
+        schema=schema,
+    )
+
+
+def _stream_record_batches(
+    client: ClickHouseClient,
+    query: str,
+    parameters: dict[str, Any],
+    columns: list[ClickHouseColumn],
+    logger: FilteringBoundLogger,
+) -> Generator[pa.RecordBatch]:
+    """Stream the extraction query as one Arrow record batch per ClickHouse block.
+
+    ArrowStream is the fast path because the server builds the batches. When the host rejects that
+    format, we read the same query in the Native format, which every host that passed discovery
+    accepts because clickhouse-connect uses it for the metadata queries. Each Native block is
+    converted against the discovered schema. The host rejects the format before it sends any rows,
+    so the retry cannot duplicate data. Both paths hold one block (`max_block_size` rows) at a
+    time, plus the bounded HTTP read buffer of clickhouse-connect.
+    """
+    try:
+        arrow_stream = client.query_arrow_stream(query, parameters=parameters)
+    except pa.ArrowInvalid as e:
+        if _EMPTY_ARROW_RESPONSE_MESSAGE not in str(e):
+            raise
+        return
+    except ClickHouseError as e:
+        if not _is_arrow_format_rejected(str(e)):
+            raise
+        logger.warning("ClickHouse host rejected the ArrowStream format, reading in the Native format instead")
+        schema = pa.schema([column.to_arrow_field() for column in columns])
+        datetime64_precisions = [_datetime64_precision(column) for column in columns]
+        # Python datetimes stop at microseconds, so DateTime64 columns come back as integer ticks
+        # to keep the sub-microsecond digits of DateTime64(7..9).
+        column_formats: dict[str, str | dict[str, str]] = {
+            column.name: "int" for column, precision in zip(columns, datetime64_precisions) if precision is not None
+        }
+        with client.query_column_block_stream(query, parameters=parameters, column_formats=column_formats) as blocks:
+            for block in blocks:
+                yield _native_block_to_record_batch(block, schema, datetime64_precisions)
+        return
+
+    with arrow_stream as batches:
+        yield from batches
+
+
+def clickhouse_source(
+    *,
+    tunnel: Callable[[], _GeneratorContextManager[tuple[str, int]]],
+    user: str,
+    password: str | None,
+    database: str,
+    secure: bool,
+    verify: bool,
+    table_names: list[str],
+    should_use_incremental_field: bool,
+    logger: FilteringBoundLogger,
+    db_incremental_field_last_value: Optional[Any],
+    chunk_size_override: Optional[int] = None,
+    incremental_field: Optional[str] = None,
+    incremental_field_type: Optional[IncrementalFieldType] = None,
+    row_filters: Optional[list[ValidatedRowFilter]] = None,
+    enabled_columns: Optional[list[str]] = None,
+    stored_primary_keys: Optional[list[str]] = None,
+    bypass_env_proxy: BypassEnvProxy = None,
+    server_hostname: str | None = None,
+    sync_type: ExternalDataSchemaSyncType | None = None,
+) -> SourceResponse:
+    """Build a SourceResponse that pulls a single ClickHouse table.
+
+    Streams the data via Arrow batches so we never materialize the whole
+    table in memory. Each yielded `pa.Table` is one Arrow record batch.
+    """
+    if not table_names or not table_names[0]:
+        raise ValueError("Table name is missing")
+    table_name = table_names[0]
+
+    chunk_size = chunk_size_override if chunk_size_override is not None else DEFAULT_CHUNK_SIZE
+
+    with tunnel() as (host, port):
+        client = _get_client(
+            host=host,
+            port=port,
+            database=database,
+            user=user,
+            password=password,
+            secure=secure,
+            verify=verify,
+            query_timeout=METADATA_QUERY_TIMEOUT_SECONDS,
+            bypass_env_proxy=bypass_env_proxy,
+            server_hostname=server_hostname,
+        )
+
+        try:
+            logger.info(f"Discovering table {database}.{table_name}")
+            table = _get_table(client, database, table_name)
+            logger.info(f"Source schema: {table.to_arrow_schema()}")
+
+            primary_keys = _get_primary_keys(client, database, table_name)
+            if primary_keys:
+                logger.debug(f"Found primary keys (sorting key): {primary_keys}")
+
+            # Project to the user-selected columns (always keeping PK + cursor).
+            projected_columns = _project_columns(list(table.columns), enabled_columns, primary_keys, incremental_field)
+            page_key = _page_key(list(table.columns), should_use_incremental_field, incremental_field, primary_keys)
+
+            # Warn when the incremental cursor isn't the sorting-key prefix.
+            # ClickHouse can only skip the sort if the ORDER BY column leads
+            # the sorting key; otherwise every incremental run does a full
+            # server-side sort. `max_bytes_before_external_sort` in
+            # `_query_settings` keeps it from OOMing, but it will be slow.
+            if should_use_incremental_field and incremental_field and primary_keys:
+                if primary_keys[0] != incremental_field:
+                    logger.warning(
+                        f"Incremental cursor '{incremental_field}' is not the first "
+                        f"column of the sorting key {primary_keys} for "
+                        f"{database}.{table_name}. Each incremental sync will perform "
+                        f"a server-side sort. Consider a cursor that matches the "
+                        f"table's sorting key for best performance."
+                    )
+
+            row_counts = get_clickhouse_row_count(
+                host=host,
+                port=port,
+                database=database,
+                user=user,
+                password=password,
+                secure=secure,
+                verify=verify,
+                names=[table_name],
+                bypass_env_proxy=bypass_env_proxy,
+                server_hostname=server_hostname,
+            )
+            rows_to_sync: int | None = row_counts.get(table_name)
+
+            # For incremental resumes, pull the filtered count so progress
+            # reporting isn't anchored to the full table size.
+            if should_use_incremental_field and incremental_field and db_incremental_field_last_value is not None:
+                incremental_count = _get_incremental_row_count(
+                    client,
+                    database,
+                    table_name,
+                    incremental_field,
+                    db_incremental_field_last_value,
+                    logger,
+                    incremental_field_type=incremental_field_type,
+                )
+                if incremental_count is not None:
+                    rows_to_sync = incremental_count
+
+            partition_settings = (
+                _get_partition_settings(client, database, table_name, logger) if should_use_incremental_field else None
+            )
+
+            # The merge matches rows on the stored key when one exists (`resolve_primary_keys`),
+            # so the probe must check that key and not the sorting key.
+            merge_keys = resolve_merge_keys(
+                stored_primary_keys, primary_keys, [column.name for column in table.columns]
+            )
+            has_duplicate_primary_keys = False
+            # Only an incremental sync merges, so it is the only sync that reads the probe result.
+            if sync_type == ExternalDataSchemaSyncType.INCREMENTAL and should_probe_for_duplicates(
+                merge_keys, primary_keys, constraints_enforced=False
+            ):
+                probe_conditions: list[str] = []
+                probe_parameters: dict[str, Any] = {}
+                # The merge can only fail on a duplicate among the rows this run reads.
+                if should_use_incremental_field and incremental_field and db_incremental_field_last_value is not None:
+                    probe_conditions, filter_params = _build_conditions(
+                        should_use_incremental_field=True,
+                        incremental_field=incremental_field,
+                        incremental_field_type=incremental_field_type,
+                        row_filters=row_filters,
+                    )
+                    probe_parameters = {
+                        **filter_params,
+                        "last_value": _last_value_param(db_incremental_field_last_value, incremental_field_type),
+                    }
+                probed = _has_duplicate_primary_keys(
+                    client, database, table_name, merge_keys, logger, probe_conditions, probe_parameters
+                )
+                # Only a probe that ran proves anything.
+                has_duplicate_primary_keys = probed is True
+        finally:
+            client.close()
+
+    def get_rows() -> Iterator[Any]:
+        logger.info(f"get_rows: starting stream for {database}.{table_name} chunk_size={chunk_size}")
+        # Open a fresh tunnel + client for the streaming read so the
+        # connection used for discovery isn't held open longer than needed.
+        with tunnel() as (stream_host, stream_port):
+            stream_client = _get_client(
+                host=stream_host,
+                port=stream_port,
+                database=database,
+                user=user,
+                password=password,
+                secure=secure,
+                verify=verify,
+                query_timeout=DATA_QUERY_TIMEOUT_SECONDS,
+                settings=_query_settings(chunk_size),
+                bypass_env_proxy=bypass_env_proxy,
+                server_hostname=server_hostname,
+            )
+
+            try:
+                base_conditions, filter_params = _build_conditions(
+                    should_use_incremental_field=should_use_incremental_field,
+                    incremental_field=incremental_field,
+                    incremental_field_type=incremental_field_type,
+                    row_filters=row_filters,
+                )
+
+                parameters: dict[str, Any] = dict(filter_params)
+                if should_use_incremental_field:
+                    last_value = db_incremental_field_last_value
+                    if last_value is None and incremental_field_type is not None:
+                        last_value = incremental_type_to_initial_value(incremental_field_type)
+                    parameters["last_value"] = _last_value_param(last_value, incremental_field_type)
+
+                def read_batches() -> Generator[pa.RecordBatch]:
+                    """Read the table in one query, or in pages of key ranges once a host limit rejects that.
+
+                    A page is retried with half as many rows while the host rejects it before it sends a
+                    row. A rejection after rows were read raises, because the retry would read them again.
+                    """
+                    page_rows: int | None = None
+                    lower: list[str] | None = None
+                    # Set once a capped retry has fired, so a host that keeps rejecting (a
+                    # misconfigured or adversarial endpoint) can't spin this loop forever.
+                    retried_max_execution_time = False
+                    while True:
+                        read_any = False
+                        try:
+                            upper: list[str] | None = None
+                            page_conditions: list[str] = []
+                            page_parameters: dict[str, Any] = {}
+                            if page_rows is not None and page_key is not None:
+                                lower_conditions, lower_parameters = _page_conditions(page_key, lower, None)
+                                bound_query = _build_page_bound_query(
+                                    database=database,
+                                    table_name=table_name,
+                                    key=page_key,
+                                    conditions=[*base_conditions, *lower_conditions],
+                                    page_rows=page_rows,
+                                )
+                                bound_rows = stream_client.query(
+                                    bound_query, parameters={**parameters, **lower_parameters}
+                                ).result_rows
+                                upper = list(bound_rows[0]) if bound_rows else None
+                                page_conditions, page_parameters = _page_conditions(page_key, lower, upper)
+
+                            query, _ = _build_query(
+                                database=database,
+                                table_name=table_name,
+                                columns=projected_columns,
+                                should_use_incremental_field=should_use_incremental_field,
+                                incremental_field=incremental_field,
+                                incremental_field_type=incremental_field_type,
+                                row_filters=row_filters,
+                                page_conditions=page_conditions,
+                            )
+                            logger.info(f"ClickHouse query: {query}")
+                            with closing(
+                                _stream_record_batches(
+                                    stream_client, query, {**parameters, **page_parameters}, projected_columns, logger
+                                )
+                            ) as batches:
+                                for batch in batches:
+                                    read_any = read_any or batch.num_rows > 0
+                                    yield batch
+                        except ClickHouseError as e:
+                            message = str(e)
+                            if (
+                                not read_any
+                                and not retried_max_execution_time
+                                and (ceiling := _max_execution_time_ceiling(message)) is not None
+                            ):
+                                retried_max_execution_time = True
+                                stream_client.set_client_setting("max_execution_time", ceiling)
+                                logger.warning(
+                                    f"ClickHouse capped max_execution_time at {ceiling}s for this source; "
+                                    "retrying with that limit"
+                                )
+                                continue
+                            if read_any or page_key is None or not _is_query_limit_exceeded(message):
+                                raise
+                            if page_rows is not None and page_rows // 2 < PAGED_READ_MIN_ROWS:
+                                raise
+                            page_rows = PAGED_READ_INITIAL_ROWS if page_rows is None else page_rows // 2
+                            logger.warning(f"ClickHouse query exceeded a host limit, reading {page_rows} rows per page")
+                            continue
+
+                        if upper is None:
+                            return
+                        lower = upper
+
+                # The stream yields pa.RecordBatch chunks — one per
+                # ClickHouse block, capped by max_block_size. We accumulate
+                # these into ~YIELD_TARGET_BYTES / YIELD_TARGET_ROWS pa.Tables
+                # before yielding, so the pipeline's Delta writer sees fewer,
+                # larger batches and commits fewer Delta files.
+                pending: list[pa.RecordBatch] = []
+                pending_rows = 0
+                pending_bytes = 0
+                with closing(read_batches()) as stream:
+                    for chunk in stream:
+                        if chunk.num_rows == 0:
+                            continue
+                        pending.append(chunk)
+                        pending_rows += chunk.num_rows
+                        pending_bytes += chunk.nbytes
+                        if pending_rows >= YIELD_TARGET_ROWS or pending_bytes >= YIELD_TARGET_BYTES:
+                            yield pa.Table.from_batches(pending)
+                            pending = []
+                            pending_rows = 0
+                            pending_bytes = 0
+
+                if pending:
+                    yield pa.Table.from_batches(pending)
+            finally:
+                stream_client.close()
+
+    name = NamingConvention().normalize_identifier(table_name)
+
+    return SourceResponse(
+        name=name,
+        items=get_rows,
+        primary_keys=primary_keys,
+        partition_count=partition_settings.partition_count if partition_settings else None,
+        partition_size=partition_settings.partition_size if partition_settings else None,
+        rows_to_sync=rows_to_sync,
+        has_duplicate_primary_keys=has_duplicate_primary_keys,
+        sort_mode=(
+            "asc"
+            if _reads_in_incremental_order(list(table.columns), should_use_incremental_field, incremental_field)
+            else None
+        ),
+    )

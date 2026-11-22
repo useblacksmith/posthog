@@ -1,0 +1,454 @@
+"""Seeders for experiments-domain sandboxed eval cases.
+
+Each seeder is a synchronous callable that runs in a worker thread (via
+``asyncio.to_thread`` from ``base.py:task()``) and creates the entities
+the prompt references inside the per-case team. Returns a dict that's
+exposed to scorers as ``output["seed"]`` so deterministic scorers can
+reference the seeded IDs without round-tripping through ``expected``.
+"""
+
+from __future__ import annotations
+
+import uuid
+import logging
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from products.tasks.backend.facade.agents import CustomPromptSandboxContext
+
+logger = logging.getLogger(__name__)
+
+
+__all__ = [
+    "ROLLOUT_EXPERIMENT_NAME",
+    "SHARED_METRIC_NAME",
+    "SHARED_METRIC_EVENT",
+    "UNEVEN_SPLIT_EXPERIMENT_NAME",
+    "INACTIVE_FLAG_EXPERIMENT_NAME",
+    "ENDED_EXPERIMENT_NAME",
+    "SHIP_VARIANT_FLIP_SIGNATURE",
+    "seed_running_experiment",
+    "seed_day_old_experiment",
+    "seed_paused_and_resumed_experiment",
+    "seed_shared_metric_purchase_count",
+    "seed_uneven_split_experiment",
+    "seed_inactive_flag_experiment",
+    "seed_ended_experiment_with_flag_flip",
+]
+
+
+# Deterministic name referenced verbatim by the rollout-skill prompt so the
+# agent's `experiment-list` / `experiment-get` calls can resolve the seeded
+# experiment by name.
+ROLLOUT_EXPERIMENT_NAME = "split test demo"
+# Neutral product-flavored names — these MUST NOT hint at the diagnosis the
+# agent is being asked to identify. Earlier names ("uneven split bias case",
+# "stuck empty experiment") let the agent pattern-match on the experiment
+# name; the rename forces the agent to actually inspect state via tools.
+UNEVEN_SPLIT_EXPERIMENT_NAME = "homepage hero copy"
+INACTIVE_FLAG_EXPERIMENT_NAME = "pricing page redesign"
+ENDED_EXPERIMENT_NAME = "checkout cta v2"
+
+
+# Verbatim description of the catch-all release condition that PostHog adds to a feature flag
+# when a variant is shipped to all users, see the `ship_flag_variant` call in the experiments
+# product's experiment service
+SHIP_VARIANT_FLIP_SIGNATURE = "Added automatically when the experiment was ended to keep only one variant."
+
+
+def seed_running_experiment(
+    context: CustomPromptSandboxContext,
+    *,
+    start_date: datetime | None = None,
+    description: str = "Seeded by eval — running experiment with 50/50 split.",
+) -> dict[str, Any]:
+    """Seed one running experiment with a 50/50 multivariate flag.
+
+    Designed for prompts that ask the agent to change variant split on a
+    *running* experiment — the canonical scenario the
+    ``configuring-experiment-rollout`` skill exists to handle.
+
+    ⚠️ SHARED SEEDER — currently used by multiple eval cases and files.
+    Any change to the returned state invalidates every dependent case simultaneously.
+    If you need a variant of this state for one case, add a new seeder rather than
+    parameterising this one — the eval framework passes only ``context`` to seeders, so
+    case-specific config has to live in the seeder definition.
+    """
+    from products.experiments.backend.facade.testing import create_experiment
+    from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
+    team_id = context.team_id
+    user_id = context.user_id
+
+    flag = FeatureFlag.objects.create(
+        team_id=team_id,
+        created_by_id=user_id,
+        key=f"split-test-demo-{uuid.uuid4().hex[:6]}",
+        name=f"{ROLLOUT_EXPERIMENT_NAME} flag",
+        filters={
+            "groups": [{"properties": [], "rollout_percentage": 100}],
+            "multivariate": {
+                "variants": [
+                    {"key": "control", "name": "Control", "rollout_percentage": 50},
+                    {"key": "test", "name": "Test", "rollout_percentage": 50},
+                ]
+            },
+        },
+        active=True,
+    )
+
+    experiment_id = create_experiment(
+        team_id=team_id,
+        created_by_id=user_id,
+        name=ROLLOUT_EXPERIMENT_NAME,
+        description=description,
+        feature_flag_id=flag.id,
+        start_date=start_date or datetime.now(tz=UTC) - timedelta(days=7),
+    )
+
+    payload: dict[str, Any] = {
+        "experiment_id": experiment_id,
+        "experiment_name": ROLLOUT_EXPERIMENT_NAME,
+        "feature_flag_id": flag.id,
+        "feature_flag_key": flag.key,
+        "initial_split": {"control": 50, "test": 50},
+    }
+    logger.info(
+        "Seeded running experiment for team_id=%s: experiment_id=%s flag_key=%s",
+        team_id,
+        experiment_id,
+        flag.key,
+    )
+    return payload
+
+
+def _seed_split_test_experiment_started_at(
+    context: CustomPromptSandboxContext, *, start_date: datetime, description: str
+) -> dict[str, Any]:
+    """Seed the shared 50/50 experiment with the start date that a case's prompt describes."""
+    payload = seed_running_experiment(context, start_date=start_date, description=description)
+    return {**payload, "start_date": start_date.isoformat()}
+
+
+def seed_day_old_experiment(context: CustomPromptSandboxContext) -> dict[str, Any]:
+    """Seed the 50/50 experiment launched one day ago, for prompts that describe a first-day read."""
+    return _seed_split_test_experiment_started_at(
+        context,
+        start_date=datetime.now(tz=UTC) - timedelta(days=1),
+        description="Seeded by eval — running experiment launched yesterday.",
+    )
+
+
+def seed_paused_and_resumed_experiment(context: CustomPromptSandboxContext) -> dict[str, Any]:
+    """Seed the 50/50 experiment two weeks into its run, paused for five days in the middle and resumed.
+
+    The pause leaves the same trace the product writes: the flag's ``active`` flip under the
+    FeatureFlag scope and a ``paused`` / ``resumed`` entry under the Experiment scope, so an agent
+    that reads the activity log finds the pause the prompt describes.
+    """
+    from posthog.models.activity_logging.activity_log import ActivityLog, Change, Detail
+
+    now = datetime.now(tz=UTC)
+    paused_at = now - timedelta(days=9)
+    resumed_at = now - timedelta(days=4)
+
+    payload = _seed_split_test_experiment_started_at(
+        context,
+        start_date=now - timedelta(days=14),
+        description="Seeded by eval — running experiment, paused for five days and resumed.",
+    )
+
+    for created_at, activity, active_before, active_after in (
+        (paused_at, "paused", True, False),
+        (resumed_at, "resumed", False, True),
+    ):
+        ActivityLog.objects.create(
+            team_id=context.team_id,
+            user_id=context.user_id,
+            was_impersonated=False,
+            is_system=False,
+            item_id=str(payload["feature_flag_id"]),
+            scope="FeatureFlag",
+            activity="updated",
+            detail=Detail(
+                name=payload["feature_flag_key"],
+                changes=[
+                    Change(
+                        type="FeatureFlag",
+                        action="changed",
+                        field="active",
+                        before=active_before,
+                        after=active_after,
+                    )
+                ],
+            ),
+            created_at=created_at,
+        )
+        ActivityLog.objects.create(
+            team_id=context.team_id,
+            user_id=context.user_id,
+            was_impersonated=False,
+            is_system=False,
+            item_id=str(payload["experiment_id"]),
+            scope="Experiment",
+            activity=activity,
+            detail=Detail(name=payload["experiment_name"]),
+            created_at=created_at,
+        )
+
+    return {
+        **payload,
+        "paused_at": paused_at.isoformat(),
+        "resumed_at": resumed_at.isoformat(),
+    }
+
+
+def seed_uneven_split_experiment(context: CustomPromptSandboxContext) -> dict[str, Any]:
+    """Seed a *running* experiment with an 80/20 multivariate split and the default
+    ``multiple_variant_handling="exclude"``.
+
+    Carrier scenario for diagnostic group A (bias & skew) — the agent should
+    recognise that an 80/20 split combined with Exclude systematically removes
+    overlap users from the smaller variant, biasing the test arm.
+    """
+    from products.experiments.backend.facade.testing import create_experiment
+    from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
+    team_id = context.team_id
+    user_id = context.user_id
+
+    flag = FeatureFlag.objects.create(
+        team_id=team_id,
+        created_by_id=user_id,
+        key=f"uneven-split-{uuid.uuid4().hex[:6]}",
+        name=f"{UNEVEN_SPLIT_EXPERIMENT_NAME} flag",
+        filters={
+            "groups": [{"properties": [], "rollout_percentage": 100}],
+            "multivariate": {
+                "variants": [
+                    {"key": "control", "name": "Control", "rollout_percentage": 80},
+                    {"key": "test", "name": "Test", "rollout_percentage": 20},
+                ]
+            },
+        },
+        active=True,
+    )
+
+    experiment_id = create_experiment(
+        team_id=team_id,
+        created_by_id=user_id,
+        name=UNEVEN_SPLIT_EXPERIMENT_NAME,
+        description="Seeded by eval — 80/20 split, default exclude handling.",
+        feature_flag_id=flag.id,
+        start_date=datetime.now(tz=UTC) - timedelta(days=14),
+    )
+
+    return {
+        "experiment_id": experiment_id,
+        "experiment_name": UNEVEN_SPLIT_EXPERIMENT_NAME,
+        "feature_flag_id": flag.id,
+        "feature_flag_key": flag.key,
+        "initial_split": {"control": 80, "test": 20},
+    }
+
+
+def seed_inactive_flag_experiment(context: CustomPromptSandboxContext) -> dict[str, Any]:
+    """Seed a 'running' experiment whose feature flag is INACTIVE.
+
+    Carrier scenario for diagnostic group B (empty experiment) — the agent
+    should recognise that `feature_flag.active=False` means `$feature_flag_called`
+    can never fire, so the exposure-shape snapshot will be empty and the
+    diagnostic is B10 / A5 (flag inactive / experiment not actually live).
+    """
+    from products.experiments.backend.facade.testing import create_experiment
+    from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
+    team_id = context.team_id
+    user_id = context.user_id
+
+    flag = FeatureFlag.objects.create(
+        team_id=team_id,
+        created_by_id=user_id,
+        key=f"inactive-empty-{uuid.uuid4().hex[:6]}",
+        name=f"{INACTIVE_FLAG_EXPERIMENT_NAME} flag",
+        filters={
+            "groups": [{"properties": [], "rollout_percentage": 100}],
+            "multivariate": {
+                "variants": [
+                    {"key": "control", "name": "Control", "rollout_percentage": 50},
+                    {"key": "test", "name": "Test", "rollout_percentage": 50},
+                ]
+            },
+        },
+        # The diagnostic signature: experiment.start_date is set so the
+        # experiment looks running, but the flag is off — exposures cannot fire.
+        active=False,
+    )
+
+    experiment_id = create_experiment(
+        team_id=team_id,
+        created_by_id=user_id,
+        name=INACTIVE_FLAG_EXPERIMENT_NAME,
+        description="Seeded by eval — experiment with start_date set but flag inactive.",
+        feature_flag_id=flag.id,
+        start_date=datetime.now(tz=UTC) - timedelta(days=3),
+    )
+
+    return {
+        "experiment_id": experiment_id,
+        "experiment_name": INACTIVE_FLAG_EXPERIMENT_NAME,
+        "feature_flag_id": flag.id,
+        "feature_flag_key": flag.key,
+        "flag_active": False,
+    }
+
+
+def seed_ended_experiment_with_flag_flip(context: CustomPromptSandboxContext) -> dict[str, Any]:
+    """Seed a *stopped* experiment whose feature flag was rewritten by ship-variant.
+
+    Carrier scenario for diagnostic group E (mid-run changes / E7) — after an
+    experiment is ended via `experiment-ship-variant` in the "all users" mode,
+    PostHog rewrites the flag's `multivariate.variants` rollout to 0/100
+    favouring the shipped variant AND prepends a catch-all release condition
+    that carries a verbatim description string ([SHIP_VARIANT_FLIP_SIGNATURE]).
+
+    The skill's prescribed diagnostic path is to read the flag's change history
+    and scan for the verbatim signature in
+    ``detail.changes[].after.groups[].description``. To make that path testable,
+    this seeder writes an ``ActivityLog`` row with a synthetic "filters changed"
+    diff that mirrors what the production ship-variant flow emits — before-state
+    is a 50/50 multivariate with one release condition; after-state is the live
+    0/100 payload with the catch-all condition in front.
+    """
+    from posthog.models.activity_logging.activity_log import ActivityLog, Change, Detail
+
+    from products.experiments.backend.facade.testing import create_experiment
+    from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
+    team_id = context.team_id
+    user_id = context.user_id
+
+    before_filters: dict[str, Any] = {
+        "groups": [{"properties": [], "rollout_percentage": 100}],
+        "multivariate": {
+            "variants": [
+                {"key": "control", "name": "Control", "rollout_percentage": 50},
+                {"key": "test", "name": "Test", "rollout_percentage": 50},
+            ]
+        },
+    }
+    after_filters: dict[str, Any] = {
+        "groups": [
+            {"properties": [], "rollout_percentage": 100, "description": SHIP_VARIANT_FLIP_SIGNATURE},
+            {"properties": [], "rollout_percentage": 100},
+        ],
+        # Original 50/50 split was rewritten to 0/100 by ship-variant.
+        "multivariate": {
+            "variants": [
+                {"key": "control", "name": "Control", "rollout_percentage": 0},
+                {"key": "test", "name": "Test", "rollout_percentage": 100},
+            ]
+        },
+    }
+
+    flag = FeatureFlag.objects.create(
+        team_id=team_id,
+        created_by_id=user_id,
+        key=f"ship-flip-{uuid.uuid4().hex[:6]}",
+        name=f"{ENDED_EXPERIMENT_NAME} flag",
+        filters=after_filters,
+        active=True,
+    )
+
+    experiment_id = create_experiment(
+        team_id=team_id,
+        created_by_id=user_id,
+        name=ENDED_EXPERIMENT_NAME,
+        description="Seeded by eval — experiment ended via ship-variant; flag rewritten to 0/100.",
+        feature_flag_id=flag.id,
+        start_date=datetime.now(tz=UTC) - timedelta(days=30),
+        end_date=datetime.now(tz=UTC) - timedelta(days=1),
+    )
+
+    # Write the synthetic ship-variant diff to the activity log so
+    # `feature-flags-activity-retrieve` returns the real before/after payload
+    # the skill instructs the agent to scan.
+    # team_id alone satisfies the ActivityLog must-have-team-or-org check —
+    # organization_id is optional and not exposed on CustomPromptSandboxContext.
+    ActivityLog.objects.create(
+        team_id=team_id,
+        user_id=user_id,
+        was_impersonated=False,
+        is_system=False,
+        item_id=str(flag.id),
+        scope="FeatureFlag",
+        activity="updated",
+        detail=Detail(
+            name=flag.key,
+            changes=[
+                Change(
+                    type="FeatureFlag",
+                    action="changed",
+                    field="filters",
+                    before=before_filters,
+                    after=after_filters,
+                ),
+            ],
+        ),
+    )
+
+    return {
+        "experiment_id": experiment_id,
+        "experiment_name": ENDED_EXPERIMENT_NAME,
+        "feature_flag_id": flag.id,
+        "feature_flag_key": flag.key,
+        "final_split": {"control": 0, "test": 100},
+        "signature": SHIP_VARIANT_FLIP_SIGNATURE,
+    }
+
+
+SHARED_METRIC_NAME = "purchase count per user"
+SHARED_METRIC_EVENT = "purchase_completed"
+
+
+def seed_shared_metric_purchase_count(context: CustomPromptSandboxContext) -> dict[str, Any]:
+    """Seed one shared metric: mean count of purchase_completed per user, no filters."""
+    from products.experiments.backend.facade.testing import create_saved_metric
+
+    team_id = context.team_id
+    user_id = context.user_id
+
+    query = {
+        "kind": "ExperimentMetric",
+        "metric_type": "mean",
+        "source": {
+            "kind": "EventsNode",
+            "event": SHARED_METRIC_EVENT,
+            "math": "total",
+        },
+        "uuid": str(uuid.uuid4()),
+    }
+
+    saved_metric_id = create_saved_metric(
+        team_id=team_id,
+        created_by_id=user_id,
+        name=SHARED_METRIC_NAME,
+        description="Counts purchase_completed events per user.",
+        query=query,
+    )
+
+    payload: dict[str, Any] = {
+        "saved_metric_id": saved_metric_id,
+        "saved_metric_name": SHARED_METRIC_NAME,
+        "event": SHARED_METRIC_EVENT,
+        "metric_type": "mean",
+        "math": "total",
+    }
+    logger.info(
+        "Seeded shared metric for team_id=%s: id=%s name=%s event=%s",
+        team_id,
+        saved_metric_id,
+        SHARED_METRIC_NAME,
+        SHARED_METRIC_EVENT,
+    )
+    return payload

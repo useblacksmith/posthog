@@ -1,0 +1,541 @@
+import { MakeLogicType, actions, afterMount, connect, kea, listeners, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+
+import api from 'lib/api'
+import { teamLogic } from 'scenes/teamLogic'
+
+import { llmAnalyticsProviderKeysModelsList } from './generated/api'
+import {
+    type LLMProvider,
+    LLMProviderKey,
+    llmProviderKeysLogic,
+    providerSortIndex,
+    toLLMProvider,
+} from './settings/llmProviderKeysLogic'
+import type { CreateLLMProviderKeyPayload, UpdateLLMProviderKeyPayload } from './settings/llmProviderKeysLogic'
+import { isUnhealthyProviderKeyState, providerKeyStateSuffix, providerLabel } from './settings/providerKeyStateUtils'
+
+export interface ModelOption {
+    id: string
+    name: string
+    provider: string
+    description: string
+    providerKeyId?: string
+    isRecommended?: boolean
+    supportsDecisions?: boolean
+    supportsChat?: boolean
+    supportsReasoning?: boolean
+}
+
+export interface ProviderModelGroup {
+    provider: LLMProvider
+    providerKeyId: string
+    label: string
+    models: ModelOption[]
+    /** Set when the key cannot serve models. The picker lists the group but blocks selection. */
+    disabledReason?: string
+    /** Set when the user can type a model id that the provider does not list, such as an Azure deployment name. */
+    allowsCustomModel?: boolean
+}
+
+export type ByokModelNotice =
+    | { kind: 'no-keys' }
+    | { kind: 'no-usable-keys' }
+    | { kind: 'models-failed'; keys: LLMProviderKey[] }
+    | { kind: 'deployments-unlisted'; keys: LLMProviderKey[] }
+
+// Every empty state reuses this array, so a load with no failures keeps providerModelGroups memoized.
+const NO_FAILED_PROVIDER_KEYS: string[] = []
+const UNHEALTHY_KEY_REASON = 'This provider key has an issue. Check your provider settings.'
+const UNAVAILABLE_KEY_REASON = "Couldn't load models for this key. Try again in a moment."
+const UNAVAILABLE_KEY_SUFFIX = ' (Unavailable)'
+
+function getByokModelNotice(
+    providerKeys: LLMProviderKey[],
+    providerKeysLoading: boolean,
+    byokModelsLoading: boolean,
+    failedByokProviderKeyIds: string[],
+    providerModelGroups: ProviderModelGroup[]
+): ByokModelNotice | null {
+    if (providerKeysLoading || byokModelsLoading) {
+        return null
+    }
+    const failedKeys = providerKeys.filter(
+        (key) => failedByokProviderKeyIds.includes(key.id) && !allowsCustomModel(key)
+    )
+    if (failedKeys.length > 0) {
+        return { kind: 'models-failed', keys: failedKeys }
+    }
+    const unlistedKeyIds = new Set(
+        providerModelGroups
+            .filter((group) => group.allowsCustomModel && group.models.length === 0)
+            .map((group) => group.providerKeyId)
+    )
+    if (unlistedKeyIds.size > 0) {
+        return { kind: 'deployments-unlisted', keys: providerKeys.filter((key) => unlistedKeyIds.has(key.id)) }
+    }
+    if (providerModelGroups.some((group) => !group.disabledReason)) {
+        return null
+    }
+    return providerKeys.length === 0 ? { kind: 'no-keys' } : { kind: 'no-usable-keys' }
+}
+
+// Azure OpenAI and Claude on Microsoft Foundry need a deployment name, and Azure does not always list deployments.
+function allowsCustomModel(key: LLMProviderKey): boolean {
+    return key.provider === 'azure_openai' || (key.provider === 'anthropic' && !!key.azure_endpoint_display)
+}
+
+function providerKeyGroupLabel(key: LLMProviderKey, keysPerProvider: Record<string, number>, suffix = ''): string {
+    const label = providerLabel(key.provider)
+    return (keysPerProvider[key.provider] ?? 0) > 1 ? `${label} (${key.name})${suffix}` : `${label}${suffix}`
+}
+
+function unavailableKeyState(
+    key: LLMProviderKey,
+    failedKeyIds: Set<string>
+): { suffix: string; reason: string } | null {
+    if (isUnhealthyProviderKeyState(key.state)) {
+        return { suffix: providerKeyStateSuffix(key.state), reason: UNHEALTHY_KEY_REASON }
+    }
+    if (failedKeyIds.has(key.id)) {
+        return { suffix: UNAVAILABLE_KEY_SUFFIX, reason: UNAVAILABLE_KEY_REASON }
+    }
+    return null
+}
+
+export function buildPlaygroundProviderModelGroups(models: ModelOption[]): ProviderModelGroup[] {
+    const byProvider: Record<string, ModelOption[]> = {}
+    for (const model of models) {
+        const provider = model.provider || 'Unknown'
+        if (!byProvider[provider]) {
+            byProvider[provider] = []
+        }
+        byProvider[provider].push(model)
+    }
+    return Object.entries(byProvider)
+        .sort(([a], [b]) => providerSortIndex(a) - providerSortIndex(b))
+        .flatMap(([provider, providerModels]) => {
+            const llmProvider = toLLMProvider(provider)
+            if (!llmProvider) {
+                return []
+            }
+            return [
+                {
+                    provider: llmProvider,
+                    providerKeyId: `playground:${llmProvider}`,
+                    label: providerLabel(llmProvider),
+                    models: providerModels,
+                },
+            ]
+        })
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface modelPickerLogicValues {
+    providerKeys: LLMProviderKey[] // llmProviderKeysLogic
+    providerKeysLoading: boolean // llmProviderKeysLogic
+    currentTeamId: number | null // teamLogic
+    byokModelNotice: ByokModelNotice | null
+    byokModels: ModelOption[]
+    byokModelsLoading: boolean
+    evaluationModelNotice: ByokModelNotice | null
+    evaluationProviderModelGroups: ProviderModelGroup[]
+    failedByokProviderKeyIds: string[]
+    generativeByokModels: ModelOption[]
+    hasByokKeys: boolean
+    playgroundByokProviderModelGroups: ProviderModelGroup[]
+    playgroundModels: ModelOption[]
+    playgroundModelsLoading: boolean
+    playgroundProviderModelGroups: ProviderModelGroup[]
+    playgroundSystemOneModelGroups: ProviderModelGroup[]
+    providerModelGroups: ProviderModelGroup[]
+    systemOneModels: ModelOption[]
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface modelPickerLogicActions {
+    createProviderKeySuccess: (
+        providerKeys: LLMProviderKey[],
+        payload?:
+            | {
+                  payload: CreateLLMProviderKeyPayload
+              }
+            | undefined
+    ) => {
+        payload?: {
+            payload: CreateLLMProviderKeyPayload
+        }
+        providerKeys: LLMProviderKey[]
+    } // llmProviderKeysLogic
+    loadProviderKeysSuccess: (
+        providerKeys: LLMProviderKey[],
+        payload?: any
+    ) => {
+        payload?: any
+        providerKeys: LLMProviderKey[]
+    } // llmProviderKeysLogic
+    updateProviderKeySuccess: (
+        providerKeys: LLMProviderKey[],
+        payload?:
+            | {
+                  id: string
+                  payload: UpdateLLMProviderKeyPayload
+              }
+            | undefined
+    ) => {
+        payload?: {
+            id: string
+            payload: UpdateLLMProviderKeyPayload
+        }
+        providerKeys: LLMProviderKey[]
+    } // llmProviderKeysLogic
+    loadByokModels: () => any
+    loadByokModelsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadByokModelsSuccess: (
+        byokModels: ModelOption[],
+        payload?: any
+    ) => {
+        byokModels: ModelOption[]
+        payload?: any
+    }
+    loadPlaygroundModels: () => any
+    loadPlaygroundModelsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadPlaygroundModelsSuccess: (
+        playgroundModels: ModelOption[],
+        payload?: any
+    ) => {
+        playgroundModels: ModelOption[]
+        payload?: any
+    }
+    setFailedByokProviderKeyIds: (providerKeyIds: string[]) => {
+        providerKeyIds: string[]
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface modelPickerLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        hasByokKeys: (providerKeys: LLMProviderKey[]) => boolean
+        generativeByokModels: (byokModels: ModelOption[], providerKeys: LLMProviderKey[]) => ModelOption[]
+        playgroundProviderModelGroups: (playgroundModels: ModelOption[]) => ProviderModelGroup[]
+        evaluationProviderModelGroups: (
+            byokModels: ModelOption[],
+            providerKeys: LLMProviderKey[],
+            failedByokProviderKeyIds: string[]
+        ) => ProviderModelGroup[]
+        providerModelGroups: (evaluationProviderModelGroups: ProviderModelGroup[]) => ProviderModelGroup[]
+        systemOneModels: (byokModels: ModelOption[], providerKeys: LLMProviderKey[]) => ModelOption[]
+        playgroundSystemOneModelGroups: (evaluationProviderModelGroups: ProviderModelGroup[]) => ProviderModelGroup[]
+        playgroundByokProviderModelGroups: (providerModelGroups: ProviderModelGroup[]) => ProviderModelGroup[]
+        evaluationModelNotice: (
+            providerKeys: LLMProviderKey[],
+            providerKeysLoading: boolean,
+            byokModelsLoading: boolean,
+            failedByokProviderKeyIds: string[],
+            evaluationProviderModelGroups: ProviderModelGroup[]
+        ) => ByokModelNotice | null
+        byokModelNotice: (
+            providerKeys: LLMProviderKey[],
+            providerKeysLoading: boolean,
+            byokModelsLoading: boolean,
+            failedByokProviderKeyIds: string[],
+            providerModelGroups: ProviderModelGroup[]
+        ) => ByokModelNotice | null
+    }
+}
+
+export type modelPickerLogicType = MakeLogicType<
+    modelPickerLogicValues,
+    modelPickerLogicActions,
+    Record<string, any>,
+    modelPickerLogicMeta
+>
+
+export const modelPickerLogic = kea<modelPickerLogicType>([
+    path(['products', 'ai_observability', 'frontend', 'modelPickerLogic']),
+
+    connect(() => ({
+        values: [llmProviderKeysLogic, ['providerKeys', 'providerKeysLoading'], teamLogic, ['currentTeamId']],
+        actions: [
+            llmProviderKeysLogic,
+            ['loadProviderKeysSuccess', 'createProviderKeySuccess', 'updateProviderKeySuccess'],
+        ],
+    })),
+
+    actions({
+        setFailedByokProviderKeyIds: (providerKeyIds: string[]) => ({ providerKeyIds }),
+    }),
+
+    loaders(({ values, actions }) => ({
+        byokModels: {
+            __default: [] as ModelOption[],
+            loadByokModels: async (): Promise<ModelOption[]> => {
+                const validKeys = values.providerKeys.filter((k: LLMProviderKey) => k.state === 'ok')
+                if (validKeys.length === 0) {
+                    return []
+                }
+                const failedProviderKeyIds: string[] = []
+                const results = await Promise.all(
+                    validKeys.map(async (key: LLMProviderKey) => {
+                        try {
+                            // The project in the URL, not the user's current one, which a second tab can change.
+                            const rawModels = await llmAnalyticsProviderKeysModelsList(
+                                String(values.currentTeamId),
+                                key.id
+                            )
+                            return rawModels.map((m) => ({
+                                id: m.id,
+                                name: m.name,
+                                provider: m.provider,
+                                description: m.description,
+                                isRecommended: m.is_recommended ?? false,
+                                supportsDecisions: m.supports_decisions ?? false,
+                                supportsChat: m.supports_chat ?? !m.supports_decisions,
+                                supportsReasoning: m.supports_reasoning ?? false,
+                                providerKeyId: key.id,
+                            }))
+                        } catch {
+                            failedProviderKeyIds.push(key.id)
+                            return []
+                        }
+                    })
+                )
+                actions.setFailedByokProviderKeyIds(failedProviderKeyIds)
+                const dedupedModels = new Map<string, ModelOption>()
+                for (const models of results) {
+                    for (const model of models) {
+                        const dedupeKey = `${model.providerKeyId ?? ''}::${model.id}`
+                        if (!dedupedModels.has(dedupeKey)) {
+                            dedupedModels.set(dedupeKey, model)
+                        }
+                    }
+                }
+                return Array.from(dedupedModels.values())
+            },
+        },
+        playgroundModels: {
+            __default: [] as ModelOption[],
+            loadPlaygroundModels: async (): Promise<ModelOption[]> => {
+                // nosemgrep: prefer-codegen-api -- Legacy raw API call with a hand-written URL and an unchecked response type. No generated function covers this endpoint yet. Find out why the generated client skips it (no schema, no product tag, or excluded from the spec) and fix that first.
+                const rawModels = (await api.get('/api/llm_proxy/models/')) as (Omit<ModelOption, 'isRecommended'> & {
+                    is_recommended?: boolean
+                })[]
+                return (rawModels ?? []).map((m) => ({
+                    id: m.id,
+                    name: m.name,
+                    provider: m.provider,
+                    description: m.description,
+                    isRecommended: m.is_recommended ?? false,
+                }))
+            },
+        },
+    })),
+
+    reducers({
+        failedByokProviderKeyIds: [
+            NO_FAILED_PROVIDER_KEYS,
+            {
+                loadByokModels: () => NO_FAILED_PROVIDER_KEYS,
+                setFailedByokProviderKeyIds: (_, { providerKeyIds }: { providerKeyIds: string[] }) =>
+                    providerKeyIds.length > 0 ? providerKeyIds : NO_FAILED_PROVIDER_KEYS,
+            },
+        ],
+    }),
+
+    listeners(({ actions }) => ({
+        // Refresh BYOK models whenever provider keys change so the
+        // model picker immediately reflects newly valid options.
+        loadProviderKeysSuccess: () => {
+            actions.loadByokModels()
+        },
+        createProviderKeySuccess: () => {
+            actions.loadByokModels()
+        },
+        updateProviderKeySuccess: () => {
+            actions.loadByokModels()
+        },
+    })),
+
+    afterMount(({ actions, values }) => {
+        actions.loadPlaygroundModels()
+        if (values.providerKeys.length > 0) {
+            actions.loadByokModels()
+        }
+    }),
+
+    selectors({
+        hasByokKeys: [
+            (s) => [s.providerKeys],
+            (providerKeys: LLMProviderKey[]): boolean =>
+                providerKeys.some((k) => k.state === 'ok' && k.provider !== 'system_one'),
+        ],
+        generativeByokModels: [
+            (s) => [s.byokModels, s.providerKeys],
+            (models: ModelOption[], keys: LLMProviderKey[]): ModelOption[] =>
+                models.filter(
+                    (model) =>
+                        (model.supportsChat ?? !model.supportsDecisions) &&
+                        !keys.some((key) => key.id === model.providerKeyId && key.provider === 'system_one')
+                ),
+        ],
+        playgroundProviderModelGroups: [
+            (s) => [s.playgroundModels],
+            (playgroundModels: ModelOption[]): ProviderModelGroup[] =>
+                buildPlaygroundProviderModelGroups(Array.isArray(playgroundModels) ? playgroundModels : []),
+        ],
+        evaluationProviderModelGroups: [
+            (s) => [s.byokModels, s.providerKeys, s.failedByokProviderKeyIds],
+            (
+                byokModels: ModelOption[],
+                providerKeys: LLMProviderKey[],
+                failedByokProviderKeyIds: string[]
+            ): ProviderModelGroup[] => {
+                const byKeyId: Record<string, ModelOption[]> = {}
+                for (const model of byokModels) {
+                    const keyId = model.providerKeyId ?? ''
+                    if (!byKeyId[keyId]) {
+                        byKeyId[keyId] = []
+                    }
+                    byKeyId[keyId].push(model)
+                }
+
+                const keysPerProvider: Record<string, number> = {}
+                for (const key of providerKeys) {
+                    keysPerProvider[key.provider] = (keysPerProvider[key.provider] ?? 0) + 1
+                }
+
+                const failedKeyIds = new Set(failedByokProviderKeyIds)
+                const groups: ProviderModelGroup[] = []
+                for (const key of providerKeys) {
+                    const models = byKeyId[key.id] ?? []
+                    const customModelKey = allowsCustomModel(key) && key.state === 'ok'
+                    if (models.length > 0 || customModelKey) {
+                        groups.push({
+                            provider: key.provider,
+                            providerKeyId: key.id,
+                            label: providerKeyGroupLabel(key, keysPerProvider),
+                            models,
+                            ...(customModelKey ? { allowsCustomModel: true } : {}),
+                        })
+                        continue
+                    }
+
+                    // A key that cannot serve models stays listed, so the picker shows why it is short.
+                    const unavailable = unavailableKeyState(key, failedKeyIds)
+                    if (unavailable) {
+                        groups.push({
+                            provider: key.provider,
+                            providerKeyId: key.id,
+                            label: providerKeyGroupLabel(key, keysPerProvider, unavailable.suffix),
+                            models: [],
+                            disabledReason: unavailable.reason,
+                        })
+                    }
+                }
+
+                return groups.sort((a, b) => {
+                    const providerDiff = providerSortIndex(a.provider) - providerSortIndex(b.provider)
+                    if (providerDiff !== 0) {
+                        return providerDiff
+                    }
+                    return a.label.localeCompare(b.label)
+                })
+            },
+        ],
+        providerModelGroups: [
+            (s) => [s.evaluationProviderModelGroups],
+            (groups: ProviderModelGroup[]): ProviderModelGroup[] =>
+                groups
+                    .filter((group) => group.provider !== 'system_one')
+                    .map((group) => ({
+                        ...group,
+                        models: group.models.filter((model) => model.supportsChat ?? !model.supportsDecisions),
+                    }))
+                    .filter((group) => group.models.length > 0 || group.disabledReason || group.allowsCustomModel),
+        ],
+        systemOneModels: [
+            (s) => [s.byokModels, s.providerKeys],
+            (models: ModelOption[], keys: LLMProviderKey[]): ModelOption[] =>
+                models.filter((model) =>
+                    keys.some((key) => key.id === model.providerKeyId && key.provider === 'system_one')
+                ),
+        ],
+        // System One answers typed questions instead of chatting, so the playground lists it apart from the chat keys.
+        playgroundSystemOneModelGroups: [
+            (s) => [s.evaluationProviderModelGroups],
+            (groups: ProviderModelGroup[]): ProviderModelGroup[] =>
+                groups
+                    .filter(
+                        (group) => group.provider === 'system_one' && (group.models.length > 0 || group.disabledReason)
+                    )
+                    .map((group) => (group.allowsCustomModel ? { ...group, allowsCustomModel: false } : group)),
+        ],
+        // The playground runs only listed models, so it does not offer typed deployment names.
+        playgroundByokProviderModelGroups: [
+            (s) => [s.providerModelGroups],
+            (groups: ProviderModelGroup[]): ProviderModelGroup[] =>
+                groups
+                    .filter((group) => group.models.length > 0 || group.disabledReason)
+                    .map((group) => (group.allowsCustomModel ? { ...group, allowsCustomModel: false } : group)),
+        ],
+        evaluationModelNotice: [
+            (s) => [
+                s.providerKeys,
+                s.providerKeysLoading,
+                s.byokModelsLoading,
+                s.failedByokProviderKeyIds,
+                s.evaluationProviderModelGroups,
+            ],
+            (
+                providerKeys: LLMProviderKey[],
+                providerKeysLoading: boolean,
+                byokModelsLoading: boolean,
+                failedByokProviderKeyIds: string[],
+                groups: ProviderModelGroup[]
+            ): ByokModelNotice | null =>
+                getByokModelNotice(
+                    providerKeys,
+                    providerKeysLoading,
+                    byokModelsLoading,
+                    failedByokProviderKeyIds,
+                    groups
+                ),
+        ],
+        byokModelNotice: [
+            (s) => [
+                s.providerKeys,
+                s.providerKeysLoading,
+                s.byokModelsLoading,
+                s.failedByokProviderKeyIds,
+                s.providerModelGroups,
+            ],
+            (
+                providerKeys: LLMProviderKey[],
+                providerKeysLoading: boolean,
+                byokModelsLoading: boolean,
+                failedByokProviderKeyIds: string[],
+                providerModelGroups: ProviderModelGroup[]
+            ): ByokModelNotice | null => {
+                return getByokModelNotice(
+                    providerKeys.filter((key) => key.provider !== 'system_one'),
+                    providerKeysLoading,
+                    byokModelsLoading,
+                    failedByokProviderKeyIds,
+                    providerModelGroups
+                )
+            },
+        ],
+    }),
+])

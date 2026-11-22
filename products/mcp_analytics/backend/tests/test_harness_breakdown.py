@@ -1,0 +1,448 @@
+import re
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin, _create_event, flush_persons_and_events
+from unittest.mock import patch
+
+from parameterized import parameterized
+
+from posthog.schema import (
+    DateRange,
+    EventPropertyFilter,
+    EventsQuery,
+    MCPHarnessBreakdownItem,
+    MCPHarnessBreakdownQuery,
+    PropertyOperator,
+)
+
+from posthog.hogql import parser
+from posthog.hogql.parser import parse_expr
+from posthog.hogql.query import execute_hogql_query
+from posthog.hogql.visitor import clear_locations
+
+from posthog.hogql_queries.events_query_runner import EventsQueryRunner
+
+from products.mcp_analytics.backend import mcp_harness
+from products.mcp_analytics.backend.facade.api import mcp_harness_virtual_field_expr
+from products.mcp_analytics.backend.facade.contracts import CustomHarnessRule
+from products.mcp_analytics.backend.hogql_queries.harness_breakdown import MCPHarnessBreakdownQueryRunner
+from products.mcp_analytics.backend.models import MCPCustomHarness
+from products.mcp_analytics.backend.tests import _MCPAnalyticsTeamScopedTestMixin
+
+
+def test_harness_labels_tuple_matches_multiif_branches() -> None:
+    # The tuple and the multiIf are two expressions of one fact (the labels we emit);
+    # this keeps them from drifting. Each branch ends `, '<Label>',`; the else arm is 'Other'.
+    sql = mcp_harness.harness_label_sql("h")
+    emitted = set(re.findall(r"'([^']+)',\s*$", sql, re.MULTILINE)) | {"Other"}
+    assert emitted == set(mcp_harness.HARNESS_LABELS)
+
+
+@parameterized.expand(
+    [
+        ("token", mcp_harness.HARNESS_TOKEN_SQL),
+        ("display_name", mcp_harness.HARNESS_DISPLAY_NAME_SQL),
+        ("label", mcp_harness.harness_label_sql("h")),
+        ("label_or_token", mcp_harness.harness_label_or_token_sql("h")),
+    ]
+)
+def test_harness_expressions_are_parseable_hogql(_name: str, sql: str) -> None:
+    # These are assembled as f-strings and only ever reach the parser inside a query
+    # runner, so a syntax slip (an inline comment the grammar rejects, an unbalanced
+    # paren) would otherwise surface as a broken dashboard rather than a failing test.
+    parse_expr(sql)
+
+
+def test_custom_rules_come_before_built_in_buckets_and_are_escaped() -> None:
+    rule = CustomHarnessRule(name="O'Brien \\ Agent", pattern="Acme'Agent")
+
+    for sql in (
+        mcp_harness.harness_label_sql("h", [rule]),
+        mcp_harness.harness_label_or_token_sql("h", custom_rules=[rule]),
+    ):
+        parse_expr(sql)
+        assert sql.index("O\\'Brien") < sql.index("'Claude Code',")
+
+
+def test_virtual_field_with_rules_matches_a_full_parse_and_reuses_the_parse_cache() -> None:
+    rules = (CustomHarnessRule(name="Acme Agent", pattern="acme-agent"),)
+    full_parse = parse_expr(
+        "if(startsWith(event, '$mcp_'), arrayMap(h -> {label}, [{token}])[1], NULL)",
+        placeholders={
+            "label": parse_expr(mcp_harness.harness_label_sql("h", rules)),
+            "token": parse_expr(mcp_harness.HARNESS_TOKEN_SQL),
+        },
+    )
+    mcp_harness_virtual_field_expr(rules)
+
+    with patch.object(parser, "_invoke_parser", wraps=parser._invoke_parser) as invoke_parser:
+        expr = mcp_harness_virtual_field_expr(rules)
+
+    assert invoke_parser.call_count == 0
+    assert clear_locations(expr) == clear_locations(full_parse)
+
+
+def test_label_or_token_keeps_the_bounded_label_set_reachable() -> None:
+    # The verbatim fallback must only replace the "Other" arm — if it shadowed a real
+    # branch, recognized clients would start rendering as raw tokens.
+    bounded = mcp_harness.harness_label_sql("h")
+    verbatim = mcp_harness.harness_label_or_token_sql("h")
+    assert verbatim.count("'Claude Code',") == bounded.count("'Claude Code',")
+    assert "'Other'" not in verbatim
+    assert mcp_harness.UNIDENTIFIED_HARNESS_LABEL in verbatim
+
+
+class TestMCPHarnessBreakdownQueryRunner(_MCPAnalyticsTeamScopedTestMixin, ClickhouseTestMixin, APIBaseTest):
+    def _emit(
+        self,
+        *,
+        properties: dict[str, Any],
+        is_error: bool = False,
+        session_id: str = "s1",
+        distinct_id: str = "d1",
+        timestamp: datetime | None = None,
+    ) -> None:
+        _create_event(
+            team=self.team,
+            event="$mcp_tool_call",
+            distinct_id=distinct_id,
+            timestamp=timestamp or datetime.now(tz=UTC),
+            properties={
+                "$session_id": session_id,
+                "$mcp_tool_name": "query_run",
+                "$mcp_is_error": is_error,
+                **properties,
+            },
+        )
+
+    def _breakdown(self, date_from: str = "-90d") -> dict[str, MCPHarnessBreakdownItem]:
+        runner = MCPHarnessBreakdownQueryRunner(
+            query=MCPHarnessBreakdownQuery(dateRange=DateRange(date_from=date_from)),
+            team=self.team,
+        )
+        return {row.harness: row for row in runner.calculate().results}
+
+    def test_virtual_harness_property_groups_as_string(self) -> None:
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client"})
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client"}, distinct_id="d2")
+        self._emit(properties={"$mcp_client_name": "claude-code"}, distinct_id="d3")
+
+        flush_persons_and_events()
+        response = execute_hogql_query(
+            "SELECT properties.$virt_mcp_harness AS client, count() AS calls "
+            "FROM events WHERE event = '$mcp_tool_call' GROUP BY client ORDER BY calls DESC",
+            team=self.team,
+        )
+
+        self.assertEqual(response.columns, ["client", "calls"])
+        self.assertEqual(response.column_formats, ["mcp_harness", None])
+        self.assertEqual(response.results, [("OpenAI Codex", 2), ("Claude Code", 1)])
+
+    def test_custom_harness_names_calls_everywhere_the_label_shows(self) -> None:
+        MCPCustomHarness.objects.create(team=self.team, name="Acme Agent", match_pattern="acme-agent")
+        MCPCustomHarness.objects.create(team=self.team, name="Our Cursor", match_pattern="cursor-internal")
+        self._emit(properties={"$mcp_client_name": "Acme-Agent/1.2"})
+        self._emit(properties={"$mcp_client_user_agent": "acme-agent/2.0 (node)"}, distinct_id="d2")
+        self._emit(properties={"$mcp_client_name": "cursor-internal"}, distinct_id="d3")
+        self._emit(properties={"$mcp_client_name": "something-else"}, distinct_id="d4")
+        flush_persons_and_events()
+
+        virtual = execute_hogql_query(
+            "SELECT properties.$virt_mcp_harness AS client, count() AS calls "
+            "FROM events WHERE event = '$mcp_tool_call' GROUP BY client ORDER BY calls DESC, client",
+            team=self.team,
+        )
+
+        self.assertEqual(virtual.results, [("Acme Agent", 2), ("Other", 1), ("Our Cursor", 1)])
+        self.assertEqual(set(self._breakdown()), {"Acme Agent", "Other", "Our Cursor"})
+
+    def test_virtual_harness_property_is_empty_on_other_events(self) -> None:
+        _create_event(team=self.team, event="$pageview", distinct_id="d1", properties={"$mcp_client_name": "codex"})
+
+        flush_persons_and_events()
+        response = execute_hogql_query("SELECT properties.$virt_mcp_harness FROM events", team=self.team)
+
+        self.assertEqual(response.results, [(None,)])
+
+    @parameterized.expand(
+        [
+            ("claude-code/1.2.0", "claude-code/1.2.0", "Claude"),
+            ("codex-mcp-client", "codex-mcp-client", "OpenAI"),
+            ("", "Other", "Other harnesses"),
+        ]
+    )
+    def test_events_query_explicit_icon_preserves_client_label(self, client: str, label: str, mark: str) -> None:
+        self._emit(properties={"$mcp_client_name": client})
+        flush_persons_and_events()
+        column = (
+            "withIcon(coalesce(nullIf(toString(properties.$mcp_client_name), ''), properties.$virt_mcp_harness), "
+            "transform(properties.$virt_mcp_harness, ['Claude Code', 'OpenAI Codex'], "
+            "['Claude', 'OpenAI'], 'Other harnesses')) -- Client"
+        )
+        response = EventsQueryRunner(
+            query=EventsQuery(select=[column], events=["$mcp_tool_call"], orderBy=[column.split(" --")[0] + " DESC"]),
+            team=self.team,
+        ).calculate()
+
+        self.assertEqual(response.results, [[("__hx_tag", "BrandMarkLabel", "label", label, "mark", mark)]])
+
+    @parameterized.expand(
+        [
+            ("aliased", " AS harness", "harness"),
+            ("unaliased", "", "$virt_mcp_harness"),
+        ]
+    )
+    def test_virtual_harness_property_keeps_format_after_wildcard(
+        self, _name: str, alias: str, column_name: str
+    ) -> None:
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client"})
+
+        response = execute_hogql_query(
+            f"SELECT *, properties.$virt_mcp_harness{alias} FROM events WHERE event = '$mcp_tool_call' LIMIT 1",
+            team=self.team,
+        )
+
+        assert response.columns is not None
+        assert response.column_formats is not None
+        self.assertEqual(response.columns[-1], column_name)
+        self.assertEqual(response.column_formats[-1], "mcp_harness")
+
+    def test_tool_name_scopes_to_effective_tool_and_new_sdk(self) -> None:
+        new_sdk = {"$mcp_source": "posthog_mcp_analytics"}
+        self._emit(distinct_id="d1", properties={"$mcp_client_name": "claude-ai", **new_sdk})
+        self._emit(
+            distinct_id="d2",
+            properties={"$mcp_tool_name": "other_tool", "$mcp_client_name": "cursor-vscode", **new_sdk},
+        )
+        # Single-exec wrapper: the effective tool is in $mcp_exec_tool_call_name.
+        self._emit(
+            distinct_id="d3",
+            properties={
+                "$mcp_tool_name": "exec",
+                "$mcp_exec_tool_call_name": "query_run",
+                "$mcp_client_name": "windsurf",
+                **new_sdk,
+            },
+        )
+        # Same tool but missing the new-SDK source marker -> excluded.
+        self._emit(distinct_id="d4", properties={"$mcp_client_name": "claude-ai"})
+        flush_persons_and_events()
+
+        runner = MCPHarnessBreakdownQueryRunner(
+            query=MCPHarnessBreakdownQuery(dateRange=DateRange(date_from="-90d"), toolName="query_run"),
+            team=self.team,
+        )
+        rows = {row.harness: row for row in runner.calculate().results}
+
+        assert set(rows) == {"Claude.ai", "Windsurf"}
+
+    @parameterized.expand(
+        [
+            # The vendor header resolves from both wire keys it is captured under
+            # ($mcp_vendor_client from the SDKs, unprefixed mcp_vendor_client from
+            # PostHog's own server) and in both value spellings.
+            ("sdk_vendor_cowork", {"$mcp_vendor_client": "Cowork"}, "Cowork"),
+            ("sdk_vendor_claudecode", {"$mcp_vendor_client": "ClaudeCode"}, "Claude Code"),
+            (
+                "sdk_vendor_claude_artifacts_over_generic_name",
+                {"$mcp_vendor_client": "ClaudeArtifacts", "$mcp_client_name": "Claude"},
+                "Claude Artifacts",
+            ),
+            ("sdk_vendor_hyphenated", {"$mcp_vendor_client": "claude-code"}, "Claude Code"),
+            ("legacy_vendor_cowork", {"mcp_vendor_client": "Cowork"}, "Cowork"),
+            ("legacy_vendor_claudecode", {"mcp_vendor_client": "ClaudeCode"}, "Claude Code"),
+            (
+                "sdk_vendor_wins_over_legacy",
+                {"$mcp_vendor_client": "Cowork", "mcp_vendor_client": "ClaudeCode"},
+                "Cowork",
+            ),
+            ("client_name_codex", {"$mcp_client_name": "codex-mcp-client"}, "OpenAI Codex"),
+            ("client_name_cursor", {"$mcp_client_name": "cursor-vscode"}, "Cursor"),
+            ("sdk_client_name_claudeai", {"$mcp_client_name": "claude-ai"}, "Claude.ai"),
+            (
+                "sdk_client_name_mcp_remote_stripped",
+                {"$mcp_client_name": "claude-ai (via mcp-remote 0.1.37)"},
+                "Claude.ai",
+            ),
+            ("ua_claude_cli", {"$mcp_client_user_agent": "claude-code/2.1.0 (cli)"}, "Claude Code"),
+            (
+                "ua_claude_sdk",
+                {"$mcp_client_user_agent": "claude-code/2.1.0 (sdk-ts, agent-sdk/0.3)"},
+                "Claude Agent SDK",
+            ),
+            # Surface-specific exacts must win over the generic claude-code prefix.
+            (
+                "ua_claude_vscode",
+                {"$mcp_client_user_agent": "claude-code/2.1.0 (claude-vscode, agent-sdk/0.3)"},
+                "Claude Code (VS Code)",
+            ),
+            (
+                "ua_claude_desktop",
+                {"$mcp_client_user_agent": "claude-code/2.1.0 (claude-desktop, agent-sdk/0.3)"},
+                "Claude Desktop",
+            ),
+            ("ua_openai", {"$mcp_client_user_agent": "openai-mcp/1.0.0"}, "OpenAI"),
+            # grok.com Connectors: the grok- UA must beat the generic "connectors-manager"
+            # clientInfo.name it also reports, or the vendor is lost to 'Other'.
+            (
+                "grok_connectors_ua_beats_generic_name",
+                {
+                    "$mcp_client_user_agent": "grok-connectors-manager/0.1.0",
+                    "$mcp_client_name": "connectors-manager",
+                },
+                "Grok",
+            ),
+            # xAI API surface: no grok UA, buckets via its grok- clientInfo.name.
+            ("grok_shell_client_name", {"$mcp_client_name": "grok-shell-posthog"}, "Grok"),
+            ("ua_kimchi", {"$mcp_client_user_agent": "kimchi/1.2.2"}, "Kimchi"),
+            # Kimchi reports pi-mcp's generic clientInfo.name; its UA must beat it.
+            (
+                "kimchi_ua_beats_generic_pi_mcp_name",
+                {"$mcp_client_user_agent": "kimchi/1.2.2", "$mcp_client_name": "pi-mcp-castai"},
+                "Kimchi",
+            ),
+            # Without the kimchi UA, pi-mcp's name alone stays unattributed: it is
+            # not Pi's own `pi-client`, and other pi-based clients share it.
+            ("pi_mcp_name_alone_is_other", {"$mcp_client_name": "pi-mcp-castai"}, "Other"),
+            ("client_name_librechat", {"$mcp_client_name": "@librechat/api-client"}, "LibreChat"),
+            (
+                "mcp_remote_suffix_stripped",
+                {"$mcp_client_name": "codex-mcp-client (via mcp-remote 0.1.37)"},
+                "OpenAI Codex",
+            ),
+            ("client_name_lovable", {"$mcp_client_name": "lovable"}, "Lovable"),
+            ("unknown_to_other", {"$mcp_client_name": "totally-unknown-thing"}, "Other"),
+            ("generic_claude_without_vendor_is_other", {"$mcp_client_name": "Claude"}, "Other"),
+            # Not resolution signals: the SDKs never emit these properties and the
+            # server folds the session-pinned name into per-event $mcp_client_name,
+            # so on their own they attribute nothing.
+            ("session_name_no_longer_read", {"mcp_session_client_name": "codex-mcp-client"}, "Other"),
+            ("oauth_name_no_longer_read", {"$mcp_oauth_client_name": "lovable"}, "Other"),
+        ]
+    )
+    def test_resolves_harness_label(self, _name: str, properties: dict[str, Any], expected: str) -> None:
+        self._emit(properties=properties)
+        flush_persons_and_events()
+
+        by_harness = self._breakdown()
+
+        assert expected in by_harness, f"expected {expected!r}, got {sorted(by_harness)}"
+        assert by_harness[expected].total_calls == 1
+
+    def test_vendor_header_wins_over_generic_client_name(self) -> None:
+        # Anthropic's pooled surfaces self-report the generic "Anthropic/ClaudeAI"
+        # clientInfo.name; the vendor header is what separates Cowork from Claude.ai —
+        # including when it arrives under the unprefixed wire key.
+        self._emit(properties={"mcp_vendor_client": "Cowork", "$mcp_client_name": "Anthropic/ClaudeAI"})
+        flush_persons_and_events()
+
+        by_harness = self._breakdown()
+
+        assert "Cowork" in by_harness
+        assert "Claude.ai" not in by_harness
+
+    def test_aggregates_calls_errors_and_sessions(self) -> None:
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client"}, session_id="a", is_error=False)
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client"}, session_id="a", is_error=True)
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client"}, session_id="b", is_error=False)
+        flush_persons_and_events()
+
+        row = self._breakdown()["OpenAI Codex"]
+
+        assert row.total_calls == 3
+        assert row.errors == 1
+        assert row.sessions == 2
+        assert row.error_rate_pct == 33.3
+
+    def test_date_range_excludes_older_events(self) -> None:
+        now = datetime.now(tz=UTC)
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client"}, timestamp=now - timedelta(days=30))
+        self._emit(properties={"$mcp_client_name": "cursor-vscode"}, timestamp=now)
+        flush_persons_and_events()
+
+        by_harness = self._breakdown(date_from="-7d")
+
+        assert "Cursor" in by_harness
+        assert "OpenAI Codex" not in by_harness
+
+    def test_property_filter_applies(self) -> None:
+        # properties is the only user-supplied input reaching the WHERE clause;
+        # confirm it actually filters (via property_to_expr), not just passes through.
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client", "$mcp_tool_name": "query_run"})
+        self._emit(properties={"$mcp_client_name": "cursor-vscode", "$mcp_tool_name": "insight_get"})
+        flush_persons_and_events()
+
+        runner = MCPHarnessBreakdownQueryRunner(
+            query=MCPHarnessBreakdownQuery(
+                dateRange=DateRange(date_from="-90d"),
+                properties=[
+                    EventPropertyFilter(key="$mcp_tool_name", value=["query_run"], operator=PropertyOperator.EXACT)
+                ],
+            ),
+            team=self.team,
+        )
+        by_harness = {row.harness: row for row in runner.calculate().results}
+
+        assert "OpenAI Codex" in by_harness
+        assert "Cursor" not in by_harness
+
+    @parameterized.expand([("posthog_session_id", "$session_id"), ("mcp_session_id", "$mcp_session_id")])
+    def test_sessions_count_either_session_id_without_tool_name(self, _name: str, session_key: str) -> None:
+        self._emit(session_id="", properties={"$mcp_client_name": "codex-mcp-client", session_key: "a"})
+        flush_persons_and_events()
+
+        assert self._breakdown()["OpenAI Codex"].sessions == 1
+
+    def test_harness_sessions_is_none_when_tool_name_unset(self) -> None:
+        self._emit(properties={"$mcp_client_name": "codex-mcp-client"})
+        flush_persons_and_events()
+
+        row = self._breakdown()["OpenAI Codex"]
+
+        assert row.harness_sessions is None
+
+    @parameterized.expand([("posthog_session_id", "$session_id"), ("mcp_session_id", "$mcp_session_id")])
+    def test_harness_sessions_counts_all_tools_when_tool_name_set(self, _name: str, session_key: str) -> None:
+        new_sdk = {"$mcp_source": "posthog_mcp_analytics"}
+        self._emit(
+            distinct_id="d1",
+            session_id="",
+            properties={"$mcp_client_name": "codex-mcp-client", session_key: "a", **new_sdk},
+        )
+        # A different tool, same harness, different session: counts toward harness_sessions
+        # but not toward this tool's own `sessions`.
+        self._emit(
+            distinct_id="d2",
+            session_id="",
+            properties={
+                "$mcp_tool_name": "other_tool",
+                "$mcp_client_name": "codex-mcp-client",
+                session_key: "b",
+                **new_sdk,
+            },
+        )
+        flush_persons_and_events()
+
+        runner = MCPHarnessBreakdownQueryRunner(
+            query=MCPHarnessBreakdownQuery(dateRange=DateRange(date_from="-90d"), toolName="query_run"),
+            team=self.team,
+        )
+        row = {row.harness: row for row in runner.calculate().results}["OpenAI Codex"]
+
+        assert row.sessions == 1
+        assert row.harness_sessions == 2
+
+    def test_harness_omitted_when_tool_never_ran_there_but_shown_without_tool_name(self) -> None:
+        new_sdk = {"$mcp_source": "posthog_mcp_analytics"}
+        self._emit(
+            properties={"$mcp_tool_name": "other_tool", "$mcp_client_name": "codex-mcp-client", **new_sdk},
+        )
+        flush_persons_and_events()
+
+        runner = MCPHarnessBreakdownQueryRunner(
+            query=MCPHarnessBreakdownQuery(dateRange=DateRange(date_from="-90d"), toolName="query_run"),
+            team=self.team,
+        )
+        assert "OpenAI Codex" not in {row.harness for row in runner.calculate().results}
+        assert "OpenAI Codex" in self._breakdown()

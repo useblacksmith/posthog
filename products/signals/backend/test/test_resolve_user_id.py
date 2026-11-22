@@ -1,0 +1,231 @@
+import pytest
+
+from django.apps import apps
+
+from posthog.constants import AvailableFeature
+from posthog.models import Organization, Team, User
+from posthog.models.integration import Integration
+from posthog.models.organization import OrganizationMembership
+from posthog.models.user_integration import UserIntegration
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.signals.backend.task_profiles import (
+    GITHUB_ONLY_DOMAINS,
+    REPO_SELECTION,
+    RESEARCH,
+    SCOUT_FULL_NETWORK,
+    SCOUT_TRIAL_JUDGE,
+)
+from products.signals.backend.temporal.agentic import (
+    get_or_create_signals_sandbox_env,
+    resolve_acting_user_id_for_team,
+    resolve_user_id_for_team,
+)
+
+
+@pytest.fixture
+def organization():
+    org = Organization.objects.create(name="test-resolve-user-org")
+    return org
+
+
+@pytest.fixture
+def team(organization):
+    return Team.objects.create(organization=organization, name="test-resolve-user-team")
+
+
+def _create_user(
+    email: str,
+    organization: Organization,
+    *,
+    is_active: bool = True,
+    level: OrganizationMembership.Level = OrganizationMembership.Level.OWNER,
+) -> User:
+    user = User.objects.create(email=email, is_active=is_active)
+    OrganizationMembership.objects.create(user=user, organization=organization, level=level)
+    return user
+
+
+def _create_github_integration(team: Team, created_by: User | None = None) -> Integration:
+    return Integration.objects.create(
+        team=team,
+        kind="github",
+        config={"installation_id": "12345"},
+        sensitive_config={},
+        created_by=created_by,
+    )
+
+
+def _create_user_github_integration(user: User, *, integration_id: str = "67890") -> UserIntegration:
+    return UserIntegration.objects.create(
+        user=user,
+        kind=UserIntegration.IntegrationKind.GITHUB,
+        integration_id=integration_id,
+        config={"installation_id": integration_id},
+        sensitive_config={},
+    )
+
+
+@pytest.mark.django_db
+def test_returns_integration_creator_when_active(organization, team):
+    first_user = _create_user("first@example.com", organization)
+    creator = _create_user("creator@example.com", organization)
+    _create_github_integration(team, created_by=creator)
+
+    result = resolve_user_id_for_team(team.id)
+
+    assert result == creator.id
+    assert result != first_user.id
+
+
+@pytest.mark.django_db
+def test_falls_back_to_first_active_member_when_creator_inactive(organization, team):
+    first_user = _create_user("first@example.com", organization)
+    creator = _create_user("creator@example.com", organization, is_active=False)
+    _create_github_integration(team, created_by=creator)
+
+    result = resolve_user_id_for_team(team.id)
+
+    assert result == first_user.id
+
+
+@pytest.mark.django_db
+def test_falls_back_to_first_active_member_when_creator_not_set(organization, team):
+    first_user = _create_user("first@example.com", organization)
+    _create_github_integration(team, created_by=None)
+
+    result = resolve_user_id_for_team(team.id)
+
+    assert result == first_user.id
+
+
+@pytest.mark.django_db
+def test_skips_inactive_members_in_fallback(organization, team):
+    _create_user("inactive@example.com", organization, is_active=False)
+    active_user = _create_user("active@example.com", organization)
+    _create_github_integration(team, created_by=None)
+
+    result = resolve_user_id_for_team(team.id)
+
+    assert result == active_user.id
+
+
+@pytest.mark.django_db
+def test_raises_when_no_active_users(organization, team):
+    _create_user("inactive@example.com", organization, is_active=False)
+    _create_github_integration(team, created_by=None)
+
+    with pytest.raises(RuntimeError, match="No active users"):
+        resolve_user_id_for_team(team.id)
+
+
+@pytest.mark.django_db
+def test_uses_user_integration_owner_when_no_team_integration(organization, team):
+    other = _create_user("other@example.com", organization)
+    user_integration_owner = _create_user("posthog-code@example.com", organization)
+    _create_user_github_integration(user_integration_owner)
+
+    result = resolve_user_id_for_team(team.id)
+
+    assert result == user_integration_owner.id
+    assert result != other.id
+
+
+@pytest.mark.django_db
+def test_prefers_team_integration_creator_over_user_integration_owner(organization, team):
+    creator = _create_user("creator@example.com", organization)
+    user_integration_owner = _create_user("posthog-code@example.com", organization)
+    _create_user_github_integration(user_integration_owner)
+    _create_github_integration(team, created_by=creator)
+
+    result = resolve_user_id_for_team(team.id)
+
+    assert result == creator.id
+
+
+@pytest.mark.django_db
+def test_raises_when_team_has_no_github_source_at_all(organization, team):
+    # No Integration, no UserIntegration. Picking an arbitrary org member without GitHub
+    # credentials would just paper over the bug; the caller has to short-circuit instead.
+    _create_user("first@example.com", organization)
+
+    with pytest.raises(RuntimeError, match="No GitHub integration"):
+        resolve_user_id_for_team(team.id)
+
+
+@pytest.mark.django_db
+def test_acting_user_falls_back_to_active_member_without_github(organization, team):
+    # The scout path has no repo to clone, so it must NOT require GitHub: a team with an active
+    # org member but no integration resolves that member instead of failing. This is the fix for
+    # the teams that were crashing every scheduled run on the GitHub precondition.
+    member = _create_user("member@example.com", organization)
+
+    assert resolve_acting_user_id_for_team(team.id) == member.id
+
+
+@pytest.mark.django_db
+def test_acting_user_returns_none_when_no_active_member(organization, team):
+    # The only genuine "can't run" case — no active user to act as. Returning None (not raising)
+    # is what lets the scheduled caller short-circuit to a skip instead of a bogus failed run.
+    _create_user("inactive@example.com", organization, is_active=False)
+
+    assert resolve_acting_user_id_for_team(team.id) is None
+
+
+@pytest.mark.django_db
+def test_acting_user_prefers_github_creator_when_present(organization, team):
+    # When GitHub IS connected, keep the existing attribution: act as the integration creator,
+    # not an arbitrary member — so the decoupling doesn't change behavior for set-up teams.
+    _create_user("member@example.com", organization)
+    creator = _create_user("creator@example.com", organization)
+    _create_github_integration(team, created_by=creator)
+
+    assert resolve_acting_user_id_for_team(team.id) == creator.id
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("denial", ["private_project", "per_member_rule"])
+@pytest.mark.parametrize("with_github_integration", [False, True])
+def test_acting_user_skips_member_without_project_access(organization, team, with_github_integration, denial):
+    organization.available_product_features = [
+        {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+    ]
+    organization.save()
+    denied_member = _create_user("denied@example.com", organization, level=OrganizationMembership.Level.MEMBER)
+    admin = _create_user("admin@example.com", organization, level=OrganizationMembership.Level.ADMIN)
+    denied_by_member = (
+        OrganizationMembership.objects.get(user=denied_member, organization=organization)
+        if denial == "per_member_rule"
+        else None
+    )
+    AccessControl.objects.create(
+        team=team,
+        resource="project",
+        resource_id=str(team.id),
+        organization_member=denied_by_member,
+        access_level="none",
+    )
+    if with_github_integration:
+        _create_github_integration(team, created_by=denied_member)
+
+    assert resolve_acting_user_id_for_team(team.id) == admin.id
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "profile,expected_level,expected_domains",
+    [
+        pytest.param(RESEARCH, "trusted", [], id="trusted"),
+        pytest.param(REPO_SELECTION, "custom", GITHUB_ONLY_DOMAINS, id="github_only"),
+        pytest.param(SCOUT_TRIAL_JUDGE, "custom", [], id="custom_without_domains"),
+        pytest.param(SCOUT_FULL_NETWORK, "full", [], id="full"),
+    ],
+)
+def test_sandbox_env_takes_its_network_policy_from_the_profile(team, profile, expected_level, expected_domains):
+    SandboxEnvironment = apps.get_model("tasks", "SandboxEnvironment")
+
+    env_id = get_or_create_signals_sandbox_env(team.id, "SIGNALS_PROFILE_TEST", profile)
+
+    env = SandboxEnvironment.objects.get(id=env_id)
+    assert env.internal is True
+    assert (env.network_access_level, env.allowed_domains) == (expected_level, expected_domains)

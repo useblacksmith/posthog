@@ -1,0 +1,215 @@
+use std::io::Write;
+
+use posthog_symbol_data::{
+    read_symbol_data, read_symbol_data_with_byte_count_limited,
+    symbol_data_known_decompressed_size, write_symbol_data, write_symbol_data_uncompressed,
+    AppleDsym, ElfDebugInfo, HermesMap, ProguardMapping, SourceAndMap, SymbolDataError,
+};
+
+const MAGIC_LEN: usize = b"posthog_error_tracking".len();
+const VERSION_OFFSET: usize = MAGIC_LEN;
+const COMPRESSION_OFFSET: usize = MAGIC_LEN + 4 + 4; // after MAGIC + VERSION + TYPE
+
+#[test]
+fn test_source_and_map_reading() {
+    // This file is v1 format - validates backward compatibility
+    let input = include_bytes!("static/sourcemap_with_nulls.jsdata");
+    read_symbol_data::<SourceAndMap>(input).unwrap();
+}
+
+#[test]
+fn test_v2_compressed_header() {
+    let input = SourceAndMap {
+        minified_source: "minified_source".to_string(),
+        sourcemap: "sourcemap".to_string(),
+    };
+
+    let bytes = write_symbol_data(input.clone()).unwrap();
+    let version = u32::from_le_bytes(
+        bytes[VERSION_OFFSET..VERSION_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(version, 2);
+    assert_eq!(bytes[COMPRESSION_OFFSET], 1); // zstd
+
+    let uncompressed = write_symbol_data_uncompressed(input.clone()).unwrap();
+    assert_eq!(
+        symbol_data_known_decompressed_size(&bytes).unwrap(),
+        Some(uncompressed.len() - COMPRESSION_OFFSET - 1)
+    );
+
+    let output = read_symbol_data::<SourceAndMap>(&bytes).unwrap();
+    assert_eq!(input, output);
+}
+
+#[test]
+fn test_v2_compressed_size_includes_concatenated_frames() {
+    let first = zstd::bulk::compress(b"first", 3).unwrap();
+    let second_payload = vec![b'x'; 100_000];
+    let second = zstd::bulk::compress(&second_payload, 3).unwrap();
+
+    let mut bytes = write_symbol_data(SourceAndMap {
+        minified_source: "source".to_string(),
+        sourcemap: "map".to_string(),
+    })
+    .unwrap();
+    bytes.truncate(COMPRESSION_OFFSET + 1);
+    bytes.extend(first);
+    bytes.extend(second);
+
+    assert_eq!(
+        symbol_data_known_decompressed_size(&bytes).unwrap(),
+        Some(5 + second_payload.len())
+    );
+}
+
+#[test]
+fn test_v2_compressed_without_content_size() {
+    let mut encoder = zstd::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.write_all(b"legacy payload").unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut bytes = write_symbol_data(SourceAndMap {
+        minified_source: "source".to_string(),
+        sourcemap: "map".to_string(),
+    })
+    .unwrap();
+    bytes.truncate(COMPRESSION_OFFSET + 1);
+    bytes.extend(compressed);
+
+    assert_eq!(symbol_data_known_decompressed_size(&bytes).unwrap(), None);
+}
+
+#[test]
+fn test_limited_read_stops_at_the_limit() {
+    let limit = 1024;
+    let at_limit = ElfDebugInfo {
+        data: vec![0; limit],
+    };
+    let bytes = write_symbol_data(at_limit.clone()).unwrap();
+    assert_eq!(
+        read_symbol_data_with_byte_count_limited::<ElfDebugInfo>(&bytes, limit).unwrap(),
+        (at_limit, limit)
+    );
+
+    let over_limit = write_symbol_data(ElfDebugInfo {
+        data: vec![0; limit + 1],
+    })
+    .unwrap();
+    let uncompressed_over_limit = write_symbol_data_uncompressed(ElfDebugInfo {
+        data: vec![0; limit + 1],
+    })
+    .unwrap();
+
+    // A frame that declares no content size decodes until the frame ends.
+    let mut encoder = zstd::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.write_all(&vec![0; 64 * limit]).unwrap();
+    let mut undeclared_size = write_symbol_data(ElfDebugInfo { data: Vec::new() }).unwrap();
+    undeclared_size.truncate(COMPRESSION_OFFSET + 1);
+    undeclared_size.extend(encoder.finish().unwrap());
+
+    for bytes in [over_limit, uncompressed_over_limit, undeclared_size] {
+        assert_eq!(
+            read_symbol_data_with_byte_count_limited::<ElfDebugInfo>(&bytes, limit).unwrap_err(),
+            SymbolDataError::DecompressedTooLarge(limit as u64)
+        );
+    }
+}
+
+#[test]
+fn test_v2_uncompressed_header() {
+    let input = SourceAndMap {
+        minified_source: "minified_source".to_string(),
+        sourcemap: "sourcemap".to_string(),
+    };
+
+    let bytes = write_symbol_data_uncompressed(input.clone()).unwrap();
+    let version = u32::from_le_bytes(
+        bytes[VERSION_OFFSET..VERSION_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(version, 2);
+    assert_eq!(bytes[COMPRESSION_OFFSET], 0); // none
+
+    let output = read_symbol_data::<SourceAndMap>(&bytes).unwrap();
+    assert_eq!(input, output);
+}
+
+macro_rules! roundtrip_test {
+    ($name:ident, $ty:ty, $value:expr) => {
+        #[test]
+        fn $name() {
+            let input = $value;
+            let bytes = write_symbol_data(input.clone()).unwrap();
+            let output = read_symbol_data::<$ty>(&bytes).unwrap();
+            assert_eq!(input, output);
+        }
+    };
+}
+
+roundtrip_test!(
+    test_v2_roundtrip_source_and_map,
+    SourceAndMap,
+    SourceAndMap {
+        minified_source: "minified_source".to_string(),
+        sourcemap: "sourcemap".to_string(),
+    }
+);
+roundtrip_test!(
+    test_v2_roundtrip_hermes_map,
+    HermesMap,
+    HermesMap {
+        sourcemap: "hermes map data".to_string(),
+    }
+);
+roundtrip_test!(
+    test_v2_roundtrip_proguard_mapping,
+    ProguardMapping,
+    ProguardMapping {
+        content: "proguard mapping data".to_string(),
+    }
+);
+roundtrip_test!(
+    test_v2_roundtrip_elf_debug_info,
+    ElfDebugInfo,
+    ElfDebugInfo {
+        data: b"\x7fELF fake debug payload".to_vec(),
+    }
+);
+
+#[test]
+fn test_cross_type_reads_fail() {
+    // Consumers that accept multiple container types dispatch on the type tag,
+    // so a type mismatch must be an error rather than a silent
+    // reinterpretation — in both directions.
+    let elf_bytes = write_symbol_data(ElfDebugInfo {
+        data: b"\x7fELF fake debug payload".to_vec(),
+    })
+    .unwrap();
+    assert!(read_symbol_data::<AppleDsym>(&elf_bytes).is_err());
+
+    let dsym_bytes = write_symbol_data(AppleDsym {
+        data: b"fake dsym zip payload".to_vec(),
+    })
+    .unwrap();
+    assert!(read_symbol_data::<ElfDebugInfo>(&dsym_bytes).is_err());
+}
+
+#[test]
+fn test_v2_compressed_large_payload() {
+    let large_source = "a".repeat(100_000);
+    let large_map = "b".repeat(100_000);
+    let input = SourceAndMap {
+        minified_source: large_source,
+        sourcemap: large_map,
+    };
+
+    let bytes = write_symbol_data(input.clone()).unwrap();
+    let uncompressed_bytes = write_symbol_data_uncompressed(input.clone()).unwrap();
+    assert!(bytes.len() < uncompressed_bytes.len() / 2);
+
+    let output = read_symbol_data::<SourceAndMap>(&bytes).unwrap();
+    assert_eq!(input, output);
+}

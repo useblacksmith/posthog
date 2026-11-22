@@ -1,0 +1,52 @@
+"""
+Facade re-exports for the sandbox execution surface.
+
+These are behavioral primitives (abstract base class + config/value types + factory
+functions), not data — other products construct and drive sandboxes through them. They
+cross the boundary as objects, per the wiring pattern. Kept out of ``facade/api.py`` so the
+heavy docker/modal dependencies stay off the light data-surface import path.
+"""
+
+from products.tasks.backend.exceptions import (
+    SandboxCleanupError,
+    SandboxExecutionError,
+    SandboxNotFoundError,
+    SandboxNotRunningError,
+    SandboxProvisionError,
+    SandboxTimeoutError,
+)
+from products.tasks.backend.logic.services.sandbox import (
+    ExecutionResult,
+    SandboxBase,
+    SandboxClass,
+    SandboxConfig,
+    SandboxResources,
+    SandboxStatus,
+    SandboxTemplate,
+    get_sandbox_class,
+    get_sandbox_class_for_backend,
+    get_sandbox_class_for_sandbox_id,
+    is_public_sandbox_repo,
+    sandbox_repo_path,
+)
+
+__all__ = [
+    "ExecutionResult",
+    "SandboxBase",
+    "SandboxCleanupError",
+    "SandboxClass",
+    "SandboxConfig",
+    "SandboxExecutionError",
+    "SandboxNotFoundError",
+    "SandboxNotRunningError",
+    "SandboxProvisionError",
+    "SandboxResources",
+    "SandboxStatus",
+    "SandboxTemplate",
+    "SandboxTimeoutError",
+    "get_sandbox_class",
+    "get_sandbox_class_for_backend",
+    "get_sandbox_class_for_sandbox_id",
+    "is_public_sandbox_repo",
+    "sandbox_repo_path",
+]

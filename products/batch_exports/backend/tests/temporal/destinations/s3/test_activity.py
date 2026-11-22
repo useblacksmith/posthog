@@ -1,0 +1,561 @@
+import uuid
+
+import pytest
+
+from temporalio.testing._activity import ActivityEnvironment
+
+from posthog.models.integration import Integration, IntegrationError
+from posthog.temporal.tests.utils.events import generate_test_events_in_clickhouse
+
+from products.batch_exports.backend.service import (
+    AnyBatchExportModel,
+    BatchExportEventsCustomModel,
+    BatchExportEventsModel,
+    BatchExportSchema,
+)
+from products.batch_exports.backend.temporal.destinations.constants import (
+    COMPRESSION_EXTENSIONS,
+    FILE_FORMAT_EXTENSIONS,
+)
+from products.batch_exports.backend.temporal.destinations.s3_batch_export import (
+    S3InsertInputs,
+    _get_s3_integration,
+    insert_into_s3_activity_from_stage,
+    s3_default_fields,
+)
+from products.batch_exports.backend.tests.temporal.destinations.s3.utils import (
+    SPLIT_FILE_FORMAT_COMPRESSIONS,
+    SUPPORTED_FILE_FORMAT_COMPRESSIONS,
+    TEST_S3_MODELS,
+    assert_clickhouse_records_in_s3,
+    run_activity,
+)
+from products.batch_exports.backend.tests.temporal.utils.s3 import assert_files_in_s3, read_json_file_from_s3
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.django_db]
+
+# Codecs run on the bytes the file writer produces, whatever the model, so every model runs once per
+# file format and every remaining codec runs once with the events model.
+MODEL_FILE_FORMAT_COMPRESSIONS: list[tuple[str, str | None]] = [("Parquet", "zstd"), ("JSONLines", "gzip")]
+FILE_FORMAT_COMPRESSION_MODEL_CASES = [
+    *(
+        (file_format, compression, model)
+        for model in TEST_S3_MODELS
+        for file_format, compression in MODEL_FILE_FORMAT_COMPRESSIONS
+    ),
+    *(
+        (file_format, compression, BatchExportEventsModel())
+        for file_format, compression in SUPPORTED_FILE_FORMAT_COMPRESSIONS
+        if (file_format, compression) not in MODEL_FILE_FORMAT_COMPRESSIONS
+    ),
+]
+
+
+async def test_get_s3_integration_rejects_wrong_kind(ateam):
+    """An integration whose kind is neither aws-s3 nor s3-compatible can't be resolved as an S3 one.
+
+    The serializer validates the kind on create/update, so this only happens if the integration's
+    kind is changed out from under an existing export (unlikely, but worth checking).
+    """
+    integration = await Integration.objects.acreate(
+        team_id=ateam.pk,
+        kind=Integration.IntegrationKind.SLACK,
+        integration_id="not-s3",
+        config={},
+        sensitive_config={},
+    )
+
+    with pytest.raises(IntegrationError) as exc_info:
+        await _get_s3_integration(integration.id, ateam.pk)
+    assert "not an S3 integration" in str(exc_info.value)
+    assert "kind='slack'" in str(exc_info.value)
+
+
+async def test_insert_into_s3_activity_fails_without_an_integration(activity_environment, ateam):
+    """An export with no linked integration has no way to authenticate, so it fails without retrying.
+
+    Not sure if this is reachable in practice, but it tests the activity's error handling in case it
+    ever does occur.
+    """
+    insert_inputs = S3InsertInputs(
+        bucket_name="my-bucket",
+        region="us-east-1",
+        prefix="events/",
+        team_id=ateam.pk,
+        data_interval_start="2023-04-20T14:00:00+00:00",
+        data_interval_end="2023-04-20T15:00:00+00:00",
+        integration_id=None,
+        batch_export_id=str(uuid.uuid4()),
+        destination_default_fields=s3_default_fields(),
+    )
+
+    result = await activity_environment.run(insert_into_s3_activity_from_stage, insert_inputs)
+
+    # Non-retryable errors are returned on the result rather than raised, so the run fails once.
+    assert result.error is not None
+    assert result.error.type == "MissingIntegrationError"
+
+
+@pytest.mark.parametrize(
+    ("file_format", "compression", "model"), FILE_FORMAT_COMPRESSION_MODEL_CASES, indirect=["compression"]
+)
+async def test_insert_into_s3_activity_puts_data_into_s3(
+    clickhouse_client,
+    bucket_name,
+    object_storage_client,
+    activity_environment: ActivityEnvironment,
+    compression,
+    exclude_events,
+    file_format,
+    data_interval_start,
+    data_interval_end,
+    model: AnyBatchExportModel | BatchExportSchema | None,
+    generate_test_data,
+    ateam,
+    s3_compatible_integration,
+):
+    """Test that the insert_into_s3_activity_from_stage function ends up with data into S3.
+
+    We use the generate_test_events_in_clickhouse function to generate several sets
+    of events. Some of these sets are expected to be exported, and others not. Expected
+    events are those that:
+    * Are created for the team_id of the batch export.
+    * Are created in the date range of the batch export.
+    * Are not duplicates of other events that are in the same batch.
+    * Match any filters specified in the batch export model.
+
+    Once we have these events, we pass them to the assert_clickhouse_records_in_s3 function to check
+    that they appear in the expected S3 bucket and key.
+    """
+
+    prefix = str(uuid.uuid4())
+
+    batch_export_model: AnyBatchExportModel | None = None
+    if isinstance(model, AnyBatchExportModel):
+        batch_export_model = model
+    elif model is not None:
+        batch_export_model = BatchExportEventsCustomModel(schema=model)
+
+    batch_export_id = str(uuid.uuid4())
+
+    insert_inputs = S3InsertInputs(
+        bucket_name=bucket_name,
+        region="us-east-1",
+        prefix=prefix,
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start.isoformat(),
+        data_interval_end=data_interval_end.isoformat(),
+        integration_id=s3_compatible_integration.id,
+        compression=compression,
+        exclude_events=exclude_events,
+        file_format=file_format,
+        batch_export_model=batch_export_model,
+        batch_export_id=batch_export_id,
+        destination_default_fields=s3_default_fields(),
+    )
+
+    result = await run_activity(activity_environment, insert_inputs)
+    records_exported = result.records_completed
+    bytes_exported = result.bytes_exported
+    assert result.error is None
+
+    events_to_export_created, persons_to_export_created = generate_test_data
+    assert (
+        records_exported == len(events_to_export_created)
+        or records_exported == len(persons_to_export_created)
+        or records_exported == len([event for event in events_to_export_created if event["properties"] is not None])
+        or (isinstance(model, AnyBatchExportModel) and model.name == "sessions" and 1 <= records_exported <= 2)
+    )
+
+    assert isinstance(bytes_exported, int)
+    assert bytes_exported > 0
+
+    sort_key = "uuid"
+    if isinstance(model, AnyBatchExportModel) and model.name == "persons":
+        sort_key = "person_id"
+    elif isinstance(model, AnyBatchExportModel) and model.name == "sessions":
+        sort_key = "session_id"
+
+    await assert_clickhouse_records_in_s3(
+        s3_compatible_client=object_storage_client,
+        clickhouse_client=clickhouse_client,
+        bucket_name=bucket_name,
+        key_prefix=prefix,
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start,
+        data_interval_end=data_interval_end,
+        batch_export_model=model,
+        exclude_events=exclude_events,
+        include_events=None,
+        compression=compression,
+        file_format=file_format,
+        backfill_details=None,
+        sort_key=sort_key,
+    )
+
+
+@pytest.mark.parametrize("exclude_events", [None], indirect=True)
+@pytest.mark.parametrize("model", [BatchExportEventsModel()])
+@pytest.mark.parametrize("compression", [None], indirect=True)
+@pytest.mark.parametrize("file_format", ["JSONLines"], indirect=True)
+async def test_insert_into_s3_activity_resolves_credentials_from_integration(
+    clickhouse_client,
+    bucket_name,
+    object_storage_client,
+    activity_environment: ActivityEnvironment,
+    compression,
+    exclude_events,
+    file_format,
+    data_interval_start,
+    data_interval_end,
+    model: AnyBatchExportModel,
+    generate_test_data,
+    ateam,
+    s3_compatible_integration,
+):
+    """An integration-backed S3-compatible export resolves credentials and endpoint_url from the
+    linked Integration at run time, with none of them present on the activity inputs.
+    """
+    prefix = str(uuid.uuid4())
+
+    insert_inputs = S3InsertInputs(
+        bucket_name=bucket_name,
+        region="us-east-1",
+        prefix=prefix,
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start.isoformat(),
+        data_interval_end=data_interval_end.isoformat(),
+        # No inline credentials or endpoint_url — both are resolved from the integration.
+        integration_id=s3_compatible_integration.id,
+        compression=compression,
+        exclude_events=exclude_events,
+        file_format=file_format,
+        batch_export_model=model,
+        batch_export_id=str(uuid.uuid4()),
+        destination_default_fields=s3_default_fields(),
+    )
+
+    result = await run_activity(activity_environment, insert_inputs)
+    assert result.error is None
+    assert result.records_completed is not None and result.records_completed > 0
+    assert result.bytes_exported is not None and result.bytes_exported > 0
+
+    await assert_clickhouse_records_in_s3(
+        s3_compatible_client=object_storage_client,
+        clickhouse_client=clickhouse_client,
+        bucket_name=bucket_name,
+        key_prefix=prefix,
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start,
+        data_interval_end=data_interval_end,
+        batch_export_model=model,
+        exclude_events=exclude_events,
+        include_events=None,
+        compression=compression,
+        file_format=file_format,
+        backfill_details=None,
+        sort_key="uuid",
+    )
+
+
+@pytest.mark.parametrize("exclude_events", [None, ["test-exclude"]], indirect=True)
+@pytest.mark.parametrize("model", [BatchExportEventsModel()])
+@pytest.mark.parametrize("compression", [None], indirect=True)
+@pytest.mark.parametrize("file_format", ["Parquet"], indirect=True)
+async def test_insert_into_s3_activity_with_exclude_events(
+    clickhouse_client,
+    bucket_name,
+    object_storage_client,
+    activity_environment: ActivityEnvironment,
+    compression,
+    exclude_events,
+    file_format,
+    data_interval_start,
+    data_interval_end,
+    model: AnyBatchExportModel | BatchExportSchema | None,
+    generate_test_data,
+    ateam,
+    s3_compatible_integration,
+):
+    """Test that the insert_into_s3_activity_from_stage function does not export events that match the exclude_events
+    filter.
+    """
+
+    prefix = str(uuid.uuid4())
+
+    batch_export_model: AnyBatchExportModel | None = None
+    if isinstance(model, AnyBatchExportModel):
+        batch_export_model = model
+    elif model is not None:
+        batch_export_model = BatchExportEventsCustomModel(schema=model)
+
+    batch_export_id = str(uuid.uuid4())
+
+    insert_inputs = S3InsertInputs(
+        bucket_name=bucket_name,
+        region="us-east-1",
+        prefix=prefix,
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start.isoformat(),
+        data_interval_end=data_interval_end.isoformat(),
+        integration_id=s3_compatible_integration.id,
+        compression=compression,
+        exclude_events=exclude_events,
+        file_format=file_format,
+        batch_export_model=batch_export_model,
+        batch_export_id=batch_export_id,
+        destination_default_fields=s3_default_fields(),
+    )
+
+    result = await run_activity(activity_environment, insert_inputs)
+    records_exported = result.records_completed
+    bytes_exported = result.bytes_exported
+    assert result.error is None
+
+    events_to_export_created, persons_to_export_created = generate_test_data
+    assert (
+        records_exported == len(events_to_export_created)
+        or records_exported == len(persons_to_export_created)
+        or records_exported == len([event for event in events_to_export_created if event["properties"] is not None])
+        or (isinstance(model, AnyBatchExportModel) and model.name == "sessions" and 1 <= records_exported <= 2)
+    )
+
+    assert isinstance(bytes_exported, int)
+    assert bytes_exported > 0
+
+    sort_key = "uuid"
+    if isinstance(model, AnyBatchExportModel) and model.name == "persons":
+        sort_key = "person_id"
+    elif isinstance(model, AnyBatchExportModel) and model.name == "sessions":
+        sort_key = "session_id"
+
+    await assert_clickhouse_records_in_s3(
+        s3_compatible_client=object_storage_client,
+        clickhouse_client=clickhouse_client,
+        bucket_name=bucket_name,
+        key_prefix=prefix,
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start,
+        data_interval_end=data_interval_end,
+        batch_export_model=model,
+        exclude_events=exclude_events,
+        include_events=None,
+        compression=compression,
+        file_format=file_format,
+        backfill_details=None,
+        sort_key=sort_key,
+    )
+
+
+@pytest.mark.parametrize(("file_format", "compression"), SPLIT_FILE_FORMAT_COMPRESSIONS, indirect=["compression"])
+@pytest.mark.parametrize("model", [BatchExportEventsModel()])
+@pytest.mark.parametrize("max_file_size_mb", [None, 1])
+async def test_insert_into_s3_activity_puts_splitted_files_into_s3(
+    clickhouse_client,
+    bucket_name,
+    object_storage_client,
+    activity_environment,
+    compression,
+    max_file_size_mb,
+    exclude_events,
+    file_format,
+    data_interval_start,
+    data_interval_end,
+    model: AnyBatchExportModel,
+    ateam,
+    s3_compatible_integration,
+):
+    prefix = str(uuid.uuid4())
+    events_per_batch = 1_000 if max_file_size_mb is None else 40_000
+
+    events_1, _, _ = await generate_test_events_in_clickhouse(
+        client=clickhouse_client,
+        team_id=ateam.pk,
+        start_time=data_interval_start,
+        end_time=data_interval_end,
+        count=events_per_batch,
+        count_outside_range=0,
+        count_other_team=0,
+        duplicate=False,
+        properties={"$prop1": 123},
+    )
+
+    events_2, _, _ = await generate_test_events_in_clickhouse(
+        client=clickhouse_client,
+        team_id=ateam.pk,
+        start_time=data_interval_start,
+        end_time=data_interval_end,
+        count=events_per_batch,
+        count_outside_range=0,
+        count_other_team=0,
+        duplicate=False,
+        properties={"$prop1": 123},
+    )
+
+    events_to_export_created = events_1 + events_2
+
+    insert_inputs = S3InsertInputs(
+        bucket_name=bucket_name,
+        region="us-east-1",
+        prefix=prefix,
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start.isoformat(),
+        data_interval_end=data_interval_end.isoformat(),
+        integration_id=s3_compatible_integration.id,
+        compression=compression,
+        exclude_events=exclude_events,
+        file_format=file_format,
+        max_file_size_mb=max_file_size_mb,
+        batch_export_model=model,
+        batch_export_id=str(uuid.uuid4()),
+        destination_default_fields=s3_default_fields(),
+    )
+
+    result = await run_activity(activity_environment, insert_inputs)
+    records_exported = result.records_completed
+    bytes_exported = result.bytes_exported
+    assert result.error is None
+
+    assert records_exported == len(events_to_export_created)
+    assert isinstance(bytes_exported, int)
+    assert bytes_exported > 0
+
+    s3_data, s3_keys = await assert_files_in_s3(
+        s3_compatible_client=object_storage_client,
+        bucket_name=bucket_name,
+        key_prefix=prefix,
+        file_format=file_format,
+        compression=compression,
+        json_columns=("properties", "person_properties", "set", "set_once"),
+    )
+
+    assert len(s3_data) == len(events_to_export_created)
+    num_files = len(s3_keys)
+
+    def expected_s3_key(
+        file_number: int,
+        data_interval_start,
+        data_interval_end,
+        file_format: str,
+        compression: str,
+        max_file_size_mb: int | None,
+    ):
+        file_extension = FILE_FORMAT_EXTENSIONS[file_format]
+        base_key_name = f"{prefix}/{data_interval_start.isoformat()}-{data_interval_end.isoformat()}"
+        if max_file_size_mb is None:
+            key_name = base_key_name
+        else:
+            key_name = f"{base_key_name}-{file_number}"
+        key_name = f"{key_name}.{file_extension}"
+        if compression:
+            compression_extension = COMPRESSION_EXTENSIONS[compression]
+            key_name = f"{key_name}.{compression_extension}"
+        return key_name
+
+    if max_file_size_mb is None:
+        assert num_files == 1
+    else:
+        assert num_files > 1
+
+    expected_keys = [
+        expected_s3_key(
+            file_number=i,
+            data_interval_start=data_interval_start,
+            data_interval_end=data_interval_end,
+            file_format=file_format,
+            compression=compression,
+            max_file_size_mb=max_file_size_mb,
+        )
+        for i in range(num_files)
+    ]
+    assert set(expected_keys) == set(s3_keys)
+
+    manifest_key = f"{prefix}/{data_interval_start.isoformat()}-{data_interval_end.isoformat()}_manifest.json"
+    if max_file_size_mb is None:
+        with pytest.raises(object_storage_client.exceptions.NoSuchKey):
+            await read_json_file_from_s3(object_storage_client, bucket_name, manifest_key)
+    else:
+        manifest_data: dict | list = await read_json_file_from_s3(object_storage_client, bucket_name, manifest_key)
+        assert isinstance(manifest_data, dict)
+        assert manifest_data["files"] == expected_keys
+
+
+@pytest.mark.parametrize("model", [BatchExportEventsModel()])
+@pytest.mark.parametrize("file_format", ["invalid"])
+async def test_insert_into_s3_activity_fails_on_invalid_file_format(
+    clickhouse_client,
+    bucket_name,
+    object_storage_client,
+    activity_environment,
+    compression,
+    exclude_events,
+    file_format,
+    data_interval_start,
+    data_interval_end,
+    model: AnyBatchExportModel,
+    ateam,
+    s3_compatible_integration,
+):
+    """Test the insert_into_s3_activity_from_stage_activity function returns an error when an invalid file format is requested."""
+
+    insert_inputs = S3InsertInputs(
+        bucket_name=bucket_name,
+        region="us-east-1",
+        prefix="any",
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start.isoformat(),
+        data_interval_end=data_interval_end.isoformat(),
+        integration_id=s3_compatible_integration.id,
+        compression=compression,
+        exclude_events=exclude_events,
+        file_format=file_format,
+        batch_export_model=model,
+        batch_export_id=str(uuid.uuid4()),
+        destination_default_fields=s3_default_fields(),
+    )
+
+    result = await run_activity(activity_environment, insert_inputs)
+    assert result.error is not None
+    assert result.error.type == "UnsupportedFileFormatError"
+    assert result.error.message == "'invalid' is not a supported format for S3 batch exports."
+    assert result.error_repr is not None
+    assert result.error_repr == "UnsupportedFileFormatError: 'invalid' is not a supported format for S3 batch exports."
+
+
+@pytest.mark.parametrize("model", [BatchExportEventsModel()])
+@pytest.mark.parametrize("compression", ["invalid"])
+async def test_insert_into_s3_activity_fails_on_invalid_compression(
+    clickhouse_client,
+    bucket_name,
+    object_storage_client,
+    activity_environment,
+    compression,
+    exclude_events,
+    data_interval_start,
+    data_interval_end,
+    model: AnyBatchExportModel,
+    ateam,
+    s3_compatible_integration,
+):
+    """Test the insert_into_s3_activity_from_stage activity returns an error when an invalid compression is requested."""
+
+    insert_inputs = S3InsertInputs(
+        bucket_name=bucket_name,
+        region="us-east-1",
+        prefix="any",
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start.isoformat(),
+        data_interval_end=data_interval_end.isoformat(),
+        integration_id=s3_compatible_integration.id,
+        compression=compression,
+        exclude_events=exclude_events,
+        file_format="JSONLines",
+        batch_export_model=model,
+        batch_export_id=str(uuid.uuid4()),
+        destination_default_fields=s3_default_fields(),
+    )
+
+    result = await run_activity(activity_environment, insert_inputs)
+    assert result.error is not None
+    assert result.error.type == "UnsupportedCompressionError"
+    assert result.error.message == "'invalid' is not a supported compression for S3 batch exports."

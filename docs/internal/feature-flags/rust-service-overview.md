@@ -1,0 +1,454 @@
+# Rust feature flags service
+
+The Rust feature flags service (`rust/feature-flags/`) handles all runtime feature flag evaluation and local SDK evaluation. It serves the `/flags` and `/decide` endpoints for flag evaluation, and the `/flags/definitions` endpoint for local SDK evaluation. Django remains the admin API for flag CRUD operations (`/api/projects/{id}/feature_flags/`).
+
+## Infrastructure routing
+
+Traffic routing happens at the Kubernetes infrastructure level using **Contour HTTPProxy** resources (Envoy-based). The Rust service never receives requests through Django -- they are routed directly by Contour.
+
+```text
+Client
+  │
+  ▼
+AWS ALB
+  │
+  ▼
+Contour / Envoy (path-based routing)
+  │
+  ├── /decide/*              ──▶ posthog-feature-flags:3001              (Rust, flags fleet)
+  ├── /flags/?               ──▶ posthog-feature-flags:3001              (Rust, flags fleet)
+  ├── /flags/definitions     ──▶ posthog-feature-flags-definitions:3001  (Rust, definitions fleet)
+  ├── /api/feature_flag/local_evaluation ──▶ posthog-feature-flags-definitions:3001 (Rust, definitions fleet, legacy alias)
+  ├── /api/*                 ──▶ posthog-web-django:8000                 (Django, catch-all)
+  └── /*                     ──▶ posthog-web-django:8000                 (Django, final catch-all)
+```
+
+Key routing details:
+
+- The `decide` and `feature-flags` proxy blocks are **included before** the `api` block in Contour, so they match first
+- `/decide` adds an `X-Original-Endpoint: decide` header so the Rust service can adjust response format
+- A **dedicated subdomain** (`us-d.i.posthog.com` / `eu-d.i.posthog.com`) routes only to `decide` + `feature-flags` with no Django fallback
+- All flag routes have a **5-second timeout** and 2 retries on `reset`/`cancelled`
+- A PR canary (`/pr-canary` on an approved PR) adds a weighted `feature-flags-pr-canary` entry to the `/flags` and `/decide` routes
+- The same canary adds `X-PostHog-Fleet: canary` and `X-PostHog-Fleet: stable` header routes, so a request can pick a fleet
+- The canary weight comes from the state file in the charts repo, not from Argo Rollouts
+
+### Fleet split
+
+The Rust service runs as two separate fleets controlled by the `SERVICE_MODE` env var:
+
+| Fleet                               | `SERVICE_MODE` | Routes                                                     | Purpose                                   |
+| ----------------------------------- | -------------- | ---------------------------------------------------------- | ----------------------------------------- |
+| `posthog-feature-flags`             | `flags`        | `/flags`, `/decide`                                        | Runtime flag evaluation                   |
+| `posthog-feature-flags-definitions` | `definitions`  | `/flags/definitions`, `/api/feature_flag/local_evaluation` | Flag definitions for local SDK evaluation |
+
+Both fleets share the same Kubernetes secret (`posthog-feature-flags`) via the `secretName` chart override.
+The `all` mode (default) registers all routes and is used for local development.
+
+Routing config lives in the `charts` repo: `argocd/contour-ingress/values/values.prod-us.yaml` (and `prod-eu`, `dev` variants).
+
+## Architecture overview
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                          SDK Request                            │
+│                    POST /flags or /decide                       │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                        Contour / Envoy
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Rust Feature Flags Service                  │
+│                     (Axum, port 3001)                           │
+├─────────────────────────────────────────────────────────────────┤
+│  Rate limiting ──▶ Auth ──▶ Decode ──▶ Evaluate ──▶ Response   │
+└─────────────────────────────────────────────────────────────────┘
+        │                │                    │
+        ▼                ▼                    ▼
+  ┌──────────┐   ┌──────────────┐   ┌──────────────────┐
+  │  Redis   │   │  PostgreSQL  │   │   S3 (fallback)  │
+  │ (cache)  │   │  (source of  │   │   via HyperCache │
+  │          │   │   truth)     │   │                  │
+  └──────────┘   └──────────────┘   └──────────────────┘
+```
+
+## Project structure
+
+| Directory         | Purpose                                                                                        |
+| ----------------- | ---------------------------------------------------------------------------------------------- |
+| `src/api/`        | HTTP endpoint handlers, auth, rate limiting, request/response types                            |
+| `src/handler/`    | Request processing pipeline: decoding, billing, evaluation, session recording, config assembly |
+| `src/flags/`      | Core domain: flag models, matching engine, property filters, analytics, dependency graph       |
+| `src/cohorts/`    | Cohort models, DB operations, in-memory cache (moka), realtime membership providers            |
+| `src/properties/` | Property models, operator matching, relative date parsing                                      |
+| `src/team/`       | Team model and DB operations                                                                   |
+| `src/database/`   | Connection management, persons DB routing                                                      |
+| `src/metrics/`    | Prometheus metric constants and utilities                                                      |
+| `src/utils/`      | User-agent parsing, graph algorithms                                                           |
+| `src/site_apps/`  | Site apps support                                                                              |
+| `tests/`          | Integration tests (flag matching, HTTP methods, rate limiting, experience continuity)          |
+
+## HTTP endpoints
+
+All routes are defined in `rust/feature-flags/src/router.rs`.
+
+| Route                                | Method | Handler                               | Purpose                                                                                   |
+| ------------------------------------ | ------ | ------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `/flags`                             | POST   | `endpoint::flags`                     | Feature flag evaluation (primary endpoint)                                                |
+| `/flags`                             | GET    | `endpoint::flags`                     | Returns minimal response with empty flags                                                 |
+| `/decide`                            | POST   | `endpoint::flags`                     | Same handler as `/flags`, response format varies via `X-Original-Endpoint: decide` header |
+| `/flags/definitions`                 | GET    | `flag_definitions::flags_definitions` | Flag definitions for local SDK evaluation (requires secret token or personal API key)     |
+| `/api/feature_flag/local_evaluation` | GET    | `flag_definitions::flags_definitions` | Legacy alias for `/flags/definitions` (backward compat with old SDK versions)             |
+| `/`                                  | GET    | `index`                               | Returns `"feature flags"` (basic health check)                                            |
+| `/_readiness`                        | GET    | `readiness`                           | Kubernetes readiness probe, tests all 4 DB pool connections                               |
+| `/_liveness`                         | GET    | `liveness`                            | Kubernetes liveness probe, heartbeat-based                                                |
+| `/_startup`                          | GET    | `startup`                             | Kubernetes startup probe, warms DB pools                                                  |
+| `/metrics`                           | GET    | Prometheus                            | Metrics scrape endpoint (when `ENABLE_METRICS=true`)                                      |
+
+All flag routes accept trailing slashes.
+
+### `/flags` request processing
+
+The POST handler follows this pipeline:
+
+1. **Rate limiting**: IP-based check (DDoS defense), then token-based check (per-project limits)
+2. **Body decoding**: JSON, base64, or gzip-compressed bodies. A body with arrays or objects nested more than 128 levels deep gets a 400.
+3. **Authentication**: Extracts API token from body, query params, or headers
+4. **Team lookup**: HyperCache (Redis -> S3) with PostgreSQL fallback (configurable via `SKIP_PG_TEAM_FALLBACK`)
+5. **Flag definitions fetch**: HyperCache (Redis -> S3) with PostgreSQL fallback
+6. **Billing check**: Verifies the team's feature flag quota hasn't been exceeded
+7. **Flag evaluation**: Core matching logic (see [flag-evaluation-engine.md](flag-evaluation-engine.md))
+8. **Config assembly**: Session recording settings, error tracking, site apps
+9. **Response formatting**: Version-specific serialization
+
+### Response versioning
+
+The response format depends on the `v` query parameter and the endpoint:
+
+| Version   | Endpoint  | Response format                                                                              |
+| --------- | --------- | -------------------------------------------------------------------------------------------- |
+| (default) | `/flags`  | `LegacyFlagsResponse`: flat `feature_flags: { key: value }` map                              |
+| `v=2`     | `/flags`  | `FlagsResponse`: detailed `flags: { key: FlagDetails }` map with reasons, metadata, payloads |
+| `v=1`     | `/decide` | `DecideV1Response`: list of active flag keys                                                 |
+| `v=2`     | `/decide` | `DecideV2Response`: flat `feature_flags: { key: value }` map                                 |
+
+### `/flags/definitions` endpoint
+
+This endpoint serves flag definitions for server-side SDKs that evaluate flags locally. It replaced the Django `/api/feature_flag/local_evaluation` endpoint (which is preserved as a Rust alias for backward compatibility). All 7 server-side SDKs (Python, Node, Go, Ruby, PHP, .NET, Rust) now poll this endpoint by default.
+
+Authenticated via:
+
+- Team secret API token (`Authorization: Bearer phs_...`), or
+- Personal API key with `feature_flag:read` scope
+
+Current implementation returns flag definitions with cohort data from HyperCache, with PostgreSQL fallback on cache miss. Supports ETag-based conditional requests (`If-None-Match` header) to avoid re-transferring unchanged definitions. Rate limited per team (default 600/minute).
+
+Billing quota enforcement matches Django's `/api/feature_flag/local_evaluation` behavior:
+
+- **Quota check**: Uses `FeatureFlagsLimiter.is_limited(token)` to verify the team hasn't exceeded their feature flag request quota. Returns HTTP 402 with a JSON body (`{"type": "quota_limited", "code": "payment_required", ...}`) when the quota is exceeded.
+- **Non-billable flag filtering**: Usage tracking skips requests where the response contains only non-billable flags — i.e., flags with keys starting with `survey-targeting-` or `product-tour-targeting-`. The shared `is_billable_flag_key()` predicate (in `flag_analytics.rs`) is used by both this endpoint and the `/flags` billing handler.
+- **304 responses bill 1 unit**: A conditional response that returns `304 Not Modified` is recorded on its own counter and billed at the `/flags` rate, a tenth of a full response. See [Conditional requests (ETag)](billing.md#conditional-requests-etag) for the billable-flag memo and what goes unbilled.
+
+## Request and response types
+
+### `FlagRequest` (POST body)
+
+```rust
+pub struct FlagRequest {
+    pub token: Option<String>,               // aliases: $token, api_key
+    pub distinct_id: Option<String>,         // alias: $distinct_id
+    pub geoip_disable: Option<bool>,
+    pub disable_flags: Option<bool>,
+    pub person_properties: Option<HashMap<String, Value>>,
+    pub groups: Option<HashMap<String, Value>>,
+    pub group_properties: Option<HashMap<String, HashMap<String, Value>>>,
+    pub person_property_keys_known_absent: Option<Value>, // array of strings
+    pub group_property_keys_known_absent: Option<Value>,  // group type name -> array of strings
+    pub anon_distinct_id: Option<String>,    // alias: $anon_distinct_id
+    pub device_id: Option<String>,           // alias: $device_id
+    pub flag_keys: Option<Vec<String>>,      // evaluate only these flags
+    pub timezone: Option<String>,
+    pub evaluation_contexts: Option<Vec<String>>,
+    pub evaluation_runtime: Option<EvaluationRuntime>,
+}
+```
+
+#### GeoIP enrichment of `person_properties`
+
+Unless `geoip_disable: true` is set in the body, `handler::properties::get_person_property_overrides` looks up the request IP in MaxMind and merges the resulting `$geoip_*` properties into `person_properties` before evaluation.
+
+The lookup also fills `$geoip_subdivision_1_code`, `$geoip_subdivision_1_name`, `$geoip_subdivision_2_code` and `$geoip_subdivision_2_name`.
+
+GeoIP only fills gaps. A `$geoip_*` key present in the request body is left alone, and a JSON null counts as absent, since callers clear a property with `$unset`, so a null is a gap to fill.
+This matters for server-side evaluation: the IP we geolocate is whoever made the HTTP request, so a call from a backend or an SSR render resolves the server's own location, not the end user's.
+A caller that resolved geo itself (from `CF-IPCountry`, `X-Forwarded-For`, or similar) is the authority for those keys.
+
+Two signals size how often that precedence matters:
+
+- `flags_geoip_properties_differ_from_lookup_total` counts requests that supplied a `$geoip_*` value disagreeing with the lookup, i.e. requests that would evaluate differently if the lookup won.
+- The canonical log line carries the same fact as `geoip_properties_differ_from_lookup`. The counter has no labels, so query the log line in Loki to attribute a spike to a team or SDK.
+
+Both are removable once the precedence change has settled.
+
+#### Known-absent property keys
+
+`person_property_keys_known_absent` lists person property keys the caller knows the person doesn't have. `group_property_keys_known_absent` maps a group type name to the group property keys the caller knows that group doesn't have. An SDK sends them when local evaluation falls back to `/flags`, so the server reaches the same answer local evaluation would.
+
+```json
+{
+  "person_property_keys_known_absent": ["plan"],
+  "group_property_keys_known_absent": { "organization": ["subscription"] }
+}
+```
+
+- A listed key is absent for this request. The listing wins over a stored value, a value in `person_properties` or `group_properties`, and a value the service adds itself: `$geoip_*`, a copied `$initial_*`, the `$os`/`$os_name` alias, `$group_key`, and `distinct_id`.
+- Each operator then answers as it does for a key missing from the person's full stored properties: `is_not_set` and the negated operators (`is_not`, `not_icontains`, `not_regex`, `not_starts_with`, `not_ends_with`, `not_icontains_multi`, `not_between`) match, and every other operator, including `is_set` and `semver_neq`, does not.
+- A missing field or JSON null lists nothing. Each list holds at most 1000 strings, counted with duplicates. A wrong type or a longer list returns a 400 whose message names the field.
+- A group type name the team doesn't have is ignored. A person key with the person metadata prefix is ignored, so a listed `created_at` never hides the persons-table `created_at` column.
+- A listed key counts as supplied when the service decides whether to fetch stored properties, so listing a key never causes a fetch.
+- Static cohorts and realtime cohorts read membership from stored tables, so known absence doesn't change their membership. Cohorts evaluated from properties in the service do honor it.
+
+### `FlagsResponse` (v2 response)
+
+```rust
+pub struct FlagsResponse {
+    pub errors_while_computing_flags: bool,
+    pub flags: HashMap<String, FlagDetails>,
+    pub quota_limited: Option<Vec<String>>,
+    pub request_id: Uuid,
+    pub evaluated_at: i64,
+    pub config: ConfigResponse,
+}
+
+pub struct FlagDetails {
+    pub key: String,
+    pub enabled: bool,
+    pub variant: Option<String>,
+    pub reason: FlagEvaluationReason,
+    pub metadata: FlagDetailsMetadata,
+}
+```
+
+## Rate limiting
+
+Three independent rate limiters (IP, token, definitions), all in-process using the `governor` crate. The `/flags` IP and token limiters support a warn-then-enforce model with `X-PostHog-Rate-Limit-Warning` headers and per-token custom overrides. See [rate-limiting.md](rate-limiting.md) for the full model, configuration modes, and migration path.
+
+## Server initialization
+
+The `serve()` function in `rust/feature-flags/src/server.rs` orchestrates startup:
+
+1. **Redis clients**: Shared `ReadWriteClient` (auto-routes reads to replica). Optional dedicated flags Redis with 3-mode migration: shared-only -> dual-write -> dedicated-only.
+2. **Database pools**: `PostgresRouter` with 4 pools (persons reader/writer, non-persons reader/writer), plus an optional behavioral cohorts reader pool. See [database-interaction-patterns.md](database-interaction-patterns.md).
+3. **GeoIP**: MaxMind database for IP geolocation.
+4. **Cohort cache**: In-memory `CohortCacheManager` (moka, 256 MB default, 5-minute TTL).
+5. **HyperCache readers**: 4 pre-initialized readers for flags, flags+cohorts, team metadata, and config.
+6. **Billing limiters**: Redis-backed quota enforcement for feature flags and session replay.
+7. **Cookieless manager**: Redis-backed cookieless identity resolution.
+8. **Background tasks**: DB pool monitoring, cohort cache monitoring, rate limiter cleanup, health heartbeat.
+
+## Configuration reference
+
+All values come from environment variables via the `envconfig` crate. Defined in `rust/feature-flags/src/config.rs`.
+
+### Server
+
+| Variable          | Default          | Purpose                                           |
+| ----------------- | ---------------- | ------------------------------------------------- |
+| `ADDRESS`         | `127.0.0.1:3001` | Listen address                                    |
+| `MAX_CONCURRENCY` | `1000`           | Max concurrent flag evaluation requests           |
+| `DEBUG`           | `false`          | Pretty console logging vs JSON structured logging |
+| `ENABLE_METRICS`  | `false`          | Expose `/metrics` endpoint                        |
+| `SERVICE_MODE`    | `all`            | Fleet mode: `flags`, `definitions`, or `all`      |
+
+### Property matching rollout
+
+Exact property matching is selected per team through `TeamFeatureFlagsConfig.property_matching_version`. Version `1` preserves legacy boolean coercion, while version `2` uses exact scalar and array equality. Team metadata and local-evaluation responses expose the selected version.
+
+### PostgreSQL
+
+| Variable                                  | Default                                             | Purpose                               |
+| ----------------------------------------- | --------------------------------------------------- | ------------------------------------- |
+| `WRITE_DATABASE_URL`                      | `postgres://posthog:posthog@localhost:5432/posthog` | Main database primary                 |
+| `READ_DATABASE_URL`                       | same                                                | Main database replica                 |
+| `PERSONS_WRITE_DATABASE_URL`              | (empty, aliases to main)                            | Persons database primary              |
+| `PERSONS_READ_DATABASE_URL`               | (empty, aliases to main)                            | Persons database replica              |
+| `MAX_PG_CONNECTIONS`                      | `10`                                                | Max connections per pool              |
+| `ACQUIRE_TIMEOUT_SECS`                    | `1`                                                 | Connection acquisition timeout        |
+| `IDLE_TIMEOUT_SECS`                       | `300`                                               | Close idle connections after this     |
+| `NON_PERSONS_READER_STATEMENT_TIMEOUT_MS` | `2000`                                              | Statement timeout for flag/team reads |
+| `PERSONS_READER_STATEMENT_TIMEOUT_MS`     | `1000`                                              | Statement timeout for person lookups  |
+| `WRITER_STATEMENT_TIMEOUT_MS`             | `2000`                                              | Statement timeout for writes          |
+
+### Behavioral cohorts
+
+| Variable                               | Default  | Purpose                                                                                                                                                                                         |
+| -------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BEHAVIORAL_COHORTS_READ_DATABASE_URL` | (empty)  | Optional PostgreSQL connection for realtime cohort membership lookups. When empty, no pool is created and a NoOp provider resolves every realtime cohort lookup to non-membership               |
+| `REALTIME_COHORT_EVALUATION_TEAM_IDS`  | `none`   | Rollout gate for realtime cohort evaluation: `none`, `all`, or specific team IDs / ranges (e.g. `1,5,300:400`). Teams whose `cohort_realtime_team_access` row is at `serving` are evaluated too |
+| `COHORT_MEMBERSHIP_CACHE_TTL_SECONDS`  | `60`     | Cache TTL for cohort membership lookups                                                                                                                                                         |
+| `COHORT_MEMBERSHIP_CACHE_MAX_ENTRIES`  | `500000` | Max entries in cohort membership cache                                                                                                                                                          |
+| `REALTIME_COHORT_LOOKUP_TIMEOUT_MS`    | `1000`   | Upper bound on one membership lookup (pool acquire + query), matching the pool's 1s statement timeout; on timeout the lookup degrades to non-membership                                         |
+
+The behavioral cohorts pool uses tight limits (max 5 connections, 1s statement timeout) since it only performs simple key lookups against the `cohort_membership` table.
+Realtime cohort evaluation degrades gracefully at every layer, always treating people as non-members rather than failing flag evaluation:
+when `BEHAVIORAL_COHORTS_READ_DATABASE_URL` is not set a `NoOpCohortMembershipProvider` returns `false` for all checks (with a startup warning if `REALTIME_COHORT_EVALUATION_TEAM_IDS` is set at the same time),
+and when the database is unavailable at runtime, query errors and lookups exceeding `REALTIME_COHORT_LOOKUP_TIMEOUT_MS` also resolve to non-membership.
+Cache and query health are observable via the `flags_cohort_membership_cache_*` and `flags_realtime_cohort_*` metrics — see [database-interaction-patterns.md](database-interaction-patterns.md#prometheus-metrics).
+
+### Redis
+
+| Variable                                     | Default                     | Purpose                                                                                                                                                                                 |
+| -------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REDIS_URL`                                  | `redis://localhost:6379/`   | Shared Redis primary                                                                                                                                                                    |
+| `REDIS_READER_URL`                           | (falls back to `REDIS_URL`) | Shared Redis replica                                                                                                                                                                    |
+| `FLAGS_REDIS_URL`                            | (empty)                     | Dedicated flags Redis primary                                                                                                                                                           |
+| `FLAGS_REDIS_READER_URL`                     | (empty)                     | Dedicated flags Redis replica                                                                                                                                                           |
+| `FLAGS_REDIS_ENABLED`                        | `false`                     | Inert. Nothing reads it, so setting it moves no read path                                                                                                                               |
+| `FLAG_DEFINITIONS_DEDICATED_REDIS_ENABLED`   | `false`                     | Serve the `/flags/definitions` payload and its ETag from the dedicated flags Redis instead of the shared one. See [dedicated flags Redis](hypercache-system.md#dedicated-flags-redis)   |
+| `FLAG_DEFINITIONS_REBUILD_ON_S3_HIT_ENABLED` | `false`                     | Rebuild definitions after an S3 hit and a confirmed Redis miss. Requires `FLAG_DEFINITIONS_SELF_HEAL_ENABLED=true`. See [the rebuild queue](hypercache-system.md#dedicated-flags-redis) |
+| `REDIS_RESPONSE_TIMEOUT_MS`                  | `100`                       | Redis response timeout (capped at 30s)                                                                                                                                                  |
+| `REDIS_CONNECTION_TIMEOUT_MS`                | `5000`                      | Redis connection timeout (capped at 60s)                                                                                                                                                |
+
+### S3 / HyperCache
+
+| Variable                             | Default     | Purpose                                                                                                                                                                                             |
+| ------------------------------------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OBJECT_STORAGE_BUCKET`              | `posthog`   | S3 bucket name                                                                                                                                                                                      |
+| `OBJECT_STORAGE_REGION`              | `us-east-1` | AWS region                                                                                                                                                                                          |
+| `OBJECT_STORAGE_ENDPOINT`            | (empty)     | Custom S3 endpoint for local dev                                                                                                                                                                    |
+| `HYPERCACHE_READ_REPAIR_TTL_SECONDS` | `600`       | TTL for writing an S3 hit back into Redis after a confirmed miss. `0` disables, as does `SKIP_WRITES`. Also read by hypercache-server. See [read repair](hypercache-system.md#read-repair)          |
+| `HYPERCACHE_S3_TIMEOUT_MS`           | `3000`      | Upper bound on one S3 read, for every HyperCache reader. Keep it below `REQUEST_TIMEOUT_MS`, so a slow read leaves time for the fallback. Startup replaces `0` or a value above `10000` with `3000` |
+
+### Team lookup
+
+| Variable                          | Default | Purpose                                                                                                                                                          |
+| --------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SKIP_PG_TEAM_FALLBACK`           | `false` | When enabled, skip PostgreSQL fallback for team token lookups. HyperCache (Redis/S3) is treated as the source of truth — a cache miss means the token is invalid |
+| `TEAM_NEGATIVE_CACHE_TTL_SECONDS` | `30`    | TTL (seconds) for negative cache entries for invalid team tokens                                                                                                 |
+| `TEAM_NEGATIVE_CACHE_CAPACITY`    | `10000` | Max entries in the negative cache for invalid team tokens                                                                                                        |
+
+When `SKIP_PG_TEAM_FALLBACK` is enabled, HyperCache misses return a token validation error instead of querying PostgreSQL. This eliminates database pressure from requests with invalid tokens. Transient errors (Redis/S3 timeouts) bypass the fallback entirely and are not negative-cached.
+
+### Rate limiting
+
+See [rate-limiting.md](rate-limiting.md) for the full configuration reference.
+
+### Caching
+
+| Variable                         | Default              | Purpose                   |
+| -------------------------------- | -------------------- | ------------------------- |
+| `COHORT_CACHE_CAPACITY_BYTES`    | `268435456` (256 MB) | Moka cache memory limit   |
+| `CACHE_TTL_SECONDS`              | `300`                | Cohort cache TTL          |
+| `BILLING_LIMITER_CACHE_TTL_SECS` | `5`                  | Billing limiter cache TTL |
+
+See [Behavioral cohorts](#behavioral-cohorts) for cohort membership cache settings.
+
+### Observability
+
+| Variable                      | Default                 | Purpose                                                                               |
+| ----------------------------- | ----------------------- | ------------------------------------------------------------------------------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | (disabled)              | OpenTelemetry collector endpoint                                                      |
+| `OTEL_TRACES_SAMPLER_ARG`     | `0.001`                 | Trace sampling rate (0.1%)                                                            |
+| `OTEL_SERVICE_NAME`           | `posthog-feature-flags` | Service name in traces                                                                |
+| `TEAM_IDS_TO_TRACK`           | `all`                   | Teams to emit detailed metrics for (`all`, `none`, comma-separated, or range `1:100`) |
+
+### Other
+
+| Variable                                 | Default                    | Purpose                                |
+| ---------------------------------------- | -------------------------- | -------------------------------------- |
+| `MAXMIND_DB_PATH`                        | `share/GeoLite2-City.mmdb` | GeoIP database path                    |
+| `OPTIMIZE_EXPERIENCE_CONTINUITY_LOOKUPS` | `true`                     | Skip DB lookups for 100%-rollout flags |
+| `FLAGS_SESSION_REPLAY_QUOTA_CHECK`       | `false`                    | Check session replay quota             |
+
+## Cache invalidation
+
+The Rust service caches auth token metadata in the flags Redis (dedicated when configured, otherwise shared) under the key pattern `posthog:auth_token:{token_hash}`. Entries are populated lazily by the Rust service on first use and invalidated by Django signal handlers when individual tokens change.
+
+For bulk invalidation of all cached tokens associated with a team, use the `invalidate_flags_auth_cache` management command. This forces the Rust service to re-validate against Postgres on the next request. It does **not** revoke any tokens.
+
+### Usage
+
+```bash
+# Invalidate all cached auth tokens for a team
+python manage.py invalidate_flags_auth_cache --team-id 12345
+
+# Preview what would be invalidated without deleting
+python manage.py invalidate_flags_auth_cache --team-id 12345 --dry-run
+```
+
+### Token sources
+
+The command collects token hashes from three sources and batch-deletes the corresponding Redis cache entries:
+
+| Source                  | Description                                                                                                          |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Team secret tokens      | `secret_api_token` and `secret_api_token_backup`, hashed with SHA-256                                                |
+| Project secret API keys | `ProjectSecretAPIKey.secure_value` for the team                                                                      |
+| Personal API keys       | `PersonalAPIKey` entries for users in the team's organization, filtered by `scoped_teams` and `scoped_organizations` |
+
+### When to use
+
+- **Security incidents**: Force re-validation after a suspected token compromise
+- **Token rotation**: Clear stale cache entries after rotating team secret tokens
+- **Debugging**: Diagnose cache staleness issues by forcing a cache miss
+
+### Options
+
+| Flag                   | Description                                                                                          |
+| ---------------------- | ---------------------------------------------------------------------------------------------------- |
+| `--team-id` (required) | Team ID whose flags auth cache entries to invalidate                                                 |
+| `--dry-run`            | Show what would be invalidated without deleting. Works even when `FLAGS_REDIS_URL` is not configured |
+
+> **Note:** Without `--dry-run`, the command requires `FLAGS_REDIS_URL` to be configured.
+
+## Key dependencies
+
+| Crate                                   | Purpose                                                           |
+| --------------------------------------- | ----------------------------------------------------------------- |
+| `axum`                                  | HTTP framework                                                    |
+| `sqlx`                                  | Async PostgreSQL driver                                           |
+| `tokio`                                 | Async runtime                                                     |
+| `serde` / `serde_json` / `serde-pickle` | Serialization (pickle for HyperCache interop with Python)         |
+| `governor`                              | Token-bucket rate limiting                                        |
+| `moka`                                  | Concurrent in-memory cache (cohorts)                              |
+| `sha1` / `sha2`                         | Hashing for flag rollout and variant selection                    |
+| `petgraph`                              | Dependency graph (flag-on-flag dependencies, cohort dependencies) |
+| `fancy-regex`                           | Regex property matching with backtrack limits                     |
+| `semver`                                | Semantic versioning operator support                              |
+| `rayon`                                 | Parallel flag evaluation within dependency stages                 |
+| `tokio-retry`                           | Exponential backoff for DB operations                             |
+
+## Middleware
+
+Applied in order via Axum layers (defined in `router.rs`):
+
+1. **ConcurrencyLimitLayer**: Caps concurrent flag evaluation requests (default 1000)
+2. **TraceLayer**: HTTP request tracing with spans
+3. **CorsLayer**: Permissive CORS (mirrors request origin, allows credentials, exposes `x-posthog-rate-limit-warning`)
+4. **track_metrics**: Prometheus HTTP request metrics
+
+## Related files
+
+| File                                                         | Purpose                                           |
+| ------------------------------------------------------------ | ------------------------------------------------- |
+| `rust/feature-flags/src/main.rs`                             | Binary entry point, tracing setup                 |
+| `rust/feature-flags/src/server.rs`                           | Service initialization, resource creation         |
+| `rust/feature-flags/src/router.rs`                           | Axum router, routes, shared state                 |
+| `rust/feature-flags/src/config.rs`                           | Environment variable configuration                |
+| `rust/feature-flags/src/api/endpoint.rs`                     | `/flags` and `/decide` handler                    |
+| `rust/feature-flags/src/api/flag_definitions.rs`             | `/flags/definitions` handler                      |
+| `rust/feature-flags/src/api/auth.rs`                         | Authentication (secret tokens, personal API keys) |
+| `rust/feature-flags/src/api/types.rs`                        | Request/response types                            |
+| `rust/feature-flags/src/handler/flags.rs`                    | Core request processing pipeline                  |
+| `posthog/storage/team_access_cache.py`                       | Token auth cache with targeted invalidation       |
+| `posthog/management/commands/invalidate_flags_auth_cache.py` | Bulk cache invalidation management command        |
+
+## See also
+
+- [Rate limiting](rate-limiting.md) - Warn-then-enforce model, configuration modes, per-token overrides
+- [Flag evaluation engine](flag-evaluation-engine.md) - How flags are matched and evaluated
+- [Database interaction patterns](database-interaction-patterns.md) - PostgreSQL connection pooling and query routing
+- [HyperCache system](hypercache-system.md) - Multi-tier caching with Redis, S3, and PostgreSQL
+- [Experience continuity](experience-continuity.md) - Hash key overrides for consistent flag values across identity changes
+- [Django API endpoints](django-api-endpoints.md) - CRUD and management endpoints served by Django

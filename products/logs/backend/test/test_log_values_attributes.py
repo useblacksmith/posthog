@@ -1,0 +1,615 @@
+import os
+import json
+from types import SimpleNamespace
+
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin
+from unittest.mock import patch
+
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.hogql.errors import QueryError
+
+from posthog.clickhouse.client import sync_execute
+from posthog.errors import ExposedCHQueryError
+
+from products.logs.backend.presentation.views.api import _LogsValuesQuerySerializer
+
+
+class TestLogValuesAttributesTimezones(ClickhouseTestMixin, APIBaseTest):
+    CLASS_DATA_LEVEL_SETUP = True
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+
+        with open(os.path.join(os.path.dirname(__file__), "test_logs.jsonnd")) as f:
+            sql = ""
+            for line in f:
+                log_item = json.loads(line)
+                log_item["team_id"] = cls.team.id
+                sql += json.dumps(log_item) + "\n"
+            sync_execute(f"""
+                INSERT INTO logs
+                FORMAT JSONEachRow
+                {sql}
+            """)
+
+    def test_log_values_query_consistency_across_timezones(self):
+        """Test that the same values and attributes query returns consistent results across different team timezones"""
+
+        timezones_to_test = ["UTC", "America/Los_Angeles", "Europe/London", "Asia/Tokyo"]
+
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "key": "level",
+            "attribute_type": "log",
+            "search": "",
+        }
+
+        values_results_by_timezone = {}
+        attributes_results_by_timezone = {}
+
+        for tz in timezones_to_test:
+            self.team.timezone = tz
+            self.team.save()
+
+            response = self.client.get(f"/api/projects/{self.team.id}/logs/values", query_params)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            values_results_by_timezone[tz] = response.json()["results"]
+
+            response = self.client.get(f"/api/projects/{self.team.id}/logs/attributes", query_params)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            attributes_results_by_timezone[tz] = response.json()
+
+        base_values_result = values_results_by_timezone["UTC"]
+        base_attributes_result = attributes_results_by_timezone["UTC"]["results"]
+        for tz, result in values_results_by_timezone.items():
+            with self.subTest(timezone=tz):
+                self.assertEqual(len(result), len(base_values_result), f"Results length mismatch for timezone {tz}")
+                base_values = {r["name"] for r in base_values_result}
+                tz_values = {r["name"] for r in result}
+                self.assertEqual(base_values, tz_values, f"Log level values mismatch for timezone {tz}")
+
+        for tz, result in attributes_results_by_timezone.items():
+            result = result["results"]
+            with self.subTest(timezone=tz):
+                self.assertEqual(len(result), len(base_attributes_result), f"Results length mismatch for timezone {tz}")
+                base_attributes = {r["name"] for r in base_attributes_result}
+                tz_attributes = {r["name"] for r in result}
+                self.assertEqual(base_attributes, tz_attributes, f"Log level attributes mismatch for timezone {tz}")
+
+    def test_log_values_query_with_value_filter_no_service_name(self):
+        """Test that the value parameter correctly filters log values without service_name filtering"""
+
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "key": "level",
+            "attribute_type": "log",
+            "value": "or",
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/values", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+
+        for result in results:
+            self.assertIn("or", result["name"].lower(), f"Value '{result['name']}' should contain 'or'")
+
+        value_names = {r["name"] for r in results}
+        self.assertIn("more", value_names, "Should include 'more' level")
+        self.assertIn("error", value_names, "Should include 'error' level")
+
+    def test_log_values_query_with_value_filter_with_service_name(self):
+        """Test that the value parameter correctly filters log values with service_name filtering"""
+
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "key": "level",
+            "attribute_type": "log",
+            "value": "DE",
+            "serviceNames": '["argo-rollouts"]',
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/values", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+
+        for result in results:
+            self.assertIn("de", result["name"].lower(), f"Value '{result['name']}' should contain 'de'")
+
+        self.assertGreater(len(results), 0, "Should return at least one result")
+
+    @parameterized.expand(
+        [
+            ("the service the values live under", "argo-rollouts", True),
+            ("another service", "cdp-api", False),
+        ]
+    )
+    def test_log_values_query_scoped_by_service_in_group(self, _name, service, expects_results):
+        # The viewer keeps its service selection in filterGroup, so these suggestions have to read it
+        # from there: otherwise a scoped viewer offers values that exist only in other services.
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "key": "level",
+            "attribute_type": "log",
+            "value": "DE",
+            "filterGroup": json.dumps(
+                {
+                    "type": "AND",
+                    "values": [
+                        {
+                            "type": "AND",
+                            "values": [{"key": "service_name", "type": "log", "operator": "exact", "value": [service]}],
+                        }
+                    ],
+                }
+            ),
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/values", query_params)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.json()["results"]
+        self.assertEqual(len(results) > 0, expects_results)
+
+    def test_log_values_query_with_value_filter_no_matches(self):
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "key": "level",
+            "attribute_type": "log",
+            "value": "DE",
+            "serviceNames": '["cdp-api"]',
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/values", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+        self.assertEqual(len(results), 0, "Should return no results for non-existent value filter")
+
+    def test_log_values_query_with_empty_value_filter(self):
+        """Test that empty value parameter returns all values (no filtering)"""
+
+        # First get all values without filter
+        query_params_all = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "key": "level",
+            "attribute_type": "log",
+        }
+
+        response_all = self.client.get(f"/api/projects/{self.team.pk}/logs/values", query_params_all)
+        self.assertEqual(response_all.status_code, status.HTTP_200_OK)
+        all_results = response_all.json()["results"]
+
+        query_params_empty = {
+            **query_params_all,
+            "value": "",
+        }
+
+        response_empty = self.client.get(f"/api/projects/{self.team.pk}/logs/values", query_params_empty)
+        self.assertEqual(response_empty.status_code, status.HTTP_200_OK)
+        empty_results = response_empty.json()["results"]
+
+        self.assertEqual(len(all_results), len(empty_results), "Empty value filter should return all values")
+
+        all_names = {r["name"] for r in all_results}
+        empty_names = {r["name"] for r in empty_results}
+        self.assertEqual(all_names, empty_names, "Empty value filter should return same values as no filter")
+        self.assertEqual(set(all_names), {"info", "DEBUG", "PING", "more", "error"})
+
+    @parameterized.expand(
+        [
+            ("level", "log"),
+            ("service.name", "resource"),
+        ]
+    )
+    def test_log_values_query_returns_counts(self, key, attribute_type):
+        """Each value carries a positive integer count, and results are ordered most-observed first."""
+
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "key": key,
+            "attribute_type": attribute_type,
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/values", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+        self.assertGreater(len(results), 0, f"Expected at least one {key} value")
+
+        for result in results:
+            self.assertIsInstance(result["count"], int, f"count missing/non-int for {result['name']}")
+            self.assertGreater(result["count"], 0, f"count should be positive for {result['name']}")
+
+        counts = [r["count"] for r in results]
+        self.assertEqual(counts, sorted(counts, reverse=True), "Values should be ordered by count descending")
+
+    def test_log_attributes_search_values_off_by_default(self):
+        """Searching with `search_values` unset should match attribute keys only."""
+
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "attribute_type": "resource",
+            "search": "argo-rollouts-dashboard",
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/attributes", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+        # No attribute key contains "argo-rollouts-dashboard", so without value search the result is empty.
+        self.assertEqual(results, [], "search_values defaults to false — value-only matches must not surface")
+
+    def test_log_attributes_search_values_finds_match_on_value(self):
+        """When `search_values=true`, matches against attribute_value should surface with matchedOn='value'."""
+
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "attribute_type": "resource",
+            "search": "argo-rollouts-dashboard",
+            "search_values": "true",
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/attributes", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+        self.assertGreater(len(results), 0, "Expected value-based matches for argo-rollouts-dashboard")
+
+        for entry in results:
+            self.assertIn("matchedOn", entry)
+            self.assertIn(entry["matchedOn"], ("key", "value"))
+            if entry["matchedOn"] == "value":
+                self.assertTrue(entry.get("matchedValue"), "Value matches should expose the matched sample value")
+                self.assertIn("argo-rollouts-dashboard", (entry["matchedValue"] or "").lower())
+
+        # All keys here match purely on value (no attribute key contains "argo-rollouts-dashboard").
+        self.assertTrue(any(r["matchedOn"] == "value" for r in results))
+
+    def test_log_attributes_search_values_skipped_for_short_search(self):
+        """Searches under 4 characters should never trigger value matching, even with `search_values=true`."""
+
+        # "arg" (3 chars) is a substring of values like "argo-rollouts-dashboard", but value
+        # search is gated to >= 4 chars to avoid scanning attribute_value on broad queries.
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "attribute_type": "resource",
+            "search": "arg",
+            "search_values": "true",
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/attributes", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+        for entry in results:
+            self.assertNotEqual(
+                entry.get("matchedOn"),
+                "value",
+                "value matches must not surface when search term is shorter than the minimum length",
+            )
+
+    def test_log_attributes_search_values_ranks_key_matches_first(self):
+        """Key matches must always rank above value matches when both exist."""
+
+        # Search "argo" — `service.name` value is "argo-rollouts" (value match), and several
+        # k8s.* keys contain it as substring of their values, but no key literally contains "argo".
+        # We assert that whenever a key match is present it appears before any value match.
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "attribute_type": "resource",
+            "search": "argo",
+            "search_values": "true",
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/attributes", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+        match_kinds = [r["matchedOn"] for r in results]
+
+        # Once we hit the first value match, we should never see a key match after it.
+        first_value_idx = next((i for i, m in enumerate(match_kinds) if m == "value"), None)
+        if first_value_idx is not None:
+            tail = match_kinds[first_value_idx:]
+            self.assertNotIn("key", tail, "key matches must appear before value matches")
+
+    def test_log_attributes_search_trace_id_before_pid(self):
+        """Test that searching attributes for 'id' returns trace_id before pid"""
+
+        query_params = {
+            "dateRange": '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}',
+            "attribute_type": "log",
+            "search": "id",
+        }
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/attributes", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        results = response.json()["results"]
+        result_names = [r["name"] for r in results]
+
+        self.assertIn("trace_id", result_names, "trace_id should be in results when searching for 'id'")
+        self.assertIn("brokers.0.id", result_names, "brokers.0.id should be in results when searching for 'id'")
+        self.assertIn("pid", result_names, "pid should be in results when searching for 'id'")
+
+        trace_id_index = result_names.index("trace_id")
+        brokers_id_index = result_names.index("brokers.0.id")
+        pid_index = result_names.index("pid")
+        self.assertLess(
+            trace_id_index, brokers_id_index, "trace_id should appear before brokers.0.id when searching for 'id'"
+        )
+        self.assertLess(brokers_id_index, pid_index, "brokers.0.id should appear before pid when searching for 'id'")
+
+
+class TestLogValuesAttributesQueryErrors(APIBaseTest):
+    @parameterized.expand(
+        [
+            (
+                "values",
+                "products.logs.backend.presentation.views.api.LogValuesQueryRunner.calculate",
+                {"key": "service.name", "attribute_type": "resource"},
+            ),
+            (
+                "attributes",
+                "products.logs.backend.presentation.views.api.LogAttributesQueryRunner.calculate",
+                {"attribute_type": "resource"},
+            ),
+        ]
+    )
+    def test_query_error_returns_400_with_message(self, endpoint, runner_path, params):
+        # HogQL and ClickHouse failures are disjoint exception hierarchies; both must reach the
+        # service filter as a clean 400, not an opaque 500.
+        for error in (QueryError("bad log query"), ExposedCHQueryError("bad clickhouse query", code=43)):
+            with self.subTest(error=type(error).__name__):
+                with patch(runner_path, side_effect=error):
+                    response = self.client.get(f"/api/projects/{self.team.pk}/logs/{endpoint}", params)
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.json()["error"], str(error))
+
+    @parameterized.expand(
+        [
+            ("values", "LogValuesQueryRunner", {"key": "service.name", "attribute_type": "resource"}),
+            ("attributes", "LogAttributesQueryRunner", {"attribute_type": "resource"}),
+        ]
+    )
+    def test_filter_group_param_is_optional_and_accepts_a_flat_list(self, endpoint, runner_name, params):
+        flat_filter_group = [{"type": "log", "key": "severity_level", "value": ["error"], "operator": "exact"}]
+        with (
+            patch(f"products.logs.backend.presentation.views.api.{runner_name}") as runner_class,
+            patch("posthog.api.mixins.capture_exception") as capture_exception,
+        ):
+            runner_class.return_value.calculate.return_value = SimpleNamespace(results=[], count=0)
+
+            response = self.client.get(f"/api/projects/{self.team.pk}/logs/{endpoint}", params)
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+            self.assertIsNone(runner_class.call_args.kwargs["query"].filterGroup)
+
+            response = self.client.get(
+                f"/api/projects/{self.team.pk}/logs/{endpoint}",
+                {**params, "filterGroup": json.dumps(flat_filter_group)},
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+            filter_group = runner_class.call_args.kwargs["query"].filterGroup
+            self.assertEqual(filter_group.values[0].values[0].key, "severity_level")
+
+        capture_exception.assert_not_called()
+
+    @parameterized.expand(
+        [
+            ("empty_string", ""),
+            ("empty_object", "{}"),
+            ("empty_list", "[]"),
+            ("not_json", "not json"),
+            ("scalar", "5"),
+            ("group_without_values", json.dumps({"type": "AND"})),
+            ("integer_past_the_digit_limit", "[" + "1" * 5000 + "]"),
+        ]
+    )
+    def test_malformed_filter_group_param_means_no_filter(self, _name, filter_group):
+        with (
+            patch("products.logs.backend.presentation.views.api.LogAttributesQueryRunner") as runner_class,
+            patch("posthog.api.mixins.capture_exception") as capture_exception,
+        ):
+            runner_class.return_value.calculate.return_value = SimpleNamespace(results=[], count=0)
+
+            response = self.client.get(
+                f"/api/projects/{self.team.pk}/logs/attributes",
+                {"attribute_type": "resource", "filterGroup": filter_group},
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertIsNone(runner_class.call_args.kwargs["query"].filterGroup)
+        capture_exception.assert_not_called()
+
+
+class TestLogAttributesIlikeEscaping(ClickhouseTestMixin, APIBaseTest):
+    CLASS_DATA_LEVEL_SETUP = True
+
+    DATE_RANGE = '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}'
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        # Two rows whose `promo.code` value differs only by the "%" — used to prove that a
+        # "50%off" search escapes the wildcard instead of matching "50ABCoff" too.
+        rows = [
+            {"uuid": "019b2664-0000-7000-0000-000000000001", "value": "50%off"},
+            {"uuid": "019b2664-0000-7000-0000-000000000002", "value": "50ABCoff"},
+        ]
+        sql = ""
+        for i, row in enumerate(rows):
+            sql += (
+                json.dumps(
+                    {
+                        "uuid": row["uuid"],
+                        "team_id": cls.team.id,
+                        "timestamp": "2025-12-16 09:30:00.000000",
+                        "observed_timestamp": "2025-12-16 09:30:00.000000",
+                        "body": f"promo log {i}",
+                        "severity_text": "info",
+                        "severity_number": 9,
+                        "service_name": "promo-svc",
+                        "resource_attributes": {"service.name": "promo-svc"},
+                        "attributes_map_str": {"promo.code__str": row["value"]},
+                    }
+                )
+                + "\n"
+            )
+        sync_execute(f"INSERT INTO logs FORMAT JSONEachRow\n{sql}")
+
+    def _attributes(self, params: dict) -> list[dict]:
+        query_params = {"dateRange": self.DATE_RANGE, **params}
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/attributes", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.json()["results"]
+
+    def test_attribute_value_search_escapes_ilike_wildcards(self):
+        # "%" must match a literal percent — "50%off" must not wildcard-match "50ABCoff".
+        results = self._attributes({"attribute_type": "log", "search": "50%off", "search_values": "true"})
+        value_matches = [r["matchedValue"] for r in results if r["matchedOn"] == "value"]
+        self.assertIn("50%off", value_matches)
+        self.assertNotIn("50ABCoff", value_matches)
+
+    def test_value_search_escapes_ilike_wildcards(self):
+        # The /logs/values endpoint must escape the wildcard too.
+        query_params = {"dateRange": self.DATE_RANGE, "key": "promo.code", "attribute_type": "log", "value": "50%off"}
+        response = self.client.get(f"/api/projects/{self.team.pk}/logs/values", query_params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        names = {r["name"] for r in response.json()["results"]}
+        self.assertIn("50%off", names)
+        self.assertNotIn("50ABCoff", names)
+
+
+class TestLogAttributesKeysFilter(ClickhouseTestMixin, APIBaseTest):
+    CLASS_DATA_LEVEL_SETUP = True
+
+    DATE_RANGE = '{"date_from": "2025-12-16T09:00:00Z", "date_to": "2025-12-16T11:00:00Z"}'
+    FILLER_KEYS = [f"filler.key.{i:03d}" for i in range(100)]
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        # The 100 filler keys occur in two logs. The environment key occurs in one log.
+        # A list of the 100 most common keys omits the environment key. The facet probe must find it.
+        filler = dict.fromkeys(cls.FILLER_KEYS, "x")
+        resources = [
+            {"service.name": "api", **filler},
+            {"service.name": "api", **filler},
+            {"service.name": "api", "deployment.environment": "production"},
+        ]
+        sql = ""
+        for i, resource_attributes in enumerate(resources):
+            sql += (
+                json.dumps(
+                    {
+                        "uuid": f"019b2664-0000-7000-0000-0000000001{i:02d}",
+                        "team_id": cls.team.id,
+                        "timestamp": "2025-12-16 09:30:00.000000",
+                        "observed_timestamp": "2025-12-16 09:30:00.000000",
+                        "body": f"keys filter log {i}",
+                        "severity_text": "info",
+                        "severity_number": 9,
+                        "service_name": "api",
+                        "resource_attributes": resource_attributes,
+                    }
+                )
+                + "\n"
+            )
+        sync_execute(f"INSERT INTO logs FORMAT JSONEachRow\n{sql}")
+
+    def _get(self, params: dict):
+        query_params = {"dateRange": self.DATE_RANGE, "attribute_type": "resource", **params}
+        return self.client.get(f"/api/projects/{self.team.pk}/logs/attributes", query_params)
+
+    def _names(self, params: dict) -> list[str]:
+        response = self._get(params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return [r["name"] for r in response.json()["results"]]
+
+    def test_keys_returns_low_volume_key_beyond_top_100(self):
+        self.assertNotIn("deployment.environment", self._names({}))
+        self.assertEqual(
+            self._names({"keys": "deployment.environment.name,deployment.environment,env"}),
+            ["deployment.environment"],
+        )
+
+    def test_keys_survive_resource_attribute_filter(self):
+        # Keep the key filter out of the resource fingerprint subquery. That subquery has no attribute_key.
+        filter_group = json.dumps(
+            {
+                "type": "AND",
+                "values": [
+                    {
+                        "type": "AND",
+                        "values": [
+                            {
+                                "key": "service.name",
+                                "type": "log_resource_attribute",
+                                "operator": "exact",
+                                "value": ["api"],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            self._names({"keys": "deployment.environment", "filterGroup": filter_group}), ["deployment.environment"]
+        )
+
+    @parameterized.expand(
+        [
+            ("spaces_and_blanks", " deployment.environment , ,env,", ["deployment.environment"]),
+            ("duplicates", "deployment.environment,deployment.environment", ["deployment.environment"]),
+            ("absent_key", "k8s.pod.name", []),
+        ]
+    )
+    def test_keys_parsing(self, _name, keys, expected):
+        self.assertEqual(self._names({"keys": keys}), expected)
+
+    def test_empty_keys_does_not_filter(self):
+        self.assertEqual(len(self._names({"keys": ""})), 100)
+
+    @parameterized.expand(
+        [
+            ("window_over_the_seed", "2025-12-16T09:00:00Z", "2025-12-16T11:00:00Z", ["deployment.environment"]),
+            ("window_before_the_seed", "2025-12-15T09:00:00Z", "2025-12-15T11:00:00Z", []),
+        ]
+    )
+    def test_flat_date_params_scope_window(self, _name, date_from, date_to, expected):
+        # The generated frontend client cannot send the JSON dateRange, so it scopes the window with flat params.
+        response = self.client.get(
+            f"/api/projects/{self.team.pk}/logs/attributes",
+            {
+                "attribute_type": "resource",
+                "keys": "deployment.environment",
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([r["name"] for r in response.json()["results"]], expected)
+
+    def test_date_range_json_wins_over_flat_params(self):
+        names = self._names(
+            {"keys": "deployment.environment", "date_from": "2025-12-15T09:00:00Z", "date_to": "2025-12-15T11:00:00Z"}
+        )
+        self.assertEqual(names, ["deployment.environment"])
+
+    def test_too_many_keys_returns_400(self):
+        response = self._get({"keys": ",".join(f"key.{i}" for i in range(101))})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class TestLogValuesQuerySerializer:
+    def test_blank_value_is_accepted(self) -> None:
+        serializer = _LogsValuesQuerySerializer(data={"key": "level", "value": ""})
+
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data.get("value", "") == ""

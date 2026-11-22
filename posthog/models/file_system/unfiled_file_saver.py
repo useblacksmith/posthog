@@ -1,0 +1,138 @@
+# posthog/models/file_system/unfiled_file_saver.py
+from collections.abc import Callable
+from datetime import datetime
+from typing import Optional
+
+from django.utils import timezone
+
+from posthog.models.file_system.constants import DEFAULT_SURFACE, WORKFLOW_FILE_SYSTEM_TYPES, workflows_list_v2_enabled
+from posthog.models.file_system.file_system import FileSystem, escape_path, split_path
+from posthog.models.file_system.file_system_mixin import FileSystemSyncMixin
+from posthog.models.team import Team
+from posthog.models.user import User
+from posthog.session_recordings.models.session_recording_playlist import SessionRecordingPlaylist
+
+from products.cdp.backend.models.hog_functions.hog_function import HogFunction
+from products.cohorts.backend.models.cohort import Cohort
+from products.early_access_features.backend.models import EarlyAccessFeature
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.notebooks.backend.models import Notebook
+from products.product_analytics.backend.facade.models import Insight
+from products.surveys.backend.models import Survey
+
+# Sealed products add their own models with `register_mixin_model` (actions, canvas, dashboards, experiments).
+MIXIN_MODELS: dict[str, type[FileSystemSyncMixin]] = {
+    "feature_flag": FeatureFlag,
+    "insight": Insight,
+    "notebook": Notebook,
+    "early_access_feature": EarlyAccessFeature,
+    "session_recording_playlist": SessionRecordingPlaylist,
+    "cohort": Cohort,
+    "hog_function": HogFunction,
+    "survey": Survey,
+}
+
+# Which models feed each surface's tree. New product surfaces register their own models here so
+# they are never swept into the default ("web") tree, and vice versa.
+MIXIN_MODELS_BY_SURFACE: dict[str, dict[str, type[FileSystemSyncMixin]]] = {
+    DEFAULT_SURFACE: MIXIN_MODELS,
+}
+
+
+def register_mixin_model(file_type: str, model_cls: type[FileSystemSyncMixin], surface: str = DEFAULT_SURFACE) -> None:
+    """For a sealed product to add its model from its own `AppConfig.ready()`, so this module
+    never has to import the product's internals."""
+    MIXIN_MODELS_BY_SURFACE.setdefault(surface, {})[file_type] = model_cls
+
+
+class UnfiledFileSaver:
+    """
+    Checks each model's get_file_system_unfiled(...) for items that
+    haven't been put into FileSystem. Creates them with unique paths.
+    """
+
+    def __init__(
+        self,
+        team: Team,
+        user: User,
+        surface: str = DEFAULT_SURFACE,
+        authorize: Callable[[list[FileSystem]], list[FileSystem]] | None = None,
+    ):
+        self.team = team
+        self.user = user
+        self.surface = surface
+        self.authorize = authorize
+        self._in_memory_paths: set[str] = set()
+
+    def save_unfiled_for_model(self, model_cls: type[FileSystemSyncMixin]) -> list[FileSystem]:
+        unfiled_qs = model_cls.get_file_system_unfiled(self.team, surface=self.surface)
+        new_files: list[FileSystem] = []
+        users_by_id: dict[int, User] = {}
+        for obj in unfiled_qs:
+            rep = obj.get_file_system_representation()
+
+            # If should_delete is True, skip making a new entry
+            if rep.should_delete:
+                continue
+
+            path = f"{rep.base_folder}/{escape_path(rep.name)}"
+            user: User | None = None
+            if rep.meta.get("created_by"):
+                user = users_by_id.get(rep.meta["created_by"])
+                if user is None:
+                    user = User.objects.filter(pk=rep.meta["created_by"]).first()
+                    if user:
+                        users_by_id[rep.meta["created_by"]] = user
+                if user is None:
+                    user = self.user
+            created_at = timezone.now()
+            if rep.meta.get("created_at"):
+                created_at = datetime.fromisoformat(rep.meta["created_at"])
+            new_files.append(
+                FileSystem(
+                    team=self.team,
+                    path=path,
+                    depth=len(split_path(path)),
+                    type=rep.type,
+                    ref=rep.ref,
+                    href=rep.href,
+                    meta=rep.meta,
+                    created_by=user,
+                    created_at=created_at,
+                    shortcut=False,
+                    surface=rep.surface,
+                )
+            )
+        if self.authorize is not None:
+            new_files = self.authorize(new_files)
+        FileSystem.objects.bulk_create(new_files)
+        return new_files
+
+    def save_all_unfiled(self) -> list[FileSystem]:
+        created_all = []
+        workflows_enabled = workflows_list_v2_enabled(self.team, self.user)
+        for file_type, model_cls in MIXIN_MODELS_BY_SURFACE.get(self.surface, {}).items():
+            if file_type in WORKFLOW_FILE_SYSTEM_TYPES and not workflows_enabled:
+                continue
+            created_all.extend(self.save_unfiled_for_model(model_cls))
+        return created_all
+
+
+def save_unfiled_files(
+    team: Team,
+    user: User,
+    file_type: Optional[str] = None,
+    surface: str = DEFAULT_SURFACE,
+    authorize: Callable[[list[FileSystem]], list[FileSystem]] | None = None,
+) -> list[FileSystem]:
+    saver = UnfiledFileSaver(team, user, surface, authorize)
+    if file_type is None:
+        return saver.save_all_unfiled()
+
+    if file_type in WORKFLOW_FILE_SYSTEM_TYPES and not workflows_list_v2_enabled(team, user):
+        return []
+
+    found_cls = MIXIN_MODELS_BY_SURFACE.get(surface, {}).get(file_type)
+    if not found_cls:
+        return []
+    return saver.save_unfiled_for_model(found_cls)

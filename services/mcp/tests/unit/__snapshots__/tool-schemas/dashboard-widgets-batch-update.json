@@ -1,0 +1,68 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "id": {
+            "description": "A unique integer value identifying this dashboard.",
+            "type": "number"
+        },
+        "widgets": {
+            "description": "Widget tiles to update atomically, each identified by its tile_id. config shape is per widget_type; see dashboard-widget-catalog-list for per-type config_schema (1–10 per request).",
+            "items": {
+                "properties": {
+                    "config": {
+                        "additionalProperties": {},
+                        "description": "Widget configuration as a JSON object. Its keys depend on widget_type: read that type's config_schema from dashboard-widget-catalog-list. The API validates the config and returns a 400 that names each invalid field. Each top-level key you send replaces the stored value, and keys you leave out stay as they are. Omit config to leave it unchanged.",
+                        "propertyNames": {
+                            "type": "string"
+                        },
+                        "type": "object"
+                    },
+                    "description": {
+                        "description": "New markdown description for the widget. Omit to leave unchanged.",
+                        "type": "string"
+                    },
+                    "name": {
+                        "anyOf": [
+                            {
+                                "maxLength": 400,
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "description": "New display name for the widget. Empty string or null clears it; omit to leave unchanged."
+                    },
+                    "tile_id": {
+                        "description": "ID of the widget tile to update. Use dashboard-get to look up widget tile IDs.",
+                        "type": "number"
+                    },
+                    "widget_type": {
+                        "description": "The tile's widget type. It cannot be changed, so omit it or pass the current type.\n\n* `activity_events_list` - Activity Events List\n* `canvas_app` - Canvas App\n* `conversations_recent_tickets` - Conversations Recent Tickets\n* `error_tracking_list` - Error Tracking List\n* `experiment_results` - Experiment Results\n* `experiments_list` - Experiments List\n* `logs_list` - Logs List\n* `metrics_table` - Metrics Table\n* `notebook_widget` - Notebook Widget\n* `session_replay_list` - Session Replay List\n* `survey_results` - Survey Results",
+                        "enum": [
+                            "activity_events_list",
+                            "canvas_app",
+                            "conversations_recent_tickets",
+                            "error_tracking_list",
+                            "experiment_results",
+                            "experiments_list",
+                            "logs_list",
+                            "metrics_table",
+                            "notebook_widget",
+                            "session_replay_list",
+                            "survey_results"
+                        ],
+                        "type": "string"
+                    }
+                },
+                "required": ["tile_id"],
+                "type": "object"
+            },
+            "maxItems": 10,
+            "minItems": 1,
+            "type": "array"
+        }
+    },
+    "required": ["id"],
+    "type": "object"
+}

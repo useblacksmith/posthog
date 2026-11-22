@@ -1,0 +1,122 @@
+import { BuiltLogic } from 'kea'
+
+import {
+    DataWarehousePopoverField,
+    DefinitionPopoverRenderer,
+    TaxonomicFilterGroupType,
+} from 'lib/components/TaxonomicFilter/types'
+import { LemonButtonProps } from 'lib/lemon-ui/LemonButton'
+import type { LemonSelectOptionLeaf } from 'lib/lemon-ui/LemonSelect'
+
+import { ChartDisplayCategory, InsightType, PropertyOperator } from '~/types'
+
+import type { entityFilterLogicType } from '../entityFilterLogic'
+import { SeriesNode, WarehouseSeriesNodeKind } from '../seriesNode'
+
+export enum MathAvailability {
+    All,
+    ActorsOnly,
+    FunnelsOnly,
+    CalendarHeatmapOnly,
+    BoxPlotOnly,
+    None,
+}
+
+export interface ActionFilterRowProps {
+    logic: BuiltLogic<entityFilterLogicType>
+    node: SeriesNode
+    /** Sidecar row identity, for the drag key. Nodes stay schema-pure so they carry none. */
+    uuid: string
+    index: number
+    typeKey: string
+    mathAvailability: MathAvailability
+    singleFilter?: boolean
+    hideFilter?: boolean // Hides the local filter options
+    hideRename?: boolean // Hides the rename option
+    hideDuplicate?: boolean // Hides the duplicate option
+    hideDeleteBtn?: boolean // Choose to hide delete btn. You can use the onClose function passed into customRow{Pre|Suf}fix to render the delete btn anywhere
+    showCombine?: boolean // Show the combine inline events option
+    insightType?: InsightType // The type of insight (trends, funnels, etc.)
+    // Opt in the flag-gated "Performed event" behavioral filter. Off by default because behavioral
+    // filters compile to a person_id subquery, which realtime contexts (CDP, workflows) reject.
+    allowBehavioralPropertyFilter?: boolean
+    propertyFiltersPopover?: boolean
+    onRenameClick?: () => void // Used to open rename modal
+    showSeriesIndicator?: boolean // Show series badge
+    seriesIndicatorType?: 'alpha' | 'numeric' // Series badge shows A, B, C | 1, 2, 3
+    filterCount: number
+    sortable: boolean
+    customRowSuffix?:
+        | string
+        | JSX.Element
+        | ((props: { node: SeriesNode; index: number; onClose: () => void }) => JSX.Element) // Custom suffix element to show in each row
+    hasBreakdown: boolean // Whether the current graph has a breakdown filter applied
+    showNestedArrow?: boolean // Show nested arrows to the left of property filter buttons
+    actionsTaxonomicGroupTypes?: TaxonomicFilterGroupType[] // Which tabs to show for actions selector
+    propertiesTaxonomicGroupTypes?: TaxonomicFilterGroupType[] // Which tabs to show for property filters
+    disabled?: boolean
+    readOnly?: boolean
+    renderRow?: ({
+        seriesIndicator,
+        filter,
+        suffix,
+        propertyFiltersButton,
+        renameRowButton,
+        deleteButton,
+    }: Record<string, JSX.Element | string | undefined>) => JSX.Element // build your own row given these components
+    trendsDisplayCategory: ChartDisplayCategory | null
+    /** Whether properties shown should be limited to just numerical types */
+    showNumericalPropsOnly?: boolean
+    /** Only allow these math types in the selector */
+    allowedMathTypes?: readonly string[]
+    /** Fields to display in the data warehouse filter popover */
+    dataWarehousePopoverFields?: DataWarehousePopoverField[]
+    /** Node kind to create when a data warehouse table is picked */
+    dataWarehouseNodeKind?: WarehouseSeriesNodeKind
+    /** Whether to add left padding to the filters div to align with suffix content */
+    filtersLeftPadding?: boolean
+    /** Doc link to show in the tooltip of the New Filter button */
+    addFilterDocLink?: string
+    /** Doc link to show in the tooltip of the Combine events button */
+    inlineEventsDocLink?: string
+    /** Allow adding non-captured events */
+    allowNonCapturedEvents?: boolean
+    flagCallsFromFlagEvaluations?: boolean
+    hogQLGlobals?: Record<string, any>
+    definitionPopoverRenderer?: DefinitionPopoverRenderer
+    operatorAllowlist?: PropertyOperator[]
+}
+
+export interface MathSelectorProps {
+    math?: string
+    mathGroupTypeIndex?: number | null
+    mathAvailability: MathAvailability
+    index: number
+    disabled?: boolean
+    disabledReason?: string
+    onMathSelect: (index: number, value: any) => any
+    trendsDisplayCategory: ChartDisplayCategory | null
+    style?: React.CSSProperties
+    size?: LemonButtonProps['size']
+    /** Only allow these math types in the selector */
+    allowedMathTypes?: readonly string[]
+    excludedMathTypes?: ReadonlySet<string>
+    query?: Record<string, any>
+    fullWidth?: boolean
+    truncateText?: { maxWidthClass: string }
+}
+
+/** An option whose math comes in variants, such as "Count per user" with average, median and so on. */
+export interface MathOptionChoice {
+    prefix: string
+    value: string
+    options: LemonSelectOptionLeaf<string>[]
+    onSelect: (value: string) => void
+}
+
+export type MathSelectorOption = LemonSelectOptionLeaf<string> & { choice?: MathOptionChoice }
+
+export interface MathSelectorSection {
+    options: MathSelectorOption[]
+    footer?: React.ReactNode
+}

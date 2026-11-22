@@ -1,0 +1,257 @@
+import { useEffect, useRef, useState } from 'react'
+
+import { LemonButton, LemonInput, LemonTextArea, Spinner } from '@posthog/lemon-ui'
+
+import { CollapsiblePrimitive, CollapsiblePrimitiveContent } from 'lib/ui/Collapsible/lib/CollapsiblePrimitive'
+import { cn } from 'lib/utils/css-classes'
+
+export interface Option {
+    label: string
+    value: string
+    icon?: JSX.Element
+    description?: string
+}
+
+interface OptionSelectorProps {
+    options: Option[]
+    onSelect: (value: string | null) => void
+    allowCustom?: boolean
+    customPlaceholder?: string
+    onCustomSubmit?: (value: string) => void
+    disabled?: boolean
+    loading?: boolean
+    loadingMessage?: string
+    /** Initial value for the custom input (used when editing a previous answer) */
+    initialCustomValue?: string
+    /** Currently selected value (used to highlight the selected option) */
+    selectedValue?: string
+    /** Label for the submit button (default: "Next") */
+    submitLabel?: string
+    /** Called when the user clicks "Skip question" */
+    onSkip?: () => void
+    multiline?: boolean
+}
+
+export function OptionSelector({
+    options,
+    onSelect,
+    allowCustom = false,
+    customPlaceholder = 'Type your response...',
+    onCustomSubmit,
+    disabled = false,
+    loading = false,
+    loadingMessage = 'Processing...',
+    initialCustomValue,
+    selectedValue,
+    submitLabel = 'Next',
+    onSkip,
+    multiline = false,
+}: OptionSelectorProps): JSX.Element {
+    const freeTextOnly = allowCustom && options.length === 0
+    const isCustomValue = selectedValue !== undefined && !options.some((o) => o.value === selectedValue)
+    const [userWantsCustomMode, setUserWantsCustomMode] = useState(isCustomValue)
+    const showCustomInput = freeTextOnly || userWantsCustomMode || isCustomValue
+    const [customInput, setCustomInput] = useState(initialCustomValue ?? '')
+    const selectedValueRef = useRef(selectedValue)
+    selectedValueRef.current = selectedValue
+
+    useEffect(() => {
+        if (disabled || loading) {
+            return
+        }
+
+        function handleKeyDown(event: KeyboardEvent): void {
+            if (showCustomInput && !freeTextOnly && event.key === 'Escape') {
+                event.preventDefault()
+                setUserWantsCustomMode(false)
+                setCustomInput('')
+                return
+            }
+
+            // Don't trigger keyboard shortcuts when typing in an input
+            if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+                return
+            }
+
+            for (const [index, option] of options.entries()) {
+                if (event.key === String(index + 1)) {
+                    event.preventDefault()
+                    if (selectedValueRef.current === option.value) {
+                        onSelect(null)
+                    } else {
+                        setUserWantsCustomMode(false)
+                        onSelect(option.value)
+                    }
+                    return
+                }
+            }
+
+            if (allowCustom && event.key === String(options.length + 1)) {
+                event.preventDefault()
+                setUserWantsCustomMode(true)
+            }
+        }
+
+        window.addEventListener('keydown', handleKeyDown)
+        return () => {
+            window.removeEventListener('keydown', handleKeyDown)
+        }
+    }, [options, onSelect, allowCustom, disabled, loading, showCustomInput, freeTextOnly])
+
+    const noDescriptions = options.every((o) => !o.description)
+    const footerOpen = !!onSkip || showCustomInput
+    // Without a skip button the submit button is the panel's only content. Base UI measures the closing
+    // height after React commits, so if the button unmounted in the same render the row would snap to
+    // its padding before it slides shut. Keep it mounted for as long as the panel is.
+    const showSubmit = showCustomInput || !onSkip
+
+    const handleCustomSubmit = (): void => {
+        if (!customInput.trim()) {
+            // When not choosing a custom input, hide the input and show button again
+            setUserWantsCustomMode(false)
+
+            return
+        }
+        if (freeTextOnly) {
+            onCustomSubmit?.(multiline ? customInput : customInput.trim())
+            return
+        }
+        setUserWantsCustomMode(false)
+        onCustomSubmit?.(customInput.trim())
+    }
+
+    if (loading) {
+        return (
+            <div className="flex items-center gap-2 text-muted">
+                <Spinner className="size-4" />
+                <span>{loadingMessage}</span>
+            </div>
+        )
+    }
+
+    return (
+        <CollapsiblePrimitive open={footerOpen} className="flex flex-col">
+            <div
+                className={cn('flex flex-col gap-1.5', {
+                    // When there are no descriptions, reduce the gap between options to 0.5
+                    'gap-0.5': noDescriptions,
+                })}
+            >
+                <div className="flex flex-col gap-2 font-medium">
+                    {options.map((o) => (
+                        <label
+                            key={o.value}
+                            className="grid items-center gap-x-2 grid-cols-[min-content_auto] text-sm cursor-pointer"
+                            onClick={(e) => {
+                                e.preventDefault()
+                                if (disabled) {
+                                    return
+                                }
+                                if (selectedValue === o.value) {
+                                    onSelect(null)
+                                } else {
+                                    setUserWantsCustomMode(false)
+                                    onSelect(o.value)
+                                }
+                            }}
+                        >
+                            <input
+                                type="radio"
+                                className="cursor-pointer"
+                                checked={selectedValue === o.value && !showCustomInput}
+                                disabled={disabled}
+                                onChange={() => {}}
+                            />
+                            <span>{o.label}</span>
+                            {o.description && (
+                                <div className="text-secondary font-normal row-start-2 col-start-2 text-pretty text-xs">
+                                    {o.description}
+                                </div>
+                            )}
+                        </label>
+                    ))}
+                </div>
+
+                {freeTextOnly &&
+                    (multiline ? (
+                        <LemonTextArea
+                            placeholder={customPlaceholder}
+                            value={customInput}
+                            onChange={setCustomInput}
+                            onPressCmdEnter={handleCustomSubmit}
+                            minRows={3}
+                            maxRows={12}
+                            autoFocus
+                        />
+                    ) : (
+                        <LemonInput
+                            placeholder={customPlaceholder}
+                            fullWidth
+                            size="small"
+                            value={customInput}
+                            onChange={setCustomInput}
+                            onPressEnter={handleCustomSubmit}
+                            autoFocus
+                        />
+                    ))}
+                {allowCustom && !freeTextOnly && (
+                    <label className="grid items-center gap-x-2 grid-cols-[min-content_auto] text-sm font-medium cursor-pointer">
+                        <input
+                            type="radio"
+                            className="cursor-pointer"
+                            checked={showCustomInput}
+                            disabled={disabled}
+                            onChange={() => {
+                                setUserWantsCustomMode(true)
+                            }}
+                            value="custom"
+                        />
+                        {showCustomInput ? (
+                            <LemonInput
+                                className="starting:opacity-0 opacity-100 transition-[opacity] duration-150 motion-reduce:transition-none"
+                                placeholder={customPlaceholder}
+                                fullWidth
+                                size="small"
+                                value={customInput}
+                                onChange={setCustomInput}
+                                onPressEnter={handleCustomSubmit}
+                                disabled={disabled}
+                                autoFocus={true}
+                            />
+                        ) : (
+                            <span className="my-1.5">Explain what you'd like instead.</span>
+                        )}
+                    </label>
+                )}
+            </div>
+            {(allowCustom || footerOpen) && (
+                <CollapsiblePrimitiveContent className="transition-[height,opacity] duration-150 ease-out opacity-100 data-[starting-style]:opacity-0 data-[ending-style]:opacity-0 motion-reduce:transition-none">
+                    <div
+                        className={cn('flex items-center justify-between gap-2 pt-3.5', {
+                            'pt-2.5': noDescriptions,
+                        })}
+                    >
+                        {onSkip && (
+                            <LemonButton type="secondary" size="small" onClick={onSkip} disabled={disabled}>
+                                Skip question
+                            </LemonButton>
+                        )}
+                        {showSubmit && (
+                            <div className="ml-auto starting:opacity-0 opacity-100 transition-[opacity] duration-150 motion-reduce:transition-none">
+                                <LemonButton
+                                    type="primary"
+                                    size="small"
+                                    disabled={disabled}
+                                    disabledReason={!customInput.trim() ? 'Please type a response' : undefined}
+                                    onClick={handleCustomSubmit}
+                                >
+                                    {submitLabel}
+                                </LemonButton>
+                            </div>
+                        )}
+                    </div>
+                </CollapsiblePrimitiveContent>
+            )}
+        </CollapsiblePrimitive>
+    )
+}

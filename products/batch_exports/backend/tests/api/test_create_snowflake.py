@@ -1,0 +1,102 @@
+import pytest
+
+from django.test.client import Client as HttpClient
+
+from rest_framework import status
+from temporalio.client import ScheduleActionStartWorkflow
+
+from posthog.models.integration import Integration
+
+from products.batch_exports.backend.tests.api.conftest import describe_schedule
+from products.batch_exports.backend.tests.api.fixtures import create_integration_backed_snowflake_export
+from products.batch_exports.backend.tests.api.operations import create_batch_export
+
+pytestmark = [
+    pytest.mark.django_db,
+    pytest.mark.usefixtures("temporal_worker", "cleanup"),
+]
+
+
+@pytest.mark.parametrize(
+    "auth_type,credentials,expected_detail",
+    [
+        (
+            "password",
+            {"password": "abc123"},
+            "Configuration has unknown field/s: 'account', 'authentication_type', 'password', 'user'",
+        ),
+        (
+            "keypair",
+            {"private_key": "SECRET_KEY"},
+            "Configuration has unknown field/s: 'account', 'authentication_type', 'private_key', 'user'",
+        ),
+    ],
+)
+def test_create_snowflake_batch_export_with_inline_credentials_is_rejected(
+    client: HttpClient, auth_type, credentials, expected_detail, temporal, organization, team, user
+):
+    client.force_login(user)
+    response = create_batch_export(
+        client,
+        team.pk,
+        {
+            "name": "my-export",
+            "interval": "hour",
+            "destination": {
+                "type": "Snowflake",
+                "config": {
+                    "account": "my-account",
+                    "user": "user",
+                    "database": "my-db",
+                    "warehouse": "COMPUTE_WH",
+                    "schema": "public",
+                    "table_name": "my_events",
+                    "authentication_type": auth_type,
+                    **credentials,
+                },
+            },
+        },
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST, response.json()
+    assert response.json()["detail"] == expected_detail
+
+
+def test_create_snowflake_batch_export_using_integration(client: HttpClient, temporal, organization, team, user):
+    """A Snowflake export authenticates via a matching integration, with no account/user/credentials in config."""
+    _, data = create_integration_backed_snowflake_export(client, team, user)
+    assert data["destination"]["type"] == "Snowflake"
+    assert "password" not in data["destination"]["config"]
+
+    schedule = describe_schedule(temporal, data["id"])
+    assert isinstance(schedule.schedule.action, ScheduleActionStartWorkflow)
+    assert schedule.schedule.action.workflow == "snowflake-export"
+
+
+def test_create_snowflake_batch_export_rejects_mismatched_integration_kind(
+    client: HttpClient, temporal, organization, team, user
+):
+    """A Snowflake export rejects an integration whose kind isn't snowflake."""
+    integration = Integration.objects.create(
+        team=team,
+        kind=Integration.IntegrationKind.AWS_S3,
+        integration_id="prod-aws",
+        config={"name": "prod-aws", "aws_account_id": "123456789012"},
+        sensitive_config={"aws_access_key_id": "key", "aws_secret_access_key": "secret"},
+        created_by=user,
+    )
+    client.force_login(user)
+    response = create_batch_export(
+        client,
+        team.pk,
+        {
+            "name": "my-export",
+            "interval": "hour",
+            "destination": {
+                "type": "Snowflake",
+                "config": {"database": "my-db", "warehouse": "COMPUTE_WH", "schema": "public"},
+                "integration": integration.id,
+            },
+        },
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST, response.json()
+    assert response.json()["detail"] == ("Integration provided is not a Snowflake integration (got kind='aws-s3')")

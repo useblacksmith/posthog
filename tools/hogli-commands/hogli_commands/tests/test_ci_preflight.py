@@ -1,0 +1,483 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from unittest.mock import MagicMock, patch
+
+from click.testing import CliRunner
+from hogli.cli import cli
+from hogli.manifest import REPO_ROOT
+from hogli_commands import ci_preflight
+from hogli_commands.change_detection import matches_globs
+from hogli_commands.ci_preflight import (
+    DIFF_CHECKS,
+    DiffCheck,
+    _pnpm_workspace_root,
+    _run_diff_check,
+    _run_workspace_scoped,
+    _staleness_risks,
+)
+from hogli_commands.preflight_checks import Scope, Status
+
+runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def no_diff_reading_checks() -> Iterator[None]:
+    # The real ones shell out to node and semgrep on any changed path.
+    with (
+        patch("hogli_commands.ci_preflight.DIFF_CHECKS", [chk for chk in DIFF_CHECKS if chk.run is None]),
+        patch("hogli_commands.ci_preflight.check_stack_depth", return_value=("skipped", "no local stack")),
+    ):
+        yield
+
+
+class TestDiffReadingChecks:
+    @pytest.mark.parametrize(
+        "status,warn_only,expected_exit",
+        [("fail", False, 1), ("advisory", False, 0), (None, False, 0), ("warning", True, 0)],
+    )
+    @patch("hogli_commands.ci_preflight._merge_base", return_value="abc123")
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.changed_files", return_value=["frontend/snapshots.yml"])
+    def test_only_a_failed_check_blocks_the_push_and_a_warn_only_check_is_skipped(
+        self,
+        mock_changed: MagicMock,
+        mock_fetch: MagicMock,
+        mock_stale: MagicMock,
+        mock_emit: MagicMock,
+        mock_merge_base: MagicMock,
+        status: Status | None,
+        warn_only: bool,
+        expected_exit: int,
+    ) -> None:
+        def run(scope: Scope) -> tuple[Status, str]:
+            if status is None:
+                raise KeyError("unexpected tool output")
+            return status, "detail"
+
+        check = DiffCheck(key="probe", label="probe", triggers=["frontend/*"], verify=None, run=run, soft=warn_only)
+        with patch("hogli_commands.ci_preflight.DIFF_CHECKS", [check]):
+            result = runner.invoke(cli, ["ci:preflight", "--strict"])
+
+        assert result.exit_code == expected_exit
+        assert ("[probe]" in result.output) != warn_only
+
+
+class TestKillSwitch:
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight.changed_files")
+    def test_short_circuits_before_any_git_work(self, mock_changed: MagicMock, mock_emit: MagicMock) -> None:
+        result = runner.invoke(cli, ["ci:preflight"], env={"HOGLI_PREFLIGHT_DISABLED": "1"})
+        assert result.exit_code == 0
+        assert "disabled" in result.output
+        mock_changed.assert_not_called()
+        assert mock_emit.call_args[0][0]["mode"] == "disabled"
+
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight.changed_files")
+    def test_json_output_stays_parseable(self, mock_changed: MagicMock, mock_emit: MagicMock) -> None:
+        result = runner.invoke(cli, ["ci:preflight", "--json"], env={"HOGLI_PREFLIGHT_DISABLED": "1"})
+        assert result.exit_code == 0
+        assert json.loads(result.output)["mode"] == "disabled"
+        mock_changed.assert_not_called()
+
+
+class TestStrictAndFixContracts:
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.changed_files", return_value=[])
+    def test_explicit_preflight_blocks_an_oversized_stack_without_a_diff(
+        self, mock_changed: MagicMock, mock_fetch: MagicMock, mock_stale: MagicMock, mock_emit: MagicMock
+    ) -> None:
+        with patch("hogli_commands.ci_preflight.check_stack_depth", return_value=("fail", "6 open layers")):
+            result = runner.invoke(cli, ["ci:preflight", "--strict"])
+        assert result.exit_code == 1
+        assert "6 open layers" in result.output
+
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.changed_files", return_value=["posthog/api/does_not_exist.py"])
+    def test_strict_never_blocks_on_advisory(
+        self, mock_changed: MagicMock, mock_fetch: MagicMock, mock_stale: MagicMock, mock_emit: MagicMock
+    ) -> None:
+        result = runner.invoke(cli, ["ci:preflight", "--strict"])
+        assert "build:openapi" in result.output
+        assert result.exit_code == 0
+
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.shutil.which", return_value="/usr/bin/hogli")
+    @patch("hogli_commands.ci_preflight.subprocess.run")
+    @patch("hogli_commands.ci_preflight.changed_files", return_value=[".github/workflows/ci-foo.yml"])
+    def test_strict_exits_nonzero_on_failure(
+        self,
+        mock_changed: MagicMock,
+        mock_run: MagicMock,
+        mock_which: MagicMock,
+        mock_fetch: MagicMock,
+        mock_stale: MagicMock,
+        mock_emit: MagicMock,
+    ) -> None:
+        mock_run.return_value = MagicMock(returncode=1, stdout="workflow convention violated", stderr="")
+        result = runner.invoke(cli, ["ci:preflight", "--strict"])
+        assert result.exit_code == 1
+
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._capability_met", return_value=False)
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.changed_files", return_value=["posthog/api/does_not_exist.py"])
+    def test_fix_without_stack_still_advises_openapi(
+        self,
+        mock_changed: MagicMock,
+        mock_fetch: MagicMock,
+        mock_stale: MagicMock,
+        mock_capability: MagicMock,
+        mock_emit: MagicMock,
+    ) -> None:
+        result = runner.invoke(cli, ["ci:preflight", "--fix"])
+        assert result.exit_code == 0
+        assert "if you have not run `hogli build:openapi` since changing them, run it and commit" in result.output
+        # Nothing regenerated here, so the advisory must not claim the types are stale.
+        # A branch keeps its source edits in the diff after a regen, so a staleness claim
+        # can never be cleared by running the fix.
+        assert "out of date" not in result.output
+
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.changed_files", return_value=["posthog/api/does_not_exist.py"])
+    def test_guidance_only_check_is_not_counted_as_an_advisory(
+        self, mock_changed: MagicMock, mock_fetch: MagicMock, mock_stale: MagicMock, mock_emit: MagicMock
+    ) -> None:
+        result = runner.invoke(cli, ["ci:preflight", "--json"])
+        summary = json.loads(result.output)
+        assert "openapi" in summary["triggered"]
+        # A check that runs nothing has found nothing. Counting it puts an advisory on
+        # every push that touches an API file, which spends the weight the footer needs
+        # for the checks that did measure something.
+        assert summary["advisories"] == 0
+
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.subprocess.run")
+    @patch("hogli_commands.ci_preflight.changed_files", return_value=["posthog/api/does_not_exist.py"])
+    def test_nudge_names_the_command_without_running_it(
+        self,
+        mock_changed: MagicMock,
+        mock_run: MagicMock,
+        mock_fetch: MagicMock,
+        mock_stale: MagicMock,
+        mock_emit: MagicMock,
+    ) -> None:
+        result = runner.invoke(cli, ["ci:preflight", "--strict"])
+
+        assert result.exit_code == 0
+        assert "uv run mypy ." in result.output
+        # Giving the check a `verify` would tax every push with a repo-wide mypy run.
+        ran = [arg for call in mock_run.call_args_list for arg in call.args[0]]
+        assert "mypy" not in ran
+
+
+class TestProjectionsDriftCheck:
+    @pytest.mark.parametrize(
+        "changed",
+        [
+            "posthog/taxonomy/taxonomy.py",
+            "products/tasks/scripts/model_catalog_projection.py",
+            "tools/hogli-commands/hogli_commands/projections.py",
+            "frontend/src/taxonomy/core-filter-definitions-by-group.json",
+            "products/tasks/backend/model_catalog.py",
+            "posthog/scopes/oauth.py",
+            "services/mcp/src/lib/oauth-scopes.generated.ts",
+        ],
+    )
+    def test_every_side_of_the_drift_relation_triggers(self, changed: str) -> None:
+        check = next(chk for chk in DIFF_CHECKS if chk.key == "projections")
+        assert matches_globs(changed, check.triggers)
+
+    @pytest.mark.parametrize(
+        "changed",
+        [
+            "products/warehouse_sources/sources/stripe/source.py",
+            "products/warehouse_sources/backend/temporal/data_imports/sources/field_classification.csv",
+        ],
+    )
+    def test_ci_tier_sources_get_advice_instead_of_a_blocking_render(self, changed: str) -> None:
+        blocking = next(chk for chk in DIFF_CHECKS if chk.key == "projections")
+        advisory = next(chk for chk in DIFF_CHECKS if chk.key == "ci-projections")
+
+        assert not matches_globs(changed, blocking.triggers)
+        assert matches_globs(changed, advisory.triggers)
+        assert advisory.verify is None
+
+    def test_concrete_triggers_still_point_at_real_files(self) -> None:
+        check = next(chk for chk in DIFF_CHECKS if chk.key == "projections")
+        # Renaming the generator or its output leaves these triggers matching nothing,
+        # and preflight stops catching a hand-edit with nothing else to notice.
+        concrete = [trigger for trigger in check.triggers if "*" not in trigger]
+        assert concrete, "the generator and its output are no longer triggers"
+        # Every check carrying a hardcoded path has that same failure mode. Glob
+        # triggers cannot be checked this way, because matches_globs uses fnmatch,
+        # where `*` spans `/`, while Path.glob does not.
+        missing = {
+            chk.key: gone
+            for chk in DIFF_CHECKS
+            if (gone := [t for t in chk.triggers if "*" not in t and not (REPO_ROOT / t).exists()])
+        }
+        assert not missing, f"triggers no longer on disk: {missing}"
+
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._capability_met", return_value=False)
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.subprocess.run")
+    @patch(
+        "hogli_commands.ci_preflight.changed_files",
+        return_value=["frontend/src/taxonomy/core-filter-definitions-by-group.json"],
+    )
+    def test_missing_project_env_skips_instead_of_failing(
+        self,
+        mock_changed: MagicMock,
+        mock_run: MagicMock,
+        mock_fetch: MagicMock,
+        mock_stale: MagicMock,
+        mock_capability: MagicMock,
+        mock_emit: MagicMock,
+    ) -> None:
+        result = runner.invoke(cli, ["ci:preflight", "--strict"])
+
+        # The generator imports Django, so a bare checkout cannot run it. Without the
+        # capability gate the run would exit ModuleNotFoundError, and --strict would
+        # block the push on a failure the diff did not cause.
+        assert result.exit_code == 0
+        assert "needs python-env" in result.output
+        ran = [arg for call in mock_run.call_args_list for arg in call.args[0]]
+        assert "build:projections" not in ran
+
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.shutil.which", return_value="/usr/bin/hogli")
+    @patch("hogli_commands.ci_preflight.subprocess.run")
+    @patch("hogli_commands.ci_preflight._project_python_ready", return_value=True)
+    @patch(
+        "hogli_commands.ci_preflight.changed_files",
+        return_value=["frontend/src/taxonomy/core-filter-definitions-by-group.json"],
+    )
+    def test_present_project_env_verifies_without_writing(
+        self,
+        mock_changed: MagicMock,
+        mock_ready: MagicMock,
+        mock_run: MagicMock,
+        mock_which: MagicMock,
+        mock_fetch: MagicMock,
+        mock_stale: MagicMock,
+        mock_emit: MagicMock,
+    ) -> None:
+        mock_run.return_value = MagicMock(returncode=1, stdout="taxonomy json is out of date", stderr="")
+
+        result = runner.invoke(cli, ["ci:preflight", "--strict"])
+
+        # If the verify command were the write path, it would rewrite the outputs and
+        # exit 0, so a drifted push would report pass instead of blocking.
+        assert result.exit_code == 1
+        dispatched = [call.args[0] for call in mock_run.call_args_list]
+        assert ["hogli", "build:projections", "--check", "--tier", "preflight"] in dispatched
+
+
+class TestStalenessRisks:
+    @pytest.mark.parametrize(
+        "branch_files,master_files,conflicts,expected_fragments",
+        [
+            (["posthog/models/team.py"], ["frontend/src/lib/utils.tsx"], [], []),
+            (["posthog/models/team.py"], ["frontend/src/lib/utils.tsx"], None, []),
+            (["a.py"], ["b.py"], ["posthog/api/insight.py"], ["conflicts in 1 file"]),
+            (
+                ["posthog/migrations/0700_ours.py"],
+                ["posthog/migrations/0700_theirs.py"],
+                [],
+                ["migrations added on both sides in posthog/migrations"],
+            ),
+            (["posthog/api/ours.py"], ["posthog/api/theirs.py"], [], ["master also changed build:openapi"]),
+            (["a.py"], [".github/workflows/ci-python.yml"], [], ["CI workflows changed on master (1 file(s))"]),
+        ],
+    )
+    def test_risk_derivation(
+        self,
+        branch_files: list[str],
+        master_files: list[str],
+        conflicts: list[str] | None,
+        expected_fragments: list[str],
+    ) -> None:
+        risks = _staleness_risks(branch_files, master_files, conflicts, [])
+        assert len(risks) == len(expected_fragments)
+        for fragment, risk in zip(expected_fragments, risks):
+            assert fragment in risk
+
+
+@pytest.fixture
+def workspaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for ws in ("", "products/desktop", "packages/agent", "tools/hedgebox-dummy"):
+        (tmp_path / ws).mkdir(parents=True, exist_ok=True)
+        (tmp_path / ws / "pnpm-workspace.yaml").touch()
+    monkeypatch.setattr(ci_preflight, "REPO_ROOT", tmp_path)
+
+
+@pytest.mark.usefixtures("workspaces")
+class TestWorkspaceScopedLockfile:
+    """The lockfile check must validate each pnpm workspace against its own lockfile."""
+
+    @pytest.mark.parametrize(
+        "file_path,expected_workspace",
+        [
+            ("package.json", "."),
+            ("frontend/package.json", "."),
+            ("nodejs/package.json", "."),
+            ("products/desktop/package.json", "products/desktop"),
+            ("products/desktop/pnpm-lock.yaml", "products/desktop"),
+            ("products/desktop/packages/core/package.json", "products/desktop"),
+            ("packages/agent/package.json", "packages/agent"),
+            ("packages/agent/packages/agent/package.json", "packages/agent"),
+            ("tools/hedgebox-dummy/package.json", "tools/hedgebox-dummy"),
+        ],
+    )
+    def test_workspace_root_resolution(self, file_path: str, expected_workspace: str) -> None:
+        assert _pnpm_workspace_root(file_path) == expected_workspace
+
+    @pytest.mark.parametrize(
+        "changed,expected_dirs",
+        [
+            (["products/desktop/package.json"], ["products/desktop"]),
+            (["package.json"], ["."]),
+            (["package.json", "products/desktop/packages/core/package.json"], [".", "products/desktop"]),
+        ],
+    )
+    @patch("hogli_commands.ci_preflight._workspace_install_present", return_value=True)
+    @patch("hogli_commands.ci_preflight.shutil.which", return_value="/usr/bin/pnpm")
+    @patch("hogli_commands.ci_preflight.subprocess.run")
+    def test_lockfile_runs_once_per_workspace(
+        self,
+        mock_run: MagicMock,
+        mock_which: MagicMock,
+        mock_install: MagicMock,
+        changed: list[str],
+        expected_dirs: list[str],
+    ) -> None:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        lockfile = next(chk for chk in DIFF_CHECKS if chk.key == "lockfile")
+        assert lockfile.workspace_scoped
+        lockfile.matched = changed
+
+        status, detail = _run_workspace_scoped(lockfile, do_fix=False)
+
+        assert status == "pass"
+        ran_dirs = [call.kwargs["cwd"] for call in mock_run.call_args_list]
+        root = ci_preflight.REPO_ROOT
+        assert ran_dirs == [root if d == "." else root / d for d in expected_dirs]
+
+    @patch("hogli_commands.ci_preflight._workspace_install_present", return_value=True)
+    @patch("hogli_commands.ci_preflight.shutil.which", return_value="/usr/bin/pnpm")
+    @patch("hogli_commands.ci_preflight.subprocess.run")
+    def test_lockfile_failure_names_the_workspace(
+        self, mock_run: MagicMock, mock_which: MagicMock, mock_install: MagicMock
+    ) -> None:
+        mock_run.return_value = MagicMock(returncode=1, stdout="ERR_PNPM_OUTDATED_LOCKFILE", stderr="")
+        lockfile = next(chk for chk in DIFF_CHECKS if chk.key == "lockfile")
+        lockfile.matched = ["products/desktop/package.json"]
+
+        status, detail = _run_workspace_scoped(lockfile, do_fix=False)
+
+        assert status == "fail"
+        assert "products/desktop: ERR_PNPM_OUTDATED_LOCKFILE" in detail
+
+    @patch("hogli_commands.ci_preflight._workspace_install_present", return_value=False)
+    def test_lockfile_skips_workspace_without_install(self, mock_install: MagicMock) -> None:
+        lockfile = next(chk for chk in DIFF_CHECKS if chk.key == "lockfile")
+        lockfile.matched = ["products/desktop/package.json"]
+
+        status, detail = _run_workspace_scoped(lockfile, do_fix=False)
+
+        assert status == "skipped"
+        assert "products/desktop: needs node" in detail
+
+
+class TestMigrationsCheck:
+    @patch("hogli_commands.ci_preflight.shutil.which", return_value="/usr/bin/hogli")
+    @patch("hogli_commands.ci_preflight._port_open", return_value=True)
+    @patch("hogli_commands.ci_preflight.subprocess.run")
+    def test_disabled_migration_checks_report_skipped_not_pass(
+        self, mock_run: MagicMock, mock_port: MagicMock, mock_which: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("POSTHOG_SKIP_MIGRATION_CHECKS", "1")
+        migrations = next(chk for chk in DIFF_CHECKS if chk.key == "migrations")
+        migrations.matched = ["posthog/migrations/0999_example.py"]
+
+        status, detail = _run_diff_check(migrations, do_fix=False, against=None, strict=True)
+
+        assert status == "skipped"
+        assert "POSTHOG_SKIP_MIGRATION_CHECKS" in detail
+
+    @patch("hogli_commands.ci_preflight.shutil.which", return_value="/usr/bin/hogli")
+    @patch("hogli_commands.ci_preflight._port_open", return_value=True)
+    @patch("hogli_commands.ci_preflight.subprocess.run")
+    def test_failure_detail_shows_the_closing_error_not_the_log_noise(
+        self, mock_run: MagicMock, mock_port: MagicMock, mock_which: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("POSTHOG_SKIP_MIGRATION_CHECKS", raising=False)
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="DEBUG settings loaded\nDEBUG connecting\nDEBUG warning: cache cold\nDEBUG done\n",
+            stderr="The local database lacks these migrations: posthog.0999_example\n",
+        )
+        migrations = next(chk for chk in DIFF_CHECKS if chk.key == "migrations")
+        migrations.matched = ["posthog/migrations/0999_example.py"]
+
+        status, detail = _run_diff_check(migrations, do_fix=False, against=None, strict=True)
+
+        assert status == "fail"
+        assert "posthog.0999_example" in detail
+
+
+class TestDepotMirrorsCheck:
+    @pytest.mark.parametrize(
+        "changed,expected_exit,expected_fragment",
+        [
+            ([".github/actions/setup-uv/action.yml"], 1, "setup-uv drifted"),
+            (["posthog/api/does_not_exist.py"], 0, None),
+        ],
+    )
+    @patch("hogli_commands.ci_preflight._emit_telemetry")
+    @patch("hogli_commands.ci_preflight._staleness", return_value=("pass", "even with master", {}))
+    @patch("hogli_commands.ci_preflight._fetch_master")
+    @patch("hogli_commands.ci_preflight.shutil.which", return_value=None)
+    @patch("hogli_commands.ci_preflight.mirror_violations", return_value=["setup-uv drifted"])
+    def test_blocks_the_push_only_when_depot_paths_change(
+        self,
+        mock_violations: MagicMock,
+        mock_which: MagicMock,
+        mock_fetch: MagicMock,
+        mock_stale: MagicMock,
+        mock_emit: MagicMock,
+        changed: list[str],
+        expected_exit: int,
+        expected_fragment: str | None,
+    ) -> None:
+        with patch("hogli_commands.ci_preflight.changed_files", return_value=changed):
+            result = runner.invoke(cli, ["ci:preflight", "--strict"])
+
+        assert result.exit_code == expected_exit
+        if expected_fragment:
+            assert expected_fragment in result.output
+        else:
+            assert "depot-mirrors" not in result.output

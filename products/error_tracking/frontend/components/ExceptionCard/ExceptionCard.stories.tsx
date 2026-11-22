@@ -1,0 +1,905 @@
+import { Meta } from '@storybook/react'
+import { BindLogic, useActions } from 'kea'
+import { useEffect } from 'react'
+
+import { LemonCard } from '@posthog/lemon-ui'
+
+import { ErrorEventType } from 'lib/components/Errors/types'
+import { FEATURE_FLAGS } from 'lib/constants'
+
+import { mswDecorator } from '~/mocks/browser'
+import { LogMessage, LogSeverityLevel, NodeKind } from '~/queries/schema/schema-general'
+import { AccessControlLevel, AccessControlResourceType } from '~/types'
+
+import { TEST_EVENTS } from '../../__mocks__/events'
+import { results as batchGetResults } from '../../__mocks__/stack_frames/batch_get'
+import { ExceptionTag } from '../../hooks/use-error-tag-renderer'
+import { StyleVariables } from '../StyleVariables'
+import { ExceptionCard } from './ExceptionCard'
+import { ExceptionCardTab, exceptionCardLogic } from './exceptionCardLogic'
+
+const meta: Meta = {
+    title: 'ErrorTracking/ExceptionCard',
+    parameters: {
+        layout: 'centered',
+        viewMode: 'story',
+    },
+    // The trace link hides without tracing access, and the default story context grants none.
+    beforeEach: () => {
+        const context = window.POSTHOG_APP_CONTEXT!
+        const previous = context.resource_access_control
+        context.resource_access_control = {
+            ...previous,
+            [AccessControlResourceType.Tracing]: AccessControlLevel.Viewer,
+        }
+        return () => {
+            context.resource_access_control = previous
+        }
+    },
+    decorators: [
+        mswDecorator({
+            post: {
+                'api/environments/:team_id/error_tracking/stack_frames/batch_get/': { results: batchGetResults },
+            },
+        }),
+        (Story) => (
+            <StyleVariables>
+                {/* 👇 Decorators in Storybook also accept a function. Replace <Story/> with Story() to enable it  */}
+                <Story />
+            </StyleVariables>
+        ),
+    ],
+}
+
+export default meta
+
+function asErrorEventType(event: unknown): ErrorEventType {
+    return event as unknown as ErrorEventType
+}
+
+////////////////////// Generic stacktraces
+
+export function ExceptionCardBase(): JSX.Element {
+    return (
+        <div className="w-[1000px] h-[700px]">
+            <BindLogic logic={exceptionCardLogic} props={{ issueId: 'issue-id', loading: false }}>
+                <OpenTab tab="timeline">
+                    <ExceptionCard
+                        issueId="issue-id"
+                        issueName="Test Issue"
+                        loading={false}
+                        event={TEST_EVENTS['javascript_resolved'] as any}
+                    />
+                </OpenTab>
+            </BindLogic>
+        </div>
+    )
+}
+ExceptionCardBase.parameters = sessionTimelineParameters(asErrorEventType(TEST_EVENTS['javascript_resolved']))
+
+export function ExceptionCardWithFooter(): JSX.Element {
+    const event = asErrorEventType(TEST_EVENTS['javascript_resolved'])
+
+    // Definite width, like the other card stories: `w-full` resolves against a shrink-to-fit storybook
+    // wrapper, so the card would size to its own content rather than to the story.
+    return (
+        <div className="h-[700px] w-[1000px]">
+            <ExceptionCard
+                issueId="issue-id"
+                issueName="Test Issue"
+                loading={false}
+                event={event}
+                label={<ExceptionTag color="red" label="Last Seen" />}
+            />
+        </div>
+    )
+}
+ExceptionCardWithFooter.parameters = sessionTimelineParameters(asErrorEventType(TEST_EVENTS['javascript_resolved']))
+
+export function ExceptionCardNoInApp(): JSX.Element {
+    return (
+        <div className="w-[800px]">
+            <ExceptionCard
+                issueId="issue-id"
+                issueName="Test Issue"
+                loading={false}
+                event={TEST_EVENTS['javascript_no_in_app'] as any}
+            />
+        </div>
+    )
+}
+ExceptionCardNoInApp.parameters = sessionTimelineParameters(asErrorEventType(TEST_EVENTS['javascript_no_in_app']))
+
+export function ExceptionCardLoading(): JSX.Element {
+    return (
+        <div className="w-[800px]">
+            <ExceptionCard issueId="issue-id" issueName={null} loading={true} event={undefined} />
+        </div>
+    )
+}
+ExceptionCardLoading.tags = ['test-skip']
+
+export function ExceptionCardSessionTimelineWithSteps(): JSX.Element {
+    const event = buildSessionTimelineEvent([
+        {
+            type: 'ui.interaction',
+            message: 'Button clicked',
+            level: 'info',
+            timestamp: '2024-07-09T12:00:02.500Z',
+        },
+        {
+            type: 'http',
+            message: 'API request started',
+            level: 'info',
+            timestamp: '2024-07-09T12:00:03.800Z',
+        },
+        {
+            type: 'state',
+            message: 'State updated',
+            level: 'debug',
+            timestamp: '2024-07-09T12:00:03.800Z',
+        },
+    ])
+
+    return <ExceptionCardSessionTimelineStory event={event} />
+}
+ExceptionCardSessionTimelineWithSteps.parameters = sessionTimelineParameters(
+    buildSessionTimelineEvent([
+        {
+            type: 'ui.interaction',
+            message: 'Button clicked',
+            level: 'info',
+            timestamp: '2024-07-09T12:00:02.500Z',
+        },
+        {
+            type: 'http',
+            message: 'API request started',
+            level: 'info',
+            timestamp: '2024-07-09T12:00:03.800Z',
+        },
+        {
+            type: 'state',
+            message: 'State updated',
+            level: 'debug',
+            timestamp: '2024-07-09T12:00:03.800Z',
+        },
+    ])
+)
+
+export function ExceptionCardSessionTimelineWithoutSteps(): JSX.Element {
+    const event = buildSessionTimelineEvent()
+    return <ExceptionCardSessionTimelineStory event={event} />
+}
+ExceptionCardSessionTimelineWithoutSteps.parameters = sessionTimelineParameters(buildSessionTimelineEvent())
+
+export function ExceptionCardSessionTimelineWithMalformedSteps(): JSX.Element {
+    const event = buildSessionTimelineEvent([
+        {
+            type: 'ui.interaction',
+            message: 'Button clicked',
+            level: 'info',
+            timestamp: '2024-07-09T12:00:02.500Z',
+        },
+        {
+            bad: 'row',
+        },
+    ])
+
+    return <ExceptionCardSessionTimelineStory event={event} />
+}
+ExceptionCardSessionTimelineWithMalformedSteps.parameters = sessionTimelineParameters(
+    buildSessionTimelineEvent([
+        {
+            type: 'ui.interaction',
+            message: 'Button clicked',
+            level: 'info',
+            timestamp: '2024-07-09T12:00:02.500Z',
+        },
+        {
+            bad: 'row',
+        },
+    ])
+)
+
+export function ExceptionCardSessionTimelineWithLongPreviewTexts(): JSX.Element {
+    const event = buildLongPreviewTextEvent()
+    return <ExceptionCardSessionTimelineStory event={event} containerClassName="w-[560px] h-[700px]" />
+}
+ExceptionCardSessionTimelineWithLongPreviewTexts.parameters = sessionTimelineParameters(buildLongPreviewTextEvent())
+
+////////////////////// No session ID
+
+const NO_SESSION_STEPS = [
+    {
+        type: 'ui.interaction',
+        message: 'Button clicked',
+        level: 'info',
+        timestamp: '2024-07-09T12:00:02.500Z',
+    },
+    {
+        type: 'http',
+        message: 'API request started',
+        level: 'info',
+        timestamp: '2024-07-09T12:00:03.800Z',
+    },
+    {
+        type: 'state',
+        message: 'State updated',
+        level: 'debug',
+        timestamp: '2024-07-09T12:00:04.200Z',
+    },
+]
+
+export function ExceptionCardNoSessionWithSteps(): JSX.Element {
+    const event = buildSessionTimelineEvent(NO_SESSION_STEPS, { sessionId: null })
+    return <ExceptionCardSessionTimelineStory event={event} />
+}
+
+export function ExceptionCardNoSessionWithoutSteps(): JSX.Element {
+    const event = buildSessionTimelineEvent(undefined, { sessionId: null })
+    return <ExceptionCardSessionTimelineStory event={event} />
+}
+
+//////////////////// Utils
+
+function ExceptionCardSessionTimelineStory({
+    event,
+    containerClassName = 'w-[1000px] h-[700px]',
+}: {
+    event: ErrorEventType
+    containerClassName?: string
+}): JSX.Element {
+    return (
+        <div className={containerClassName}>
+            <BindLogic logic={exceptionCardLogic} props={{ issueId: 'issue-id', loading: false }}>
+                <OpenTab tab="timeline">
+                    <ExceptionCard issueId="issue-id" issueName="Test Issue" loading={false} event={event} />
+                </OpenTab>
+            </BindLogic>
+        </div>
+    )
+}
+
+function buildLongPreviewTextEvent(): ErrorEventType {
+    const event = buildSessionTimelineEvent([
+        {
+            type: `ui.interaction.${'t'.repeat(180)}`,
+            message: `Step before crash: ${'m'.repeat(220)}`,
+            level: 'info',
+            timestamp: '2024-07-09T12:00:02.500Z',
+        },
+        {
+            type: 'http',
+            message: 'API request started',
+            level: 'info',
+            timestamp: '2024-07-09T12:00:03.800Z',
+        },
+    ])
+
+    return {
+        ...event,
+        properties: {
+            ...event.properties,
+            $exception_list: [
+                {
+                    type: `VeryLongExceptionType${'X'.repeat(170)}`,
+                    value: `Extremely long exception message intended for truncation coverage ${'Y'.repeat(220)}`,
+                },
+            ],
+        },
+    }
+}
+
+type StoryCombinedEventRow = [
+    uuid: string,
+    eventName: string,
+    timestamp: string,
+    lib: string | null,
+    currentUrl: string | null,
+    exceptionList: Array<{ type?: string; value?: string }> | null,
+    exceptionFingerprint: string | null,
+    exceptionIssueId: string | null,
+]
+
+type StoryEventDetailsRow = [
+    uuid: string,
+    eventName: string,
+    timestamp: string,
+    properties: Record<string, unknown>,
+    distinctId: string,
+]
+type StoryExceptionRow = [uuid: string, timestamp: string, properties: string]
+type StoryPageRow = [uuid: string, timestamp: string, url: string, lib: string]
+type StoryCustomRow = [uuid: string, eventName: string, timestamp: string, lib: string]
+type StoryLogRow = [timestamp: string, level: string, message: string]
+
+interface TimelineQueryLike {
+    after?: string
+    before?: string
+    orderBy?: string[]
+    limit?: number
+    select?: string[]
+    where?: unknown[]
+    kind?: NodeKind
+    query?: string
+}
+
+function toTimestampMs(value: unknown): number {
+    if (value instanceof Date || typeof value === 'string' || typeof value === 'number') {
+        return new Date(value).getTime()
+    }
+
+    return Number.NaN
+}
+
+function sessionTimelineParameters(event: ErrorEventType): Record<string, unknown> {
+    const center = new Date(event.timestamp).getTime()
+    const at = (deltaMs: number): string => new Date(center + deltaMs).toISOString()
+
+    const exceptionList = Array.isArray(event.properties?.$exception_list) ? event.properties.$exception_list : []
+    const exceptionRows: StoryExceptionRow[] = [[event.uuid, event.timestamp, JSON.stringify(event.properties)]]
+    const pageRows: StoryPageRow[] = [
+        ['page-1', at(-15000), 'https://app.example.com/home', 'web'],
+        ['page-2', at(-7000), 'https://app.example.com/demo', 'web'],
+    ]
+    const customRows: StoryCustomRow[] = [
+        ['custom-1', 'form_opened', at(-11000), 'web'],
+        ['custom-2', 'button_clicked', at(-3000), 'web'],
+    ]
+    const combinedEventRows: StoryCombinedEventRow[] = [
+        ['page-1', '$pageview', at(-15000), 'web', 'https://app.example.com/home', null, null, null],
+        ['custom-1', 'form_opened', at(-11000), 'web', null, null, null, null],
+        ['page-2', '$pageview', at(-7000), 'web', 'https://app.example.com/demo', null, null, null],
+        [
+            'previous-exception',
+            '$exception',
+            at(-4500),
+            'web',
+            null,
+            [{ type: 'ReferenceError', value: 'window.appConfig is undefined' }],
+            'prev-fingerprint',
+            'issue-id',
+        ],
+        ['custom-2', 'button_clicked', at(-3000), 'web', null, null, null, null],
+        [
+            event.uuid,
+            '$exception',
+            event.timestamp,
+            event.properties?.$lib ?? 'web',
+            null,
+            exceptionList,
+            event.properties?.$exception_fingerprint ?? 'current-fingerprint',
+            event.properties?.$exception_issue_id ?? 'issue-id',
+        ],
+    ]
+
+    const eventDetailsRowsEntries: Array<[string, StoryEventDetailsRow]> = combinedEventRows.map(
+        (row): [string, StoryEventDetailsRow] => {
+            const [uuid, eventName, ts, lib, currentUrl, exceptionListForRow, exceptionFingerprint, exceptionIssueId] =
+                row
+            const baseProperties = {
+                ...(lib ? { $lib: lib } : {}),
+                ...(currentUrl ? { $current_url: currentUrl } : {}),
+                ...(exceptionListForRow ? { $exception_list: exceptionListForRow } : {}),
+                ...(exceptionFingerprint ? { $exception_fingerprint: exceptionFingerprint } : {}),
+                ...(exceptionIssueId ? { $exception_issue_id: exceptionIssueId } : {}),
+            }
+
+            const properties = uuid === event.uuid ? event.properties : baseProperties
+            return [String(uuid), [uuid, eventName, ts, properties, 'story-user-distinct-id']]
+        }
+    )
+
+    const eventDetailsRowsByUuid = Object.fromEntries(eventDetailsRowsEntries) as Record<string, StoryEventDetailsRow>
+
+    const logRows: StoryLogRow[] = [
+        [at(-13000), 'info', 'App initialized'],
+        [at(-6000), 'warn', 'Slow network detected'],
+        [at(-3500), 'info', 'Form submitted'],
+        [at(-1200), 'error', 'Console error before exception'],
+    ]
+
+    const filterRows = <T extends unknown[]>(rows: T[], timestampIndex: number, query: TimelineQueryLike): T[] => {
+        const after = query.after ? new Date(query.after).getTime() : Number.NEGATIVE_INFINITY
+        const before = query.before ? new Date(query.before).getTime() : Number.POSITIVE_INFINITY
+        const descending = query.orderBy?.some((clause: string) => clause.includes('DESC'))
+        const limit = typeof query.limit === 'number' ? query.limit : rows.length
+
+        const filtered = rows.filter((row) => {
+            const timestamp = toTimestampMs(row[timestampIndex])
+            return Number.isFinite(timestamp) && timestamp >= after && timestamp <= before
+        })
+
+        return filtered
+            .sort((a, b) => {
+                const aTimestamp = toTimestampMs(a[timestampIndex])
+                const bTimestamp = toTimestampMs(b[timestampIndex])
+                const diff =
+                    (Number.isFinite(aTimestamp) ? aTimestamp : 0) - (Number.isFinite(bTimestamp) ? bTimestamp : 0)
+                return descending ? -diff : diff
+            })
+            .slice(0, limit)
+    }
+
+    const filterLogRowsFromHogQL = <T extends [string, ...unknown[]]>(rows: T[], query: TimelineQueryLike): T[] => {
+        const queryString = String(query?.query ?? '')
+        const descending = /ORDER BY\s+timestamp\s+DESC/i.test(queryString)
+        const limitMatch = queryString.match(/LIMIT\s+(\d+)/i)
+        const limit = limitMatch ? parseInt(limitMatch[1], 10) : rows.length
+
+        const isoMatches = Array.from(queryString.matchAll(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g), (m) =>
+            new Date(m[0]).getTime()
+        )
+
+        const lowerBound = isoMatches[0] ?? Number.NEGATIVE_INFINITY
+        const upperBound = isoMatches[1] ?? Number.POSITIVE_INFINITY
+
+        const filtered = rows.filter((row) => {
+            const ts = new Date(row[0]).getTime()
+            if (descending) {
+                return ts >= lowerBound && ts < upperBound
+            }
+            return ts > lowerBound && ts <= upperBound
+        })
+
+        return filtered
+            .sort((a, b) => {
+                const diff = new Date(a[0]).getTime() - new Date(b[0]).getTime()
+                return descending ? -diff : diff
+            })
+            .slice(0, limit)
+    }
+
+    const queryHandler = async ({ request }: { request: Request }): Promise<unknown> => {
+        const body = (await request.json()) as { query: TimelineQueryLike }
+        const query = body.query
+
+        if (query.kind === NodeKind.EventsQuery) {
+            const isCombinedEventLoaderQuery =
+                query.select?.includes('event') &&
+                query.select?.includes('properties.$current_url') &&
+                query.select?.includes('properties.$exception_list')
+
+            if (isCombinedEventLoaderQuery) {
+                return [200, { results: filterRows(combinedEventRows, 2, query) }]
+            }
+
+            const isEventDetailsQuery =
+                query.select?.includes('uuid') &&
+                query.select?.includes('event') &&
+                query.select?.includes('properties')
+
+            if (isEventDetailsQuery) {
+                const uuidClause = query.where?.find(
+                    (clause: unknown) => typeof clause === 'string' && String(clause).startsWith('equals(uuid,')
+                )
+                const uuidMatch =
+                    typeof uuidClause === 'string' ? uuidClause.match(/equals\(uuid,\s*'([^']+)'\)/) : null
+                const eventRow = uuidMatch ? eventDetailsRowsByUuid[uuidMatch[1]] : null
+                return [200, { results: eventRow ? [eventRow] : [] }]
+            }
+
+            if (query.select?.includes('properties.$current_url')) {
+                return [200, { results: filterRows(pageRows, 1, query) }]
+            }
+
+            if (query.select?.includes('event')) {
+                return [200, { results: filterRows(customRows, 2, query) }]
+            }
+
+            if (query.select?.includes('properties')) {
+                return [200, { results: filterRows(exceptionRows, 1, query) }]
+            }
+
+            return [200, { results: filterRows(combinedEventRows, 2, query) }]
+        }
+
+        if (query.kind === NodeKind.HogQLQuery) {
+            return [200, { results: filterLogRowsFromHogQL(logRows, query) }]
+        }
+
+        return [200, { results: [] }]
+    }
+
+    return {
+        msw: {
+            mocks: {
+                post: {
+                    'api/environments/:team_id/query': queryHandler,
+                    '/api/environments/:team_id/query': queryHandler,
+                    '/api/environments/:team_id/query/': queryHandler,
+                    '/api/environments/:team_id/query/:query_kind': queryHandler,
+                    '/api/environments/:team_id/query/:query_kind/': queryHandler,
+                },
+            },
+        },
+    }
+}
+
+function normalizeExceptionStepForStory(step: unknown): unknown {
+    if (!step || typeof step !== 'object' || Array.isArray(step)) {
+        return step
+    }
+
+    const record = step as Record<string, unknown>
+    const { type, message, level, timestamp, ...rest } = record
+
+    return {
+        ...rest,
+        ...(record.$type !== undefined ? { $type: record.$type } : typeof type === 'string' ? { $type: type } : {}),
+        ...(record.$message !== undefined
+            ? { $message: record.$message }
+            : typeof message === 'string'
+              ? { $message: message }
+              : {}),
+        ...(record.$level !== undefined
+            ? { $level: record.$level }
+            : typeof level === 'string'
+              ? { $level: level }
+              : {}),
+        ...(record.$timestamp !== undefined
+            ? { $timestamp: record.$timestamp }
+            : typeof timestamp === 'string' || typeof timestamp === 'number'
+              ? { $timestamp: timestamp }
+              : {}),
+    }
+}
+
+function buildSessionTimelineEvent(
+    exceptionSteps?: any[],
+    { sessionId = 'session-with-steps' }: { sessionId?: string | null } = {}
+): ErrorEventType {
+    const baseEvent = asErrorEventType(TEST_EVENTS['javascript_resolved'])
+    const { $session_id: _dropped, ...baseWithoutSession } = baseEvent.properties as Record<string, unknown>
+
+    const baseProperties = {
+        ...baseWithoutSession,
+        ...(sessionId != null ? { $session_id: sessionId } : {}),
+        $lib: 'web',
+    }
+
+    const normalizedExceptionSteps = exceptionSteps?.map(normalizeExceptionStepForStory)
+
+    return {
+        ...baseEvent,
+        uuid: 'current-exception-uuid',
+        timestamp: '2024-07-09T12:00:05.000Z',
+        properties:
+            normalizedExceptionSteps !== undefined
+                ? { ...baseProperties, $exception_steps: normalizedExceptionSteps }
+                : baseProperties,
+    }
+}
+
+function OpenTab({
+    tab,
+    children,
+    issueId = 'issue-id',
+}: {
+    tab: ExceptionCardTab
+    children: JSX.Element
+    issueId?: string
+}): JSX.Element {
+    const { setCurrentTab } = useActions(exceptionCardLogic({ issueId, loading: false }))
+
+    useEffect(() => {
+        setCurrentTab(tab)
+    }, [setCurrentTab, tab])
+
+    return children
+}
+
+//////////////////// All Events
+
+function ExceptionCardWrapperAllEvents({
+    children,
+}: {
+    children: (issueId: string, event: ErrorEventType) => JSX.Element
+}): JSX.Element {
+    return (
+        <div className="space-y-4">
+            {Object.entries(TEST_EVENTS).map(([name, fixture]) => {
+                const event = { ...asErrorEventType(fixture), uuid: name }
+
+                return (
+                    <LemonCard key={name} hoverEffect={false} className="h-96 w-[1000px] overflow-hidden p-0">
+                        {children(name, event)}
+                    </LemonCard>
+                )
+            })}
+        </div>
+    )
+}
+
+export function ExceptionCardAllEvents(): JSX.Element {
+    return (
+        <ExceptionCardWrapperAllEvents>
+            {(issueId, event) => <ExceptionCard issueId={issueId} issueName={null} loading={false} event={event} />}
+        </ExceptionCardWrapperAllEvents>
+    )
+}
+
+//////////////////// Header layout
+
+/*
+ * The header fits a label, the tab bar and an action into one 40px row. Each width pins a different
+ * branch of the container query: which parts are drawn, and whether the tab bar centres or scrolls.
+ */
+const HEADER_WIDTHS: { width: number; caption: string }[] = [
+    { width: 300, caption: '300px — tightest pane: icon only, tab bar scrolls' },
+    { width: 420, caption: '420px — icon only, tab bar takes the slack' },
+    { width: 560, caption: '560px — still under @xl: icon only' },
+    { width: 576, caption: '576px — @xl boundary: label is back, tab bar re-centres' },
+    { width: 900, caption: '900px — roomy: symmetric gutters, tab bar dead centre' },
+]
+
+// The action outgrows a 1fr gutter just above @xl, so this matrix also covers the band up to where it fits.
+const HEADER_WIDTHS_WITH_ACTION: typeof HEADER_WIDTHS = [
+    ...HEADER_WIDTHS.filter(({ width }) => width < 576),
+    { width: 576, caption: '576px — @xl boundary: the action keeps its width' },
+    { width: 600, caption: '600px — logo kept' },
+    { width: 640, caption: '640px — tab bar clears the action' },
+    { width: 700, caption: '700px — label is back' },
+    { width: 800, caption: '800px — room for both: tab bar centred' },
+]
+
+function HeaderWidthMatrix({
+    widths = HEADER_WIDTHS,
+    children,
+}: {
+    widths?: typeof HEADER_WIDTHS
+    children: (width: number) => JSX.Element
+}): JSX.Element {
+    return (
+        <div className="space-y-6">
+            {widths.map(({ width, caption }) => (
+                <div key={width} className="space-y-1">
+                    <div className="text-muted text-xs">{caption}</div>
+                    {/* outline rather than border: a border eats 2px of the card's width and shifts the
+                        container-query boundary these captions name. */}
+                    <div className="h-48 overflow-hidden outline outline-1 outline-[var(--border)]" style={{ width }}>
+                        {children(width)}
+                    </div>
+                </div>
+            ))}
+        </div>
+    )
+}
+
+// The footer shows how long ago the event happened. Pin the clock so the label stays "a year ago".
+const HEADER_WIDTHS_MOCK_DATE = '2026-04-04T23:42:36Z'
+
+export function ExceptionCardHeaderWidths(): JSX.Element {
+    const event = asErrorEventType(TEST_EVENTS['javascript_resolved'])
+
+    return (
+        <HeaderWidthMatrix>
+            {(width) => (
+                <ExceptionCard issueId={`header-${width}`} issueName="Test Issue" loading={false} event={event} />
+            )}
+        </HeaderWidthMatrix>
+    )
+}
+ExceptionCardHeaderWidths.parameters = { mockDate: HEADER_WIDTHS_MOCK_DATE }
+
+/*
+ * Worst case: without the Trace tab, the right-hand cell holds the View trace action, so the tab bar has the
+ * least room it ever gets in production. The action has to survive at every width, and the label is the
+ * only thing allowed to go.
+ */
+export function ExceptionCardHeaderWidthsWithAction(): JSX.Element {
+    const baseEvent = asErrorEventType(TEST_EVENTS['javascript_resolved'])
+    const event = { ...baseEvent, properties: { ...baseEvent.properties, $trace_id: LOGS_STORY_TRACE_ID } }
+
+    return (
+        <div className="[&_[data-attr=session-timeline-scroll-container]]:overflow-clip">
+            <HeaderWidthMatrix widths={HEADER_WIDTHS_WITH_ACTION}>
+                {(width) => (
+                    <OpenTab tab="timeline" issueId={`header-action-${width}`}>
+                        <ExceptionCard
+                            issueId={`header-action-${width}`}
+                            issueName="Test Issue"
+                            loading={false}
+                            event={event}
+                        />
+                    </OpenTab>
+                )}
+            </HeaderWidthMatrix>
+        </div>
+    )
+}
+ExceptionCardHeaderWidthsWithAction.parameters = {
+    ...sessionTimelineParameters(asErrorEventType(TEST_EVENTS['javascript_resolved'])),
+    mockDate: HEADER_WIDTHS_MOCK_DATE,
+}
+
+//////////////////// Logs tab
+
+const LOGS_STORY_SESSION_ID = 'session-with-logs'
+// Hex, like stored ids: the trace link drops any id that is not.
+const LOGS_STORY_TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736'
+const storySpanId = (index: number): string => (index + 1).toString(16).padStart(16, '0')
+const LOGS_STORY_SPAN_ID = storySpanId(4)
+
+function buildStoryLogs(event: ErrorEventType): LogMessage[] {
+    const center = new Date(event.timestamp).getTime()
+    const at = (deltaMs: number): string => new Date(center + deltaMs).toISOString()
+
+    const lines: { offsetMs: number; level: LogSeverityLevel; body: string }[] = [
+        { offsetMs: -42000, level: 'info', body: 'GET /api/projects/7/dashboards 200 in 84ms' },
+        { offsetMs: -21000, level: 'info', body: 'Loaded dashboard config for project 7' },
+        { offsetMs: -4200, level: 'warn', body: 'Config request took 2841ms, above the 2000ms budget' },
+        { offsetMs: -900, level: 'error', body: 'GET /api/projects/7/config 502 Bad Gateway' },
+        { offsetMs: 0, level: 'error', body: 'Uncaught TypeError: cannot read properties of undefined' },
+        { offsetMs: 3100, level: 'info', body: 'Retrying config request (attempt 1 of 3)' },
+        { offsetMs: 9400, level: 'info', body: 'GET /api/projects/7/config 200 in 131ms' },
+    ]
+
+    return lines.map(({ offsetMs, level, body }, index) => ({
+        uuid: `story-log-${index}`,
+        trace_id: LOGS_STORY_TRACE_ID,
+        span_id: storySpanId(index),
+        resource_attributes: { 'service.name': 'posthog-web' },
+        attributes: { sessionId: LOGS_STORY_SESSION_ID },
+        body,
+        timestamp: at(offsetMs),
+        observed_timestamp: at(offsetMs),
+        severity_text: level,
+        severity_number: 13,
+        level,
+        instrumentation_scope: 'any',
+        event_name: 'any',
+    }))
+}
+
+function logsTabParameters(event: ErrorEventType): Record<string, unknown> {
+    const logs = buildStoryLogs(event)
+
+    return {
+        featureFlags: [FEATURE_FLAGS.LOGS_IN_ERROR_TRACKING],
+        msw: {
+            mocks: {
+                get: {
+                    'api/projects/:team_id/logs_config/': {
+                        logs_distinct_id_attribute_key: 'posthogDistinctId',
+                        logs_distinct_id_attribute_keys: ['posthogDistinctId'],
+                        logs_session_id_attribute_keys: ['sessionId'],
+                    },
+                },
+                post: {
+                    '/api/environments/:team_id/logs/query': { results: logs, maxExportableLogs: 5000 },
+                    '/api/environments/:team_id/logs/sparkline': logs.map((log) => ({
+                        count: 1,
+                        level: log.severity_text,
+                        time: log.timestamp,
+                    })),
+                    '/api/projects/:team_id/logs/facet_values': { results: [] },
+                    '/api/projects/:team_id/logs/services': { results: [], sparkline: [], totalServices: 0 },
+                },
+            },
+        },
+    }
+}
+
+function logsStory(
+    issueId: string,
+    { sessionId, spanId, traceId }: { sessionId: string | null; spanId?: string; traceId?: string }
+): {
+    (): JSX.Element
+    parameters: Record<string, unknown>
+} {
+    const event = buildSessionTimelineEvent(undefined, { sessionId })
+    event.properties = {
+        ...event.properties,
+        ...(traceId ? { $trace_id: traceId } : {}),
+        ...(spanId ? { $span_id: spanId } : {}),
+    }
+
+    const story = (): JSX.Element => (
+        <div className="w-[1000px] h-[700px]">
+            <OpenTab tab="logs" issueId={issueId}>
+                <ExceptionCard issueId={issueId} issueName="Test Issue" loading={false} event={event} />
+            </OpenTab>
+        </div>
+    )
+    story.parameters = logsTabParameters(event)
+    return story
+}
+
+export const ExceptionCardLogs = logsStory('issue-id', {
+    sessionId: LOGS_STORY_SESSION_ID,
+    traceId: LOGS_STORY_TRACE_ID,
+    spanId: LOGS_STORY_SPAN_ID,
+})
+
+export const ExceptionCardLogsWithTraceOnly = logsStory('issue-trace-only', {
+    sessionId: null,
+    traceId: LOGS_STORY_TRACE_ID,
+})
+
+export const ExceptionCardLogsWithSessionOnly = logsStory('issue-session-only', {
+    sessionId: LOGS_STORY_SESSION_ID,
+})
+
+export const ExceptionCardLogsWithoutSession = logsStory('issue-no-session', { sessionId: null })
+
+//////////////////// Trace tab
+
+function storyTraceSpan(
+    index: number,
+    parent: number | null,
+    name: string,
+    service: string,
+    startMs: number,
+    endMs: number,
+    statusCode = 0
+): Record<string, unknown> {
+    const at = (ms: number): string => new Date(Date.parse('2024-07-09T12:00:04.000Z') + ms).toISOString()
+    return {
+        uuid: `story-span-${index}`,
+        trace_id: LOGS_STORY_TRACE_ID.toUpperCase(),
+        span_id: storySpanId(index).toUpperCase(),
+        parent_span_id: parent === null ? '' : storySpanId(parent).toUpperCase(),
+        name,
+        kind: 2,
+        service_name: service,
+        status_code: statusCode,
+        timestamp: at(startMs),
+        end_time: at(endMs),
+        duration_nano: (endMs - startMs) * 1_000_000,
+        is_root_span: parent === null,
+        matched_filter: true,
+        attributes: {},
+        resource_attributes: {},
+    }
+}
+
+export function ExceptionCardTrace(): JSX.Element {
+    const event = buildSessionTimelineEvent(undefined, { sessionId: null })
+    event.properties = { ...event.properties, $trace_id: LOGS_STORY_TRACE_ID, $span_id: LOGS_STORY_SPAN_ID }
+
+    return (
+        <div className="w-[1000px] h-[500px]">
+            <OpenTab tab="trace" issueId="issue-trace">
+                <ExceptionCard issueId="issue-trace" issueName="Test Issue" loading={false} event={event} />
+            </OpenTab>
+        </div>
+    )
+}
+
+ExceptionCardTrace.parameters = {
+    featureFlags: [FEATURE_FLAGS.LOGS_IN_ERROR_TRACKING],
+    testOptions: { snapshotBrowsers: [] },
+    msw: {
+        mocks: {
+            post: {
+                '/api/projects/:team_id/tracing/spans/trace/:trace_id/': {
+                    results: [
+                        storyTraceSpan(0, null, 'GET /api/projects/7/config', 'posthog-web', 0, 920, 2),
+                        storyTraceSpan(1, 0, 'auth.verify_session', 'posthog-web', 10, 60),
+                        storyTraceSpan(2, 0, 'SELECT team_config', 'posthog-web', 70, 180),
+                        storyTraceSpan(4, 0, 'GET config-service /v1/config', 'config-service', 200, 900, 2),
+                    ],
+                    hasMore: false,
+                    nextOffset: null,
+                },
+            },
+        },
+    },
+}
+
+export function ExceptionCardTraceWithoutTraceId(): JSX.Element {
+    const event = buildSessionTimelineEvent(undefined, { sessionId: null })
+
+    return (
+        <div className="w-[1000px] h-[500px]">
+            <OpenTab tab="trace" issueId="issue-no-trace">
+                <ExceptionCard issueId="issue-no-trace" issueName="Test Issue" loading={false} event={event} />
+            </OpenTab>
+        </div>
+    )
+}
+ExceptionCardTraceWithoutTraceId.parameters = {
+    featureFlags: [FEATURE_FLAGS.LOGS_IN_ERROR_TRACKING],
+    testOptions: { snapshotBrowsers: [] },
+}

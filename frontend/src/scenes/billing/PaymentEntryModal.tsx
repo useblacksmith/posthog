@@ -1,0 +1,175 @@
+import { Elements, PaymentElement, useElements, useStripe } from '@stripe/react-stripe-js'
+import { useActions, useValues } from 'kea'
+import posthog from 'posthog-js'
+import { useEffect, useState } from 'react'
+
+import { LemonBanner, LemonButton, LemonModal } from '@posthog/lemon-ui'
+
+import { SupportFormFields, supportLogic } from 'lib/components/Support/supportLogic'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+
+import { PaymentCompletion } from './PaymentCompletion'
+import { paymentEntryLogic } from './paymentEntryLogic'
+
+const stripeJs = async (): Promise<typeof import('@stripe/stripe-js')> => await import('@stripe/stripe-js')
+
+// Covers every way Stripe.js can fail to become usable: a blocked script, a network failure, or no
+// publishable key at all on an instance without Stripe configured. Only the first is worth a retry,
+// so the message offers a way out of the other two instead of looping the user on "try again".
+const STRIPE_UNAVAILABLE_MESSAGE =
+    "We couldn't load the payment form. Disable any ad blocker and reload the page. If it keeps failing, contact support."
+
+// The support panel offers a ticket only to plans entitled to one, and a failed upgrade is the case
+// where the person cannot buy that entitlement. Billing issues are answered on every plan, so that
+// flag is what keeps this path reachable. See `canCreateTicket` in sidepanelTicketsLogic.
+const supportRequestForError = (error: string): Partial<SupportFormFields> => ({
+    kind: 'support',
+    billing_issue: true,
+    isEmailFormOpen: true,
+    message: `I couldn't complete my upgrade. The error shown was:\n\n${error}`,
+})
+
+export const PaymentForm = (): JSX.Element => {
+    const { stripeError, isLoading } = useValues(paymentEntryLogic)
+    const { setStripeError, clearErrors, hidePaymentEntryModal, confirmPayment } = useActions(paymentEntryLogic)
+    const { openSupportForm } = useActions(supportLogic)
+    const showContactSupport = useFeatureFlag('PAYMENT_ENTRY_CONTACT_SUPPORT')
+
+    const stripe = useStripe()
+    const elements = useElements()
+
+    const handleSubmit = (event: React.MouseEvent<HTMLElement>): void => {
+        clearErrors()
+        event.preventDefault()
+        // Stripe.js never became usable: no publishable key, a blocked script, or a load failure.
+        // Returning quietly leaves a button that does nothing at all, which reads as a broken app
+        // and gives neither the user nor a support ticket anything to go on.
+        if (!stripe || !elements) {
+            setStripeError(STRIPE_UNAVAILABLE_MESSAGE)
+            posthog.captureException(new Error('payment entry stripe unavailable'), {
+                has_stripe: !!stripe,
+                has_elements: !!elements,
+                has_public_key: !!window.STRIPE_PUBLIC_KEY,
+            })
+            return
+        }
+        confirmPayment(stripe, elements)
+    }
+
+    return (
+        <div>
+            <PaymentElement />
+            <p className="text-xs text-secondary mt-0.5">
+                A temporary $0.50 authorization hold will be placed on your card to verify it. This hold will be
+                automatically released within 7 days and you will not be charged.
+            </p>
+            {stripeError && <LemonBanner type="error">{stripeError}</LemonBanner>}
+            <div className="flex justify-end deprecated-space-x-2 mt-2">
+                {stripeError && showContactSupport && (
+                    <LemonButton
+                        type="secondary"
+                        onClick={() => {
+                            hidePaymentEntryModal()
+                            openSupportForm(supportRequestForError(stripeError))
+                        }}
+                        data-attr="payment-entry-stripe-error-contact-support"
+                    >
+                        Contact support
+                    </LemonButton>
+                )}
+                <LemonButton disabled={isLoading} type="secondary" onClick={hidePaymentEntryModal}>
+                    Cancel
+                </LemonButton>
+                <LemonButton loading={isLoading || !stripe || !elements} type="primary" onClick={handleSubmit}>
+                    Submit
+                </LemonButton>
+            </div>
+        </div>
+    )
+}
+
+export const PaymentEntryModal = (): JSX.Element => {
+    const { clientSecret, paymentEntryModalOpen, apiError, paymentFlow, completedPaymentOrganization } =
+        useValues(paymentEntryLogic)
+    const { hidePaymentEntryModal, initiateAuthorization, setStripeError } = useActions(paymentEntryLogic)
+    const { openSupportForm } = useActions(supportLogic)
+    const showContactSupport = useFeatureFlag('PAYMENT_ENTRY_CONTACT_SUPPORT')
+    const [stripePromise, setStripePromise] = useState<any>(null)
+
+    useEffect(() => {
+        // Only load Stripe.js when the modal is opened
+        if (paymentEntryModalOpen && !completedPaymentOrganization && !stripePromise) {
+            const loadStripeJs = async (): Promise<void> => {
+                const { loadStripe } = await stripeJs()
+                const publicKey = window.STRIPE_PUBLIC_KEY!
+                setStripePromise(await loadStripe(publicKey))
+            }
+            // `loadStripe` rejects outright when the key is missing (an instance without Stripe
+            // configured, e.g. local dev), so without a catch this is an unhandled rejection and the
+            // only symptom is an inert form.
+            void loadStripeJs().catch((error) => {
+                posthog.captureException(new Error('payment entry stripe load failed', { cause: error }))
+                // Surfaced now rather than on the first click: otherwise the modal just shows a
+                // blank payment area, and the only way to find out is to submit it.
+                setStripeError(STRIPE_UNAVAILABLE_MESSAGE)
+            })
+        }
+    }, [paymentEntryModalOpen, completedPaymentOrganization, stripePromise, setStripeError])
+
+    useEffect(() => {
+        if (paymentEntryModalOpen && !completedPaymentOrganization) {
+            initiateAuthorization()
+        }
+    }, [paymentEntryModalOpen, paymentFlow, completedPaymentOrganization, initiateAuthorization])
+
+    return (
+        <LemonModal
+            onClose={hidePaymentEntryModal}
+            width="max(44vw)"
+            isOpen={paymentEntryModalOpen}
+            title={completedPaymentOrganization ? 'Payment setup completed' : 'Add your payment details to subscribe'}
+            description=""
+        >
+            <div>
+                {completedPaymentOrganization ? (
+                    <PaymentCompletion />
+                ) : clientSecret ? (
+                    <Elements stripe={stripePromise} options={{ clientSecret }}>
+                        <PaymentForm />
+                    </Elements>
+                ) : apiError ? (
+                    <div className="flex flex-col gap-2 my-2">
+                        <p className="text-md">
+                            {showContactSupport
+                                ? 'We could not complete your upgrade at this time. Review the error below, and contact us if you need help. We answer billing questions on every plan.'
+                                : 'We could not complete your upgrade at this time. Please review the error below and contact support if you need help.'}
+                        </p>
+                        <LemonBanner type="error">{apiError}</LemonBanner>
+                        <div className="flex justify-end gap-2 mt-2">
+                            <LemonButton type="secondary" onClick={hidePaymentEntryModal}>
+                                Close
+                            </LemonButton>
+                            {showContactSupport && (
+                                <LemonButton
+                                    type="primary"
+                                    onClick={() => {
+                                        hidePaymentEntryModal()
+                                        openSupportForm(supportRequestForError(apiError))
+                                    }}
+                                    data-attr="payment-entry-api-error-contact-support"
+                                >
+                                    Contact support
+                                </LemonButton>
+                            )}
+                        </div>
+                    </div>
+                ) : (
+                    <div className="min-h-80 flex flex-col justify-center items-center">
+                        <img src="/static/payment-loading.gif" alt="" aria-hidden="true" className="h-20 w-20" />
+                        <p className="text-secondary text-md mt-4">We're contacting the hedgehogs for approval.</p>
+                    </div>
+                )}
+            </div>
+        </LemonModal>
+    )
+}

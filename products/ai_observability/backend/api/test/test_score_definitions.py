@@ -1,0 +1,765 @@
+from uuid import uuid4
+
+from posthog.test.base import APIBaseTest
+from unittest.mock import ANY, Mock, call, patch
+
+from django.http import QueryDict
+from django.test import SimpleTestCase
+
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.constants import AvailableFeature
+from posthog.models import OrganizationMembership, User
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.ai_observability.backend.api.score_definitions import (
+    ScoreDefinitionVersionQuerySerializer,
+    ScoreDefinitionViewSet,
+)
+from products.ai_observability.backend.models.score_definitions import (
+    ScoreDefinition,
+    ScoreDefinitionVersion,
+    StaleScoreDefinitionVersion,
+)
+from products.ai_observability.backend.read_pagination import encode_cursor
+
+
+class TestScoreDefinitionsApi(APIBaseTest):
+    def _endpoint(self) -> str:
+        return f"/api/environments/{self.team.id}/llm_analytics/score_definitions/"
+
+    def _current_version(self, definition: ScoreDefinition) -> ScoreDefinitionVersion:
+        current_version = definition.current_version
+        assert current_version is not None
+        return current_version
+
+    @parameterized.expand(
+        [
+            (
+                "categorical_single",
+                {
+                    "name": "Quality",
+                    "kind": "categorical",
+                    "config": {
+                        "options": [
+                            {"key": "good", "label": "Good"},
+                            {"key": "bad", "label": "Bad"},
+                        ]
+                    },
+                },
+            ),
+            (
+                "categorical_multiple",
+                {
+                    "name": "Themes",
+                    "kind": "categorical",
+                    "config": {
+                        "options": [
+                            {"key": "helpful", "label": "Helpful"},
+                            {"key": "accurate", "label": "Accurate"},
+                            {"key": "complete", "label": "Complete"},
+                        ],
+                        "selection_mode": "multiple",
+                        "min_selections": 1,
+                        "max_selections": 2,
+                        "passing_rule": {"categories": ["accurate", "helpful"]},
+                    },
+                },
+            ),
+            (
+                "numeric",
+                {
+                    "name": "Score",
+                    "kind": "numeric",
+                    "config": {"min": 0, "max": 5, "step": 1, "passing_rule": {"operator": "gte", "threshold": 3}},
+                },
+            ),
+            (
+                "boolean",
+                {
+                    "name": "Resolved",
+                    "kind": "boolean",
+                    "config": {"true_label": "Yes", "false_label": "No", "true_is_failure": False},
+                },
+            ),
+        ]
+    )
+    def test_can_create_score_definitions_for_all_supported_kinds(self, _name: str, payload: dict):
+        response = self.client.post(self._endpoint(), payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        definition = ScoreDefinition.objects.get(pk=response.data["id"])
+        current_version = self._current_version(definition)
+        self.assertEqual(definition.created_by, self.user)
+        self.assertEqual(response.data["updated_by"]["id"], self.user.id)
+        self.assertEqual(definition.kind, payload["kind"])
+        self.assertEqual(current_version.version, 1)
+        self.assertEqual(current_version.config, payload["config"])
+
+    def test_patch_updates_metadata_without_creating_a_new_version(self):
+        definition = self._create_definition()
+        original_author = definition.created_by
+        ScoreDefinition.objects.filter(pk=definition.pk).update(updated_by=None)
+
+        response = self.client.patch(
+            f"{self._endpoint()}{definition.id}/",
+            {
+                "name": "Updated quality",
+                "short_name": "  Quality  ",
+                "description": "Updated description",
+                "archived": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        definition.refresh_from_db()
+        current_version = self._current_version(definition)
+        self.assertEqual(definition.name, "Updated quality")
+        self.assertEqual(definition.short_name, "Quality")
+        self.assertEqual(definition.created_by, original_author)
+        self.assertEqual(response.data["updated_by"]["id"], self.user.id)
+        self.assertEqual(definition.description, "Updated description")
+        self.assertTrue(definition.archived)
+        self.assertEqual(current_version.version, 1)
+        self.assertEqual(definition.versions.count(), 1)
+
+    def test_create_starts_active(self):
+        response = self.client.post(
+            self._endpoint(),
+            {
+                "name": "Customer Satisfaction",
+                "kind": "boolean",
+                "config": {"true_label": "Good", "false_label": "Bad"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        definition = ScoreDefinition.objects.get(pk=response.data["id"])
+        self.assertFalse(definition.archived)
+
+    @parameterized.expand(
+        [
+            (
+                "numeric_with_categorical_keys",
+                "numeric",
+                {"options": [{"key": "a", "label": "A"}]},
+            ),
+            (
+                "boolean_with_numeric_keys",
+                "boolean",
+                {"min": 0, "max": 1},
+            ),
+            (
+                "categorical_with_boolean_keys",
+                "categorical",
+                {"true_label": "Yes", "false_label": "No"},
+            ),
+        ]
+    )
+    def test_create_rejects_config_keys_that_do_not_match_kind(self, _name: str, kind: str, config: dict):
+        response = self.client.post(
+            self._endpoint(),
+            {"name": "Mismatch", "kind": kind, "config": config},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["attr"], "config")
+        self.assertIn("Unsupported keys", response.data["detail"])
+
+    def test_response_exposes_current_version_id(self):
+        response = self.client.post(
+            self._endpoint(),
+            {
+                "name": "Quality",
+                "kind": "categorical",
+                "config": {
+                    "options": [
+                        {"key": "good", "label": "Good"},
+                        {"key": "bad", "label": "Bad"},
+                    ]
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        definition = ScoreDefinition.objects.get(pk=response.data["id"])
+        self.assertEqual(response.data["current_version"], 1)
+        self.assertEqual(response.data["current_version_id"], str(definition.current_version_id))
+
+    def test_create_rejects_archived_scorers(self):
+        response = self.client.post(
+            self._endpoint(),
+            {
+                "name": "Customer Satisfaction",
+                "kind": "boolean",
+                "archived": True,
+                "config": {"true_label": "Good", "false_label": "Bad"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["attr"], "archived")
+        self.assertEqual(response.data["detail"], "New scorers must be created as active.")
+
+    @patch("products.ai_observability.backend.api.score_definitions.report_user_action")
+    def test_create_reports_user_action(self, mock_report_user_action):
+        response = self.client.post(
+            self._endpoint(),
+            {
+                "name": "Quality",
+                "kind": "categorical",
+                "config": {
+                    "options": [
+                        {"key": "good", "label": "Good"},
+                        {"key": "bad", "label": "Bad"},
+                    ]
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        definition = ScoreDefinition.objects.get(pk=response.data["id"])
+
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "llma scorer created",
+            {
+                "scorer_id": str(definition.id),
+                "scorer_name": "Quality",
+                "scorer_kind": "categorical",
+                "calculation": "reported",
+                "has_description": False,
+                "archived": False,
+                "version": 1,
+            },
+            team=self.team,
+            request=ANY,
+        )
+
+    def test_new_version_creates_immutable_snapshot_and_advances_current_version(self):
+        definition = self._create_definition()
+        original_config = self._current_version(definition).config
+
+        response = self.client.post(
+            f"{self._endpoint()}{definition.id}/new_version/",
+            {
+                "name": "Updated scorer",
+                "short_name": "Quality",
+                "description": "Updated description",
+                "base_version": 1,
+                "config": {
+                    "options": [
+                        {"key": "pass", "label": "Pass"},
+                        {"key": "needs_work", "label": "Needs work"},
+                        {"key": "fail", "label": "Fail"},
+                    ],
+                    "selection_mode": "multiple",
+                    "min_selections": 1,
+                    "max_selections": 2,
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        definition.refresh_from_db()
+        current_version = self._current_version(definition)
+        self.assertEqual(current_version.version, 2)
+        self.assertEqual(response.data["updated_by"]["id"], self.user.id)
+        self.assertEqual((definition.name, definition.description), ("Updated scorer", "Updated description"))
+        self.assertEqual(definition.short_name, "Quality")
+        self.assertEqual(definition.versions.count(), 2)
+        self.assertEqual(definition.versions.get(version=1).config, original_config)
+        self.assertEqual(
+            definition.versions.get(version=2).config,
+            {
+                "options": [
+                    {"key": "pass", "label": "Pass"},
+                    {"key": "needs_work", "label": "Needs work"},
+                    {"key": "fail", "label": "Fail"},
+                ],
+                "selection_mode": "multiple",
+                "min_selections": 1,
+                "max_selections": 2,
+            },
+        )
+
+    def test_version_history_preserves_identical_bumps_and_archived_versions_across_pages(self) -> None:
+        definition = self._create_definition(kind="numeric")
+        original = self._current_version(definition)
+        bumped = self.client.post(
+            f"{self._endpoint()}{definition.id}/new_version/", {"config": original.config}, format="json"
+        )
+        self.assertEqual(bumped.status_code, status.HTTP_200_OK)
+        self.assertNotEqual(bumped.data["current_version_id"], str(original.id))
+        definition.archived = True
+        definition.save(update_fields=["archived"])
+        endpoint = f"{self._endpoint()}{definition.id}/versions/"
+
+        first = self.client.get(endpoint, {"limit": 1})
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(first.data["count"], 2)
+        self.assertEqual([row["version"] for row in first.data["results"]], [2])
+        definition.create_new_version(config={"min": -1, "max": 1}, created_by=self.user)
+        second = self.client.get(first.data["next"])
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.data["count"], 3)
+        self.assertEqual([row["id"] for row in second.data["results"]], [str(original.id)])
+        self.assertIsNone(second.data["next_cursor"])
+        self.assertIsNone(second.data["next"])
+
+        historical = self.client.get(f"{endpoint}{original.id}/")
+        self.assertEqual(historical.status_code, status.HTTP_200_OK)
+        self.assertEqual(historical.data["config"], original.config)
+        self.assertEqual(historical.data["definition_id"], str(definition.id))
+        self.assertEqual(historical.data["kind"], "numeric")
+        other = self._create_definition(name="Another scorer")
+        self.assertEqual(
+            self.client.get(f"{endpoint}{other.current_version_id}/").status_code, status.HTTP_404_NOT_FOUND
+        )
+        invalid_limit = self.client.get(endpoint, {"limit": 101})
+        self.assertEqual(invalid_limit.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(invalid_limit.data["attr"], "limit")
+        unexpected_query = self.client.get(f"{endpoint}{original.id}/", {"limit": 1})
+        self.assertEqual(unexpected_query.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(unexpected_query.data["attr"], "limit")
+
+    @parameterized.expand(
+        [
+            ("read", ["llm_analytics:read"], status.HTTP_200_OK),
+            ("upload_only", ["offline_evaluation_ingestion:write"], status.HTTP_403_FORBIDDEN),
+        ]
+    )
+    def test_version_reads_require_scorer_read_scope(self, _name: str, scopes: list[str], expected_status: int) -> None:
+        definition = self._create_definition()
+        api_key = self.create_personal_api_key_with_scopes(scopes)
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {api_key}")
+        for suffix in ("", f"{definition.current_version_id}/"):
+            with self.subTest(suffix=suffix):
+                response = self.client.get(f"{self._endpoint()}{definition.id}/versions/{suffix}")
+                self.assertEqual(response.status_code, expected_status, response.data)
+
+    def test_version_reads_hide_denied_scorers(self) -> None:
+        definition = self._create_definition()
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+        ]
+        self.organization.save()
+        member = User.objects.create_and_join(self.organization, "scorer-viewer@example.com", "test-password")
+        membership = OrganizationMembership.objects.get(user=member, organization=self.organization)
+        AccessControl.objects.create(
+            team=self.team, resource="project", resource_id=str(self.team.id), access_level="member"
+        )
+        AccessControl.objects.create(
+            team=self.team,
+            resource="llm_analytics",
+            resource_id=str(definition.id),
+            organization_member=membership,
+            access_level="none",
+        )
+        self.client.force_login(member)
+
+        for suffix in ("", f"{definition.current_version_id}/"):
+            with self.subTest(suffix=suffix):
+                denied = self.client.get(f"{self._endpoint()}{definition.id}/versions/{suffix}")
+                missing = self.client.get(f"{self._endpoint()}{uuid4()}/versions/{suffix}")
+                self.assertEqual(denied.status_code, status.HTTP_404_NOT_FOUND, denied.data)
+                self.assertEqual(denied.data, missing.data)
+
+    def test_new_version_with_matching_base_version_advances_to_v2(self):
+        definition = self._create_definition()
+
+        response = self.client.post(
+            f"{self._endpoint()}{definition.id}/new_version/",
+            {
+                "base_version": 1,
+                "config": {
+                    "options": [
+                        {"key": "pass", "label": "Pass"},
+                        {"key": "fail", "label": "Fail"},
+                    ]
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        definition.refresh_from_db()
+        self.assertEqual(self._current_version(definition).version, 2)
+
+    def test_create_new_version_raises_when_base_version_is_stale_at_lock_time(self):
+        """Lower-level guarantee: the base_version check happens inside `select_for_update`.
+
+        A regression that moves the check above the lock would let two concurrent writers with the
+        same `base_version` both pass — exactly what OCC must prevent. Asserting the model contract
+        here keeps that fix in place even if the view layer changes.
+        """
+        definition = self._create_definition()
+        # Another writer advances the scorer to v2 — equivalent to "the row was bumped between when
+        # the caller observed v1 and when the caller's transaction acquired the lock".
+        definition.create_new_version(
+            config={"options": [{"key": "winner", "label": "Winner"}]},
+            created_by=self.user,
+        )
+
+        with self.assertRaises(StaleScoreDefinitionVersion) as cm:
+            definition.create_new_version(
+                config={"options": [{"key": "loser", "label": "Loser"}]},
+                created_by=self.user,
+                base_version=1,
+            )
+
+        self.assertEqual(cm.exception.current_version, 2)
+        # No third version was created.
+        self.assertEqual(ScoreDefinitionVersion.objects.filter(definition=definition).count(), 2)
+
+    def test_new_version_with_stale_base_version_returns_409(self):
+        definition = self._create_definition()
+        original_name = definition.name
+        original_description = definition.description
+        # Someone else bumps the scorer to v2 first.
+        definition.create_new_version(
+            config={"options": [{"key": "intermediate", "label": "Intermediate"}]},
+            created_by=self.user,
+        )
+
+        response = self.client.post(
+            f"{self._endpoint()}{definition.id}/new_version/",
+            {
+                "base_version": 1,
+                "name": "Stale name",
+                "description": "Stale description",
+                "config": {
+                    "options": [
+                        {"key": "stale", "label": "Stale"},
+                    ]
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data["current_version"], 2)
+        definition.refresh_from_db()
+        # Scorer still at v2 — the stale request did not bump it.
+        self.assertEqual(self._current_version(definition).version, 2)
+        self.assertEqual((definition.name, definition.description), (original_name, original_description))
+
+    def test_new_version_rolls_back_when_metadata_persistence_fails(self) -> None:
+        definition = self._create_definition()
+        original_version_id = definition.current_version_id
+        original_metadata = (definition.name, definition.description)
+        original_count = ScoreDefinitionVersion.objects.filter(definition=definition).count()
+        save = ScoreDefinition.save
+
+        def save_then_fail(instance: ScoreDefinition, *, update_fields: list[str]) -> None:
+            save(instance, update_fields=update_fields)
+            if "name" in update_fields:
+                raise RuntimeError("Metadata persistence failed")
+
+        with patch.object(ScoreDefinition, "save", save_then_fail):
+            response = self.client.post(
+                f"{self._endpoint()}{definition.id}/new_version/",
+                {
+                    "name": "Updated name",
+                    "description": "Updated description",
+                    "config": self._current_version(definition).config,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        definition.refresh_from_db()
+        self.assertEqual(definition.current_version_id, original_version_id)
+        self.assertEqual((definition.name, definition.description), original_metadata)
+        self.assertEqual(ScoreDefinitionVersion.objects.filter(definition=definition).count(), original_count)
+
+    def test_new_version_applies_metadata_written_concurrently_before_the_lock(self):
+        definition = self._create_definition()
+        original_name = definition.name
+        get_object = ScoreDefinitionViewSet.get_object
+
+        def get_object_then_rename_elsewhere(view: ScoreDefinitionViewSet) -> ScoreDefinition:
+            loaded = get_object(view)
+            ScoreDefinition.objects.filter(pk=loaded.pk).update(name="Renamed elsewhere")
+            return loaded
+
+        with patch.object(ScoreDefinitionViewSet, "get_object", get_object_then_rename_elsewhere):
+            response = self.client.post(
+                f"{self._endpoint()}{definition.id}/new_version/",
+                {"base_version": 1, "name": original_name, "config": self._current_version(definition).config},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        definition.refresh_from_db()
+        self.assertEqual(definition.name, original_name)
+        self.assertEqual(response.data["name"], original_name)
+
+    @parameterized.expand(
+        [
+            ("smuggle_boolean_kind_with_boolean_config", "categorical", "boolean", {"true_label": "Yes"}),
+            ("smuggle_numeric_kind_with_numeric_config", "categorical", "numeric", {"min": 0, "max": 1}),
+            (
+                "smuggle_categorical_kind_with_categorical_config",
+                "boolean",
+                "categorical",
+                {"options": [{"key": "a", "label": "A"}]},
+            ),
+        ]
+    )
+    def test_new_version_ignores_kind_smuggled_in_body(
+        self, _name: str, scorer_kind: str, smuggled_kind: str, config: dict
+    ):
+        definition = self._create_definition(kind=scorer_kind)
+
+        response = self.client.post(
+            f"{self._endpoint()}{definition.id}/new_version/",
+            {"kind": smuggled_kind, "config": config},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["attr"], "config")
+        self.assertIn("Unsupported keys", response.data["detail"])
+        definition.refresh_from_db()
+        self.assertEqual(self._current_version(definition).version, 1)
+
+    # The /new_version/ custom @action has to declare required_scopes explicitly;
+    # without it the default scope resolver returns None for non-CRUD action names and PAK
+    # requests are rejected with "This action does not support personal API key access".
+    @parameterized.expand(
+        [
+            ("write_scope_allowed", ["llm_analytics:write"], status.HTTP_200_OK),
+            ("read_scope_denied", ["llm_analytics:read"], status.HTTP_403_FORBIDDEN),
+            ("wrong_scope_denied", ["insight:write"], status.HTTP_403_FORBIDDEN),
+        ]
+    )
+    def test_new_version_pak_scope(self, _name: str, scopes: list[str], expected_status: int) -> None:
+        definition = self._create_definition()
+        api_key = self.create_personal_api_key_with_scopes(scopes)
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {api_key}")
+
+        response = self.client.post(
+            f"{self._endpoint()}{definition.id}/new_version/",
+            {
+                "config": {
+                    "options": [
+                        {"key": "pak-pass", "label": "Pass"},
+                    ]
+                }
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, expected_status)
+
+    def test_list_defaults_to_active_only_and_respects_archived_param(self):
+        active = self._create_definition(name="Active scorer", kind="categorical")
+        archived = self._create_definition(name="Archived scorer", kind="categorical", archived=True)
+
+        # Default — no archived param → active only
+        response = self.client.get(self._endpoint())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [result["id"] for result in response.data["results"]]
+        self.assertIn(str(active.id), ids)
+        self.assertNotIn(str(archived.id), ids)
+
+        # archived=false → active only (same as default)
+        response = self.client.get(self._endpoint(), {"archived": "false"})
+        ids = [result["id"] for result in response.data["results"]]
+        self.assertIn(str(active.id), ids)
+        self.assertNotIn(str(archived.id), ids)
+
+        # archived=true → archived only
+        response = self.client.get(self._endpoint(), {"archived": "true"})
+        ids = [result["id"] for result in response.data["results"]]
+        self.assertNotIn(str(active.id), ids)
+        self.assertIn(str(archived.id), ids)
+
+    @parameterized.expand([("empty", ""), ("whitespace", "   "), ("unparseable", "invalid")])
+    def test_list_treats_non_boolean_archived_param_as_default_active_only(self, _name: str, value: str):
+        active = self._create_definition(name="Active scorer", kind="categorical")
+        archived = self._create_definition(name="Archived scorer", kind="categorical", archived=True)
+
+        response = self.client.get(self._endpoint(), {"archived": value})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [result["id"] for result in response.data["results"]]
+        self.assertIn(str(active.id), ids)
+        self.assertNotIn(str(archived.id), ids)
+
+    @parameterized.expand(["resolved", "resolution"])
+    def test_list_supports_search_kind_archived_and_ordering(self, search: str) -> None:
+        active = self._create_definition(name="Quality", kind="categorical")
+        archived = self._create_definition(
+            name="Resolved",
+            kind="boolean",
+            archived=True,
+        )
+
+        archived.short_name = "Resolution"
+        archived.save(update_fields=["short_name"])
+        response = self.client.get(
+            self._endpoint(),
+            {
+                "search": search,
+                "kind": "boolean",
+                "archived": "true",
+                "order_by": "name",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([result["id"] for result in response.data["results"]], [str(archived.id)])
+        self.assertNotIn(str(active.id), [result["id"] for result in response.data["results"]])
+        ScoreDefinition.objects.filter(pk=active.pk).update(created_by=None)
+        response = self.client.get(self._endpoint(), {"created_by": str(self.user.id), "archived": "true"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([result["id"] for result in response.data["results"]], [str(archived.id)])
+        response = self.client.get(self._endpoint(), {"created_by": str(self.user.id), "archived": "false"})
+        self.assertEqual(response.data["results"], [])
+
+    @patch("products.ai_observability.backend.api.score_definitions.report_user_action")
+    def test_patch_reports_user_action(self, mock_report_user_action: Mock) -> None:
+        definition = self._create_definition()
+        mock_report_user_action.reset_mock()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.patch(
+                f"{self._endpoint()}{definition.id}/",
+                {"name": "Updated quality", "description": "Updated description", "archived": True},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        definition.refresh_from_db()
+
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "llma scorer updated",
+            {
+                "scorer_id": str(definition.id),
+                "scorer_name": "Updated quality",
+                "scorer_kind": "categorical",
+                "calculation": "reported",
+                "has_description": True,
+                "archived": True,
+                "version": 1,
+                "changed_fields": ["name", "description", "archived"],
+                "archived_new_value": True,
+            },
+            team=self.team,
+            request=ANY,
+        )
+
+    @parameterized.expand([("configuration_only", False), ("with_metadata", True)])
+    @patch("products.ai_observability.backend.api.score_definitions.report_user_action")
+    def test_new_version_reports_user_action(
+        self, _name: str, update_metadata: bool, mock_report_user_action: Mock
+    ) -> None:
+        definition = self._create_definition()
+        mock_report_user_action.reset_mock()
+
+        metadata = {"name": "Updated quality", "description": "Updated description"} if update_metadata else {}
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"{self._endpoint()}{definition.id}/new_version/",
+                {
+                    **metadata,
+                    "config": {
+                        "options": [
+                            {"key": "pass", "label": "Pass"},
+                            {"key": "fail", "label": "Fail"},
+                        ]
+                    },
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        definition.refresh_from_db()
+
+        properties = {
+            "scorer_id": str(definition.id),
+            "scorer_name": definition.name,
+            "scorer_kind": definition.kind,
+            "calculation": "reported",
+            "has_description": update_metadata,
+            "archived": False,
+            "version": 2,
+        }
+        expected_calls = [call(self.user, "llma scorer version created", properties, team=self.team, request=ANY)]
+        if update_metadata:
+            expected_calls.append(
+                call(
+                    self.user,
+                    "llma scorer updated",
+                    {**properties, "changed_fields": ["name", "description"]},
+                    team=self.team,
+                    request=ANY,
+                )
+            )
+        self.assertCountEqual(mock_report_user_action.call_args_list, expected_calls)
+
+    def _default_config_for_kind(self, kind: str) -> dict:
+        if kind == "categorical":
+            return {
+                "options": [
+                    {"key": "good", "label": "Good"},
+                    {"key": "bad", "label": "Bad"},
+                ]
+            }
+        if kind == "numeric":
+            return {"min": 0, "max": 1, "step": 0.1}
+        if kind == "boolean":
+            return {"true_label": "Yes", "false_label": "No"}
+        raise ValueError(f"Unsupported kind: {kind}")
+
+    def _create_definition(
+        self,
+        *,
+        name: str = "Quality",
+        kind: str = "categorical",
+        archived: bool = False,
+        config: dict | None = None,
+    ) -> ScoreDefinition:
+        payload = {
+            "name": name,
+            "kind": kind,
+            "config": config or self._default_config_for_kind(kind),
+        }
+        response = self.client.post(self._endpoint(), payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        definition = ScoreDefinition.objects.get(pk=response.data["id"])
+        if archived:
+            definition.archived = True
+            definition.save(update_fields=["archived", "updated_at"])
+        return definition
+
+
+class TestScoreDefinitionVersionQueries(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("zero_limit", {"limit": 0}, "limit"),
+            ("oversized_limit", {"limit": 101}, "limit"),
+            ("malformed_cursor", {"cursor": "invalid"}, "cursor"),
+            ("oversized_cursor_version", {"cursor": encode_cursor(["2147483648", str(uuid4())])}, "cursor"),
+            ("invalid_cursor_uuid", {"cursor": encode_cursor(["1", "not-a-uuid"])}, "cursor"),
+            ("repeated_limit", QueryDict("limit=1&limit=2"), "limit"),
+            ("unsupported_filter", {"search": "quality"}, "search"),
+        ]
+    )
+    def test_rejects_unbounded_or_unsupported_queries(self, _name: str, query: dict[str, object], field: str) -> None:
+        serializer = ScoreDefinitionVersionQuerySerializer(data=query)
+        self.assertFalse(serializer.is_valid())
+        self.assertIn(field, serializer.errors)

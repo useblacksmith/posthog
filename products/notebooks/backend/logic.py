@@ -1,0 +1,435 @@
+"""
+Domain logic for notebooks.
+
+Owns ORM access and business rules. Returns ORM instances and primitives to the
+facade, which maps them to framework-free contracts. Nothing outside the product
+should import this module — cross-product callers go through ``facade.api``.
+"""
+
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
+
+from django.db import transaction
+from django.db.models import F, Prefetch, Q
+from django.utils import timezone
+
+from asgiref.sync import sync_to_async
+
+from posthog.constants import AvailableFeature
+from posthog.models import Team
+from posthog.models.tag import Tag, tagify
+from posthog.models.tagged_item import TaggedItem
+
+from products.access_control.backend.facade.user_access_control import UserAccessControl
+
+from .facade.contracts import NotebookContentEditNotAllowed
+from .markdown_conversion import get_markdown_notebook_markdown, is_markdown_notebook_content
+from .markdown_migration import to_markdown_notebook_content
+from .models import Notebook, ResourceNotebook
+from .sql_v2_state import validate_cell_count
+
+if TYPE_CHECKING:
+    from posthog.models import User
+
+
+def _validate_shared_notebook_edit(user: "User", notebook: Notebook, content: dict[str, Any]) -> None:
+    from posthog.api.sharing_publish_gate import (  # noqa: PLC0415 — keep query runners off the facade import path
+        denied_resources_in_notebook_edit,
+        is_publicly_shared,
+    )
+
+    if not notebook.team.organization.is_feature_available(AvailableFeature.ACCESS_CONTROL):
+        return
+    if UserAccessControl(user=user, team=notebook.team).is_organization_admin:
+        return
+    if not is_publicly_shared(notebook):
+        return
+    denied_resources = denied_resources_in_notebook_edit(user, notebook, content)
+    if denied_resources:
+        denied_names = ", ".join(f"`{name}`" for name in denied_resources)
+        raise NotebookContentEditNotAllowed(
+            f"Can't save: you don't have access to {denied_names}, and this notebook is publicly shared."
+        )
+
+
+def _base_queryset(team_id: int, *, include_deleted: bool = False) -> Any:
+    qs = Notebook.objects.filter(team_id=team_id)
+    if not include_deleted:
+        qs = qs.filter(deleted=False)
+    return qs
+
+
+def notebook_exists(team_id: int, short_id: str, *, include_deleted: bool = True) -> bool:
+    return _base_queryset(team_id, include_deleted=include_deleted).filter(short_id=short_id).exists()
+
+
+async def anotebook_exists(team_id: int, short_id: str, *, include_deleted: bool = True) -> bool:
+    return await _base_queryset(team_id, include_deleted=include_deleted).filter(short_id=short_id).aexists()
+
+
+def get_notebook(team_id: int, short_id: str, *, include_deleted: bool = False) -> Notebook | None:
+    return _base_queryset(team_id, include_deleted=include_deleted).filter(short_id=short_id).first()
+
+
+async def aget_notebook(team_id: int, short_id: str, *, include_deleted: bool = False) -> Notebook | None:
+    return await _base_queryset(team_id, include_deleted=include_deleted).filter(short_id=short_id).afirst()
+
+
+async def acan_user_edit_notebook(team_id: int, short_id: str, user_access_control: UserAccessControl) -> bool:
+    notebook = await aget_notebook(team_id, short_id, include_deleted=True)
+    if notebook is None:
+        return False
+
+    def check() -> bool:
+        return bool(user_access_control.check_access_level_for_object(notebook, "editor"))
+
+    return await sync_to_async(check)()
+
+
+async def aupdate_notebook_content(
+    team_id: int,
+    short_id: str,
+    *,
+    content: dict[str, Any],
+    title: str,
+    text_content: str | None,
+    user: "User",
+) -> Notebook | None:
+    notebook = await aget_notebook(team_id, short_id, include_deleted=True)
+    if notebook is None:
+        return None
+    # Enforced here rather than only at the HTTP layer: this writer bypasses the serializer
+    # entirely (it is a queryset update, so no save() hook or signal fires either), and it is
+    # how Max saves a notebook. A ceiling only the API respects is not a ceiling.
+    validate_cell_count(notebook.content, content)
+    await sync_to_async(_validate_shared_notebook_edit)(user, notebook, content)
+    await Notebook.objects.filter(pk=notebook.pk).aupdate(
+        content=content,
+        title=title,
+        text_content=text_content,
+        version=F("version") + 1,
+        last_modified_by_id=user.id,
+        last_modified_at=timezone.now(),
+    )
+    await notebook.arefresh_from_db()
+    return notebook
+
+
+async def aupsert_notebook(
+    team_id: int,
+    short_id: str,
+    *,
+    created_by_id: int | None,
+    user: "User",
+    title: str,
+    content: dict[str, Any],
+    text_content: str | None = None,
+) -> tuple[Notebook, bool]:
+    # Checked before the upsert, not after: aget_or_create would otherwise have already
+    # written the over-limit row by the time the ceiling rejected it. Like the rest of this
+    # writer, the read and the write are not atomic — the path has no version CAS at all.
+    existing = await aget_notebook(team_id, short_id, include_deleted=True)
+    validate_cell_count(existing.content if existing is not None else None, content)
+    notebook, created = await Notebook.objects.aget_or_create(
+        team_id=team_id,
+        short_id=short_id,
+        defaults={
+            "created_by_id": created_by_id,
+            "last_modified_by_id": user.id,
+            "title": title,
+            "content": content,
+            "text_content": text_content,
+        },
+    )
+    if not created:
+        await sync_to_async(_validate_shared_notebook_edit)(user, notebook, content)
+        notebook.content = content
+        notebook.title = title
+        notebook.version += 1
+        notebook.last_modified_by_id = user.id
+        update_fields = ["content", "title", "version", "last_modified_by", "last_modified_at"]
+        if text_content is not None:
+            notebook.text_content = text_content
+            update_fields.append("text_content")
+        await notebook.asave(update_fields=update_fields)
+    return notebook, created
+
+
+def get_notebook_short_ids_for_creator(project_id: int, user_id: int) -> list[str]:
+    return list(
+        Notebook.objects.filter(created_by_id=user_id, team__project_id=project_id).values_list("short_id", flat=True)
+    )
+
+
+def get_notebook_activity_summary(team_id: int, limit: int) -> tuple[int, list[dict[str, Any]]]:
+    qs = Notebook.objects.filter(team_id=team_id, deleted=False)
+    total = qs.count()
+    recent = list(qs.order_by("-last_modified_at")[:limit].values("short_id", "title", "last_modified_at"))
+    return total, recent
+
+
+def create_notebook(
+    team_id: int,
+    *,
+    title: str | None,
+    content: Any,
+    text_content: str | None = None,
+    created_by_id: int | None = None,
+    last_modified_by_id: int | None = None,
+    visibility: str = Notebook.Visibility.DEFAULT,
+) -> Notebook:
+    return Notebook.objects.create(
+        team_id=team_id,
+        title=title,
+        content=content,
+        text_content=text_content,
+        created_by_id=created_by_id,
+        last_modified_by_id=last_modified_by_id,
+        visibility=visibility,
+    )
+
+
+def get_group_notebook_short_id(group_id: int) -> str | None:
+    link = ResourceNotebook.objects.filter(group=group_id).select_related("notebook").first()
+    return link.notebook.short_id if link else None
+
+
+def group_has_notebook(group_id: int) -> bool:
+    return ResourceNotebook.objects.filter(group=group_id).exists()
+
+
+def create_group_notebook(team_id: int, group_id: int, *, title: str | None, content: Any) -> Notebook:
+    with transaction.atomic():
+        notebook = Notebook.objects.create(
+            team_id=team_id,
+            title=title,
+            content=content,
+            visibility=Notebook.Visibility.INTERNAL,
+        )
+        ResourceNotebook.objects.create(notebook=notebook, group=group_id)
+    return notebook
+
+
+def create_account_notebook(
+    team_id: int,
+    account_id: str | UUID,
+    *,
+    title: str | None,
+    content: Any,
+    text_content: str | None = None,
+    created_by_id: int | None = None,
+    last_modified_by_id: int | None = None,
+) -> Notebook:
+    if not is_markdown_notebook_content(content):
+        organization_id = Team.objects.values_list("organization_id", flat=True).get(id=team_id)
+        content = to_markdown_notebook_content(content, organization_id=organization_id)
+    # A converted or synthesized document can hold more cells than the editor allows, so count it before saving.
+    validate_cell_count(None, content)
+    # Search reads text_content, so it mirrors the stored markdown.
+    text_content = get_markdown_notebook_markdown(content)
+    with transaction.atomic():
+        notebook = Notebook.objects.create(
+            team_id=team_id,
+            title=title,
+            content=content,
+            text_content=text_content,
+            created_by_id=created_by_id,
+            last_modified_by_id=last_modified_by_id,
+            visibility=Notebook.Visibility.INTERNAL,
+        )
+        ResourceNotebook.objects.create(notebook=notebook, account_id=account_id)
+    return notebook
+
+
+def list_account_internal_notes(account_id: str | UUID) -> list[ResourceNotebook]:
+    return list(
+        ResourceNotebook.objects.filter(
+            account_id=account_id,
+            notebook__deleted=False,
+            notebook__visibility=Notebook.Visibility.INTERNAL,
+        )
+        .select_related("notebook")
+        .order_by("-notebook__last_modified_at")
+    )
+
+
+def _tags_prefetch() -> Prefetch:
+    # Same `prefetched_tags` attribute the tagged-item serializer mixin reads, so one query serves the whole page.
+    return Prefetch("tagged_items", queryset=TaggedItem.objects.select_related("tag"), to_attr="prefetched_tags")
+
+
+def _account_notebook_queryset(account_id: str | UUID) -> Any:
+    return (
+        Notebook.objects.filter(
+            deleted=False,
+            visibility=Notebook.Visibility.INTERNAL,
+            resources__account_id=account_id,
+        )
+        .select_related("created_by", "last_modified_by")
+        .prefetch_related(_tags_prefetch())
+    )
+
+
+# Author sorting fans out to the user's name columns so the order matches what the UI shows.
+_ACCOUNT_NOTEBOOK_ORDERING: dict[str, tuple[str, ...]] = {
+    "created_at": ("created_at",),
+    "-created_at": ("-created_at",),
+    "created_by": ("created_by__first_name", "created_by__last_name"),
+    "-created_by": ("-created_by__first_name", "-created_by__last_name"),
+    "last_modified_at": ("last_modified_at",),
+    "-last_modified_at": ("-last_modified_at",),
+    "title": ("title",),
+    "-title": ("-title",),
+}
+_DEFAULT_ACCOUNT_NOTEBOOK_ORDERING = ("-created_at",)
+
+
+def list_account_notebooks(
+    account_id: str | UUID,
+    *,
+    search: str | None = None,
+    order: str | None = None,
+    tags: Iterable[str] | None = None,
+    created_by_ids: Iterable[int] | None = None,
+) -> list[Notebook]:
+    queryset = _account_notebook_queryset(account_id)
+    if created_by_ids:
+        queryset = queryset.filter(created_by_id__in=list(created_by_ids))
+    if search:
+        # Mirror the main notebooks list: full-text over title and content (some notebooks
+        # have no text_content until their next save, so title is matched too).
+        queryset = queryset.filter(Q(title__search=search) | Q(text_content__search=search))
+    if tags:
+        queryset = queryset.filter(tagged_items__tag__name__in=[tagify(t) for t in tags]).distinct()
+    ordering = _ACCOUNT_NOTEBOOK_ORDERING.get(order or "", _DEFAULT_ACCOUNT_NOTEBOOK_ORDERING)
+    return list(queryset.order_by(*ordering))
+
+
+def get_account_notebook(account_id: str | UUID, short_id: str) -> Notebook | None:
+    return _account_notebook_queryset(account_id).filter(short_id=short_id).first()
+
+
+def update_account_notebook(
+    account_id: str | UUID,
+    short_id: str,
+    *,
+    tags: Iterable[str] | None = None,
+) -> Notebook | None:
+    """Replace the tags of an account notebook. `None` leaves them untouched.
+
+    The title is not editable here: a note's displayed title comes from its first line, so it is
+    renamed by editing the note."""
+    if tags is None:
+        return get_account_notebook(account_id, short_id)
+    with transaction.atomic():
+        notebook = (
+            _account_notebook_queryset(account_id)
+            .select_related(None)
+            .prefetch_related(None)
+            .filter(short_id=short_id, resources__account__team_id=F("team_id"))
+            .select_for_update(of=("self",))
+            .first()
+        )
+        if notebook is None:
+            return None
+        set_notebook_tags(notebook, tags)
+        return get_account_notebook(account_id, short_id)
+
+
+def set_notebook_tags(notebook: Notebook, tags: Iterable[str]) -> None:
+    """Replace a notebook's tags. Rows are written one by one so each change lands in the activity log."""
+    deduped = sorted({tagify(t) for t in tags if tagify(t)})
+    kept: list[TaggedItem] = []
+    for name in deduped:
+        tag, _ = Tag.objects.get_or_create(name=name, team_id=notebook.team_id)
+        item, _ = notebook.tagged_items.get_or_create(tag_id=tag.id)
+        item.tag = tag
+        kept.append(item)
+    removed = list(notebook.tagged_items.exclude(tag__name__in=deduped).select_related("tag__team"))
+    for item in removed:
+        item.uuid_object = notebook
+        item.delete()
+    if removed:
+        Tag.objects.filter(
+            team_id=notebook.team_id, id__in=[item.tag_id for item in removed], tagged_items__isnull=True
+        ).delete()
+    notebook.prefetched_tags = kept  # type: ignore[attr-defined]
+
+
+def delete_account_notebook(account_id: str | UUID, short_id: str) -> bool:
+    notebook = _account_notebook_queryset(account_id).filter(short_id=short_id).first()
+    if notebook is None:
+        return False
+    notebook.delete()
+    return True
+
+
+def list_team_account_notes(
+    team_id: int,
+    *,
+    account_ids: Iterable[UUID | str] | None = None,
+    account_id: UUID | str | None = None,
+    created_by_ids: Iterable[int] | None = None,
+    search: str | None = None,
+    tags: Iterable[str] | None = None,
+    order: str | None = None,
+    offset: int = 0,
+    limit: int = 100,
+) -> tuple[list[ResourceNotebook], int]:
+    """Team-wide account notes: internal notebooks linked to any account, newest-modified first.
+
+    ``account_ids`` restricts to the given accounts (callers pass the caller-accessible set —
+    a lazy ``values_list`` queryset compiles to a SQL subquery). ``account_id`` narrows to a
+    single account, ``created_by_ids`` to notes authored by the given users. ``search`` is
+    full-text over notebook title/content plus substring over the linked account's name.
+    ``tags`` keeps notes carrying any of the tags.
+    Returns ``(page, total_count)``.
+    """
+    queryset = (
+        ResourceNotebook.objects.filter(
+            account__isnull=False,
+            notebook__team_id=team_id,
+            notebook__deleted=False,
+            notebook__visibility=Notebook.Visibility.INTERNAL,
+        )
+        .select_related("notebook", "notebook__created_by", "account")
+        .prefetch_related(
+            Prefetch(
+                "notebook__tagged_items",
+                queryset=TaggedItem.objects.select_related("tag"),
+                to_attr="prefetched_tags",
+            )
+        )
+    )
+    if account_ids is not None:
+        queryset = queryset.filter(account_id__in=account_ids)
+    if account_id is not None:
+        queryset = queryset.filter(account_id=account_id)
+    if created_by_ids is not None:
+        queryset = queryset.filter(notebook__created_by_id__in=created_by_ids)
+    if search:
+        queryset = queryset.filter(
+            Q(notebook__title__search=search)
+            | Q(notebook__text_content__search=search)
+            | Q(account__name__icontains=search)
+        )
+    if tags:
+        queryset = queryset.filter(notebook__tagged_items__tag__name__in=[tagify(t) for t in tags]).distinct()
+    queryset = queryset.order_by(*_TEAM_ACCOUNT_NOTE_ORDERING.get(order or "", _DEFAULT_TEAM_ACCOUNT_NOTE_ORDERING))
+    return list(queryset[offset : offset + limit]), queryset.count()
+
+
+_TEAM_ACCOUNT_NOTE_ORDERING: dict[str, tuple[str, ...]] = {
+    "last_modified_at": ("notebook__last_modified_at",),
+    "-last_modified_at": ("-notebook__last_modified_at",),
+    "created_at": ("notebook__created_at",),
+    "-created_at": ("-notebook__created_at",),
+    "title": ("notebook__title",),
+    "-title": ("-notebook__title",),
+    "created_by": ("notebook__created_by__first_name", "notebook__created_by__last_name"),
+    "-created_by": ("-notebook__created_by__first_name", "-notebook__created_by__last_name"),
+    "account_name": ("account__name", "-notebook__last_modified_at"),
+    "-account_name": ("-account__name", "-notebook__last_modified_at"),
+}
+_DEFAULT_TEAM_ACCOUNT_NOTE_ORDERING = ("-notebook__last_modified_at",)

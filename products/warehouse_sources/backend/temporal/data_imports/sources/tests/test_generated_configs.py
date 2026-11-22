@@ -1,0 +1,401 @@
+import pytest
+
+from products.warehouse_sources.backend.temporal.data_imports.sources import SourceRegistry
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs import get_config_for_source
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.bigquery import (
+    BigQuerySourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.mongodb import (
+    MongoDBSourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.mssql import MSSQLSourceConfig
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.mysql import MySQLSourceConfig
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.postgres import (
+    PostgresSourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.salesforce import (
+    SalesforceSourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.snowflake import (
+    SnowflakeSourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.stripe import StripeSourceConfig
+from products.warehouse_sources.sources.beamer._config import BeamerSourceConfig
+from products.warehouse_sources.sources.chargebee._config import ChargebeeSourceConfig
+from products.warehouse_sources.sources.doit._config import DoItSourceConfig
+from products.warehouse_sources.sources.gitlab._config import GitLabSourceConfig
+from products.warehouse_sources.sources.gorgias._config import GorgiasSourceConfig
+from products.warehouse_sources.sources.shopify._config import ShopifySourceConfig
+from products.warehouse_sources.sources.supabase._config import SupabaseSourceConfig
+
+
+# The form submits "temporary-dataset", but dataclasses.asdict() persists "temporary_dataset",
+# so a source that has been saved once is read back under the second spelling.
+@pytest.mark.parametrize("temporary_dataset_key", ["temporary-dataset", "temporary_dataset"])
+def test_bigquery_config(temporary_dataset_key: str):
+    config = BigQuerySourceConfig.from_dict(
+        {
+            "auth_type": {
+                "selection": "key_file",
+                "key_file": {
+                    "project_id": "project_id",
+                    "private_key_id": "private_key_id",
+                    "private_key": "private_key",
+                    "client_email": "client_email",
+                    "token_uri": "token_uri",
+                },
+            },
+            "dataset_id": "dataset_id",
+            temporary_dataset_key: {"enabled": False, "temporary_dataset_id": ""},
+            "dataset_project": {"enabled": False, "dataset_project_id": ""},
+        }
+    )
+
+    assert config.auth_type.selection == "key_file"
+    assert config.auth_type.key_file is not None
+    assert config.auth_type.key_file.project_id == "project_id"
+    assert config.auth_type.key_file.private_key_id == "private_key_id"
+    assert config.auth_type.key_file.private_key == "private_key"
+    assert config.auth_type.key_file.client_email == "client_email"
+    assert config.auth_type.key_file.token_uri == "token_uri"
+    assert config.dataset_id == "dataset_id"
+    assert config.temporary_dataset is not None
+    assert config.temporary_dataset.enabled is False
+    assert config.temporary_dataset.temporary_dataset_id == ""
+    assert config.dataset_project is not None
+    assert config.dataset_project.enabled is False
+    assert config.dataset_project.dataset_project_id == ""
+
+
+def test_beamer_config():
+    config = BeamerSourceConfig.from_dict({"api_key": "api_key"})
+    assert config.api_key == "api_key"
+
+
+def test_chargebee_config():
+    config = ChargebeeSourceConfig.from_dict({"api_key": "api_key", "site_name": "subdomain"})
+    assert config.api_key == "api_key"
+    assert config.site_name == "subdomain"
+
+
+def test_doit_config():
+    config = DoItSourceConfig.from_dict({"api_key": "api_key"})
+    assert config.api_key == "api_key"
+
+
+def test_gitlab_config():
+    config = GitLabSourceConfig.from_dict(
+        {"personal_access_token": "glpat-token", "project": "group/project", "gitlab_host": "https://gitlab.com"}
+    )
+    assert config.personal_access_token == "glpat-token"
+    assert config.project == "group/project"
+    assert config.gitlab_host == "https://gitlab.com"
+
+
+def test_gitlab_config_without_host():
+    config = GitLabSourceConfig.from_dict({"personal_access_token": "glpat-token", "project": "42"})
+    assert config.gitlab_host is None
+
+
+def test_gorgias_config():
+    config = GorgiasSourceConfig.from_dict({"gorgias_domain": "acme", "email": "you@acme.com", "api_key": "api_key"})
+    assert config.gorgias_domain == "acme"
+    assert config.email == "you@acme.com"
+    assert config.api_key == "api_key"
+
+
+def test_mssql_config():
+    config = MSSQLSourceConfig.from_dict(
+        {
+            "host": "host",
+            "port": 1433,
+            "database": "database",
+            "user": "user",
+            "password": "password",
+            "schema": "schema",
+            "ssh_tunnel": {
+                "enabled": True,
+                "host": "host",
+                "port": 22,
+                "auth_type": {
+                    "selection": "password",
+                    "username": "username",
+                    "password": "password",
+                    "private_key": "",
+                    "passphrase": "",
+                },
+            },
+        }
+    )
+
+    assert config.host == "host"
+    assert config.port == 1433
+    assert config.database == "database"
+    assert config.user == "user"
+    assert config.password == "password"
+    assert config.schema == "schema"
+    assert config.ssh_tunnel is not None
+    assert config.ssh_tunnel.enabled is True
+    assert config.ssh_tunnel.host == "host"
+    assert config.ssh_tunnel.port == 22
+    assert config.ssh_tunnel.auth is not None
+    assert config.ssh_tunnel.auth.type == "password"
+    assert config.ssh_tunnel.auth.username == "username"
+    assert config.ssh_tunnel.auth.password == "password"
+    assert config.ssh_tunnel.auth.private_key == ""
+    assert config.ssh_tunnel.auth.passphrase == ""
+
+
+def test_mongo_config():
+    config = MongoDBSourceConfig.from_dict({"connection_string": "connection_string"})
+    assert config.connection_string == "connection_string"
+
+
+def test_mysql_config():
+    config = MySQLSourceConfig.from_dict(
+        {
+            "host": "host",
+            "port": 1433,
+            "database": "database",
+            "user": "user",
+            "password": "password",
+            "schema": "schema",
+            "using_ssl": "true",
+            "ssh_tunnel": {
+                "enabled": True,
+                "host": "host",
+                "port": 22,
+                "auth_type": {
+                    "selection": "password",
+                    "username": "username",
+                    "password": "password",
+                    "private_key": "",
+                    "passphrase": "",
+                },
+            },
+        }
+    )
+
+    assert config.host == "host"
+    assert config.port == 1433
+    assert config.database == "database"
+    assert config.user == "user"
+    assert config.password == "password"
+    assert config.schema == "schema"
+    assert config.using_ssl is True
+    assert config.ssh_tunnel is not None
+    assert config.ssh_tunnel.enabled is True
+    assert config.ssh_tunnel.host == "host"
+    assert config.ssh_tunnel.port == 22
+    assert config.ssh_tunnel.auth is not None
+    assert config.ssh_tunnel.auth.type == "password"
+    assert config.ssh_tunnel.auth.username == "username"
+    assert config.ssh_tunnel.auth.password == "password"
+    assert config.ssh_tunnel.auth.private_key == ""
+    assert config.ssh_tunnel.auth.passphrase == ""
+
+
+def test_postgres_config():
+    config = PostgresSourceConfig.from_dict(
+        {
+            "host": "host",
+            "port": 1433,
+            "database": "database",
+            "user": "user",
+            "password": "password",
+            "schema": "schema",
+            "ssh_tunnel": {
+                "enabled": True,
+                "host": "host",
+                "port": 22,
+                "auth_type": {
+                    "selection": "password",
+                    "username": "username",
+                    "password": "password",
+                    "private_key": "",
+                    "passphrase": "",
+                },
+            },
+        }
+    )
+
+    assert config.host == "host"
+    assert config.port == 1433
+    assert config.database == "database"
+    assert config.user == "user"
+    assert config.password == "password"
+    assert config.schema == "schema"
+    assert config.ssh_tunnel is not None
+    assert config.ssh_tunnel.enabled is True
+    assert config.ssh_tunnel.host == "host"
+    assert config.ssh_tunnel.port == 22
+    assert config.ssh_tunnel.auth is not None
+    assert config.ssh_tunnel.auth.type == "password"
+    assert config.ssh_tunnel.auth.username == "username"
+    assert config.ssh_tunnel.auth.password == "password"
+    assert config.ssh_tunnel.auth.private_key == ""
+    assert config.ssh_tunnel.auth.passphrase == ""
+
+
+def test_postgres_config_without_schema():
+    config = PostgresSourceConfig.from_dict(
+        {
+            "host": "host",
+            "port": 1433,
+            "database": "database",
+            "user": "user",
+            "password": "password",
+        }
+    )
+
+    assert config.schema is None
+
+
+def test_supabase_config():
+    config = SupabaseSourceConfig.from_dict(
+        {
+            "host": "host",
+            "port": 1433,
+            "database": "database",
+            "user": "user",
+            "password": "password",
+            "schema": "public",
+        }
+    )
+
+    assert config.host == "host"
+    assert config.port == 1433
+    assert config.database == "database"
+    assert config.user == "user"
+    assert config.password == "password"
+    assert config.schema == "public"
+
+
+def test_salesforce_config():
+    config = SalesforceSourceConfig.from_dict({"salesforce_integration_id": 1})
+    assert config.salesforce_integration_id == 1
+
+
+def test_snowflake_config():
+    config = SnowflakeSourceConfig.from_dict(
+        {
+            "account_id": "account_id",
+            "database": "database",
+            "warehouse": "warehouse",
+            "auth_type": {
+                "selection": "password",
+                "user": "user",
+                "password": "password",
+                "private_key": "",
+                "passphrase": "",
+            },
+            "role": "role",
+            "schema": "schema",
+        }
+    )
+    assert config.account_id == "account_id"
+    assert config.database == "database"
+    assert config.warehouse == "warehouse"
+    assert config.role == "role"
+    assert config.schema == "schema"
+    assert config.auth_type is not None
+    assert config.auth_type.selection == "password"
+    assert config.auth_type.user == "user"
+    assert config.auth_type.password == "password"
+    assert config.auth_type.private_key == ""
+    assert config.auth_type.passphrase == ""
+
+
+@pytest.mark.parametrize(
+    "schema_override,expected_schema",
+    [
+        # A blank schema flips the source into multi-schema discovery; the config stores the raw
+        # value (absent/""/whitespace) verbatim — drivers normalize it via `normalize_namespace`.
+        ({}, None),
+        ({"schema": ""}, ""),
+        ({"schema": "   "}, "   "),
+    ],
+)
+def test_snowflake_config_without_schema(schema_override, expected_schema):
+    config = SnowflakeSourceConfig.from_dict(
+        {
+            "account_id": "account_id",
+            "database": "database",
+            "warehouse": "warehouse",
+            "auth_type": {"selection": "password", "user": "user", "password": "password"},
+            **schema_override,
+        }
+    )
+
+    assert config.schema == expected_schema
+
+
+@pytest.mark.parametrize(
+    "config_dict,expected_auth_method_attrs",
+    [
+        # Nested form: the `auth_method` select submitted as a mapping.
+        (
+            {"auth_method": {"selection": "api_key", "stripe_secret_key": "api_key"}, "stripe_account_id": "acct_id"},
+            {"selection": "api_key", "stripe_secret_key": "api_key"},
+        ),
+        # Flat form: the option value as a scalar with the option's fields as siblings. This
+        # passes `validate_dict`, so `from_dict` must not raise an unhandled TypeError on the scalar.
+        (
+            {"auth_method": "oauth", "stripe_integration_id": 176624, "stripe_account_id": "acct_id"},
+            {"stripe_integration_id": 176624},
+        ),
+    ],
+)
+def test_stripe_config(config_dict, expected_auth_method_attrs):
+    is_valid, errors = StripeSourceConfig.validate_dict(config_dict)
+    assert is_valid is True
+    assert errors == []
+
+    config = StripeSourceConfig.from_dict(config_dict)
+    assert config.stripe_account_id == "acct_id"
+    for attr, expected in expected_auth_method_attrs.items():
+        assert getattr(config.auth_method, attr) == expected
+
+
+@pytest.mark.parametrize(
+    "stored,expected_auth_method_attrs",
+    [
+        (
+            {
+                "shopify_store_id": "store_id",
+                "auth_method": {
+                    "selection": "client_credentials",
+                    "shopify_client_id": "client_id",
+                    "shopify_client_secret": "client_secret",
+                },
+            },
+            {"shopify_client_id": "client_id", "shopify_client_secret": "client_secret"},
+        ),
+        (
+            {
+                "shopify_store_id": "store_id",
+                "auth_method": {"selection": "access_token", "shopify_access_token": "shpat_token"},
+            },
+            {"shopify_access_token": "shpat_token", "shopify_client_id": None},
+        ),
+    ],
+)
+def test_shopify_config(stored, expected_auth_method_attrs):
+    # These are the two shapes the `auth_method` backfill writes for sources connected before the
+    # select existed. `validate_dict` runs on update, so a rename on either side of that backfill
+    # blocks editing every Shopify source that already exists.
+    assert ShopifySourceConfig.validate_dict(stored) == (True, [])
+
+    config = ShopifySourceConfig.from_dict(stored)
+    assert config.shopify_store_id == "store_id"
+    for attr, expected in expected_auth_method_attrs.items():
+        assert getattr(config.auth_method, attr) == expected
+
+
+def test_get_config_for_source_resolves_every_registered_source():
+    # The generator emits `<member.name.lower()>.py` modules and the static package __init__
+    # derives the same names at runtime; if either side changes its rule (or a registered
+    # source's module is missing/stale), resolution breaks for that source.
+    for source_type in SourceRegistry.get_all_sources():
+        config_cls = get_config_for_source(source_type)
+        assert config_cls.__name__ == f"{source_type}SourceConfig"
